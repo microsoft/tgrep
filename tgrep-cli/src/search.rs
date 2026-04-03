@@ -26,6 +26,7 @@ pub struct SearchOptions {
     pub smart_case: bool,
     pub fixed_string: bool,
     pub files_only: bool,
+    pub files_without_match: bool,
     pub count: bool,
     pub word_boundary: bool,
     pub max_count: Option<usize>,
@@ -47,6 +48,9 @@ pub struct SearchOptions {
     pub multiline: bool,
     pub no_ignore: bool,
     pub hidden: bool,
+    pub quiet: bool,
+    pub no_filename: bool,
+    pub no_line_number: bool,
 }
 
 impl SearchOptions {
@@ -81,6 +85,8 @@ impl SearchOptions {
             self.color,
             self.null,
             self.trim,
+            self.no_filename,
+            self.no_line_number,
         )
     }
 
@@ -143,8 +149,10 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
 
     let ci = opts.effective_case_insensitive();
 
-    // Try to delegate to a running server
+    // Try to delegate to a running server (skip for files_without_match
+    // since the server only returns matching files).
     if !opts.no_index
+        && !opts.files_without_match
         && let Ok(info) = ServerInfo::load(&index_dir)
     {
         if let Ok(had_matches) = search_via_server(&info, opts, ci) {
@@ -215,6 +223,11 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
 
     let mut writer = OutputWriter::new(opts.make_output_config());
     let had_matches = !matches.is_empty();
+
+    if opts.quiet {
+        writer.flush()?;
+        return Ok(had_matches);
+    }
 
     if opts.files_only {
         let mut seen = std::collections::HashSet::new();
@@ -301,7 +314,7 @@ fn search_local_index(
 
     let is_match_all = plan.is_match_all();
 
-    let candidates = if is_match_all {
+    let candidates = if is_match_all || opts.files_without_match {
         reader.all_file_ids()
     } else {
         query::execute_plan(&plan, &|tri| reader.lookup_trigram(tri))
@@ -337,7 +350,18 @@ fn search_local_index(
 
         let matched = search_file_content(&content, &re, &rel_path, opts, &mut writer)?;
         if matched {
+            if !opts.files_without_match {
+                had_matches = true;
+            }
+            if opts.quiet {
+                break;
+            }
+        } else if opts.files_without_match {
+            writer.write_file(&rel_path)?;
             had_matches = true;
+            if opts.quiet {
+                break;
+            }
         }
     }
 
@@ -410,7 +434,18 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
 
         let matched = search_file_content(&content, &re, &rel_path, opts, &mut writer)?;
         if matched {
+            if !opts.files_without_match {
+                had_matches = true;
+            }
+            if opts.quiet {
+                break;
+            }
+        } else if opts.files_without_match {
+            writer.write_file(&rel_path)?;
             had_matches = true;
+            if opts.quiet {
+                break;
+            }
         }
     }
 
@@ -452,6 +487,9 @@ fn search_file_content(
         };
         if include {
             match_indices.push(i);
+            if opts.quiet || opts.files_without_match {
+                break;
+            }
             if let Some(max) = opts.max_count
                 && match_indices.len() >= max
             {
@@ -462,6 +500,11 @@ fn search_file_content(
 
     if match_indices.is_empty() {
         return Ok(false);
+    }
+
+    // For quiet/files_without_match, we only need the boolean result.
+    if opts.quiet || opts.files_without_match {
+        return Ok(true);
     }
 
     if opts.files_only {

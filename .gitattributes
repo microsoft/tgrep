@@ -1,0 +1,2 @@
+# Force LF line endings for shell scripts (even on Windows checkouts)
+*.sh text eol=lf

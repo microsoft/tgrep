@@ -1,0 +1,20 @@
+[package]
+name = "tgrep-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Trigram index library for fast full-text search on large codebases"
+keywords = ["trigram", "search", "index", "grep", "full-text"]
+categories = ["text-processing", "algorithms"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+memmap2 = "0.9"
+regex = "1"
+regex-syntax = "0.8"
+rayon = "1"
+ignore = "0.4"

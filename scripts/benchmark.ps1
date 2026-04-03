@@ -1,0 +1,240 @@
+<#
+.SYNOPSIS
+    Benchmark tgrep vs ripgrep on Windows.
+.DESCRIPTION
+    Runs a 100-query search benchmark comparing tgrep (client/server) against ripgrep.
+    By default, clones the Linux kernel (shallow) as the benchmark target.
+.PARAMETER RepoPath
+    Path to an existing repository to benchmark against. When set, skips cloning.
+.PARAMETER RepoUrl
+    URL to clone for benchmarking (ignored when RepoPath is set).
+.PARAMETER BenchDir
+    Working directory for benchmark artifacts (index, results, cloned repo).
+.PARAMETER TgrepBin
+    Path to the tgrep binary. Auto-detected from target\release\tgrep.exe if not set.
+.PARAMETER ResultsPath
+    Output path for the results markdown file.
+.PARAMETER SkipBuild
+    Skip building tgrep from source (assumes the binary already exists).
+.EXAMPLE
+    .\scripts\benchmark.ps1
+    # Builds tgrep, clones Linux kernel, runs full benchmark.
+.EXAMPLE
+    .\scripts\benchmark.ps1 -RepoPath C:\src\myrepo -SkipBuild
+    # Benchmarks against an existing repo using a pre-built binary.
+#>
+param(
+    [string]$RepoPath = '',
+    [string]$RepoUrl = 'https://github.com/torvalds/linux.git',
+    [string]$BenchDir = (Join-Path $env:TEMP 'tgrep-bench'),
+    [string]$TgrepBin = '',
+    [string]$ResultsPath = '',
+    [switch]$SkipBuild
+)
+
+$ErrorActionPreference = 'Stop'
+
+# ── Resolve paths ──
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RepoRoot  = Split-Path -Parent $ScriptDir
+
+if (-not $TgrepBin) {
+    $TgrepBin = Join-Path $RepoRoot 'target\release\tgrep.exe'
+}
+if (-not $ResultsPath) {
+    $ResultsPath = Join-Path $BenchDir 'benchmark-results.md'
+}
+
+$IndexPath = Join-Path $BenchDir 'tgrep-index'
+
+if ($RepoPath) {
+    $BenchRepoDir = $RepoPath
+} else {
+    $BenchRepoDir = Join-Path $BenchDir 'linux'
+}
+
+# ── Build ──
+if (-not $SkipBuild) {
+    Write-Host '==> Building tgrep (release)...' -ForegroundColor Cyan
+    Push-Location $RepoRoot
+    try {
+        cargo build --release
+        if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+    } finally {
+        Pop-Location
+    }
+}
+
+if (-not (Test-Path $TgrepBin)) {
+    throw "tgrep binary not found at $TgrepBin — run 'make release' first or pass -TgrepBin"
+}
+
+# ── Clone benchmark repo ──
+if (-not $RepoPath) {
+    if (-not (Test-Path $BenchRepoDir)) {
+        Write-Host "==> Cloning $RepoUrl (shallow)..." -ForegroundColor Cyan
+        New-Item -ItemType Directory -Path $BenchDir -Force | Out-Null
+        git clone --depth 1 $RepoUrl $BenchRepoDir
+        if ($LASTEXITCODE -ne 0) { throw 'git clone failed' }
+    } else {
+        Write-Host "==> Using existing repo at $BenchRepoDir" -ForegroundColor Yellow
+    }
+}
+
+if (-not (Test-Path $BenchRepoDir)) {
+    throw "Benchmark repo not found at $BenchRepoDir"
+}
+
+# ── Count files ──
+$FileCount = (git -C $BenchRepoDir ls-files | Measure-Object -Line).Lines
+
+# ── Build index ──
+Write-Host '==> Building tgrep index...' -ForegroundColor Cyan
+& $TgrepBin index $BenchRepoDir --index-path $IndexPath
+if ($LASTEXITCODE -ne 0) { throw 'tgrep index failed' }
+
+# ── 30 search patterns (mix of literals, multi-word, and regex) ──
+$Queries = @(
+    'mutex_lock'
+    'printk'
+    'EXPORT_SYMBOL'
+    'kfree'
+    'kmalloc'
+    'BUG_ON'
+    'pr_err'
+    'unlikely'
+    'IS_ERR'
+    'container_of'
+    'ARRAY_SIZE'
+    '__init'
+    'module_init'
+    'platform_driver'
+    'struct device'
+    'struct file'
+    'struct sk_buff'
+    'struct task_struct'
+    'struct page'
+    'alloc_chrdev_region'
+    'proc_create'
+    'ioctl'
+    'read'
+    'TODO'
+    'FIXME'
+    'SPDX-License-Identifier'
+    '^#include <linux/'
+    '^#define\s+[A-Z_]+'
+    'for_each_\w+'
+    '#ifdef\s+CONFIG_'
+)
+
+$QueryCount = $Queries.Count
+Write-Host "==> Running $QueryCount queries against $FileCount files" -ForegroundColor Cyan
+
+# ── Start tgrep serve ──
+Write-Host '==> Starting tgrep serve...' -ForegroundColor Cyan
+
+$LockFile = Join-Path $IndexPath 'serve.json'
+if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
+
+$serveOut = Join-Path $BenchDir 'serve-stdout.log'
+$serveErr = Join-Path $BenchDir 'serve-stderr.log'
+New-Item -ItemType Directory -Path $BenchDir -Force | Out-Null
+$serveProc = Start-Process -FilePath $TgrepBin `
+    -ArgumentList "serve `"$BenchRepoDir`" --index-path `"$IndexPath`" --no-watch" `
+    -RedirectStandardOutput $serveOut -RedirectStandardError $serveErr `
+    -PassThru -WindowStyle Hidden
+
+Write-Host "Waiting for tgrep serve (pid $($serveProc.Id))..."
+$ready = $false
+for ($i = 0; $i -lt 60; $i++) {
+    if (Test-Path $LockFile) {
+        $port = (Get-Content $LockFile | ConvertFrom-Json).port
+        Write-Host "tgrep serve ready on port $port" -ForegroundColor Green
+        $ready = $true
+        break
+    }
+    Start-Sleep -Seconds 1
+}
+
+if (-not $ready) {
+    Write-Host 'ERROR: tgrep serve failed to start within 60s' -ForegroundColor Red
+    if (-not $serveProc.HasExited) { $serveProc.Kill() }
+    throw 'tgrep serve failed to start'
+}
+
+# ── Benchmark: tgrep (client → serve) ──
+$savedEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    Write-Host "`n==> Benchmarking tgrep (client -> serve)..." -ForegroundColor Cyan
+    $tgrepSw = [System.Diagnostics.Stopwatch]::StartNew()
+    foreach ($q in $Queries) {
+        & $TgrepBin $q $BenchRepoDir --index-path $IndexPath *>$null
+    }
+    $tgrepSw.Stop()
+    $tgrepMs = $tgrepSw.ElapsedMilliseconds
+    Write-Host "tgrep: ${tgrepMs}ms total" -ForegroundColor Green
+} finally {
+    $ErrorActionPreference = $savedEAP
+    # ── Stop serve ──
+    Write-Host '==> Stopping tgrep serve...'
+    try {
+        if (-not $serveProc.HasExited) { $serveProc.Kill() }
+        $serveProc.WaitForExit(5000) | Out-Null
+    } catch { }
+}
+
+# ── Benchmark: ripgrep ──
+$rgCmd = Get-Command rg -ErrorAction SilentlyContinue
+$rgMs = -1
+if ($rgCmd) {
+    Write-Host "`n==> Benchmarking ripgrep..." -ForegroundColor Cyan
+    $ErrorActionPreference = 'Continue'
+    $rgSw = [System.Diagnostics.Stopwatch]::StartNew()
+    foreach ($q in $Queries) {
+        & rg -n $q $BenchRepoDir *>$null
+    }
+    $rgSw.Stop()
+    $ErrorActionPreference = $savedEAP
+    $rgMs = $rgSw.ElapsedMilliseconds
+    Write-Host "ripgrep: ${rgMs}ms total" -ForegroundColor Green
+} else {
+    Write-Host 'ripgrep (rg) not found in PATH, skipping' -ForegroundColor Yellow
+}
+
+# ── Write results ──
+$tgrepAvg = [math]::Round($tgrepMs / $QueryCount, 1)
+$dateStr  = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+$repoName = Split-Path $BenchRepoDir -Leaf
+$arch     = $env:PROCESSOR_ARCHITECTURE
+
+$sb = [System.Text.StringBuilder]::new()
+[void]$sb.AppendLine("# Benchmark: ${QueryCount}-query search on repo: $repoName")
+[void]$sb.AppendLine()
+[void]$sb.AppendLine("- **Repo**: $BenchRepoDir")
+[void]$sb.AppendLine("- **Files**: $FileCount")
+[void]$sb.AppendLine("- **Queries**: $QueryCount")
+[void]$sb.AppendLine("- **Date**: $dateStr")
+[void]$sb.AppendLine("- **Platform**: Windows $arch")
+[void]$sb.AppendLine('- **Scope**: search only (index built before timing)')
+[void]$sb.AppendLine('- **tgrep mode**: client/server — `tgrep serve` runs in background, `tgrep` client connects via TCP')
+[void]$sb.AppendLine()
+[void]$sb.AppendLine('| Tool | Total (ms) | Avg per query (ms) |')
+[void]$sb.AppendLine('| --- | ---: | ---: |')
+if ($rgMs -ge 0) {
+    $rgAvg = [math]::Round($rgMs / $QueryCount, 1)
+    [void]$sb.AppendLine(('| ripgrep | {0} | {1} |' -f $rgMs, $rgAvg))
+}
+[void]$sb.AppendLine(('| tgrep (client -> serve) | {0} | {1} |' -f $tgrepMs, $tgrepAvg))
+
+$results = $sb.ToString()
+
+$resultsDir = Split-Path $ResultsPath -Parent
+if ($resultsDir) {
+    New-Item -ItemType Directory -Path $resultsDir -Force | Out-Null
+}
+Set-Content -Path $ResultsPath -Value $results -NoNewline
+
+Write-Host ''
+Write-Host $results -ForegroundColor Green
+Write-Host "Results saved to $ResultsPath" -ForegroundColor Cyan

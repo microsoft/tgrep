@@ -1,0 +1,260 @@
+/// LiveIndex: a mutable, in-memory trigram index overlay.
+///
+/// Used by the server to track files that have changed since the on-disk
+/// index was built. Supports insert, update, and delete operations.
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use crate::trigram;
+
+/// Bit flag to distinguish live index file IDs from reader file IDs.
+pub const OVERLAY_BIT: u32 = 1 << 31;
+
+/// Raw clone of LiveIndex data for background checkpoint processing.
+/// Allows the expensive ID remapping to happen outside any lock.
+pub struct RawIndexSnapshot {
+    pub inverted: HashMap<u32, HashSet<u32>>,
+    pub file_paths: HashMap<u32, String>,
+}
+
+impl RawIndexSnapshot {
+    /// Remap raw data into disk-ready format (sequential IDs, sorted postings).
+    pub fn into_disk_format(self) -> (Vec<String>, HashMap<u32, Vec<u32>>) {
+        LiveIndex::remap_snapshot(&self.inverted, &self.file_paths)
+    }
+}
+
+pub struct LiveIndex {
+    /// Trigram → set of file IDs (with OVERLAY_BIT set).
+    inverted: HashMap<u32, HashSet<u32>>,
+    /// File ID → relative path.
+    file_paths: HashMap<u32, String>,
+    /// Path → file ID (for updates/deletes).
+    path_to_id: HashMap<String, u32>,
+    /// Paths that have been deleted (remove from reader results).
+    deleted_paths: HashSet<String>,
+    /// Next file ID counter (before applying OVERLAY_BIT).
+    next_id: AtomicU32,
+    /// Number of mutations since last save.
+    dirty_count: u32,
+}
+
+impl Default for LiveIndex {
+    fn default() -> Self {
+        Self {
+            inverted: HashMap::new(),
+            file_paths: HashMap::new(),
+            path_to_id: HashMap::new(),
+            deleted_paths: HashSet::new(),
+            next_id: AtomicU32::new(0),
+            dirty_count: 0,
+        }
+    }
+}
+
+impl LiveIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert or update a file in the live index.
+    pub fn upsert_file(&mut self, rel_path: &str, content: &[u8]) {
+        // Remove old entry if exists
+        if let Some(&old_id) = self.path_to_id.get(rel_path) {
+            self.remove_file_by_id(old_id);
+        }
+
+        let raw_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let file_id = raw_id | OVERLAY_BIT;
+
+        let trigrams = trigram::extract(content);
+        let lower = content.to_ascii_lowercase();
+        let lower_tris = trigram::extract(&lower);
+        for &tri in trigrams.iter().chain(lower_tris.iter()) {
+            self.inverted.entry(tri).or_default().insert(file_id);
+        }
+
+        self.file_paths.insert(file_id, rel_path.to_string());
+        self.path_to_id.insert(rel_path.to_string(), file_id);
+        self.deleted_paths.remove(rel_path);
+        self.dirty_count += 1;
+    }
+
+    /// Insert or update a file with pre-computed trigrams.
+    /// This avoids extracting trigrams while holding the write lock.
+    pub fn upsert_file_with_trigrams(&mut self, rel_path: &str, trigrams: Vec<u32>) {
+        // Remove old entry if exists
+        if let Some(&old_id) = self.path_to_id.get(rel_path) {
+            self.remove_file_by_id(old_id);
+        }
+
+        let raw_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let file_id = raw_id | OVERLAY_BIT;
+
+        for &tri in &trigrams {
+            self.inverted.entry(tri).or_default().insert(file_id);
+        }
+
+        self.file_paths.insert(file_id, rel_path.to_string());
+        self.path_to_id.insert(rel_path.to_string(), file_id);
+        self.deleted_paths.remove(rel_path);
+        self.dirty_count += 1;
+    }
+
+    /// Mark a file as deleted.
+    pub fn delete_file(&mut self, rel_path: &str) {
+        if let Some(&file_id) = self.path_to_id.get(rel_path) {
+            self.remove_file_by_id(file_id);
+        }
+        self.deleted_paths.insert(rel_path.to_string());
+        self.dirty_count += 1;
+    }
+
+    /// Look up a trigram in the live overlay.
+    pub fn lookup_trigram(&self, trigram: u32) -> Vec<u32> {
+        self.inverted
+            .get(&trigram)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get file path for a live overlay file ID.
+    pub fn file_path(&self, file_id: u32) -> Option<&str> {
+        self.file_paths.get(&file_id).map(|s| s.as_str())
+    }
+
+    /// Check if a path has been deleted from the overlay.
+    pub fn is_deleted(&self, path: &str) -> bool {
+        self.deleted_paths.contains(path)
+    }
+
+    /// Check if the overlay has an active entry for this path.
+    pub fn has_path(&self, path: &str) -> bool {
+        self.path_to_id.contains_key(path)
+    }
+
+    /// Number of files in the overlay.
+    pub fn num_files(&self) -> usize {
+        self.file_paths.len()
+    }
+
+    /// Number of unique trigrams in the overlay.
+    pub fn num_trigrams(&self) -> usize {
+        self.inverted.len()
+    }
+
+    /// Number of mutations since last reset.
+    pub fn dirty_count(&self) -> u32 {
+        self.dirty_count
+    }
+
+    /// Reset the dirty counter (e.g., after saving).
+    pub fn reset_dirty_count(&mut self) {
+        self.dirty_count = 0;
+    }
+
+    /// Get all live file IDs.
+    pub fn all_file_ids(&self) -> Vec<u32> {
+        self.file_paths.keys().copied().collect()
+    }
+
+    /// Export all file paths in insertion order (by raw ID).
+    pub fn all_paths_ordered(&self) -> Vec<&str> {
+        let mut pairs: Vec<_> = self.file_paths.iter().collect();
+        pairs.sort_by_key(|&(&id, _)| id & !OVERLAY_BIT);
+        pairs.into_iter().map(|(_, p)| p.as_str()).collect()
+    }
+
+    /// Get a reference to the inverted index.
+    pub fn inverted_index(&self) -> &HashMap<u32, HashSet<u32>> {
+        &self.inverted
+    }
+
+    /// Check if a file ID belongs to the live overlay.
+    pub fn is_overlay_id(file_id: u32) -> bool {
+        file_id & OVERLAY_BIT != 0
+    }
+
+    /// Update the live index for a file on disk. Reads the file and upserts.
+    pub fn update_from_disk(&mut self, root: &Path, rel_path: &str) {
+        let full_path = root.join(rel_path);
+        match std::fs::read(&full_path) {
+            Ok(data) => {
+                if trigram::is_binary(&data) {
+                    self.delete_file(rel_path);
+                } else {
+                    self.upsert_file(rel_path, &data);
+                }
+            }
+            Err(_) => {
+                // File doesn't exist or can't be read → treat as deleted
+                self.delete_file(rel_path);
+            }
+        }
+    }
+
+    /// Fast clone of raw data for background checkpoint.
+    /// Only clones the HashMaps — no remapping or sorting. Very fast under lock.
+    pub fn clone_raw_data(&self) -> RawIndexSnapshot {
+        RawIndexSnapshot {
+            inverted: self.inverted.clone(),
+            file_paths: self.file_paths.clone(),
+        }
+    }
+
+    /// Snapshot the inverted index data for disk serialization.
+    /// Returns (ordered_paths, remapped_inverted_index) with sequential file IDs.
+    /// This is designed to be called under a brief read lock, then written to disk
+    /// without holding the lock.
+    pub fn snapshot_for_disk(&self) -> (Vec<String>, HashMap<u32, Vec<u32>>) {
+        Self::remap_snapshot(&self.inverted, &self.file_paths)
+    }
+
+    /// Remap raw data into disk-ready format (sequential IDs, sorted postings).
+    /// Can be called without holding any lock on the LiveIndex.
+    pub(crate) fn remap_snapshot(
+        inverted: &HashMap<u32, HashSet<u32>>,
+        file_paths: &HashMap<u32, String>,
+    ) -> (Vec<String>, HashMap<u32, Vec<u32>>) {
+        // Sort file paths by raw ID for deterministic ordering
+        let mut pairs: Vec<_> = file_paths.iter().collect();
+        pairs.sort_by_key(|&(&id, _)| id & !OVERLAY_BIT);
+        let paths: Vec<&str> = pairs.iter().map(|(_, p)| p.as_str()).collect();
+
+        let mut path_to_new_id: HashMap<&str, u32> = HashMap::new();
+        for (new_id, &path) in paths.iter().enumerate() {
+            path_to_new_id.insert(path, new_id as u32);
+        }
+
+        let mut remapped: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (&trigram, file_ids) in inverted {
+            let mut posting = Vec::new();
+            for &fid in file_ids {
+                if let Some(path) = file_paths.get(&fid)
+                    && let Some(&new_id) = path_to_new_id.get(path.as_str())
+                {
+                    posting.push(new_id);
+                }
+            }
+            if !posting.is_empty() {
+                posting.sort_unstable();
+                remapped.insert(trigram & !OVERLAY_BIT, posting);
+            }
+        }
+
+        let owned_paths: Vec<String> = paths.into_iter().map(|s| s.to_string()).collect();
+        (owned_paths, remapped)
+    }
+
+    fn remove_file_by_id(&mut self, file_id: u32) {
+        // Remove from inverted index
+        self.inverted.retain(|_, set| {
+            set.remove(&file_id);
+            !set.is_empty()
+        });
+        if let Some(path) = self.file_paths.remove(&file_id) {
+            self.path_to_id.remove(&path);
+        }
+    }
+}

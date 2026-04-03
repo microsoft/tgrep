@@ -1,0 +1,38 @@
+name: Benchmark (Linux/macOS)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Benchmark (${{ matrix.os }})
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ripgrep
+        run: cargo install ripgrep --locked
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Run benchmark
+        run: |
+          chmod +x scripts/benchmark.sh
+          ./scripts/benchmark.sh --skip-build --bench-dir /tmp/tgrep-bench --results benchmark-results.md
+
+      - name: Print results
+        run: cat benchmark-results.md
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.os }}
+          path: benchmark-results.md

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Pre-commit hook: runs cargo fmt --check and cargo clippy before each commit.
+# Install with: make hooks
+set -euo pipefail
+
+echo "pre-commit: checking formatting..."
+if ! cargo fmt --all -- --check; then
+    echo ""
+    echo "error: formatting check failed. Run 'cargo fmt --all' and retry."
+    exit 1
+fi
+
+echo "pre-commit: running clippy..."
+if ! cargo clippy --workspace -- -D warnings; then
+    echo ""
+    echo "error: clippy found warnings. Fix them and retry."
+    exit 1
+fi

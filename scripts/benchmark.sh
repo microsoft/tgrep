@@ -106,38 +106,110 @@ FILE_COUNT=$(git -C "$BENCH_REPO_DIR" ls-files | wc -l | tr -d ' ')
 echo "==> Building tgrep index..."
 "$TGREP_BIN" index "$BENCH_REPO_DIR" --index-path "$INDEX_PATH"
 
-# ── 30 search patterns (mix of literals, multi-word, and regex) ──
+# ── 102 search patterns (mix of literals, multi-word, and regex) ──
 QUERIES=(
   'mutex_lock'
+  'spin_lock_irqsave'
   'printk'
   'EXPORT_SYMBOL'
+  'MODULE_LICENSE'
   'kfree'
   'kmalloc'
   'BUG_ON'
+  'WARN_ON'
   'pr_err'
+  'pr_info'
+  'pr_warn'
+  'dev_err'
+  'dev_info'
+  'netdev_err'
+  'DEFINE_MUTEX'
+  'LIST_HEAD'
+  'atomic_read'
+  'atomic_set'
+  'rcu_read_lock'
+  'rcu_read_unlock'
+  'smp_wmb'
   'unlikely'
+  'likely'
   'IS_ERR'
+  'PTR_ERR'
+  'ERR_PTR'
   'container_of'
   'ARRAY_SIZE'
+  'BUILD_BUG_ON'
+  'static_assert'
   '__init'
+  '__exit'
   'module_init'
+  'module_exit'
   'platform_driver'
+  'pci_driver'
+  'usb_driver'
+  'i2c_driver'
+  'spi_driver'
+  'of_match_table'
+  'compatible'
   'struct device'
   'struct file'
+  'struct inode'
+  'struct mutex'
+  'struct spinlock'
+  'struct list_head'
+  'struct kobject'
+  'struct platform_device'
+  'struct pci_dev'
+  'struct net_device'
   'struct sk_buff'
+  'struct socket'
   'struct task_struct'
+  'struct mm_struct'
   'struct page'
+  'struct bio'
+  'struct request'
+  'struct dentry'
+  'struct super_block'
   'alloc_chrdev_region'
+  'cdev_init'
+  'class_create'
+  'device_create'
+  'sysfs_create_group'
+  'debugfs_create_dir'
   'proc_create'
+  'register_netdev'
+  'register_chrdev'
   'ioctl'
+  'mmap'
+  'poll'
   'read'
+  'write'
+  'open'
+  'release'
+  'probe'
+  'remove'
+  'suspend'
+  'resume'
   'TODO'
   'FIXME'
-  'SPDX-License-Identifier'
+  'HACK'
+  'XXX'
+  'deprecated'
   '^#include <linux/'
+  '^#include <asm/'
+  '^#include <net/'
   '^#define\s+[A-Z_]+'
+  '^\s*return -[A-Z]+;'
+  'enum\s+\{'
+  'union\s+\{'
+  'typedef\s+struct'
+  'goto\s+\w+;'
   'for_each_\w+'
+  '__attribute__\s*\(\('
   '#ifdef\s+CONFIG_'
+  '#if\s+defined'
+  'MODULE_AUTHOR'
+  'MODULE_DESCRIPTION'
+  'SPDX-License-Identifier'
 )
 
 QUERY_COUNT=${#QUERIES[@]}
@@ -208,23 +280,6 @@ else
   echo "ripgrep (rg) not found in PATH, skipping"
 fi
 
-# ── Benchmark: grep ──
-GREP_MS=-1
-if command -v grep >/dev/null 2>&1; then
-  echo ""
-  echo "==> Benchmarking grep..."
-  GREP_START=$(now_ns)
-  for pattern in "${QUERIES[@]}"; do
-    grep -r -n -E --binary-files=without-match \
-      --exclude-dir=.git --exclude-dir=.tgrep \
-      "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1 || true
-  done
-  GREP_END=$(now_ns)
-  GREP_MS=$(( (GREP_END - GREP_START) / 1000000 ))
-  echo "grep: ${GREP_MS}ms total"
-else
-  echo "grep not found in PATH, skipping"
-fi
 
 # ── Write results ──
 TGREP_AVG=$(awk "BEGIN { printf \"%.1f\", $TGREP_MS / $QUERY_COUNT }")
@@ -252,10 +307,6 @@ cat > "$RESULTS_PATH" <<EOF
 | --- | ---: | ---: |
 EOF
 
-if [ "$GREP_MS" -ge 0 ]; then
-  GREP_AVG=$(awk "BEGIN { printf \"%.1f\", $GREP_MS / $QUERY_COUNT }")
-  echo "| grep | $GREP_MS | $GREP_AVG |" >> "$RESULTS_PATH"
-fi
 if [ "$RG_MS" -ge 0 ]; then
   RG_AVG=$(awk "BEGIN { printf \"%.1f\", $RG_MS / $QUERY_COUNT }")
   echo "| ripgrep | $RG_MS | $RG_AVG |" >> "$RESULTS_PATH"

@@ -178,14 +178,31 @@ fi
 
 # ── Benchmark: tgrep (client → serve) ──
 echo ""
+log_mem() {
+  if [ -f /proc/meminfo ]; then
+    awk '/MemTotal|MemAvailable|MemFree|SwapTotal|SwapFree/ {printf "  %s %s\n", $1, $2" "$3}' /proc/meminfo
+  elif command -v vm_stat >/dev/null 2>&1; then
+    vm_stat | head -10
+  fi
+}
+
+echo "==> Memory before tgrep benchmark:"
+log_mem
+
 echo "==> Benchmarking tgrep (client -> serve)..."
 TGREP_START=$(now_ns)
+QIDX=0
 for pattern in "${QUERIES[@]}"; do
+  QIDX=$((QIDX + 1))
+  echo "  [$QIDX/$QUERY_COUNT] $pattern"
   "$TGREP_BIN" "$pattern" "$BENCH_REPO_DIR" --index-path "$INDEX_PATH" > /dev/null 2>&1 || true
 done
 TGREP_END=$(now_ns)
 TGREP_MS=$(( (TGREP_END - TGREP_START) / 1000000 ))
 echo "tgrep: ${TGREP_MS}ms total"
+
+echo "==> Memory after tgrep benchmark:"
+log_mem
 
 # ── Stop serve ──
 echo "==> Stopping tgrep serve..."

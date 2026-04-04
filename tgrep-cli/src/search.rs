@@ -357,7 +357,9 @@ fn search_local_index(
                 break;
             }
         } else if opts.files_without_match {
-            writer.write_file(&rel_path)?;
+            if !opts.quiet {
+                writer.write_file(&rel_path)?;
+            }
             had_matches = true;
             if opts.quiet {
                 break;
@@ -441,7 +443,9 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
                 break;
             }
         } else if opts.files_without_match {
-            writer.write_file(&rel_path)?;
+            if !opts.quiet {
+                writer.write_file(&rel_path)?;
+            }
             had_matches = true;
             if opts.quiet {
                 break;

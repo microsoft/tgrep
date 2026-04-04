@@ -215,11 +215,11 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
         .get("result")
         .ok_or_else(|| anyhow::anyhow!("no result in response"))?;
 
+    let empty_vec = Vec::new();
     let matches = result
         .get("matches")
         .and_then(|m| m.as_array())
-        .unwrap_or(&Vec::new())
-        .clone();
+        .unwrap_or(&empty_vec);
 
     let mut writer = OutputWriter::new(opts.make_output_config());
     let had_matches = !matches.is_empty();
@@ -231,7 +231,7 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
 
     if opts.files_only {
         let mut seen = std::collections::HashSet::new();
-        for m in &matches {
+        for m in matches {
             if let Some(file) = m.get("file").and_then(|f| f.as_str())
                 && seen.insert(file.to_string())
             {
@@ -240,7 +240,7 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
         }
     } else if opts.count {
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for m in &matches {
+        for m in matches {
             if let Some(file) = m.get("file").and_then(|f| f.as_str()) {
                 *counts.entry(file.to_string()).or_default() += 1;
             }
@@ -249,7 +249,7 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
             writer.write_count(file, *count)?;
         }
     } else {
-        for m in &matches {
+        for m in matches {
             let file = m.get("file").and_then(|f| f.as_str()).unwrap_or("");
             let line = m.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
             let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");

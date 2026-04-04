@@ -2,13 +2,15 @@
 ///
 /// Keeps the trigram index in memory (HybridIndex), watches for filesystem
 /// changes, and serves search/status queries over TCP.
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use lru::LruCache;
 
 use anyhow::Result;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -53,7 +55,7 @@ impl ServerInfo {
 
 struct ServerState {
     index: RwLock<HybridIndex>,
-    cache: RwLock<HashMap<String, Arc<String>>>,
+    cache: RwLock<LruCache<String, Arc<String>>>,
     root: PathBuf,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
@@ -115,7 +117,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, no_watch: bool) -> Result<()>
 
     let state = Arc::new(ServerState {
         index: RwLock::new(hybrid),
-        cache: RwLock::new(HashMap::new()),
+        cache: RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap())),
         root: root.clone(),
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
@@ -382,25 +384,18 @@ fn handle_search(
     }; // index lock released here
     let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
 
-    // Resolve file contents from cache (read lock) or disk
+    // Resolve file contents from cache (LRU) or disk
     let t_resolve = Instant::now();
     let candidate_contents: Vec<(String, Arc<String>)> = candidate_info
         .iter()
         .filter_map(|(rel_path, full_path)| {
-            let hit = {
-                let cache = state.cache.read().unwrap();
-                cache.get(rel_path).map(Arc::clone)
-            };
-            let content = if let Some(cached) = hit {
-                cached
+            let mut cache = state.cache.write().unwrap();
+            let content = if let Some(cached) = cache.get(rel_path) {
+                Arc::clone(cached)
             } else {
                 let c = std::fs::read_to_string(full_path).ok()?;
                 let arc = Arc::new(c);
-                let mut cache = state.cache.write().unwrap();
-                if cache.len() >= CACHE_CAPACITY {
-                    cache.clear();
-                }
-                cache.insert(rel_path.clone(), Arc::clone(&arc));
+                cache.put(rel_path.clone(), Arc::clone(&arc));
                 arc
             };
             Some((rel_path.clone(), content))
@@ -675,7 +670,7 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
 
         // Invalidate cache for this path
         if let Ok(mut cache) = state.cache.write() {
-            cache.remove(&rel_path);
+            cache.pop(&rel_path);
         }
     }
 }

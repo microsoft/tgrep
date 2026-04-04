@@ -175,11 +175,10 @@ where
             result.sort_unstable();
             result.dedup();
 
-            for list in &lists {
-                let mut set: Vec<u32> = list.clone();
-                set.sort_unstable();
-                set.dedup();
-                result = intersect_sorted(&result, &set);
+            for mut list in lists {
+                list.sort_unstable();
+                list.dedup();
+                result = intersect_sorted(&result, &list);
                 if result.is_empty() {
                     break;
                 }

@@ -12,8 +12,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+QUERIES_FILE=""
 REPO_PATH=""
-REPO_URL="https://github.com/torvalds/linux.git"
+REPO_URL=""
 BENCH_DIR="/tmp/tgrep-bench"
 TGREP_BIN=""
 RESULTS_PATH=""
@@ -22,6 +23,7 @@ SKIP_BUILD=false
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --queries)     QUERIES_FILE="$2"; shift 2 ;;
     --repo-path)   REPO_PATH="$2"; shift 2 ;;
     --repo-url)    REPO_URL="$2"; shift 2 ;;
     --bench-dir)   BENCH_DIR="$2"; shift 2 ;;
@@ -32,8 +34,10 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: $(basename "$0") [OPTIONS]"
       echo ""
       echo "Options:"
+      echo "  --queries   PATH   JSON file with repo_url and queries array"
+      echo "                     (default: scripts/benchmark-queries.json)"
       echo "  --repo-path PATH   Existing repo to benchmark (skips cloning)"
-      echo "  --repo-url  URL    URL to clone for benchmarking (default: torvalds/linux)"
+      echo "  --repo-url  URL    URL to clone (overrides value from queries JSON)"
       echo "  --bench-dir DIR    Working directory for artifacts (default: /tmp/tgrep-bench)"
       echo "  --tgrep-bin PATH   Path to tgrep binary (default: target/release/tgrep)"
       echo "  --results   PATH   Output path for results markdown"
@@ -45,6 +49,41 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Resolve paths ──
+if [ -z "$QUERIES_FILE" ]; then
+  QUERIES_FILE="$SCRIPT_DIR/benchmark-queries.json"
+fi
+if [ ! -f "$QUERIES_FILE" ]; then
+  echo "error: queries file not found: $QUERIES_FILE" >&2
+  exit 1
+fi
+
+# ── Load queries JSON ──
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "error: python3 is required to parse the queries JSON file" >&2
+  exit 1
+fi
+
+if [ -z "$REPO_URL" ]; then
+  REPO_URL=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['repo_url'])" "$QUERIES_FILE")
+fi
+if [ -z "$REPO_URL" ]; then
+  echo "error: no repo_url specified (set in queries JSON or pass --repo-url)" >&2
+  exit 1
+fi
+
+# Read queries into a bash array
+mapfile -t QUERIES < <(python3 -c "
+import json, sys
+data = json.load(open(sys.argv[1]))
+for q in data['queries']:
+    print(q)
+" "$QUERIES_FILE")
+
+if [ ${#QUERIES[@]} -eq 0 ]; then
+  echo "error: no queries found in $QUERIES_FILE" >&2
+  exit 1
+fi
+
 if [ -z "$TGREP_BIN" ]; then
   TGREP_BIN="$REPO_ROOT/target/release/tgrep"
 fi
@@ -109,112 +148,6 @@ INDEX_START=$(now_ns)
 INDEX_END=$(now_ns)
 INDEX_MS=$(( (INDEX_END - INDEX_START) / 1000000 ))
 echo "Index built in ${INDEX_MS}ms"
-
-# ── 102 search patterns (mix of literals, multi-word, and regex) ──
-QUERIES=(
-  'mutex_lock'
-  'spin_lock_irqsave'
-  'printk'
-  'EXPORT_SYMBOL'
-  'MODULE_LICENSE'
-  'kfree'
-  'kmalloc'
-  'BUG_ON'
-  'WARN_ON'
-  'pr_err'
-  'pr_info'
-  'pr_warn'
-  'dev_err'
-  'dev_info'
-  'netdev_err'
-  'DEFINE_MUTEX'
-  'LIST_HEAD'
-  'atomic_read'
-  'atomic_set'
-  'rcu_read_lock'
-  'rcu_read_unlock'
-  'smp_wmb'
-  'unlikely'
-  'likely'
-  'IS_ERR'
-  'PTR_ERR'
-  'ERR_PTR'
-  'container_of'
-  'ARRAY_SIZE'
-  'BUILD_BUG_ON'
-  'static_assert'
-  '__init'
-  '__exit'
-  'module_init'
-  'module_exit'
-  'platform_driver'
-  'pci_driver'
-  'usb_driver'
-  'i2c_driver'
-  'spi_driver'
-  'of_match_table'
-  'compatible'
-  'struct device'
-  'struct file'
-  'struct inode'
-  'struct mutex'
-  'struct spinlock'
-  'struct list_head'
-  'struct kobject'
-  'struct platform_device'
-  'struct pci_dev'
-  'struct net_device'
-  'struct sk_buff'
-  'struct socket'
-  'struct task_struct'
-  'struct mm_struct'
-  'struct page'
-  'struct bio'
-  'struct request'
-  'struct dentry'
-  'struct super_block'
-  'alloc_chrdev_region'
-  'cdev_init'
-  'class_create'
-  'device_create'
-  'sysfs_create_group'
-  'debugfs_create_dir'
-  'proc_create'
-  'register_netdev'
-  'register_chrdev'
-  'ioctl'
-  'mmap'
-  'poll'
-  'read'
-  'write'
-  'open'
-  'release'
-  'probe'
-  'remove'
-  'suspend'
-  'resume'
-  'TODO'
-  'FIXME'
-  'HACK'
-  'XXX'
-  'deprecated'
-  '^#include <linux/'
-  '^#include <asm/'
-  '^#include <net/'
-  '^#define\s+[A-Z_]+'
-  '^\s*return -[A-Z]+;'
-  'enum\s+\{'
-  'union\s+\{'
-  'typedef\s+struct'
-  'goto\s+\w+;'
-  'for_each_\w+'
-  '__attribute__\s*\(\('
-  '#ifdef\s+CONFIG_'
-  '#if\s+defined'
-  'MODULE_AUTHOR'
-  'MODULE_DESCRIPTION'
-  'SPDX-License-Identifier'
-)
 
 QUERY_COUNT=${#QUERIES[@]}
 echo "==> Running $QUERY_COUNT queries against $FILE_COUNT files"

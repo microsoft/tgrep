@@ -1,0 +1,44 @@
+name: Benchmark Chromium (Linux/macOS)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Benchmark Chromium (${{ matrix.os }})
+    timeout-minutes: 180
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ripgrep
+        run: cargo install ripgrep --locked
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h
+
+      - name: Run benchmark
+        run: |
+          chmod +x scripts/benchmark.sh
+          ./scripts/benchmark.sh --queries scripts/benchmark-queries-chromium.json --skip-build --bench-dir /tmp/tgrep-bench --results benchmark-results.md
+
+      - name: Print results
+        run: cat benchmark-results.md
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-chromium-${{ matrix.os }}
+          path: benchmark-results.md

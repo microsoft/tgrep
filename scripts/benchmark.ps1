@@ -2,12 +2,15 @@
 .SYNOPSIS
     Benchmark tgrep vs ripgrep on Windows.
 .DESCRIPTION
-    Runs a 100-query search benchmark comparing tgrep (client/server) against ripgrep.
-    By default, clones the Linux kernel (shallow) as the benchmark target.
+    Runs a search benchmark comparing tgrep (client/server) against ripgrep.
+    Queries and the default repo URL are loaded from a JSON file.
+.PARAMETER QueriesFile
+    Path to a JSON file containing "repo_url" and "queries" array.
+    Defaults to scripts\benchmark-queries.json next to this script.
 .PARAMETER RepoPath
     Path to an existing repository to benchmark against. When set, skips cloning.
 .PARAMETER RepoUrl
-    URL to clone for benchmarking (ignored when RepoPath is set).
+    URL to clone for benchmarking. Overrides the value from QueriesFile.
 .PARAMETER BenchDir
     Working directory for benchmark artifacts (index, results, cloned repo).
 .PARAMETER TgrepBin
@@ -20,12 +23,13 @@
     .\scripts\benchmark.ps1
     # Builds tgrep, clones Linux kernel, runs full benchmark.
 .EXAMPLE
-    .\scripts\benchmark.ps1 -RepoPath C:\src\myrepo -SkipBuild
-    # Benchmarks against an existing repo using a pre-built binary.
+    .\scripts\benchmark.ps1 -QueriesFile my-queries.json -RepoPath C:\src\myrepo -SkipBuild
+    # Benchmarks with custom queries against an existing repo.
 #>
 param(
+    [string]$QueriesFile = '',
     [string]$RepoPath = '',
-    [string]$RepoUrl = 'https://github.com/torvalds/linux.git',
+    [string]$RepoUrl = '',
     [string]$BenchDir = (Join-Path $env:TEMP 'tgrep-bench'),
     [string]$TgrepBin = '',
     [string]$ResultsPath = '',
@@ -37,6 +41,26 @@ $ErrorActionPreference = 'Stop'
 # ── Resolve paths ──
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot  = Split-Path -Parent $ScriptDir
+
+# ── Load queries JSON ──
+if (-not $QueriesFile) {
+    $QueriesFile = Join-Path $ScriptDir 'benchmark-queries.json'
+}
+if (-not (Test-Path $QueriesFile)) {
+    throw "Queries file not found: $QueriesFile"
+}
+$benchConfig = Get-Content $QueriesFile -Raw | ConvertFrom-Json
+$Queries = @($benchConfig.queries)
+if ($Queries.Count -eq 0) {
+    throw "No queries found in $QueriesFile"
+}
+
+if (-not $RepoUrl) {
+    $RepoUrl = $benchConfig.repo_url
+}
+if (-not $RepoUrl) {
+    throw "No repo_url specified (set in queries JSON or pass -RepoUrl)"
+}
 
 if (-not $TgrepBin) {
     $TgrepBin = Join-Path $RepoRoot 'target\release\tgrep.exe'
@@ -96,112 +120,6 @@ if ($LASTEXITCODE -ne 0) { throw 'tgrep index failed' }
 $indexSw.Stop()
 $indexMs = $indexSw.ElapsedMilliseconds
 Write-Host "Index built in ${indexMs}ms" -ForegroundColor Green
-
-# ── 102 search patterns (mix of literals, multi-word, and regex) ──
-$Queries = @(
-    'mutex_lock'
-    'spin_lock_irqsave'
-    'printk'
-    'EXPORT_SYMBOL'
-    'MODULE_LICENSE'
-    'kfree'
-    'kmalloc'
-    'BUG_ON'
-    'WARN_ON'
-    'pr_err'
-    'pr_info'
-    'pr_warn'
-    'dev_err'
-    'dev_info'
-    'netdev_err'
-    'DEFINE_MUTEX'
-    'LIST_HEAD'
-    'atomic_read'
-    'atomic_set'
-    'rcu_read_lock'
-    'rcu_read_unlock'
-    'smp_wmb'
-    'unlikely'
-    'likely'
-    'IS_ERR'
-    'PTR_ERR'
-    'ERR_PTR'
-    'container_of'
-    'ARRAY_SIZE'
-    'BUILD_BUG_ON'
-    'static_assert'
-    '__init'
-    '__exit'
-    'module_init'
-    'module_exit'
-    'platform_driver'
-    'pci_driver'
-    'usb_driver'
-    'i2c_driver'
-    'spi_driver'
-    'of_match_table'
-    'compatible'
-    'struct device'
-    'struct file'
-    'struct inode'
-    'struct mutex'
-    'struct spinlock'
-    'struct list_head'
-    'struct kobject'
-    'struct platform_device'
-    'struct pci_dev'
-    'struct net_device'
-    'struct sk_buff'
-    'struct socket'
-    'struct task_struct'
-    'struct mm_struct'
-    'struct page'
-    'struct bio'
-    'struct request'
-    'struct dentry'
-    'struct super_block'
-    'alloc_chrdev_region'
-    'cdev_init'
-    'class_create'
-    'device_create'
-    'sysfs_create_group'
-    'debugfs_create_dir'
-    'proc_create'
-    'register_netdev'
-    'register_chrdev'
-    'ioctl'
-    'mmap'
-    'poll'
-    'read'
-    'write'
-    'open'
-    'release'
-    'probe'
-    'remove'
-    'suspend'
-    'resume'
-    'TODO'
-    'FIXME'
-    'HACK'
-    'XXX'
-    'deprecated'
-    '^#include <linux/'
-    '^#include <asm/'
-    '^#include <net/'
-    '^#define\s+[A-Z_]+'
-    '^\s*return -[A-Z]+;'
-    'enum\s+\{'
-    'union\s+\{'
-    'typedef\s+struct'
-    'goto\s+\w+;'
-    'for_each_\w+'
-    '__attribute__\s*\(\('
-    '#ifdef\s+CONFIG_'
-    '#if\s+defined'
-    'MODULE_AUTHOR'
-    'MODULE_DESCRIPTION'
-    'SPDX-License-Identifier'
-)
 
 $QueryCount = $Queries.Count
 Write-Host "==> Running $QueryCount queries against $FileCount files" -ForegroundColor Cyan

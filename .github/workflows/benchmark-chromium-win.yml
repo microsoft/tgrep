@@ -1,0 +1,36 @@
+name: Benchmark Chromium (Windows)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Benchmark Chromium (Windows)
+    timeout-minutes: 180
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ripgrep
+        run: cargo install ripgrep --locked
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Run benchmark
+        shell: pwsh
+        run: |
+          .\scripts\benchmark.ps1 -QueriesFile scripts\benchmark-queries-chromium.json -SkipBuild -BenchDir $env:RUNNER_TEMP\tgrep-bench -ResultsPath benchmark-results.md
+
+      - name: Print results
+        shell: pwsh
+        run: Get-Content benchmark-results.md
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-chromium-windows
+          path: benchmark-results.md

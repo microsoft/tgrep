@@ -263,10 +263,15 @@ fn handle_search(
         .get("max_count")
         .and_then(|m| m.as_u64())
         .map(|m| m as usize);
-    let glob_filter = params
+    let glob_filters: Vec<String> = params
         .get("glob")
-        .and_then(|g| g.as_str())
-        .map(|s| s.to_string());
+        .and_then(|g| g.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
     let file_type = params
         .get("file_type")
         .and_then(|t| t.as_str())
@@ -365,8 +370,8 @@ fn handle_search(
                 {
                     return None;
                 }
-                if let Some(ref glob) = glob_filter
-                    && !simple_glob_match(glob, &rel_path)
+                if !glob_filters.is_empty()
+                    && !glob_filters.iter().any(|g| simple_glob_match(g, &rel_path))
                 {
                     return None;
                 }

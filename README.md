@@ -97,6 +97,7 @@ tgrep "pattern" . -w              # whole word
 tgrep "pattern" . -v              # invert match
 tgrep "pattern" . -m 5            # max 5 matches per file
 tgrep "pattern" . -g "*.rs"       # glob filter
+tgrep "pattern" . -g "*.rs" -g "*.toml"  # multiple globs (OR)
 tgrep "pattern" . -t rust         # type filter
 tgrep "pattern" . -e "also_this"  # multiple patterns
 tgrep "pattern" . -A 3            # 3 lines after match
@@ -107,6 +108,10 @@ tgrep "pattern" . --vimgrep       # vim-compatible output
 tgrep "pattern" . --stats         # show query plan & timing
 tgrep "pattern" . --no-index      # brute-force (skip index)
 tgrep "pattern" . -U              # multiline matching
+tgrep "pattern" . -q              # quiet: exit code only
+tgrep "pattern" . -L              # files that DON'T match
+tgrep "pattern" . --no-filename   # suppress filenames
+tgrep "pattern" . -N              # suppress line numbers
 tgrep --files .                   # list searchable files
 tgrep --files -t rust .           # list Rust files only
 tgrep --type-list                 # show all file types
@@ -143,10 +148,13 @@ Server status for /src/my-monorepo
 | `-f, --file <FILE>` | Read patterns from file (one per line) |
 | `-U, --multiline` | Enable multiline matching |
 | `-n, --line-number` | Show line numbers (default: on) |
+| `-N, --no-line-number` | Suppress line numbers |
 | `-c, --count` | Print match count per file |
 | `-l, --files-with-matches` | Print only filenames |
+| `-L, --files-without-match` | Print files that do NOT match |
+| `-q, --quiet` | Suppress output; exit code only |
 | `-m, --max-count <N>` | Limit matches per file |
-| `-g, --glob <GLOB>` | Filter files by glob pattern |
+| `-g, --glob <GLOB>` | Filter files by glob pattern (repeatable) |
 | `-t, --type <TYPE>` | Filter by file type (`rust`, `py`, `js`, …) |
 | `--type-list` | Print all supported file types |
 | `--files` | List files that would be searched |
@@ -154,6 +162,8 @@ Server status for /src/my-monorepo
 | `-B, --before-context <N>` | Lines of context before match |
 | `-C, --context <N>` | Lines of context before and after |
 | `--heading / --no-heading` | Grouped vs flat output |
+| `-H, --with-filename` | Show filenames (default: on) |
+| `--no-filename` | Suppress filenames in output |
 | `--json` | JSON output (one object per line) |
 | `--vimgrep` | Vim-compatible `file:line:col:content` |
 | `--color auto/always/never` | Color mode control |

@@ -73,6 +73,10 @@ struct Cli {
     #[arg(short = 'l', long = "files-with-matches", global = true)]
     files_only: bool,
 
+    /// Print files that do NOT match the pattern.
+    #[arg(short = 'L', long = "files-without-match", global = true)]
+    files_without_match: bool,
+
     /// Print match count per file.
     #[arg(short = 'c', long = "count", global = true)]
     count: bool,
@@ -89,10 +93,14 @@ struct Cli {
     #[arg(long = "files", global = true)]
     list_files: bool,
 
+    /// Suppress all output; exit code only (0 = match found, 1 = no match).
+    #[arg(short = 'q', long = "quiet", global = true)]
+    quiet: bool,
+
     // ── Filtering ────────────────────────────────────
-    /// Filter files by glob pattern.
-    #[arg(short = 'g', long = "glob", global = true)]
-    glob: Option<String>,
+    /// Filter files by glob pattern (can be specified multiple times).
+    #[arg(short = 'g', long = "glob", global = true, action = clap::ArgAction::Append)]
+    glob: Vec<String>,
 
     /// Filter files by type (e.g., rust, py, js). Use --type-list to see all.
     #[arg(short = 't', long = "type", global = true)]
@@ -114,6 +122,22 @@ struct Cli {
     /// Lines of context before and after each match.
     #[arg(short = 'C', long = "context", global = true)]
     context: Option<usize>,
+
+    /// Print the file name for each match (default behavior, ripgrep compatibility).
+    #[arg(short = 'H', long = "with-filename", global = true)]
+    with_filename: bool,
+
+    /// Suppress filenames in output.
+    #[arg(long = "no-filename", global = true)]
+    no_filename: bool,
+
+    /// Show line numbers (default behavior, ripgrep compatibility).
+    #[arg(short = 'n', long = "line-number", global = true)]
+    line_number: bool,
+
+    /// Suppress line numbers in output.
+    #[arg(short = 'N', long = "no-line-number", global = true)]
+    no_line_number: bool,
 
     // ── Output formatting ────────────────────────────
     /// Group matches by file with heading.
@@ -234,6 +258,7 @@ impl Cli {
             smart_case: self.smart_case,
             fixed_string: self.fixed_strings,
             files_only: self.files_only,
+            files_without_match: self.files_without_match,
             count: self.count,
             word_boundary: self.word_regexp,
             max_count: self.max_count,
@@ -255,6 +280,9 @@ impl Cli {
             multiline: self.multiline,
             no_ignore,
             hidden,
+            quiet: self.quiet,
+            no_filename: self.no_filename,
+            no_line_number: self.no_line_number,
         }
     }
 }

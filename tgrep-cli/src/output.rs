@@ -54,6 +54,8 @@ pub struct OutputConfig {
     pub heading: Option<bool>,
     pub null: bool,
     pub trim: bool,
+    pub no_filename: bool,
+    pub no_line_number: bool,
 }
 
 impl OutputConfig {
@@ -68,6 +70,8 @@ impl OutputConfig {
         color: ColorMode,
         null: bool,
         trim: bool,
+        no_filename: bool,
+        no_line_number: bool,
     ) -> Self {
         let format = if json {
             OutputFormat::Json
@@ -87,6 +91,8 @@ impl OutputConfig {
             heading,
             null,
             trim,
+            no_filename,
+            no_line_number,
         }
     }
 }
@@ -151,16 +157,29 @@ impl OutputWriter {
                 writeln!(self.stdout, "{json}")?;
             }
             _ => {
-                self.ensure_heading(&ctx.file)?;
+                if !self.config.no_filename {
+                    self.ensure_heading(&ctx.file)?;
+                }
                 let content = self.maybe_trim(&ctx.content);
-                if self.use_heading {
-                    if self.use_color {
+                if self.use_heading && !self.config.no_filename {
+                    if self.config.no_line_number {
+                        writeln!(self.stdout, "{content}")?;
+                    } else if self.use_color {
                         writeln!(self.stdout, "\x1b[32m{}\x1b[0m-{content}", ctx.line_number)?;
                     } else {
                         writeln!(self.stdout, "{}-{content}", ctx.line_number)?;
                     }
                 } else {
-                    writeln!(self.stdout, "{}-{}-{content}", ctx.file, ctx.line_number)?;
+                    let show_file = !self.config.no_filename;
+                    let show_line = !self.config.no_line_number;
+                    match (show_file, show_line) {
+                        (true, true) => {
+                            writeln!(self.stdout, "{}-{}-{content}", ctx.file, ctx.line_number)?
+                        }
+                        (true, false) => writeln!(self.stdout, "{}-{content}", ctx.file)?,
+                        (false, true) => writeln!(self.stdout, "{}-{content}", ctx.line_number)?,
+                        (false, false) => writeln!(self.stdout, "{content}")?,
+                    }
                 }
             }
         }
@@ -172,15 +191,28 @@ impl OutputWriter {
         let content = self.maybe_trim(&m.content);
         match self.config.format {
             OutputFormat::Heading | OutputFormat::Flat => {
-                self.ensure_heading(&m.file)?;
-                if self.use_heading {
-                    if self.use_color {
+                if !self.config.no_filename {
+                    self.ensure_heading(&m.file)?;
+                }
+                if self.use_heading && !self.config.no_filename {
+                    if self.config.no_line_number {
+                        writeln!(self.stdout, "{content}")?;
+                    } else if self.use_color {
                         writeln!(self.stdout, "\x1b[32m{}\x1b[0m:{content}", m.line_number)?;
                     } else {
                         writeln!(self.stdout, "{}:{content}", m.line_number)?;
                     }
                 } else {
-                    writeln!(self.stdout, "{}:{}:{content}", m.file, m.line_number)?;
+                    let show_file = !self.config.no_filename;
+                    let show_line = !self.config.no_line_number;
+                    match (show_file, show_line) {
+                        (true, true) => {
+                            writeln!(self.stdout, "{}:{}:{content}", m.file, m.line_number)?
+                        }
+                        (true, false) => writeln!(self.stdout, "{}:{content}", m.file)?,
+                        (false, true) => writeln!(self.stdout, "{}:{content}", m.line_number)?,
+                        (false, false) => writeln!(self.stdout, "{content}")?,
+                    }
                 }
             }
             OutputFormat::Vimgrep => {
@@ -215,7 +247,11 @@ impl OutputWriter {
     }
 
     pub fn write_count(&mut self, file: &str, count: usize) -> io::Result<()> {
-        writeln!(self.stdout, "{file}:{count}")?;
+        if self.config.no_filename {
+            writeln!(self.stdout, "{count}")?;
+        } else {
+            writeln!(self.stdout, "{file}:{count}")?;
+        }
         Ok(())
     }
 

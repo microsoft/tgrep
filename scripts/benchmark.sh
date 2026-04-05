@@ -225,16 +225,41 @@ cleanup_serve
 
 # ── Benchmark: ripgrep ──
 RG_MS=-1
+RG_TIMEOUTS=0
+RG_TIMEOUT_SEC=10
 if command -v rg >/dev/null 2>&1; then
+  # Detect timeout command (macOS needs gtimeout from coreutils)
+  TIMEOUT_CMD=""
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+  fi
+
   echo ""
-  echo "==> Benchmarking ripgrep..."
+  echo "==> Benchmarking ripgrep (${RG_TIMEOUT_SEC}s timeout per query)..."
   RG_START=$(now_ns)
+  QIDX=0
   for pattern in "${QUERIES[@]}"; do
-    rg -n "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1 || true
+    QIDX=$((QIDX + 1))
+    echo "  [$QIDX/$QUERY_COUNT] $pattern"
+    if [ -n "$TIMEOUT_CMD" ]; then
+      $TIMEOUT_CMD "$RG_TIMEOUT_SEC" rg -n "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1
+      rc=$?
+      if [ $rc -eq 124 ]; then
+        echo "    ⚠ timed out (${RG_TIMEOUT_SEC}s)"
+        RG_TIMEOUTS=$((RG_TIMEOUTS + 1))
+      fi
+    else
+      rg -n "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1 || true
+    fi
   done
   RG_END=$(now_ns)
   RG_MS=$(( (RG_END - RG_START) / 1000000 ))
   echo "ripgrep: ${RG_MS}ms total"
+  if [ $RG_TIMEOUTS -gt 0 ]; then
+    echo "ripgrep: $RG_TIMEOUTS/$QUERY_COUNT queries timed out (${RG_TIMEOUT_SEC}s limit)"
+  fi
 else
   echo "ripgrep (rg) not found in PATH, skipping"
 fi
@@ -278,15 +303,15 @@ cat > "$RESULTS_PATH" <<EOF
 - **Scope**: search only (index built before timing)
 - **tgrep mode**: client/server — \`tgrep serve\` runs in background, \`tgrep\` client connects via TCP
 
-| Tool | Total (ms) | Avg per query (ms) |
-| --- | ---: | ---: |
+| Tool | Total (ms) | Avg per query (ms) | Timeouts (${RG_TIMEOUT_SEC}s) |
+| --- | ---: | ---: | ---: |
 EOF
 
 if [ "$RG_MS" -ge 0 ]; then
   RG_AVG=$(awk "BEGIN { printf \"%.1f\", $RG_MS / $QUERY_COUNT }")
-  echo "| ripgrep | $RG_MS | $RG_AVG |" >> "$RESULTS_PATH"
+  echo "| ripgrep | $RG_MS | $RG_AVG | $RG_TIMEOUTS |" >> "$RESULTS_PATH"
 fi
-echo "| tgrep (client → serve) | $TGREP_MS | $TGREP_AVG |" >> "$RESULTS_PATH"
+echo "| tgrep (client → serve) | $TGREP_MS | $TGREP_AVG | - |" >> "$RESULTS_PATH"
 
 echo ""
 cat "$RESULTS_PATH"

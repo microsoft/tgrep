@@ -183,17 +183,42 @@ try {
 # ── Benchmark: ripgrep ──
 $rgCmd = Get-Command rg -ErrorAction SilentlyContinue
 $rgMs = -1
+$rgTimeouts = 0
+$rgTimeoutMs = 10000
+$rgTimeoutSec = $rgTimeoutMs / 1000
 if ($rgCmd) {
-    Write-Host "`n==> Benchmarking ripgrep..." -ForegroundColor Cyan
-    $ErrorActionPreference = 'Continue'
+    Write-Host "`n==> Benchmarking ripgrep (${rgTimeoutSec}s timeout per query)..." -ForegroundColor Cyan
+    $rgOutTmp = Join-Path $BenchDir 'rg-stdout.tmp'
+    $rgErrTmp = Join-Path $BenchDir 'rg-stderr.tmp'
+    New-Item -ItemType Directory -Path $BenchDir -Force | Out-Null
     $rgSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $qIdx = 0
     foreach ($q in $Queries) {
-        & rg -n $q $BenchRepoDir *>$null
+        $qIdx++
+        Write-Host "  [$qIdx/$QueryCount] $q"
+        $safeQ = $q -replace '"', '\"'
+        $safePath = $BenchRepoDir -replace '"', '\"'
+        $rgProc = Start-Process -FilePath $rgCmd.Source `
+            -ArgumentList "-n -- `"$safeQ`" `"$safePath`"" `
+            -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $rgOutTmp `
+            -RedirectStandardError $rgErrTmp
+        $finished = $rgProc.WaitForExit($rgTimeoutMs)
+        if (-not $finished) {
+            try { $rgProc.Kill() } catch {}
+            try { $rgProc.WaitForExit(2000) | Out-Null } catch {}
+            $rgTimeouts++
+            Write-Host "    timed out (${rgTimeoutSec}s)" -ForegroundColor Yellow
+        }
     }
     $rgSw.Stop()
-    $ErrorActionPreference = $savedEAP
+    Remove-Item -Path $rgOutTmp -ErrorAction SilentlyContinue
+    Remove-Item -Path $rgErrTmp -ErrorAction SilentlyContinue
     $rgMs = $rgSw.ElapsedMilliseconds
     Write-Host "ripgrep: ${rgMs}ms total" -ForegroundColor Green
+    if ($rgTimeouts -gt 0) {
+        Write-Host "ripgrep: $rgTimeouts/$QueryCount queries timed out (${rgTimeoutSec}s limit)" -ForegroundColor Yellow
+    }
 } else {
     Write-Host 'ripgrep (rg) not found in PATH, skipping' -ForegroundColor Yellow
 }
@@ -233,13 +258,13 @@ $sb = [System.Text.StringBuilder]::new()
 [void]$sb.AppendLine('- **Scope**: search only (index built before timing)')
 [void]$sb.AppendLine('- **tgrep mode**: client/server — `tgrep serve` runs in background, `tgrep` client connects via TCP')
 [void]$sb.AppendLine()
-[void]$sb.AppendLine('| Tool | Total (ms) | Avg per query (ms) |')
-[void]$sb.AppendLine('| --- | ---: | ---: |')
+[void]$sb.AppendLine("| Tool | Total (ms) | Avg per query (ms) | Timeouts (${rgTimeoutSec}s) |")
+[void]$sb.AppendLine('| --- | ---: | ---: | ---: |')
 if ($rgMs -ge 0) {
     $rgAvg = [math]::Round($rgMs / $QueryCount, 1)
-    [void]$sb.AppendLine(('| ripgrep | {0} | {1} |' -f $rgMs, $rgAvg))
+    [void]$sb.AppendLine(('| ripgrep | {0} | {1} | {2} |' -f $rgMs, $rgAvg, $rgTimeouts))
 }
-[void]$sb.AppendLine(('| tgrep (client -> serve) | {0} | {1} |' -f $tgrepMs, $tgrepAvg))
+[void]$sb.AppendLine(('| tgrep (client -> serve) | {0} | {1} | - |' -f $tgrepMs, $tgrepAvg))
 
 $results = $sb.ToString()
 

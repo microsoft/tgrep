@@ -14,13 +14,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install ripgrep
+        run: cargo install ripgrep --locked
+
       - name: Build release
         run: cargo build --release
 
       - name: Run benchmark
         shell: pwsh
         run: |
-          .\scripts\benchmark.ps1 -QueriesFile scripts\benchmark-queries-chromium.json -SkipBuild -SkipRipgrep -BenchDir $env:RUNNER_TEMP\tgrep-bench -ResultsPath benchmark-results.md
+          .\scripts\benchmark.ps1 -QueriesFile scripts\benchmark-queries-chromium.json -SkipBuild -BenchDir $env:RUNNER_TEMP\tgrep-bench -ResultsPath benchmark-results.md
 
       - name: Print results
         shell: pwsh

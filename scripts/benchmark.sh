@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
-# Benchmark tgrep vs ripgrep vs grep on Linux/macOS.
+# Benchmark tgrep vs ripgrep on Linux/macOS.
+#
+# Uses `tgrep serve` for memory-efficient background indexing, then polls
+# `tgrep status` until the index is complete before running queries.
 #
 # Usage:
 #   ./scripts/benchmark.sh                                    # full run
@@ -19,7 +22,6 @@ BENCH_DIR="/tmp/tgrep-bench"
 TGREP_BIN=""
 RESULTS_PATH=""
 SKIP_BUILD=false
-SKIP_RG=false
 
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
@@ -31,7 +33,6 @@ while [[ $# -gt 0 ]]; do
     --tgrep-bin)   TGREP_BIN="$2"; shift 2 ;;
     --results)     RESULTS_PATH="$2"; shift 2 ;;
     --skip-build)  SKIP_BUILD=true; shift ;;
-    --skip-rg)     SKIP_RG=true; shift ;;
     -h|--help)
       echo "Usage: $(basename "$0") [OPTIONS]"
       echo ""
@@ -44,7 +45,6 @@ while [[ $# -gt 0 ]]; do
       echo "  --tgrep-bin PATH   Path to tgrep binary (default: target/release/tgrep)"
       echo "  --results   PATH   Output path for results markdown"
       echo "  --skip-build       Skip building tgrep from source"
-      echo "  --skip-rg          Skip the ripgrep comparison"
       exit 0
       ;;
     *) echo "Unknown option: $1 (use --help for usage)" >&2; exit 1 ;;
@@ -74,8 +74,11 @@ if [ -z "$REPO_URL" ]; then
   exit 1
 fi
 
-# Read queries into a bash array
-mapfile -t QUERIES < <(python3 -c "
+# Read queries into a shell array (compatible with bash 3 / macOS)
+QUERIES=()
+while IFS= read -r line; do
+  QUERIES+=("$line")
+done < <(python3 -c "
 import json, sys
 data = json.load(open(sys.argv[1]))
 for q in data['queries']:
@@ -99,7 +102,9 @@ INDEX_PATH="$BENCH_DIR/tgrep-index"
 if [ -n "$REPO_PATH" ]; then
   BENCH_REPO_DIR="$REPO_PATH"
 else
-  BENCH_REPO_DIR="$BENCH_DIR/linux"
+  # Derive clone directory name from repo URL (e.g. linux, chromium)
+  CLONE_NAME=$(basename "$REPO_URL" .git)
+  BENCH_REPO_DIR="$BENCH_DIR/$CLONE_NAME"
 fi
 
 # GNU date supports %N for nanoseconds; macOS/BSD does not
@@ -144,22 +149,12 @@ fi
 # ── Count files ──
 FILE_COUNT=$(git -C "$BENCH_REPO_DIR" ls-files | wc -l | tr -d ' ')
 
-# ── Build index ──
-echo "==> Building tgrep index..."
-INDEX_START=$(now_ns)
-"$TGREP_BIN" index "$BENCH_REPO_DIR" --index-path "$INDEX_PATH"
-INDEX_END=$(now_ns)
-INDEX_MS=$(( (INDEX_END - INDEX_START) / 1000000 ))
-echo "Index built in ${INDEX_MS}ms"
-
-QUERY_COUNT=${#QUERIES[@]}
-echo "==> Running $QUERY_COUNT queries against $FILE_COUNT files"
-
-# ── Start tgrep serve ──
-echo "==> Starting tgrep serve..."
+# ── Start tgrep serve (builds index in background) ──
+echo "==> Starting tgrep serve (index will build in background)..."
 
 LOCKFILE="$INDEX_PATH/serve.json"
 rm -f "$LOCKFILE"
+mkdir -p "$INDEX_PATH"
 
 "$TGREP_BIN" serve "$BENCH_REPO_DIR" --index-path "$INDEX_PATH" --no-watch > /dev/null 2>&1 &
 SERVE_PID=$!
@@ -187,6 +182,28 @@ if [ "$READY" = false ]; then
   echo "ERROR: tgrep serve failed to start within 60s" >&2
   exit 1
 fi
+
+# ── Wait for background indexing to complete ──
+echo "==> Waiting for index build to complete..."
+INDEX_START=$(now_ns)
+while true; do
+  STATUS_OUTPUT=$("$TGREP_BIN" status "$BENCH_REPO_DIR" --index-path "$INDEX_PATH" 2>/dev/null || true)
+  if echo "$STATUS_OUTPUT" | grep -q "Indexing:   complete"; then
+    break
+  fi
+  # Print progress
+  PROGRESS=$(echo "$STATUS_OUTPUT" | grep "Indexing:" | head -1 || true)
+  if [ -n "$PROGRESS" ]; then
+    echo "  $PROGRESS"
+  fi
+  sleep 10
+done
+INDEX_END=$(now_ns)
+INDEX_MS=$(( (INDEX_END - INDEX_START) / 1000000 ))
+echo "Index built in ${INDEX_MS}ms"
+
+QUERY_COUNT=${#QUERIES[@]}
+echo "==> Running $QUERY_COUNT queries against $FILE_COUNT files"
 
 # ── Benchmark: tgrep (client → serve) ──
 echo ""
@@ -223,9 +240,7 @@ cleanup_serve
 
 # ── Benchmark: ripgrep ──
 RG_MS=-1
-if [ "$SKIP_RG" = true ]; then
-  echo "ripgrep benchmark skipped (--skip-rg)"
-elif command -v rg >/dev/null 2>&1; then
+if command -v rg >/dev/null 2>&1; then
   echo ""
   echo "==> Benchmarking ripgrep..."
   RG_START=$(now_ns)

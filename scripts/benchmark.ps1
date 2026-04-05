@@ -33,7 +33,8 @@ param(
     [string]$BenchDir = (Join-Path $env:TEMP 'tgrep-bench'),
     [string]$TgrepBin = '',
     [string]$ResultsPath = '',
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$SkipRipgrep
 )
 
 $ErrorActionPreference = 'Stop'
@@ -181,7 +182,9 @@ try {
 # ── Benchmark: ripgrep ──
 $rgCmd = Get-Command rg -ErrorAction SilentlyContinue
 $rgMs = -1
-if ($rgCmd) {
+if ($SkipRipgrep) {
+    Write-Host 'ripgrep benchmark skipped (-SkipRipgrep)' -ForegroundColor Yellow
+} elseif ($rgCmd) {
     Write-Host "`n==> Benchmarking ripgrep..." -ForegroundColor Cyan
     $ErrorActionPreference = 'Continue'
     $rgSw = [System.Diagnostics.Stopwatch]::StartNew()

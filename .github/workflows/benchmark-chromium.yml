@@ -17,9 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ripgrep
-        run: cargo install ripgrep --locked
-
       - name: Build release
         run: cargo build --release
 
@@ -32,7 +29,7 @@ jobs:
       - name: Run benchmark
         run: |
           chmod +x scripts/benchmark.sh
-          ./scripts/benchmark.sh --queries scripts/benchmark-queries-chromium.json --skip-build --bench-dir /tmp/tgrep-bench --results benchmark-results.md
+          ./scripts/benchmark.sh --queries scripts/benchmark-queries-chromium.json --skip-build --skip-rg --bench-dir /tmp/tgrep-bench --results benchmark-results.md
 
       - name: Print results
         run: cat benchmark-results.md

@@ -19,6 +19,7 @@ BENCH_DIR="/tmp/tgrep-bench"
 TGREP_BIN=""
 RESULTS_PATH=""
 SKIP_BUILD=false
+SKIP_RG=false
 
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
     --tgrep-bin)   TGREP_BIN="$2"; shift 2 ;;
     --results)     RESULTS_PATH="$2"; shift 2 ;;
     --skip-build)  SKIP_BUILD=true; shift ;;
+    --skip-rg)     SKIP_RG=true; shift ;;
     -h|--help)
       echo "Usage: $(basename "$0") [OPTIONS]"
       echo ""
@@ -42,6 +44,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --tgrep-bin PATH   Path to tgrep binary (default: target/release/tgrep)"
       echo "  --results   PATH   Output path for results markdown"
       echo "  --skip-build       Skip building tgrep from source"
+      echo "  --skip-rg          Skip the ripgrep comparison"
       exit 0
       ;;
     *) echo "Unknown option: $1 (use --help for usage)" >&2; exit 1 ;;
@@ -220,7 +223,9 @@ cleanup_serve
 
 # ── Benchmark: ripgrep ──
 RG_MS=-1
-if command -v rg >/dev/null 2>&1; then
+if [ "$SKIP_RG" = true ]; then
+  echo "ripgrep benchmark skipped (--skip-rg)"
+elif command -v rg >/dev/null 2>&1; then
   echo ""
   echo "==> Benchmarking ripgrep..."
   RG_START=$(now_ns)

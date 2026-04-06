@@ -136,6 +136,20 @@ Server status for /src/my-monorepo
   Indexing:   complete
 ```
 
+### Count files
+
+```bash
+tgrep count-files .              # count text files (no server needed)
+tgrep count-files /path/to/repo  # scan a specific repo
+```
+
+Prints the count to stdout (scriptable) and details to stderr:
+
+```
+284957
+284957 text files (47516 binary skipped, 0 errors) in 1200ms
+```
+
 ## CLI Flags
 
 | Flag | Description |

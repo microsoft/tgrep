@@ -1,0 +1,37 @@
+[package]
+name = "tgrep-fuzz"
+version = "0.0.1"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tgrep-core = { path = "../tgrep-core" }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_trigram"
+path = "fuzz_targets/fuzz_trigram.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_query"
+path = "fuzz_targets/fuzz_query.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ondisk"
+path = "fuzz_targets/fuzz_ondisk.rs"
+test = false
+doc = false

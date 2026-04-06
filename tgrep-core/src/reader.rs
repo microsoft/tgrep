@@ -1,4 +1,4 @@
-/// Mmap-based read-only index reader.
+/// Read-only index reader.
 ///
 /// Memory-maps `lookup.bin` for zero-copy binary search on the sorted
 /// trigram table. Reads posting lists from `index.bin` on demand to
@@ -6,7 +6,7 @@
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::Result;
@@ -14,8 +14,10 @@ use crate::ondisk::{self, LOOKUP_ENTRY_SIZE, LookupEntry, POSTING_ENTRY_SIZE, Po
 
 pub struct IndexReader {
     lookup: Option<Mmap>,
-    /// Opened file handle for on-demand posting list reads (not mmap'd).
+    /// File handle for on-demand posting list reads (not mmap'd).
     postings_file: Option<Mutex<File>>,
+    /// Path to index.bin for bulk reads (all_trigram_postings).
+    postings_path: Option<PathBuf>,
     file_paths: Vec<String>,
     num_entries: usize,
 }
@@ -34,19 +36,18 @@ impl IndexReader {
         let postings_meta = std::fs::metadata(&postings_path)?;
 
         // Handle empty index (no files indexed yet) — mmap requires non-zero length
-        let (lookup, postings_file, num_entries) =
-            if lookup_meta.len() == 0 || postings_meta.len() == 0 {
-                (None, None, 0)
-            } else {
-                let lookup_file = File::open(&lookup_path)?;
-                let pf = File::open(&postings_path)?;
-                // SAFETY: File is opened read-only and the Mmap lifetime is tied to
-                // IndexReader. The close() method drops the mapping before any file
-                // overwrites (required on Windows).
-                let lk = unsafe { Mmap::map(&lookup_file)? };
-                let n = lk.len() / LOOKUP_ENTRY_SIZE;
-                (Some(lk), Some(Mutex::new(pf)), n)
-            };
+        let (lookup, pf, pp, num_entries) = if lookup_meta.len() == 0 || postings_meta.len() == 0 {
+            (None, None, None, 0)
+        } else {
+            let lookup_file = File::open(&lookup_path)?;
+            let pf = File::open(&postings_path)?;
+            // SAFETY: File is opened read-only and the Mmap lifetime is tied to
+            // IndexReader. The close() method drops the mapping before any file
+            // overwrites (required on Windows).
+            let lk = unsafe { Mmap::map(&lookup_file)? };
+            let n = lk.len() / LOOKUP_ENTRY_SIZE;
+            (Some(lk), Some(Mutex::new(pf)), Some(postings_path), n)
+        };
 
         // Load file paths
         let files_data = std::fs::read(&files_path)?;
@@ -60,16 +61,18 @@ impl IndexReader {
 
         Ok(Self {
             lookup,
-            postings_file,
+            postings_file: pf,
+            postings_path: pp,
             file_paths,
             num_entries,
         })
     }
 
-    /// Release mmap handles so the underlying files can be overwritten (Windows).
+    /// Release mmap and file handles so the underlying files can be overwritten (Windows).
     pub fn close(&mut self) {
         self.lookup = None;
         self.postings_file = None;
+        self.postings_path = None;
         self.file_paths.clear();
         self.num_entries = 0;
     }
@@ -124,14 +127,38 @@ impl IndexReader {
         &self.file_paths
     }
 
-    /// Iterate all trigram entries in the lookup table.
-    /// Returns (trigram_hash, posting_list) for each entry.
+    /// Read all trigram entries and their posting lists.
+    /// Used by `full_snapshot()` during flush — bulk-reads the entire postings
+    /// file into memory for efficient sequential decode, then drops it.
     pub fn all_trigram_postings(&self) -> Vec<(u32, Vec<u32>)> {
+        if self.num_entries == 0 {
+            return Vec::new();
+        }
+
+        // Bulk-read the entire postings file — temporary memory, dropped after decode
+        let postings_data = match &self.postings_path {
+            Some(path) => match std::fs::read(path) {
+                Ok(data) => data,
+                Err(_) => return Vec::new(),
+            },
+            None => return Vec::new(),
+        };
+
         let mut result = Vec::with_capacity(self.num_entries);
         for i in 0..self.num_entries {
             let entry = self.read_lookup_entry(i);
-            let postings = self.read_posting_entries(entry.offset, entry.length);
-            let file_ids: Vec<u32> = postings.into_iter().map(|e| e.file_id).collect();
+            let start = entry.offset as usize;
+            let mut file_ids = Vec::with_capacity(entry.length as usize);
+            for j in 0..entry.length as usize {
+                let pos = start + j * POSTING_ENTRY_SIZE;
+                if pos + POSTING_ENTRY_SIZE <= postings_data.len() {
+                    let buf: &[u8; POSTING_ENTRY_SIZE] = postings_data
+                        [pos..pos + POSTING_ENTRY_SIZE]
+                        .try_into()
+                        .unwrap();
+                    file_ids.push(PostingEntry::decode(buf).file_id);
+                }
+            }
             result.push((entry.trigram, file_ids));
         }
         result

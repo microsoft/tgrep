@@ -26,6 +26,8 @@ pub struct WalkOptions {
     pub include_hidden: bool,
     pub no_ignore: bool,
     pub search_binary: bool,
+    /// Directory names to exclude from walking (e.g., "vendor", "third_party").
+    pub exclude_dirs: Vec<String>,
 }
 
 /// Check if a file extension indicates a binary format.
@@ -48,6 +50,8 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
     let files = std::sync::Mutex::new(Vec::new());
     let skipped_binary = std::sync::atomic::AtomicUsize::new(0);
     let skipped_error = std::sync::atomic::AtomicUsize::new(0);
+    let exclude_dirs: std::sync::Arc<Vec<String>> = std::sync::Arc::new(opts.exclude_dirs.clone());
+    let search_binary = opts.search_binary;
 
     let walker = WalkBuilder::new(root)
         .hidden(!opts.include_hidden)
@@ -58,7 +62,11 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         .build_parallel();
 
     walker.run(|| {
-        Box::new(|entry| {
+        let exclude = exclude_dirs.clone();
+        let files = &files;
+        let skipped_binary = &skipped_binary;
+        let skipped_error = &skipped_error;
+        Box::new(move |entry| {
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => {
@@ -67,13 +75,25 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
                 }
             };
 
+            // Skip excluded directories and their subtrees
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if !exclude.is_empty() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if exclude.iter().any(|d| d == name) {
+                            return ignore::WalkState::Skip;
+                        }
+                    }
+                }
+                return ignore::WalkState::Continue;
+            }
+
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
 
             let path = entry.path();
 
-            if !opts.search_binary {
+            if !search_binary {
                 if is_binary_extension(path) {
                     skipped_binary.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return ignore::WalkState::Continue;
@@ -108,8 +128,9 @@ pub struct FileMeta {
 
 /// Walk a directory tree collecting only filesystem metadata (mtime, size).
 /// No file content is read — this is used for stale file detection on startup.
-pub fn walk_file_metadata(root: &Path) -> Vec<FileMeta> {
+pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta> {
     let results = std::sync::Mutex::new(Vec::new());
+    let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(exclude_dirs.to_vec());
 
     let walker = WalkBuilder::new(root)
         .hidden(true) // skip hidden by default
@@ -120,11 +141,24 @@ pub fn walk_file_metadata(root: &Path) -> Vec<FileMeta> {
         .build_parallel();
 
     walker.run(|| {
-        Box::new(|entry| {
+        let exclude = exclude.clone();
+        let results = &results;
+        Box::new(move |entry| {
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => return ignore::WalkState::Continue,
             };
+
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if !exclude.is_empty() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if exclude.iter().any(|d| d == name) {
+                            return ignore::WalkState::Skip;
+                        }
+                    }
+                }
+                return ignore::WalkState::Continue;
+            }
 
             if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;

@@ -70,6 +70,7 @@ tgrep is designed to be significantly faster than ripgrep on large repos:
 tgrep index .                          # index current directory
 tgrep index /path/to/repo             # index a specific repo
 tgrep index . --index-path /tmp/idx   # custom index location
+tgrep index . --exclude vendor --exclude third_party  # skip directories
 ```
 
 ### Start the server
@@ -78,6 +79,7 @@ tgrep index . --index-path /tmp/idx   # custom index location
 tgrep serve .                          # start server (auto-builds index if missing)
 tgrep serve . --index-path /tmp/idx    # custom index location
 tgrep serve . --no-watch               # skip file watcher (saves memory)
+tgrep serve . --exclude node_modules   # exclude directories from indexing
 ```
 
 The server builds the index in the background if none exists, and serves
@@ -189,6 +191,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `--no-ignore` | Don't respect .gitignore files |
 | `-u` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden |
 | `--no-index` | Skip index, grep all files |
+| `--exclude <DIR>` | Exclude directory from indexing (repeatable) |
 | `--stats` | Print query plan and candidate stats |
 | `--index-path <DIR>` | Custom index directory |
 

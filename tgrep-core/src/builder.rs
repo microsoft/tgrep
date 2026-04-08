@@ -13,7 +13,12 @@ use crate::walker;
 const INDEX_DIR_NAME: &str = ".tgrep";
 
 /// Build a trigram index for all text files under `root`.
-pub fn build_index(root: &Path, index_dir: Option<&Path>, include_hidden: bool) -> Result<()> {
+pub fn build_index(
+    root: &Path,
+    index_dir: Option<&Path>,
+    include_hidden: bool,
+    exclude_dirs: &[String],
+) -> Result<()> {
     let root = std::fs::canonicalize(root)?;
     let index_dir = match index_dir {
         Some(d) => d.to_path_buf(),
@@ -26,6 +31,7 @@ pub fn build_index(root: &Path, index_dir: Option<&Path>, include_hidden: bool) 
         &root,
         &walker::WalkOptions {
             include_hidden,
+            exclude_dirs: exclude_dirs.to_vec(),
             ..Default::default()
         },
     );

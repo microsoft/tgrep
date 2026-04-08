@@ -64,6 +64,8 @@ struct ServerState {
     index_progress: std::sync::atomic::AtomicU64,
     /// Total files discovered for indexing.
     index_total: std::sync::atomic::AtomicU64,
+    /// Directories to exclude from indexing.
+    exclude_dirs: Vec<String>,
 }
 
 struct SearchOpts {
@@ -75,7 +77,12 @@ struct SearchOpts {
     after_context: usize,
 }
 
-pub fn run(root: &Path, index_path: Option<&Path>, no_watch: bool) -> Result<()> {
+pub fn run(
+    root: &Path,
+    index_path: Option<&Path>,
+    no_watch: bool,
+    exclude_dirs: &[String],
+) -> Result<()> {
     let serve_start = Instant::now();
     let root = std::fs::canonicalize(root)?;
     let index_dir = index_path
@@ -123,6 +130,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, no_watch: bool) -> Result<()>
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
+        exclude_dirs: exclude_dirs.to_vec(),
     });
 
     // Bind TCP listener on a random port
@@ -602,7 +610,8 @@ fn handle_reload(id: Option<serde_json::Value>, state: &ServerState) -> String {
     let index_dir = builder::default_index_dir(&state.root);
 
     // Rebuild from disk
-    if let Err(e) = builder::build_index(&state.root, Some(&index_dir), false) {
+    if let Err(e) = builder::build_index(&state.root, Some(&index_dir), false, &state.exclude_dirs)
+    {
         return json_rpc_error(id, -32000, &format!("rebuild failed: {e}"));
     }
 
@@ -826,7 +835,7 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
     }
 
     // Walk filesystem metadata (no content reads)
-    let current_meta = walker::walk_file_metadata(root);
+    let current_meta = walker::walk_file_metadata(root, &state.exclude_dirs);
     let walk_ms = start.elapsed().as_millis();
 
     // Build lookup of current filesystem state
@@ -972,6 +981,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         root,
         &WalkOptions {
             include_hidden: false,
+            exclude_dirs: state.exclude_dirs.clone(),
             ..Default::default()
         },
     );
@@ -1091,7 +1101,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     // Write per-file stamps for ALL walked files (including content-binary
     // ones) so the stale check on next startup is accurate.
-    let walk_meta = tgrep_core::walker::walk_file_metadata(root);
+    let walk_meta = tgrep_core::walker::walk_file_metadata(root, &state.exclude_dirs);
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta
         .into_iter()
         .map(|fm| {

@@ -207,6 +207,10 @@ enum Command {
         /// Force a full rebuild.
         #[arg(long)]
         force: bool,
+
+        /// Exclude directories from indexing (can be specified multiple times).
+        #[arg(long = "exclude", action = clap::ArgAction::Append)]
+        exclude: Vec<String>,
     },
 
     /// Start the persistent search server.
@@ -218,6 +222,10 @@ enum Command {
         /// Disable the file system watcher (saves memory on large repos).
         #[arg(long)]
         no_watch: bool,
+
+        /// Exclude directories from indexing (can be specified multiple times).
+        #[arg(long = "exclude", action = clap::ArgAction::Append)]
+        exclude: Vec<String>,
     },
 
     /// Search for a pattern.
@@ -305,12 +313,14 @@ fn main() {
     }
 
     let result = match cli.command {
-        Some(Command::Index { path, .. }) => {
-            index::run(&path, cli.index_path.as_deref(), cli.hidden)
+        Some(Command::Index { path, exclude, .. }) => {
+            index::run(&path, cli.index_path.as_deref(), cli.hidden, &exclude)
         }
-        Some(Command::Serve { path, no_watch }) => {
-            serve::run(&path, cli.index_path.as_deref(), no_watch)
-        }
+        Some(Command::Serve {
+            path,
+            no_watch,
+            exclude,
+        }) => serve::run(&path, cli.index_path.as_deref(), no_watch, &exclude),
         Some(Command::Search {
             ref pattern,
             ref path,

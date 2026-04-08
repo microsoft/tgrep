@@ -780,7 +780,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "tgrep-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "tgrep-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "ignore",

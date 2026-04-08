@@ -44,6 +44,16 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 
 ---
 
+## mozilla/gecko-dev (~250K files)
+
+- **Repo**: [mozilla/gecko-dev](https://github.com/mozilla/gecko-dev) (~250,000 files)
+- **Queries**: 122 (mix of C++, JavaScript, and Python patterns)
+- **Workflows**: `benchmark-gecko.yml` (Linux/macOS), `benchmark-gecko-win.yml` (Windows)
+
+*Results pending — run the benchmark workflow to populate.*
+
+---
+
 ## chromium/chromium (492K files)
 
 [Benchmark Run (macOS)](https://github.com/microsoft/tgrep/actions/runs/23994708937)

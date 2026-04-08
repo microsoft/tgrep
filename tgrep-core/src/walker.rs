@@ -198,3 +198,138 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta>
 
     results.into_inner().unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Create a temp directory with a structure for exclude testing:
+    ///   testdata/
+    ///     src/
+    ///       main.rs
+    ///     vendor/
+    ///       dep.rs
+    ///     third_party/
+    ///       lib.rs
+    ///     README.md
+    fn setup_fixture() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("testdata");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("vendor")).unwrap();
+        fs::create_dir_all(root.join("third_party")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("vendor/dep.rs"), "pub fn dep() {}").unwrap();
+        fs::write(root.join("third_party/lib.rs"), "pub fn lib() {}").unwrap();
+        fs::write(root.join("README.md"), "# hello").unwrap();
+        dir
+    }
+
+    fn sorted_filenames(result: &WalkResult, root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = result
+            .files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn walk_dir_no_excludes_returns_all_files() {
+        let dir = setup_fixture();
+        let root = dir.path().join("testdata");
+        let result = walk_dir(&root, &WalkOptions::default());
+        let names = sorted_filenames(&result, &root);
+        assert_eq!(names, vec!["README.md", "src/main.rs", "third_party/lib.rs", "vendor/dep.rs"]);
+    }
+
+    #[test]
+    fn walk_dir_exclude_single_dir() {
+        let dir = setup_fixture();
+        let root = dir.path().join("testdata");
+        let result = walk_dir(
+            &root,
+            &WalkOptions {
+                exclude_dirs: vec!["vendor".to_string()],
+                ..Default::default()
+            },
+        );
+        let names = sorted_filenames(&result, &root);
+        assert!(names.contains(&"src/main.rs".to_string()));
+        assert!(names.contains(&"third_party/lib.rs".to_string()));
+        assert!(!names.contains(&"vendor/dep.rs".to_string()));
+    }
+
+    #[test]
+    fn walk_dir_exclude_multiple_dirs() {
+        let dir = setup_fixture();
+        let root = dir.path().join("testdata");
+        let result = walk_dir(
+            &root,
+            &WalkOptions {
+                exclude_dirs: vec!["vendor".to_string(), "third_party".to_string()],
+                ..Default::default()
+            },
+        );
+        let names = sorted_filenames(&result, &root);
+        assert_eq!(names, vec!["README.md", "src/main.rs"]);
+    }
+
+    #[test]
+    fn walk_dir_exclude_nonexistent_dir_is_noop() {
+        let dir = setup_fixture();
+        let root = dir.path().join("testdata");
+        let all = walk_dir(&root, &WalkOptions::default());
+        let with_bogus = walk_dir(
+            &root,
+            &WalkOptions {
+                exclude_dirs: vec!["nonexistent".to_string()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            sorted_filenames(&all, &root),
+            sorted_filenames(&with_bogus, &root),
+        );
+    }
+
+    #[test]
+    fn walk_dir_exclude_skips_nested_files() {
+        let dir = setup_fixture();
+        let root = dir.path().join("testdata");
+        // Add a nested file inside vendor
+        fs::create_dir_all(root.join("vendor/sub")).unwrap();
+        fs::write(root.join("vendor/sub/nested.rs"), "fn nested() {}").unwrap();
+
+        let result = walk_dir(
+            &root,
+            &WalkOptions {
+                exclude_dirs: vec!["vendor".to_string()],
+                ..Default::default()
+            },
+        );
+        let names = sorted_filenames(&result, &root);
+        assert!(!names.iter().any(|n| n.starts_with("vendor/")));
+    }
+
+    #[test]
+    fn walk_file_metadata_excludes_dirs() {
+        let dir = setup_fixture();
+        let root = dir.path().join("testdata");
+
+        let all = walk_file_metadata(&root, &[]);
+        let excluded = walk_file_metadata(&root, &["vendor".to_string()]);
+
+        assert!(all.iter().any(|f| f.relative_path.starts_with("vendor/")));
+        assert!(!excluded.iter().any(|f| f.relative_path.starts_with("vendor/")));
+        assert!(excluded.iter().any(|f| f.relative_path == "src/main.rs"));
+    }
+}

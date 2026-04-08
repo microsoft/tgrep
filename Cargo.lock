@@ -808,6 +808,7 @@ dependencies = [
  "regex-syntax",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

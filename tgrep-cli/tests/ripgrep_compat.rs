@@ -584,3 +584,96 @@ fn count_files_skips_binary() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("1 binary skipped"));
 }
+
+// ─── --exclude (index) ─────────────────────────────────────────────
+
+/// Create a fixture with subdirectories to test --exclude during indexing.
+fn setup_exclude_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("vendor")).unwrap();
+    fs::create_dir_all(root.join("third_party")).unwrap();
+    fs::write(root.join("src/main.rs"), "fn main() { hello(); }").unwrap();
+    fs::write(root.join("vendor/dep.rs"), "fn hello() { dep(); }").unwrap();
+    fs::write(root.join("third_party/lib.rs"), "fn hello() { lib(); }").unwrap();
+    fs::write(root.join("README.md"), "# hello project").unwrap();
+    dir
+}
+
+#[test]
+fn index_exclude_single_dir() {
+    let dir = setup_exclude_fixture();
+    let root = dir.path().join("testdata");
+    let index_dir = dir.path().join("idx");
+
+    // Build index excluding vendor
+    tgrep()
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--exclude",
+            "vendor",
+        ])
+        .assert()
+        .success();
+
+    // Search the index for "hello" — should find src/main.rs and third_party/lib.rs
+    // but not vendor/dep.rs
+    let output = tgrep()
+        .args([
+            "hello",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "-l",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("src/main.rs") || stdout.contains("src\\main.rs"));
+    assert!(
+        stdout.contains("third_party/lib.rs") || stdout.contains("third_party\\lib.rs")
+    );
+    assert!(!stdout.contains("vendor"));
+}
+
+#[test]
+fn index_exclude_multiple_dirs() {
+    let dir = setup_exclude_fixture();
+    let root = dir.path().join("testdata");
+    let index_dir = dir.path().join("idx");
+
+    // Build index excluding both vendor and third_party
+    tgrep()
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--exclude",
+            "vendor",
+            "--exclude",
+            "third_party",
+        ])
+        .assert()
+        .success();
+
+    // Search the index for "hello" — should only find src/main.rs and README.md
+    let output = tgrep()
+        .args([
+            "hello",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "-l",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("src/main.rs") || stdout.contains("src\\main.rs"));
+    assert!(!stdout.contains("vendor"));
+    assert!(!stdout.contains("third_party"));
+}

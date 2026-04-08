@@ -17,7 +17,6 @@ use lru::LruCache;
 use anyhow::Result;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rayon::prelude::*;
-use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
 use tgrep_core::builder;
@@ -358,42 +357,15 @@ fn handle_search(
     let mut all_patterns = vec![pattern.to_string()];
     all_patterns.extend(extra_patterns);
 
-    let combined = if all_patterns.len() == 1 {
-        let mut p = if fixed_string {
-            regex::escape(&all_patterns[0])
-        } else {
-            all_patterns[0].clone()
-        };
-        if word_boundary {
-            p = format!(r"\b(?:{p})\b");
-        }
-        p
-    } else {
-        let parts: Vec<String> = all_patterns
-            .iter()
-            .map(|p| {
-                let mut p = if fixed_string {
-                    regex::escape(p)
-                } else {
-                    p.clone()
-                };
-                if word_boundary {
-                    p = format!(r"\b(?:{p})\b");
-                }
-                p
-            })
-            .collect();
-        format!("(?:{})", parts.join("|"))
-    };
-
-    let re = match RegexBuilder::new(&combined)
-        .case_insensitive(case_insensitive)
-        .multi_line(multiline)
-        .dot_matches_new_line(multiline)
-        .build()
-    {
+    let re = match crate::search::build_combined_regex(
+        &all_patterns,
+        case_insensitive,
+        fixed_string,
+        word_boundary,
+        multiline,
+    ) {
         Ok(r) => r,
-        Err(e) => return json_rpc_error(id, -32602, &format!("regex error: {e}")),
+        Err(e) => return json_rpc_error(id, -32602, &format!("{e}")),
     };
 
     // Build query plan from primary pattern for index filtering

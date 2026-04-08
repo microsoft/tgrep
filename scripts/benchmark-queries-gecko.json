@@ -106,7 +106,7 @@
     "virtual\\s+.*\\s*=\\s*0",
     "static_assert",
     "constexpr",
-    "[[nodiscard]]",
+    "\\[\\[nodiscard\\]\\]",
     "std::move",
     "std::unique_ptr",
     "UniquePtr",

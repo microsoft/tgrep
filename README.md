@@ -19,16 +19,16 @@ tgrep "fn main" .        # instant — auto-connects to running server
 
 See [full benchmark results](BENCHMARKS.md) — up to **98x faster** than ripgrep on large repos.
 
-### Benchmark highlights (search time only, index pre-built)
+### Benchmark highlights (avg latency per query, index pre-built)
 
 | Repo | Files | Platform | ripgrep | tgrep | Speedup |
 | --- | ---: | --- | ---: | ---: | ---: |
-| gecko-dev | 388K | macOS arm64 | 5,191s | 53s | **98x** |
-| gecko-dev | 388K | Windows | 1,840s | 74s | **25x** |
-| chromium | 493K | macOS arm64 | 1,825s | 88s | **21x** |
-| chromium | 493K | Windows | 770s | 75s | **10x** |
-| gecko-dev | 388K | Linux x86_64 | 159s | 39s | **4x** |
-| linux | 93K | Windows | 531s | 131s | **4x** |
+| gecko-dev | 388K | macOS arm64 | 42,550ms | 436ms | **98x** |
+| gecko-dev | 388K | Windows | 15,083ms | 605ms | **25x** |
+| chromium | 493K | macOS arm64 | 60,835ms | 2,947ms | **21x** |
+| chromium | 493K | Windows | 25,678ms | 2,516ms | **10x** |
+| gecko-dev | 388K | Linux x86_64 | 1,302ms | 321ms | **4x** |
+| linux | 93K | Windows | 5,206ms | 1,284ms | **4x** |
 
 ## Architecture
 

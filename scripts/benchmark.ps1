@@ -184,7 +184,7 @@ try {
 $rgCmd = Get-Command rg -ErrorAction SilentlyContinue
 $rgMs = -1
 $rgTimeouts = 0
-$rgTimeoutMs = 10000
+$rgTimeoutMs = 120000
 $rgTimeoutSec = $rgTimeoutMs / 1000
 if ($rgCmd) {
     Write-Host "`n==> Benchmarking ripgrep (${rgTimeoutSec}s timeout per query)..." -ForegroundColor Cyan

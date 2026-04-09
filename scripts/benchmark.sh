@@ -226,7 +226,7 @@ cleanup_serve
 # ── Benchmark: ripgrep ──
 RG_MS=-1
 RG_TIMEOUTS=0
-RG_TIMEOUT_SEC=10
+RG_TIMEOUT_SEC=120
 if command -v rg >/dev/null 2>&1; then
   # Detect timeout command (macOS needs gtimeout from coreutils)
   TIMEOUT_CMD=""
@@ -244,8 +244,8 @@ if command -v rg >/dev/null 2>&1; then
     QIDX=$((QIDX + 1))
     echo "  [$QIDX/$QUERY_COUNT] $pattern"
     if [ -n "$TIMEOUT_CMD" ]; then
-      $TIMEOUT_CMD "$RG_TIMEOUT_SEC" rg -n "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1
-      rc=$?
+      rc=0
+      $TIMEOUT_CMD "$RG_TIMEOUT_SEC" rg -n "$pattern" "$BENCH_REPO_DIR" > /dev/null 2>&1 || rc=$?
       if [ $rc -eq 124 ]; then
         echo "    ⚠ timed out (${RG_TIMEOUT_SEC}s)"
         RG_TIMEOUTS=$((RG_TIMEOUTS + 1))

@@ -44,39 +44,89 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 
 ---
 
-## mozilla/gecko-dev (~250K files)
+## mozilla/gecko-dev (388K files)
 
-- **Repo**: [mozilla/gecko-dev](https://github.com/mozilla/gecko-dev) (~250,000 files)
+[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24166560879)
+[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24166565600)
+
+- **Repo**: [mozilla/gecko-dev](https://github.com/mozilla/gecko-dev) (387,841 files)
 - **Queries**: 122 (mix of C++, JavaScript, and Python patterns)
-- **Workflows**: `benchmark-gecko.yml` (Linux/macOS), `benchmark-gecko-win.yml` (Windows)
+- **Index build time**: ~84s (Linux), ~239s (Windows), ~292s (macOS)
+- **Index size**: 1,938 MB (~1.9 GB)
 
-*Results pending — run the benchmark workflow to populate.*
+### Windows AMD64
 
----
+| Tool | Total (ms) | Avg per query (ms) |
+| --- | ---: | ---: |
+| ripgrep | 1,840,166 | 15,083.3 |
+| tgrep (client → serve) | 73,847 | 605.3 |
 
-## chromium/chromium (492K files)
-
-[Benchmark Run (macOS)](https://github.com/microsoft/tgrep/actions/runs/23994708937)
-
-- **Repo**: [chromium/chromium](https://github.com/chromium/chromium) (491,632 files)
-- **Queries**: 121 (mix of literals, multi-word, and regex)
-- **Index build time**: ~498s (~8 min)
-- **Index size**: 2,467 MB (~2.4 GB)
+**tgrep is ~25x faster**
 
 ### macOS Apple Silicon (Darwin arm64)
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 5,653,497 | 46,723.1 |
-| tgrep (client → serve) | 162,404 | 1,342.2 |
+| ripgrep | 5,191,142 | 42,550.3 |
+| tgrep (client → serve) | 53,166 | 435.8 |
 
-**tgrep is ~35x faster**
+**tgrep is ~98x faster**
+
+### Linux x86_64
+
+| Tool | Total (ms) | Avg per query (ms) |
+| --- | ---: | ---: |
+| ripgrep | 158,795 | 1,301.6 |
+| tgrep (client → serve) | 39,119 | 320.6 |
+
+**tgrep is ~4x faster**
+
+---
+
+## chromium/chromium (493K files)
+
+[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24171177161)
+[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24171159517)
+
+- **Repo**: [chromium/chromium](https://github.com/chromium/chromium) (492,734 files)
+- **Queries**: 30 (mix of literals, multi-word, and regex)
+- **Index build time**: ~106s (Linux), ~312s (Windows), ~668s (macOS)
+- **Index size**: 2,470 MB (~2.4 GB)
+
+### Windows AMD64
+
+| Tool | Total (ms) | Avg per query (ms) |
+| --- | ---: | ---: |
+| ripgrep | 770,353 | 25,678.4 |
+| tgrep (client → serve) | 75,473 | 2,515.8 |
+
+**tgrep is ~10x faster**
+
+### macOS Apple Silicon (Darwin arm64)
+
+| Tool | Total (ms) | Avg per query (ms) |
+| --- | ---: | ---: |
+| ripgrep | 1,825,058 | 60,835.3 |
+| tgrep (client → serve) | 88,415 | 2,947.2 |
+
+**tgrep is ~21x faster**
+
+### Linux x86_64
+
+| Tool | Total (ms) | Avg per query (ms) |
+| --- | ---: | ---: |
+| ripgrep | 95,974 | 3,199.1 |
+| tgrep (client → serve) | 37,483 | 1,249.4 |
+
+**tgrep is ~2.6x faster**
 
 ---
 
 ## Key takeaways
 
 - tgrep's advantage grows with repo size — the trigram index eliminates scanning files that can't match
-- On the 492K-file Chromium repo, ripgrep spends ~47s per query scanning every file; tgrep averages ~1.3s
+- On the 388K-file gecko-dev repo, tgrep is up to **98x faster** (macOS) and **25x faster** (Windows)
+- On the 493K-file Chromium repo, tgrep is up to **21x faster** (macOS) and **10x faster** (Windows)
+- On Linux, aggressive OS page caching narrows the gap, but tgrep is still **2.6–4x faster** on large repos
 - On smaller repos (93K files), the gap narrows because OS page cache helps ripgrep's brute-force approach
 - Index build is a one-time cost; the server watches for file changes and updates incrementally

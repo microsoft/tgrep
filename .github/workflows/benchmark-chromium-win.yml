@@ -10,7 +10,7 @@ jobs:
   benchmark:
     name: Benchmark Chromium (Windows)
     timeout-minutes: 180
-    runs-on: windows-latest-16-core
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 

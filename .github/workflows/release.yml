@@ -17,9 +17,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
+            use_cross: true
           - os: macos-latest
             target: x86_64-apple-darwin
           - os: macos-latest
@@ -36,15 +37,23 @@ jobs:
         run: |
           rustup target add ${{ matrix.target }}
 
-      - name: Install cross-linker (aarch64-linux)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install musl-tools (x86_64-linux-musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross (aarch64-linux-musl)
+        if: matrix.use_cross
+        run: cargo install cross --locked
 
       - name: Build release binary
+        if: ${{ !matrix.use_cross }}
         run: cargo build --release --locked -p tgrep-cli --bin tgrep --target ${{ matrix.target }}
+
+      - name: Build release binary (cross)
+        if: ${{ matrix.use_cross }}
+        run: cross build --release --locked -p tgrep-cli --bin tgrep --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'

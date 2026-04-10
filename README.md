@@ -296,8 +296,8 @@ for Linux, macOS (Intel & Apple Silicon), and Windows.
 
 ```bash
 # Linux (x86_64)
-gh release download --repo microsoft/tgrep -p '*x86_64-unknown-linux-gnu*' -D /tmp/tgrep-dl
-tar xzf /tmp/tgrep-dl/tgrep-*-x86_64-unknown-linux-gnu.tar.gz -C ~/.local/bin
+gh release download --repo microsoft/tgrep -p '*x86_64-unknown-linux-musl*' -D /tmp/tgrep-dl
+tar xzf /tmp/tgrep-dl/tgrep-*-x86_64-unknown-linux-musl.tar.gz -C ~/.local/bin
 
 # macOS (Apple Silicon)
 gh release download --repo microsoft/tgrep -p '*aarch64-apple-darwin*' -D /tmp/tgrep-dl

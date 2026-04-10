@@ -17,8 +17,8 @@ detect_target() {
     case "$os" in
         Linux)
             case "$arch" in
-                x86_64)  echo "x86_64-unknown-linux-gnu" ;;
-                aarch64) echo "aarch64-unknown-linux-gnu" ;;
+                x86_64)  echo "x86_64-unknown-linux-musl" ;;
+                aarch64) echo "aarch64-unknown-linux-musl" ;;
                 *)       error "Unsupported architecture: $arch" ;;
             esac
             ;;

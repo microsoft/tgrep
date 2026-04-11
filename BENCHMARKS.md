@@ -122,6 +122,30 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 
 ---
 
+## rust-lang/rust (~50K files)
+
+- **Repo**: [rust-lang/rust](https://github.com/rust-lang/rust) (~50K files)
+- **Queries**: 100 (mix of Rust patterns, macros, traits, and regex)
+- **Status**: Pending — run the `Benchmark Rust` workflows to populate results
+
+---
+
+## kubernetes/kubernetes (~20K files)
+
+- **Repo**: [kubernetes/kubernetes](https://github.com/kubernetes/kubernetes) (~20K files)
+- **Queries**: 96 (mix of Go patterns, Kubernetes API types, and regex)
+- **Status**: Pending — run the `Benchmark Kubernetes` workflows to populate results
+
+---
+
+## golang/go (~10K files)
+
+- **Repo**: [golang/go](https://github.com/golang/go) (~10K files)
+- **Queries**: 100 (mix of Go stdlib patterns, testing, and regex)
+- **Status**: Pending — run the `Benchmark Go` workflows to populate results
+
+---
+
 ## Key takeaways
 
 - tgrep's advantage grows with repo size — the trigram index eliminates scanning files that can't match

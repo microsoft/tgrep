@@ -23,12 +23,15 @@ See [full benchmark results](BENCHMARKS.md) — up to **98x faster** than ripgre
 
 | Repo | Files | Platform | ripgrep | tgrep | Speedup |
 | --- | ---: | --- | ---: | ---: | ---: |
-| gecko-dev | 388K | macOS arm64 | 42,550ms | 436ms | **98x** |
-| gecko-dev | 388K | Windows | 15,083ms | 605ms | **25x** |
 | chromium | 493K | macOS arm64 | 60,835ms | 2,947ms | **21x** |
 | chromium | 493K | Windows | 25,678ms | 2,516ms | **10x** |
-| gecko-dev | 388K | Linux x86_64 | 1,302ms | 321ms | **4x** |
+| gecko-dev | 388K | macOS arm64 | 42,550ms | 436ms | **98x** |
+| gecko-dev | 388K | Windows | 15,083ms | 605ms | **25x** |
 | linux | 93K | Windows | 5,206ms | 1,284ms | **4x** |
+| rust | 59K | Windows | 1,805ms | 229ms | **8x** |
+| kubernetes | 29K | Windows | 1,490ms | 143ms | **10x** |
+| go | 15K | Windows | 614ms | 65ms | **9.5x** |
+| go | 15K | macOS arm64 | 118ms | 29ms | **4x** |
 
 ## Architecture
 

@@ -1,0 +1,232 @@
+# tgrep ADO Pipeline - OneBranch Official
+#
+# This file should be placed in the microsoft/tgrep GitHub repo at:
+#   .pipelines/sign-and-release.yml
+#
+# How it works:
+#   - ADO pipeline is configured to use this YAML from the tgrep GitHub repo
+#   - ADO automatically checks out tgrep source to $(Build.SourcesDirectory) via 'checkout: self'
+#     (same pattern as VSCode: vscode/build/azure-pipelines/common/checkout.yml)
+#   - Builds tgrep.exe for Windows x64
+#   - Signs tgrep.exe using OneBranch signing (no ESRP service connection needed)
+#   - Packages into zip matching the GitHub release.yml naming convention
+#   - Optionally uploads signed zip to GitHub Release via gh CLI
+#     (gh CLI confirmed available on Microsoft ADO agents: used by VSCode pipeline)
+#
+# Prerequisites:
+#   - DeepPrompt ADO project must have access to OneBranch.Pipelines/GovernedTemplates repo
+#   - Add GITHUB_TOKEN as a secret pipeline variable (GitHub PAT with write:release on microsoft/tgrep)
+#   - .cargo/config.toml must exist in tgrep repo with BinSkim-required rustflags
+#     (see tgrep-files/.cargo/config.toml)
+#
+# Reference repos:
+#   - microsoft/ripgrep-prebuilt: same pattern (Rust + ADO + 1ES + publish to GitHub Release)
+#   - microsoft/vscode: checkout: self pattern, gh CLI usage
+#   - microsoft/ServiceProfiler: OneBranch signing pattern
+
+trigger: none
+
+parameters:
+  - name: ReleaseTag
+    displayName: 'GitHub Release Tag (e.g. v0.1.10)'
+    type: string
+    default: 'main'
+  - name: PublishToGitHub
+    displayName: 'Publish signed binary to GitHub Release (only enable after signing is verified)'
+    type: boolean
+    default: false
+  - name: debug
+    displayName: 'Enable debug output'
+    type: boolean
+    default: false
+
+variables:
+  CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]  # needed for onebranch.pipeline.version task https://aka.ms/obpipelines/versioning
+  system.debug: ${{ parameters.debug }}
+  ENABLE_PRS_DELAYSIGN: 1
+  TGREP_TAG: ${{ parameters.ReleaseTag }}
+  WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'  # Docker image https://aka.ms/obpipelines/containers
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: OneBranch.Pipelines/GovernedTemplates
+      ref: refs/heads/main
+
+extends:
+  template: v2/OneBranch.Official.CrossPlat.yml@templates  # https://aka.ms/obpipelines/templates
+  parameters:
+    featureFlags:
+      WindowsHostVersion: '1ESWindows2022'
+    git:
+      submodules: false
+    cloudvault:  # https://aka.ms/obpipelines/cloudvault
+      enabled: false
+    globalSdl:  # https://aka.ms/obpipelines/sdl
+      codeql:
+        compiled:
+          enabled: true
+      sbom:
+        enabled: true
+      tsa:
+        enabled: false  # onebranch publish all sdl results to TSA. If TSA is disabled all SDL tools will forced into 'break' build mode.
+      # Uncomment if CredScan reports false positives:
+      # credscan:
+      #   suppressionsFile: $(Build.SourcesDirectory)\.config\CredScanSuppressions.json
+      # policheck:
+      #   exclusionsFile: $(Build.SourcesDirectory)\PolicheckExclusion.xml
+      #   break: true
+
+    stages:
+      - stage: build_and_sign
+        displayName: 'Build and Sign tgrep Windows Binary'
+        jobs:
+          - job: build_sign_windows
+            displayName: 'Build tgrep Windows x64 + Sign'
+            timeoutInMinutes: 120
+            cancelTimeoutInMinutes: 1
+            pool:
+              type: windows
+            variables:
+              ob_outputDirectory: '$(Build.ArtifactStagingDirectory)/ONEBRANCH_ARTIFACT'
+              ob_sdl_binskim_break: true  # https://aka.ms/obpipelines/sdl
+              # Note: ob_sdl_binskim_break requires .cargo/config.toml with BinSkim rustflags.
+              # If BinSkim fails, set to false temporarily and add .config/guardian/.gdnbaselines baseline.
+
+            steps:
+              # ---------------------------------------------------------------
+              # Step 1: Checkout tgrep source code
+              # ADO checks out the repo containing this YAML (microsoft/tgrep)
+              # into $(Build.SourcesDirectory) automatically.
+              # Reference: vscode/build/azure-pipelines/common/checkout.yml
+              # ---------------------------------------------------------------
+              - checkout: self
+                fetchDepth: 1
+                fetchTags: false
+                displayName: 'Checkout microsoft/tgrep'
+
+              # ---------------------------------------------------------------
+              # Step 2: Check if Rust toolchain is pre-installed
+              # OneBranch Windows container is friendly to .NET/MSBuild but Rust
+              # may not be pre-installed. Check first; Step 3 installs if missing.
+              # ---------------------------------------------------------------
+              - powershell: |
+                  Write-Host "=== Checking Rust toolchain ==="
+                  $rustupOk = $false
+                  $cargoOk  = $false
+                  try { rustup --version; $rustupOk = $true } catch { Write-Host "rustup not found" }
+                  try { cargo  --version; $cargoOk  = $true } catch { Write-Host "cargo not found"  }
+                  try { rustc  --version } catch { Write-Host "rustc not found"  }
+                  Write-Host "##vso[task.setvariable variable=RUST_PREINSTALLED]$($rustupOk -and $cargoOk)"
+                displayName: 'Check Rust toolchain (pre-installed?)'
+                continueOnError: true
+
+              # ---------------------------------------------------------------
+              # Step 3: Install Rust toolchain (only if not pre-installed)
+              # Silent install via official rustup-init.exe
+              # ---------------------------------------------------------------
+              - powershell: |
+                  Write-Host "=== Installing Rust toolchain ==="
+                  $installerUrl = "https://win.rustup.rs/x86_64"
+                  $installerPath = "$env:TEMP\rustup-init.exe"
+                  Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath
+                  & $installerPath -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
+                  $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+                  rustup --version
+                  cargo --version
+                  rustc --version
+                displayName: 'Install Rust toolchain (if not pre-installed)'
+                condition: ne(variables['RUST_PREINSTALLED'], 'True')
+
+              # ---------------------------------------------------------------
+              # Step 4: Add Windows MSVC target
+              # ---------------------------------------------------------------
+              - script: |
+                  rustup target add x86_64-pc-windows-msvc
+                  rustup show
+                displayName: 'Add Rust target x86_64-pc-windows-msvc'
+
+              # ---------------------------------------------------------------
+              # Step 5: Build Windows x64 release binary
+              # .cargo/config.toml provides BinSkim-required rustflags automatically.
+              # ---------------------------------------------------------------
+              - script: |
+                  cargo build --release --locked -p tgrep-cli --bin tgrep --target x86_64-pc-windows-msvc
+                displayName: 'Build tgrep Windows x64'
+                workingDirectory: $(Build.SourcesDirectory)
+
+              # ---------------------------------------------------------------
+              # Step 6: Verify binary exists
+              # ---------------------------------------------------------------
+              - script: |
+                  dir target\x86_64-pc-windows-msvc\release\tgrep.exe
+                displayName: 'Verify tgrep.exe exists'
+                workingDirectory: $(Build.SourcesDirectory)
+
+              # ---------------------------------------------------------------
+              # Step 7: Sign tgrep.exe using OneBranch signing
+              # signing_profile: "external_distribution" = Microsoft Authenticode (CP-231522)
+              # Exact filename used instead of glob to avoid accidentally signing other .exe files.
+              # Reference: https://onebranch.visualstudio.com/Build/_git/OneBranch.Sign?path=/ESRP/Templates/operations
+              # ---------------------------------------------------------------
+              - task: onebranch.pipeline.signing@1
+                displayName: 'Sign tgrep.exe'
+                inputs:
+                  command: "sign"
+                  signing_profile: "external_distribution"
+                  files_to_sign: "tgrep.exe"
+                  search_root: "$(Build.SourcesDirectory)/target/x86_64-pc-windows-msvc/release"
+
+              # ---------------------------------------------------------------
+              # Step 8: Package signed binary
+              # Zip name matches the format used in GitHub release.yml for consistency.
+              # ---------------------------------------------------------------
+              - powershell: |
+                  $tag = "$(TGREP_TAG)"
+                  $zipName = "tgrep-$tag-x86_64-pc-windows-msvc.zip"
+                  $exePath = "$(Build.SourcesDirectory)/target/x86_64-pc-windows-msvc/release/tgrep.exe"
+                  $readmePath = "$(Build.SourcesDirectory)/README.md"
+                  $outPath = "$(Build.ArtifactStagingDirectory)/$zipName"
+                  Compress-Archive -Path $exePath, $readmePath -DestinationPath $outPath
+                  Write-Host "Packaged: $zipName"
+                  dir $outPath
+                displayName: 'Package signed tgrep.exe into zip'
+
+              # ---------------------------------------------------------------
+              # Step 9: Copy to OneBranch output directory
+              # This directory is automatically uploaded as a pipeline artifact by OneBranch.
+              # ---------------------------------------------------------------
+              - task: CopyFiles@2
+                displayName: 'Copy artifacts to ONEBRANCH_ARTIFACT'
+                inputs:
+                  SourceFolder: '$(Build.ArtifactStagingDirectory)'
+                  Contents: '*.zip'
+                  TargetFolder: '$(Build.ArtifactStagingDirectory)/ONEBRANCH_ARTIFACT'
+
+              # ---------------------------------------------------------------
+              # Step 10 (optional): Publish to GitHub Release
+              # Pattern confirmed by microsoft/ripgrep-prebuilt README:
+              #   "the last job will upload those artifacts to the Github release"
+              # gh CLI confirmed available on Microsoft ADO agents (used by VSCode pipeline).
+              # Keep PublishToGitHub=false until signing is verified end-to-end.
+              # Requires GITHUB_TOKEN secret pipeline variable (GitHub PAT with write:release).
+              # ---------------------------------------------------------------
+              - ${{ if eq(parameters.PublishToGitHub, true) }}:
+                - powershell: |
+                    try {
+                      gh --version
+                      Write-Host "gh CLI found, proceeding with upload"
+                    } catch {
+                      Write-Error "gh CLI not found. Please install GitHub CLI or use REST API instead."
+                      exit 1
+                    }
+                  displayName: 'Verify gh CLI is available'
+                  env:
+                    GH_TOKEN: $(GITHUB_TOKEN)
+
+                - script: |
+                    gh release upload $(TGREP_TAG) "$(Build.ArtifactStagingDirectory)/*.zip" --repo microsoft/tgrep --clobber
+                  displayName: 'Upload signed binary to GitHub Release'
+                  env:
+                    GH_TOKEN: $(GITHUB_TOKEN)  # Secret pipeline variable: GitHub PAT with write:release

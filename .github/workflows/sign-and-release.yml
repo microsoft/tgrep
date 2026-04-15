@@ -5,20 +5,24 @@
 #   - ADO automatically checks out tgrep source to $(Build.SourcesDirectory) via 'checkout: self'
 #   - Rust is installed via RustInstaller@1 (official Microsoft ADO task)
 #   - Cargo is authenticated to ADO DeepPrompt feed via CargoAuthenticate@0
-#   - .cargo/config.toml (checked in at repo root) redirects crates.io to ADO feed
-#     and provides BinSkim-required rustflags
+#   - .cargo/config.toml (checked in at repo root) provides:
+#       * [registries.devdiv-deepprompt]: required by CargoAuthenticate@0 to inject credentials
+#       * [target.*] rustflags: BinSkim-required flags (OneBranch BA2007)
+#       * NOTE: crates.io is NOT redirected here to avoid breaking external contributor builds
 #   - Builds tgrep.exe for Windows x64
 #   - Signs tgrep.exe using OneBranch signing (no ESRP service connection needed)
 #   - Packages into zip matching the GitHub release.yml naming convention
-#   - Optionally uploads signed zip to GitHub Release via gh CLI
+#   - Optionally uploads signed zip to GitHub Release via GitHubRelease@1 ADO task
 #
 # Prerequisites:
 #   - DeepPrompt ADO project must have access to OneBranch.Pipelines/GovernedTemplates repo
-#   - Add GITHUB_TOKEN as a secret pipeline variable (GitHub PAT with write:release on microsoft/tgrep)
+#   - Create a GitHub service connection named 'tgrep-github' in ADO project settings:
+#       Project Settings → Service connections → New → GitHub → OAuth
+#       (OAuth is recommended: no expiry, auto-renews; authorizing account needs write access to microsoft/tgrep)
 #
 # Reference repos:
-#   - microsoft/ripgrep-prebuilt: same pattern (Rust + ADO + 1ES + publish to GitHub Release)
-#   - microsoft/vscode: checkout: self pattern, gh CLI usage
+#   - microsoft/ripgrep-prebuilt: same pattern (Rust + ADO + 1ES + GitHubRelease@1 publish)
+#   - microsoft/vscode: checkout: self pattern
 
 trigger: none
 

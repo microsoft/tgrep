@@ -15,7 +15,11 @@ Thanks for your interest in contributing! Here's how to get started.
 ## Workflow
 
 ```bash
-# Run tests
+# Run all checks (fmt + clippy + test)
+make check
+make test
+
+# Or run individually:
 cargo test
 
 # Check formatting

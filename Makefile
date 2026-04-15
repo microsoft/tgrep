@@ -13,7 +13,8 @@ test:
 	cargo test --workspace
 
 check:
-	cargo check --workspace
+	cargo fmt --all -- --check
+	cargo clippy --workspace -- -D warnings
 
 fmt:
 	cargo fmt --all

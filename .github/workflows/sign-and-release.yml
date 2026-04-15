@@ -1,28 +1,28 @@
 # tgrep ADO Pipeline - OneBranch Official
 #
-# This file should be placed in the microsoft/tgrep GitHub repo at:
-#   .pipelines/sign-and-release.yml
-#
 # How it works:
 #   - ADO pipeline is configured to use this YAML from the tgrep GitHub repo
 #   - ADO automatically checks out tgrep source to $(Build.SourcesDirectory) via 'checkout: self'
-#     (same pattern as VSCode: vscode/build/azure-pipelines/common/checkout.yml)
+#   - Rust is installed via RustInstaller@1 (official Microsoft ADO task)
+#   - Cargo is authenticated to ADO DeepPrompt feed via CargoAuthenticate@0
+#   - .cargo/config.toml (checked in at repo root) provides:
+#       * [registries.devdiv-deepprompt]: required by CargoAuthenticate@0 to inject credentials
+#       * [target.*] rustflags: BinSkim-required flags (OneBranch BA2007)
+#       * NOTE: crates.io is NOT redirected here to avoid breaking external contributor builds
 #   - Builds tgrep.exe for Windows x64
 #   - Signs tgrep.exe using OneBranch signing (no ESRP service connection needed)
 #   - Packages into zip matching the GitHub release.yml naming convention
-#   - Optionally uploads signed zip to GitHub Release via gh CLI
-#     (gh CLI confirmed available on Microsoft ADO agents: used by VSCode pipeline)
+#   - Optionally uploads signed zip to GitHub Release via GitHubRelease@1 ADO task
 #
 # Prerequisites:
 #   - DeepPrompt ADO project must have access to OneBranch.Pipelines/GovernedTemplates repo
-#   - Add GITHUB_TOKEN as a secret pipeline variable (GitHub PAT with write:release on microsoft/tgrep)
-#   - .cargo/config.toml must exist in tgrep repo with BinSkim-required rustflags
-#     (see tgrep-files/.cargo/config.toml)
+#   - Create a GitHub service connection named 'tgrep-github' in ADO project settings:
+#       Project Settings → Service connections → New → GitHub → OAuth
+#       (OAuth is recommended: no expiry, auto-renews; authorizing account needs write access to microsoft/tgrep)
 #
 # Reference repos:
-#   - microsoft/ripgrep-prebuilt: same pattern (Rust + ADO + 1ES + publish to GitHub Release)
-#   - microsoft/vscode: checkout: self pattern, gh CLI usage
-#   - microsoft/ServiceProfiler: OneBranch signing pattern
+#   - microsoft/ripgrep-prebuilt: same pattern (Rust + ADO + 1ES + GitHubRelease@1 publish)
+#   - microsoft/vscode: checkout: self pattern
 
 trigger: none
 
@@ -99,7 +99,6 @@ extends:
               # Step 1: Checkout tgrep source code
               # ADO checks out the repo containing this YAML (microsoft/tgrep)
               # into $(Build.SourcesDirectory) automatically.
-              # Reference: vscode/build/azure-pipelines/common/checkout.yml
               # ---------------------------------------------------------------
               - checkout: self
                 fetchDepth: 1
@@ -107,49 +106,43 @@ extends:
                 displayName: 'Checkout microsoft/tgrep'
 
               # ---------------------------------------------------------------
-              # Step 2: Check if Rust toolchain is pre-installed
-              # OneBranch Windows container is friendly to .NET/MSBuild but Rust
-              # may not be pre-installed. Check first; Step 3 installs if missing.
+              # Step 2: Install Rust toolchain via RustInstaller@1
+              # Uses the official Microsoft Rust installer task (MSRustup).
+              # toolchainFeed: dedicated Rust NuGet feed (contains rust.msrustup-* packages).
+              # Reference: rust.msrustup/.pipelines/build.yml, ripgrep-prebuilt pipeline
               # ---------------------------------------------------------------
-              - powershell: |
-                  Write-Host "=== Checking Rust toolchain ==="
-                  $rustupOk = $false
-                  $cargoOk  = $false
-                  try { rustup --version; $rustupOk = $true } catch { Write-Host "rustup not found" }
-                  try { cargo  --version; $cargoOk  = $true } catch { Write-Host "cargo not found"  }
-                  try { rustc  --version } catch { Write-Host "rustc not found"  }
-                  Write-Host "##vso[task.setvariable variable=RUST_PREINSTALLED]$($rustupOk -and $cargoOk)"
-                displayName: 'Check Rust toolchain (pre-installed?)'
-                continueOnError: true
+              - task: RustInstaller@1
+                displayName: 'Install Rust toolchain'
+                inputs:
+                  rustVersion: ms-stable
+                  additionalTargets: x86_64-pc-windows-msvc
+                  toolchainFeed: https://devdiv.pkgs.visualstudio.com/_packaging/Rust/nuget/v3/index.json
 
               # ---------------------------------------------------------------
-              # Step 3: Install Rust toolchain (only if not pre-installed)
-              # Silent install via official rustup-init.exe
-              # ---------------------------------------------------------------
-              - powershell: |
-                  Write-Host "=== Installing Rust toolchain ==="
-                  $installerUrl = "https://win.rustup.rs/x86_64"
-                  $installerPath = "$env:TEMP\rustup-init.exe"
-                  Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath
-                  & $installerPath -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
-                  $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-                  rustup --version
-                  cargo --version
-                  rustc --version
-                displayName: 'Install Rust toolchain (if not pre-installed)'
-                condition: ne(variables['RUST_PREINSTALLED'], 'True')
-
-              # ---------------------------------------------------------------
-              # Step 4: Add Windows MSVC target
+              # Step 3: Verify Rust installation
               # ---------------------------------------------------------------
               - script: |
-                  rustup target add x86_64-pc-windows-msvc
-                  rustup show
-                displayName: 'Add Rust target x86_64-pc-windows-msvc'
+                  rustc --version
+                  cargo --version
+                displayName: 'Verify Rust version'
+
+              # ---------------------------------------------------------------
+              # Step 4: Authenticate with ADO DeepPrompt Cargo feed.
+              # CargoAuthenticate@0 reads .cargo/config.toml and injects credentials
+              # for all ADO registries listed there. This is the official Microsoft
+              # way to authenticate cargo to ADO Artifact feeds.
+              # Reference: rust.sdk.sample, rust.msrustup pipelines
+              # ---------------------------------------------------------------
+              - task: CargoAuthenticate@0
+                displayName: 'Authenticate with ADO DeepPrompt Cargo feed'
+                inputs:
+                  configFile: '.cargo/config.toml'
 
               # ---------------------------------------------------------------
               # Step 5: Build Windows x64 release binary
-              # .cargo/config.toml provides BinSkim-required rustflags automatically.
+              # .cargo/config.toml (checked in at repo root) provides:
+              #   - crates.io redirect to ADO DeepPrompt Cargo feed
+              #   - BinSkim-required rustflags (OneBranch BA2007)
               # ---------------------------------------------------------------
               - script: |
                   cargo build --release --locked -p tgrep-cli --bin tgrep --target x86_64-pc-windows-msvc
@@ -206,27 +199,32 @@ extends:
 
               # ---------------------------------------------------------------
               # Step 10 (optional): Publish to GitHub Release
-              # Pattern confirmed by microsoft/ripgrep-prebuilt README:
-              #   "the last job will upload those artifacts to the Github release"
-              # gh CLI confirmed available on Microsoft ADO agents (used by VSCode pipeline).
+              # Pattern from microsoft/ripgrep-prebuilt/build/publish.yml.
+              # Uses GitHubRelease@1 task with ADO service connection (no PAT needed).
+              #
+              # Prerequisites (one-time setup by ADO project admin):
+              #   1. Go to: DeepPrompt ADO project → Project Settings → Service connections
+              #   2. Click "New service connection" → choose "GitHub"
+              #   3. Authentication: "OAuth" (recommended) or "Personal Access Token"
+              #      - OAuth: authorize via GitHub OAuth app (no expiry, auto-renews)
+              #      - PAT: GitHub PAT with repo scope (expires, needs manual renewal)
+              #   4. Name the connection exactly: "tgrep-github"
+              #      (must match gitHubConnection value below)
+              #   5. Grant access to pipeline: check "Grant access permission to all pipelines"
+              #      or explicitly allow this pipeline
+              #
               # Keep PublishToGitHub=false until signing is verified end-to-end.
-              # Requires GITHUB_TOKEN secret pipeline variable (GitHub PAT with write:release).
               # ---------------------------------------------------------------
               - ${{ if eq(parameters.PublishToGitHub, true) }}:
-                - powershell: |
-                    try {
-                      gh --version
-                      Write-Host "gh CLI found, proceeding with upload"
-                    } catch {
-                      Write-Error "gh CLI not found. Please install GitHub CLI or use REST API instead."
-                      exit 1
-                    }
-                  displayName: 'Verify gh CLI is available'
-                  env:
-                    GH_TOKEN: $(GITHUB_TOKEN)
-
-                - script: |
-                    gh release upload $(TGREP_TAG) "$(Build.ArtifactStagingDirectory)/*.zip" --repo microsoft/tgrep --clobber
-                  displayName: 'Upload signed binary to GitHub Release'
-                  env:
-                    GH_TOKEN: $(GITHUB_TOKEN)  # Secret pipeline variable: GitHub PAT with write:release
+                - task: GitHubRelease@1
+                  displayName: 'Publish signed binary to GitHub Release'
+                  inputs:
+                    gitHubConnection: 'tgrep-github'   # ADO service connection name (see prerequisites above)
+                    repositoryName: 'microsoft/tgrep'
+                    action: 'edit'
+                    target: '$(Build.SourceVersion)'
+                    tagSource: 'userSpecifiedTag'
+                    tag: '$(TGREP_TAG)'
+                    assets: '$(Build.ArtifactStagingDirectory)/*.zip'
+                    assetUploadMode: 'replace'
+                    addChangeLog: true

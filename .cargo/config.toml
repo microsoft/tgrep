@@ -1,0 +1,18 @@
+# Redirect crates.io to ADO DeepPrompt Cargo feed (devdiv org-scoped).
+# Feed: https://dev.azure.com/devdiv/_artifacts/feed/DeepPrompt
+#
+# CargoAuthenticate@0 requires a [registries] table to inject credentials.
+# The [source.*] section redirects crates.io lookups to the same feed.
+
+[registries.devdiv-deepprompt]
+index = "sparse+https://pkgs.dev.azure.com/devdiv/_packaging/DeepPrompt/Cargo/index/"
+
+[source.crates-io]
+replace-with = "devdiv-deepprompt"
+
+[source.devdiv-deepprompt]
+registry = "sparse+https://pkgs.dev.azure.com/devdiv/_packaging/DeepPrompt/Cargo/index/"
+
+# BinSkim compliance flags (OneBranch BA2007)
+[target.'cfg(target_os = "windows")']
+rustflags = ["-Ccontrol-flow-guard", "-Ctarget-feature=+crt-static", "-Clink-args=/DYNAMICBASE /CETCOMPAT"]

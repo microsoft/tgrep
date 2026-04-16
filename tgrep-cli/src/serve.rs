@@ -764,16 +764,24 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
                     continue;
                 }
                 // Reopen reader, keep LiveIndex as fallback, prune persisted entries.
+                let num_files = paths.len();
                 match index.reopen_reader(index_dir) {
                     Ok(()) => {
-                        index.prune_persisted_entries();
-                        index.live.reset_dirty_count();
-                        last_save = Instant::now();
-                        eprintln!(
-                            "[trace] auto-save complete in {:.1}s ({} files on disk)",
-                            save_start.elapsed().as_secs_f64(),
-                            index.reader_file_count(),
-                        );
+                        let reader_files = index.reader_file_count();
+                        if reader_files >= num_files {
+                            index.prune_persisted_entries();
+                            index.live.reset_dirty_count();
+                            last_save = Instant::now();
+                            eprintln!(
+                                "[trace] auto-save complete in {:.1}s ({} files on disk)",
+                                save_start.elapsed().as_secs_f64(),
+                                reader_files,
+                            );
+                        } else {
+                            eprintln!(
+                                "[trace] auto-save reopen incomplete: expected {num_files} files, found {reader_files}; live overlay retained"
+                            );
+                        }
                     }
                     Err(e) => {
                         eprintln!("[trace] auto-save reopen failed: {e}, live overlay retained");
@@ -1292,12 +1300,12 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
 }
 
 /// Move index files from staging to the target directory.
-/// Data files are copied first; `meta.json` is copied last so it acts as
-/// a commit marker — if the process is interrupted, a missing or stale
-/// `meta.json` signals an incomplete publish.
+/// Files are copied in a fixed order, with `meta.json` copied last.
+/// This ordering is only a convention for publication layout; it does not
+/// provide atomic publish semantics or reader-side validation by itself.
 fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(target)?;
-    // Data files first, meta last (commit marker).
+    // Data files first, meta last.
     for name in &[
         "index.bin",
         "lookup.bin",

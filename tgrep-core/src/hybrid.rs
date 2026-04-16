@@ -154,6 +154,33 @@ impl HybridIndex {
         self.reader.all_paths().iter().cloned().collect()
     }
 
+    /// Number of files in the on-disk reader.
+    pub fn reader_file_count(&self) -> usize {
+        self.reader.num_files()
+    }
+
+    /// Remove overlay entries whose paths already exist in the on-disk reader.
+    ///
+    /// After a flush + `reopen_reader`, the reader contains a superset of the
+    /// snapshot data.  Any overlay entry that is also present in the reader is
+    /// now redundant — removing it avoids duplicate work during queries and
+    /// prevents unbounded overlay growth.  Entries added *after* the snapshot
+    /// (e.g. by the file-watcher) are preserved because they are **not** in
+    /// the reader yet.
+    pub fn prune_persisted_entries(&mut self) {
+        let reader_paths: std::collections::HashSet<&str> =
+            self.reader.all_paths().iter().map(|s| s.as_str()).collect();
+        let to_remove: Vec<String> = self
+            .live
+            .overlay_paths()
+            .into_iter()
+            .filter(|p| reader_paths.contains(p.as_str()))
+            .collect();
+        for path in &to_remove {
+            self.live.remove_overlay_entry(path);
+        }
+    }
+
     /// Produce a full snapshot merging reader + overlay for disk serialization.
     /// Reader files not superseded by overlay are included with remapped IDs.
     pub fn full_snapshot(&self) -> (Vec<String>, std::collections::HashMap<u32, Vec<u32>>) {

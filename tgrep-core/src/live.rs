@@ -291,6 +291,21 @@ impl LiveIndex {
         (owned_paths, remapped)
     }
 
+    /// Remove an overlay entry by path *without* marking it as deleted.
+    /// Used after a flush: the file is now in the on-disk reader, so we
+    /// remove the redundant overlay copy while keeping the reader copy
+    /// visible (no tombstone).
+    pub fn remove_overlay_entry(&mut self, path: &str) {
+        if let Some(&file_id) = self.path_to_id.get(path) {
+            self.remove_file_by_id(file_id);
+        }
+    }
+
+    /// Return all paths currently in the overlay.
+    pub fn overlay_paths(&self) -> Vec<String> {
+        self.path_to_id.keys().cloned().collect()
+    }
+
     fn remove_file_by_id(&mut self, file_id: u32) {
         // Remove from inverted index and masks
         let mut trigrams_to_clean = Vec::new();

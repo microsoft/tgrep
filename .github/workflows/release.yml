@@ -47,6 +47,11 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --locked --version 0.2.5
 
+      - name: Disable /CETCOMPAT for ARM64 Windows
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: echo "RUSTFLAGS=-Clink-args=/CETCOMPAT:NO" >> $env:GITHUB_ENV
+
       - name: Build release binary
         if: ${{ !matrix.use_cross }}
         run: cargo build --release --locked -p tgrep-cli --bin tgrep --target ${{ matrix.target }}

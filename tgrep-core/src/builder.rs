@@ -187,7 +187,7 @@ pub fn write_index_from_snapshot(
     let mut files_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
     for (id, path) in paths.iter().enumerate() {
-        files_file.write_all(&ondisk::encode_file_entry(id as u32, path))?;
+        files_file.write_all(&ondisk::encode_file_entry(id as u32, path)?)?;
     }
     files_file.flush()?;
 
@@ -252,7 +252,7 @@ fn write_index_v2(
     let mut files_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
     for (id, path) in file_id_map {
-        files_file.write_all(&ondisk::encode_file_entry(*id, path))?;
+        files_file.write_all(&ondisk::encode_file_entry(*id, path)?)?;
     }
     files_file.flush()?;
 

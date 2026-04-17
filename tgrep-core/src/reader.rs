@@ -35,6 +35,17 @@ impl IndexReader {
         {
             (None, None, 0)
         } else {
+            // A corrupted lookup.bin whose size is not a multiple of the fixed
+            // entry size would cause silent truncation of the trailing entry
+            // (and binary search would still see it via integer division).
+            // Reject up-front so the failure is loud and obvious.
+            if !(lookup_meta.len() as usize).is_multiple_of(LOOKUP_ENTRY_SIZE) {
+                return Err(crate::Error::IndexCorrupted(format!(
+                    "lookup.bin size {} is not a multiple of {}",
+                    lookup_meta.len(),
+                    LOOKUP_ENTRY_SIZE
+                )));
+            }
             let lookup_file = File::open(&lookup_path)?;
             let postings_file = File::open(&postings_path)?;
             // SAFETY: Files are opened read-only and the Mmap lifetime is tied to
@@ -46,14 +57,16 @@ impl IndexReader {
             (Some(lk), Some(pk), n)
         };
 
-        // Load file paths
+        // Load file paths. A truncated files.bin used to be silently accepted,
+        // resulting in queries that returned empty file paths for high IDs.
         let files_data = std::fs::read(&files_path)?;
-        let file_entries = ondisk::decode_file_entries(&files_data);
-        let mut file_paths = vec![String::new(); file_entries.len()];
+        let file_entries = ondisk::decode_file_entries(&files_data)?;
+        // Size the table to fit the largest declared id, not just the entry
+        // count, so that any future sparse-id writers don't drop entries.
+        let max_id = file_entries.iter().map(|(id, _)| *id as usize).max();
+        let mut file_paths = vec![String::new(); max_id.map(|m| m + 1).unwrap_or(0)];
         for (id, path) in file_entries {
-            if (id as usize) < file_paths.len() {
-                file_paths[id as usize] = path;
-            }
+            file_paths[id as usize] = path;
         }
 
         Ok(Self {

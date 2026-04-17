@@ -1300,9 +1300,20 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
 }
 
 /// Move index files from staging to the target directory.
-/// Files are copied in a fixed order, with `meta.json` copied last.
-/// This ordering is only a convention for publication layout; it does not
-/// provide atomic publish semantics or reader-side validation by itself.
+///
+/// Files are published in a fixed order, with `meta.json` last. This is only a
+/// convention for publication layout; it does not provide atomic publish
+/// semantics or reader-side validation by itself.
+///
+/// Performance note: this function is called while the server holds the index
+/// write lock, which blocks all search reads. Each per-file move uses
+/// `std::fs::rename` — on the same volume this is an O(microseconds)
+/// directory entry update, vs `std::fs::copy` which is O(file_size) and on a
+/// large `index.bin` (hundreds of MB) can take tens of seconds, blocking
+/// queries the whole time. Staging dirs are always created next to the target
+/// (same parent) so cross-volume cases should not arise; if rename truly
+/// fails, the error is surfaced rather than silently falling back to a slow
+/// copy under the lock (see `publish_file`).
 fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(target)?;
     // Data files first, meta last.
@@ -1315,13 +1326,68 @@ fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
     ] {
         let src = staging.join(name);
         let dst = target.join(name);
-        if src.exists() {
-            // Use copy+remove instead of rename — rename may fail across drives/volumes
-            std::fs::copy(&src, &dst)?;
-            let _ = std::fs::remove_file(&src);
+        if !src.exists() {
+            continue;
         }
+        publish_file(&src, &dst)?;
     }
     Ok(())
+}
+
+/// Publish a single staged file at `src` to `dst`.
+///
+/// Uses `std::fs::rename`, which on the same volume is an O(microseconds)
+/// directory entry update — this is the property that keeps the server's
+/// index write lock from being held for the duration of a multi-hundred-MB
+/// file copy (which previously blocked all search queries).
+///
+/// On Windows, transient sharing violations can occur after dropping an mmap
+/// (cache manager / AV / indexers may briefly hold a reference), so retry
+/// for a short window.
+///
+/// Deliberately does NOT fall back to `std::fs::copy` on persistent failure:
+/// the caller holds the index write lock and a multi-hundred-MB copy is
+/// exactly the pathology we are fixing. Staging is always created next to
+/// the target, so cross-volume cases should not arise; if rename truly
+/// cannot succeed, surfacing the error lets the caller abort cleanly
+/// rather than silently regress search latency.
+fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    const RENAME_RETRIES: u32 = 30;
+    const RENAME_BACKOFF: Duration = Duration::from_millis(50);
+
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..RENAME_RETRIES {
+        match std::fs::rename(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Retry only on transient Windows sharing violations
+                // (PermissionDenied) — other errors are likely structural.
+                let transient = cfg!(windows)
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+                    );
+                if !transient || attempt + 1 == RENAME_RETRIES {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "publish_file: rename({}, {}) failed after {} attempt(s): {e}",
+                            src.display(),
+                            dst.display(),
+                            attempt + 1,
+                        ),
+                    ));
+                }
+                last_err = Some(e);
+                thread::sleep(RENAME_BACKOFF);
+            }
+        }
+    }
+    // Unreachable: the loop either returns Ok, or returns Err on the last
+    // iteration. Defensive return preserves the last error.
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::other("publish_file: rename retries exhausted with no error recorded")
+    }))
 }
 
 fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
@@ -1374,5 +1440,69 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
         unsafe {
             signal(2, signal_handler);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_file(path: &Path, content: &[u8]) {
+        std::fs::write(path, content).expect("write_file");
+    }
+
+    #[test]
+    fn publish_file_renames_when_target_missing() {
+        let tmp = std::env::temp_dir().join(format!("tgrep_pf_a_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("src.bin");
+        let dst = tmp.join("dst.bin");
+        write_file(&src, b"hello");
+        publish_file(&src, &dst).unwrap();
+        assert!(!src.exists(), "src should be moved");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn publish_file_replaces_existing_target() {
+        let tmp = std::env::temp_dir().join(format!("tgrep_pf_b_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("src.bin");
+        let dst = tmp.join("dst.bin");
+        write_file(&src, b"new");
+        write_file(&dst, b"old");
+        publish_file(&src, &dst).unwrap();
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn move_staged_files_publishes_known_files_only() {
+        let tmp = std::env::temp_dir().join(format!("tgrep_pf_c_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let staging = tmp.join("staging");
+        let target = tmp.join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        for name in ["index.bin", "lookup.bin", "files.bin", "meta.json"] {
+            write_file(&staging.join(name), name.as_bytes());
+        }
+        write_file(&staging.join("ignored.txt"), b"nope");
+        move_staged_files(&staging, &target).unwrap();
+        for name in ["index.bin", "lookup.bin", "files.bin", "meta.json"] {
+            assert_eq!(std::fs::read(target.join(name)).unwrap(), name.as_bytes());
+            assert!(
+                !staging.join(name).exists(),
+                "{name} should be moved out of staging"
+            );
+        }
+        assert!(
+            staging.join("ignored.txt").exists(),
+            "unknown files should be left alone"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -1294,8 +1294,12 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
         return;
     }
 
-    // Open the new reader OUTSIDE any lock — this can take a moment for large
-    // indices and we don't want to block search.
+    // Open the new reader. The publish mutex is intentionally still held
+    // here so that move + open + swap form an atomic publish unit (no other
+    // publisher can interleave a rename or swap a competing reader between
+    // these steps). The server-wide `state.index` RwLock is NOT taken, so
+    // search queries continue to be served by the previous reader (whose
+    // `Arc<IndexReader>` they hold) throughout this call.
     match tgrep_core::reader::IndexReader::open(index_dir) {
         Ok(new_reader) => {
             let reader_files = new_reader.num_files();
@@ -1384,6 +1388,29 @@ fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
 /// the target, so cross-volume cases should not arise; if rename truly
 /// cannot succeed, surfacing the error lets the caller abort cleanly
 /// rather than silently regress search latency.
+/// Context wrapper that preserves the original `std::io::Error` as the
+/// `source()` of the returned error so callers can downcast through the
+/// chain to inspect `raw_os_error()` for diagnostics.
+#[derive(Debug)]
+struct PublishError {
+    ctx: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Include the underlying error in the formatted message for
+        // human-readable logging; structured access remains via `source()`.
+        write!(f, "{}: {}", self.ctx, self.source)
+    }
+}
+
+impl std::error::Error for PublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     const RENAME_RETRIES: u32 = 30;
     const RENAME_BACKOFF: Duration = Duration::from_millis(50);
@@ -1407,23 +1434,20 @@ fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
                 let transient = false;
 
                 if !transient || attempt + 1 == RENAME_RETRIES {
-                    // Preserve the original error (including raw_os_error)
-                    // by attaching context via the source chain rather than
-                    // rebuilding a new io::Error from just `e.kind()`.
-                    let raw = e.raw_os_error();
+                    // Wrap with a context error that preserves the original
+                    // `std::io::Error` as the `source()` of the returned
+                    // error, so callers can downcast through the chain to
+                    // recover `raw_os_error()` for diagnostics.
                     let ctx = format!(
-                        "publish_file: rename({}, {}) failed after {} attempt(s){}",
+                        "publish_file: rename({}, {}) failed after {} attempt(s)",
                         src.display(),
                         dst.display(),
                         attempt + 1,
-                        match raw {
-                            Some(c) => format!(" (os error {c})"),
-                            None => String::new(),
-                        },
                     );
+                    let kind = e.kind();
                     return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("{ctx}: {e}"),
+                        kind,
+                        PublishError { ctx, source: e },
                     ));
                 }
                 last_err = Some(e);
@@ -1536,6 +1560,35 @@ mod tests {
         assert!(
             msg.contains("after 1 attempt"),
             "expected fast-fail (1 attempt), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_file_preserves_original_error_via_source_chain() {
+        // The wrapped error should keep the original io::Error reachable
+        // through std::error::Error::source() so callers can recover
+        // raw_os_error() for diagnostics.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("missing.bin");
+        let dst = tmp.path().join("dst.bin");
+        let err = publish_file(&src, &dst).unwrap_err();
+
+        // Walk source chain: outer io::Error -> PublishError -> inner io::Error
+        let inner_dyn = std::error::Error::source(&err)
+            .expect("outer error should expose its inner cause");
+        let inner_io = inner_dyn
+            .downcast_ref::<std::io::Error>()
+            .or_else(|| {
+                std::error::Error::source(inner_dyn)
+                    .and_then(|s| s.downcast_ref::<std::io::Error>())
+            })
+            .expect("inner io::Error should be reachable via source chain");
+        assert_eq!(inner_io.kind(), std::io::ErrorKind::NotFound);
+        // raw_os_error is platform-specific but should be Some on the
+        // platforms we target (Windows: 2, Unix: 2). Just check it's set.
+        assert!(
+            inner_io.raw_os_error().is_some(),
+            "raw_os_error should be preserved on the inner error"
         );
     }
 

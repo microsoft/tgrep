@@ -55,7 +55,17 @@ impl HybridIndex {
         *self.reader.write().unwrap() = Arc::new(new_reader);
     }
 
-    /// Replace the reader with an empty one, releasing the current mmap.
+    /// Replace the reader with an empty one and drop this `HybridIndex`'s
+    /// reference to the previous reader.
+    ///
+    /// **Note**: this does *not* guarantee an immediate unmap of the
+    /// previous on-disk index files. Because the reader is held inside an
+    /// `Arc<IndexReader>`, the underlying mmap section is only released
+    /// once the last in-flight reference (e.g. `Arc<IndexReader>` clones
+    /// held by concurrent search queries) is dropped. Callers that need
+    /// the file handles released before, say, overwriting the underlying
+    /// files on platforms that disallow it must additionally ensure no
+    /// outstanding readers exist.
     ///
     /// Retained for callers that need the old "drop then re-open" sequence;
     /// new code should prefer `swap_reader` so there is no window during

@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -94,6 +94,15 @@ struct ServerState {
     index_total: std::sync::atomic::AtomicU64,
     /// Directories to exclude from indexing.
     exclude_dirs: Vec<String>,
+    /// Serializes on-disk index publication across all publishers
+    /// (auto-save, checkpoint, flush). Held across
+    /// `move_staged_files` + `IndexReader::open` + `swap_reader` so
+    /// that concurrent publishers cannot interleave per-file renames
+    /// into `index_dir` (which would leave a mismatched mix of
+    /// `index.bin` / `lookup.bin` / `files.bin` from different
+    /// snapshots) or swap readers out of order. Searches do **not**
+    /// take this lock, so they continue uninterrupted during a publish.
+    publish_lock: Mutex<()>,
 }
 
 struct SearchOpts {
@@ -163,6 +172,7 @@ pub fn run(
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
         exclude_dirs: exclude_dirs.to_vec(),
+        publish_lock: Mutex::new(()),
     });
 
     // Bind TCP listener on a random port
@@ -756,6 +766,11 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
             // previous reader (whose mmap stays valid until the last
             // in-flight Arc<IndexReader> is dropped) and by the live overlay
             // throughout the entire publish.
+            //
+            // Held across move + open + swap so concurrent publishers
+            // (checkpoint / flush) cannot interleave renames or swap
+            // readers out of order. Searches do not take this lock.
+            let _publish = state.publish_lock.lock().unwrap();
             let num_files = paths.len();
             if let Err(e) = move_staged_files(&staging_dir, index_dir) {
                 eprintln!("[trace] auto-save move failed: {e}");
@@ -1206,12 +1221,20 @@ fn checkpoint_index_to_disk(
         // swap in a fresh reader without taking the outer write lock.
         // Searches continue to be served by the previous reader (its mmap
         // remains valid while in-flight queries hold an Arc<IndexReader>).
+        //
+        // Held across move + open + swap so that a concurrent auto-save
+        // or stale-refresh flush cannot interleave per-file renames into
+        // `index_dir` (which would leave a mismatched on-disk index) or
+        // swap readers out of order. Searches do not take this lock.
+        let _publish = state.publish_lock.lock().unwrap();
         if let Err(e) = move_staged_files(&staging_dir, &index_dir) {
             eprintln!("[trace] warning: checkpoint move failed: {e}");
         } else {
-            // Reopen the reader so future snapshots include checkpointed files.
-            // Without this, the reader stays empty and the final flush loses
-            // all files that were only in the on-disk reader (seeded files).
+            // Reopen the reader so future snapshots stay aligned with the
+            // newly published on-disk checkpoint, including files that exist
+            // only in the checkpointed reader state (for example, seeded
+            // files). This swap is atomic — searches see the old reader
+            // until the moment it returns and then the new one afterward.
             match tgrep_core::reader::IndexReader::open(&index_dir) {
                 Ok(new_reader) => {
                     state.index.read().unwrap().swap_reader(new_reader);
@@ -1260,14 +1283,23 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
 
     // Lock-free publish: rename staging files into place, build new reader,
     // then swap. Search queries continue to be served throughout.
+    //
+    // Held across move + open + swap so concurrent publishers
+    // (auto-save / checkpoint) cannot interleave renames or swap readers
+    // out of order. Searches do not take this lock.
+    let _publish = state.publish_lock.lock().unwrap();
     if let Err(e) = move_staged_files(&staging_dir, index_dir) {
         eprintln!("[trace] warning: flush move failed: {e}");
         let _ = std::fs::remove_dir_all(&staging_dir);
         return;
     }
 
-    // Open the new reader OUTSIDE any lock — this can take a moment for large
-    // indices and we don't want to block search.
+    // Open the new reader. The publish mutex is intentionally still held
+    // here so that move + open + swap form an atomic publish unit (no other
+    // publisher can interleave a rename or swap a competing reader between
+    // these steps). The server-wide `state.index` RwLock is NOT taken, so
+    // search queries continue to be served by the previous reader (whose
+    // `Arc<IndexReader>` they hold) throughout this call.
     match tgrep_core::reader::IndexReader::open(index_dir) {
         Ok(new_reader) => {
             let reader_files = new_reader.num_files();
@@ -1343,9 +1375,12 @@ fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
 /// index write lock from being held for the duration of a multi-hundred-MB
 /// file copy (which previously blocked all search queries).
 ///
-/// On Windows, transient sharing violations can occur after dropping an mmap
-/// (cache manager / AV / indexers may briefly hold a reference), so retry
-/// for a short window.
+/// On Windows, transient sharing violations (`ERROR_SHARING_VIOLATION` = 32,
+/// `ERROR_LOCK_VIOLATION` = 33) can occur after dropping an mmap (cache
+/// manager / AV / indexers may briefly hold a reference), so retry only
+/// those specific error codes for a short window. All other errors fail
+/// fast — a broader retry surface would needlessly extend the publish
+/// window for non-transient failures.
 ///
 /// Deliberately does NOT fall back to `std::fs::copy` on persistent failure:
 /// the caller holds the index write lock and a multi-hundred-MB copy is
@@ -1353,31 +1388,66 @@ fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
 /// the target, so cross-volume cases should not arise; if rename truly
 /// cannot succeed, surfacing the error lets the caller abort cleanly
 /// rather than silently regress search latency.
+/// Context wrapper that preserves the original `std::io::Error` as the
+/// `source()` of the returned error so callers can downcast through the
+/// chain to inspect `raw_os_error()` for diagnostics.
+#[derive(Debug)]
+struct PublishError {
+    ctx: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Include the underlying error in the formatted message for
+        // human-readable logging; structured access remains via `source()`.
+        write!(f, "{}: {}", self.ctx, self.source)
+    }
+}
+
+impl std::error::Error for PublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     const RENAME_RETRIES: u32 = 30;
     const RENAME_BACKOFF: Duration = Duration::from_millis(50);
+    // Windows error codes that can transiently occur when another handle
+    // (mmap section, AV scanner, indexer) still references the target file:
+    //   ERROR_SHARING_VIOLATION = 32
+    //   ERROR_LOCK_VIOLATION    = 33
+    // Other errors (NotFound, permission/ACL issues, disk full, …) are
+    // structural and should fail fast so we don't extend the publish window.
+    #[cfg(windows)]
+    const TRANSIENT_WIN_ERRORS: &[i32] = &[32, 33];
 
     let mut last_err: Option<std::io::Error> = None;
     for attempt in 0..RENAME_RETRIES {
         match std::fs::rename(src, dst) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                // Retry only on transient Windows sharing violations
-                // (PermissionDenied) — other errors are likely structural.
-                let transient = cfg!(windows)
-                    && matches!(
-                        e.kind(),
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
-                    );
+                #[cfg(windows)]
+                let transient = matches!(e.raw_os_error(), Some(c) if TRANSIENT_WIN_ERRORS.contains(&c));
+                #[cfg(not(windows))]
+                let transient = false;
+
                 if !transient || attempt + 1 == RENAME_RETRIES {
+                    // Wrap with a context error that preserves the original
+                    // `std::io::Error` as the `source()` of the returned
+                    // error, so callers can downcast through the chain to
+                    // recover `raw_os_error()` for diagnostics.
+                    let ctx = format!(
+                        "publish_file: rename({}, {}) failed after {} attempt(s)",
+                        src.display(),
+                        dst.display(),
+                        attempt + 1,
+                    );
+                    let kind = e.kind();
                     return Err(std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "publish_file: rename({}, {}) failed after {} attempt(s): {e}",
-                            src.display(),
-                            dst.display(),
-                            attempt + 1,
-                        ),
+                        kind,
+                        PublishError { ctx, source: e },
                     ));
                 }
                 last_err = Some(e);
@@ -1448,6 +1518,7 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn write_file(path: &Path, content: &[u8]) {
         std::fs::write(path, content).expect("write_file");
@@ -1455,39 +1526,77 @@ mod tests {
 
     #[test]
     fn publish_file_renames_when_target_missing() {
-        let tmp = std::env::temp_dir().join(format!("tgrep_pf_a_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let src = tmp.join("src.bin");
-        let dst = tmp.join("dst.bin");
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
         write_file(&src, b"hello");
         publish_file(&src, &dst).unwrap();
         assert!(!src.exists(), "src should be moved");
         assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn publish_file_replaces_existing_target() {
-        let tmp = std::env::temp_dir().join(format!("tgrep_pf_b_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let src = tmp.join("src.bin");
-        let dst = tmp.join("dst.bin");
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src.bin");
+        let dst = tmp.path().join("dst.bin");
         write_file(&src, b"new");
         write_file(&dst, b"old");
         publish_file(&src, &dst).unwrap();
         assert!(!src.exists());
         assert_eq!(std::fs::read(&dst).unwrap(), b"new");
-        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn publish_file_fails_fast_on_missing_source() {
+        // NotFound is a structural error; should fail on the first attempt
+        // without any retries (regardless of platform).
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("does_not_exist.bin");
+        let dst = tmp.path().join("dst.bin");
+        let err = publish_file(&src, &dst).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("after 1 attempt"),
+            "expected fast-fail (1 attempt), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn publish_file_preserves_original_error_via_source_chain() {
+        // The wrapped error should keep the original io::Error reachable
+        // through std::error::Error::source() so callers can recover
+        // raw_os_error() for diagnostics.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("missing.bin");
+        let dst = tmp.path().join("dst.bin");
+        let err = publish_file(&src, &dst).unwrap_err();
+
+        // Walk source chain: outer io::Error -> PublishError -> inner io::Error
+        let inner_dyn = std::error::Error::source(&err)
+            .expect("outer error should expose its inner cause");
+        let inner_io = inner_dyn
+            .downcast_ref::<std::io::Error>()
+            .or_else(|| {
+                std::error::Error::source(inner_dyn)
+                    .and_then(|s| s.downcast_ref::<std::io::Error>())
+            })
+            .expect("inner io::Error should be reachable via source chain");
+        assert_eq!(inner_io.kind(), std::io::ErrorKind::NotFound);
+        // raw_os_error is platform-specific but should be Some on the
+        // platforms we target (Windows: 2, Unix: 2). Just check it's set.
+        assert!(
+            inner_io.raw_os_error().is_some(),
+            "raw_os_error should be preserved on the inner error"
+        );
     }
 
     #[test]
     fn move_staged_files_publishes_known_files_only() {
-        let tmp = std::env::temp_dir().join(format!("tgrep_pf_c_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let staging = tmp.join("staging");
-        let target = tmp.join("target");
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
         std::fs::create_dir_all(&staging).unwrap();
         for name in ["index.bin", "lookup.bin", "files.bin", "meta.json"] {
             write_file(&staging.join(name), name.as_bytes());
@@ -1505,6 +1614,5 @@ mod tests {
             staging.join("ignored.txt").exists(),
             "unknown files should be left alone"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

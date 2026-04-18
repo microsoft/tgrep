@@ -103,6 +103,14 @@ struct ServerState {
     /// snapshots) or swap readers out of order. Searches do **not**
     /// take this lock, so they continue uninterrupted during a publish.
     publish_lock: Mutex<()>,
+    /// Last-known per-file stamps (mtime + size). Used by the file
+    /// watcher to ignore notify events that don't reflect a real
+    /// content change (e.g. atime-only updates, attribute changes,
+    /// or events triggered by the search itself opening files on
+    /// some filesystems). Loaded from `filestamps.json` at startup
+    /// and refreshed after each successful flush + per watcher event
+    /// that actually mutates the index.
+    file_stamps: RwLock<std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
 }
 
 struct SearchOpts {
@@ -173,6 +181,7 @@ pub fn run(
         index_total: std::sync::atomic::AtomicU64::new(0),
         exclude_dirs: exclude_dirs.to_vec(),
         publish_lock: Mutex::new(()),
+        file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
     });
 
     // Bind TCP listener on a random port
@@ -675,6 +684,8 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
 }
 
 fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
+    use tgrep_core::meta::FileStamp;
+
     // Skip file events while the initial background index build is in progress —
     // the indexer will pick up all files itself, and the watcher would just
     // cause duplicate reindex work.
@@ -704,17 +715,61 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
             Err(_) => continue,
         };
 
-        let mut index = state.index.write().unwrap();
+        let is_remove = matches!(event.kind, EventKind::Remove(_)) || !path.exists();
 
-        if matches!(event.kind, EventKind::Remove(_)) || !path.exists() {
+        if is_remove {
+            // Only act on removals for paths we previously knew about. notify
+            // can deliver Remove events for transient/unknown paths (e.g. a
+            // build tool's temp file) and we'd otherwise spam the log.
+            if !state.file_stamps.read().unwrap().contains_key(&rel_path) {
+                continue;
+            }
             eprintln!("[trace] reindex: removed {rel_path}");
-            index.live.delete_file(&rel_path);
-        } else if path.is_file() {
-            eprintln!("[trace] reindex: modified {rel_path}");
-            index.live.update_from_disk(root, &rel_path);
+            state.index.write().unwrap().live.delete_file(&rel_path);
+            state.file_stamps.write().unwrap().remove(&rel_path);
+            if let Ok(mut cache) = state.cache.write() {
+                cache.pop(&rel_path);
+            }
+            continue;
         }
 
-        // Invalidate cache for this path
+        if !path.is_file() {
+            continue;
+        }
+
+        // Compute the file's current stamp and skip if it matches what we
+        // last indexed. notify on Windows in particular fires Modify events
+        // for atime/attribute updates, opens, etc. — re-indexing on those
+        // would re-read large files, churn the live overlay, and produce a
+        // misleading "modified" trace for files that didn't actually change.
+        let current = match std::fs::metadata(path) {
+            Ok(m) => FileStamp {
+                mtime: m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                size: m.len(),
+            },
+            Err(_) => continue,
+        };
+        if state.file_stamps.read().unwrap().get(&rel_path) == Some(&current) {
+            continue;
+        }
+
+        eprintln!("[trace] reindex: modified {rel_path}");
+        state
+            .index
+            .write()
+            .unwrap()
+            .live
+            .update_from_disk(root, &rel_path);
+        state
+            .file_stamps
+            .write()
+            .unwrap()
+            .insert(rel_path.clone(), current);
         if let Ok(mut cache) = state.cache.write() {
             cache.pop(&rel_path);
         }
@@ -984,6 +1039,10 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
         })
         .collect();
     flush_index_to_disk(state, root, index_dir, Some(&new_stamps));
+
+    // Refresh in-memory stamps so the watcher can dedupe spurious notify
+    // events for files that already match what we just published.
+    *state.file_stamps.write().unwrap() = new_stamps;
 }
 
 /// Walk the repo and populate the LiveIndex in batches in a background thread.
@@ -1143,6 +1202,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // Final (and only) flush to disk for the bulk build.
     eprintln!("[trace] persisting final index to disk...");
     let pruned = flush_index_to_disk(state, root, index_dir, Some(&stamps));
+
+    // Refresh the in-memory file_stamps so the file watcher can recognize
+    // unchanged files and skip spurious notify events (e.g. atime/attribute
+    // updates on Windows). Done even if the flush failed — the live overlay
+    // already reflects what we just indexed, and the stamps describe that.
+    *state.file_stamps.write().unwrap() = stamps;
 
     // Reclaim memory held by the indexing-time live overlay — but only when
     // the flush actually completed and `prune_persisted_entries` ran. If the

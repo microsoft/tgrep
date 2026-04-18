@@ -98,8 +98,14 @@ impl LiveIndex {
 
     /// Insert or update a file with pre-computed trigrams.
     /// This avoids extracting trigrams while holding the write lock.
-    /// Note: masks are set to all-ones (no filtering) since pre-computed
-    /// trigrams don't include mask data.
+    ///
+    /// Note: this fast path does NOT populate `self.masks`. Pre-computed
+    /// trigrams carry no mask information, so a stored entry would only
+    /// ever be the "no-filter" sentinel `(u8::MAX, u8::MAX)` — which is
+    /// exactly what `lookup_trigram_with_masks` already returns by default
+    /// when a `(trigram, file_id)` entry is missing. Skipping the insert
+    /// avoids an enormous mask map (one entry per trigram per file) during
+    /// bulk indexing without changing query results.
     pub fn upsert_file_with_trigrams(&mut self, rel_path: &str, trigrams: Vec<u32>) {
         // Remove old entry if exists
         if let Some(&old_id) = self.path_to_id.get(rel_path) {
@@ -111,13 +117,6 @@ impl LiveIndex {
 
         for &tri in &trigrams {
             self.inverted.entry(tri).or_default().insert(file_id);
-            self.masks.insert(
-                (tri, file_id),
-                trigram::TrigramMasks {
-                    loc_mask: u8::MAX,
-                    next_mask: u8::MAX,
-                },
-            );
         }
 
         self.file_paths.insert(file_id, rel_path.to_string());
@@ -200,6 +199,21 @@ impl LiveIndex {
     /// Reset the dirty counter (e.g., after saving).
     pub fn reset_dirty_count(&mut self) {
         self.dirty_count = 0;
+    }
+
+    /// Shrink internal maps to fit their current contents. Useful after a
+    /// large prune (e.g., immediately after the post-indexing flush moves
+    /// hundreds of thousands of files from the live overlay onto disk) to
+    /// release the indexing-time HashMap capacity back to the allocator.
+    pub fn shrink_to_fit(&mut self) {
+        self.inverted.shrink_to_fit();
+        for set in self.inverted.values_mut() {
+            set.shrink_to_fit();
+        }
+        self.masks.shrink_to_fit();
+        self.file_paths.shrink_to_fit();
+        self.path_to_id.shrink_to_fit();
+        self.deleted_paths.shrink_to_fit();
     }
 
     /// Get all live file IDs.

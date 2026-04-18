@@ -991,15 +991,21 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
 }
 
 /// Walk the repo and populate the LiveIndex in batches in a background thread.
-/// Uses rayon for parallel trigram extraction. Flushes to disk every
-/// FLUSH_INTERVAL or FLUSH_FILE_THRESHOLD, whichever comes first.
+/// Uses rayon for parallel trigram extraction. The bulk build is held entirely
+/// in the live overlay; only one final flush to disk happens once the walk
+/// completes. This avoids the super-linear cost of repeatedly snapshotting an
+/// ever-growing reader+overlay during indexing, and lets us release the live
+/// overlay's allocations once the data is safely on disk.
+///
+/// Trade-off: a crash during the initial build loses all in-progress work
+/// (no intermediate checkpoint to fall back to). The file watcher and
+/// auto-save loop continue to protect ongoing changes after the initial
+/// build completes.
 fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) {
     use rayon::prelude::*;
     use tgrep_core::walker::{self, WalkOptions};
 
     const BATCH_SIZE: usize = 500;
-    const FLUSH_FILE_THRESHOLD: usize = 100_000;
-    const FLUSH_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
 
     let start = Instant::now();
     eprintln!("[trace] background indexing started...");
@@ -1063,10 +1069,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         t_walk.elapsed().as_secs_f64() * 1000.0
     );
 
-    let mut files_since_flush: usize = 0;
-    let mut last_flush = Instant::now();
-    let checkpoint_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
     // Phase 2: Process new files in parallel batches
     for (batch_idx, batch) in new_files.chunks(BATCH_SIZE).enumerate() {
         // Parallel: read files + extract trigrams (no locks held)
@@ -1102,7 +1104,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
         let progress =
             seeded_count as usize + ((batch_idx + 1) * BATCH_SIZE).min(new_count as usize);
-        files_since_flush += batch.len();
         state
             .index_progress
             .store(progress as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1112,16 +1113,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 "[trace] indexing progress: ~{progress}/{total} files ({:.1}s elapsed)",
                 start.elapsed().as_secs_f64()
             );
-        }
-
-        // Periodic flush to disk (checkpoint only — don't reopen, keep accumulating in LiveIndex)
-        if files_since_flush >= FLUSH_FILE_THRESHOLD || last_flush.elapsed() >= FLUSH_INTERVAL {
-            eprintln!(
-                "[trace] flushing index to disk ({files_since_flush} files since last flush)..."
-            );
-            checkpoint_index_to_disk(state, index_dir, &checkpoint_active);
-            files_since_flush = 0;
-            last_flush = Instant::now();
         }
     }
 
@@ -1133,14 +1124,20 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         start.elapsed().as_secs_f64()
     );
 
-    // Wait for any active checkpoint thread to finish before final flush
-    while checkpoint_active.load(std::sync::atomic::Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    // Final flush to disk
+    // Final (and only) flush to disk for the bulk build.
     eprintln!("[trace] persisting final index to disk...");
     flush_index_to_disk(state, root, index_dir);
+
+    // Reclaim memory held by the indexing-time live overlay. The flush above
+    // has already pruned overlay entries that are now in the on-disk reader,
+    // but `HashMap` does not release its capacity on remove. Shrink the maps
+    // explicitly so the indexing-peak allocations don't linger for the life
+    // of the server. Files added by the watcher after the snapshot stay in
+    // the overlay and are unaffected.
+    {
+        let mut index = state.index.write().unwrap();
+        index.live.shrink_to_fit();
+    }
 
     // Write per-file stamps for ALL walked files (including content-binary
     // ones) so the stale check on next startup is accurate.
@@ -1165,93 +1162,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     state
         .indexing
         .store(false, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Checkpoint: write LiveIndex to disk for crash recovery, but do NOT reopen.
-/// Clones raw data under a brief read lock, then spawns a background thread
-/// for the expensive ID remapping and disk I/O — indexing continues unblocked.
-fn checkpoint_index_to_disk(
-    state: &Arc<ServerState>,
-    index_dir: &Path,
-    checkpoint_active: &Arc<std::sync::atomic::AtomicBool>,
-) {
-    // Skip if a previous checkpoint is still running
-    if checkpoint_active.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[trace] checkpoint skipped: previous checkpoint still running");
-        return;
-    }
-
-    let clone_start = Instant::now();
-
-    // Snapshot reader + overlay under read lock for a complete checkpoint
-    let (paths, inverted) = {
-        let index = state.index.read().unwrap();
-        let (paths, inverted) = index.full_snapshot();
-        eprintln!(
-            "[trace] checkpoint: snapshotted {} files in {:.1}ms (indexing continues)",
-            paths.len(),
-            clone_start.elapsed().as_secs_f64() * 1000.0
-        );
-        (paths, inverted)
-    };
-
-    // Spawn background thread for the expensive disk write
-    checkpoint_active.store(true, std::sync::atomic::Ordering::Relaxed);
-    let state = Arc::clone(state);
-    let index_dir = index_dir.to_path_buf();
-    let active_flag = Arc::clone(checkpoint_active);
-
-    thread::spawn(move || {
-        let flush_start = Instant::now();
-
-        let num_files = paths.len();
-
-        // Write to staging directory
-        let staging_dir = index_dir.with_file_name(".tgrep_staging");
-        if let Err(e) =
-            builder::write_index_from_snapshot(&state.root, &staging_dir, &paths, &inverted, false)
-        {
-            eprintln!("[trace] warning: checkpoint flush failed: {e}");
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            active_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-
-        // Lock-free publish: rename staging files into place, then build and
-        // swap in a fresh reader without taking the outer write lock.
-        // Searches continue to be served by the previous reader (its mmap
-        // remains valid while in-flight queries hold an Arc<IndexReader>).
-        //
-        // Held across move + open + swap so that a concurrent auto-save
-        // or stale-refresh flush cannot interleave per-file renames into
-        // `index_dir` (which would leave a mismatched on-disk index) or
-        // swap readers out of order. Searches do not take this lock.
-        let _publish = state.publish_lock.lock().unwrap();
-        if let Err(e) = move_staged_files(&staging_dir, &index_dir) {
-            eprintln!("[trace] warning: checkpoint move failed: {e}");
-        } else {
-            // Reopen the reader so future snapshots stay aligned with the
-            // newly published on-disk checkpoint, including files that exist
-            // only in the checkpointed reader state (for example, seeded
-            // files). This swap is atomic — searches see the old reader
-            // until the moment it returns and then the new one afterward.
-            match tgrep_core::reader::IndexReader::open(&index_dir) {
-                Ok(new_reader) => {
-                    state.index.read().unwrap().swap_reader(new_reader);
-                }
-                Err(e) => {
-                    eprintln!("[trace] warning: checkpoint reader reopen failed: {e}");
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(&staging_dir);
-
-        eprintln!(
-            "[trace] index checkpoint: {num_files} files written in {:.1}s",
-            flush_start.elapsed().as_secs_f64()
-        );
-        active_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-    });
 }
 
 /// Flush the current LiveIndex to disk and reopen the reader.

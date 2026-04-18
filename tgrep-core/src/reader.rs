@@ -64,6 +64,18 @@ impl IndexReader {
         })
     }
 
+    /// An empty reader that returns no results. Useful as a placeholder
+    /// when callers need to release the previous mmap before swapping in a
+    /// freshly-built reader.
+    pub fn empty() -> Self {
+        Self {
+            lookup: None,
+            postings: None,
+            file_paths: Vec::new(),
+            num_entries: 0,
+        }
+    }
+
     /// Release mmap handles so the underlying files can be overwritten (Windows).
     pub fn close(&mut self) {
         self.lookup = None;

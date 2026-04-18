@@ -750,42 +750,43 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
                 continue;
             }
 
-            // Brief write lock: swap files and reopen
-            {
-                let mut index = state.index.write().unwrap();
-                index.drop_reader();
-                if let Err(e) = move_staged_files(&staging_dir, index_dir) {
-                    eprintln!("[trace] auto-save move failed: {e}");
-                    let _ = std::fs::remove_dir_all(&staging_dir);
-                    // Try to reopen old reader; LiveIndex is still intact.
-                    if let Err(e2) = index.reopen_reader(index_dir) {
-                        eprintln!("[trace] warning: reader reopen also failed: {e2}");
-                    }
-                    continue;
-                }
-                // Reopen reader, keep LiveIndex as fallback, prune persisted entries.
-                let num_files = paths.len();
-                match index.reopen_reader(index_dir) {
-                    Ok(()) => {
-                        let reader_files = index.reader_file_count();
-                        if reader_files >= num_files {
+            // Lock-free publish: rename staging files into place, build a
+            // new IndexReader, then swap it in via a brief read lock. Search
+            // queries are NOT blocked: they continue to be served by the
+            // previous reader (whose mmap stays valid until the last
+            // in-flight Arc<IndexReader> is dropped) and by the live overlay
+            // throughout the entire publish.
+            let num_files = paths.len();
+            if let Err(e) = move_staged_files(&staging_dir, index_dir) {
+                eprintln!("[trace] auto-save move failed: {e}");
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                continue;
+            }
+            match tgrep_core::reader::IndexReader::open(index_dir) {
+                Ok(new_reader) => {
+                    let reader_files = new_reader.num_files();
+                    if reader_files >= num_files {
+                        // Swap the reader without blocking concurrent searches.
+                        state.index.read().unwrap().swap_reader(new_reader);
+                        // Brief write lock for in-memory overlay prune + dirty reset.
+                        {
+                            let mut index = state.index.write().unwrap();
                             index.prune_persisted_entries();
                             index.live.reset_dirty_count();
-                            last_save = Instant::now();
-                            eprintln!(
-                                "[trace] auto-save complete in {:.1}s ({} files on disk)",
-                                save_start.elapsed().as_secs_f64(),
-                                reader_files,
-                            );
-                        } else {
-                            eprintln!(
-                                "[trace] auto-save reopen incomplete: expected {num_files} files, found {reader_files}; live overlay retained"
-                            );
                         }
+                        last_save = Instant::now();
+                        eprintln!(
+                            "[trace] auto-save complete in {:.1}s ({reader_files} files on disk)",
+                            save_start.elapsed().as_secs_f64(),
+                        );
+                    } else {
+                        eprintln!(
+                            "[trace] auto-save reopen incomplete: expected {num_files} files, found {reader_files}; live overlay retained"
+                        );
                     }
-                    Err(e) => {
-                        eprintln!("[trace] auto-save reopen failed: {e}, live overlay retained");
-                    }
+                }
+                Err(e) => {
+                    eprintln!("[trace] auto-save reopen failed: {e}, live overlay retained");
                 }
             }
             let _ = std::fs::remove_dir_all(&staging_dir);
@@ -1201,18 +1202,23 @@ fn checkpoint_index_to_disk(
             return;
         }
 
-        // Brief write lock: drop mmap handles, move staged files, reopen reader
-        {
-            let mut index = state.index.write().unwrap();
-            index.drop_reader();
-            if let Err(e) = move_staged_files(&staging_dir, &index_dir) {
-                eprintln!("[trace] warning: checkpoint move failed: {e}");
-            }
+        // Lock-free publish: rename staging files into place, then build and
+        // swap in a fresh reader without taking the outer write lock.
+        // Searches continue to be served by the previous reader (its mmap
+        // remains valid while in-flight queries hold an Arc<IndexReader>).
+        if let Err(e) = move_staged_files(&staging_dir, &index_dir) {
+            eprintln!("[trace] warning: checkpoint move failed: {e}");
+        } else {
             // Reopen the reader so future snapshots include checkpointed files.
             // Without this, the reader stays empty and the final flush loses
             // all files that were only in the on-disk reader (seeded files).
-            if let Err(e) = index.reopen_reader(&index_dir) {
-                eprintln!("[trace] warning: checkpoint reader reopen failed: {e}");
+            match tgrep_core::reader::IndexReader::open(&index_dir) {
+                Ok(new_reader) => {
+                    state.index.read().unwrap().swap_reader(new_reader);
+                }
+                Err(e) => {
+                    eprintln!("[trace] warning: checkpoint reader reopen failed: {e}");
+                }
             }
         }
         let _ = std::fs::remove_dir_all(&staging_dir);
@@ -1252,43 +1258,39 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
         return;
     }
 
-    // Brief write lock: drop reader, move staged files, reopen
-    {
-        let mut index = state.index.write().unwrap();
-        index.drop_reader(); // release mmap handles (Windows)
-        if let Err(e) = move_staged_files(&staging_dir, index_dir) {
-            eprintln!("[trace] warning: flush move failed: {e}");
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            // Try to reopen the (old) reader so lookups don't hit None mmaps.
-            // LiveIndex is still intact as a fallback.
-            if let Err(e2) = index.reopen_reader(index_dir) {
-                eprintln!("[trace] warning: reader reopen also failed: {e2}");
-            }
-            return;
-        }
+    // Lock-free publish: rename staging files into place, build new reader,
+    // then swap. Search queries continue to be served throughout.
+    if let Err(e) = move_staged_files(&staging_dir, index_dir) {
+        eprintln!("[trace] warning: flush move failed: {e}");
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return;
+    }
 
-        // Reopen just the reader — keep LiveIndex as a safety net.
-        // If the reader is valid, prune overlay entries that are now on disk.
-        match index.reopen_reader(index_dir) {
-            Ok(()) => {
-                let reader_files = index.reader_file_count();
-                if reader_files >= num_files {
+    // Open the new reader OUTSIDE any lock — this can take a moment for large
+    // indices and we don't want to block search.
+    match tgrep_core::reader::IndexReader::open(index_dir) {
+        Ok(new_reader) => {
+            let reader_files = new_reader.num_files();
+            if reader_files >= num_files {
+                // Atomic swap — no outer write lock required.
+                state.index.read().unwrap().swap_reader(new_reader);
+                // Brief write lock for in-memory overlay maintenance only.
+                {
+                    let mut index = state.index.write().unwrap();
                     index.prune_persisted_entries();
                     index.live.reset_dirty_count();
-                    eprintln!(
-                        "[trace] flush: reader reopened ({reader_files} files), overlay pruned"
-                    );
-                } else {
-                    eprintln!(
-                        "[trace] warning: reader has {reader_files} files (expected {num_files}), keeping live overlay as fallback"
-                    );
                 }
-            }
-            Err(e) => {
+                eprintln!("[trace] flush: reader reopened ({reader_files} files), overlay pruned");
+            } else {
                 eprintln!(
-                    "[trace] warning: failed to reopen reader after flush: {e}, live overlay retained"
+                    "[trace] warning: reader has {reader_files} files (expected {num_files}), keeping live overlay as fallback"
                 );
             }
+        }
+        Err(e) => {
+            eprintln!(
+                "[trace] warning: failed to reopen reader after flush: {e}, live overlay retained"
+            );
         }
     }
     let _ = std::fs::remove_dir_all(&staging_dir);

@@ -5,10 +5,11 @@
 #   - ADO automatically checks out tgrep source to $(Build.SourcesDirectory) via 'checkout: self'
 #   - Rust is installed via RustInstaller@1 (official Microsoft ADO task)
 #   - Cargo is authenticated to ADO DeepPrompt feed via CargoAuthenticate@0
-#   - .cargo/config.toml (checked in at repo root) provides:
+#   - .github/workflows/ado-cargo-config.toml is copied to .cargo/config.toml at build time:
 #       * [registries.devdiv-deepprompt]: required by CargoAuthenticate@0 to inject credentials
+#       * [source.crates-io] replace-with: redirects crates.io to ADO feed (ADO build only)
 #       * [target.*] rustflags: BinSkim-required flags (OneBranch BA2007)
-#       * NOTE: crates.io is NOT redirected here to avoid breaking external contributor builds
+#       * NOTE: the repo-root .cargo/config.toml does NOT redirect crates.io (for external contributors)
 #   - Builds tgrep.exe for Windows x64 and arm64
 #   - Signs tgrep.exe using OneBranch signing (no ESRP service connection needed)
 #   - Packages into zip matching the GitHub release.yml naming convention
@@ -141,7 +142,6 @@ extends:
                   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
                   Copy-Item -Path $src -Destination "$dstDir\config.toml" -Force
                   Write-Host "Copied: $src -> $dstDir\config.toml"
-                  Get-Content "$dstDir\config.toml"
                 displayName: 'Copy ADO cargo config (crates.io redirect + BinSkim flags)'
 
               # ---------------------------------------------------------------
@@ -169,7 +169,7 @@ extends:
                 workingDirectory: $(Build.SourcesDirectory)
 
               # ---------------------------------------------------------------
-              # Step 6: Verify binary exists
+              # Step 7: Verify binary exists
               # ---------------------------------------------------------------
               - script: |
                   dir target\x86_64-pc-windows-msvc\release\tgrep.exe
@@ -177,7 +177,7 @@ extends:
                 workingDirectory: $(Build.SourcesDirectory)
 
               # ---------------------------------------------------------------
-              # Step 7: Sign tgrep.exe using OneBranch signing
+              # Step 8: Sign tgrep.exe using OneBranch signing
               # signing_profile: "external_distribution" = Microsoft Authenticode (CP-231522)
               # Exact filename used instead of glob to avoid accidentally signing other .exe files.
               # Reference: https://onebranch.visualstudio.com/Build/_git/OneBranch.Sign?path=/ESRP/Templates/operations
@@ -191,7 +191,7 @@ extends:
                   search_root: "$(Build.SourcesDirectory)/target/x86_64-pc-windows-msvc/release"
 
               # ---------------------------------------------------------------
-              # Step 8: Package signed binary
+              # Step 9: Package signed binary
               # Zip name matches the format used in GitHub release.yml for consistency.
               # ---------------------------------------------------------------
               - powershell: |
@@ -206,7 +206,7 @@ extends:
                 displayName: 'Package signed tgrep.exe into zip'
 
               # ---------------------------------------------------------------
-              # Step 9: Copy to OneBranch output directory
+              # Step 10: Copy to OneBranch output directory
               # This directory is automatically uploaded as a pipeline artifact by OneBranch.
               # ---------------------------------------------------------------
               - task: CopyFiles@2
@@ -217,7 +217,7 @@ extends:
                   TargetFolder: '$(Build.ArtifactStagingDirectory)/ONEBRANCH_ARTIFACT'
 
               # ---------------------------------------------------------------
-              # Step 10 (optional): Publish to GitHub Release
+              # Step 11 (optional): Publish to GitHub Release
               # Uses GitHubRelease@1 task with ADO service connection (no PAT needed).
               # ---------------------------------------------------------------
               - ${{ if eq(parameters.PublishToGitHub, true) }}:

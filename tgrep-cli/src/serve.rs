@@ -1365,7 +1365,8 @@ fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
             Ok(()) => return Ok(()),
             Err(e) => {
                 #[cfg(windows)]
-                let transient = matches!(e.raw_os_error(), Some(c) if TRANSIENT_WIN_ERRORS.contains(&c));
+                let transient =
+                    matches!(e.raw_os_error(), Some(c) if TRANSIENT_WIN_ERRORS.contains(&c));
                 #[cfg(not(windows))]
                 let transient = false;
 
@@ -1381,10 +1382,7 @@ fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
                         attempt + 1,
                     );
                     let kind = e.kind();
-                    return Err(std::io::Error::new(
-                        kind,
-                        PublishError { ctx, source: e },
-                    ));
+                    return Err(std::io::Error::new(kind, PublishError { ctx, source: e }));
                 }
                 last_err = Some(e);
                 thread::sleep(RENAME_BACKOFF);
@@ -1510,8 +1508,8 @@ mod tests {
         let err = publish_file(&src, &dst).unwrap_err();
 
         // Walk source chain: outer io::Error -> PublishError -> inner io::Error
-        let inner_dyn = std::error::Error::source(&err)
-            .expect("outer error should expose its inner cause");
+        let inner_dyn =
+            std::error::Error::source(&err).expect("outer error should expose its inner cause");
         let inner_io = inner_dyn
             .downcast_ref::<std::io::Error>()
             .or_else(|| {

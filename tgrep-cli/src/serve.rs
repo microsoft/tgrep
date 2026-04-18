@@ -967,12 +967,10 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
         start.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Persist the updated index immediately so changes survive a crash
+    // Persist the updated index immediately so changes survive a crash.
+    // Pass the freshly-walked stamps so they publish atomically with the
+    // index files.
     eprintln!("[trace] stale check: flushing updated index to disk...");
-    flush_index_to_disk(state, root, index_dir);
-
-    // Re-stamp ALL walked files (including content-binary ones) so the
-    // next startup won't treat unchanged non-indexed files as "new".
     let new_stamps: std::collections::HashMap<String, FileStamp> = current_meta
         .iter()
         .map(|fm| {
@@ -985,9 +983,7 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
             )
         })
         .collect();
-    if let Err(e) = meta::write_filestamps(&new_stamps, index_dir) {
-        eprintln!("[trace] stale check: failed to write filestamps: {e}");
-    }
+    flush_index_to_disk(state, root, index_dir, Some(&new_stamps));
 }
 
 /// Walk the repo and populate the LiveIndex in batches in a background thread.
@@ -1124,21 +1120,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         start.elapsed().as_secs_f64()
     );
 
-    // Final (and only) flush to disk for the bulk build.
-    eprintln!("[trace] persisting final index to disk...");
-    let pruned = flush_index_to_disk(state, root, index_dir);
-
-    // Reclaim memory held by the indexing-time live overlay — but only when
-    // the flush actually completed and `prune_persisted_entries` ran. If the
-    // flush failed, the overlay is still the source of truth and shrinking
-    // the indexing-sized maps would just waste the write lock with no benefit.
-    if pruned {
-        let mut index = state.index.write().unwrap();
-        index.live.shrink_to_fit();
-    }
-
-    // Write per-file stamps for ALL walked files (including content-binary
-    // ones) so the stale check on next startup is accurate.
+    // Walk filesystem metadata BEFORE the flush so we can publish the
+    // resulting per-file stamps atomically with the index files. Writing
+    // them after a successful flush would leave a multi-minute window where
+    // the index looks fully published but `filestamps.json` is missing — a
+    // server kill in that window disables incremental stale detection on
+    // the next start.
     let walk_meta = tgrep_core::walker::walk_file_metadata(root, &state.exclude_dirs);
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta
         .into_iter()
@@ -1152,8 +1139,18 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             )
         })
         .collect();
-    if let Err(e) = tgrep_core::meta::write_filestamps(&stamps, index_dir) {
-        eprintln!("[trace] warning: failed to write filestamps: {e}");
+
+    // Final (and only) flush to disk for the bulk build.
+    eprintln!("[trace] persisting final index to disk...");
+    let pruned = flush_index_to_disk(state, root, index_dir, Some(&stamps));
+
+    // Reclaim memory held by the indexing-time live overlay — but only when
+    // the flush actually completed and `prune_persisted_entries` ran. If the
+    // flush failed, the overlay is still the source of truth and shrinking
+    // the indexing-sized maps would just waste the write lock with no benefit.
+    if pruned {
+        let mut index = state.index.write().unwrap();
+        index.live.shrink_to_fit();
     }
 
     // Clear indexing flag AFTER final flush so auto-save doesn't race
@@ -1165,12 +1162,23 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 /// Flush the current LiveIndex to disk and reopen the reader.
 /// Uses fast clone + background remap so queries stay responsive.
 ///
+/// If `stamps` is `Some`, the per-file stamps are written into the staging
+/// directory and published atomically with the index files via the same
+/// `move_staged_files` step. This prevents a window where the index is
+/// fully published but `filestamps.json` is missing — a state that would
+/// disable incremental stale-detection on the next server start.
+///
 /// Returns `true` if the new reader was opened and `prune_persisted_entries`
 /// ran on the live overlay; `false` on any earlier failure (write/move/open
 /// error or partial reader). Callers can use this to decide whether
 /// follow-up work that depends on the prune (e.g. shrinking the overlay)
 /// is worth doing.
-fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) -> bool {
+fn flush_index_to_disk(
+    state: &ServerState,
+    _root: &Path,
+    index_dir: &Path,
+    stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+) -> bool {
     let flush_start = Instant::now();
 
     // Snapshot under brief read lock — use full_snapshot to merge reader + overlay
@@ -1193,6 +1201,16 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) -> b
         eprintln!("[trace] warning: flush to disk failed: {e}");
         let _ = std::fs::remove_dir_all(&staging_dir);
         return false;
+    }
+
+    // Stage filestamps alongside the index files so the subsequent move
+    // publishes them atomically. If this fails we still try to publish the
+    // index — losing only the incremental stale-check benefit on next start,
+    // not the index itself.
+    if let Some(stamps) = stamps
+        && let Err(e) = tgrep_core::meta::write_filestamps(stamps, &staging_dir)
+    {
+        eprintln!("[trace] warning: failed to write staging filestamps: {e}");
     }
 
     // Lock-free publish: rename staging files into place, build new reader,

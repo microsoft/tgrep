@@ -1126,15 +1126,13 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     // Final (and only) flush to disk for the bulk build.
     eprintln!("[trace] persisting final index to disk...");
-    flush_index_to_disk(state, root, index_dir);
+    let pruned = flush_index_to_disk(state, root, index_dir);
 
-    // Reclaim memory held by the indexing-time live overlay. The flush above
-    // has already pruned overlay entries that are now in the on-disk reader,
-    // but `HashMap` does not release its capacity on remove. Shrink the maps
-    // explicitly so the indexing-peak allocations don't linger for the life
-    // of the server. Files added by the watcher after the snapshot stay in
-    // the overlay and are unaffected.
-    {
+    // Reclaim memory held by the indexing-time live overlay — but only when
+    // the flush actually completed and `prune_persisted_entries` ran. If the
+    // flush failed, the overlay is still the source of truth and shrinking
+    // the indexing-sized maps would just waste the write lock with no benefit.
+    if pruned {
         let mut index = state.index.write().unwrap();
         index.live.shrink_to_fit();
     }
@@ -1166,7 +1164,13 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
 /// Flush the current LiveIndex to disk and reopen the reader.
 /// Uses fast clone + background remap so queries stay responsive.
-fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
+///
+/// Returns `true` if the new reader was opened and `prune_persisted_entries`
+/// ran on the live overlay; `false` on any earlier failure (write/move/open
+/// error or partial reader). Callers can use this to decide whether
+/// follow-up work that depends on the prune (e.g. shrinking the overlay)
+/// is worth doing.
+fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) -> bool {
     let flush_start = Instant::now();
 
     // Snapshot under brief read lock — use full_snapshot to merge reader + overlay
@@ -1188,7 +1192,7 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
     {
         eprintln!("[trace] warning: flush to disk failed: {e}");
         let _ = std::fs::remove_dir_all(&staging_dir);
-        return;
+        return false;
     }
 
     // Lock-free publish: rename staging files into place, build new reader,
@@ -1201,7 +1205,7 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
     if let Err(e) = move_staged_files(&staging_dir, index_dir) {
         eprintln!("[trace] warning: flush move failed: {e}");
         let _ = std::fs::remove_dir_all(&staging_dir);
-        return;
+        return false;
     }
 
     // Open the new reader. The publish mutex is intentionally still held
@@ -1210,7 +1214,7 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
     // these steps). The server-wide `state.index` RwLock is NOT taken, so
     // search queries continue to be served by the previous reader (whose
     // `Arc<IndexReader>` they hold) throughout this call.
-    match tgrep_core::reader::IndexReader::open(index_dir) {
+    let pruned = match tgrep_core::reader::IndexReader::open(index_dir) {
         Ok(new_reader) => {
             let reader_files = new_reader.num_files();
             if reader_files >= num_files {
@@ -1223,24 +1227,28 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
                     index.live.reset_dirty_count();
                 }
                 eprintln!("[trace] flush: reader reopened ({reader_files} files), overlay pruned");
+                true
             } else {
                 eprintln!(
                     "[trace] warning: reader has {reader_files} files (expected {num_files}), keeping live overlay as fallback"
                 );
+                false
             }
         }
         Err(e) => {
             eprintln!(
                 "[trace] warning: failed to reopen reader after flush: {e}, live overlay retained"
             );
+            false
         }
-    }
+    };
     let _ = std::fs::remove_dir_all(&staging_dir);
 
     eprintln!(
         "[trace] index flushed: {num_files} files on disk in {:.1}s",
         flush_start.elapsed().as_secs_f64()
     );
+    pruned
 }
 
 /// Move index files from staging to the target directory.

@@ -201,15 +201,21 @@ impl LiveIndex {
         self.dirty_count = 0;
     }
 
-    /// Shrink internal maps to fit their current contents. Useful after a
-    /// large prune (e.g., immediately after the post-indexing flush moves
-    /// hundreds of thousands of files from the live overlay onto disk) to
-    /// release the indexing-time HashMap capacity back to the allocator.
+    /// Shrink the top-level overlay maps to fit their current contents.
+    /// Useful after a large prune (e.g., immediately after the post-indexing
+    /// flush moves hundreds of thousands of files from the live overlay onto
+    /// disk) to release the indexing-time HashMap capacity back to the
+    /// allocator.
+    ///
+    /// Intentionally only shrinks the top-level maps. The per-trigram
+    /// posting `HashSet`s are typically emptied by `prune_persisted_entries`
+    /// (which removes them from `inverted` outright when they go empty), so
+    /// iterating every remaining set to call `shrink_to_fit` adds work
+    /// proportional to the trigram count under the global write lock with
+    /// little memory benefit. Callers that need the deeper compaction can
+    /// use a follow-up pass.
     pub fn shrink_to_fit(&mut self) {
         self.inverted.shrink_to_fit();
-        for set in self.inverted.values_mut() {
-            set.shrink_to_fit();
-        }
         self.masks.shrink_to_fit();
         self.file_paths.shrink_to_fit();
         self.path_to_id.shrink_to_fit();

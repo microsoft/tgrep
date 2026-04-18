@@ -39,7 +39,11 @@ impl IndexReader {
             // entry size would cause silent truncation of the trailing entry
             // (and binary search would still see it via integer division).
             // Reject up-front so the failure is loud and obvious.
-            if !(lookup_meta.len() as usize).is_multiple_of(LOOKUP_ENTRY_SIZE) {
+            //
+            // Do the modulo in u64 (file sizes are u64) so a >4GiB file on
+            // 32-bit targets isn't truncated by an `as usize` cast before
+            // the validation runs.
+            if lookup_meta.len() % (LOOKUP_ENTRY_SIZE as u64) != 0 {
                 return Err(crate::Error::IndexCorrupted(format!(
                     "lookup.bin size {} is not a multiple of {}",
                     lookup_meta.len(),
@@ -61,10 +65,31 @@ impl IndexReader {
         // resulting in queries that returned empty file paths for high IDs.
         let files_data = std::fs::read(&files_path)?;
         let file_entries = ondisk::decode_file_entries(&files_data)?;
-        // Size the table to fit the largest declared id, not just the entry
-        // count, so that any future sparse-id writers don't drop entries.
-        let max_id = file_entries.iter().map(|(id, _)| *id as usize).max();
-        let mut file_paths = vec![String::new(); max_id.map(|m| m + 1).unwrap_or(0)];
+
+        // Validate that file IDs are dense (0..N) with no duplicates.
+        // Without this, a corrupted files.bin declaring an id like
+        // u32::MAX would cause `vec![String::new(); max_id + 1]` to attempt
+        // a multi-GiB allocation and likely OOM/crash. Current writers
+        // always assign dense IDs starting at 0, so this is a strict
+        // tightening of the format invariant rather than a behavior change.
+        let n = file_entries.len();
+        let mut seen = vec![false; n];
+        for (id, _) in &file_entries {
+            let idx = *id as usize;
+            if idx >= n {
+                return Err(crate::Error::IndexCorrupted(format!(
+                    "files.bin contains out-of-range file_id {id} (entry count = {n}); \
+                     IDs must be dense in 0..{n}"
+                )));
+            }
+            if seen[idx] {
+                return Err(crate::Error::IndexCorrupted(format!(
+                    "files.bin contains duplicate file_id {id}"
+                )));
+            }
+            seen[idx] = true;
+        }
+        let mut file_paths = vec![String::new(); n];
         for (id, path) in file_entries {
             file_paths[id as usize] = path;
         }
@@ -187,5 +212,107 @@ impl IndexReader {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    /// Write a minimal trio of index files so `IndexReader::open` runs the
+    /// validation paths we want to exercise.
+    fn write_index(
+        dir: &Path,
+        lookup_bytes: &[u8],
+        postings_bytes: &[u8],
+        files_bytes: &[u8],
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("lookup.bin")).unwrap();
+        f.write_all(lookup_bytes).unwrap();
+        let mut f = std::fs::File::create(dir.join("index.bin")).unwrap();
+        f.write_all(postings_bytes).unwrap();
+        let mut f = std::fs::File::create(dir.join("files.bin")).unwrap();
+        f.write_all(files_bytes).unwrap();
+    }
+
+    fn open_err(dir: &Path) -> crate::Error {
+        match IndexReader::open(dir) {
+            Ok(_) => panic!("expected IndexReader::open to fail"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn open_rejects_lookup_with_non_multiple_size() {
+        let tmp = TempDir::new().unwrap();
+        // 1 byte short of a single LOOKUP_ENTRY_SIZE-sized record.
+        let lookup = vec![0u8; LOOKUP_ENTRY_SIZE - 1];
+        // postings non-empty so we get past the `len() == 0` short-circuit.
+        let postings = vec![0u8; POSTING_ENTRY_SIZE];
+        write_index(tmp.path(), &lookup, &postings, &[]);
+        match open_err(tmp.path()) {
+            crate::Error::IndexCorrupted(msg) => {
+                assert!(
+                    msg.contains("lookup.bin"),
+                    "expected lookup.bin diagnostic, got: {msg}"
+                );
+            }
+            other => panic!("expected IndexCorrupted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_accepts_empty_index() {
+        // Both lookup.bin and postings.bin are zero-length: legitimate case
+        // for a freshly-created server with no files indexed yet.
+        let tmp = TempDir::new().unwrap();
+        write_index(tmp.path(), &[], &[], &[]);
+        let reader = IndexReader::open(tmp.path()).expect("empty index should open");
+        assert_eq!(reader.num_entries, 0);
+        assert!(reader.file_paths.is_empty());
+    }
+
+    #[test]
+    fn open_rejects_files_with_out_of_range_id() {
+        let tmp = TempDir::new().unwrap();
+        // Single record whose declared file_id (5) is past entry count (1).
+        // Without the dense-id check this would attempt to allocate a
+        // `Vec<String>` of size 6 for a single entry — and a u32::MAX id
+        // would attempt a multi-GiB allocation.
+        let entry = ondisk::encode_file_entry(5, "a.rs").unwrap();
+        write_index(tmp.path(), &[], &[], &entry);
+        match open_err(tmp.path()) {
+            crate::Error::IndexCorrupted(msg) => assert!(msg.contains("out-of-range")),
+            other => panic!("expected IndexCorrupted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_files_with_duplicate_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut buf = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        buf.extend_from_slice(&ondisk::encode_file_entry(0, "b.rs").unwrap());
+        write_index(tmp.path(), &[], &[], &buf);
+        match open_err(tmp.path()) {
+            crate::Error::IndexCorrupted(msg) => assert!(msg.contains("duplicate")),
+            other => panic!("expected IndexCorrupted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_accepts_dense_files_table() {
+        let tmp = TempDir::new().unwrap();
+        let mut buf = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        buf.extend_from_slice(&ondisk::encode_file_entry(1, "b.rs").unwrap());
+        buf.extend_from_slice(&ondisk::encode_file_entry(2, "c.rs").unwrap());
+        write_index(tmp.path(), &[], &[], &buf);
+        let reader = IndexReader::open(tmp.path()).expect("dense IDs should be accepted");
+        assert_eq!(reader.file_paths.len(), 3);
+        assert_eq!(reader.file_paths[0], "a.rs");
+        assert_eq!(reader.file_paths[1], "b.rs");
+        assert_eq!(reader.file_paths[2], "c.rs");
     }
 }

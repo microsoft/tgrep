@@ -88,11 +88,21 @@ pub(crate) const MAX_PATH_LEN: usize = u16::MAX as usize;
 pub(crate) fn encode_file_entry(file_id: u32, path: &str) -> crate::Result<Vec<u8>> {
     let path_bytes = path.as_bytes();
     if path_bytes.len() > MAX_PATH_LEN {
+        // Avoid embedding a 64KiB+ path into the error message (memory
+        // pressure and log spam, and potentially echoes untrusted content).
+        // Include only the length and a short prefix for diagnostics.
+        const PREVIEW: usize = 80;
+        let preview_end = path
+            .char_indices()
+            .take_while(|(i, _)| *i < PREVIEW)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
         return Err(crate::Error::IndexCorrupted(format!(
-            "path too long for index ({} bytes, max {}): {}",
+            "path too long for index ({} bytes, max {}): \"{}…\"",
             path_bytes.len(),
             MAX_PATH_LEN,
-            path
+            &path[..preview_end],
         )));
     }
     let path_len = path_bytes.len() as u16;

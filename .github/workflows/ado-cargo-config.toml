@@ -1,0 +1,28 @@
+# ADO-only Cargo config for sign-and-release pipeline.
+# This file is used exclusively by .github/workflows/sign-and-release.yml
+# and is NOT the repo-root .cargo/config.toml (which intentionally does NOT
+# redirect crates.io, to avoid breaking external contributor builds).
+#
+# Redirect crates.io to ADO DeepPrompt Cargo feed (devdiv org-scoped).
+# Feed: https://dev.azure.com/devdiv/_artifacts/feed/DeepPrompt
+#
+# CargoAuthenticate@0 requires a [registries] table to inject credentials.
+# The [source.*] section redirects crates.io lookups to the same feed.
+
+[registries.devdiv-deepprompt]
+index = "sparse+https://pkgs.dev.azure.com/devdiv/_packaging/DeepPrompt/Cargo/index/"
+
+[source.crates-io]
+replace-with = "devdiv-deepprompt"
+
+[source.devdiv-deepprompt]
+registry = "sparse+https://pkgs.dev.azure.com/devdiv/_packaging/DeepPrompt/Cargo/index/"
+
+# BinSkim compliance flags (OneBranch BA2007)
+# x86_64: /CETCOMPAT is supported (Intel CET hardware feature)
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ccontrol-flow-guard", "-Ctarget-feature=+crt-static", "-Clink-args=/DYNAMICBASE /CETCOMPAT"]
+
+# arm64: /CETCOMPAT is NOT supported on ARM64, omit it
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-Ccontrol-flow-guard", "-Ctarget-feature=+crt-static", "-Clink-args=/DYNAMICBASE"]

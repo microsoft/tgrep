@@ -130,31 +130,41 @@ extends:
                 displayName: 'Verify Rust version'
 
               # ---------------------------------------------------------------
-              # Step 4: Copy ADO-specific .cargo/config.toml into place.
-              # .github/workflows/ado-cargo-config.toml redirects crates.io to the
-              # ADO DeepPrompt feed and includes BinSkim rustflags. It is separate
-              # from the repo-root .cargo/config.toml (which intentionally does NOT
-              # redirect crates.io, to avoid breaking external contributor builds).
+              # Step 4: Write ADO-specific .cargo/config.toml.
+              # OneBranch uses windows_build_container which strips .git and
+              # uses partial clone (--filter=blob:none), so file blobs are not
+              # on disk and git commands fail. We write the config inline here.
+              # (ado-cargo-config.toml in this directory was the former source
+              # of truth; it has been removed since it is no longer referenced.)
               # ---------------------------------------------------------------
               - powershell: |
                   $dstDir = "$(Build.SourcesDirectory)\.cargo"
                   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-                  $content = git -C "$(Build.SourcesDirectory)" show HEAD:.github/workflows/ado-cargo-config.toml
-                  if ($LASTEXITCODE -ne 0) { throw "git show failed with exit code $LASTEXITCODE" }
-                  [System.IO.File]::WriteAllText("$dstDir\config.toml", ($content -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
-                  Write-Host "Written: $dstDir\config.toml"
-                displayName: 'Copy ADO cargo config (crates.io redirect + BinSkim flags)'
+                  $lines = @(
+                    '[registries.devdiv-deepprompt]',
+                    'index = "sparse+https://pkgs.dev.azure.com/devdiv/_packaging/DeepPrompt/Cargo/index/"',
+                    '',
+                    '[source.crates-io]',
+                    'replace-with = "devdiv-deepprompt"',
+                    '',
+                    '[source.devdiv-deepprompt]',
+                    'registry = "sparse+https://pkgs.dev.azure.com/devdiv/_packaging/DeepPrompt/Cargo/index/"',
+                    '',
+                    '[target.x86_64-pc-windows-msvc]',
+                    'rustflags = ["-Ccontrol-flow-guard", "-Ctarget-feature=+crt-static", "-Clink-args=/DYNAMICBASE /CETCOMPAT"]',
+                    '',
+                    '[target.aarch64-pc-windows-msvc]',
+                    'rustflags = ["-Ccontrol-flow-guard", "-Ctarget-feature=+crt-static", "-Clink-args=/DYNAMICBASE"]'
+                  )
+                  $configPath = "$dstDir\config.toml"
+                  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+                  $content = [string]::Join([Environment]::NewLine, $lines)
+                  [System.IO.File]::WriteAllText($configPath, $content, $utf8NoBom)
+                  Write-Host "Written: $configPath"
+                displayName: 'Write ADO cargo config (crates.io redirect + BinSkim flags)'
 
               # ---------------------------------------------------------------
               # Step 5: Authenticate with ADO DeepPrompt Cargo feed.
-              # CargoAuthenticate@0 reads .cargo/config.toml and injects credentials
-              # for all ADO registries listed there (ado-cargo-config.toml defines
-              #   - the ADO registry definition used by CargoAuthenticate@0
-              #   - BinSkim-required rustflags (OneBranch BA2007)
-              #   - crates.io remains the default registry; no source replacement is configured
-              # in the repo-root .cargo/config.toml). This is the official Microsoft
-              # way to authenticate cargo to ADO Artifact feeds.
-              # Reference: rust.sdk.sample, rust.msrustup pipelines
               # ---------------------------------------------------------------
               - task: CargoAuthenticate@0
                 displayName: 'Authenticate with ADO DeepPrompt Cargo feed'
@@ -270,11 +280,28 @@ extends:
               - powershell: |
                   $dstDir = "$(Build.SourcesDirectory)\.cargo"
                   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-                  $content = git -C "$(Build.SourcesDirectory)" show HEAD:.github/workflows/ado-cargo-config.toml
-                  if ($LASTEXITCODE -ne 0) { throw "git show failed with exit code $LASTEXITCODE" }
-                  [System.IO.File]::WriteAllText("$dstDir\config.toml", ($content -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
-                  Write-Host "Written: $dstDir\config.toml"
-                displayName: 'Copy ADO cargo config (crates.io redirect + BinSkim flags)'
+                  $lines = @(
+                    '[registries.devdiv-deepprompt]',
+                    'index = "sparse+https://pkgs.dev.azure.com/devdiv/_packaging/DeepPrompt/Cargo/index/"',
+                    '',
+                    '[source.crates-io]',
+                    'replace-with = "devdiv-deepprompt"',
+                    '',
+                    '[source.devdiv-deepprompt]',
+                    'registry = "sparse+https://pkgs.dev.azure.com/devdiv/_packaging/DeepPrompt/Cargo/index/"',
+                    '',
+                    '[target.x86_64-pc-windows-msvc]',
+                    'rustflags = ["-Ccontrol-flow-guard", "-Ctarget-feature=+crt-static", "-Clink-args=/DYNAMICBASE /CETCOMPAT"]',
+                    '',
+                    '[target.aarch64-pc-windows-msvc]',
+                    'rustflags = ["-Ccontrol-flow-guard", "-Ctarget-feature=+crt-static", "-Clink-args=/DYNAMICBASE"]'
+                  )
+                  $configPath = "$dstDir\config.toml"
+                  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+                  $content = [string]::Join([Environment]::NewLine, $lines)
+                  [System.IO.File]::WriteAllText($configPath, $content, $utf8NoBom)
+                  Write-Host "Written: $configPath"
+                displayName: 'Write ADO cargo config (crates.io redirect + BinSkim flags)'
 
               - task: CargoAuthenticate@0
                 displayName: 'Authenticate with ADO DeepPrompt Cargo feed'

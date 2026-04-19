@@ -139,7 +139,9 @@ extends:
               - powershell: |
                   $dstDir = "$(Build.SourcesDirectory)\.cargo"
                   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-                  git -C "$(Build.SourcesDirectory)" show HEAD:.github/workflows/ado-cargo-config.toml | Out-File -FilePath "$dstDir\config.toml" -Encoding utf8NoBOM
+                  $content = git -C "$(Build.SourcesDirectory)" show HEAD:.github/workflows/ado-cargo-config.toml
+                  if ($LASTEXITCODE -ne 0) { throw "git show failed with exit code $LASTEXITCODE" }
+                  [System.IO.File]::WriteAllText("$dstDir\config.toml", ($content -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
                   Write-Host "Written: $dstDir\config.toml"
                 displayName: 'Copy ADO cargo config (crates.io redirect + BinSkim flags)'
 
@@ -268,7 +270,9 @@ extends:
               - powershell: |
                   $dstDir = "$(Build.SourcesDirectory)\.cargo"
                   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-                  git -C "$(Build.SourcesDirectory)" show HEAD:.github/workflows/ado-cargo-config.toml | Out-File -FilePath "$dstDir\config.toml" -Encoding utf8NoBOM
+                  $content = git -C "$(Build.SourcesDirectory)" show HEAD:.github/workflows/ado-cargo-config.toml
+                  if ($LASTEXITCODE -ne 0) { throw "git show failed with exit code $LASTEXITCODE" }
+                  [System.IO.File]::WriteAllText("$dstDir\config.toml", ($content -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
                   Write-Host "Written: $dstDir\config.toml"
                 displayName: 'Copy ADO cargo config (crates.io redirect + BinSkim flags)'
 

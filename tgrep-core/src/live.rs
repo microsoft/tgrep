@@ -346,6 +346,44 @@ impl LiveIndex {
         }
     }
 
+    /// Remove many overlay entries in one pass. Vastly faster than calling
+    /// `remove_overlay_entry` in a loop on large overlays: a single retain
+    /// over `inverted` and a single retain over `masks`, vs O(N) retains
+    /// each touching every trigram. When *all* overlay entries are being
+    /// removed (the common case after a successful bulk flush), the maps
+    /// are simply cleared instead.
+    pub fn batch_remove_overlay_entries(&mut self, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        // Resolve paths to file_ids; also remove from file_paths / path_to_id.
+        let mut ids: HashSet<u32> = HashSet::with_capacity(paths.len());
+        for p in paths {
+            if let Some(file_id) = self.path_to_id.remove(p) {
+                self.file_paths.remove(&file_id);
+                ids.insert(file_id);
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        // Fast path: removing the entire overlay. Drop everything wholesale —
+        // O(map size) drop instead of O(map size * removed paths) retains.
+        if self.path_to_id.is_empty() {
+            self.inverted.clear();
+            self.masks.clear();
+            return;
+        }
+        // Single retain over inverted: remove all matching ids from each
+        // posting set in one pass; drop empty posting sets.
+        self.inverted.retain(|_, set| {
+            set.retain(|fid| !ids.contains(fid));
+            !set.is_empty()
+        });
+        // Single retain over masks: drop any (tri, fid) where fid was removed.
+        self.masks.retain(|&(_, fid), _| !ids.contains(&fid));
+    }
+
     /// Return all paths currently in the overlay.
     pub fn overlay_paths(&self) -> Vec<String> {
         self.path_to_id.keys().cloned().collect()

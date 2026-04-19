@@ -225,9 +225,12 @@ impl HybridIndex {
             .into_iter()
             .filter(|p| reader_paths.contains(p.as_str()))
             .collect();
-        for path in &to_remove {
-            self.live.remove_overlay_entry(path);
-        }
+        // Single batched pass instead of one full retain-over-inverted +
+        // retain-over-masks per file. On a 285k-file overlay with ~1M
+        // trigram entries this is the difference between minutes (under
+        // the write lock, blocking all searches) and a fraction of a
+        // second.
+        self.live.batch_remove_overlay_entries(&to_remove);
     }
 
     /// Produce a full snapshot merging reader + overlay for disk serialization.

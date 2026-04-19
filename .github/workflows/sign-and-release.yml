@@ -5,20 +5,20 @@
 #   - ADO automatically checks out tgrep source to $(Build.SourcesDirectory) via 'checkout: self'
 #   - Rust is installed via RustInstaller@1 (official Microsoft ADO task)
 #   - Cargo is authenticated to ADO DeepPrompt feed via CargoAuthenticate@0
-#   - .cargo/config.toml (checked in at repo root) provides:
+#   - .github/workflows/ado-cargo-config.toml is copied to .cargo/config.toml at build time:
 #       * [registries.devdiv-deepprompt]: required by CargoAuthenticate@0 to inject credentials
+#       * [source.crates-io] replace-with: redirects crates.io to ADO feed (ADO build only)
 #       * [target.*] rustflags: BinSkim-required flags (OneBranch BA2007)
-#       * NOTE: crates.io is NOT redirected here to avoid breaking external contributor builds
-#   - Builds tgrep.exe for Windows x64
+#       * NOTE: the repo-root .cargo/config.toml does NOT redirect crates.io (for external contributors)
+#   - Builds tgrep.exe for Windows x64 and arm64
 #   - Signs tgrep.exe using OneBranch signing (no ESRP service connection needed)
 #   - Packages into zip matching the GitHub release.yml naming convention
 #   - Optionally uploads signed zip to GitHub Release via GitHubRelease@1 ADO task
 #
 # Prerequisites:
 #   - DeepPrompt ADO project must have access to OneBranch.Pipelines/GovernedTemplates repo
-#   - Create a GitHub service connection named 'tgrep-github' in ADO project settings:
-#       Project Settings → Service connections → New → GitHub → OAuth
-#       (OAuth is recommended: no expiry, auto-renews; authorizing account needs write access to microsoft/tgrep)
+#   - GitHub service connection 'github.com_msftsiwei_microsoftsso' must exist in ADO project settings
+#     (Project Settings → Service connections → GitHub → OAuth/PAT)
 #
 # Reference repos:
 #   - microsoft/ripgrep-prebuilt: same pattern (Rust + ADO + 1ES + GitHubRelease@1 publish)
@@ -80,8 +80,11 @@ extends:
 
     stages:
       - stage: build_and_sign
-        displayName: 'Build and Sign tgrep Windows Binary'
+        displayName: 'Build and Sign tgrep Windows Binaries'
         jobs:
+          # ---------------------------------------------------------------
+          # Job 1: Windows x64 (x86_64-pc-windows-msvc)
+          # ---------------------------------------------------------------
           - job: build_sign_windows
             displayName: 'Build tgrep Windows x64 + Sign'
             timeoutInMinutes: 120
@@ -127,9 +130,28 @@ extends:
                 displayName: 'Verify Rust version'
 
               # ---------------------------------------------------------------
-              # Step 4: Authenticate with ADO DeepPrompt Cargo feed.
+              # Step 4: Copy ADO-specific .cargo/config.toml into place.
+              # .github/workflows/ado-cargo-config.toml redirects crates.io to the
+              # ADO DeepPrompt feed and includes BinSkim rustflags. It is separate
+              # from the repo-root .cargo/config.toml (which intentionally does NOT
+              # redirect crates.io, to avoid breaking external contributor builds).
+              # ---------------------------------------------------------------
+              - powershell: |
+                  $src = "$(Build.SourcesDirectory)\.github\workflows\ado-cargo-config.toml"
+                  $dstDir = "$(Build.SourcesDirectory)\.cargo"
+                  New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+                  Copy-Item -Path $src -Destination "$dstDir\config.toml" -Force
+                  Write-Host "Copied: $src -> $dstDir\config.toml"
+                displayName: 'Copy ADO cargo config (crates.io redirect + BinSkim flags)'
+
+              # ---------------------------------------------------------------
+              # Step 5: Authenticate with ADO DeepPrompt Cargo feed.
               # CargoAuthenticate@0 reads .cargo/config.toml and injects credentials
-              # for all ADO registries listed there. This is the official Microsoft
+              # for all ADO registries listed there (ado-cargo-config.toml defines
+              #   - the ADO registry definition used by CargoAuthenticate@0
+              #   - BinSkim-required rustflags (OneBranch BA2007)
+              #   - crates.io remains the default registry; no source replacement is configured
+              # in the repo-root .cargo/config.toml). This is the official Microsoft
               # way to authenticate cargo to ADO Artifact feeds.
               # Reference: rust.sdk.sample, rust.msrustup pipelines
               # ---------------------------------------------------------------
@@ -139,10 +161,7 @@ extends:
                   configFile: '.cargo/config.toml'
 
               # ---------------------------------------------------------------
-              # Step 5: Build Windows x64 release binary
-              # .cargo/config.toml (checked in at repo root) provides:
-              #   - crates.io redirect to ADO DeepPrompt Cargo feed
-              #   - BinSkim-required rustflags (OneBranch BA2007)
+              # Step 6: Build Windows x64 release binary
               # ---------------------------------------------------------------
               - script: |
                   cargo build --release --locked -p tgrep-cli --bin tgrep --target x86_64-pc-windows-msvc
@@ -150,7 +169,7 @@ extends:
                 workingDirectory: $(Build.SourcesDirectory)
 
               # ---------------------------------------------------------------
-              # Step 6: Verify binary exists
+              # Step 7: Verify binary exists
               # ---------------------------------------------------------------
               - script: |
                   dir target\x86_64-pc-windows-msvc\release\tgrep.exe
@@ -158,7 +177,7 @@ extends:
                 workingDirectory: $(Build.SourcesDirectory)
 
               # ---------------------------------------------------------------
-              # Step 7: Sign tgrep.exe using OneBranch signing
+              # Step 8: Sign tgrep.exe using OneBranch signing
               # signing_profile: "external_distribution" = Microsoft Authenticode (CP-231522)
               # Exact filename used instead of glob to avoid accidentally signing other .exe files.
               # Reference: https://onebranch.visualstudio.com/Build/_git/OneBranch.Sign?path=/ESRP/Templates/operations
@@ -172,7 +191,7 @@ extends:
                   search_root: "$(Build.SourcesDirectory)/target/x86_64-pc-windows-msvc/release"
 
               # ---------------------------------------------------------------
-              # Step 8: Package signed binary
+              # Step 9: Package signed binary
               # Zip name matches the format used in GitHub release.yml for consistency.
               # ---------------------------------------------------------------
               - powershell: |
@@ -187,7 +206,7 @@ extends:
                 displayName: 'Package signed tgrep.exe into zip'
 
               # ---------------------------------------------------------------
-              # Step 9: Copy to OneBranch output directory
+              # Step 10: Copy to OneBranch output directory
               # This directory is automatically uploaded as a pipeline artifact by OneBranch.
               # ---------------------------------------------------------------
               - task: CopyFiles@2
@@ -198,28 +217,14 @@ extends:
                   TargetFolder: '$(Build.ArtifactStagingDirectory)/ONEBRANCH_ARTIFACT'
 
               # ---------------------------------------------------------------
-              # Step 10 (optional): Publish to GitHub Release
-              # Pattern from microsoft/ripgrep-prebuilt/build/publish.yml.
+              # Step 11 (optional): Publish to GitHub Release
               # Uses GitHubRelease@1 task with ADO service connection (no PAT needed).
-              #
-              # Prerequisites (one-time setup by ADO project admin):
-              #   1. Go to: DeepPrompt ADO project → Project Settings → Service connections
-              #   2. Click "New service connection" → choose "GitHub"
-              #   3. Authentication: "OAuth" (recommended) or "Personal Access Token"
-              #      - OAuth: authorize via GitHub OAuth app (no expiry, auto-renews)
-              #      - PAT: GitHub PAT with repo scope (expires, needs manual renewal)
-              #   4. Name the connection exactly: "tgrep-github"
-              #      (must match gitHubConnection value below)
-              #   5. Grant access to pipeline: check "Grant access permission to all pipelines"
-              #      or explicitly allow this pipeline
-              #
-              # Keep PublishToGitHub=false until signing is verified end-to-end.
               # ---------------------------------------------------------------
               - ${{ if eq(parameters.PublishToGitHub, true) }}:
                 - task: GitHubRelease@1
                   displayName: 'Publish signed binary to GitHub Release'
                   inputs:
-                    gitHubConnection: 'tgrep-github'   # ADO service connection name (see prerequisites above)
+                    gitHubConnection: 'github.com_msftsiwei_microsoftsso'
                     repositoryName: 'microsoft/tgrep'
                     action: 'edit'
                     target: '$(Build.SourceVersion)'
@@ -227,4 +232,100 @@ extends:
                     tag: '$(TGREP_TAG)'
                     assets: '$(Build.ArtifactStagingDirectory)/*.zip'
                     assetUploadMode: 'replace'
-                    addChangeLog: true
+                    addChangeLog: false
+
+          # ---------------------------------------------------------------
+          # Job 2: Windows arm64 (aarch64-pc-windows-msvc)
+          # Cross-compiled on x64 Windows host using MSVC arm64 cross-compiler.
+          # ---------------------------------------------------------------
+          - job: build_sign_windows_arm64
+            displayName: 'Build tgrep Windows arm64 + Sign'
+            timeoutInMinutes: 120
+            cancelTimeoutInMinutes: 1
+            pool:
+              type: windows
+            variables:
+              ob_outputDirectory: '$(Build.ArtifactStagingDirectory)/ONEBRANCH_ARTIFACT'
+              ob_sdl_binskim_break: true  # https://aka.ms/obpipelines/sdl
+
+            steps:
+              - checkout: self
+                fetchDepth: 1
+                fetchTags: false
+                displayName: 'Checkout microsoft/tgrep'
+
+              - task: RustInstaller@1
+                displayName: 'Install Rust toolchain (with arm64 target)'
+                inputs:
+                  rustVersion: ms-stable
+                  additionalTargets: aarch64-pc-windows-msvc
+                  toolchainFeed: https://devdiv.pkgs.visualstudio.com/_packaging/Rust/nuget/v3/index.json
+
+              - script: |
+                  rustc --version
+                  cargo --version
+                displayName: 'Verify Rust version'
+
+              - powershell: |
+                  $src = "$(Build.SourcesDirectory)\.github\workflows\ado-cargo-config.toml"
+                  $dstDir = "$(Build.SourcesDirectory)\.cargo"
+                  New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+                  Copy-Item -Path $src -Destination "$dstDir\config.toml" -Force
+                  Write-Host "Copied: $src -> $dstDir\config.toml"
+                  Get-Content "$dstDir\config.toml"
+                displayName: 'Copy ADO cargo config (crates.io redirect + BinSkim flags)'
+
+              - task: CargoAuthenticate@0
+                displayName: 'Authenticate with ADO DeepPrompt Cargo feed'
+                inputs:
+                  configFile: '.cargo/config.toml'
+
+              - script: |
+                  cargo build --release --locked -p tgrep-cli --bin tgrep --target aarch64-pc-windows-msvc
+                displayName: 'Build tgrep Windows arm64 (cross-compile)'
+                workingDirectory: $(Build.SourcesDirectory)
+
+              - script: |
+                  dir target\aarch64-pc-windows-msvc\release\tgrep.exe
+                displayName: 'Verify tgrep.exe (arm64) exists'
+                workingDirectory: $(Build.SourcesDirectory)
+
+              - task: onebranch.pipeline.signing@1
+                displayName: 'Sign tgrep.exe (arm64)'
+                inputs:
+                  command: "sign"
+                  signing_profile: "external_distribution"
+                  files_to_sign: "tgrep.exe"
+                  search_root: "$(Build.SourcesDirectory)/target/aarch64-pc-windows-msvc/release"
+
+              - powershell: |
+                  $tag = "$(TGREP_TAG)"
+                  $zipName = "tgrep-$tag-aarch64-pc-windows-msvc.zip"
+                  $exePath = "$(Build.SourcesDirectory)/target/aarch64-pc-windows-msvc/release/tgrep.exe"
+                  $readmePath = "$(Build.SourcesDirectory)/README.md"
+                  $outPath = "$(Build.ArtifactStagingDirectory)/$zipName"
+                  Compress-Archive -Path $exePath, $readmePath -DestinationPath $outPath
+                  Write-Host "Packaged: $zipName"
+                  dir $outPath
+                displayName: 'Package signed tgrep.exe (arm64) into zip'
+
+              - task: CopyFiles@2
+                displayName: 'Copy artifacts to ONEBRANCH_ARTIFACT'
+                inputs:
+                  SourceFolder: '$(Build.ArtifactStagingDirectory)'
+                  Contents: '*.zip'
+                  TargetFolder: '$(Build.ArtifactStagingDirectory)/ONEBRANCH_ARTIFACT'
+
+              - ${{ if eq(parameters.PublishToGitHub, true) }}:
+                - task: GitHubRelease@1
+                  displayName: 'Publish arm64 signed binary to GitHub Release'
+                  inputs:
+                    gitHubConnection: 'github.com_msftsiwei_microsoftsso'
+                    repositoryName: 'microsoft/tgrep'
+                    action: 'edit'
+                    target: '$(Build.SourceVersion)'
+                    tagSource: 'userSpecifiedTag'
+                    tag: '$(TGREP_TAG)'
+                    assets: '$(Build.ArtifactStagingDirectory)/*.zip'
+                    assetUploadMode: 'replace'
+                    addChangeLog: false

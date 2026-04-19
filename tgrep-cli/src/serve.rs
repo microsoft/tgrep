@@ -707,6 +707,30 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
     Some(watcher)
 }
 
+/// Decide whether the file watcher should skip a path entirely.
+///
+/// Mirrors the file walker's defaults so the watcher does not reindex
+/// files that the initial walk would never have indexed:
+///   * any path component starting with `.` (matches `WalkBuilder::hidden(true)`)
+///   * any path component matching one of the configured `--exclude` names
+///
+/// `rel_path` must be a forward-slash relative path (as produced by
+/// `handle_fs_event`).
+fn should_skip_watcher_path(rel_path: &str, exclude_dirs: &[String]) -> bool {
+    for seg in rel_path.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            continue;
+        }
+        if seg.starts_with('.') {
+            return true;
+        }
+        if exclude_dirs.iter().any(|d| d == seg) {
+            return true;
+        }
+    }
+    false
+}
+
 fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
     use tgrep_core::meta::FileStamp;
 
@@ -752,20 +776,7 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         // files the initial walk would have skipped — most notably
         // hidden directories like `.git/`, which fire frequent
         // `index.lock`/HEAD/refs writes during normal git operations.
-        // The walker uses `hidden(true)` by default; replicate that by
-        // skipping any path component starting with `.`. Also honor the
-        // user's --exclude list so the same names are skipped here.
-        if rel_path
-            .split('/')
-            .any(|seg| seg.starts_with('.') && seg != "." && seg != "..")
-        {
-            continue;
-        }
-        if !state.exclude_dirs.is_empty()
-            && rel_path
-                .split('/')
-                .any(|seg| state.exclude_dirs.iter().any(|d| d == seg))
-        {
+        if should_skip_watcher_path(&rel_path, &state.exclude_dirs) {
             continue;
         }
 
@@ -1653,6 +1664,60 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn skip_watcher_path_skips_dot_components() {
+        let no_exclude: Vec<String> = Vec::new();
+        // A leading dot dir is the canonical case (.git, .hg, .svn, ...).
+        assert!(should_skip_watcher_path(".git/index.lock", &no_exclude));
+        assert!(should_skip_watcher_path(".git/HEAD", &no_exclude));
+        assert!(should_skip_watcher_path(".hg/store/data", &no_exclude));
+        // A dot component anywhere in the path skips, not just the leading one.
+        assert!(should_skip_watcher_path(
+            "src/.cache/build.tmp",
+            &no_exclude
+        ));
+        assert!(should_skip_watcher_path("a/b/.hidden/c.txt", &no_exclude));
+    }
+
+    #[test]
+    fn skip_watcher_path_keeps_non_hidden_paths() {
+        let no_exclude: Vec<String> = Vec::new();
+        assert!(!should_skip_watcher_path("src/main.rs", &no_exclude));
+        assert!(!should_skip_watcher_path("README.md", &no_exclude));
+        // A dot mid-segment (e.g. "foo.bar") is NOT a hidden component —
+        // only segments that *start* with `.` are hidden.
+        assert!(!should_skip_watcher_path("src/foo.bar", &no_exclude));
+        assert!(!should_skip_watcher_path("a/b/c", &no_exclude));
+    }
+
+    #[test]
+    fn skip_watcher_path_honors_exclude_dirs() {
+        let exclude = vec!["target".to_string(), "node_modules".to_string()];
+        assert!(should_skip_watcher_path("target/debug/foo", &exclude));
+        assert!(should_skip_watcher_path(
+            "node_modules/react/index.js",
+            &exclude
+        ));
+        // Excluded name appearing as an inner component still excludes.
+        assert!(should_skip_watcher_path("a/target/b", &exclude));
+        // Substring match should NOT trigger — "targets" != "target".
+        assert!(!should_skip_watcher_path("targets/foo", &exclude));
+        // Unrelated paths are not skipped.
+        assert!(!should_skip_watcher_path("src/main.rs", &exclude));
+    }
+
+    #[test]
+    fn skip_watcher_path_handles_dot_segments_and_empty() {
+        let no_exclude: Vec<String> = Vec::new();
+        // `.` and `..` are not "hidden" components — they're path-relative
+        // markers and should not trigger a skip on their own.
+        assert!(!should_skip_watcher_path("./foo.txt", &no_exclude));
+        assert!(!should_skip_watcher_path("a/./b", &no_exclude));
+        assert!(!should_skip_watcher_path("a/../b", &no_exclude));
+        // An empty rel_path (root-level event) shouldn't panic or skip.
+        assert!(!should_skip_watcher_path("", &no_exclude));
+    }
 
     fn write_file(path: &Path, content: &[u8]) {
         std::fs::write(path, content).expect("write_file");

@@ -1216,6 +1216,14 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         })
         .collect();
 
+    // The in-memory build is done — surface "complete" in status now even
+    // though the final disk flush below can take minutes for very large
+    // repos. Auto-save and watcher reindex paths share the publish_lock
+    // with the flush, so concurrent disk activity is serialized safely.
+    state
+        .indexing
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
     // Final (and only) flush to disk for the bulk build.
     eprintln!("[trace] persisting final index to disk...");
     let pruned = flush_index_to_disk(state, root, index_dir, Some(&stamps));
@@ -1234,11 +1242,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         let mut index = state.index.write().unwrap();
         index.live.shrink_to_fit();
     }
-
-    // Clear indexing flag AFTER final flush so auto-save doesn't race
-    state
-        .indexing
-        .store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Flush the current LiveIndex to disk and reopen the reader.

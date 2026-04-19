@@ -113,9 +113,26 @@ struct ServerState {
     /// content change (e.g. atime-only updates, attribute changes,
     /// or events triggered by the search itself opening files on
     /// some filesystems). Loaded from `filestamps.json` at startup
-    /// and refreshed after each successful flush + per watcher event
-    /// that actually mutates the index.
+    /// and refreshed during the initial build, on stale-state
+    /// refresh, and per watcher event that actually mutates the
+    /// index.
     file_stamps: RwLock<std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+    /// Coordinates overlay mutations with the snapshot→publish→prune
+    /// window. Watcher mutations (handle_fs_event) acquire it for
+    /// **read** before touching the live overlay; flush/auto-save
+    /// publishers acquire it for **write** for the entire cycle from
+    /// taking the snapshot through pruning the now-persisted entries.
+    ///
+    /// Without this gate, a watcher event that fires after the
+    /// snapshot is taken but before `prune_persisted_entries` runs
+    /// would silently lose its mutation: the snapshot doesn't see
+    /// the new content, the on-disk reader is reopened with the old
+    /// version, then prune deletes the overlay entry by path because
+    /// the path now matches a reader entry — orphaning the new data.
+    ///
+    /// Searches do **not** take this lock; they keep using the
+    /// current reader + overlay throughout.
+    snapshot_gate: RwLock<()>,
 }
 
 struct SearchOpts {
@@ -188,6 +205,7 @@ pub fn run(
         exclude_dirs: exclude_dirs.to_vec(),
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
+        snapshot_gate: RwLock::new(()),
     });
 
     // Bind TCP listener on a random port
@@ -734,8 +752,14 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
             if known_path {
                 eprintln!("[trace] reindex: removed {rel_path}");
             }
-            state.index.write().unwrap().live.delete_file(&rel_path);
-            state.file_stamps.write().unwrap().remove(&rel_path);
+            // snapshot_gate held in read mode for the duration of the
+            // mutation so a concurrent flush cannot snapshot the overlay
+            // and then silently prune our delete after publishing.
+            {
+                let _gate = state.snapshot_gate.read().unwrap();
+                state.index.write().unwrap().live.delete_file(&rel_path);
+                state.file_stamps.write().unwrap().remove(&rel_path);
+            }
             if let Ok(mut cache) = state.cache.write() {
                 cache.pop(&rel_path);
             }
@@ -784,18 +808,24 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         };
 
         eprintln!("[trace] reindex: modified {rel_path}");
+        // snapshot_gate held in read mode for the entire commit + stamp
+        // update so a concurrent flush cannot snapshot in between and
+        // then prune away the new overlay entry after publishing.
         {
-            let mut index = state.index.write().unwrap();
-            match per_tri {
-                Some(per_tri) => index.live.commit_upsert(&rel_path, per_tri),
-                None => index.live.delete_file(&rel_path),
+            let _gate = state.snapshot_gate.read().unwrap();
+            {
+                let mut index = state.index.write().unwrap();
+                match per_tri {
+                    Some(per_tri) => index.live.commit_upsert(&rel_path, per_tri),
+                    None => index.live.delete_file(&rel_path),
+                }
             }
+            state
+                .file_stamps
+                .write()
+                .unwrap()
+                .insert(rel_path.clone(), current);
         }
-        state
-            .file_stamps
-            .write()
-            .unwrap()
-            .insert(rel_path.clone(), current);
         if let Ok(mut cache) = state.cache.write() {
             cache.pop(&rel_path);
         }
@@ -827,6 +857,12 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
         if dirty >= AUTO_SAVE_MUTATIONS || (dirty > 0 && elapsed >= AUTO_SAVE_INTERVAL) {
             let save_start = Instant::now();
             eprintln!("[trace] auto-save: {dirty} mutations, saving...");
+
+            // Hold the snapshot gate in write mode for the entire
+            // snapshot → publish → prune cycle so watcher mutations
+            // can't race the prune (see flush_index_to_disk for the
+            // same pattern + rationale).
+            let _gate = state.snapshot_gate.write().unwrap();
 
             // Snapshot reader + overlay under brief read lock
             let (paths, inverted) = {
@@ -1294,6 +1330,15 @@ fn flush_index_to_disk(
     stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
 ) -> bool {
     let flush_start = Instant::now();
+
+    // Hold the snapshot gate in write mode for the entire snapshot →
+    // publish → prune cycle. Watcher mutations block on this for the
+    // duration; without it, an event that fires after the snapshot but
+    // before the prune would be silently dropped (snapshot doesn't see
+    // it, reader is reopened with the old version, then the prune
+    // removes the overlay entry by path because it now matches a reader
+    // entry). Searches do not take this lock and remain unaffected.
+    let _gate = state.snapshot_gate.write().unwrap();
 
     // Snapshot under brief read lock — use full_snapshot to merge reader + overlay
     let (paths, inverted, num_files) = {

@@ -134,7 +134,8 @@ extends:
               # OneBranch uses windows_build_container which strips .git and
               # uses partial clone (--filter=blob:none), so file blobs are not
               # on disk and git commands fail. We write the config inline here.
-              # Content mirrors .pipelines/.cargo/config.toml in the repo.
+              # (ado-cargo-config.toml in this directory was the former source
+              # of truth; it has been removed since it is no longer referenced.)
               # ---------------------------------------------------------------
               - powershell: |
                   $dstDir = "$(Build.SourcesDirectory)\.cargo"

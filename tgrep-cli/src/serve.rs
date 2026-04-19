@@ -709,8 +709,9 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
 
 /// Decide whether the file watcher should skip a path entirely.
 ///
-/// Mirrors the file walker's defaults so the watcher does not reindex
-/// files that the initial walk would never have indexed:
+/// Mirrors the file walker's hidden-path and `--exclude` directory filtering
+/// so the watcher does not reindex files that the initial walk would never
+/// have indexed for those reasons:
 ///   * any path component starting with `.` (matches `WalkBuilder::hidden(true)`)
 ///   * any path component matching one of the configured `--exclude` names
 ///

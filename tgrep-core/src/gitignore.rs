@@ -36,18 +36,30 @@ pub fn build_matcher(root: &Path) -> Option<Gitignore> {
         let _ = builder.add(&info_exclude);
     }
 
-    // Walk to find every `.gitignore` file. `.gitignore` itself starts
-    // with `.` so we cannot use `hidden(true)` (it would filter the very
-    // files we are looking for). Instead, walk with hidden=false but
-    // filter out the `.git/` subtree explicitly so we don't recurse
-    // into git's own metadata. Gitignore-based subtree skipping still
-    // applies, so we don't descend into ignored dirs while collecting.
+    // Walk to find every `.gitignore` file. We can't use `hidden(true)`
+    // because `.gitignore` itself starts with `.` and would be filtered.
+    // Instead, walk with hidden=false and use `filter_entry` to skip
+    // all dot-prefixed *directories* (`.git`, `.tgrep`, `.vscode`, …) —
+    // this avoids unnecessary I/O into hidden subtrees while still
+    // letting dot-prefixed *files* like `.gitignore` through, since
+    // `filter_entry` only controls directory descent for directories.
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .filter_entry(|entry| entry.file_name() != ".git")
+        .filter_entry(|entry| {
+            // Allow files (we only care about .gitignore among them).
+            // For directories, skip any that start with '.'.
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with('.'))
+            } else {
+                true
+            }
+        })
         .build();
     for entry in walker.flatten() {
         if entry.file_name() == ".gitignore" && entry.path().is_file() {

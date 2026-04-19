@@ -712,23 +712,43 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
 /// Mirrors the file walker's hidden-path and `--exclude` directory filtering
 /// so the watcher does not reindex files that the initial walk would never
 /// have indexed for those reasons:
-///   * any path component starting with `.` (matches `WalkBuilder::hidden(true)`)
-///   * any path component matching one of the configured `--exclude` names
+///   * any path component starting with `.` (matches `WalkBuilder::hidden(true)`),
+///     including the file name itself (e.g. `.envrc`).
+///   * any *ancestor directory* component matching one of the configured
+///     `--exclude` names. The walker only treats `--exclude` names as
+///     directory subtree filters (it skips the whole subtree when the entry
+///     is a directory). A regular file whose basename happens to equal one
+///     of the excluded names (e.g. a file literally called `vendor` at the
+///     repo root, or `src/target`) is still indexed by the initial walk
+///     and so must NOT be skipped here — otherwise the in-memory and
+///     on-disk indexes would diverge.
 ///
 /// `rel_path` must be a forward-slash relative path (as produced by
 /// `handle_fs_event`).
 fn should_skip_watcher_path(rel_path: &str, exclude_dirs: &[String]) -> bool {
-    for seg in rel_path.split('/') {
-        if seg.is_empty() || seg == "." || seg == ".." {
-            continue;
-        }
-        if seg.starts_with('.') {
-            return true;
-        }
-        if exclude_dirs.iter().any(|d| d == seg) {
-            return true;
-        }
+    let segments: Vec<&str> = rel_path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .collect();
+    if segments.is_empty() {
+        return false;
     }
+
+    // Hidden-component check applies to *any* segment, including the
+    // basename — `WalkBuilder::hidden(true)` itself filters dot-files.
+    if segments.iter().any(|seg| seg.starts_with('.')) {
+        return true;
+    }
+
+    // exclude_dirs check applies only to ancestor directory components.
+    let ancestors = &segments[..segments.len() - 1];
+    if ancestors
+        .iter()
+        .any(|seg| exclude_dirs.iter().any(|d| d == seg))
+    {
+        return true;
+    }
+
     false
 }
 
@@ -1695,17 +1715,32 @@ mod tests {
     #[test]
     fn skip_watcher_path_honors_exclude_dirs() {
         let exclude = vec!["target".to_string(), "node_modules".to_string()];
+        // Excluded name as an ancestor directory => skip (matches what the
+        // walker would do — it skips the whole subtree).
         assert!(should_skip_watcher_path("target/debug/foo", &exclude));
         assert!(should_skip_watcher_path(
             "node_modules/react/index.js",
             &exclude
         ));
-        // Excluded name appearing as an inner component still excludes.
         assert!(should_skip_watcher_path("a/target/b", &exclude));
         // Substring match should NOT trigger — "targets" != "target".
         assert!(!should_skip_watcher_path("targets/foo", &exclude));
         // Unrelated paths are not skipped.
         assert!(!should_skip_watcher_path("src/main.rs", &exclude));
+    }
+
+    #[test]
+    fn skip_watcher_path_does_not_match_basename_against_exclude_dirs() {
+        // A regular file whose basename happens to equal an excluded
+        // directory name (e.g. a file literally called `vendor` at the
+        // repo root, or `src/target`) is still indexed by the walker —
+        // walker only treats `exclude_dirs` as directory subtree filters.
+        // The watcher must match that, otherwise the in-memory index and
+        // the on-disk index would disagree.
+        let exclude = vec!["target".to_string(), "vendor".to_string()];
+        assert!(!should_skip_watcher_path("vendor", &exclude));
+        assert!(!should_skip_watcher_path("src/target", &exclude));
+        assert!(!should_skip_watcher_path("a/b/vendor", &exclude));
     }
 
     #[test]

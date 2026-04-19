@@ -25,6 +25,7 @@ rayon = "1"
 regex = "1"
 lru = "0.16.3"
 fs2 = "0.4.3"
+ignore = "0.4"
 
 [dev-dependencies]
 assert_cmd = "2"

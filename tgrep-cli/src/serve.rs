@@ -133,6 +133,13 @@ struct ServerState {
     /// Searches do **not** take this lock; they keep using the
     /// current reader + overlay throughout.
     snapshot_gate: RwLock<()>,
+    /// Gitignore matcher used by the file watcher to drop events for
+    /// paths the initial walk would have skipped via the `ignore` crate
+    /// (`.gitignore`, `.git/info/exclude`, global gitignore, etc.).
+    /// Built once at startup; `None` if the matcher could not be built
+    /// (in which case the watcher just falls back to its hidden / exclude
+    /// filtering and accepts that gitignored files may be reindexed).
+    gitignore: Option<ignore::gitignore::Gitignore>,
 }
 
 struct SearchOpts {
@@ -206,6 +213,7 @@ pub fn run(
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
         snapshot_gate: RwLock::new(()),
+        gitignore: build_gitignore_matcher(&root),
     });
 
     // Bind TCP listener on a random port
@@ -707,11 +715,51 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
     Some(watcher)
 }
 
+/// Build a `Gitignore` matcher rooted at `root`, loading every `.gitignore`
+/// file inside the tree (using `WalkBuilder` so we automatically skip the
+/// `.git/` dir, hidden trees, and gitignored subtrees ourselves), plus
+/// `.git/info/exclude` and the user's global gitignore.
+///
+/// Returns `None` when no rules could be loaded; callers should treat that
+/// as "no gitignore filtering" and rely on the cheap hidden / `--exclude`
+/// fallback in `should_skip_watcher_path` for the most common cases.
+fn build_gitignore_matcher(root: &Path) -> Option<ignore::gitignore::Gitignore> {
+    use ignore::gitignore::GitignoreBuilder;
+
+    let mut builder = GitignoreBuilder::new(root);
+
+    // Repo-local .git/info/exclude (if present).
+    let info_exclude = root.join(".git").join("info").join("exclude");
+    if info_exclude.is_file() {
+        let _ = builder.add(&info_exclude);
+    }
+
+    // Walk just for `.gitignore` files. WalkBuilder honors the same
+    // gitignore + hidden defaults the indexer uses, so we don't recurse
+    // into ignored dirs and we naturally skip `.git/`.
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+    for entry in walker.flatten() {
+        if entry.file_name() == ".gitignore" && entry.path().is_file() {
+            let _ = builder.add(entry.path());
+        }
+    }
+
+    // Global gitignore (from git config) is loaded transparently by
+    // GitignoreBuilder when present.
+    let gi = builder.build().ok()?;
+    if gi.is_empty() { None } else { Some(gi) }
+}
+
 /// Decide whether the file watcher should skip a path entirely.
 ///
-/// Mirrors the file walker's hidden-path and `--exclude` directory filtering
-/// so the watcher does not reindex files that the initial walk would never
-/// have indexed for those reasons:
+/// Mirrors the file walker's hidden-path, `--exclude` directory filtering,
+/// and `.gitignore` rules so the watcher does not reindex files that the
+/// initial walk would never have indexed for those reasons:
 ///   * any path component starting with `.` (matches `WalkBuilder::hidden(true)`),
 ///     including the file name itself (e.g. `.envrc`).
 ///   * any *ancestor directory* component matching one of the configured
@@ -722,10 +770,20 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
 ///     repo root, or `src/target`) is still indexed by the initial walk
 ///     and so must NOT be skipped here — otherwise the in-memory and
 ///     on-disk indexes would diverge.
+///   * any path matched by the gitignore matcher (loaded from
+///     `.gitignore` files + `.git/info/exclude` + global gitignore).
+///     Without this, the watcher would happily upsert files like
+///     `target/release/foo.log` or `*.tmp` that the indexer's
+///     `git_ignore(true)` walk skipped, causing the in-memory and
+///     on-disk indexes to diverge over time.
 ///
 /// `rel_path` must be a forward-slash relative path (as produced by
 /// `handle_fs_event`).
-fn should_skip_watcher_path(rel_path: &str, exclude_dirs: &[String]) -> bool {
+fn should_skip_watcher_path(
+    rel_path: &str,
+    exclude_dirs: &[String],
+    gitignore: Option<&ignore::gitignore::Gitignore>,
+) -> bool {
     let segments: Vec<&str> = rel_path
         .split('/')
         .filter(|s| !s.is_empty() && *s != "." && *s != "..")
@@ -747,6 +805,19 @@ fn should_skip_watcher_path(rel_path: &str, exclude_dirs: &[String]) -> bool {
         .any(|seg| exclude_dirs.iter().any(|d| d == seg))
     {
         return true;
+    }
+
+    // Gitignore check (if a matcher is available).
+    if let Some(gi) = gitignore {
+        // We don't know whether the path is a dir or a file here — for
+        // the watcher's purposes we treat all events as "file" matches.
+        // Notify usually fires per-file events anyway, and gitignore
+        // rules that target dirs would have already skipped the dir's
+        // contents via `matched_path_or_any_parents`.
+        let m = gi.matched_path_or_any_parents(rel_path, /* is_dir = */ false);
+        if m.is_ignore() {
+            return true;
+        }
     }
 
     false
@@ -797,7 +868,7 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         // files the initial walk would have skipped — most notably
         // hidden directories like `.git/`, which fire frequent
         // `index.lock`/HEAD/refs writes during normal git operations.
-        if should_skip_watcher_path(&rel_path, &state.exclude_dirs) {
+        if should_skip_watcher_path(&rel_path, &state.exclude_dirs, state.gitignore.as_ref()) {
             continue;
         }
 
@@ -1690,26 +1761,39 @@ mod tests {
     fn skip_watcher_path_skips_dot_components() {
         let no_exclude: Vec<String> = Vec::new();
         // A leading dot dir is the canonical case (.git, .hg, .svn, ...).
-        assert!(should_skip_watcher_path(".git/index.lock", &no_exclude));
-        assert!(should_skip_watcher_path(".git/HEAD", &no_exclude));
-        assert!(should_skip_watcher_path(".hg/store/data", &no_exclude));
+        assert!(should_skip_watcher_path(
+            ".git/index.lock",
+            &no_exclude,
+            None
+        ));
+        assert!(should_skip_watcher_path(".git/HEAD", &no_exclude, None));
+        assert!(should_skip_watcher_path(
+            ".hg/store/data",
+            &no_exclude,
+            None
+        ));
         // A dot component anywhere in the path skips, not just the leading one.
         assert!(should_skip_watcher_path(
             "src/.cache/build.tmp",
-            &no_exclude
+            &no_exclude,
+            None
         ));
-        assert!(should_skip_watcher_path("a/b/.hidden/c.txt", &no_exclude));
+        assert!(should_skip_watcher_path(
+            "a/b/.hidden/c.txt",
+            &no_exclude,
+            None
+        ));
     }
 
     #[test]
     fn skip_watcher_path_keeps_non_hidden_paths() {
         let no_exclude: Vec<String> = Vec::new();
-        assert!(!should_skip_watcher_path("src/main.rs", &no_exclude));
-        assert!(!should_skip_watcher_path("README.md", &no_exclude));
+        assert!(!should_skip_watcher_path("src/main.rs", &no_exclude, None));
+        assert!(!should_skip_watcher_path("README.md", &no_exclude, None));
         // A dot mid-segment (e.g. "foo.bar") is NOT a hidden component —
         // only segments that *start* with `.` are hidden.
-        assert!(!should_skip_watcher_path("src/foo.bar", &no_exclude));
-        assert!(!should_skip_watcher_path("a/b/c", &no_exclude));
+        assert!(!should_skip_watcher_path("src/foo.bar", &no_exclude, None));
+        assert!(!should_skip_watcher_path("a/b/c", &no_exclude, None));
     }
 
     #[test]
@@ -1717,16 +1801,17 @@ mod tests {
         let exclude = vec!["target".to_string(), "node_modules".to_string()];
         // Excluded name as an ancestor directory => skip (matches what the
         // walker would do — it skips the whole subtree).
-        assert!(should_skip_watcher_path("target/debug/foo", &exclude));
+        assert!(should_skip_watcher_path("target/debug/foo", &exclude, None));
         assert!(should_skip_watcher_path(
             "node_modules/react/index.js",
-            &exclude
+            &exclude,
+            None
         ));
-        assert!(should_skip_watcher_path("a/target/b", &exclude));
+        assert!(should_skip_watcher_path("a/target/b", &exclude, None));
         // Substring match should NOT trigger — "targets" != "target".
-        assert!(!should_skip_watcher_path("targets/foo", &exclude));
+        assert!(!should_skip_watcher_path("targets/foo", &exclude, None));
         // Unrelated paths are not skipped.
-        assert!(!should_skip_watcher_path("src/main.rs", &exclude));
+        assert!(!should_skip_watcher_path("src/main.rs", &exclude, None));
     }
 
     #[test]
@@ -1738,9 +1823,9 @@ mod tests {
         // The watcher must match that, otherwise the in-memory index and
         // the on-disk index would disagree.
         let exclude = vec!["target".to_string(), "vendor".to_string()];
-        assert!(!should_skip_watcher_path("vendor", &exclude));
-        assert!(!should_skip_watcher_path("src/target", &exclude));
-        assert!(!should_skip_watcher_path("a/b/vendor", &exclude));
+        assert!(!should_skip_watcher_path("vendor", &exclude, None));
+        assert!(!should_skip_watcher_path("src/target", &exclude, None));
+        assert!(!should_skip_watcher_path("a/b/vendor", &exclude, None));
     }
 
     #[test]
@@ -1748,11 +1833,49 @@ mod tests {
         let no_exclude: Vec<String> = Vec::new();
         // `.` and `..` are not "hidden" components — they're path-relative
         // markers and should not trigger a skip on their own.
-        assert!(!should_skip_watcher_path("./foo.txt", &no_exclude));
-        assert!(!should_skip_watcher_path("a/./b", &no_exclude));
-        assert!(!should_skip_watcher_path("a/../b", &no_exclude));
+        assert!(!should_skip_watcher_path("./foo.txt", &no_exclude, None));
+        assert!(!should_skip_watcher_path("a/./b", &no_exclude, None));
+        assert!(!should_skip_watcher_path("a/../b", &no_exclude, None));
         // An empty rel_path (root-level event) shouldn't panic or skip.
-        assert!(!should_skip_watcher_path("", &no_exclude));
+        assert!(!should_skip_watcher_path("", &no_exclude, None));
+    }
+
+    #[test]
+    fn skip_watcher_path_honors_gitignore_matcher() {
+        use ignore::gitignore::GitignoreBuilder;
+
+        // Build a gitignore matcher rooted at /repo with rules that
+        // would skip `*.log` and the whole `target/` subtree.
+        let tmp = TempDir::new().unwrap();
+        let gi_path = tmp.path().join(".gitignore");
+        std::fs::write(&gi_path, "*.log\ntarget/\n").unwrap();
+        let mut gb = GitignoreBuilder::new(tmp.path());
+        gb.add(&gi_path);
+        let gi = gb.build().unwrap();
+
+        let no_exclude: Vec<String> = Vec::new();
+        // Files matched by the gitignore are skipped.
+        assert!(should_skip_watcher_path(
+            "build/output.log",
+            &no_exclude,
+            Some(&gi)
+        ));
+        assert!(should_skip_watcher_path(
+            "target/release/foo",
+            &no_exclude,
+            Some(&gi)
+        ));
+        // Files NOT matched by the gitignore are not skipped.
+        assert!(!should_skip_watcher_path(
+            "src/main.rs",
+            &no_exclude,
+            Some(&gi)
+        ));
+        assert!(!should_skip_watcher_path(
+            "README.md",
+            &no_exclude,
+            Some(&gi)
+        ));
     }
 
     fn write_file(path: &Path, content: &[u8]) {

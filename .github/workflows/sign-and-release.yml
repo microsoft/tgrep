@@ -139,7 +139,7 @@ extends:
               # of truth; it has been removed since it is no longer referenced.)
               # ---------------------------------------------------------------
               - powershell: |
-                  $dstDir = "$(Build.SourcesDirectory)\s\.cargo"
+                  $dstDir = "$(Build.SourcesDirectory)\tgrep\.cargo"
                   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
                   $lines = @(
                     '[registries.devdiv-deepprompt]',
@@ -170,7 +170,7 @@ extends:
               - task: CargoAuthenticate@0
                 displayName: 'Authenticate with ADO DeepPrompt Cargo feed'
                 inputs:
-                  configFile: 's/.cargo/config.toml'
+                  configFile: 'tgrep/.cargo/config.toml'
 
               # ---------------------------------------------------------------
               # Step 6: Build Windows x64 release binary
@@ -178,7 +178,7 @@ extends:
               - script: |
                   cargo build --release --locked -p tgrep-cli --bin tgrep --target x86_64-pc-windows-msvc
                 displayName: 'Build tgrep Windows x64'
-                workingDirectory: $(Build.SourcesDirectory)\s
+                workingDirectory: $(Build.SourcesDirectory)\tgrep
 
               # ---------------------------------------------------------------
               # Step 7: Verify binary exists
@@ -186,7 +186,7 @@ extends:
               - script: |
                   dir target\x86_64-pc-windows-msvc\release\tgrep.exe
                 displayName: 'Verify tgrep.exe exists'
-                workingDirectory: $(Build.SourcesDirectory)\s
+                workingDirectory: $(Build.SourcesDirectory)\tgrep
 
               # ---------------------------------------------------------------
               # Step 8: Sign tgrep.exe using OneBranch signing
@@ -200,7 +200,7 @@ extends:
                   command: "sign"
                   signing_profile: "external_distribution"
                   files_to_sign: "tgrep.exe"
-                  search_root: "$(Build.SourcesDirectory)/s/target/x86_64-pc-windows-msvc/release"
+                  search_root: "$(Build.SourcesDirectory)/tgrep/target/x86_64-pc-windows-msvc/release"
 
               # ---------------------------------------------------------------
               # Step 9: Package signed binary
@@ -209,8 +209,8 @@ extends:
               - powershell: |
                   $tag = "$(TGREP_TAG)"
                   $zipName = "tgrep-$tag-x86_64-pc-windows-msvc.zip"
-                  $exePath = "$(Build.SourcesDirectory)/s/target/x86_64-pc-windows-msvc/release/tgrep.exe"
-                  $readmePath = "$(Build.SourcesDirectory)/s/README.md"
+                  $exePath = "$(Build.SourcesDirectory)/tgrep/target/x86_64-pc-windows-msvc/release/tgrep.exe"
+                  $readmePath = "$(Build.SourcesDirectory)/tgrep/README.md"
                   $outPath = "$(Build.ArtifactStagingDirectory)/$zipName"
                   Compress-Archive -Path $exePath, $readmePath -DestinationPath $outPath
                   Write-Host "Packaged: $zipName"
@@ -279,7 +279,7 @@ extends:
                 displayName: 'Verify Rust version'
 
               - powershell: |
-                  $dstDir = "$(Build.SourcesDirectory)\s\.cargo"
+                  $dstDir = "$(Build.SourcesDirectory)\tgrep\.cargo"
                   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
                   $lines = @(
                     '[registries.devdiv-deepprompt]',
@@ -307,17 +307,17 @@ extends:
               - task: CargoAuthenticate@0
                 displayName: 'Authenticate with ADO DeepPrompt Cargo feed'
                 inputs:
-                  configFile: 's/.cargo/config.toml'
+                  configFile: 'tgrep/.cargo/config.toml'
 
               - script: |
                   cargo build --release --locked -p tgrep-cli --bin tgrep --target aarch64-pc-windows-msvc
                 displayName: 'Build tgrep Windows arm64 (cross-compile)'
-                workingDirectory: $(Build.SourcesDirectory)\s
+                workingDirectory: $(Build.SourcesDirectory)\tgrep
 
               - script: |
                   dir target\aarch64-pc-windows-msvc\release\tgrep.exe
                 displayName: 'Verify tgrep.exe (arm64) exists'
-                workingDirectory: $(Build.SourcesDirectory)\s
+                workingDirectory: $(Build.SourcesDirectory)\tgrep
 
               - task: onebranch.pipeline.signing@1
                 displayName: 'Sign tgrep.exe (arm64)'
@@ -325,13 +325,13 @@ extends:
                   command: "sign"
                   signing_profile: "external_distribution"
                   files_to_sign: "tgrep.exe"
-                  search_root: "$(Build.SourcesDirectory)/s/target/aarch64-pc-windows-msvc/release"
+                  search_root: "$(Build.SourcesDirectory)/tgrep/target/aarch64-pc-windows-msvc/release"
 
               - powershell: |
                   $tag = "$(TGREP_TAG)"
                   $zipName = "tgrep-$tag-aarch64-pc-windows-msvc.zip"
-                  $exePath = "$(Build.SourcesDirectory)/s/target/aarch64-pc-windows-msvc/release/tgrep.exe"
-                  $readmePath = "$(Build.SourcesDirectory)/s/README.md"
+                  $exePath = "$(Build.SourcesDirectory)/tgrep/target/aarch64-pc-windows-msvc/release/tgrep.exe"
+                  $readmePath = "$(Build.SourcesDirectory)/tgrep/README.md"
                   $outPath = "$(Build.ArtifactStagingDirectory)/$zipName"
                   Compress-Archive -Path $exePath, $readmePath -DestinationPath $outPath
                   Write-Host "Packaged: $zipName"

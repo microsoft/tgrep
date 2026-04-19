@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod error;
 pub mod filetypes;
+pub mod gitignore;
 pub mod hybrid;
 pub mod live;
 pub mod meta;

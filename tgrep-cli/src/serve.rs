@@ -133,6 +133,13 @@ struct ServerState {
     /// Searches do **not** take this lock; they keep using the
     /// current reader + overlay throughout.
     snapshot_gate: RwLock<()>,
+    /// Gitignore matcher used by the file watcher to drop events for
+    /// paths the initial walk would have skipped via the `ignore` crate
+    /// (`.gitignore`, `.git/info/exclude`, global gitignore, etc.).
+    /// Built once at startup; `None` if the matcher could not be built
+    /// (in which case the watcher just falls back to its hidden / exclude
+    /// filtering and accepts that gitignored files may be reindexed).
+    gitignore: Option<tgrep_core::gitignore::Gitignore>,
 }
 
 struct SearchOpts {
@@ -206,6 +213,15 @@ pub fn run(
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
         snapshot_gate: RwLock::new(()),
+        // Only pay the cost of walking the tree to gather .gitignore
+        // rules when we'll actually use them — i.e. when the file watcher
+        // is enabled. With --no-watch the matcher would just sit unused
+        // but we'd still have eaten a full-tree walk at startup.
+        gitignore: if no_watch {
+            None
+        } else {
+            tgrep_core::gitignore::build_matcher(&root)
+        },
     });
 
     // Bind TCP listener on a random port
@@ -707,6 +723,74 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
     Some(watcher)
 }
 
+/// Decide whether the file watcher should skip a path entirely.
+///
+/// Mirrors the file walker's hidden-path, `--exclude` directory filtering,
+/// and `.gitignore` rules so the watcher does not reindex files that the
+/// initial walk would never have indexed for those reasons:
+///   * any path component starting with `.` (matches `WalkBuilder::hidden(true)`),
+///     including the file name itself (e.g. `.envrc`).
+///   * any *ancestor directory* component matching one of the configured
+///     `--exclude` names. The walker only treats `--exclude` names as
+///     directory subtree filters (it skips the whole subtree when the entry
+///     is a directory). A regular file whose basename happens to equal one
+///     of the excluded names (e.g. a file literally called `vendor` at the
+///     repo root, or `src/target`) is still indexed by the initial walk
+///     and so must NOT be skipped here — otherwise the in-memory and
+///     on-disk indexes would diverge.
+///   * any path matched by the gitignore matcher (loaded from
+///     `.gitignore` files + `.git/info/exclude` + global gitignore).
+///     Without this, the watcher would happily upsert files like
+///     `target/release/foo.log` or `*.tmp` that the indexer's
+///     `git_ignore(true)` walk skipped, causing the in-memory and
+///     on-disk indexes to diverge over time.
+///
+/// `rel_path` must be a forward-slash relative path (as produced by
+/// `handle_fs_event`).
+fn should_skip_watcher_path(
+    rel_path: &str,
+    exclude_dirs: &[String],
+    gitignore: Option<&tgrep_core::gitignore::Gitignore>,
+) -> bool {
+    // Single streaming pass over path components — no Vec allocation
+    // on the hot watcher path. The hidden-component check applies to
+    // every segment (including the basename); the exclude_dirs check
+    // applies only to *ancestor* directory components, so we test
+    // "is there a next segment?" via Peekable to skip the basename.
+    let mut segments = rel_path
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .peekable();
+
+    while let Some(seg) = segments.next() {
+        if seg.starts_with('.') {
+            return true;
+        }
+        // Ancestor (i.e. not the last segment) — apply exclude_dirs.
+        if segments.peek().is_some()
+            && !exclude_dirs.is_empty()
+            && exclude_dirs.iter().any(|d| d == seg)
+        {
+            return true;
+        }
+    }
+
+    // Gitignore check (if a matcher is available).
+    if let Some(gi) = gitignore {
+        // We don't know whether the path is a dir or a file here — for
+        // the watcher's purposes we treat all events as "file" matches.
+        // Notify usually fires per-file events anyway, and gitignore
+        // rules that target dirs would have already skipped the dir's
+        // contents via `matched_path_or_any_parents`.
+        let m = gi.matched_path_or_any_parents(rel_path, /* is_dir = */ false);
+        if m.is_ignore() {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
     use tgrep_core::meta::FileStamp;
 
@@ -747,6 +831,14 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
             Ok(p) => p.to_string_lossy().replace('\\', "/"),
             Err(_) => continue,
         };
+
+        // Mirror the walker's filtering so the watcher does not reindex
+        // files the initial walk would have skipped — most notably
+        // hidden directories like `.git/`, which fire frequent
+        // `index.lock`/HEAD/refs writes during normal git operations.
+        if should_skip_watcher_path(&rel_path, &state.exclude_dirs, state.gitignore.as_ref()) {
+            continue;
+        }
 
         let is_remove = matches!(event.kind, EventKind::Remove(_)) || !path.exists();
 
@@ -1632,6 +1724,124 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn skip_watcher_path_skips_dot_components() {
+        let no_exclude: Vec<String> = Vec::new();
+        // A leading dot dir is the canonical case (.git, .hg, .svn, ...).
+        assert!(should_skip_watcher_path(
+            ".git/index.lock",
+            &no_exclude,
+            None
+        ));
+        assert!(should_skip_watcher_path(".git/HEAD", &no_exclude, None));
+        assert!(should_skip_watcher_path(
+            ".hg/store/data",
+            &no_exclude,
+            None
+        ));
+        // A dot component anywhere in the path skips, not just the leading one.
+        assert!(should_skip_watcher_path(
+            "src/.cache/build.tmp",
+            &no_exclude,
+            None
+        ));
+        assert!(should_skip_watcher_path(
+            "a/b/.hidden/c.txt",
+            &no_exclude,
+            None
+        ));
+    }
+
+    #[test]
+    fn skip_watcher_path_keeps_non_hidden_paths() {
+        let no_exclude: Vec<String> = Vec::new();
+        assert!(!should_skip_watcher_path("src/main.rs", &no_exclude, None));
+        assert!(!should_skip_watcher_path("README.md", &no_exclude, None));
+        // A dot mid-segment (e.g. "foo.bar") is NOT a hidden component —
+        // only segments that *start* with `.` are hidden.
+        assert!(!should_skip_watcher_path("src/foo.bar", &no_exclude, None));
+        assert!(!should_skip_watcher_path("a/b/c", &no_exclude, None));
+    }
+
+    #[test]
+    fn skip_watcher_path_honors_exclude_dirs() {
+        let exclude = vec!["target".to_string(), "node_modules".to_string()];
+        // Excluded name as an ancestor directory => skip (matches what the
+        // walker would do — it skips the whole subtree).
+        assert!(should_skip_watcher_path("target/debug/foo", &exclude, None));
+        assert!(should_skip_watcher_path(
+            "node_modules/react/index.js",
+            &exclude,
+            None
+        ));
+        assert!(should_skip_watcher_path("a/target/b", &exclude, None));
+        // Substring match should NOT trigger — "targets" != "target".
+        assert!(!should_skip_watcher_path("targets/foo", &exclude, None));
+        // Unrelated paths are not skipped.
+        assert!(!should_skip_watcher_path("src/main.rs", &exclude, None));
+    }
+
+    #[test]
+    fn skip_watcher_path_does_not_match_basename_against_exclude_dirs() {
+        // A regular file whose basename happens to equal an excluded
+        // directory name (e.g. a file literally called `vendor` at the
+        // repo root, or `src/target`) is still indexed by the walker —
+        // walker only treats `exclude_dirs` as directory subtree filters.
+        // The watcher must match that, otherwise the in-memory index and
+        // the on-disk index would disagree.
+        let exclude = vec!["target".to_string(), "vendor".to_string()];
+        assert!(!should_skip_watcher_path("vendor", &exclude, None));
+        assert!(!should_skip_watcher_path("src/target", &exclude, None));
+        assert!(!should_skip_watcher_path("a/b/vendor", &exclude, None));
+    }
+
+    #[test]
+    fn skip_watcher_path_handles_dot_segments_and_empty() {
+        let no_exclude: Vec<String> = Vec::new();
+        // `.` and `..` are not "hidden" components — they're path-relative
+        // markers and should not trigger a skip on their own.
+        assert!(!should_skip_watcher_path("./foo.txt", &no_exclude, None));
+        assert!(!should_skip_watcher_path("a/./b", &no_exclude, None));
+        assert!(!should_skip_watcher_path("a/../b", &no_exclude, None));
+        // An empty rel_path (root-level event) shouldn't panic or skip.
+        assert!(!should_skip_watcher_path("", &no_exclude, None));
+    }
+
+    #[test]
+    fn skip_watcher_path_honors_gitignore_matcher() {
+        // Build the matcher via the public tgrep-core helper so this test
+        // also exercises the shared loading logic.
+        let tmp = TempDir::new().unwrap();
+        let gi_path = tmp.path().join(".gitignore");
+        std::fs::write(&gi_path, "*.log\ntarget/\n").unwrap();
+        let gi = tgrep_core::gitignore::build_matcher(tmp.path())
+            .expect("matcher should build from a non-empty .gitignore");
+
+        let no_exclude: Vec<String> = Vec::new();
+        // Files matched by the gitignore are skipped.
+        assert!(should_skip_watcher_path(
+            "build/output.log",
+            &no_exclude,
+            Some(&gi)
+        ));
+        assert!(should_skip_watcher_path(
+            "target/release/foo",
+            &no_exclude,
+            Some(&gi)
+        ));
+        // Files NOT matched by the gitignore are not skipped.
+        assert!(!should_skip_watcher_path(
+            "src/main.rs",
+            &no_exclude,
+            Some(&gi)
+        ));
+        assert!(!should_skip_watcher_path(
+            "README.md",
+            &no_exclude,
+            Some(&gi)
+        ));
+    }
 
     fn write_file(path: &Path, content: &[u8]) {
         std::fs::write(path, content).expect("write_file");

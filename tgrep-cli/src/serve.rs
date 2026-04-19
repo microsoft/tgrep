@@ -213,7 +213,15 @@ pub fn run(
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
         snapshot_gate: RwLock::new(()),
-        gitignore: tgrep_core::walker::build_gitignore_matcher(&root),
+        // Only pay the cost of walking the tree to gather .gitignore
+        // rules when we'll actually use them — i.e. when the file watcher
+        // is enabled. With --no-watch the matcher would just sit unused
+        // but we'd still have eaten a full-tree walk at startup.
+        gitignore: if no_watch {
+            None
+        } else {
+            tgrep_core::walker::build_gitignore_matcher(&root)
+        },
     });
 
     // Bind TCP listener on a random port
@@ -744,27 +752,27 @@ fn should_skip_watcher_path(
     exclude_dirs: &[String],
     gitignore: Option<&tgrep_core::walker::Gitignore>,
 ) -> bool {
-    let segments: Vec<&str> = rel_path
+    // Single streaming pass over path components — no Vec allocation
+    // on the hot watcher path. The hidden-component check applies to
+    // every segment (including the basename); the exclude_dirs check
+    // applies only to *ancestor* directory components, so we test
+    // "is there a next segment?" via Peekable to skip the basename.
+    let mut segments = rel_path
         .split('/')
         .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-        .collect();
-    if segments.is_empty() {
-        return false;
-    }
+        .peekable();
 
-    // Hidden-component check applies to *any* segment, including the
-    // basename — `WalkBuilder::hidden(true)` itself filters dot-files.
-    if segments.iter().any(|seg| seg.starts_with('.')) {
-        return true;
-    }
-
-    // exclude_dirs check applies only to ancestor directory components.
-    let ancestors = &segments[..segments.len() - 1];
-    if ancestors
-        .iter()
-        .any(|seg| exclude_dirs.iter().any(|d| d == seg))
-    {
-        return true;
+    while let Some(seg) = segments.next() {
+        if seg.starts_with('.') {
+            return true;
+        }
+        // Ancestor (i.e. not the last segment) — apply exclude_dirs.
+        if segments.peek().is_some()
+            && !exclude_dirs.is_empty()
+            && exclude_dirs.iter().any(|d| d == seg)
+        {
+            return true;
+        }
     }
 
     // Gitignore check (if a matcher is available).

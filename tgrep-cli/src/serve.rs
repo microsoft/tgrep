@@ -139,7 +139,7 @@ struct ServerState {
     /// Built once at startup; `None` if the matcher could not be built
     /// (in which case the watcher just falls back to its hidden / exclude
     /// filtering and accepts that gitignored files may be reindexed).
-    gitignore: Option<ignore::gitignore::Gitignore>,
+    gitignore: Option<tgrep_core::walker::Gitignore>,
 }
 
 struct SearchOpts {
@@ -213,7 +213,7 @@ pub fn run(
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
         snapshot_gate: RwLock::new(()),
-        gitignore: build_gitignore_matcher(&root),
+        gitignore: tgrep_core::walker::build_gitignore_matcher(&root),
     });
 
     // Bind TCP listener on a random port
@@ -715,46 +715,6 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
     Some(watcher)
 }
 
-/// Build a `Gitignore` matcher rooted at `root`, loading every `.gitignore`
-/// file inside the tree (using `WalkBuilder` so we automatically skip the
-/// `.git/` dir, hidden trees, and gitignored subtrees ourselves), plus
-/// `.git/info/exclude` and the user's global gitignore.
-///
-/// Returns `None` when no rules could be loaded; callers should treat that
-/// as "no gitignore filtering" and rely on the cheap hidden / `--exclude`
-/// fallback in `should_skip_watcher_path` for the most common cases.
-fn build_gitignore_matcher(root: &Path) -> Option<ignore::gitignore::Gitignore> {
-    use ignore::gitignore::GitignoreBuilder;
-
-    let mut builder = GitignoreBuilder::new(root);
-
-    // Repo-local .git/info/exclude (if present).
-    let info_exclude = root.join(".git").join("info").join("exclude");
-    if info_exclude.is_file() {
-        let _ = builder.add(&info_exclude);
-    }
-
-    // Walk just for `.gitignore` files. WalkBuilder honors the same
-    // gitignore + hidden defaults the indexer uses, so we don't recurse
-    // into ignored dirs and we naturally skip `.git/`.
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
-    for entry in walker.flatten() {
-        if entry.file_name() == ".gitignore" && entry.path().is_file() {
-            let _ = builder.add(entry.path());
-        }
-    }
-
-    // Global gitignore (from git config) is loaded transparently by
-    // GitignoreBuilder when present.
-    let gi = builder.build().ok()?;
-    if gi.is_empty() { None } else { Some(gi) }
-}
-
 /// Decide whether the file watcher should skip a path entirely.
 ///
 /// Mirrors the file walker's hidden-path, `--exclude` directory filtering,
@@ -782,7 +742,7 @@ fn build_gitignore_matcher(root: &Path) -> Option<ignore::gitignore::Gitignore> 
 fn should_skip_watcher_path(
     rel_path: &str,
     exclude_dirs: &[String],
-    gitignore: Option<&ignore::gitignore::Gitignore>,
+    gitignore: Option<&tgrep_core::walker::Gitignore>,
 ) -> bool {
     let segments: Vec<&str> = rel_path
         .split('/')
@@ -1842,16 +1802,13 @@ mod tests {
 
     #[test]
     fn skip_watcher_path_honors_gitignore_matcher() {
-        use ignore::gitignore::GitignoreBuilder;
-
-        // Build a gitignore matcher rooted at /repo with rules that
-        // would skip `*.log` and the whole `target/` subtree.
+        // Build the matcher via the public tgrep-core helper so this test
+        // also exercises the shared loading logic.
         let tmp = TempDir::new().unwrap();
         let gi_path = tmp.path().join(".gitignore");
         std::fs::write(&gi_path, "*.log\ntarget/\n").unwrap();
-        let mut gb = GitignoreBuilder::new(tmp.path());
-        gb.add(&gi_path);
-        let gi = gb.build().unwrap();
+        let gi = tgrep_core::walker::build_gitignore_matcher(tmp.path())
+            .expect("matcher should build from a non-empty .gitignore");
 
         let no_exclude: Vec<String> = Vec::new();
         // Files matched by the gitignore are skipped.

@@ -2,6 +2,11 @@
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
+/// Re-export of `ignore::gitignore::Gitignore` so callers can hold a
+/// matcher (e.g. for per-event point queries from a file watcher) without
+/// taking a direct dependency on the `ignore` crate.
+pub use ignore::gitignore::Gitignore;
+
 /// Maximum file size to index (1 MB). Larger files are skipped.
 const MAX_FILE_SIZE: u64 = 1_048_576;
 
@@ -195,6 +200,53 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta>
     });
 
     results.into_inner().unwrap()
+}
+
+/// Build a `Gitignore` matcher rooted at `root`, mirroring the same
+/// gitignore semantics that `walk_dir`/`walk_file_metadata` apply during
+/// iteration. Loads:
+///   * `.git/info/exclude` (if present)
+///   * every `.gitignore` file inside the tree
+///   * the user's global gitignore (via `GitignoreBuilder`'s defaults)
+///
+/// Uses `WalkBuilder` to enumerate `.gitignore` files so we automatically
+/// skip the `.git` dir, hidden trees, and gitignored subtrees while
+/// collecting rules — same as the indexer walk.
+///
+/// Intended for callers that need to point-query gitignore membership
+/// for a single path (e.g. a file watcher reacting to a notify event).
+/// Returns `None` when no rules could be loaded.
+pub fn build_gitignore_matcher(root: &Path) -> Option<Gitignore> {
+    use ignore::gitignore::GitignoreBuilder;
+
+    let mut builder = GitignoreBuilder::new(root);
+
+    let info_exclude = root.join(".git").join("info").join("exclude");
+    if info_exclude.is_file() {
+        let _ = builder.add(&info_exclude);
+    }
+
+    // Walk to find every `.gitignore` file. `.gitignore` itself starts
+    // with `.` so we cannot use `hidden(true)` (it would filter the very
+    // files we are looking for). Instead, walk with hidden=false but
+    // filter out the `.git/` subtree explicitly so we don't recurse
+    // into git's own metadata. Gitignore-based subtree skipping still
+    // applies, so we don't descend into ignored dirs while collecting.
+    let walker = WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build();
+    for entry in walker.flatten() {
+        if entry.file_name() == ".gitignore" && entry.path().is_file() {
+            let _ = builder.add(entry.path());
+        }
+    }
+
+    let gi = builder.build().ok()?;
+    if gi.is_empty() { None } else { Some(gi) }
 }
 
 #[cfg(test)]

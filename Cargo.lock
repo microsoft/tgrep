@@ -796,7 +796,6 @@ dependencies = [
  "assert_cmd",
  "clap",
  "fs2",
- "ignore",
  "lru",
  "notify",
  "predicates",

@@ -88,6 +88,11 @@ struct ServerState {
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
     indexing: std::sync::atomic::AtomicBool,
+    /// True while a bulk flush to disk is running. Internal-only; not
+    /// surfaced through `status`. Used to suppress the auto-save loop
+    /// from kicking off a redundant parallel snapshot while the bulk
+    /// flush (or stale-refresh flush) is still executing.
+    flushing: std::sync::atomic::AtomicBool,
     /// Progress: number of files indexed so far.
     index_progress: std::sync::atomic::AtomicU64,
     /// Total files discovered for indexing.
@@ -177,6 +182,7 @@ pub fn run(
         root: root.clone(),
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
+        flushing: std::sync::atomic::AtomicBool::new(false),
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
         exclude_dirs: exclude_dirs.to_vec(),
@@ -802,8 +808,13 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
     loop {
         thread::sleep(Duration::from_secs(60));
 
-        // Don't auto-save while background indexing is active — it handles its own flushes
-        if state.indexing.load(std::sync::atomic::Ordering::Relaxed) {
+        // Don't auto-save while background indexing or a bulk flush is
+        // active — those paths handle their own publication and an
+        // auto-save fired in parallel would just snapshot the same
+        // overlay redundantly.
+        if state.indexing.load(std::sync::atomic::Ordering::Relaxed)
+            || state.flushing.load(std::sync::atomic::Ordering::Relaxed)
+        {
             continue;
         }
 
@@ -1058,7 +1069,13 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
             )
         })
         .collect();
+    state
+        .flushing
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     flush_index_to_disk(state, root, index_dir, Some(&new_stamps));
+    state
+        .flushing
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Refresh in-memory stamps so the watcher can dedupe spurious notify
     // events for files that already match what we just published.
@@ -1221,15 +1238,21 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     // The in-memory build is done — surface "complete" in status now even
     // though the final disk flush below can take minutes for very large
-    // repos. Auto-save and watcher reindex paths share the publish_lock
-    // with the flush, so concurrent disk activity is serialized safely.
+    // repos. The internal `flushing` flag (set below) keeps the auto-save
+    // loop from kicking off a redundant parallel snapshot during the flush.
     state
         .indexing
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Final (and only) flush to disk for the bulk build.
     eprintln!("[trace] persisting final index to disk...");
+    state
+        .flushing
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let pruned = flush_index_to_disk(state, root, index_dir, Some(&stamps));
+    state
+        .flushing
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Refresh the in-memory file_stamps so the file watcher can recognize
     // unchanged files and skip spurious notify events (e.g. atime/attribute

@@ -219,17 +219,24 @@ impl HybridIndex {
         let reader = self.reader();
         let reader_paths: std::collections::HashSet<&str> =
             reader.all_paths().iter().map(|s| s.as_str()).collect();
+
+        // Fast path: after a successful bulk flush every overlay path is
+        // already in the new reader. Swap all overlay maps out for empty
+        // ones (microseconds) and let a background thread drop the old
+        // contents — keeping the multi-second drop work off the index
+        // write lock so concurrent searches stay responsive.
+        if self.live.try_drop_all_persisted(&reader_paths) {
+            return;
+        }
+
+        // Selective fall-back: prune only the overlay entries that are now
+        // in the reader, leaving fresher mutations alone.
         let to_remove: Vec<String> = self
             .live
             .overlay_paths()
             .into_iter()
             .filter(|p| reader_paths.contains(p.as_str()))
             .collect();
-        // Single batched pass instead of one full retain-over-inverted +
-        // retain-over-masks per file. On a 285k-file overlay with ~1M
-        // trigram entries this is the difference between minutes (under
-        // the write lock, blocking all searches) and a fraction of a
-        // second.
         self.live.batch_remove_overlay_entries(&to_remove);
     }
 

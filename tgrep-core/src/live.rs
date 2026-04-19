@@ -384,6 +384,63 @@ impl LiveIndex {
         self.masks.retain(|&(_, fid), _| !ids.contains(&fid));
     }
 
+    /// Fast post-flush prune: if every overlay entry is reflected in
+    /// `reader_paths`, swap all overlay maps out for empty ones and drop
+    /// the old contents on a background thread. Returns `true` if the
+    /// fast path was taken (overlay is now empty), `false` if the caller
+    /// must fall back to a selective prune.
+    ///
+    /// The point of dropping off-thread is that for a 285k-file overlay
+    /// the actual `drop` of the trigram/mask maps takes ~1 second of
+    /// HashMap-bucket walking and per-entry destructor calls. Keeping
+    /// that work off the index write lock turns a multi-second post-flush
+    /// stall (during which all searches block on Windows SRWLock writer
+    /// preference) into microseconds.
+    pub fn try_drop_all_persisted(
+        &mut self,
+        reader_paths: &std::collections::HashSet<&str>,
+    ) -> bool {
+        // Every active overlay path must be present in the reader…
+        if !self
+            .path_to_id
+            .keys()
+            .all(|p| reader_paths.contains(p.as_str()))
+        {
+            return false;
+        }
+        // …and any tombstoned (deleted) path must NOT be in the reader,
+        // otherwise dropping the tombstone here would re-expose a file the
+        // user thinks is deleted.
+        if self
+            .deleted_paths
+            .iter()
+            .any(|p| reader_paths.contains(p.as_str()))
+        {
+            return false;
+        }
+
+        // Snapshot under lock, drop outside lock. The taken values are
+        // moved into a thread that owns them; this function returns
+        // immediately so the caller can release the index write lock.
+        let inverted = std::mem::take(&mut self.inverted);
+        let masks = std::mem::take(&mut self.masks);
+        let file_paths = std::mem::take(&mut self.file_paths);
+        let path_to_id = std::mem::take(&mut self.path_to_id);
+        let deleted_paths = std::mem::take(&mut self.deleted_paths);
+
+        std::thread::Builder::new()
+            .name("tgrep-drop-overlay".into())
+            .spawn(move || {
+                drop(inverted);
+                drop(masks);
+                drop(file_paths);
+                drop(path_to_id);
+                drop(deleted_paths);
+            })
+            .ok();
+        true
+    }
+
     /// Return all paths currently in the overlay.
     pub fn overlay_paths(&self) -> Vec<String> {
         self.path_to_id.keys().cloned().collect()

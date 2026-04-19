@@ -139,7 +139,7 @@ struct ServerState {
     /// Built once at startup; `None` if the matcher could not be built
     /// (in which case the watcher just falls back to its hidden / exclude
     /// filtering and accepts that gitignored files may be reindexed).
-    gitignore: Option<tgrep_core::walker::Gitignore>,
+    gitignore: Option<tgrep_core::gitignore::Gitignore>,
 }
 
 struct SearchOpts {
@@ -220,7 +220,7 @@ pub fn run(
         gitignore: if no_watch {
             None
         } else {
-            tgrep_core::walker::build_gitignore_matcher(&root)
+            tgrep_core::gitignore::build_matcher(&root)
         },
     });
 
@@ -750,7 +750,7 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
 fn should_skip_watcher_path(
     rel_path: &str,
     exclude_dirs: &[String],
-    gitignore: Option<&tgrep_core::walker::Gitignore>,
+    gitignore: Option<&tgrep_core::gitignore::Gitignore>,
 ) -> bool {
     // Single streaming pass over path components — no Vec allocation
     // on the hot watcher path. The hidden-component check applies to
@@ -1815,7 +1815,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let gi_path = tmp.path().join(".gitignore");
         std::fs::write(&gi_path, "*.log\ntarget/\n").unwrap();
-        let gi = tgrep_core::walker::build_gitignore_matcher(tmp.path())
+        let gi = tgrep_core::gitignore::build_matcher(tmp.path())
             .expect("matcher should build from a non-empty .gitignore");
 
         let no_exclude: Vec<String> = Vec::new();

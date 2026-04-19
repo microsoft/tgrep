@@ -64,6 +64,32 @@ impl LiveIndex {
 
     /// Insert or update a file in the live index.
     pub fn upsert_file(&mut self, rel_path: &str, content: &[u8]) {
+        let per_tri = Self::compute_trigram_masks(content);
+        self.commit_upsert(rel_path, per_tri);
+    }
+
+    /// Extract and merge trigrams+masks for a file's contents. Pure
+    /// computation — safe to call outside any index lock so callers
+    /// (e.g. the file watcher) can do the heavy work without blocking
+    /// concurrent searches.
+    pub fn compute_trigram_masks(content: &[u8]) -> HashMap<u32, trigram::TrigramMasks> {
+        let tri_masks = trigram::extract_with_masks(content);
+        let lower = content.to_ascii_lowercase();
+        let lower_tri_masks = trigram::extract_with_masks(&lower);
+
+        let mut per_tri: HashMap<u32, trigram::TrigramMasks> = HashMap::new();
+        for &(tri, m) in tri_masks.iter().chain(lower_tri_masks.iter()) {
+            let entry = per_tri.entry(tri).or_default();
+            entry.loc_mask |= m.loc_mask;
+            entry.next_mask |= m.next_mask;
+        }
+        per_tri
+    }
+
+    /// Commit a pre-computed set of (trigram, masks) entries for a file.
+    /// Intended to run under the index write lock after the caller has
+    /// already done the expensive extraction outside the lock.
+    pub fn commit_upsert(&mut self, rel_path: &str, per_tri: HashMap<u32, trigram::TrigramMasks>) {
         // Remove old entry if exists
         if let Some(&old_id) = self.path_to_id.get(rel_path) {
             self.remove_file_by_id(old_id);
@@ -71,19 +97,6 @@ impl LiveIndex {
 
         let raw_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let file_id = raw_id | OVERLAY_BIT;
-
-        // Extract trigrams with masks
-        let tri_masks = trigram::extract_with_masks(content);
-        let lower = content.to_ascii_lowercase();
-        let lower_tri_masks = trigram::extract_with_masks(&lower);
-
-        // Merge masks per trigram
-        let mut per_tri: HashMap<u32, trigram::TrigramMasks> = HashMap::new();
-        for &(tri, m) in tri_masks.iter().chain(lower_tri_masks.iter()) {
-            let entry = per_tri.entry(tri).or_default();
-            entry.loc_mask |= m.loc_mask;
-            entry.next_mask |= m.next_mask;
-        }
 
         for (tri, m) in per_tri {
             self.inverted.entry(tri).or_default().insert(file_id);

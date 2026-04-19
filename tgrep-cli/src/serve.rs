@@ -758,13 +758,30 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
             continue;
         }
 
+        // Read contents and extract trigrams OUTSIDE the index write lock
+        // so a concurrent search (which needs a read lock) is not blocked
+        // on our file I/O and trigram parsing. Windows' SRWLock is
+        // writer-preferring: a single waiting writer here would otherwise
+        // stall every subsequent search request.
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let is_binary = tgrep_core::trigram::is_binary(&data);
+        let per_tri = if is_binary {
+            None
+        } else {
+            Some(tgrep_core::live::LiveIndex::compute_trigram_masks(&data))
+        };
+
         eprintln!("[trace] reindex: modified {rel_path}");
-        state
-            .index
-            .write()
-            .unwrap()
-            .live
-            .update_from_disk(root, &rel_path);
+        {
+            let mut index = state.index.write().unwrap();
+            match per_tri {
+                Some(per_tri) => index.live.commit_upsert(&rel_path, per_tri),
+                None => index.live.delete_file(&rel_path),
+            }
+        }
         state
             .file_stamps
             .write()

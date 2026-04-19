@@ -12,15 +12,6 @@ mod serve;
 mod status;
 mod walkcount;
 
-// Use mimalloc as the global allocator. The default Windows system heap
-// caches freed regions aggressively for fast reuse, which after the bulk
-// indexing burst leaves several hundred MB of capacity sitting in the
-// process even though the live overlay has been dropped. mimalloc returns
-// freed pages to the OS far more readily, so steady-state RSS after a
-// flush tracks the actual working set instead of indexing-time peak.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use std::path::PathBuf;
 use std::process;
 

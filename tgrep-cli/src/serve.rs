@@ -88,6 +88,11 @@ struct ServerState {
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
     indexing: std::sync::atomic::AtomicBool,
+    /// True while a bulk flush to disk is running. Internal-only; not
+    /// surfaced through `status`. Used to suppress the auto-save loop
+    /// from kicking off a redundant parallel snapshot while the bulk
+    /// flush (or stale-refresh flush) is still executing.
+    flushing: std::sync::atomic::AtomicBool,
     /// Progress: number of files indexed so far.
     index_progress: std::sync::atomic::AtomicU64,
     /// Total files discovered for indexing.
@@ -103,6 +108,31 @@ struct ServerState {
     /// snapshots) or swap readers out of order. Searches do **not**
     /// take this lock, so they continue uninterrupted during a publish.
     publish_lock: Mutex<()>,
+    /// Last-known per-file stamps (mtime + size). Used by the file
+    /// watcher to ignore notify events that don't reflect a real
+    /// content change (e.g. atime-only updates, attribute changes,
+    /// or events triggered by the search itself opening files on
+    /// some filesystems). Loaded from `filestamps.json` at startup
+    /// and refreshed during the initial build, on stale-state
+    /// refresh, and per watcher event that actually mutates the
+    /// index.
+    file_stamps: RwLock<std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+    /// Coordinates overlay mutations with the snapshot→publish→prune
+    /// window. Watcher mutations (handle_fs_event) acquire it for
+    /// **read** before touching the live overlay; flush/auto-save
+    /// publishers acquire it for **write** for the entire cycle from
+    /// taking the snapshot through pruning the now-persisted entries.
+    ///
+    /// Without this gate, a watcher event that fires after the
+    /// snapshot is taken but before `prune_persisted_entries` runs
+    /// would silently lose its mutation: the snapshot doesn't see
+    /// the new content, the on-disk reader is reopened with the old
+    /// version, then prune deletes the overlay entry by path because
+    /// the path now matches a reader entry — orphaning the new data.
+    ///
+    /// Searches do **not** take this lock; they keep using the
+    /// current reader + overlay throughout.
+    snapshot_gate: RwLock<()>,
 }
 
 struct SearchOpts {
@@ -169,10 +199,13 @@ pub fn run(
         root: root.clone(),
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
+        flushing: std::sync::atomic::AtomicBool::new(false),
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
         exclude_dirs: exclude_dirs.to_vec(),
         publish_lock: Mutex::new(()),
+        file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
+        snapshot_gate: RwLock::new(()),
     });
 
     // Bind TCP listener on a random port
@@ -675,6 +708,8 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
 }
 
 fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
+    use tgrep_core::meta::FileStamp;
+
     // Skip file events while the initial background index build is in progress —
     // the indexer will pick up all files itself, and the watcher would just
     // cause duplicate reindex work.
@@ -690,6 +725,15 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         return;
     }
 
+    // Acquire the snapshot gate up-front for the whole event. While a
+    // flush/auto-save is publishing (writer holds it), no reindex
+    // *work* — file I/O, trigram extraction, even the [trace] line —
+    // should happen, both for correctness (no overlay mutation between
+    // snapshot and prune) and to avoid spending CPU/IO on work that
+    // would just block the watcher thread anyway. We hold it for read
+    // so multiple events can proceed concurrently outside any flush.
+    let _gate = state.snapshot_gate.read().unwrap();
+
     for path in &event.paths {
         // Skip the index directory itself
         if path
@@ -704,17 +748,85 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
             Err(_) => continue,
         };
 
-        let mut index = state.index.write().unwrap();
+        let is_remove = matches!(event.kind, EventKind::Remove(_)) || !path.exists();
 
-        if matches!(event.kind, EventKind::Remove(_)) || !path.exists() {
-            eprintln!("[trace] reindex: removed {rel_path}");
-            index.live.delete_file(&rel_path);
-        } else if path.is_file() {
-            eprintln!("[trace] reindex: modified {rel_path}");
-            index.live.update_from_disk(root, &rel_path);
+        if is_remove {
+            // notify can deliver Remove events for transient/unknown paths
+            // (e.g. a build tool's temp file). Suppress the noisy log line
+            // for those, but still apply the delete unconditionally — if
+            // `file_stamps` is missing/out-of-date (e.g. first run after
+            // an older index), skipping the delete entirely would leave
+            // stale entries for files that no longer exist.
+            let known_path = state.file_stamps.read().unwrap().contains_key(&rel_path);
+            if known_path {
+                eprintln!("[trace] reindex: removed {rel_path}");
+            }
+            // gate acquired at the function level — the entire event
+            // is processed atomically with respect to flush/auto-save.
+            state.index.write().unwrap().live.delete_file(&rel_path);
+            state.file_stamps.write().unwrap().remove(&rel_path);
+            if let Ok(mut cache) = state.cache.write() {
+                cache.pop(&rel_path);
+            }
+            continue;
         }
 
-        // Invalidate cache for this path
+        if !path.is_file() {
+            continue;
+        }
+
+        // Compute the file's current stamp and skip if it matches what we
+        // last indexed. notify on Windows in particular fires Modify events
+        // for atime/attribute updates, opens, etc. — re-indexing on those
+        // would re-read large files, churn the live overlay, and produce a
+        // misleading "modified" trace for files that didn't actually change.
+        let current = match std::fs::metadata(path) {
+            Ok(m) => FileStamp {
+                mtime: m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                size: m.len(),
+            },
+            Err(_) => continue,
+        };
+        if state.file_stamps.read().unwrap().get(&rel_path) == Some(&current) {
+            continue;
+        }
+
+        // Read contents and extract trigrams OUTSIDE the index write lock
+        // so a concurrent search (which needs a read lock) is not blocked
+        // on our file I/O and trigram parsing. Windows' SRWLock is
+        // writer-preferring: a single waiting writer here would otherwise
+        // stall every subsequent search request.
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let is_binary = tgrep_core::trigram::is_binary(&data);
+        let per_tri = if is_binary {
+            None
+        } else {
+            Some(tgrep_core::live::LiveIndex::compute_trigram_masks(&data))
+        };
+
+        eprintln!("[trace] reindex: modified {rel_path}");
+        // gate acquired at the function level — the commit + stamp
+        // update is processed atomically with respect to flush/auto-save.
+        {
+            let mut index = state.index.write().unwrap();
+            match per_tri {
+                Some(per_tri) => index.live.commit_upsert(&rel_path, per_tri),
+                None => index.live.delete_file(&rel_path),
+            }
+        }
+        state
+            .file_stamps
+            .write()
+            .unwrap()
+            .insert(rel_path.clone(), current);
         if let Ok(mut cache) = state.cache.write() {
             cache.pop(&rel_path);
         }
@@ -727,8 +839,13 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
     loop {
         thread::sleep(Duration::from_secs(60));
 
-        // Don't auto-save while background indexing is active — it handles its own flushes
-        if state.indexing.load(std::sync::atomic::Ordering::Relaxed) {
+        // Don't auto-save while background indexing or a bulk flush is
+        // active — those paths handle their own publication and an
+        // auto-save fired in parallel would just snapshot the same
+        // overlay redundantly.
+        if state.indexing.load(std::sync::atomic::Ordering::Relaxed)
+            || state.flushing.load(std::sync::atomic::Ordering::Relaxed)
+        {
             continue;
         }
 
@@ -742,12 +859,22 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
             let save_start = Instant::now();
             eprintln!("[trace] auto-save: {dirty} mutations, saving...");
 
+            // Hold the snapshot gate in write mode for the entire
+            // snapshot → publish → prune cycle so watcher mutations
+            // can't race the prune (see flush_index_to_disk for the
+            // same pattern + rationale).
+            let _gate = state.snapshot_gate.write().unwrap();
+
             // Snapshot reader + overlay under brief read lock
             let (paths, inverted) = {
                 let index = state.index.read().unwrap();
                 index.full_snapshot()
             };
             let staging_dir = index_dir.with_file_name(".tgrep_save_staging");
+            // Clear any stale files from a previously crashed auto-save —
+            // otherwise leftover artifacts (e.g. an old filestamps.json)
+            // would be picked up by move_staged_files and published.
+            let _ = std::fs::remove_dir_all(&staging_dir);
             if let Err(e) = builder::write_index_from_snapshot(
                 &state.root,
                 &staging_dir,
@@ -933,11 +1060,16 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
         walk_ms
     );
 
-    // Apply changes to the LiveIndex
+    // Apply changes to the LiveIndex. Hold snapshot_gate.read() across the
+    // mutation block so a concurrent flush/auto-save cannot snapshot the
+    // overlay and then prune away these updates after publishing. The
+    // subsequent flush_index_to_disk call below takes the gate exclusively
+    // itself.
     let update_start = Instant::now();
     let files_to_update: Vec<String> = changed.into_iter().chain(added).collect();
 
     {
+        let _gate = state.snapshot_gate.read().unwrap();
         let mut index = state.index.write().unwrap();
 
         // Remove deleted files
@@ -967,12 +1099,10 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
         start.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Persist the updated index immediately so changes survive a crash
+    // Persist the updated index immediately so changes survive a crash.
+    // Pass the freshly-walked stamps so they publish atomically with the
+    // index files.
     eprintln!("[trace] stale check: flushing updated index to disk...");
-    flush_index_to_disk(state, root, index_dir);
-
-    // Re-stamp ALL walked files (including content-binary ones) so the
-    // next startup won't treat unchanged non-indexed files as "new".
     let new_stamps: std::collections::HashMap<String, FileStamp> = current_meta
         .iter()
         .map(|fm| {
@@ -985,21 +1115,35 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
             )
         })
         .collect();
-    if let Err(e) = meta::write_filestamps(&new_stamps, index_dir) {
-        eprintln!("[trace] stale check: failed to write filestamps: {e}");
-    }
+    state
+        .flushing
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    flush_index_to_disk(state, root, index_dir, Some(&new_stamps));
+    state
+        .flushing
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Refresh in-memory stamps so the watcher can dedupe spurious notify
+    // events for files that already match what we just published.
+    *state.file_stamps.write().unwrap() = new_stamps;
 }
 
 /// Walk the repo and populate the LiveIndex in batches in a background thread.
-/// Uses rayon for parallel trigram extraction. Flushes to disk every
-/// FLUSH_INTERVAL or FLUSH_FILE_THRESHOLD, whichever comes first.
+/// Uses rayon for parallel trigram extraction. The bulk build is held entirely
+/// in the live overlay; only one final flush to disk happens once the walk
+/// completes. This avoids the super-linear cost of repeatedly snapshotting an
+/// ever-growing reader+overlay during indexing, and lets us release the live
+/// overlay's allocations once the data is safely on disk.
+///
+/// Trade-off: a crash during the initial build loses all in-progress work
+/// (no intermediate checkpoint to fall back to). The file watcher and
+/// auto-save loop continue to protect ongoing changes after the initial
+/// build completes.
 fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) {
     use rayon::prelude::*;
     use tgrep_core::walker::{self, WalkOptions};
 
     const BATCH_SIZE: usize = 500;
-    const FLUSH_FILE_THRESHOLD: usize = 100_000;
-    const FLUSH_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
 
     let start = Instant::now();
     eprintln!("[trace] background indexing started...");
@@ -1063,10 +1207,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         t_walk.elapsed().as_secs_f64() * 1000.0
     );
 
-    let mut files_since_flush: usize = 0;
-    let mut last_flush = Instant::now();
-    let checkpoint_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
     // Phase 2: Process new files in parallel batches
     for (batch_idx, batch) in new_files.chunks(BATCH_SIZE).enumerate() {
         // Parallel: read files + extract trigrams (no locks held)
@@ -1102,7 +1242,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
         let progress =
             seeded_count as usize + ((batch_idx + 1) * BATCH_SIZE).min(new_count as usize);
-        files_since_flush += batch.len();
         state
             .index_progress
             .store(progress as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1112,16 +1251,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 "[trace] indexing progress: ~{progress}/{total} files ({:.1}s elapsed)",
                 start.elapsed().as_secs_f64()
             );
-        }
-
-        // Periodic flush to disk (checkpoint only — don't reopen, keep accumulating in LiveIndex)
-        if files_since_flush >= FLUSH_FILE_THRESHOLD || last_flush.elapsed() >= FLUSH_INTERVAL {
-            eprintln!(
-                "[trace] flushing index to disk ({files_since_flush} files since last flush)..."
-            );
-            checkpoint_index_to_disk(state, index_dir, &checkpoint_active);
-            files_since_flush = 0;
-            last_flush = Instant::now();
         }
     }
 
@@ -1133,17 +1262,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         start.elapsed().as_secs_f64()
     );
 
-    // Wait for any active checkpoint thread to finish before final flush
-    while checkpoint_active.load(std::sync::atomic::Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    // Final flush to disk
-    eprintln!("[trace] persisting final index to disk...");
-    flush_index_to_disk(state, root, index_dir);
-
-    // Write per-file stamps for ALL walked files (including content-binary
-    // ones) so the stale check on next startup is accurate.
+    // Walk filesystem metadata BEFORE the flush so we can publish the
+    // resulting per-file stamps atomically with the index files. Writing
+    // them after a successful flush would leave a multi-minute window where
+    // the index looks fully published but `filestamps.json` is missing — a
+    // server kill in that window disables incremental stale detection on
+    // the next start.
     let walk_meta = tgrep_core::walker::walk_file_metadata(root, &state.exclude_dirs);
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta
         .into_iter()
@@ -1157,107 +1281,75 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             )
         })
         .collect();
-    if let Err(e) = tgrep_core::meta::write_filestamps(&stamps, index_dir) {
-        eprintln!("[trace] warning: failed to write filestamps: {e}");
-    }
 
-    // Clear indexing flag AFTER final flush so auto-save doesn't race
+    // The in-memory build is done — surface "complete" in status now even
+    // though the final disk flush below can take minutes for very large
+    // repos. Set `flushing` *before* clearing `indexing` so the auto-save
+    // loop never observes both flags as false during the handoff and
+    // races us into a redundant parallel snapshot of the bulk overlay.
+    state
+        .flushing
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     state
         .indexing
         .store(false, std::sync::atomic::Ordering::Relaxed);
-}
 
-/// Checkpoint: write LiveIndex to disk for crash recovery, but do NOT reopen.
-/// Clones raw data under a brief read lock, then spawns a background thread
-/// for the expensive ID remapping and disk I/O — indexing continues unblocked.
-fn checkpoint_index_to_disk(
-    state: &Arc<ServerState>,
-    index_dir: &Path,
-    checkpoint_active: &Arc<std::sync::atomic::AtomicBool>,
-) {
-    // Skip if a previous checkpoint is still running
-    if checkpoint_active.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[trace] checkpoint skipped: previous checkpoint still running");
-        return;
+    // Final (and only) flush to disk for the bulk build.
+    eprintln!("[trace] persisting final index to disk...");
+    let pruned = flush_index_to_disk(state, root, index_dir, Some(&stamps));
+    state
+        .flushing
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Refresh the in-memory file_stamps so the file watcher can recognize
+    // unchanged files and skip spurious notify events (e.g. atime/attribute
+    // updates on Windows). Done even if the flush failed — the live overlay
+    // already reflects what we just indexed, and the stamps describe that.
+    *state.file_stamps.write().unwrap() = stamps;
+
+    // Reclaim memory held by the indexing-time live overlay — but only when
+    // the flush actually completed and `prune_persisted_entries` ran. If the
+    // flush failed, the overlay is still the source of truth and shrinking
+    // the indexing-sized maps would just waste the write lock with no benefit.
+    if pruned {
+        let mut index = state.index.write().unwrap();
+        index.live.shrink_to_fit();
     }
-
-    let clone_start = Instant::now();
-
-    // Snapshot reader + overlay under read lock for a complete checkpoint
-    let (paths, inverted) = {
-        let index = state.index.read().unwrap();
-        let (paths, inverted) = index.full_snapshot();
-        eprintln!(
-            "[trace] checkpoint: snapshotted {} files in {:.1}ms (indexing continues)",
-            paths.len(),
-            clone_start.elapsed().as_secs_f64() * 1000.0
-        );
-        (paths, inverted)
-    };
-
-    // Spawn background thread for the expensive disk write
-    checkpoint_active.store(true, std::sync::atomic::Ordering::Relaxed);
-    let state = Arc::clone(state);
-    let index_dir = index_dir.to_path_buf();
-    let active_flag = Arc::clone(checkpoint_active);
-
-    thread::spawn(move || {
-        let flush_start = Instant::now();
-
-        let num_files = paths.len();
-
-        // Write to staging directory
-        let staging_dir = index_dir.with_file_name(".tgrep_staging");
-        if let Err(e) =
-            builder::write_index_from_snapshot(&state.root, &staging_dir, &paths, &inverted, false)
-        {
-            eprintln!("[trace] warning: checkpoint flush failed: {e}");
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            active_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-
-        // Lock-free publish: rename staging files into place, then build and
-        // swap in a fresh reader without taking the outer write lock.
-        // Searches continue to be served by the previous reader (its mmap
-        // remains valid while in-flight queries hold an Arc<IndexReader>).
-        //
-        // Held across move + open + swap so that a concurrent auto-save
-        // or stale-refresh flush cannot interleave per-file renames into
-        // `index_dir` (which would leave a mismatched on-disk index) or
-        // swap readers out of order. Searches do not take this lock.
-        let _publish = state.publish_lock.lock().unwrap();
-        if let Err(e) = move_staged_files(&staging_dir, &index_dir) {
-            eprintln!("[trace] warning: checkpoint move failed: {e}");
-        } else {
-            // Reopen the reader so future snapshots stay aligned with the
-            // newly published on-disk checkpoint, including files that exist
-            // only in the checkpointed reader state (for example, seeded
-            // files). This swap is atomic — searches see the old reader
-            // until the moment it returns and then the new one afterward.
-            match tgrep_core::reader::IndexReader::open(&index_dir) {
-                Ok(new_reader) => {
-                    state.index.read().unwrap().swap_reader(new_reader);
-                }
-                Err(e) => {
-                    eprintln!("[trace] warning: checkpoint reader reopen failed: {e}");
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(&staging_dir);
-
-        eprintln!(
-            "[trace] index checkpoint: {num_files} files written in {:.1}s",
-            flush_start.elapsed().as_secs_f64()
-        );
-        active_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-    });
 }
 
 /// Flush the current LiveIndex to disk and reopen the reader.
 /// Uses fast clone + background remap so queries stay responsive.
-fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
+///
+/// If `stamps` is `Some`, the function attempts to write per-file stamps
+/// into the staging directory so they are renamed into the index dir
+/// alongside the index files. Stamp persistence is best-effort: if writing
+/// `filestamps.json` fails we log and still publish the index, since
+/// losing the incremental stale-check on next start is preferable to
+/// dropping the freshly-built index. Callers must therefore not rely on
+/// `filestamps.json` always being published alongside a newly-flushed
+/// index.
+///
+/// Returns `true` if the new reader was opened and `prune_persisted_entries`
+/// ran on the live overlay; `false` on any earlier failure (write/move/open
+/// error or partial reader). Callers can use this to decide whether
+/// follow-up work that depends on the prune (e.g. shrinking the overlay)
+/// is worth doing.
+fn flush_index_to_disk(
+    state: &ServerState,
+    _root: &Path,
+    index_dir: &Path,
+    stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+) -> bool {
     let flush_start = Instant::now();
+
+    // Hold the snapshot gate in write mode for the entire snapshot →
+    // publish → prune cycle. Watcher mutations block on this for the
+    // duration; without it, an event that fires after the snapshot but
+    // before the prune would be silently dropped (snapshot doesn't see
+    // it, reader is reopened with the old version, then the prune
+    // removes the overlay entry by path because it now matches a reader
+    // entry). Searches do not take this lock and remain unaffected.
+    let _gate = state.snapshot_gate.write().unwrap();
 
     // Snapshot under brief read lock — use full_snapshot to merge reader + overlay
     let (paths, inverted, num_files) = {
@@ -1271,27 +1363,45 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
         (paths, inverted, num)
     };
 
-    // Expensive write — no lock held, queries served normally
+    // Always start from a clean staging dir. A previous crash (or a partial
+    // earlier flush whose error path missed the cleanup) could have left
+    // stale files behind — including a stale `filestamps.json`. If the
+    // current flush is invoked with `stamps == None` and we left an old
+    // filestamps.json there, `move_staged_files` would publish it next to
+    // a freshly-built index, silently corrupting the stale-check baseline.
     let staging_dir = index_dir.with_file_name(".tgrep_flush_staging");
+    let _ = std::fs::remove_dir_all(&staging_dir);
+
+    // Expensive write — no lock held, queries served normally
     if let Err(e) =
         builder::write_index_from_snapshot(&state.root, &staging_dir, &paths, &inverted, true)
     {
         eprintln!("[trace] warning: flush to disk failed: {e}");
         let _ = std::fs::remove_dir_all(&staging_dir);
-        return;
+        return false;
+    }
+
+    // Stage filestamps alongside the index files so the subsequent move
+    // publishes them atomically. If this fails we still try to publish the
+    // index — losing only the incremental stale-check benefit on next start,
+    // not the index itself.
+    if let Some(stamps) = stamps
+        && let Err(e) = tgrep_core::meta::write_filestamps(stamps, &staging_dir)
+    {
+        eprintln!("[trace] warning: failed to write staging filestamps: {e}");
     }
 
     // Lock-free publish: rename staging files into place, build new reader,
     // then swap. Search queries continue to be served throughout.
     //
-    // Held across move + open + swap so concurrent publishers
-    // (auto-save / checkpoint) cannot interleave renames or swap readers
-    // out of order. Searches do not take this lock.
+    // Held across move + open + swap so concurrent publishers (auto-save /
+    // background-build / watcher reindex flush) cannot interleave renames
+    // or swap readers out of order. Searches do not take this lock.
     let _publish = state.publish_lock.lock().unwrap();
     if let Err(e) = move_staged_files(&staging_dir, index_dir) {
         eprintln!("[trace] warning: flush move failed: {e}");
         let _ = std::fs::remove_dir_all(&staging_dir);
-        return;
+        return false;
     }
 
     // Open the new reader. The publish mutex is intentionally still held
@@ -1300,7 +1410,7 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
     // these steps). The server-wide `state.index` RwLock is NOT taken, so
     // search queries continue to be served by the previous reader (whose
     // `Arc<IndexReader>` they hold) throughout this call.
-    match tgrep_core::reader::IndexReader::open(index_dir) {
+    let pruned = match tgrep_core::reader::IndexReader::open(index_dir) {
         Ok(new_reader) => {
             let reader_files = new_reader.num_files();
             if reader_files >= num_files {
@@ -1313,24 +1423,28 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
                     index.live.reset_dirty_count();
                 }
                 eprintln!("[trace] flush: reader reopened ({reader_files} files), overlay pruned");
+                true
             } else {
                 eprintln!(
                     "[trace] warning: reader has {reader_files} files (expected {num_files}), keeping live overlay as fallback"
                 );
+                false
             }
         }
         Err(e) => {
             eprintln!(
                 "[trace] warning: failed to reopen reader after flush: {e}, live overlay retained"
             );
+            false
         }
-    }
+    };
     let _ = std::fs::remove_dir_all(&staging_dir);
 
     eprintln!(
         "[trace] index flushed: {num_files} files on disk in {:.1}s",
         flush_start.elapsed().as_secs_f64()
     );
+    pruned
 }
 
 /// Move index files from staging to the target directory.
@@ -1339,15 +1453,16 @@ fn flush_index_to_disk(state: &ServerState, _root: &Path, index_dir: &Path) {
 /// convention for publication layout; it does not provide atomic publish
 /// semantics or reader-side validation by itself.
 ///
-/// Performance note: this function is called while the server holds the index
-/// write lock, which blocks all search reads. Each per-file move uses
-/// `std::fs::rename` — on the same volume this is an O(microseconds)
-/// directory entry update, vs `std::fs::copy` which is O(file_size) and on a
-/// large `index.bin` (hundreds of MB) can take tens of seconds, blocking
-/// queries the whole time. Staging dirs are always created next to the target
-/// (same parent) so cross-volume cases should not arise; if rename truly
-/// fails, the error is surfaced rather than silently falling back to a slow
-/// copy under the lock (see `publish_file`).
+/// Performance note: this function runs under the server's `publish_lock`
+/// (which serializes concurrent publishers) but does NOT take the
+/// `state.index` write lock, so search queries continue to be served
+/// throughout. Each per-file move uses `std::fs::rename` — on the same
+/// volume this is an O(microseconds) directory entry update, vs
+/// `std::fs::copy` which is O(file_size) and on a large `index.bin`
+/// (hundreds of MB) can take tens of seconds. Staging dirs are always
+/// created next to the target (same parent) so cross-volume cases should
+/// not arise; if rename truly fails, the error is surfaced rather than
+/// silently falling back to a slow copy (see `publish_file`).
 fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(target)?;
     // Data files first, meta last.
@@ -1429,7 +1544,8 @@ fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
             Ok(()) => return Ok(()),
             Err(e) => {
                 #[cfg(windows)]
-                let transient = matches!(e.raw_os_error(), Some(c) if TRANSIENT_WIN_ERRORS.contains(&c));
+                let transient =
+                    matches!(e.raw_os_error(), Some(c) if TRANSIENT_WIN_ERRORS.contains(&c));
                 #[cfg(not(windows))]
                 let transient = false;
 
@@ -1445,10 +1561,7 @@ fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
                         attempt + 1,
                     );
                     let kind = e.kind();
-                    return Err(std::io::Error::new(
-                        kind,
-                        PublishError { ctx, source: e },
-                    ));
+                    return Err(std::io::Error::new(kind, PublishError { ctx, source: e }));
                 }
                 last_err = Some(e);
                 thread::sleep(RENAME_BACKOFF);
@@ -1574,8 +1687,8 @@ mod tests {
         let err = publish_file(&src, &dst).unwrap_err();
 
         // Walk source chain: outer io::Error -> PublishError -> inner io::Error
-        let inner_dyn = std::error::Error::source(&err)
-            .expect("outer error should expose its inner cause");
+        let inner_dyn =
+            std::error::Error::source(&err).expect("outer error should expose its inner cause");
         let inner_io = inner_dyn
             .downcast_ref::<std::io::Error>()
             .or_else(|| {

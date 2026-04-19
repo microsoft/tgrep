@@ -64,6 +64,44 @@ impl LiveIndex {
 
     /// Insert or update a file in the live index.
     pub fn upsert_file(&mut self, rel_path: &str, content: &[u8]) {
+        let per_tri = Self::compute_trigram_masks(content);
+        self.commit_upsert(rel_path, per_tri);
+    }
+
+    /// Extract and merge trigrams+masks for a file's contents. Pure
+    /// computation — safe to call outside any index lock so callers
+    /// (e.g. the file watcher) can do the heavy work without blocking
+    /// concurrent searches.
+    pub fn compute_trigram_masks(content: &[u8]) -> HashMap<u32, trigram::TrigramMasks> {
+        let tri_masks = trigram::extract_with_masks(content);
+
+        let mut per_tri: HashMap<u32, trigram::TrigramMasks> = HashMap::new();
+        for &(tri, m) in tri_masks.iter() {
+            let entry = per_tri.entry(tri).or_default();
+            entry.loc_mask |= m.loc_mask;
+            entry.next_mask |= m.next_mask;
+        }
+
+        // Skip the lowercase pass when content is already ASCII-lowercase —
+        // it would just re-emit the same trigrams. Mirrors the on-disk
+        // builder's optimization so watcher-driven reindexes don't pay for
+        // a redundant full scan + allocation on lowercase-heavy files.
+        let lower = content.to_ascii_lowercase();
+        if lower != content {
+            let lower_tri_masks = trigram::extract_with_masks(&lower);
+            for &(tri, m) in lower_tri_masks.iter() {
+                let entry = per_tri.entry(tri).or_default();
+                entry.loc_mask |= m.loc_mask;
+                entry.next_mask |= m.next_mask;
+            }
+        }
+        per_tri
+    }
+
+    /// Commit a pre-computed set of (trigram, masks) entries for a file.
+    /// Intended to run under the index write lock after the caller has
+    /// already done the expensive extraction outside the lock.
+    pub fn commit_upsert(&mut self, rel_path: &str, per_tri: HashMap<u32, trigram::TrigramMasks>) {
         // Remove old entry if exists
         if let Some(&old_id) = self.path_to_id.get(rel_path) {
             self.remove_file_by_id(old_id);
@@ -71,19 +109,6 @@ impl LiveIndex {
 
         let raw_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let file_id = raw_id | OVERLAY_BIT;
-
-        // Extract trigrams with masks
-        let tri_masks = trigram::extract_with_masks(content);
-        let lower = content.to_ascii_lowercase();
-        let lower_tri_masks = trigram::extract_with_masks(&lower);
-
-        // Merge masks per trigram
-        let mut per_tri: HashMap<u32, trigram::TrigramMasks> = HashMap::new();
-        for &(tri, m) in tri_masks.iter().chain(lower_tri_masks.iter()) {
-            let entry = per_tri.entry(tri).or_default();
-            entry.loc_mask |= m.loc_mask;
-            entry.next_mask |= m.next_mask;
-        }
 
         for (tri, m) in per_tri {
             self.inverted.entry(tri).or_default().insert(file_id);
@@ -98,8 +123,14 @@ impl LiveIndex {
 
     /// Insert or update a file with pre-computed trigrams.
     /// This avoids extracting trigrams while holding the write lock.
-    /// Note: masks are set to all-ones (no filtering) since pre-computed
-    /// trigrams don't include mask data.
+    ///
+    /// Note: this fast path does NOT populate `self.masks`. Pre-computed
+    /// trigrams carry no mask information, so a stored entry would only
+    /// ever be the "no-filter" sentinel `(u8::MAX, u8::MAX)` — which is
+    /// exactly what `lookup_trigram_with_masks` already returns by default
+    /// when a `(trigram, file_id)` entry is missing. Skipping the insert
+    /// avoids an enormous mask map (one entry per trigram per file) during
+    /// bulk indexing without changing query results.
     pub fn upsert_file_with_trigrams(&mut self, rel_path: &str, trigrams: Vec<u32>) {
         // Remove old entry if exists
         if let Some(&old_id) = self.path_to_id.get(rel_path) {
@@ -111,13 +142,6 @@ impl LiveIndex {
 
         for &tri in &trigrams {
             self.inverted.entry(tri).or_default().insert(file_id);
-            self.masks.insert(
-                (tri, file_id),
-                trigram::TrigramMasks {
-                    loc_mask: u8::MAX,
-                    next_mask: u8::MAX,
-                },
-            );
         }
 
         self.file_paths.insert(file_id, rel_path.to_string());
@@ -200,6 +224,27 @@ impl LiveIndex {
     /// Reset the dirty counter (e.g., after saving).
     pub fn reset_dirty_count(&mut self) {
         self.dirty_count = 0;
+    }
+
+    /// Shrink the top-level overlay maps to fit their current contents.
+    /// Useful after a large prune (e.g., immediately after the post-indexing
+    /// flush moves hundreds of thousands of files from the live overlay onto
+    /// disk) to release the indexing-time HashMap capacity back to the
+    /// allocator.
+    ///
+    /// Intentionally only shrinks the top-level maps. The per-trigram
+    /// posting `HashSet`s are typically emptied by `prune_persisted_entries`
+    /// (which removes them from `inverted` outright when they go empty), so
+    /// iterating every remaining set to call `shrink_to_fit` adds work
+    /// proportional to the trigram count under the global write lock with
+    /// little memory benefit. Callers that need the deeper compaction can
+    /// use a follow-up pass.
+    pub fn shrink_to_fit(&mut self) {
+        self.inverted.shrink_to_fit();
+        self.masks.shrink_to_fit();
+        self.file_paths.shrink_to_fit();
+        self.path_to_id.shrink_to_fit();
+        self.deleted_paths.shrink_to_fit();
     }
 
     /// Get all live file IDs.
@@ -299,6 +344,118 @@ impl LiveIndex {
         if let Some(&file_id) = self.path_to_id.get(path) {
             self.remove_file_by_id(file_id);
         }
+    }
+
+    /// Remove many overlay entries in one pass. Vastly faster than calling
+    /// `remove_overlay_entry` in a loop on large overlays: a single retain
+    /// over `inverted` and a single retain over `masks`, vs O(N) retains
+    /// each touching every trigram. When *all* overlay entries are being
+    /// removed (the common case after a successful bulk flush), the maps
+    /// are simply cleared instead.
+    pub fn batch_remove_overlay_entries(&mut self, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        // Resolve paths to file_ids; also remove from file_paths / path_to_id.
+        let mut ids: HashSet<u32> = HashSet::with_capacity(paths.len());
+        for p in paths {
+            if let Some(file_id) = self.path_to_id.remove(p) {
+                self.file_paths.remove(&file_id);
+                ids.insert(file_id);
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        // Fast path: removing the entire overlay. Drop everything wholesale —
+        // O(map size) drop instead of O(map size * removed paths) retains.
+        if self.path_to_id.is_empty() {
+            self.inverted.clear();
+            self.masks.clear();
+            return;
+        }
+        // Single retain over inverted: remove all matching ids from each
+        // posting set in one pass; drop empty posting sets.
+        self.inverted.retain(|_, set| {
+            set.retain(|fid| !ids.contains(fid));
+            !set.is_empty()
+        });
+        // Single retain over masks: drop any (tri, fid) where fid was removed.
+        self.masks.retain(|&(_, fid), _| !ids.contains(&fid));
+    }
+
+    /// Fast post-flush prune: if every overlay entry is reflected in
+    /// `reader_paths`, swap all overlay maps out for empty ones and drop
+    /// the old contents on a background thread. Returns `true` if the
+    /// fast path was taken (overlay is now empty), `false` if the caller
+    /// must fall back to a selective prune.
+    ///
+    /// The point of dropping off-thread is that for a 285k-file overlay
+    /// the actual `drop` of the trigram/mask maps takes ~1 second of
+    /// HashMap-bucket walking and per-entry destructor calls. Keeping
+    /// that work off the index write lock turns a multi-second post-flush
+    /// stall (during which all searches block on Windows SRWLock writer
+    /// preference) into microseconds.
+    pub fn try_drop_all_persisted(
+        &mut self,
+        reader_paths: &std::collections::HashSet<&str>,
+    ) -> bool {
+        // Every active overlay path must be present in the reader…
+        if !self
+            .path_to_id
+            .keys()
+            .all(|p| reader_paths.contains(p.as_str()))
+        {
+            return false;
+        }
+        // …and any tombstoned (deleted) path must NOT be in the reader,
+        // otherwise dropping the tombstone here would re-expose a file the
+        // user thinks is deleted.
+        if self
+            .deleted_paths
+            .iter()
+            .any(|p| reader_paths.contains(p.as_str()))
+        {
+            return false;
+        }
+
+        // Snapshot under lock, drop outside lock. The taken values are
+        // moved into a thread that owns them; this function returns
+        // immediately so the caller can release the index write lock.
+        let inverted = std::mem::take(&mut self.inverted);
+        let masks = std::mem::take(&mut self.masks);
+        let file_paths = std::mem::take(&mut self.file_paths);
+        let path_to_id = std::mem::take(&mut self.path_to_id);
+        let deleted_paths = std::mem::take(&mut self.deleted_paths);
+
+        // Only pay the thread-creation cost when the overlay is large
+        // enough that an inline drop would noticeably stall the caller.
+        // Small overlays (typical of an auto-save after a handful of
+        // watcher edits) drop in microseconds inline, so we don't churn
+        // OS threads on every flush cadence.
+        const OFF_THREAD_DROP_THRESHOLD: usize = 4096;
+        if inverted.len() < OFF_THREAD_DROP_THRESHOLD && masks.len() < OFF_THREAD_DROP_THRESHOLD {
+            drop(inverted);
+            drop(masks);
+            drop(file_paths);
+            drop(path_to_id);
+            drop(deleted_paths);
+        } else if std::thread::Builder::new()
+            .name("tgrep-drop-overlay".into())
+            .spawn(move || {
+                drop(inverted);
+                drop(masks);
+                drop(file_paths);
+                drop(path_to_id);
+                drop(deleted_paths);
+            })
+            .is_err()
+        {
+            // Spawn failed (rare) — the values were moved into the
+            // closure and dropped when the closure was dropped, so
+            // there's nothing more to do.
+        }
+        true
     }
 
     /// Return all paths currently in the overlay.

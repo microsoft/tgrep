@@ -235,12 +235,7 @@ mod tests {
 
     /// Write a minimal trio of index files so `IndexReader::open` runs the
     /// validation paths we want to exercise.
-    fn write_index(
-        dir: &Path,
-        lookup_bytes: &[u8],
-        postings_bytes: &[u8],
-        files_bytes: &[u8],
-    ) {
+    fn write_index(dir: &Path, lookup_bytes: &[u8], postings_bytes: &[u8], files_bytes: &[u8]) {
         std::fs::create_dir_all(dir).unwrap();
         let mut f = std::fs::File::create(dir.join("lookup.bin")).unwrap();
         f.write_all(lookup_bytes).unwrap();

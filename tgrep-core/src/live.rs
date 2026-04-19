@@ -428,7 +428,19 @@ impl LiveIndex {
         let path_to_id = std::mem::take(&mut self.path_to_id);
         let deleted_paths = std::mem::take(&mut self.deleted_paths);
 
-        std::thread::Builder::new()
+        // Only pay the thread-creation cost when the overlay is large
+        // enough that an inline drop would noticeably stall the caller.
+        // Small overlays (typical of an auto-save after a handful of
+        // watcher edits) drop in microseconds inline, so we don't churn
+        // OS threads on every flush cadence.
+        const OFF_THREAD_DROP_THRESHOLD: usize = 4096;
+        if inverted.len() < OFF_THREAD_DROP_THRESHOLD && masks.len() < OFF_THREAD_DROP_THRESHOLD {
+            drop(inverted);
+            drop(masks);
+            drop(file_paths);
+            drop(path_to_id);
+            drop(deleted_paths);
+        } else if std::thread::Builder::new()
             .name("tgrep-drop-overlay".into())
             .spawn(move || {
                 drop(inverted);
@@ -437,7 +449,12 @@ impl LiveIndex {
                 drop(path_to_id);
                 drop(deleted_paths);
             })
-            .ok();
+            .is_err()
+        {
+            // Spawn failed (rare) — the values were moved into the
+            // closure and dropped when the closure was dropped, so
+            // there's nothing more to do.
+        }
         true
     }
 

@@ -871,6 +871,10 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
                 index.full_snapshot()
             };
             let staging_dir = index_dir.with_file_name(".tgrep_save_staging");
+            // Clear any stale files from a previously crashed auto-save —
+            // otherwise leftover artifacts (e.g. an old filestamps.json)
+            // would be picked up by move_staged_files and published.
+            let _ = std::fs::remove_dir_all(&staging_dir);
             if let Err(e) = builder::write_index_from_snapshot(
                 &state.root,
                 &staging_dir,
@@ -1056,11 +1060,16 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
         walk_ms
     );
 
-    // Apply changes to the LiveIndex
+    // Apply changes to the LiveIndex. Hold snapshot_gate.read() across the
+    // mutation block so a concurrent flush/auto-save cannot snapshot the
+    // overlay and then prune away these updates after publishing. The
+    // subsequent flush_index_to_disk call below takes the gate exclusively
+    // itself.
     let update_start = Instant::now();
     let files_to_update: Vec<String> = changed.into_iter().chain(added).collect();
 
     {
+        let _gate = state.snapshot_gate.read().unwrap();
         let mut index = state.index.write().unwrap();
 
         // Remove deleted files
@@ -1275,17 +1284,18 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     // The in-memory build is done — surface "complete" in status now even
     // though the final disk flush below can take minutes for very large
-    // repos. The internal `flushing` flag (set below) keeps the auto-save
-    // loop from kicking off a redundant parallel snapshot during the flush.
+    // repos. Set `flushing` *before* clearing `indexing` so the auto-save
+    // loop never observes both flags as false during the handoff and
+    // races us into a redundant parallel snapshot of the bulk overlay.
+    state
+        .flushing
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     state
         .indexing
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Final (and only) flush to disk for the bulk build.
     eprintln!("[trace] persisting final index to disk...");
-    state
-        .flushing
-        .store(true, std::sync::atomic::Ordering::Relaxed);
     let pruned = flush_index_to_disk(state, root, index_dir, Some(&stamps));
     state
         .flushing

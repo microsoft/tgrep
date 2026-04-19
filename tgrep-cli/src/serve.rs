@@ -725,6 +725,15 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         return;
     }
 
+    // Acquire the snapshot gate up-front for the whole event. While a
+    // flush/auto-save is publishing (writer holds it), no reindex
+    // *work* — file I/O, trigram extraction, even the [trace] line —
+    // should happen, both for correctness (no overlay mutation between
+    // snapshot and prune) and to avoid spending CPU/IO on work that
+    // would just block the watcher thread anyway. We hold it for read
+    // so multiple events can proceed concurrently outside any flush.
+    let _gate = state.snapshot_gate.read().unwrap();
+
     for path in &event.paths {
         // Skip the index directory itself
         if path
@@ -752,14 +761,10 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
             if known_path {
                 eprintln!("[trace] reindex: removed {rel_path}");
             }
-            // snapshot_gate held in read mode for the duration of the
-            // mutation so a concurrent flush cannot snapshot the overlay
-            // and then silently prune our delete after publishing.
-            {
-                let _gate = state.snapshot_gate.read().unwrap();
-                state.index.write().unwrap().live.delete_file(&rel_path);
-                state.file_stamps.write().unwrap().remove(&rel_path);
-            }
+            // gate acquired at the function level — the entire event
+            // is processed atomically with respect to flush/auto-save.
+            state.index.write().unwrap().live.delete_file(&rel_path);
+            state.file_stamps.write().unwrap().remove(&rel_path);
             if let Ok(mut cache) = state.cache.write() {
                 cache.pop(&rel_path);
             }
@@ -808,24 +813,20 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         };
 
         eprintln!("[trace] reindex: modified {rel_path}");
-        // snapshot_gate held in read mode for the entire commit + stamp
-        // update so a concurrent flush cannot snapshot in between and
-        // then prune away the new overlay entry after publishing.
+        // gate acquired at the function level — the commit + stamp
+        // update is processed atomically with respect to flush/auto-save.
         {
-            let _gate = state.snapshot_gate.read().unwrap();
-            {
-                let mut index = state.index.write().unwrap();
-                match per_tri {
-                    Some(per_tri) => index.live.commit_upsert(&rel_path, per_tri),
-                    None => index.live.delete_file(&rel_path),
-                }
+            let mut index = state.index.write().unwrap();
+            match per_tri {
+                Some(per_tri) => index.live.commit_upsert(&rel_path, per_tri),
+                None => index.live.delete_file(&rel_path),
             }
-            state
-                .file_stamps
-                .write()
-                .unwrap()
-                .insert(rel_path.clone(), current);
         }
+        state
+            .file_stamps
+            .write()
+            .unwrap()
+            .insert(rel_path.clone(), current);
         if let Ok(mut cache) = state.cache.write() {
             cache.pop(&rel_path);
         }

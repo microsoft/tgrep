@@ -748,6 +748,27 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
             Err(_) => continue,
         };
 
+        // Mirror the walker's filtering so the watcher does not reindex
+        // files the initial walk would have skipped — most notably
+        // hidden directories like `.git/`, which fire frequent
+        // `index.lock`/HEAD/refs writes during normal git operations.
+        // The walker uses `hidden(true)` by default; replicate that by
+        // skipping any path component starting with `.`. Also honor the
+        // user's --exclude-dir list so the same names are skipped here.
+        if rel_path
+            .split('/')
+            .any(|seg| seg.starts_with('.') && seg != "." && seg != "..")
+        {
+            continue;
+        }
+        if !state.exclude_dirs.is_empty()
+            && rel_path
+                .split('/')
+                .any(|seg| state.exclude_dirs.iter().any(|d| d == seg))
+        {
+            continue;
+        }
+
         let is_remove = matches!(event.kind, EventKind::Remove(_)) || !path.exists();
 
         if is_remove {

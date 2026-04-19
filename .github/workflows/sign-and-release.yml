@@ -137,11 +137,12 @@ extends:
               # redirect crates.io, to avoid breaking external contributor builds).
               # ---------------------------------------------------------------
               - powershell: |
-                  $src = "$(Build.SourcesDirectory)\.github\workflows\ado-cargo-config.toml"
                   $dstDir = "$(Build.SourcesDirectory)\.cargo"
                   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-                  Copy-Item -Path $src -Destination "$dstDir\config.toml" -Force
-                  Write-Host "Copied: $src -> $dstDir\config.toml"
+                  $content = git -C "$(Build.SourcesDirectory)" show HEAD:.github/workflows/ado-cargo-config.toml
+                  if ($LASTEXITCODE -ne 0) { throw "git show failed with exit code $LASTEXITCODE" }
+                  [System.IO.File]::WriteAllText("$dstDir\config.toml", ($content -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+                  Write-Host "Written: $dstDir\config.toml"
                 displayName: 'Copy ADO cargo config (crates.io redirect + BinSkim flags)'
 
               # ---------------------------------------------------------------
@@ -267,12 +268,12 @@ extends:
                 displayName: 'Verify Rust version'
 
               - powershell: |
-                  $src = "$(Build.SourcesDirectory)\.github\workflows\ado-cargo-config.toml"
                   $dstDir = "$(Build.SourcesDirectory)\.cargo"
                   New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
-                  Copy-Item -Path $src -Destination "$dstDir\config.toml" -Force
-                  Write-Host "Copied: $src -> $dstDir\config.toml"
-                  Get-Content "$dstDir\config.toml"
+                  $content = git -C "$(Build.SourcesDirectory)" show HEAD:.github/workflows/ado-cargo-config.toml
+                  if ($LASTEXITCODE -ne 0) { throw "git show failed with exit code $LASTEXITCODE" }
+                  [System.IO.File]::WriteAllText("$dstDir\config.toml", ($content -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+                  Write-Host "Written: $dstDir\config.toml"
                 displayName: 'Copy ADO cargo config (crates.io redirect + BinSkim flags)'
 
               - task: CargoAuthenticate@0

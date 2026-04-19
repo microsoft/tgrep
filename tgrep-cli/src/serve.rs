@@ -718,13 +718,16 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         let is_remove = matches!(event.kind, EventKind::Remove(_)) || !path.exists();
 
         if is_remove {
-            // Only act on removals for paths we previously knew about. notify
-            // can deliver Remove events for transient/unknown paths (e.g. a
-            // build tool's temp file) and we'd otherwise spam the log.
-            if !state.file_stamps.read().unwrap().contains_key(&rel_path) {
-                continue;
+            // notify can deliver Remove events for transient/unknown paths
+            // (e.g. a build tool's temp file). Suppress the noisy log line
+            // for those, but still apply the delete unconditionally — if
+            // `file_stamps` is missing/out-of-date (e.g. first run after
+            // an older index), skipping the delete entirely would leave
+            // stale entries for files that no longer exist.
+            let known_path = state.file_stamps.read().unwrap().contains_key(&rel_path);
+            if known_path {
+                eprintln!("[trace] reindex: removed {rel_path}");
             }
-            eprintln!("[trace] reindex: removed {rel_path}");
             state.index.write().unwrap().live.delete_file(&rel_path);
             state.file_stamps.write().unwrap().remove(&rel_path);
             if let Ok(mut cache) = state.cache.write() {
@@ -1247,11 +1250,14 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 /// Flush the current LiveIndex to disk and reopen the reader.
 /// Uses fast clone + background remap so queries stay responsive.
 ///
-/// If `stamps` is `Some`, the per-file stamps are written into the staging
-/// directory and published atomically with the index files via the same
-/// `move_staged_files` step. This prevents a window where the index is
-/// fully published but `filestamps.json` is missing — a state that would
-/// disable incremental stale-detection on the next server start.
+/// If `stamps` is `Some`, the function attempts to write per-file stamps
+/// into the staging directory so they are renamed into the index dir
+/// alongside the index files. Stamp persistence is best-effort: if writing
+/// `filestamps.json` fails we log and still publish the index, since
+/// losing the incremental stale-check on next start is preferable to
+/// dropping the freshly-built index. Callers must therefore not rely on
+/// `filestamps.json` always being published alongside a newly-flushed
+/// index.
 ///
 /// Returns `true` if the new reader was opened and `prune_persisted_entries`
 /// ran on the live overlay; `false` on any earlier failure (write/move/open
@@ -1278,8 +1284,16 @@ fn flush_index_to_disk(
         (paths, inverted, num)
     };
 
-    // Expensive write — no lock held, queries served normally
+    // Always start from a clean staging dir. A previous crash (or a partial
+    // earlier flush whose error path missed the cleanup) could have left
+    // stale files behind — including a stale `filestamps.json`. If the
+    // current flush is invoked with `stamps == None` and we left an old
+    // filestamps.json there, `move_staged_files` would publish it next to
+    // a freshly-built index, silently corrupting the stale-check baseline.
     let staging_dir = index_dir.with_file_name(".tgrep_flush_staging");
+    let _ = std::fs::remove_dir_all(&staging_dir);
+
+    // Expensive write — no lock held, queries served normally
     if let Err(e) =
         builder::write_index_from_snapshot(&state.root, &staging_dir, &paths, &inverted, true)
     {
@@ -1301,9 +1315,9 @@ fn flush_index_to_disk(
     // Lock-free publish: rename staging files into place, build new reader,
     // then swap. Search queries continue to be served throughout.
     //
-    // Held across move + open + swap so concurrent publishers
-    // (auto-save / checkpoint) cannot interleave renames or swap readers
-    // out of order. Searches do not take this lock.
+    // Held across move + open + swap so concurrent publishers (auto-save /
+    // background-build / watcher reindex flush) cannot interleave renames
+    // or swap readers out of order. Searches do not take this lock.
     let _publish = state.publish_lock.lock().unwrap();
     if let Err(e) = move_staged_files(&staging_dir, index_dir) {
         eprintln!("[trace] warning: flush move failed: {e}");
@@ -1360,15 +1374,16 @@ fn flush_index_to_disk(
 /// convention for publication layout; it does not provide atomic publish
 /// semantics or reader-side validation by itself.
 ///
-/// Performance note: this function is called while the server holds the index
-/// write lock, which blocks all search reads. Each per-file move uses
-/// `std::fs::rename` — on the same volume this is an O(microseconds)
-/// directory entry update, vs `std::fs::copy` which is O(file_size) and on a
-/// large `index.bin` (hundreds of MB) can take tens of seconds, blocking
-/// queries the whole time. Staging dirs are always created next to the target
-/// (same parent) so cross-volume cases should not arise; if rename truly
-/// fails, the error is surfaced rather than silently falling back to a slow
-/// copy under the lock (see `publish_file`).
+/// Performance note: this function runs under the server's `publish_lock`
+/// (which serializes concurrent publishers) but does NOT take the
+/// `state.index` write lock, so search queries continue to be served
+/// throughout. Each per-file move uses `std::fs::rename` — on the same
+/// volume this is an O(microseconds) directory entry update, vs
+/// `std::fs::copy` which is O(file_size) and on a large `index.bin`
+/// (hundreds of MB) can take tens of seconds. Staging dirs are always
+/// created next to the target (same parent) so cross-volume cases should
+/// not arise; if rename truly fails, the error is surfaced rather than
+/// silently falling back to a slow copy (see `publish_file`).
 fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(target)?;
     // Data files first, meta last.

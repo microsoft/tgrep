@@ -754,7 +754,7 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         // `index.lock`/HEAD/refs writes during normal git operations.
         // The walker uses `hidden(true)` by default; replicate that by
         // skipping any path component starting with `.`. Also honor the
-        // user's --exclude-dir list so the same names are skipped here.
+        // user's --exclude list so the same names are skipped here.
         if rel_path
             .split('/')
             .any(|seg| seg.starts_with('.') && seg != "." && seg != "..")

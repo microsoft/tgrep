@@ -25,10 +25,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
+          # Windows builds are handled by the ADO OneBranch sign-and-release pipeline
+          # which produces signed binaries. See .github/workflows/sign-and-release.yml.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,11 +45,6 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --locked --version 0.2.5
 
-      - name: Disable /CETCOMPAT for ARM64 Windows
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        shell: pwsh
-        run: echo "RUSTFLAGS=-Clink-args=/CETCOMPAT:NO" >> $env:GITHUB_ENV
-
       - name: Build release binary
         if: ${{ !matrix.use_cross }}
         run: cargo build --release --locked -p tgrep-cli --bin tgrep --target ${{ matrix.target }}
@@ -61,19 +54,11 @@ jobs:
         run: cross build --release --locked -p tgrep-cli --bin tgrep --target ${{ matrix.target }}
 
       - name: Package (unix)
-        if: runner.os != 'Windows'
         run: |
           staging=$(mktemp -d)
           cp target/${{ matrix.target }}/release/tgrep "$staging/"
           cp README.md "$staging/"
           tar czf tgrep-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C "$staging" .
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/tgrep.exe", "README.md" `
-            -DestinationPath "tgrep-${{ github.ref_name }}-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

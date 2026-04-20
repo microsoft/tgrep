@@ -104,11 +104,6 @@ extends:
               # OneBranch checks out the repo containing this YAML (microsoft/tgrep)
               # into $(Build.SourcesDirectory)\s (OneBranch single-repo convention).
               # ---------------------------------------------------------------
-              - checkout: self
-                fetchDepth: 1
-                fetchTags: false
-                displayName: 'Checkout microsoft/tgrep'
-
               # ---------------------------------------------------------------
               # Step 2: Install Rust toolchain via RustInstaller@1
               # Uses the official Microsoft Rust installer task (MSRustup).
@@ -261,11 +256,6 @@ extends:
               ob_sdl_binskim_break: true  # https://aka.ms/obpipelines/sdl
 
             steps:
-              - checkout: self
-                fetchDepth: 1
-                fetchTags: false
-                displayName: 'Checkout microsoft/tgrep'
-
               - task: RustInstaller@1
                 displayName: 'Install Rust toolchain (with arm64 target)'
                 inputs:

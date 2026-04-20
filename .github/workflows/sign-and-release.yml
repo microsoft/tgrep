@@ -172,7 +172,7 @@ extends:
                   # BinSkim-required flags passed via env var (not .cargo/config.toml) so that
                   # the x64 and arm64 jobs cannot overwrite each other's config on the shared workspace.
                   # /CETCOMPAT is x86-64 only; arm64 job uses its own RUSTFLAGS without it.
-                  RUSTFLAGS: '-Ccontrol-flow-guard -Ctarget-feature=+crt-static -Clink-args=/DYNAMICBASE /CETCOMPAT'
+                  RUSTFLAGS: '-Ccontrol-flow-guard -Ctarget-feature=+crt-static -Clink-arg=/DYNAMICBASE -Clink-arg=/CETCOMPAT'
 
               # ---------------------------------------------------------------
               # Step 7: Verify binary exists
@@ -302,7 +302,7 @@ extends:
                   # BinSkim-required flags passed via env var (not .cargo/config.toml) so that
                   # the x64 and arm64 jobs cannot overwrite each other's config on the shared workspace.
                   # arm64 does NOT use /CETCOMPAT (x86-64 only); omitting it avoids LNK1246.
-                  RUSTFLAGS: '-Ccontrol-flow-guard -Ctarget-feature=+crt-static -Clink-args=/DYNAMICBASE'
+                  RUSTFLAGS: '-Ccontrol-flow-guard -Ctarget-feature=+crt-static -Clink-arg=/DYNAMICBASE'
 
               - script: |
                   dir target\aarch64-pc-windows-msvc\release\tgrep.exe

@@ -44,7 +44,6 @@ parameters:
 variables:
   CDP_DEFINITION_BUILD_COUNT: $[counter('', 0)]  # needed for onebranch.pipeline.version task https://aka.ms/obpipelines/versioning
   system.debug: ${{ parameters.debug }}
-  ENABLE_PRS_DELAYSIGN: 0  # Disable PRS delay signing; sign directly in container (0=direct, 1=requires host watcher agent)
   TGREP_TAG: ${{ parameters.ReleaseTag }}
   WindowsContainerImage: 'onebranch.azurecr.io/windows/ltsc2022/vse2022:latest'  # Docker image https://aka.ms/obpipelines/containers
 
@@ -59,7 +58,8 @@ extends:
   template: v2/OneBranch.Official.CrossPlat.yml@templates  # https://aka.ms/obpipelines/templates
   parameters:
     featureFlags:
-      WindowsHostVersion: '1ESWindows2022'
+      WindowsHostVersion:
+        Version: 2022
     git:
       submodules: false
     cloudvault:  # https://aka.ms/obpipelines/cloudvault
@@ -100,17 +100,7 @@ extends:
 
             steps:
               # ---------------------------------------------------------------
-              # Step 1: Checkout tgrep source code
-              # OneBranch checks out the repo containing this YAML (microsoft/tgrep)
-              # into $(Build.SourcesDirectory)\s (OneBranch single-repo convention).
-              # ---------------------------------------------------------------
-              - checkout: self
-                fetchDepth: 1
-                fetchTags: false
-                displayName: 'Checkout microsoft/tgrep'
-
-              # ---------------------------------------------------------------
-              # Step 2: Install Rust toolchain via RustInstaller@1
+              # Step 1: Install Rust toolchain via RustInstaller@1
               # Uses the official Microsoft Rust installer task (MSRustup).
               # toolchainFeed: dedicated Rust NuGet feed (contains rust.msrustup-* packages).
               # Reference: rust.msrustup/.pipelines/build.yml, ripgrep-prebuilt pipeline

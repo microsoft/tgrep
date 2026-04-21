@@ -468,9 +468,10 @@ fn handle_search(
         // potential index-level bug).  Glob/type filtering reducing results to 0
         // is normal for path-scoped searches and should not be logged.
         if raw_candidate_count == 0 && !pattern.is_empty() {
+            let pattern_preview: String = pattern.chars().take(40).collect();
             eprintln!(
                 "[trace] search: 0 raw candidates for pattern={:?} (globs={} type={:?})",
-                &pattern[..pattern.len().min(40)],
+                pattern_preview,
                 glob_filters.len(),
                 file_type,
             );

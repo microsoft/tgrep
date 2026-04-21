@@ -173,13 +173,14 @@ fn simplify(plan: QueryPlan) -> QueryPlan {
             queries.sort_by_key(|q| q.hash);
             // Dedup by trigram hash. When the same trigram appears with
             // different expected_next values (e.g. from separate literal
-            // segments in `mutex.*mutex_lock`), clear expected_next to
-            // avoid false negatives — we can't reliably filter on the
-            // next byte if the trigram appears in multiple contexts.
-            queries.dedup_by(|b, a| {
-                if a.hash == b.hash {
-                    if a.expected_next != b.expected_next {
-                        a.expected_next = None;
+            // segments in `mutex.*mutex_lock`), clear expected_next on the
+            // retained query to avoid false negatives — we can't reliably
+            // filter on the next byte if the trigram appears in multiple
+            // contexts.
+            queries.dedup_by(|retained, duplicate| {
+                if retained.hash == duplicate.hash {
+                    if retained.expected_next != duplicate.expected_next {
+                        retained.expected_next = None;
                     }
                     true
                 } else {

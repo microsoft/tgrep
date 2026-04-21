@@ -306,7 +306,12 @@ impl HybridIndex {
     /// Reader files not superseded by overlay are included with remapped IDs.
     /// Preserves loc_mask and next_mask from both the on-disk reader and the
     /// live overlay so that Bloom-filter optimizations survive flush cycles.
-    pub fn full_snapshot(&self) -> (Vec<String>, std::collections::HashMap<u32, Vec<PostingEntry>>) {
+    pub fn full_snapshot(
+        &self,
+    ) -> (
+        Vec<String>,
+        std::collections::HashMap<u32, Vec<PostingEntry>>,
+    ) {
         use std::collections::HashMap;
 
         let reader = self.reader();
@@ -343,11 +348,13 @@ impl HybridIndex {
             let remapped: Vec<PostingEntry> = posting
                 .into_iter()
                 .filter_map(|entry| {
-                    reader_id_map.get(&entry.file_id).map(|&new_id| PostingEntry {
-                        file_id: new_id,
-                        loc_mask: entry.loc_mask,
-                        next_mask: entry.next_mask,
-                    })
+                    reader_id_map
+                        .get(&entry.file_id)
+                        .map(|&new_id| PostingEntry {
+                            file_id: new_id,
+                            loc_mask: entry.loc_mask,
+                            next_mask: entry.next_mask,
+                        })
                 })
                 .collect();
             if !remapped.is_empty() {

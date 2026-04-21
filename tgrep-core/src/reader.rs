@@ -41,8 +41,8 @@ impl IndexReader {
         // the file object's size directly from the kernel, which is always
         // up-to-date even when the NTFS directory-entry metadata cache has not
         // yet been invalidated.
-        use std::io::{Seek, SeekFrom};
         use memmap2::MmapOptions;
+        use std::io::{Seek, SeekFrom};
 
         let mut lookup_file = File::open(&lookup_path)?;
         let mut postings_file = File::open(&postings_path)?;
@@ -57,7 +57,7 @@ impl IndexReader {
             // entry size would cause silent truncation of the trailing entry
             // (and binary search would still see it via integer division).
             // Reject up-front so the failure is loud and obvious.
-            if lookup_len % LOOKUP_ENTRY_SIZE != 0 {
+            if !lookup_len.is_multiple_of(LOOKUP_ENTRY_SIZE) {
                 return Err(crate::Error::IndexCorrupted(format!(
                     "lookup.bin size {} is not a multiple of {}",
                     lookup_len, LOOKUP_ENTRY_SIZE
@@ -199,13 +199,13 @@ impl IndexReader {
         let mut prev_trigram: Option<u32> = None;
         for i in 0..self.num_entries {
             let entry = self.read_lookup_entry(i);
-            if let Some(prev) = prev_trigram {
-                if entry.trigram <= prev {
-                    return Err(format!(
-                        "lookup.bin not sorted at entry {i}: trigram {:#x} <= prev {:#x}",
-                        entry.trigram, prev
-                    ));
-                }
+            if let Some(prev) = prev_trigram
+                && entry.trigram <= prev
+            {
+                return Err(format!(
+                    "lookup.bin not sorted at entry {i}: trigram {:#x} <= prev {:#x}",
+                    entry.trigram, prev
+                ));
             }
             let byte_len = (entry.length as usize).checked_mul(POSTING_ENTRY_SIZE);
             let end = byte_len.and_then(|bl| (entry.offset as usize).checked_add(bl));
@@ -460,7 +460,10 @@ mod tests {
         write_index(tmp.path(), &lookup, &postings, &files);
         let reader = IndexReader::open(tmp.path()).unwrap();
         let err = reader.validate_lookup().unwrap_err();
-        assert!(err.contains("not sorted"), "expected sort error, got: {err}");
+        assert!(
+            err.contains("not sorted"),
+            "expected sort error, got: {err}"
+        );
     }
 
     #[test]

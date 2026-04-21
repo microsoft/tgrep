@@ -30,3 +30,4 @@ fs2 = "0.4.3"
 assert_cmd = "2"
 tempfile = "3"
 predicates = "3"
+serde_json = { workspace = true }

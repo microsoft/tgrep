@@ -317,9 +317,7 @@ fn search_local_index(
     let candidates = if is_match_all || opts.files_without_match {
         reader.all_file_ids()
     } else {
-        query::execute_plan_with_masks(&plan, &|tri| {
-            reader.lookup_trigram_with_masks(tri)
-        })
+        query::execute_plan_with_masks(&plan, &|tri| reader.lookup_trigram_with_masks(tri))
     };
 
     if opts.stats {

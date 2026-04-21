@@ -325,8 +325,18 @@ where
             if candidates.is_empty() && queries.len() >= 3 {
                 let any_empty = list_sizes.iter().any(|(_, sz)| *sz == 0);
                 if any_empty {
-                    let min_size = list_sizes.iter().map(|(_, sz)| sz).min().copied().unwrap_or(0);
-                    let max_size = list_sizes.iter().map(|(_, sz)| sz).max().copied().unwrap_or(0);
+                    let min_size = list_sizes
+                        .iter()
+                        .map(|(_, sz)| sz)
+                        .min()
+                        .copied()
+                        .unwrap_or(0);
+                    let max_size = list_sizes
+                        .iter()
+                        .map(|(_, sz)| sz)
+                        .max()
+                        .copied()
+                        .unwrap_or(0);
                     eprintln!(
                         "[trace] AND plan: 0 candidates from {} trigrams (EMPTY posting list detected). \
                          min_list={min_size} max_list={max_size}",

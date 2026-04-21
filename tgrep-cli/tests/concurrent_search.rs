@@ -3,6 +3,7 @@
 //! Starts a `tgrep serve` instance and fires multiple parallel search requests
 //! over TCP to verify the server handles concurrency correctly.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -10,7 +11,6 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use std::{env, fs};
 
 use tempfile::TempDir;
 
@@ -46,24 +46,9 @@ fn setup_fixture() -> TempDir {
     dir
 }
 
-/// Finds the tgrep binary path from cargo build output.
+/// Returns the path to the tgrep binary, located by Cargo.
 fn tgrep_bin() -> std::path::PathBuf {
-    let mut path = env::current_exe().unwrap();
-    // Go up from deps dir to the target debug/release dir
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push("tgrep");
-    if cfg!(windows) {
-        path.set_extension("exe");
-    }
-    assert!(
-        path.exists(),
-        "tgrep binary not found at {}",
-        path.display()
-    );
-    path
+    assert_cmd::cargo::cargo_bin("tgrep")
 }
 
 struct ServerGuard {
@@ -91,13 +76,10 @@ fn start_server(root: &Path) -> ServerGuard {
             index_dir.to_str().unwrap(),
             root.to_str().unwrap(),
         ])
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("failed to start tgrep serve");
-
-    // Read stderr to find the port
-    let _stderr = child.stderr.as_ref().unwrap();
 
     // Wait for serve.json to appear
     let serve_json = index_dir.join("serve.json");

@@ -185,6 +185,18 @@ impl IndexReader {
         result
     }
 
+    /// Iterate all trigram entries with full posting data (including masks).
+    /// Returns (trigram_hash, Vec<PostingEntry>) preserving loc_mask/next_mask.
+    pub fn all_trigram_postings_with_masks(&self) -> Vec<(u32, Vec<PostingEntry>)> {
+        let mut result = Vec::with_capacity(self.num_entries);
+        for i in 0..self.num_entries {
+            let entry = self.read_lookup_entry(i);
+            let postings = self.read_posting_entries(entry.offset, entry.length);
+            result.push((entry.trigram, postings));
+        }
+        result
+    }
+
     fn binary_search(&self, trigram: u32) -> Option<usize> {
         let mut lo = 0usize;
         let mut hi = self.num_entries;

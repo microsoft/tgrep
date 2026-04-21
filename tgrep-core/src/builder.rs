@@ -132,13 +132,13 @@ pub fn default_index_dir(root: &Path) -> std::path::PathBuf {
 /// Write the on-disk index from a pre-computed snapshot (paths + inverted index).
 /// This allows the caller to snapshot under a brief lock, then write without holding it.
 ///
-/// Note: snapshots from the server still use the legacy format (no masks).
-/// This writes v1-compatible posting entries (file_id only) unless masks are available.
+/// Preserves mask data (loc_mask/next_mask) from the snapshot so Bloom-filter
+/// optimizations survive flush cycles.
 pub fn write_index_from_snapshot(
     root: &Path,
     index_dir: &Path,
     paths: &[String],
-    inverted: &HashMap<u32, Vec<u32>>,
+    inverted: &HashMap<u32, Vec<PostingEntry>>,
     complete: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(index_dir)?;
@@ -146,8 +146,7 @@ pub fn write_index_from_snapshot(
     let mut sorted_trigrams: Vec<u32> = inverted.keys().copied().collect();
     sorted_trigrams.sort_unstable();
 
-    // Write index.bin — v2 posting entries with zero masks (still benefits from
-    // the v2 reader, and a subsequent `tgrep index` will compute real masks).
+    // Write index.bin — v2 posting entries with masks preserved from snapshot.
     let mut postings_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
     let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_trigrams.len());
@@ -163,12 +162,7 @@ pub fn write_index_from_snapshot(
             length,
         });
 
-        for &fid in posting_list {
-            let entry = PostingEntry {
-                file_id: fid,
-                loc_mask: u8::MAX, // all bits set = no filtering
-                next_mask: u8::MAX,
-            };
+        for entry in posting_list {
             postings_file.write_all(&entry.encode())?;
         }
         offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;

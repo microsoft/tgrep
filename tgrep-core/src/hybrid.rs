@@ -154,15 +154,63 @@ impl HybridIndex {
         if plan.is_match_all() {
             return self.all_file_ids();
         }
-        query::execute_plan(plan, &|tri| self.lookup_trigram(tri))
+        // Snapshot reader once to ensure all trigram lookups use the same
+        // reader version — prevents race conditions during concurrent flushes.
+        let reader = self.reader();
+        query::execute_plan(plan, &|tri| self.lookup_trigram_using_reader(tri, &reader))
     }
 
     /// Execute a query plan with mask-aware filtering.
-    pub fn execute_query_with_masks(&self, plan: &QueryPlan, pattern: &str) -> Vec<u32> {
+    pub fn execute_query_with_masks(&self, plan: &QueryPlan) -> Vec<u32> {
         if plan.is_match_all() {
             return self.all_file_ids();
         }
-        query::execute_plan_with_masks(plan, pattern, &|tri| self.lookup_trigram_with_masks(tri))
+        // Snapshot reader once to ensure all trigram lookups use the same
+        // reader version — prevents race conditions during concurrent flushes.
+        let reader = self.reader();
+        query::execute_plan_with_masks(plan, &|tri| {
+            self.lookup_trigram_with_masks_using_reader(tri, &reader)
+        })
+    }
+
+    /// Look up candidate file IDs for a trigram using a specific reader snapshot.
+    /// Ensures all trigrams in a query are evaluated against the same reader version.
+    fn lookup_trigram_using_reader(&self, trigram: u32, reader: &Arc<IndexReader>) -> Vec<u32> {
+        let mut reader_ids = reader.lookup_trigram(trigram);
+        let live_ids = self.live.lookup_trigram(trigram);
+
+        reader_ids.retain(|&fid| {
+            if let Some(path) = reader.file_path(fid) {
+                !self.live.is_deleted(path) && !self.live_has_path(path)
+            } else {
+                false
+            }
+        });
+
+        reader_ids.extend(live_ids);
+        reader_ids
+    }
+
+    /// Look up candidate posting entries with masks using a specific reader snapshot.
+    /// Ensures all trigrams in a query are evaluated against the same reader version.
+    fn lookup_trigram_with_masks_using_reader(
+        &self,
+        trigram: u32,
+        reader: &Arc<IndexReader>,
+    ) -> Vec<PostingEntry> {
+        let mut reader_entries = reader.lookup_trigram_with_masks(trigram);
+        let live_entries = self.live.lookup_trigram_with_masks(trigram);
+
+        reader_entries.retain(|e| {
+            if let Some(path) = reader.file_path(e.file_id) {
+                !self.live.is_deleted(path) && !self.live_has_path(path)
+            } else {
+                false
+            }
+        });
+
+        reader_entries.extend(live_entries);
+        reader_entries
     }
 
     /// Total number of files across both layers.
@@ -242,7 +290,9 @@ impl HybridIndex {
 
     /// Produce a full snapshot merging reader + overlay for disk serialization.
     /// Reader files not superseded by overlay are included with remapped IDs.
-    pub fn full_snapshot(&self) -> (Vec<String>, std::collections::HashMap<u32, Vec<u32>>) {
+    /// Preserves loc_mask and next_mask from both the on-disk reader and the
+    /// live overlay so that Bloom-filter optimizations survive flush cycles.
+    pub fn full_snapshot(&self) -> (Vec<String>, std::collections::HashMap<u32, Vec<PostingEntry>>) {
         use std::collections::HashMap;
 
         let reader = self.reader();
@@ -271,30 +321,43 @@ impl HybridIndex {
             paths.push(op.to_string());
         }
 
-        // Phase 2: Build merged inverted index
-        let mut inverted: HashMap<u32, Vec<u32>> = HashMap::new();
+        // Phase 2: Build merged inverted index with masks
+        let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
 
-        // Reader trigram postings (remapped, excluding superseded files)
-        for (trigram, posting) in reader.all_trigram_postings() {
-            let remapped: Vec<u32> = posting
+        // Reader trigram postings with masks (remapped, excluding superseded files)
+        for (trigram, posting) in reader.all_trigram_postings_with_masks() {
+            let remapped: Vec<PostingEntry> = posting
                 .into_iter()
-                .filter_map(|old_id| reader_id_map.get(&old_id).copied())
+                .filter_map(|entry| {
+                    reader_id_map.get(&entry.file_id).map(|&new_id| PostingEntry {
+                        file_id: new_id,
+                        loc_mask: entry.loc_mask,
+                        next_mask: entry.next_mask,
+                    })
+                })
                 .collect();
             if !remapped.is_empty() {
                 inverted.entry(trigram).or_default().extend(remapped);
             }
         }
 
-        // Overlay trigram postings (remapped)
+        // Overlay trigram postings with masks (remapped)
         let overlay_inverted = self.live.inverted_index();
         for (&trigram, file_ids) in overlay_inverted {
             let tri_clean = trigram & !crate::live::OVERLAY_BIT;
-            let remapped: Vec<u32> = file_ids
+            let remapped: Vec<PostingEntry> = file_ids
                 .iter()
                 .filter_map(|&fid| {
-                    self.live
-                        .file_path(fid)
-                        .and_then(|p| overlay_path_to_new_id.get(p).copied())
+                    self.live.file_path(fid).and_then(|p| {
+                        overlay_path_to_new_id.get(p).map(|&new_id| {
+                            let m = self.live.get_masks(trigram, fid);
+                            PostingEntry {
+                                file_id: new_id,
+                                loc_mask: m.loc_mask,
+                                next_mask: m.next_mask,
+                            }
+                        })
+                    })
                 })
                 .collect();
             if !remapped.is_empty() {
@@ -302,9 +365,9 @@ impl HybridIndex {
             }
         }
 
-        // Sort all posting lists
+        // Sort all posting lists by file_id
         for posting in inverted.values_mut() {
-            posting.sort_unstable();
+            posting.sort_by_key(|e| e.file_id);
         }
 
         (paths, inverted)

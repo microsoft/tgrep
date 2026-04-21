@@ -317,12 +317,7 @@ fn search_local_index(
     let candidates = if is_match_all || opts.files_without_match {
         reader.all_file_ids()
     } else {
-        let effective_pattern = if ci {
-            opts.pattern.to_lowercase()
-        } else {
-            opts.pattern.clone()
-        };
-        query::execute_plan_with_masks(&plan, &effective_pattern, &|tri| {
+        query::execute_plan_with_masks(&plan, &|tri| {
             reader.lookup_trigram_with_masks(tri)
         })
     };
@@ -676,7 +671,7 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 
 fn plan_summary(plan: &QueryPlan) -> String {
     match plan {
-        QueryPlan::And(tris) => format!("AND({} trigrams)", tris.len()),
+        QueryPlan::And(queries) => format!("AND({} trigrams)", queries.len()),
         QueryPlan::Or(plans) => {
             let subs: Vec<String> = plans.iter().map(plan_summary).collect();
             format!("OR({})", subs.join(", "))

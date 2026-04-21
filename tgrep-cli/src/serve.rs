@@ -442,13 +442,7 @@ fn handle_search(
     let candidate_info: Vec<(String, PathBuf)> = {
         let index = state.index.read().unwrap();
 
-        // Use mask-aware filtering for literal patterns (fixed_string or simple literals)
-        let effective_pattern = if case_insensitive {
-            pattern.to_lowercase()
-        } else {
-            pattern.to_string()
-        };
-        let candidates = index.execute_query_with_masks(&plan, &effective_pattern);
+        let candidates = index.execute_query_with_masks(&plan);
 
         candidates
             .iter()

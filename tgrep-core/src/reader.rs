@@ -27,12 +27,21 @@ impl IndexReader {
             return Err(crate::Error::IndexNotFound(index_dir.display().to_string()));
         }
 
-        let lookup_meta = std::fs::metadata(&lookup_path)?;
-        let postings_meta = std::fs::metadata(&postings_path)?;
+        // Open files and create mmaps. We intentionally use the *mmap
+        // length* (not `std::fs::metadata().len()`) as the source of truth
+        // for the empty-index check. On Windows, `metadata()` can return a
+        // stale zero length for a file that was just renamed into place by
+        // `move_staged_files`, because NTFS directory-entry metadata updates
+        // are not always immediately visible to a separate `metadata()` call
+        // even though `File::open` + `CreateFileMapping` see the correct
+        // data. Using the mmap length avoids this race entirely.
+        let lookup_file = File::open(&lookup_path)?;
+        let postings_file = File::open(&postings_path)?;
 
-        // Handle empty index (no files indexed yet) — mmap requires non-zero length
-        let (lookup, postings, num_entries) = if lookup_meta.len() == 0 || postings_meta.len() == 0
-        {
+        let lookup_file_len = lookup_file.metadata()?.len();
+        let postings_file_len = postings_file.metadata()?.len();
+
+        let (lookup, postings, num_entries) = if lookup_file_len == 0 || postings_file_len == 0 {
             (None, None, 0)
         } else {
             // A corrupted lookup.bin whose size is not a multiple of the fixed
@@ -43,15 +52,13 @@ impl IndexReader {
             // Do the modulo in u64 (file sizes are u64) so a >4GiB file on
             // 32-bit targets isn't truncated by an `as usize` cast before
             // the validation runs.
-            if lookup_meta.len() % (LOOKUP_ENTRY_SIZE as u64) != 0 {
+            if lookup_file_len % (LOOKUP_ENTRY_SIZE as u64) != 0 {
                 return Err(crate::Error::IndexCorrupted(format!(
                     "lookup.bin size {} is not a multiple of {}",
-                    lookup_meta.len(),
+                    lookup_file_len,
                     LOOKUP_ENTRY_SIZE
                 )));
             }
-            let lookup_file = File::open(&lookup_path)?;
-            let postings_file = File::open(&postings_path)?;
             // SAFETY: Files are opened read-only and the Mmap lifetime is tied to
             // IndexReader. The close() method drops the mappings before any file
             // overwrites (required on Windows).
@@ -160,6 +167,17 @@ impl IndexReader {
     /// Total number of unique trigrams.
     pub fn num_trigrams(&self) -> usize {
         self.num_entries
+    }
+
+    /// Returns `true` when the reader has files but zero trigram entries.
+    ///
+    /// This is a degenerate state that should never occur for a well-formed
+    /// index with > 0 files — every indexed file produces at least one
+    /// trigram. When detected after a flush, it indicates the mmap was
+    /// opened against stale / zero-length metadata (observed on Windows
+    /// NTFS after rapid file renames) and the reader should be reopened.
+    pub fn is_degenerate(&self) -> bool {
+        !self.file_paths.is_empty() && self.num_entries == 0
     }
 
     /// Get all file IDs present in this reader.
@@ -333,5 +351,23 @@ mod tests {
         assert_eq!(reader.file_paths[0], "a.rs");
         assert_eq!(reader.file_paths[1], "b.rs");
         assert_eq!(reader.file_paths[2], "c.rs");
+    }
+
+    #[test]
+    fn is_degenerate_detects_files_without_trigrams() {
+        let tmp = TempDir::new().unwrap();
+        // Files present but lookup/postings are empty → degenerate reader
+        let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        write_index(tmp.path(), &[], &[], &files);
+        let reader = IndexReader::open(tmp.path()).expect("should open");
+        assert!(reader.is_degenerate(), "files but no trigrams = degenerate");
+    }
+
+    #[test]
+    fn is_degenerate_false_for_empty_index() {
+        let tmp = TempDir::new().unwrap();
+        write_index(tmp.path(), &[], &[], &[]);
+        let reader = IndexReader::open(tmp.path()).expect("should open");
+        assert!(!reader.is_degenerate(), "empty index is not degenerate");
     }
 }

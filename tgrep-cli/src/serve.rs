@@ -993,7 +993,14 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
             match tgrep_core::reader::IndexReader::open(index_dir) {
                 Ok(new_reader) => {
                     let reader_files = new_reader.num_files();
-                    if reader_files >= num_files {
+                    let reader_trigrams = new_reader.num_trigrams();
+
+                    if new_reader.is_degenerate() {
+                        eprintln!(
+                            "[trace] auto-save: degenerate reader ({reader_files} files, \
+                             0 trigrams), keeping live overlay"
+                        );
+                    } else if reader_files >= num_files {
                         // Swap the reader without blocking concurrent searches.
                         state.index.read().unwrap().swap_reader(new_reader);
                         // Brief write lock for in-memory overlay prune + dirty reset.
@@ -1004,7 +1011,8 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
                         }
                         last_save = Instant::now();
                         eprintln!(
-                            "[trace] auto-save complete in {:.1}s ({reader_files} files on disk)",
+                            "[trace] auto-save complete in {:.1}s ({reader_files} files, \
+                             {reader_trigrams} trigrams on disk)",
                             save_start.elapsed().as_secs_f64(),
                         );
                     } else {
@@ -1496,33 +1504,78 @@ fn flush_index_to_disk(
     // these steps). The server-wide `state.index` RwLock is NOT taken, so
     // search queries continue to be served by the previous reader (whose
     // `Arc<IndexReader>` they hold) throughout this call.
-    let pruned = match tgrep_core::reader::IndexReader::open(index_dir) {
-        Ok(new_reader) => {
-            let reader_files = new_reader.num_files();
-            if reader_files >= num_files {
-                // Atomic swap — no outer write lock required.
-                state.index.read().unwrap().swap_reader(new_reader);
-                // Brief write lock for in-memory overlay maintenance only.
-                {
-                    let mut index = state.index.write().unwrap();
-                    index.prune_persisted_entries();
-                    index.live.reset_dirty_count();
+    //
+    // On Windows, NTFS metadata for a recently-renamed file can transiently
+    // appear stale (zero-length), causing IndexReader::open to create a
+    // degenerate reader with files but no trigrams. We retry a few times
+    // with a short backoff to ride out the transient.
+    let pruned = 'open: {
+        const READER_OPEN_RETRIES: u32 = 5;
+        const READER_OPEN_BACKOFF: Duration = Duration::from_millis(200);
+
+        for attempt in 0..READER_OPEN_RETRIES {
+            match tgrep_core::reader::IndexReader::open(index_dir) {
+                Ok(new_reader) => {
+                    let reader_files = new_reader.num_files();
+                    let reader_trigrams = new_reader.num_trigrams();
+
+                    if new_reader.is_degenerate() {
+                        eprintln!(
+                            "[trace] warning: reader has {reader_files} files but 0 trigrams \
+                             (attempt {}/{READER_OPEN_RETRIES}, likely stale NTFS metadata)",
+                            attempt + 1
+                        );
+                        if attempt + 1 < READER_OPEN_RETRIES {
+                            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
+                            continue;
+                        }
+                        eprintln!(
+                            "[trace] warning: degenerate reader persists after \
+                             {READER_OPEN_RETRIES} attempts, keeping live overlay as fallback"
+                        );
+                        break 'open false;
+                    }
+
+                    if reader_files >= num_files {
+                        // Atomic swap — no outer write lock required.
+                        state.index.read().unwrap().swap_reader(new_reader);
+                        // Brief write lock for in-memory overlay maintenance only.
+                        {
+                            let mut index = state.index.write().unwrap();
+                            index.prune_persisted_entries();
+                            index.live.reset_dirty_count();
+                        }
+                        eprintln!(
+                            "[trace] flush: reader reopened ({reader_files} files, \
+                             {reader_trigrams} trigrams), overlay pruned"
+                        );
+                        break 'open true;
+                    } else {
+                        eprintln!(
+                            "[trace] warning: reader has {reader_files} files \
+                             (expected {num_files}), keeping live overlay as fallback"
+                        );
+                        break 'open false;
+                    }
                 }
-                eprintln!("[trace] flush: reader reopened ({reader_files} files), overlay pruned");
-                true
-            } else {
-                eprintln!(
-                    "[trace] warning: reader has {reader_files} files (expected {num_files}), keeping live overlay as fallback"
-                );
-                false
+                Err(e) => {
+                    if attempt + 1 < READER_OPEN_RETRIES {
+                        eprintln!(
+                            "[trace] warning: reader open failed (attempt {}/{READER_OPEN_RETRIES}): {e}",
+                            attempt + 1
+                        );
+                        thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
+                        continue;
+                    }
+                    eprintln!(
+                        "[trace] warning: failed to reopen reader after flush: {e}, \
+                         live overlay retained"
+                    );
+                    break 'open false;
+                }
             }
         }
-        Err(e) => {
-            eprintln!(
-                "[trace] warning: failed to reopen reader after flush: {e}, live overlay retained"
-            );
-            false
-        }
+        false
     };
     let _ = std::fs::remove_dir_all(&staging_dir);
 

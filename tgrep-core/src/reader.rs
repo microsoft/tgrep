@@ -47,22 +47,37 @@ impl IndexReader {
         let mut lookup_file = File::open(&lookup_path)?;
         let mut postings_file = File::open(&postings_path)?;
 
-        let lookup_len = lookup_file.seek(SeekFrom::End(0))? as usize;
-        let postings_len = postings_file.seek(SeekFrom::End(0))? as usize;
+        let lookup_len_u64 = lookup_file.seek(SeekFrom::End(0))?;
+        let postings_len_u64 = postings_file.seek(SeekFrom::End(0))?;
 
-        let (lookup, postings, num_entries) = if lookup_len == 0 || postings_len == 0 {
+        let (lookup, postings, num_entries) = if lookup_len_u64 == 0 || postings_len_u64 == 0 {
             (None, None, 0)
         } else {
             // A corrupted lookup.bin whose size is not a multiple of the fixed
             // entry size would cause silent truncation of the trailing entry
             // (and binary search would still see it via integer division).
             // Reject up-front so the failure is loud and obvious.
-            if !lookup_len.is_multiple_of(LOOKUP_ENTRY_SIZE) {
+            //
+            // Validate in u64 before narrowing to usize so that oversized files
+            // on 32-bit targets are caught before any truncation.
+            if !lookup_len_u64.is_multiple_of(LOOKUP_ENTRY_SIZE as u64) {
                 return Err(crate::Error::IndexCorrupted(format!(
                     "lookup.bin size {} is not a multiple of {}",
-                    lookup_len, LOOKUP_ENTRY_SIZE
+                    lookup_len_u64, LOOKUP_ENTRY_SIZE
                 )));
             }
+            let lookup_len = usize::try_from(lookup_len_u64).map_err(|_| {
+                crate::Error::IndexCorrupted(format!(
+                    "lookup.bin size {} does not fit in usize on this platform",
+                    lookup_len_u64
+                ))
+            })?;
+            let postings_len = usize::try_from(postings_len_u64).map_err(|_| {
+                crate::Error::IndexCorrupted(format!(
+                    "index.bin size {} does not fit in usize on this platform",
+                    postings_len_u64
+                ))
+            })?;
             // SAFETY: Files are opened read-only and the Mmap lifetime is tied
             // to IndexReader. The close() method drops the mappings before any
             // file overwrites (required on Windows).

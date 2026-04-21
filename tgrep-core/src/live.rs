@@ -340,7 +340,7 @@ impl LiveIndex {
             }
             if !posting.is_empty() {
                 posting.sort_unstable();
-                remapped.insert(trigram & !OVERLAY_BIT, posting);
+                remapped.insert(trigram, posting);
             }
         }
 

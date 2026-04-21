@@ -363,9 +363,10 @@ impl HybridIndex {
         }
 
         // Overlay trigram postings with masks (remapped)
+        // Trigram keys in the live inverted index never have OVERLAY_BIT set
+        // (OVERLAY_BIT is only used in file IDs), so they can be used directly.
         let overlay_inverted = self.live.inverted_index();
         for (&trigram, file_ids) in overlay_inverted {
-            let tri_clean = trigram & !crate::live::OVERLAY_BIT;
             let remapped: Vec<PostingEntry> = file_ids
                 .iter()
                 .filter_map(|&fid| {
@@ -382,7 +383,7 @@ impl HybridIndex {
                 })
                 .collect();
             if !remapped.is_empty() {
-                inverted.entry(tri_clean).or_default().extend(remapped);
+                inverted.entry(trigram).or_default().extend(remapped);
             }
         }
 

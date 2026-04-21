@@ -464,23 +464,15 @@ fn handle_search(
             })
             .collect();
 
-        // Diagnostic: detect when raw candidates are lost in filtering
-        if raw_candidate_count > 0 && filtered.is_empty() {
-            let sample_fids: Vec<u32> = candidates.iter().copied().take(5).collect();
-            let sample_paths: Vec<Option<String>> =
-                sample_fids.iter().map(|&fid| index.file_path(fid)).collect();
+        // Only log when the index itself returns 0 candidates (indicates a
+        // potential index-level bug).  Glob/type filtering reducing results to 0
+        // is normal for path-scoped searches and should not be logged.
+        if raw_candidate_count == 0 && !pattern.is_empty() {
             eprintln!(
-                "[trace] WARNING: {} raw candidates filtered to 0! sample_fids={:?} sample_paths={:?}",
-                raw_candidate_count, sample_fids, sample_paths,
-            );
-        }
-        if raw_candidate_count != filtered.len() && raw_candidate_count > 0 {
-            eprintln!(
-                "[trace] search filter: raw={} filtered={} (type={:?} globs={})",
-                raw_candidate_count,
-                filtered.len(),
-                file_type,
+                "[trace] search: 0 raw candidates for pattern={:?} (globs={} type={:?})",
+                &pattern[..pattern.len().min(40)],
                 glob_filters.len(),
+                file_type,
             );
         }
 

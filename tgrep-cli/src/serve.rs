@@ -439,11 +439,11 @@ fn handle_search(
 
     // Collect candidates and their paths/full_paths while holding the index lock briefly
     let t_index = Instant::now();
-    let candidate_info: Vec<(String, PathBuf)> = {
+    let (candidate_info, raw_candidate_count): (Vec<(String, PathBuf)>, usize) = {
         let index = state.index.read().unwrap();
 
         let candidates = index.execute_query_with_masks(&plan);
-        let raw_candidate_count = candidates.len();
+        let raw_count = candidates.len();
 
         let filtered: Vec<(String, PathBuf)> = candidates
             .iter()
@@ -464,20 +464,7 @@ fn handle_search(
             })
             .collect();
 
-        // Only log when the index itself returns 0 candidates (indicates a
-        // potential index-level bug).  Glob/type filtering reducing results to 0
-        // is normal for path-scoped searches and should not be logged.
-        if raw_candidate_count == 0 && !pattern.is_empty() {
-            let pattern_preview: String = pattern.chars().take(40).collect();
-            eprintln!(
-                "[trace] search: 0 raw candidates for pattern={:?} (globs={} type={:?})",
-                pattern_preview,
-                glob_filters.len(),
-                file_type,
-            );
-        }
-
-        filtered
+        (filtered, raw_count)
     }; // index lock released here
     let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
 
@@ -531,9 +518,10 @@ fn handle_search(
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 
     eprintln!(
-        "[trace] search: pattern={:?} case_insensitive={} candidates={} matches={} elapsed={:.1}ms (index={:.1}ms resolve={:.1}ms search={:.1}ms)",
+        "[trace] search: pattern={:?} case_insensitive={} raw_candidates={} candidates={} matches={} elapsed={:.1}ms (index={:.1}ms resolve={:.1}ms search={:.1}ms)",
         pattern,
         case_insensitive,
+        raw_candidate_count,
         candidate_info.len(),
         matches.len(),
         elapsed_ms,

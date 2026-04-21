@@ -321,29 +321,28 @@ where
                 }
             }
 
-            // Only log when a posting list is unexpectedly empty (trigram in
-            // lookup but 0 postings — indicates index corruption).
+            // Log when the AND intersection produces 0 candidates — helps diagnose
+            // whether the issue is empty posting lists, mask filtering, or intersection.
             if candidates.is_empty() && queries.len() >= 3 {
                 let any_empty = list_sizes.iter().any(|(_, sz)| *sz == 0);
-                if any_empty {
-                    let min_size = list_sizes
-                        .iter()
-                        .map(|(_, sz)| sz)
-                        .min()
-                        .copied()
-                        .unwrap_or(0);
-                    let max_size = list_sizes
-                        .iter()
-                        .map(|(_, sz)| sz)
-                        .max()
-                        .copied()
-                        .unwrap_or(0);
-                    eprintln!(
-                        "[trace] AND plan: 0 candidates from {} trigrams (EMPTY posting list detected). \
-                         min_list={min_size} max_list={max_size}",
-                        queries.len(),
-                    );
-                }
+                let min_size = list_sizes
+                    .iter()
+                    .map(|(_, sz)| sz)
+                    .min()
+                    .copied()
+                    .unwrap_or(0);
+                let max_size = list_sizes
+                    .iter()
+                    .map(|(_, sz)| sz)
+                    .max()
+                    .copied()
+                    .unwrap_or(0);
+                eprintln!(
+                    "[trace] AND plan: 0 candidates from {} trigrams. \
+                     any_empty={any_empty} min_list={min_size} max_list={max_size} \
+                     sizes={list_sizes:?}",
+                    queries.len(),
+                );
             }
 
             candidates.into_iter().map(|(fid, _, _)| fid).collect()

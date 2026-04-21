@@ -263,6 +263,11 @@ where
             // Fetch full posting entries (with masks) for each trigram
             let mut lists: Vec<(&TrigramQuery, Vec<PostingEntry>)> =
                 queries.iter().map(|q| (q, lookup(q.hash))).collect();
+
+            // Diagnostic: collect sizes before sort for zero-candidate analysis
+            let list_sizes: Vec<(u32, usize)> =
+                lists.iter().map(|(q, l)| (q.hash, l.len())).collect();
+
             lists.sort_by_key(|(_, l)| l.len());
 
             // Start with smallest posting list
@@ -313,6 +318,19 @@ where
                 if candidates.is_empty() {
                     break;
                 }
+            }
+
+            // Diagnostic: when a non-trivial query returns 0, log per-trigram posting sizes
+            if candidates.is_empty() && queries.len() >= 3 {
+                let any_empty = list_sizes.iter().any(|(_, sz)| *sz == 0);
+                let min_size = list_sizes.iter().map(|(_, sz)| sz).min().copied().unwrap_or(0);
+                let max_size = list_sizes.iter().map(|(_, sz)| sz).max().copied().unwrap_or(0);
+                eprintln!(
+                    "[trace] AND plan: 0 candidates from {} trigrams. \
+                     any_empty={any_empty} min_list={min_size} max_list={max_size} \
+                     sizes={list_sizes:?}",
+                    queries.len(),
+                );
             }
 
             candidates.into_iter().map(|(fid, _, _)| fid).collect()

@@ -29,6 +29,20 @@ pub struct HybridIndex {
 impl HybridIndex {
     pub fn open(index_dir: &Path, root: &Path) -> Result<Self> {
         let reader = IndexReader::open(index_dir)?;
+        // Reject degenerate readers (files present but 0 trigrams) at startup.
+        // This matches the retry logic in flush_index_to_disk.
+        if reader.is_degenerate() {
+            return Err(crate::Error::IndexCorrupted(format!(
+                "degenerate reader: {} files but 0 trigrams",
+                reader.num_files()
+            )));
+        }
+        // Validate and warm up the lookup mmap so the first searches after
+        // startup don't hit cold pages (which caused zero-candidate results
+        // on Windows).
+        if let Err(msg) = reader.validate_lookup() {
+            return Err(crate::Error::IndexCorrupted(msg));
+        }
         Ok(Self {
             reader: RwLock::new(Arc::new(reader)),
             live: LiveIndex::new(),

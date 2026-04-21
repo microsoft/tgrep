@@ -443,8 +443,9 @@ fn handle_search(
         let index = state.index.read().unwrap();
 
         let candidates = index.execute_query_with_masks(&plan);
+        let raw_candidate_count = candidates.len();
 
-        candidates
+        let filtered: Vec<(String, PathBuf)> = candidates
             .iter()
             .filter_map(|&fid| {
                 let rel_path = index.file_path(fid)?.to_string();
@@ -461,7 +462,29 @@ fn handle_search(
                 let full_path = index.full_path(fid)?;
                 Some((rel_path, full_path))
             })
-            .collect()
+            .collect();
+
+        // Diagnostic: detect when raw candidates are lost in filtering
+        if raw_candidate_count > 0 && filtered.is_empty() {
+            let sample_fids: Vec<u32> = candidates.iter().copied().take(5).collect();
+            let sample_paths: Vec<Option<String>> =
+                sample_fids.iter().map(|&fid| index.file_path(fid)).collect();
+            eprintln!(
+                "[trace] WARNING: {} raw candidates filtered to 0! sample_fids={:?} sample_paths={:?}",
+                raw_candidate_count, sample_fids, sample_paths,
+            );
+        }
+        if raw_candidate_count != filtered.len() && raw_candidate_count > 0 {
+            eprintln!(
+                "[trace] search filter: raw={} filtered={} (type={:?} globs={})",
+                raw_candidate_count,
+                filtered.len(),
+                file_type,
+                glob_filters.len(),
+            );
+        }
+
+        filtered
     }; // index lock released here
     let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
 
@@ -1000,6 +1023,10 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
                             "[trace] auto-save: degenerate reader ({reader_files} files, \
                              0 trigrams), keeping live overlay"
                         );
+                    } else if let Err(msg) = new_reader.validate_lookup() {
+                        eprintln!(
+                            "[trace] auto-save: validation failed: {msg}, keeping live overlay"
+                        );
                     } else if reader_files >= num_files {
                         // Swap the reader without blocking concurrent searches.
                         state.index.read().unwrap().swap_reader(new_reader);
@@ -1532,6 +1559,30 @@ fn flush_index_to_disk(
                         eprintln!(
                             "[trace] warning: degenerate reader persists after \
                              {READER_OPEN_RETRIES} attempts, keeping live overlay as fallback"
+                        );
+                        break 'open false;
+                    }
+
+                    // Validate + warm the lookup mmap before swapping the
+                    // reader in. This catches corruption (unsorted lookup
+                    // table, out-of-bounds posting offsets) and, as a
+                    // side-effect, pages in every byte of lookup.bin so that
+                    // subsequent binary searches never hit cold mmap pages
+                    // — preventing the zero-candidate failure observed on
+                    // Windows after flush.
+                    if let Err(msg) = new_reader.validate_lookup() {
+                        eprintln!(
+                            "[trace] warning: reader validation failed \
+                             (attempt {}/{READER_OPEN_RETRIES}): {msg}",
+                            attempt + 1
+                        );
+                        if attempt + 1 < READER_OPEN_RETRIES {
+                            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
+                            continue;
+                        }
+                        eprintln!(
+                            "[trace] warning: reader validation failed after \
+                             {READER_OPEN_RETRIES} attempts, keeping live overlay"
                         );
                         break 'open false;
                     }

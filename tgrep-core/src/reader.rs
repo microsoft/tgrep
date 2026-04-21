@@ -27,43 +27,47 @@ impl IndexReader {
             return Err(crate::Error::IndexNotFound(index_dir.display().to_string()));
         }
 
-        // Open files and create mmaps. We intentionally use the *mmap
-        // length* (not `std::fs::metadata().len()`) as the source of truth
-        // for the empty-index check. On Windows, `metadata()` can return a
-        // stale zero length for a file that was just renamed into place by
-        // `move_staged_files`, because NTFS directory-entry metadata updates
-        // are not always immediately visible to a separate `metadata()` call
-        // even though `File::open` + `CreateFileMapping` see the correct
-        // data. Using the mmap length avoids this race entirely.
-        let lookup_file = File::open(&lookup_path)?;
-        let postings_file = File::open(&postings_path)?;
+        // Map files first, then use *mmap length* as the source of truth.
+        //
+        // On Windows, `File::metadata().len()` (fstat) can transiently return
+        // zero for a file that was just renamed into place by
+        // `move_staged_files`, because NTFS metadata updates are not always
+        // immediately visible — even from the same file handle. Since memmap2
+        // internally queries `File::metadata().len()` to determine the mapping
+        // size, we bypass it by seeking to the end of the file to get the true
+        // length, then passing it explicitly via `MmapOptions::len()`.
+        //
+        // `SetFilePointerEx` (which backs `file.seek(SeekFrom::End(0))`) reads
+        // the file object's size directly from the kernel, which is always
+        // up-to-date even when the NTFS directory-entry metadata cache has not
+        // yet been invalidated.
+        use std::io::{Seek, SeekFrom};
+        use memmap2::MmapOptions;
 
-        let lookup_file_len = lookup_file.metadata()?.len();
-        let postings_file_len = postings_file.metadata()?.len();
+        let mut lookup_file = File::open(&lookup_path)?;
+        let mut postings_file = File::open(&postings_path)?;
 
-        let (lookup, postings, num_entries) = if lookup_file_len == 0 || postings_file_len == 0 {
+        let lookup_len = lookup_file.seek(SeekFrom::End(0))? as usize;
+        let postings_len = postings_file.seek(SeekFrom::End(0))? as usize;
+
+        let (lookup, postings, num_entries) = if lookup_len == 0 || postings_len == 0 {
             (None, None, 0)
         } else {
             // A corrupted lookup.bin whose size is not a multiple of the fixed
             // entry size would cause silent truncation of the trailing entry
             // (and binary search would still see it via integer division).
             // Reject up-front so the failure is loud and obvious.
-            //
-            // Do the modulo in u64 (file sizes are u64) so a >4GiB file on
-            // 32-bit targets isn't truncated by an `as usize` cast before
-            // the validation runs.
-            if lookup_file_len % (LOOKUP_ENTRY_SIZE as u64) != 0 {
+            if lookup_len % LOOKUP_ENTRY_SIZE != 0 {
                 return Err(crate::Error::IndexCorrupted(format!(
                     "lookup.bin size {} is not a multiple of {}",
-                    lookup_file_len,
-                    LOOKUP_ENTRY_SIZE
+                    lookup_len, LOOKUP_ENTRY_SIZE
                 )));
             }
-            // SAFETY: Files are opened read-only and the Mmap lifetime is tied to
-            // IndexReader. The close() method drops the mappings before any file
-            // overwrites (required on Windows).
-            let lk = unsafe { Mmap::map(&lookup_file)? };
-            let pk = unsafe { Mmap::map(&postings_file)? };
+            // SAFETY: Files are opened read-only and the Mmap lifetime is tied
+            // to IndexReader. The close() method drops the mappings before any
+            // file overwrites (required on Windows).
+            let lk = unsafe { MmapOptions::new().len(lookup_len).map(&lookup_file)? };
+            let pk = unsafe { MmapOptions::new().len(postings_len).map(&postings_file)? };
             let n = lk.len() / LOOKUP_ENTRY_SIZE;
             (Some(lk), Some(pk), n)
         };
@@ -178,6 +182,50 @@ impl IndexReader {
     /// NTFS after rapid file renames) and the reader should be reopened.
     pub fn is_degenerate(&self) -> bool {
         !self.file_paths.is_empty() && self.num_entries == 0
+    }
+
+    /// Validate that the lookup table is sorted by trigram hash and that
+    /// posting-list ranges stay within `index.bin` bounds.
+    ///
+    /// Returns `Ok(())` when the table is well-formed. As a side-effect, this
+    /// sequentially reads every lookup entry, warming the mmap pages into the
+    /// OS page cache so that subsequent binary searches never hit cold pages.
+    pub fn validate_lookup(&self) -> std::result::Result<(), String> {
+        let lookup = match self.lookup.as_ref() {
+            Some(l) => l,
+            None => return Ok(()), // empty index, nothing to validate
+        };
+        let postings_len = self.postings.as_ref().map_or(0, |p| p.len());
+        let mut prev_trigram: Option<u32> = None;
+        for i in 0..self.num_entries {
+            let entry = self.read_lookup_entry(i);
+            if let Some(prev) = prev_trigram {
+                if entry.trigram <= prev {
+                    return Err(format!(
+                        "lookup.bin not sorted at entry {i}: trigram {:#x} <= prev {:#x}",
+                        entry.trigram, prev
+                    ));
+                }
+            }
+            let byte_len = (entry.length as usize).checked_mul(POSTING_ENTRY_SIZE);
+            let end = byte_len.and_then(|bl| (entry.offset as usize).checked_add(bl));
+            match end {
+                Some(e) if e <= postings_len => {}
+                _ => {
+                    return Err(format!(
+                        "lookup entry {i} (trigram {:#x}): posting range \
+                         [offset={}, length={}] exceeds index.bin length {postings_len}",
+                        entry.trigram, entry.offset, entry.length
+                    ));
+                }
+            }
+            prev_trigram = Some(entry.trigram);
+        }
+        // Touch last byte of lookup to ensure the final page is paged in.
+        if !lookup.is_empty() {
+            std::hint::black_box(lookup[lookup.len() - 1]);
+        }
+        Ok(())
     }
 
     /// Get all file IDs present in this reader.
@@ -369,5 +417,82 @@ mod tests {
         write_index(tmp.path(), &[], &[], &[]);
         let reader = IndexReader::open(tmp.path()).expect("should open");
         assert!(!reader.is_degenerate(), "empty index is not degenerate");
+    }
+
+    /// Build a well-formed lookup + postings for testing validate_lookup.
+    fn make_sorted_index(trigrams: &[u32]) -> (Vec<u8>, Vec<u8>) {
+        let mut lookup_buf = Vec::new();
+        let mut postings_buf = Vec::new();
+        for &tri in trigrams {
+            let offset = postings_buf.len() as u64;
+            // One posting entry per trigram for simplicity
+            let pe = PostingEntry {
+                file_id: 0,
+                loc_mask: 0xFF,
+                next_mask: 0xFF,
+            };
+            postings_buf.extend_from_slice(&pe.encode());
+            let le = LookupEntry {
+                trigram: tri,
+                offset,
+                length: 1,
+            };
+            lookup_buf.extend_from_slice(&le.encode());
+        }
+        (lookup_buf, postings_buf)
+    }
+
+    #[test]
+    fn validate_lookup_accepts_sorted_table() {
+        let tmp = TempDir::new().unwrap();
+        let (lookup, postings) = make_sorted_index(&[100, 200, 300]);
+        let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        write_index(tmp.path(), &lookup, &postings, &files);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        assert!(reader.validate_lookup().is_ok());
+    }
+
+    #[test]
+    fn validate_lookup_rejects_unsorted_table() {
+        let tmp = TempDir::new().unwrap();
+        let (lookup, postings) = make_sorted_index(&[200, 100, 300]); // unsorted!
+        let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        write_index(tmp.path(), &lookup, &postings, &files);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        let err = reader.validate_lookup().unwrap_err();
+        assert!(err.contains("not sorted"), "expected sort error, got: {err}");
+    }
+
+    #[test]
+    fn validate_lookup_rejects_out_of_bounds_postings() {
+        let tmp = TempDir::new().unwrap();
+        // Create lookup that points past the end of postings
+        let le = LookupEntry {
+            trigram: 100,
+            offset: 0,
+            length: 999, // way past the single entry we provide
+        };
+        let mut lookup = Vec::new();
+        lookup.extend_from_slice(&le.encode());
+        let pe = PostingEntry {
+            file_id: 0,
+            loc_mask: 0xFF,
+            next_mask: 0xFF,
+        };
+        let mut postings = Vec::new();
+        postings.extend_from_slice(&pe.encode());
+        let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        write_index(tmp.path(), &lookup, &postings, &files);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        let err = reader.validate_lookup().unwrap_err();
+        assert!(err.contains("exceeds"), "expected bounds error, got: {err}");
+    }
+
+    #[test]
+    fn validate_lookup_empty_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        write_index(tmp.path(), &[], &[], &[]);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        assert!(reader.validate_lookup().is_ok());
     }
 }

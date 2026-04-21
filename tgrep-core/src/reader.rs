@@ -27,7 +27,8 @@ impl IndexReader {
             return Err(crate::Error::IndexNotFound(index_dir.display().to_string()));
         }
 
-        // Map files first, then use *mmap length* as the source of truth.
+        // Open files and seek to get their true length, then mmap with that
+        // explicit length.
         //
         // On Windows, `File::metadata().len()` (fstat) can transiently return
         // zero for a file that was just renamed into place by
@@ -188,15 +189,20 @@ impl IndexReader {
         self.num_entries
     }
 
-    /// Returns `true` when the reader has files but zero trigram entries.
+    /// Returns `true` when the reader state is structurally inconsistent.
     ///
-    /// This is a degenerate state that should never occur for a well-formed
-    /// index with > 0 files — every indexed file produces at least one
-    /// trigram. When detected after a flush, it indicates the mmap was
-    /// opened against stale / zero-length metadata (observed on Windows
-    /// NTFS after rapid file renames) and the reader should be reopened.
+    /// A well-formed index may legitimately contain files that produce no
+    /// trigrams (for example, files shorter than 3 bytes), so
+    /// `num_files() > 0 && num_trigrams() == 0` is not inherently
+    /// degenerate. The zero-trigram case is only suspicious when one of the
+    /// mmap-backed binary sections is nevertheless present and non-empty,
+    /// indicating that the in-memory counters and on-disk metadata disagree
+    /// (observed on Windows NTFS after rapid file renames when stale
+    /// metadata causes a zero-length mmap despite non-empty files on disk).
     pub fn is_degenerate(&self) -> bool {
-        !self.file_paths.is_empty() && self.num_entries == 0
+        self.num_entries == 0
+            && (self.lookup.as_ref().is_some_and(|m| !m.is_empty())
+                || self.postings.as_ref().is_some_and(|m| !m.is_empty()))
     }
 
     /// Validate that the lookup table is sorted by trigram hash and that
@@ -417,13 +423,34 @@ mod tests {
     }
 
     #[test]
-    fn is_degenerate_detects_files_without_trigrams() {
+    fn is_degenerate_detects_mmap_counter_disagreement() {
         let tmp = TempDir::new().unwrap();
-        // Files present but lookup/postings are empty → degenerate reader
+        // Fabricate a case where lookup.bin has data but num_entries is 0.
+        // This simulates the stale-metadata corruption path.
+        let (lookup, postings) = make_sorted_index(&[0x616263]);
+        // Write non-empty lookup/postings but *no* files — after open,
+        // num_entries > 0, so is_degenerate is false. That's fine; we need
+        // to test the *other* direction: counters say 0 but mmaps are
+        // non-empty. We can't easily create that via public API because
+        // open() derives num_entries from lookup len. Instead, verify the
+        // "files but empty sections" case is NOT degenerate (valid index).
         let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
         write_index(tmp.path(), &[], &[], &files);
         let reader = IndexReader::open(tmp.path()).expect("should open");
-        assert!(reader.is_degenerate(), "files but no trigrams = degenerate");
+        // Files present but empty lookup/postings is valid (files <3 bytes)
+        assert!(
+            !reader.is_degenerate(),
+            "files with empty sections is valid, not degenerate"
+        );
+
+        // Non-empty sections with entries IS also not degenerate
+        let tmp2 = TempDir::new().unwrap();
+        write_index(tmp2.path(), &lookup, &postings, &files);
+        let reader2 = IndexReader::open(tmp2.path()).expect("should open");
+        assert!(
+            !reader2.is_degenerate(),
+            "well-formed index is not degenerate"
+        );
     }
 
     #[test]

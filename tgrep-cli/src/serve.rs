@@ -445,24 +445,47 @@ fn handle_search(
         let candidates = index.execute_query_with_masks(&plan);
         let raw_count = candidates.len();
 
+        // Diagnostic counters for filter stages
+        let mut no_path_count: usize = 0;
+        let mut type_filtered_count: usize = 0;
+        let mut glob_filtered_count: usize = 0;
+
         let filtered: Vec<(String, PathBuf)> = candidates
             .iter()
             .filter_map(|&fid| {
-                let rel_path = index.file_path(fid)?.to_string();
+                let rel_path = match index.file_path(fid) {
+                    Some(p) => p.to_string(),
+                    None => {
+                        no_path_count += 1;
+                        return None;
+                    }
+                };
                 if let Some(ref type_name) = file_type
                     && !tgrep_core::filetypes::matches_type(&rel_path, type_name)
                 {
+                    type_filtered_count += 1;
                     return None;
                 }
                 if !glob_filters.is_empty()
                     && !glob_filters.iter().any(|g| simple_glob_match(g, &rel_path))
                 {
+                    glob_filtered_count += 1;
                     return None;
                 }
                 let full_path = index.full_path(fid)?;
                 Some((rel_path, full_path))
             })
             .collect();
+
+        // Log filter breakdown when raw candidates are dropped to zero
+        if raw_count > 0 && filtered.is_empty() {
+            eprintln!(
+                "[trace] filter: raw={raw_count} no_path={no_path_count} \
+                 type_filtered={type_filtered_count} glob_filtered={glob_filtered_count} \
+                 file_type={file_type:?} globs={glob_count}",
+                glob_count = glob_filters.len(),
+            );
+        }
 
         (filtered, raw_count)
     }; // index lock released here

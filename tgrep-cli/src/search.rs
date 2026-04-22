@@ -110,6 +110,7 @@ impl SearchOptions {
 /// List files that would be searched (--files mode).
 pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
     let root = std::fs::canonicalize(root)?;
+    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob);
     let walk = walker::walk_dir(
         &root,
         &walker::WalkOptions {
@@ -132,7 +133,7 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
         {
             continue;
         }
-        if !passes_glob_filters(&opts.glob, &rel_path) {
+        if !glob_filter.matches(&rel_path) {
             continue;
         }
         writer.write_file(&rel_path)?;
@@ -295,6 +296,7 @@ fn search_local_index(
 ) -> Result<bool> {
     let start = Instant::now();
     let reader = IndexReader::open(index_dir)?;
+    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob);
 
     let all_patterns = opts.all_patterns()?;
     let re = build_combined_regex(
@@ -338,7 +340,7 @@ fn search_local_index(
             None => continue,
         };
 
-        if !passes_filters(&rel_path, &opts.glob, &opts.file_type) {
+        if !passes_filters(&rel_path, &glob_filter, &opts.file_type) {
             continue;
         }
 
@@ -381,6 +383,7 @@ fn search_local_index(
 
 fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<bool> {
     let start = Instant::now();
+    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob);
 
     // If root is a file, walk its parent and filter to just that file
     let (walk_root, single_file) = if root.is_file() {
@@ -425,7 +428,7 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
             .to_string_lossy()
             .replace('\\', "/");
 
-        if !passes_filters(&rel_path, &opts.glob, &opts.file_type) {
+        if !passes_filters(&rel_path, &glob_filter, &opts.file_type) {
             continue;
         }
 
@@ -636,53 +639,17 @@ pub fn build_combined_regex(
         .map_err(|e| anyhow::anyhow!("regex error: {e}"))
 }
 
-fn passes_filters(rel_path: &str, globs: &[String], file_type: &Option<String>) -> bool {
+fn passes_filters(
+    rel_path: &str,
+    glob_filter: &crate::glob_filter::GlobFilter,
+    file_type: &Option<String>,
+) -> bool {
     if let Some(type_name) = file_type
         && !filetypes::matches_type(rel_path, type_name)
     {
         return false;
     }
-    if !passes_glob_filters(globs, rel_path) {
-        return false;
-    }
-    true
-}
-
-/// Check if a path passes all glob filters. If no globs are specified, all
-/// paths pass. Patterns prefixed with `!` act as exclusions — if the path
-/// matches any exclusion it is rejected. Otherwise, if inclusion patterns
-/// are present the path must match at least one.
-fn passes_glob_filters(globs: &[String], path: &str) -> bool {
-    if globs.is_empty() {
-        return true;
-    }
-    let mut has_include = false;
-    let mut included = false;
-    for g in globs {
-        if let Some(neg) = g.strip_prefix('!') {
-            if glob_matches(neg, path) {
-                return false; // excluded
-            }
-        } else {
-            has_include = true;
-            if !included && glob_matches(g, path) {
-                included = true;
-            }
-        }
-    }
-    !has_include || included
-}
-
-fn glob_matches(pattern: &str, path: &str) -> bool {
-    // Normalize backslashes so Windows-style globs match forward-slash index paths
-    let pattern = pattern.replace('\\', "/");
-    let pattern = pattern.replace('.', r"\.");
-    let pattern = pattern.replace("**", "§§");
-    let pattern = pattern.replace('*', "[^/]*");
-    let pattern = pattern.replace("§§", ".*");
-    regex::Regex::new(&format!("(?i){pattern}$"))
-        .map(|re| re.is_match(path))
-        .unwrap_or(false)
+    glob_filter.matches(rel_path)
 }
 
 fn plan_summary(plan: &QueryPlan) -> String {

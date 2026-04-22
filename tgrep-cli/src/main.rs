@@ -5,6 +5,7 @@
 ///   tgrep serve [path]           Start the search server
 ///   tgrep <pattern> [path]       Search (auto-delegates to server)
 ///   tgrep status [path]          Show index/server status
+mod glob_filter;
 mod index;
 mod output;
 mod search;

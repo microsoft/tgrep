@@ -372,7 +372,7 @@ fn handle_search(
         .get("max_count")
         .and_then(|m| m.as_u64())
         .map(|m| m as usize);
-    let glob_filters: Vec<String> = params
+    let glob_filter_strs: Vec<String> = params
         .get("glob")
         .and_then(|g| g.as_array())
         .map(|arr| {
@@ -381,6 +381,7 @@ fn handle_search(
                 .collect()
         })
         .unwrap_or_default();
+    let glob_filter = crate::glob_filter::GlobFilter::new(&glob_filter_strs);
     let file_type = params
         .get("file_type")
         .and_then(|t| t.as_str())
@@ -472,7 +473,7 @@ fn handle_search(
                     type_filtered_count += 1;
                     return None;
                 }
-                if !glob_filters.is_empty() && !glob_filter_matches(&glob_filters, &rel_path) {
+                if !glob_filter.is_empty() && !glob_filter.matches(&rel_path) {
                     glob_filtered_count += 1;
                     if first_glob_rejected.is_none() {
                         first_glob_rejected = Some(rel_path);
@@ -489,7 +490,7 @@ fn handle_search(
             eprintln!(
                 "[trace] filter: raw={raw_count} no_path={no_path_count} \
                  type_filtered={type_filtered_count} glob_filtered={glob_filtered_count} \
-                 file_type={file_type:?} glob_values={glob_filters:?} \
+                 file_type={file_type:?} glob_values={glob_filter_strs:?} \
                  sample_rejected={first_glob_rejected:?}",
             );
         }
@@ -1077,40 +1078,6 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
 ///   an exclusion.
 /// - If inclusion patterns are present, the path must match at least one AND
 ///   must not match any exclusion.
-fn glob_filter_matches(globs: &[String], path: &str) -> bool {
-    if globs.is_empty() {
-        return true;
-    }
-    let mut has_include = false;
-    let mut included = false;
-    for g in globs {
-        if let Some(neg) = g.strip_prefix('!') {
-            if simple_glob_match(neg, path) {
-                return false; // excluded
-            }
-        } else {
-            has_include = true;
-            if !included && simple_glob_match(g, path) {
-                included = true;
-            }
-        }
-    }
-    // If there were no inclusion patterns, the path passes (only exclusions existed)
-    !has_include || included
-}
-
-fn simple_glob_match(pattern: &str, path: &str) -> bool {
-    // Normalize backslashes so Windows-style globs match forward-slash index paths
-    let pattern = pattern.replace('\\', "/");
-    let pattern = pattern.replace('.', r"\.");
-    let pattern = pattern.replace("**", "§§");
-    let pattern = pattern.replace('*', "[^/]*");
-    let pattern = pattern.replace("§§", ".*");
-    regex::Regex::new(&format!("(?i){pattern}$"))
-        .map(|re| re.is_match(path))
-        .unwrap_or(false)
-}
-
 fn json_rpc_result(id: Option<serde_json::Value>, result: serde_json::Value) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -1986,54 +1953,61 @@ mod tests {
     }
 
     #[test]
-    fn simple_glob_match_unix_patterns() {
-        // Standard forward-slash globs against forward-slash index paths
-        assert!(simple_glob_match("**/*.cs", "src/foo/bar.cs"));
-        assert!(simple_glob_match("*.cs", "src/foo/bar.cs"));
-        assert!(simple_glob_match("*.cs", "bar.cs"));
-        assert!(!simple_glob_match("**/*.cs", "src/foo/bar.rs"));
-        assert!(simple_glob_match("src/**", "src/foo/bar.cs"));
-        assert!(!simple_glob_match("src/**", "lib/foo/bar.cs"));
+    fn glob_filter_unix_patterns() {
+        use crate::glob_filter::GlobFilter;
+        let f = GlobFilter::new(&["**/*.cs".to_string()]);
+        assert!(f.matches("src/foo/bar.cs"));
+        assert!(f.matches("bar.cs"));
+        assert!(!f.matches("src/foo/bar.rs"));
+        let f2 = GlobFilter::new(&["src/**".to_string()]);
+        assert!(f2.matches("src/foo/bar.cs"));
+        assert!(!f2.matches("lib/foo/bar.cs"));
     }
 
     #[test]
-    fn simple_glob_match_backslash_normalization() {
-        // Windows-style globs with backslashes must match forward-slash paths
-        assert!(simple_glob_match(r"**\*.cs", "src/foo/bar.cs"));
-        assert!(simple_glob_match(r"src\**\*.cs", "src/foo/bar.cs"));
-        assert!(simple_glob_match(r"src\**", "src/foo/bar.cs"));
-        assert!(!simple_glob_match(r"lib\**", "src/foo/bar.cs"));
+    fn glob_filter_backslash_normalization() {
+        use crate::glob_filter::GlobFilter;
+        let f = GlobFilter::new(&[r"**\*.cs".to_string()]);
+        assert!(f.matches("src/foo/bar.cs"));
+        let f2 = GlobFilter::new(&[r"src\**\*.cs".to_string()]);
+        assert!(f2.matches("src/foo/bar.cs"));
+        let f3 = GlobFilter::new(&[r"src\**".to_string()]);
+        assert!(f3.matches("src/foo/bar.cs"));
+        assert!(!GlobFilter::new(&[r"lib\**".to_string()]).matches("src/foo/bar.cs"));
     }
 
     #[test]
-    fn simple_glob_match_case_insensitive() {
-        assert!(simple_glob_match("**/*.CS", "src/foo/bar.cs"));
-        assert!(simple_glob_match("**/*.cs", "src/foo/BAR.CS"));
+    fn glob_filter_case_insensitive() {
+        use crate::glob_filter::GlobFilter;
+        let f = GlobFilter::new(&["**/*.CS".to_string()]);
+        assert!(f.matches("src/foo/bar.cs"));
+        assert!(f.matches("src/foo/BAR.CS"));
     }
 
     #[test]
     fn glob_filter_negation_only() {
-        // Only exclusion patterns: path passes unless it matches an exclusion
-        let globs = vec!["!.git".to_string()];
-        assert!(glob_filter_matches(&globs, "src/foo/bar.cs"));
-        assert!(glob_filter_matches(&globs, "README.md"));
-        assert!(!glob_filter_matches(&globs, ".git"));
-        assert!(!glob_filter_matches(&globs, "foo/.git"));
+        use crate::glob_filter::GlobFilter;
+        let f = GlobFilter::new(&["!.git".to_string()]);
+        assert!(f.matches("src/foo/bar.cs"));
+        assert!(f.matches("README.md"));
+        assert!(!f.matches(".git"));
+        assert!(!f.matches("foo/.git"));
     }
 
     #[test]
     fn glob_filter_inclusion_and_exclusion() {
-        // Mix of include and exclude: must match an include AND not match any exclude
-        let globs = vec!["**/*.cs".to_string(), "!**/test/**".to_string()];
-        assert!(glob_filter_matches(&globs, "src/foo/bar.cs"));
-        assert!(!glob_filter_matches(&globs, "src/test/bar.cs"));
-        assert!(!glob_filter_matches(&globs, "src/foo/bar.rs")); // no include match
+        use crate::glob_filter::GlobFilter;
+        let f = GlobFilter::new(&["**/*.cs".to_string(), "!**/test/**".to_string()]);
+        assert!(f.matches("src/foo/bar.cs"));
+        assert!(!f.matches("src/test/bar.cs"));
+        assert!(!f.matches("src/foo/bar.rs"));
     }
 
     #[test]
     fn glob_filter_empty_passes_all() {
-        let globs: Vec<String> = vec![];
-        assert!(glob_filter_matches(&globs, "anything"));
+        use crate::glob_filter::GlobFilter;
+        let f = GlobFilter::new(&[]);
+        assert!(f.matches("anything"));
     }
 
     fn write_file(path: &Path, content: &[u8]) {

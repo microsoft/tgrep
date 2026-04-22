@@ -199,6 +199,15 @@ impl IndexReader {
     /// indicating that the in-memory counters and on-disk metadata disagree
     /// (observed on Windows NTFS after rapid file renames when stale
     /// metadata causes a zero-length mmap despite non-empty files on disk).
+    ///
+    /// Note: because `open()` derives `num_entries` directly from the
+    /// lookup mmap length, this condition cannot occur through normal
+    /// construction — it represents a post-construction inconsistency
+    /// (e.g. partial `close()` or direct field mutation). Call sites in
+    /// `serve.rs` that need to detect the "files present, trigrams missing"
+    /// Windows stale-metadata heuristic should compare `num_files()` vs
+    /// `num_trigrams()` independently rather than relying solely on this
+    /// method.
     pub fn is_degenerate(&self) -> bool {
         self.num_entries == 0
             && (self.lookup.as_ref().is_some_and(|m| !m.is_empty())
@@ -228,10 +237,13 @@ impl IndexReader {
                     entry.trigram, prev
                 ));
             }
-            let byte_len = (entry.length as usize).checked_mul(POSTING_ENTRY_SIZE);
-            let end = byte_len.and_then(|bl| (entry.offset as usize).checked_add(bl));
+            // Perform range math in u64 to avoid truncation on 32-bit targets
+            // or corrupted indexes with large offsets.
+            let postings_len_u64 = postings_len as u64;
+            let byte_len = (entry.length as u64).checked_mul(POSTING_ENTRY_SIZE as u64);
+            let end = byte_len.and_then(|bl| entry.offset.checked_add(bl));
             match end {
-                Some(e) if e <= postings_len => {}
+                Some(e) if e <= postings_len_u64 => {}
                 _ => {
                     return Err(format!(
                         "lookup entry {i} (trigram {:#x}): posting range \
@@ -425,31 +437,45 @@ mod tests {
     #[test]
     fn is_degenerate_detects_mmap_counter_disagreement() {
         let tmp = TempDir::new().unwrap();
-        // Fabricate a case where lookup.bin has data but num_entries is 0.
-        // This simulates the stale-metadata corruption path.
         let (lookup, postings) = make_sorted_index(&[0x616263]);
-        // Write non-empty lookup/postings but *no* files — after open,
-        // num_entries > 0, so is_degenerate is false. That's fine; we need
-        // to test the *other* direction: counters say 0 but mmaps are
-        // non-empty. We can't easily create that via public API because
-        // open() derives num_entries from lookup len. Instead, verify the
-        // "files but empty sections" case is NOT degenerate (valid index).
         let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+
+        // Files present but empty lookup/postings is valid (files <3 bytes)
         write_index(tmp.path(), &[], &[], &files);
         let reader = IndexReader::open(tmp.path()).expect("should open");
-        // Files present but empty lookup/postings is valid (files <3 bytes)
         assert!(
             !reader.is_degenerate(),
             "files with empty sections is valid, not degenerate"
         );
 
-        // Non-empty sections with entries IS also not degenerate
+        // Non-empty sections with matching entries IS also not degenerate
         let tmp2 = TempDir::new().unwrap();
         write_index(tmp2.path(), &lookup, &postings, &files);
         let reader2 = IndexReader::open(tmp2.path()).expect("should open");
         assert!(
             !reader2.is_degenerate(),
             "well-formed index is not degenerate"
+        );
+
+        // Fabricate the inconsistent internal state: mmap-backed
+        // lookup/postings are present, but num_entries is forced to 0.
+        // This simulates a post-construction inconsistency.
+        let tmp3 = TempDir::new().unwrap();
+        write_index(tmp3.path(), &lookup, &postings, &files);
+        let opened = IndexReader::open(tmp3.path()).expect("should open");
+        assert!(
+            opened.lookup.as_ref().map_or(0, |m| m.len()) >= LOOKUP_ENTRY_SIZE,
+            "fixture should have a non-empty lookup mmap"
+        );
+        let degenerate_reader = IndexReader {
+            lookup: opened.lookup,
+            postings: opened.postings,
+            file_paths: opened.file_paths,
+            num_entries: 0,
+        };
+        assert!(
+            degenerate_reader.is_degenerate(),
+            "non-empty mmap with num_entries == 0 must be degenerate"
         );
     }
 

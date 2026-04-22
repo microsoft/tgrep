@@ -6,16 +6,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use tgrep_core::hybrid::HybridIndex;
 use tgrep_core::PostingEntry;
+use tgrep_core::hybrid::HybridIndex;
 use tgrep_core::{builder, query, trigram};
 
 /// Build a test index on disk from a set of file contents.
 /// Returns the temp directory path (caller owns cleanup).
-fn build_test_index(
-    root: &Path,
-    files: &[(&str, &[u8])],
-) -> tempfile::TempDir {
+fn build_test_index(root: &Path, files: &[(&str, &[u8])]) -> tempfile::TempDir {
     let tmp = tempfile::TempDir::new().unwrap();
     let index_dir = tmp.path();
 
@@ -54,8 +51,14 @@ fn all_query_ids_resolve_via_snapshot() {
     let root = tempfile::TempDir::new().unwrap();
     let files: Vec<(&str, &[u8])> = vec![
         ("src/main.rs", b"fn main() { println!(\"hello\"); }"),
-        ("src/lib.rs", b"pub fn hello() -> &'static str { \"hello\" }"),
-        ("src/util.rs", b"pub fn format_hello(name: &str) -> String { format!(\"hello {}\", name) }"),
+        (
+            "src/lib.rs",
+            b"pub fn hello() -> &'static str { \"hello\" }",
+        ),
+        (
+            "src/util.rs",
+            b"pub fn format_hello(name: &str) -> String { format!(\"hello {}\", name) }",
+        ),
     ];
 
     // Create the actual files on disk (for root)
@@ -174,9 +177,7 @@ fn snapshot_survives_reader_swap() {
 #[test]
 fn new_query_after_swap_resolves_correctly() {
     let root = tempfile::TempDir::new().unwrap();
-    let files_v1: Vec<(&str, &[u8])> = vec![
-        ("a.rs", b"fn search_target() {}"),
-    ];
+    let files_v1: Vec<(&str, &[u8])> = vec![("a.rs", b"fn search_target() {}")];
     for (path, content) in &files_v1 {
         let full = root.path().join(path);
         std::fs::create_dir_all(full.parent().unwrap()).unwrap();
@@ -216,10 +217,7 @@ fn new_query_after_swap_resolves_correctly() {
 #[test]
 fn match_all_uses_consistent_snapshot() {
     let root = tempfile::TempDir::new().unwrap();
-    let files: Vec<(&str, &[u8])> = vec![
-        ("a.txt", b"hello world"),
-        ("b.txt", b"goodbye world"),
-    ];
+    let files: Vec<(&str, &[u8])> = vec![("a.txt", b"hello world"), ("b.txt", b"goodbye world")];
     for (path, content) in &files {
         let full = root.path().join(path);
         std::fs::write(&full, content).unwrap();
@@ -261,7 +259,10 @@ fn concurrent_swap_during_query() {
         files_v1.push((path, content.into_bytes()));
     }
 
-    let files_refs: Vec<(&str, &[u8])> = files_v1.iter().map(|(p, c)| (p.as_str(), c.as_slice())).collect();
+    let files_refs: Vec<(&str, &[u8])> = files_v1
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_slice()))
+        .collect();
     let index_v1 = build_test_index(root.path(), &files_refs);
     let hybrid = Arc::new(HybridIndex::open(index_v1.path(), root.path()).unwrap());
 
@@ -274,7 +275,10 @@ fn concurrent_swap_during_query() {
         std::fs::write(&full, content.as_bytes()).unwrap();
         files_v2.push((path, content.into_bytes()));
     }
-    let files_refs_v2: Vec<(&str, &[u8])> = files_v2.iter().map(|(p, c)| (p.as_str(), c.as_slice())).collect();
+    let files_refs_v2: Vec<(&str, &[u8])> = files_v2
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_slice()))
+        .collect();
     let index_v2 = build_test_index(root.path(), &files_refs_v2);
 
     let barrier = Arc::new(Barrier::new(2));

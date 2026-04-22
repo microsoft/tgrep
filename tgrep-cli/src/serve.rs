@@ -472,9 +472,7 @@ fn handle_search(
                     type_filtered_count += 1;
                     return None;
                 }
-                if !glob_filters.is_empty()
-                    && !glob_filter_matches(&glob_filters, &rel_path)
-                {
+                if !glob_filters.is_empty() && !glob_filter_matches(&glob_filters, &rel_path) {
                     glob_filtered_count += 1;
                     if first_glob_rejected.is_none() {
                         first_glob_rejected = Some(rel_path);

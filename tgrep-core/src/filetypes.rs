@@ -1,9 +1,12 @@
 /// File type definitions for `--type` / `-t` filtering (ripgrep-compatible).
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Built-in file type definitions mapping type names to glob patterns.
-pub fn builtin_types() -> HashMap<&'static str, &'static [&'static str]> {
-    let mut m = HashMap::new();
+/// Initialized once and cached for the lifetime of the process.
+static BUILTIN_TYPES: LazyLock<HashMap<&'static str, &'static [&'static str]>> =
+    LazyLock::new(|| {
+        let mut m = HashMap::new();
     m.insert("asm", &["*.asm", "*.s", "*.S"][..]);
     m.insert("avro", &["*.avdl", "*.avpr", "*.avsc"]);
     m.insert("bazel", &["*.bzl", "*.bazel", "BUILD", "WORKSPACE"]);
@@ -95,7 +98,12 @@ pub fn builtin_types() -> HashMap<&'static str, &'static [&'static str]> {
     m.insert("xml", &["*.xml", "*.xsl", "*.xslt", "*.xsd", "*.svg"]);
     m.insert("yaml", &["*.yml", "*.yaml"]);
     m.insert("zig", &["*.zig"]);
-    m
+        m
+    });
+
+/// Return the cached built-in file type definitions.
+pub fn builtin_types() -> &'static HashMap<&'static str, &'static [&'static str]> {
+    &BUILTIN_TYPES
 }
 
 /// Check if a file path matches any of the glob patterns for a type.

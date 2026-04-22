@@ -502,23 +502,69 @@ fn handle_search(
     }; // index lock released here
     let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
 
-    // Resolve file contents from cache (LRU) or disk
+    // Resolve file contents from cache (LRU) or disk.
+    // Two-phase approach: read-lock for cache hits, then disk I/O outside the
+    // lock, then a single write-lock to promote hits and insert misses.
     let t_resolve = Instant::now();
-    let candidate_contents: Vec<(String, Arc<String>)> = candidate_info
-        .iter()
-        .filter_map(|(rel_path, full_path)| {
+    let candidate_contents: Vec<(String, Arc<String>)> = {
+        // Phase 1: read-lock to find cache hits (peek avoids write-lock need)
+        let mut hit_keys: Vec<String> = Vec::new();
+        let mut hits: Vec<(String, Arc<String>)> = Vec::with_capacity(candidate_info.len());
+        let mut misses: Vec<(String, PathBuf)> = Vec::new();
+        {
+            let cache = state.cache.read().unwrap();
+            for (rel_path, full_path) in &candidate_info {
+                if let Some(cached) = cache.peek(rel_path) {
+                    hit_keys.push(rel_path.clone());
+                    hits.push((rel_path.clone(), Arc::clone(cached)));
+                } else {
+                    misses.push((rel_path.clone(), full_path.clone()));
+                }
+            }
+        } // read lock released
+
+        // Phase 2: read cache misses from disk (no lock held)
+        let disk_results: Vec<(String, Arc<String>)> = misses
+            .into_iter()
+            .filter_map(|(rel_path, full_path)| {
+                let content = std::fs::read_to_string(&full_path).ok()?;
+                Some((rel_path, Arc::new(content)))
+            })
+            .collect();
+
+        // Phase 3: single write-lock to promote hits and insert misses
+        if !hit_keys.is_empty() || !disk_results.is_empty() {
             let mut cache = state.cache.write().unwrap();
-            let content = if let Some(cached) = cache.get(rel_path) {
-                Arc::clone(cached)
-            } else {
-                let c = std::fs::read_to_string(full_path).ok()?;
-                let arc = Arc::new(c);
-                cache.put(rel_path.clone(), Arc::clone(&arc));
-                arc
-            };
-            Some((rel_path.clone(), content))
-        })
-        .collect();
+            // Promote hit entries so LRU recency stays accurate
+            for key in &hit_keys {
+                cache.get(key);
+            }
+            // Insert disk results, re-checking for races with other threads
+            for (rel_path, content) in &disk_results {
+                if cache.peek(rel_path).is_none() {
+                    cache.put(rel_path.clone(), Arc::clone(content));
+                }
+            }
+        }
+
+        // Combine hits and disk results, preserving candidate order
+        let mut result_map: std::collections::HashMap<&str, Arc<String>> =
+            std::collections::HashMap::with_capacity(hits.len() + disk_results.len());
+        for (rel_path, content) in &hits {
+            result_map.insert(rel_path, Arc::clone(content));
+        }
+        for (rel_path, content) in &disk_results {
+            result_map.insert(rel_path, Arc::clone(content));
+        }
+        candidate_info
+            .iter()
+            .filter_map(|(rel_path, _)| {
+                result_map
+                    .remove(rel_path.as_str())
+                    .map(|c| (rel_path.clone(), c))
+            })
+            .collect()
+    };
     let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
 
     let has_context = before_context > 0 || after_context > 0;

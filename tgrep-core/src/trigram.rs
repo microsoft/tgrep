@@ -3,7 +3,7 @@
 /// A trigram is every overlapping 3-byte window in a byte sequence.
 /// We pack 3 bytes into a `u32`: `(a << 16) | (b << 8) | c`.
 /// This gives us up to ~16.7M unique trigrams with zero collisions.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub type TrigramHash = u32;
 
@@ -48,12 +48,11 @@ pub fn extract(data: &[u8]) -> Vec<TrigramHash> {
     if data.len() < 3 {
         return Vec::new();
     }
-    let mut seen = vec![false; 1 << 24]; // 16MB bitmap — faster than HashSet
+    let mut seen = HashSet::new();
     let mut result = Vec::new();
     for window in data.windows(3) {
         let h = hash(window[0], window[1], window[2]);
-        if !seen[h as usize] {
-            seen[h as usize] = true;
+        if seen.insert(h) {
             result.push(h);
         }
     }

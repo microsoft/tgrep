@@ -29,6 +29,21 @@ pub struct HybridIndex {
 impl HybridIndex {
     pub fn open(index_dir: &Path, root: &Path) -> Result<Self> {
         let reader = IndexReader::open(index_dir)?;
+        // Reject structurally inconsistent readers (mmap sections present but
+        // counters say zero entries). This catches stale-metadata corruption
+        // on Windows without rejecting valid indexes where all files are too
+        // short to produce trigrams.
+        if reader.is_degenerate() {
+            return Err(crate::Error::IndexCorrupted(
+                "degenerate reader: mmap sections non-empty but num_entries is 0".to_string(),
+            ));
+        }
+        // Validate and warm up the lookup mmap so the first searches after
+        // startup don't hit cold pages (which caused zero-candidate results
+        // on Windows).
+        if let Err(msg) = reader.validate_lookup() {
+            return Err(crate::Error::IndexCorrupted(msg));
+        }
         Ok(Self {
             reader: RwLock::new(Arc::new(reader)),
             live: LiveIndex::new(),
@@ -154,15 +169,109 @@ impl HybridIndex {
         if plan.is_match_all() {
             return self.all_file_ids();
         }
-        query::execute_plan(plan, &|tri| self.lookup_trigram(tri))
+        // Snapshot reader once to ensure all trigram lookups use the same
+        // reader version — prevents race conditions during concurrent flushes.
+        let reader = self.reader();
+        query::execute_plan(plan, &|tri| self.lookup_trigram_using_reader(tri, &reader))
     }
 
     /// Execute a query plan with mask-aware filtering.
-    pub fn execute_query_with_masks(&self, plan: &QueryPlan, pattern: &str) -> Vec<u32> {
-        if plan.is_match_all() {
-            return self.all_file_ids();
+    ///
+    /// Returns the matching file IDs **and** the `Arc<IndexReader>` snapshot
+    /// used for the lookups.  Callers that need to resolve file paths from
+    /// the returned IDs **must** use [`resolve_path`] / [`resolve_full_path`]
+    /// with the same snapshot — calling [`file_path`] instead introduces a
+    /// race: a concurrent `swap_reader` between the query and the path
+    /// resolution would resolve IDs against a different reader, silently
+    /// dropping every candidate whose ID does not exist in the new reader.
+    pub fn execute_query_with_masks(&self, plan: &QueryPlan) -> (Vec<u32>, Arc<IndexReader>) {
+        let reader = self.reader();
+        let ids = if plan.is_match_all() {
+            self.all_file_ids_using(&reader)
+        } else {
+            query::execute_plan_with_masks(plan, &|tri| {
+                self.lookup_trigram_with_masks_using_reader(tri, &reader)
+            })
+        };
+        (ids, reader)
+    }
+
+    /// Like [`all_file_ids`] but uses a caller-provided reader snapshot.
+    fn all_file_ids_using(&self, reader: &Arc<IndexReader>) -> Vec<u32> {
+        let mut ids: Vec<u32> = reader
+            .all_file_ids()
+            .into_iter()
+            .filter(|&fid| {
+                if let Some(path) = reader.file_path(fid) {
+                    !self.live.is_deleted(path) && !self.live_has_path(path)
+                } else {
+                    false
+                }
+            })
+            .collect();
+        ids.extend(self.live.all_file_ids());
+        ids
+    }
+
+    /// Resolve a file ID to a relative path using a specific reader snapshot.
+    ///
+    /// Handles both reader IDs (looked up in the provided snapshot) and
+    /// overlay IDs (looked up in the live index).  Pair with the snapshot
+    /// returned by [`execute_query_with_masks`] to guarantee consistency.
+    pub fn resolve_path(&self, file_id: u32, reader: &IndexReader) -> Option<String> {
+        if live::LiveIndex::is_overlay_id(file_id) {
+            self.live.file_path(file_id).map(|s| s.to_string())
+        } else {
+            reader.file_path(file_id).map(|s| s.to_string())
         }
-        query::execute_plan_with_masks(plan, pattern, &|tri| self.lookup_trigram_with_masks(tri))
+    }
+
+    /// Resolve a file ID to an absolute path using a specific reader snapshot.
+    pub fn resolve_full_path(&self, file_id: u32, reader: &IndexReader) -> Option<PathBuf> {
+        self.resolve_path(file_id, reader).map(|rel| {
+            self.root
+                .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
+        })
+    }
+
+    /// Look up candidate file IDs for a trigram using a specific reader snapshot.
+    /// Ensures all trigrams in a query are evaluated against the same reader version.
+    fn lookup_trigram_using_reader(&self, trigram: u32, reader: &Arc<IndexReader>) -> Vec<u32> {
+        let mut reader_ids = reader.lookup_trigram(trigram);
+        let live_ids = self.live.lookup_trigram(trigram);
+
+        reader_ids.retain(|&fid| {
+            if let Some(path) = reader.file_path(fid) {
+                !self.live.is_deleted(path) && !self.live_has_path(path)
+            } else {
+                false
+            }
+        });
+
+        reader_ids.extend(live_ids);
+        reader_ids
+    }
+
+    /// Look up candidate posting entries with masks using a specific reader snapshot.
+    /// Ensures all trigrams in a query are evaluated against the same reader version.
+    fn lookup_trigram_with_masks_using_reader(
+        &self,
+        trigram: u32,
+        reader: &Arc<IndexReader>,
+    ) -> Vec<PostingEntry> {
+        let mut reader_entries = reader.lookup_trigram_with_masks(trigram);
+        let live_entries = self.live.lookup_trigram_with_masks(trigram);
+
+        reader_entries.retain(|e| {
+            if let Some(path) = reader.file_path(e.file_id) {
+                !self.live.is_deleted(path) && !self.live_has_path(path)
+            } else {
+                false
+            }
+        });
+
+        reader_entries.extend(live_entries);
+        reader_entries
     }
 
     /// Total number of files across both layers.
@@ -242,7 +351,14 @@ impl HybridIndex {
 
     /// Produce a full snapshot merging reader + overlay for disk serialization.
     /// Reader files not superseded by overlay are included with remapped IDs.
-    pub fn full_snapshot(&self) -> (Vec<String>, std::collections::HashMap<u32, Vec<u32>>) {
+    /// Preserves loc_mask and next_mask from both the on-disk reader and the
+    /// live overlay so that Bloom-filter optimizations survive flush cycles.
+    pub fn full_snapshot(
+        &self,
+    ) -> (
+        Vec<String>,
+        std::collections::HashMap<u32, Vec<PostingEntry>>,
+    ) {
         use std::collections::HashMap;
 
         let reader = self.reader();
@@ -271,40 +387,56 @@ impl HybridIndex {
             paths.push(op.to_string());
         }
 
-        // Phase 2: Build merged inverted index
-        let mut inverted: HashMap<u32, Vec<u32>> = HashMap::new();
+        // Phase 2: Build merged inverted index with masks
+        let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
 
-        // Reader trigram postings (remapped, excluding superseded files)
-        for (trigram, posting) in reader.all_trigram_postings() {
-            let remapped: Vec<u32> = posting
+        // Reader trigram postings with masks (remapped, excluding superseded files)
+        for (trigram, posting) in reader.all_trigram_postings_with_masks() {
+            let remapped: Vec<PostingEntry> = posting
                 .into_iter()
-                .filter_map(|old_id| reader_id_map.get(&old_id).copied())
+                .filter_map(|entry| {
+                    reader_id_map
+                        .get(&entry.file_id)
+                        .map(|&new_id| PostingEntry {
+                            file_id: new_id,
+                            loc_mask: entry.loc_mask,
+                            next_mask: entry.next_mask,
+                        })
+                })
                 .collect();
             if !remapped.is_empty() {
                 inverted.entry(trigram).or_default().extend(remapped);
             }
         }
 
-        // Overlay trigram postings (remapped)
+        // Overlay trigram postings with masks (remapped)
+        // Trigram keys in the live inverted index never have OVERLAY_BIT set
+        // (OVERLAY_BIT is only used in file IDs), so they can be used directly.
         let overlay_inverted = self.live.inverted_index();
         for (&trigram, file_ids) in overlay_inverted {
-            let tri_clean = trigram & !crate::live::OVERLAY_BIT;
-            let remapped: Vec<u32> = file_ids
+            let remapped: Vec<PostingEntry> = file_ids
                 .iter()
                 .filter_map(|&fid| {
-                    self.live
-                        .file_path(fid)
-                        .and_then(|p| overlay_path_to_new_id.get(p).copied())
+                    self.live.file_path(fid).and_then(|p| {
+                        overlay_path_to_new_id.get(p).map(|&new_id| {
+                            let m = self.live.get_masks(trigram, fid);
+                            PostingEntry {
+                                file_id: new_id,
+                                loc_mask: m.loc_mask,
+                                next_mask: m.next_mask,
+                            }
+                        })
+                    })
                 })
                 .collect();
             if !remapped.is_empty() {
-                inverted.entry(tri_clean).or_default().extend(remapped);
+                inverted.entry(trigram).or_default().extend(remapped);
             }
         }
 
-        // Sort all posting lists
+        // Sort all posting lists by file_id
         for posting in inverted.values_mut() {
-            posting.sort_unstable();
+            posting.sort_by_key(|e| e.file_id);
         }
 
         (paths, inverted)

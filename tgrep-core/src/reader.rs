@@ -27,12 +27,31 @@ impl IndexReader {
             return Err(crate::Error::IndexNotFound(index_dir.display().to_string()));
         }
 
-        let lookup_meta = std::fs::metadata(&lookup_path)?;
-        let postings_meta = std::fs::metadata(&postings_path)?;
+        // Open files and seek to get their true length, then mmap with that
+        // explicit length.
+        //
+        // On Windows, `File::metadata().len()` (fstat) can transiently return
+        // zero for a file that was just renamed into place by
+        // `move_staged_files`, because NTFS metadata updates are not always
+        // immediately visible — even from the same file handle. Since memmap2
+        // internally queries `File::metadata().len()` to determine the mapping
+        // size, we bypass it by seeking to the end of the file to get the true
+        // length, then passing it explicitly via `MmapOptions::len()`.
+        //
+        // `SetFilePointerEx` (which backs `file.seek(SeekFrom::End(0))`) reads
+        // the file object's size directly from the kernel, which is always
+        // up-to-date even when the NTFS directory-entry metadata cache has not
+        // yet been invalidated.
+        use memmap2::MmapOptions;
+        use std::io::{Seek, SeekFrom};
 
-        // Handle empty index (no files indexed yet) — mmap requires non-zero length
-        let (lookup, postings, num_entries) = if lookup_meta.len() == 0 || postings_meta.len() == 0
-        {
+        let mut lookup_file = File::open(&lookup_path)?;
+        let mut postings_file = File::open(&postings_path)?;
+
+        let lookup_len_u64 = lookup_file.seek(SeekFrom::End(0))?;
+        let postings_len_u64 = postings_file.seek(SeekFrom::End(0))?;
+
+        let (lookup, postings, num_entries) = if lookup_len_u64 == 0 || postings_len_u64 == 0 {
             (None, None, 0)
         } else {
             // A corrupted lookup.bin whose size is not a multiple of the fixed
@@ -40,23 +59,31 @@ impl IndexReader {
             // (and binary search would still see it via integer division).
             // Reject up-front so the failure is loud and obvious.
             //
-            // Do the modulo in u64 (file sizes are u64) so a >4GiB file on
-            // 32-bit targets isn't truncated by an `as usize` cast before
-            // the validation runs.
-            if lookup_meta.len() % (LOOKUP_ENTRY_SIZE as u64) != 0 {
+            // Validate in u64 before narrowing to usize so that oversized files
+            // on 32-bit targets are caught before any truncation.
+            if !lookup_len_u64.is_multiple_of(LOOKUP_ENTRY_SIZE as u64) {
                 return Err(crate::Error::IndexCorrupted(format!(
                     "lookup.bin size {} is not a multiple of {}",
-                    lookup_meta.len(),
-                    LOOKUP_ENTRY_SIZE
+                    lookup_len_u64, LOOKUP_ENTRY_SIZE
                 )));
             }
-            let lookup_file = File::open(&lookup_path)?;
-            let postings_file = File::open(&postings_path)?;
-            // SAFETY: Files are opened read-only and the Mmap lifetime is tied to
-            // IndexReader. The close() method drops the mappings before any file
-            // overwrites (required on Windows).
-            let lk = unsafe { Mmap::map(&lookup_file)? };
-            let pk = unsafe { Mmap::map(&postings_file)? };
+            let lookup_len = usize::try_from(lookup_len_u64).map_err(|_| {
+                crate::Error::IndexCorrupted(format!(
+                    "lookup.bin size {} does not fit in usize on this platform",
+                    lookup_len_u64
+                ))
+            })?;
+            let postings_len = usize::try_from(postings_len_u64).map_err(|_| {
+                crate::Error::IndexCorrupted(format!(
+                    "index.bin size {} does not fit in usize on this platform",
+                    postings_len_u64
+                ))
+            })?;
+            // SAFETY: Files are opened read-only and the Mmap lifetime is tied
+            // to IndexReader. The close() method drops the mappings before any
+            // file overwrites (required on Windows).
+            let lk = unsafe { MmapOptions::new().len(lookup_len).map(&lookup_file)? };
+            let pk = unsafe { MmapOptions::new().len(postings_len).map(&postings_file)? };
             let n = lk.len() / LOOKUP_ENTRY_SIZE;
             (Some(lk), Some(pk), n)
         };
@@ -162,6 +189,78 @@ impl IndexReader {
         self.num_entries
     }
 
+    /// Returns `true` when the reader state is structurally inconsistent.
+    ///
+    /// A well-formed index may legitimately contain files that produce no
+    /// trigrams (for example, files shorter than 3 bytes), so
+    /// `num_files() > 0 && num_trigrams() == 0` is not inherently
+    /// degenerate. The zero-trigram case is only suspicious when one of the
+    /// mmap-backed binary sections is nevertheless present and non-empty,
+    /// indicating that the in-memory counters and on-disk metadata disagree
+    /// (observed on Windows NTFS after rapid file renames when stale
+    /// metadata causes a zero-length mmap despite non-empty files on disk).
+    ///
+    /// Note: because `open()` derives `num_entries` directly from the
+    /// lookup mmap length, this condition cannot occur through normal
+    /// construction — it represents a post-construction inconsistency
+    /// (e.g. partial `close()` or direct field mutation). Call sites in
+    /// `serve.rs` that need to detect the "files present, trigrams missing"
+    /// Windows stale-metadata heuristic should compare `num_files()` vs
+    /// `num_trigrams()` independently rather than relying solely on this
+    /// method.
+    pub fn is_degenerate(&self) -> bool {
+        self.num_entries == 0
+            && (self.lookup.as_ref().is_some_and(|m| !m.is_empty())
+                || self.postings.as_ref().is_some_and(|m| !m.is_empty()))
+    }
+
+    /// Validate that the lookup table is sorted by trigram hash and that
+    /// posting-list ranges stay within `index.bin` bounds.
+    ///
+    /// Returns `Ok(())` when the table is well-formed. As a side-effect, this
+    /// sequentially reads every lookup entry, warming the mmap pages into the
+    /// OS page cache so that subsequent binary searches never hit cold pages.
+    pub fn validate_lookup(&self) -> std::result::Result<(), String> {
+        let lookup = match self.lookup.as_ref() {
+            Some(l) => l,
+            None => return Ok(()), // empty index, nothing to validate
+        };
+        let postings_len = self.postings.as_ref().map_or(0, |p| p.len());
+        let mut prev_trigram: Option<u32> = None;
+        for i in 0..self.num_entries {
+            let entry = self.read_lookup_entry(i);
+            if let Some(prev) = prev_trigram
+                && entry.trigram <= prev
+            {
+                return Err(format!(
+                    "lookup.bin not sorted at entry {i}: trigram {:#x} <= prev {:#x}",
+                    entry.trigram, prev
+                ));
+            }
+            // Perform range math in u64 to avoid truncation on 32-bit targets
+            // or corrupted indexes with large offsets.
+            let postings_len_u64 = postings_len as u64;
+            let byte_len = (entry.length as u64).checked_mul(POSTING_ENTRY_SIZE as u64);
+            let end = byte_len.and_then(|bl| entry.offset.checked_add(bl));
+            match end {
+                Some(e) if e <= postings_len_u64 => {}
+                _ => {
+                    return Err(format!(
+                        "lookup entry {i} (trigram {:#x}): posting range \
+                         [offset={}, length={}] exceeds index.bin length {postings_len}",
+                        entry.trigram, entry.offset, entry.length
+                    ));
+                }
+            }
+            prev_trigram = Some(entry.trigram);
+        }
+        // Touch last byte of lookup to ensure the final page is paged in.
+        if !lookup.is_empty() {
+            std::hint::black_box(lookup[lookup.len() - 1]);
+        }
+        Ok(())
+    }
+
     /// Get all file IDs present in this reader.
     pub fn all_file_ids(&self) -> Vec<u32> {
         (0..self.file_paths.len() as u32).collect()
@@ -181,6 +280,18 @@ impl IndexReader {
             let postings = self.read_posting_entries(entry.offset, entry.length);
             let file_ids: Vec<u32> = postings.into_iter().map(|e| e.file_id).collect();
             result.push((entry.trigram, file_ids));
+        }
+        result
+    }
+
+    /// Iterate all trigram entries with full posting data (including masks).
+    /// Returns (trigram_hash, Vec<PostingEntry>) preserving loc_mask/next_mask.
+    pub fn all_trigram_postings_with_masks(&self) -> Vec<(u32, Vec<PostingEntry>)> {
+        let mut result = Vec::with_capacity(self.num_entries);
+        for i in 0..self.num_entries {
+            let entry = self.read_lookup_entry(i);
+            let postings = self.read_posting_entries(entry.offset, entry.length);
+            result.push((entry.trigram, postings));
         }
         result
     }
@@ -321,5 +432,138 @@ mod tests {
         assert_eq!(reader.file_paths[0], "a.rs");
         assert_eq!(reader.file_paths[1], "b.rs");
         assert_eq!(reader.file_paths[2], "c.rs");
+    }
+
+    #[test]
+    fn is_degenerate_detects_mmap_counter_disagreement() {
+        let tmp = TempDir::new().unwrap();
+        let (lookup, postings) = make_sorted_index(&[0x616263]);
+        let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+
+        // Files present but empty lookup/postings is valid (files <3 bytes)
+        write_index(tmp.path(), &[], &[], &files);
+        let reader = IndexReader::open(tmp.path()).expect("should open");
+        assert!(
+            !reader.is_degenerate(),
+            "files with empty sections is valid, not degenerate"
+        );
+
+        // Non-empty sections with matching entries IS also not degenerate
+        let tmp2 = TempDir::new().unwrap();
+        write_index(tmp2.path(), &lookup, &postings, &files);
+        let reader2 = IndexReader::open(tmp2.path()).expect("should open");
+        assert!(
+            !reader2.is_degenerate(),
+            "well-formed index is not degenerate"
+        );
+
+        // Fabricate the inconsistent internal state: mmap-backed
+        // lookup/postings are present, but num_entries is forced to 0.
+        // This simulates a post-construction inconsistency.
+        let tmp3 = TempDir::new().unwrap();
+        write_index(tmp3.path(), &lookup, &postings, &files);
+        let opened = IndexReader::open(tmp3.path()).expect("should open");
+        assert!(
+            opened.lookup.as_ref().map_or(0, |m| m.len()) >= LOOKUP_ENTRY_SIZE,
+            "fixture should have a non-empty lookup mmap"
+        );
+        let degenerate_reader = IndexReader {
+            lookup: opened.lookup,
+            postings: opened.postings,
+            file_paths: opened.file_paths,
+            num_entries: 0,
+        };
+        assert!(
+            degenerate_reader.is_degenerate(),
+            "non-empty mmap with num_entries == 0 must be degenerate"
+        );
+    }
+
+    #[test]
+    fn is_degenerate_false_for_empty_index() {
+        let tmp = TempDir::new().unwrap();
+        write_index(tmp.path(), &[], &[], &[]);
+        let reader = IndexReader::open(tmp.path()).expect("should open");
+        assert!(!reader.is_degenerate(), "empty index is not degenerate");
+    }
+
+    /// Build a well-formed lookup + postings for testing validate_lookup.
+    fn make_sorted_index(trigrams: &[u32]) -> (Vec<u8>, Vec<u8>) {
+        let mut lookup_buf = Vec::new();
+        let mut postings_buf = Vec::new();
+        for &tri in trigrams {
+            let offset = postings_buf.len() as u64;
+            // One posting entry per trigram for simplicity
+            let pe = PostingEntry {
+                file_id: 0,
+                loc_mask: 0xFF,
+                next_mask: 0xFF,
+            };
+            postings_buf.extend_from_slice(&pe.encode());
+            let le = LookupEntry {
+                trigram: tri,
+                offset,
+                length: 1,
+            };
+            lookup_buf.extend_from_slice(&le.encode());
+        }
+        (lookup_buf, postings_buf)
+    }
+
+    #[test]
+    fn validate_lookup_accepts_sorted_table() {
+        let tmp = TempDir::new().unwrap();
+        let (lookup, postings) = make_sorted_index(&[100, 200, 300]);
+        let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        write_index(tmp.path(), &lookup, &postings, &files);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        assert!(reader.validate_lookup().is_ok());
+    }
+
+    #[test]
+    fn validate_lookup_rejects_unsorted_table() {
+        let tmp = TempDir::new().unwrap();
+        let (lookup, postings) = make_sorted_index(&[200, 100, 300]); // unsorted!
+        let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        write_index(tmp.path(), &lookup, &postings, &files);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        let err = reader.validate_lookup().unwrap_err();
+        assert!(
+            err.contains("not sorted"),
+            "expected sort error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_lookup_rejects_out_of_bounds_postings() {
+        let tmp = TempDir::new().unwrap();
+        // Create lookup that points past the end of postings
+        let le = LookupEntry {
+            trigram: 100,
+            offset: 0,
+            length: 999, // way past the single entry we provide
+        };
+        let mut lookup = Vec::new();
+        lookup.extend_from_slice(&le.encode());
+        let pe = PostingEntry {
+            file_id: 0,
+            loc_mask: 0xFF,
+            next_mask: 0xFF,
+        };
+        let mut postings = Vec::new();
+        postings.extend_from_slice(&pe.encode());
+        let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        write_index(tmp.path(), &lookup, &postings, &files);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        let err = reader.validate_lookup().unwrap_err();
+        assert!(err.contains("exceeds"), "expected bounds error, got: {err}");
+    }
+
+    #[test]
+    fn validate_lookup_empty_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        write_index(tmp.path(), &[], &[], &[]);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        assert!(reader.validate_lookup().is_ok());
     }
 }

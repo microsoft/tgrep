@@ -1,19 +1,31 @@
 use std::collections::HashMap;
-use tgrep_core::{builder, query, reader, trigram};
+use tgrep_core::{PostingEntry, builder, query, reader, trigram};
 
 #[test]
 fn case_insensitive_search_roundtrip() {
     let content = b"internal class AlertSchema : AlertBaseSchema";
 
-    // Extract trigrams (original + lowercase) just like builder/serve does
-    let mut file_tris = trigram::extract(content);
+    // Extract trigrams with masks (original + lowercase) just like builder/serve does
+    let mut tri_masks = trigram::extract_with_masks(content);
     let lower = content.to_ascii_lowercase();
-    file_tris.extend(trigram::extract(&lower));
+    if lower != *content {
+        tri_masks.extend(trigram::extract_with_masks(&lower));
+    }
 
-    // Build inverted index for file_id=0
-    let mut inverted: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &tri in &file_tris {
-        inverted.entry(tri).or_default().push(0);
+    // Build inverted index with masks for file_id=0
+    let mut per_tri: HashMap<u32, trigram::TrigramMasks> = HashMap::new();
+    for &(tri, m) in &tri_masks {
+        let entry = per_tri.entry(tri).or_default();
+        entry.loc_mask |= m.loc_mask;
+        entry.next_mask |= m.next_mask;
+    }
+    let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
+    for (tri, m) in per_tri {
+        inverted.entry(tri).or_default().push(PostingEntry {
+            file_id: 0,
+            loc_mask: m.loc_mask,
+            next_mask: m.next_mask,
+        });
     }
 
     // Write to temp directory

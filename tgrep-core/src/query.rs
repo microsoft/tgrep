@@ -8,11 +8,24 @@ use regex_syntax::hir::{Class, Hir, HirKind, Literal};
 use crate::ondisk::PostingEntry;
 use crate::trigram::{self, TrigramHash};
 
+/// A single trigram query with optional next-byte constraint.
+///
+/// `expected_next` is the byte that follows this trigram in the parsed
+/// literal, used for next_mask Bloom-filter checks. Computed at plan-build
+/// time from the HIR-extracted literal so it is always correct — even for
+/// regex patterns where the raw pattern string differs from the matched text.
+#[derive(Debug, Clone)]
+pub struct TrigramQuery {
+    pub hash: TrigramHash,
+    /// Expected next character for next_mask Bloom check.
+    pub expected_next: Option<u8>,
+}
+
 /// A node in the query plan tree.
 #[derive(Debug, Clone)]
 pub enum QueryPlan {
     /// All trigrams must match (intersection of posting lists).
-    And(Vec<TrigramHash>),
+    And(Vec<TrigramQuery>),
     /// Any branch can match (union of results).
     Or(Vec<QueryPlan>),
     /// No trigrams could be extracted — must scan all files.
@@ -39,12 +52,32 @@ pub fn build_literal_plan(literal: &str, case_insensitive: bool) -> QueryPlan {
     } else {
         literal.to_string()
     };
-    let trigrams = trigram::extract_from_literal(&text);
-    if trigrams.is_empty() {
-        QueryPlan::MatchAll
-    } else {
-        QueryPlan::And(trigrams)
+    literals_to_query_plan(text.as_bytes())
+}
+
+/// Convert a byte sequence into a QueryPlan of AND'd trigram queries.
+/// Each `TrigramQuery` carries the expected next byte (if any) so that
+/// next_mask Bloom-filter checks use the correct literal byte — not the
+/// raw regex pattern string.
+fn literals_to_query_plan(bytes: &[u8]) -> QueryPlan {
+    if bytes.len() < 3 {
+        return QueryPlan::MatchAll;
     }
+    let queries: Vec<TrigramQuery> = (0..bytes.len() - 2)
+        .map(|i| {
+            let hash = trigram::hash(bytes[i], bytes[i + 1], bytes[i + 2]);
+            let expected_next = if i + 3 < bytes.len() {
+                Some(bytes[i + 3])
+            } else {
+                None
+            };
+            TrigramQuery {
+                hash,
+                expected_next,
+            }
+        })
+        .collect();
+    QueryPlan::And(queries)
 }
 
 fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
@@ -55,17 +88,12 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
             } else {
                 String::from_utf8_lossy(bytes).into_owned()
             };
-            let trigrams = trigram::extract_from_literal(&text);
-            if trigrams.is_empty() {
-                QueryPlan::MatchAll
-            } else {
-                QueryPlan::And(trigrams)
-            }
+            literals_to_query_plan(text.as_bytes())
         }
         HirKind::Concat(subs) => {
             // Collect all literals from concat children into a single string,
             // then extract trigrams. Non-literal children break the chain.
-            let mut all_trigrams = Vec::new();
+            let mut all_queries = Vec::new();
             let mut current_literal = String::new();
 
             for sub in subs {
@@ -80,13 +108,15 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
                         } else {
                             current_literal.clone()
                         };
-                        all_trigrams.extend(trigram::extract_from_literal(&text));
+                        if let QueryPlan::And(queries) = literals_to_query_plan(text.as_bytes()) {
+                            all_queries.extend(queries);
+                        }
                         current_literal.clear();
                     }
                     // Recurse into the non-literal child
                     let sub_plan = decompose_hir(sub, case_insensitive);
-                    if let QueryPlan::And(tris) = sub_plan {
-                        all_trigrams.extend(tris);
+                    if let QueryPlan::And(queries) = sub_plan {
+                        all_queries.extend(queries);
                     }
                     // MatchAll or Or children don't contribute AND trigrams
                 }
@@ -99,13 +129,15 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
                 } else {
                     current_literal
                 };
-                all_trigrams.extend(trigram::extract_from_literal(&text));
+                if let QueryPlan::And(queries) = literals_to_query_plan(text.as_bytes()) {
+                    all_queries.extend(queries);
+                }
             }
 
-            if all_trigrams.is_empty() {
+            if all_queries.is_empty() {
                 QueryPlan::MatchAll
             } else {
-                QueryPlan::And(all_trigrams)
+                QueryPlan::And(all_queries)
             }
         }
         HirKind::Alternation(alts) => {
@@ -137,13 +169,28 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
 /// Simplify the query plan (dedup trigrams, flatten nested structures).
 fn simplify(plan: QueryPlan) -> QueryPlan {
     match plan {
-        QueryPlan::And(mut tris) => {
-            tris.sort_unstable();
-            tris.dedup();
-            if tris.is_empty() {
+        QueryPlan::And(mut queries) => {
+            queries.sort_by_key(|q| q.hash);
+            // Dedup by trigram hash. When the same trigram appears with
+            // different expected_next values (e.g. from separate literal
+            // segments in `mutex.*mutex_lock`), clear expected_next on the
+            // retained query to avoid false negatives — we can't reliably
+            // filter on the next byte if the trigram appears in multiple
+            // contexts.
+            queries.dedup_by(|retained, duplicate| {
+                if retained.hash == duplicate.hash {
+                    if retained.expected_next != duplicate.expected_next {
+                        retained.expected_next = None;
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+            if queries.is_empty() {
                 QueryPlan::MatchAll
             } else {
-                QueryPlan::And(tris)
+                QueryPlan::And(queries)
             }
         }
         QueryPlan::Or(plans) => {
@@ -164,11 +211,11 @@ where
     F: Fn(TrigramHash) -> Vec<u32>,
 {
     match plan {
-        QueryPlan::And(trigrams) => {
-            if trigrams.is_empty() {
+        QueryPlan::And(queries) => {
+            if queries.is_empty() {
                 return Vec::new();
             }
-            let mut lists: Vec<Vec<u32>> = trigrams.iter().map(|&t| lookup(t)).collect();
+            let mut lists: Vec<Vec<u32>> = queries.iter().map(|q| lookup(q.hash)).collect();
             lists.sort_by_key(|l| l.len());
 
             let mut result: Vec<u32> = lists.remove(0);
@@ -201,28 +248,27 @@ where
 
 /// Execute a query plan with mask-aware filtering.
 ///
-/// Uses loc_mask adjacency and next_mask checks to reduce false-positive
-/// candidates. The `pattern` is the original search literal used to extract
-/// the trigrams — needed for next_mask verification.
-pub fn execute_plan_with_masks<F>(plan: &QueryPlan, pattern: &str, lookup: &F) -> Vec<u32>
+/// Uses next_mask Bloom-filter checks to reduce false-positive candidates.
+/// The `expected_next` byte is embedded in each `TrigramQuery` at plan-build
+/// time from the HIR-parsed literal, so no raw pattern string is needed.
+pub fn execute_plan_with_masks<F>(plan: &QueryPlan, lookup: &F) -> Vec<u32>
 where
     F: Fn(TrigramHash) -> Vec<PostingEntry>,
 {
     match plan {
-        QueryPlan::And(trigrams) => {
-            if trigrams.is_empty() {
+        QueryPlan::And(queries) => {
+            if queries.is_empty() {
                 return Vec::new();
             }
 
-            let pattern_bytes = pattern.as_bytes();
-
             // Fetch full posting entries (with masks) for each trigram
-            let mut lists: Vec<(TrigramHash, Vec<PostingEntry>)> =
-                trigrams.iter().map(|&t| (t, lookup(t))).collect();
+            let mut lists: Vec<(&TrigramQuery, Vec<PostingEntry>)> =
+                queries.iter().map(|q| (q, lookup(q.hash))).collect();
+
             lists.sort_by_key(|(_, l)| l.len());
 
             // Start with smallest posting list
-            let (first_tri, first_list) = lists.remove(0);
+            let (first_query, first_list) = lists.remove(0);
             let mut candidates: Vec<(u32, u8, u8)> = first_list
                 .into_iter()
                 .map(|e| (e.file_id, e.loc_mask, e.next_mask))
@@ -231,13 +277,13 @@ where
             candidates.dedup_by_key(|e| e.0);
 
             // Apply next_mask check for the first trigram
-            if let Some(next_byte) = next_byte_after_trigram(first_tri, pattern_bytes) {
+            if let Some(next_byte) = first_query.expected_next {
                 let bit = trigram::bloom_hash(next_byte);
                 candidates.retain(|&(_, _, nm)| nm & bit != 0);
             }
 
             // Intersect with remaining posting lists
-            for (tri, mut list) in lists {
+            for (query, mut list) in lists {
                 list.sort_by_key(|e| e.file_id);
                 list.dedup_by_key(|e| e.file_id);
 
@@ -250,8 +296,8 @@ where
                     match fid_a.cmp(&fid_b) {
                         std::cmp::Ordering::Equal => {
                             let nm = list[j].next_mask;
-                            // Apply next_mask check for this trigram
-                            let pass = match next_byte_after_trigram(tri, pattern_bytes) {
+                            // Apply next_mask check using the literal-derived expected_next
+                            let pass = match query.expected_next {
                                 Some(nb) => nm & trigram::bloom_hash(nb) != 0,
                                 None => true,
                             };
@@ -276,7 +322,7 @@ where
         QueryPlan::Or(plans) => {
             let mut result = Vec::new();
             for sub in plans {
-                let mut sub_result = execute_plan_with_masks(sub, pattern, lookup);
+                let mut sub_result = execute_plan_with_masks(sub, lookup);
                 result.append(&mut sub_result);
             }
             result.sort_unstable();
@@ -285,20 +331,6 @@ where
         }
         QueryPlan::MatchAll => Vec::new(),
     }
-}
-
-/// Find the byte that follows a given trigram in the pattern string.
-fn next_byte_after_trigram(trigram: TrigramHash, pattern: &[u8]) -> Option<u8> {
-    if pattern.len() < 4 {
-        return None;
-    }
-    for window in pattern.windows(4) {
-        let h = trigram::hash(window[0], window[1], window[2]);
-        if h == trigram {
-            return Some(window[3]);
-        }
-    }
-    None
 }
 
 fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -368,12 +400,13 @@ mod tests {
         // from "class alertschema"
         let plan = build_literal_plan("class AlertSchema", true);
         match &plan {
-            QueryPlan::And(tris) => {
-                assert!(!tris.is_empty(), "should have trigrams");
+            QueryPlan::And(queries) => {
+                assert!(!queries.is_empty(), "should have trigrams");
                 // Verify these are lowercase trigrams
                 let expected = trigram::extract_from_literal("class alertschema");
+                let hashes: Vec<TrigramHash> = queries.iter().map(|q| q.hash).collect();
                 for tri in &expected {
-                    assert!(tris.contains(tri), "missing trigram {tri:#010x}");
+                    assert!(hashes.contains(tri), "missing trigram {tri:#010x}");
                 }
             }
             _ => panic!("expected And plan"),
@@ -385,11 +418,12 @@ mod tests {
         // Same test but via regex parser path
         let plan = build_query_plan("class AlertSchema", true).unwrap();
         match &plan {
-            QueryPlan::And(tris) => {
-                assert!(!tris.is_empty(), "should have trigrams");
+            QueryPlan::And(queries) => {
+                assert!(!queries.is_empty(), "should have trigrams");
                 let expected = trigram::extract_from_literal("class alertschema");
+                let hashes: Vec<TrigramHash> = queries.iter().map(|q| q.hash).collect();
                 for tri in &expected {
-                    assert!(tris.contains(tri), "missing trigram {tri:#010x}");
+                    assert!(hashes.contains(tri), "missing trigram {tri:#010x}");
                 }
             }
             _ => panic!("expected And plan, got {plan:?}"),
@@ -449,7 +483,7 @@ mod tests {
         }
 
         let plan = build_literal_plan("mutex_lock", false);
-        let candidates = execute_plan_with_masks(&plan, "mutex_lock", &|tri| {
+        let candidates = execute_plan_with_masks(&plan, &|tri| {
             inverted.get(&tri).cloned().unwrap_or_default()
         });
 
@@ -485,7 +519,7 @@ mod tests {
         // overlapping trigrams. The mask filtering should reduce or eliminate
         // this as a candidate.
         let plan = build_literal_plan("mutex_lock", false);
-        let candidates = execute_plan_with_masks(&plan, "mutex_lock", &|tri| {
+        let candidates = execute_plan_with_masks(&plan, &|tri| {
             inverted.get(&tri).cloned().unwrap_or_default()
         });
 

@@ -196,6 +196,18 @@ impl LiveIndex {
         self.file_paths.get(&file_id).map(|s| s.as_str())
     }
 
+    /// Get masks for a specific (trigram, file_id) pair. Returns the
+    /// no-filter sentinel when no masks are stored (e.g. bulk-insert path).
+    pub fn get_masks(&self, trigram: u32, file_id: u32) -> trigram::TrigramMasks {
+        self.masks
+            .get(&(trigram, file_id))
+            .copied()
+            .unwrap_or(trigram::TrigramMasks {
+                loc_mask: u8::MAX,
+                next_mask: u8::MAX,
+            })
+    }
+
     /// Check if a path has been deleted from the overlay.
     pub fn is_deleted(&self, path: &str) -> bool {
         self.deleted_paths.contains(path)
@@ -328,7 +340,7 @@ impl LiveIndex {
             }
             if !posting.is_empty() {
                 posting.sort_unstable();
-                remapped.insert(trigram & !OVERLAY_BIT, posting);
+                remapped.insert(trigram, posting);
             }
         }
 

@@ -439,35 +439,62 @@ fn handle_search(
 
     // Collect candidates and their paths/full_paths while holding the index lock briefly
     let t_index = Instant::now();
-    let candidate_info: Vec<(String, PathBuf)> = {
+    let (candidate_info, raw_candidate_count): (Vec<(String, PathBuf)>, usize) = {
         let index = state.index.read().unwrap();
 
-        // Use mask-aware filtering for literal patterns (fixed_string or simple literals)
-        let effective_pattern = if case_insensitive {
-            pattern.to_lowercase()
-        } else {
-            pattern.to_string()
-        };
-        let candidates = index.execute_query_with_masks(&plan, &effective_pattern);
+        // The reader snapshot is returned alongside the file IDs so that
+        // path resolution below uses the *same* reader that produced the
+        // posting-list results.  Without this, a concurrent `swap_reader`
+        // between the query and the path lookups would silently drop every
+        // candidate whose ID does not exist in the new reader.
+        let (candidates, reader_snapshot) = index.execute_query_with_masks(&plan);
+        let raw_count = candidates.len();
 
-        candidates
+        // Diagnostic counters for filter stages
+        let mut no_path_count: usize = 0;
+        let mut type_filtered_count: usize = 0;
+        let mut glob_filtered_count: usize = 0;
+        let mut first_glob_rejected: Option<String> = None;
+
+        let filtered: Vec<(String, PathBuf)> = candidates
             .iter()
             .filter_map(|&fid| {
-                let rel_path = index.file_path(fid)?.to_string();
+                let rel_path = match index.resolve_path(fid, &reader_snapshot) {
+                    Some(p) => p,
+                    None => {
+                        no_path_count += 1;
+                        return None;
+                    }
+                };
                 if let Some(ref type_name) = file_type
                     && !tgrep_core::filetypes::matches_type(&rel_path, type_name)
                 {
+                    type_filtered_count += 1;
                     return None;
                 }
-                if !glob_filters.is_empty()
-                    && !glob_filters.iter().any(|g| simple_glob_match(g, &rel_path))
-                {
+                if !glob_filters.is_empty() && !glob_filter_matches(&glob_filters, &rel_path) {
+                    glob_filtered_count += 1;
+                    if first_glob_rejected.is_none() {
+                        first_glob_rejected = Some(rel_path);
+                    }
                     return None;
                 }
-                let full_path = index.full_path(fid)?;
+                let full_path = index.resolve_full_path(fid, &reader_snapshot)?;
                 Some((rel_path, full_path))
             })
-            .collect()
+            .collect();
+
+        // Log filter breakdown when raw candidates are dropped to zero
+        if raw_count > 0 && filtered.is_empty() {
+            eprintln!(
+                "[trace] filter: raw={raw_count} no_path={no_path_count} \
+                 type_filtered={type_filtered_count} glob_filtered={glob_filtered_count} \
+                 file_type={file_type:?} glob_values={glob_filters:?} \
+                 sample_rejected={first_glob_rejected:?}",
+            );
+        }
+
+        (filtered, raw_count)
     }; // index lock released here
     let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
 
@@ -521,9 +548,10 @@ fn handle_search(
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 
     eprintln!(
-        "[trace] search: pattern={:?} case_insensitive={} candidates={} matches={} elapsed={:.1}ms (index={:.1}ms resolve={:.1}ms search={:.1}ms)",
+        "[trace] search: pattern={:?} case_insensitive={} raw_candidates={} candidates={} matches={} elapsed={:.1}ms (index={:.1}ms resolve={:.1}ms search={:.1}ms)",
         pattern,
         case_insensitive,
+        raw_candidate_count,
         candidate_info.len(),
         matches.len(),
         elapsed_ms,
@@ -999,7 +1027,18 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
             match tgrep_core::reader::IndexReader::open(index_dir) {
                 Ok(new_reader) => {
                     let reader_files = new_reader.num_files();
-                    if reader_files >= num_files {
+                    let reader_trigrams = new_reader.num_trigrams();
+
+                    if new_reader.is_degenerate() {
+                        eprintln!(
+                            "[trace] auto-save: degenerate reader ({reader_files} files, \
+                             0 trigrams), keeping live overlay"
+                        );
+                    } else if let Err(msg) = new_reader.validate_lookup() {
+                        eprintln!(
+                            "[trace] auto-save: validation failed: {msg}, keeping live overlay"
+                        );
+                    } else if reader_files >= num_files {
                         // Swap the reader without blocking concurrent searches.
                         state.index.read().unwrap().swap_reader(new_reader);
                         // Brief write lock for in-memory overlay prune + dirty reset.
@@ -1010,7 +1049,8 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
                         }
                         last_save = Instant::now();
                         eprintln!(
-                            "[trace] auto-save complete in {:.1}s ({reader_files} files on disk)",
+                            "[trace] auto-save complete in {:.1}s ({reader_files} files, \
+                             {reader_trigrams} trigrams on disk)",
                             save_start.elapsed().as_secs_f64(),
                         );
                     } else {
@@ -1028,7 +1068,40 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
     }
 }
 
+/// Check whether `path` passes the glob filter list.
+///
+/// Glob semantics:
+/// - Patterns starting with `!` are **exclusion** patterns (path must NOT match).
+/// - All other patterns are **inclusion** patterns (path must match at least one).
+/// - If only exclusion patterns are present, the path passes unless it matches
+///   an exclusion.
+/// - If inclusion patterns are present, the path must match at least one AND
+///   must not match any exclusion.
+fn glob_filter_matches(globs: &[String], path: &str) -> bool {
+    if globs.is_empty() {
+        return true;
+    }
+    let mut has_include = false;
+    let mut included = false;
+    for g in globs {
+        if let Some(neg) = g.strip_prefix('!') {
+            if simple_glob_match(neg, path) {
+                return false; // excluded
+            }
+        } else {
+            has_include = true;
+            if !included && simple_glob_match(g, path) {
+                included = true;
+            }
+        }
+    }
+    // If there were no inclusion patterns, the path passes (only exclusions existed)
+    !has_include || included
+}
+
 fn simple_glob_match(pattern: &str, path: &str) -> bool {
+    // Normalize backslashes so Windows-style globs match forward-slash index paths
+    let pattern = pattern.replace('\\', "/");
     let pattern = pattern.replace('.', r"\.");
     let pattern = pattern.replace("**", "§§");
     let pattern = pattern.replace('*', "[^/]*");
@@ -1502,33 +1575,102 @@ fn flush_index_to_disk(
     // these steps). The server-wide `state.index` RwLock is NOT taken, so
     // search queries continue to be served by the previous reader (whose
     // `Arc<IndexReader>` they hold) throughout this call.
-    let pruned = match tgrep_core::reader::IndexReader::open(index_dir) {
-        Ok(new_reader) => {
-            let reader_files = new_reader.num_files();
-            if reader_files >= num_files {
-                // Atomic swap — no outer write lock required.
-                state.index.read().unwrap().swap_reader(new_reader);
-                // Brief write lock for in-memory overlay maintenance only.
-                {
-                    let mut index = state.index.write().unwrap();
-                    index.prune_persisted_entries();
-                    index.live.reset_dirty_count();
+    //
+    // On Windows, NTFS metadata for a recently-renamed file can transiently
+    // appear stale (zero-length), causing IndexReader::open to create a
+    // degenerate reader with files but no trigrams. We retry a few times
+    // with a short backoff to ride out the transient.
+    let pruned = 'open: {
+        const READER_OPEN_RETRIES: u32 = 5;
+        const READER_OPEN_BACKOFF: Duration = Duration::from_millis(200);
+
+        for attempt in 0..READER_OPEN_RETRIES {
+            match tgrep_core::reader::IndexReader::open(index_dir) {
+                Ok(new_reader) => {
+                    let reader_files = new_reader.num_files();
+                    let reader_trigrams = new_reader.num_trigrams();
+
+                    if new_reader.is_degenerate() {
+                        eprintln!(
+                            "[trace] warning: reader has {reader_files} files but 0 trigrams \
+                             (attempt {}/{READER_OPEN_RETRIES}, likely stale NTFS metadata)",
+                            attempt + 1
+                        );
+                        if attempt + 1 < READER_OPEN_RETRIES {
+                            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
+                            continue;
+                        }
+                        eprintln!(
+                            "[trace] warning: degenerate reader persists after \
+                             {READER_OPEN_RETRIES} attempts, keeping live overlay as fallback"
+                        );
+                        break 'open false;
+                    }
+
+                    // Validate + warm the lookup mmap before swapping the
+                    // reader in. This catches corruption (unsorted lookup
+                    // table, out-of-bounds posting offsets) and, as a
+                    // side-effect, pages in every byte of lookup.bin so that
+                    // subsequent binary searches never hit cold mmap pages
+                    // — preventing the zero-candidate failure observed on
+                    // Windows after flush.
+                    if let Err(msg) = new_reader.validate_lookup() {
+                        eprintln!(
+                            "[trace] warning: reader validation failed \
+                             (attempt {}/{READER_OPEN_RETRIES}): {msg}",
+                            attempt + 1
+                        );
+                        if attempt + 1 < READER_OPEN_RETRIES {
+                            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
+                            continue;
+                        }
+                        eprintln!(
+                            "[trace] warning: reader validation failed after \
+                             {READER_OPEN_RETRIES} attempts, keeping live overlay"
+                        );
+                        break 'open false;
+                    }
+
+                    if reader_files >= num_files {
+                        // Atomic swap — no outer write lock required.
+                        state.index.read().unwrap().swap_reader(new_reader);
+                        // Brief write lock for in-memory overlay maintenance only.
+                        {
+                            let mut index = state.index.write().unwrap();
+                            index.prune_persisted_entries();
+                            index.live.reset_dirty_count();
+                        }
+                        eprintln!(
+                            "[trace] flush: reader reopened ({reader_files} files, \
+                             {reader_trigrams} trigrams), overlay pruned"
+                        );
+                        break 'open true;
+                    } else {
+                        eprintln!(
+                            "[trace] warning: reader has {reader_files} files \
+                             (expected {num_files}), keeping live overlay as fallback"
+                        );
+                        break 'open false;
+                    }
                 }
-                eprintln!("[trace] flush: reader reopened ({reader_files} files), overlay pruned");
-                true
-            } else {
-                eprintln!(
-                    "[trace] warning: reader has {reader_files} files (expected {num_files}), keeping live overlay as fallback"
-                );
-                false
+                Err(e) => {
+                    if attempt + 1 < READER_OPEN_RETRIES {
+                        eprintln!(
+                            "[trace] warning: reader open failed (attempt {}/{READER_OPEN_RETRIES}): {e}",
+                            attempt + 1
+                        );
+                        thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
+                        continue;
+                    }
+                    eprintln!(
+                        "[trace] warning: failed to reopen reader after flush: {e}, \
+                         live overlay retained"
+                    );
+                    break 'open false;
+                }
             }
         }
-        Err(e) => {
-            eprintln!(
-                "[trace] warning: failed to reopen reader after flush: {e}, live overlay retained"
-            );
-            false
-        }
+        false
     };
     let _ = std::fs::remove_dir_all(&staging_dir);
 
@@ -1841,6 +1983,57 @@ mod tests {
             &no_exclude,
             Some(&gi)
         ));
+    }
+
+    #[test]
+    fn simple_glob_match_unix_patterns() {
+        // Standard forward-slash globs against forward-slash index paths
+        assert!(simple_glob_match("**/*.cs", "src/foo/bar.cs"));
+        assert!(simple_glob_match("*.cs", "src/foo/bar.cs"));
+        assert!(simple_glob_match("*.cs", "bar.cs"));
+        assert!(!simple_glob_match("**/*.cs", "src/foo/bar.rs"));
+        assert!(simple_glob_match("src/**", "src/foo/bar.cs"));
+        assert!(!simple_glob_match("src/**", "lib/foo/bar.cs"));
+    }
+
+    #[test]
+    fn simple_glob_match_backslash_normalization() {
+        // Windows-style globs with backslashes must match forward-slash paths
+        assert!(simple_glob_match(r"**\*.cs", "src/foo/bar.cs"));
+        assert!(simple_glob_match(r"src\**\*.cs", "src/foo/bar.cs"));
+        assert!(simple_glob_match(r"src\**", "src/foo/bar.cs"));
+        assert!(!simple_glob_match(r"lib\**", "src/foo/bar.cs"));
+    }
+
+    #[test]
+    fn simple_glob_match_case_insensitive() {
+        assert!(simple_glob_match("**/*.CS", "src/foo/bar.cs"));
+        assert!(simple_glob_match("**/*.cs", "src/foo/BAR.CS"));
+    }
+
+    #[test]
+    fn glob_filter_negation_only() {
+        // Only exclusion patterns: path passes unless it matches an exclusion
+        let globs = vec!["!.git".to_string()];
+        assert!(glob_filter_matches(&globs, "src/foo/bar.cs"));
+        assert!(glob_filter_matches(&globs, "README.md"));
+        assert!(!glob_filter_matches(&globs, ".git"));
+        assert!(!glob_filter_matches(&globs, "foo/.git"));
+    }
+
+    #[test]
+    fn glob_filter_inclusion_and_exclusion() {
+        // Mix of include and exclude: must match an include AND not match any exclude
+        let globs = vec!["**/*.cs".to_string(), "!**/test/**".to_string()];
+        assert!(glob_filter_matches(&globs, "src/foo/bar.cs"));
+        assert!(!glob_filter_matches(&globs, "src/test/bar.cs"));
+        assert!(!glob_filter_matches(&globs, "src/foo/bar.rs")); // no include match
+    }
+
+    #[test]
+    fn glob_filter_empty_passes_all() {
+        let globs: Vec<String> = vec![];
+        assert!(glob_filter_matches(&globs, "anything"));
     }
 
     fn write_file(path: &Path, content: &[u8]) {

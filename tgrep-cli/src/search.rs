@@ -317,14 +317,7 @@ fn search_local_index(
     let candidates = if is_match_all || opts.files_without_match {
         reader.all_file_ids()
     } else {
-        let effective_pattern = if ci {
-            opts.pattern.to_lowercase()
-        } else {
-            opts.pattern.clone()
-        };
-        query::execute_plan_with_masks(&plan, &effective_pattern, &|tri| {
-            reader.lookup_trigram_with_masks(tri)
-        })
+        query::execute_plan_with_masks(&plan, &|tri| reader.lookup_trigram_with_masks(tri))
     };
 
     if opts.stats {
@@ -656,15 +649,33 @@ fn passes_filters(rel_path: &str, globs: &[String], file_type: &Option<String>) 
 }
 
 /// Check if a path passes all glob filters. If no globs are specified, all
-/// paths pass. When multiple globs are given, the path must match at least one.
+/// paths pass. Patterns prefixed with `!` act as exclusions — if the path
+/// matches any exclusion it is rejected. Otherwise, if inclusion patterns
+/// are present the path must match at least one.
 fn passes_glob_filters(globs: &[String], path: &str) -> bool {
     if globs.is_empty() {
         return true;
     }
-    globs.iter().any(|g| glob_matches(g, path))
+    let mut has_include = false;
+    let mut included = false;
+    for g in globs {
+        if let Some(neg) = g.strip_prefix('!') {
+            if glob_matches(neg, path) {
+                return false; // excluded
+            }
+        } else {
+            has_include = true;
+            if !included && glob_matches(g, path) {
+                included = true;
+            }
+        }
+    }
+    !has_include || included
 }
 
 fn glob_matches(pattern: &str, path: &str) -> bool {
+    // Normalize backslashes so Windows-style globs match forward-slash index paths
+    let pattern = pattern.replace('\\', "/");
     let pattern = pattern.replace('.', r"\.");
     let pattern = pattern.replace("**", "§§");
     let pattern = pattern.replace('*', "[^/]*");
@@ -676,7 +687,7 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 
 fn plan_summary(plan: &QueryPlan) -> String {
     match plan {
-        QueryPlan::And(tris) => format!("AND({} trigrams)", tris.len()),
+        QueryPlan::And(queries) => format!("AND({} trigrams)", queries.len()),
         QueryPlan::Or(plans) => {
             let subs: Vec<String> = plans.iter().map(plan_summary).collect();
             format!("OR({})", subs.join(", "))

@@ -1994,7 +1994,7 @@ mod tests {
     #[test]
     fn glob_filter_negation_only() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["!.git".to_string()]).unwrap();
+        let f = GlobFilter::new(&["!**/.git".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("README.md"));
         assert!(!f.matches(".git"));

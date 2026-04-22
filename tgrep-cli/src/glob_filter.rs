@@ -1,18 +1,18 @@
-/// Compiled glob filter with pre-compiled regex patterns.
+/// Compiled glob filter backed by the `globset` crate (same engine as ripgrep).
 ///
-/// Glob patterns are compiled to regex once at construction time and reused
-/// for all subsequent matches. Supports include/exclude semantics:
+/// Glob patterns are compiled once at construction time and reused for all
+/// subsequent matches. Supports include/exclude semantics:
 /// - Patterns prefixed with `!` act as exclusions
 /// - Other patterns act as inclusions
 /// - If only exclusions exist, paths pass unless they match an exclusion
 /// - If inclusions exist, a path must match at least one inclusion AND
 ///   must not match any exclusion
 use anyhow::Result;
-use regex::Regex;
+use globset::{GlobBuilder, GlobMatcher};
 
 pub struct GlobFilter {
-    includes: Vec<Regex>,
-    excludes: Vec<Regex>,
+    includes: Vec<GlobMatcher>,
+    excludes: Vec<GlobMatcher>,
 }
 
 impl GlobFilter {
@@ -39,42 +39,29 @@ impl GlobFilter {
 
     /// Check if a path passes this glob filter.
     pub fn matches(&self, path: &str) -> bool {
-        for re in &self.excludes {
-            if re.is_match(path) {
+        // Normalize backslashes for matching (index paths use forward slashes)
+        let path = path.replace('\\', "/");
+        for m in &self.excludes {
+            if m.is_match(&*path) {
                 return false;
             }
         }
         if self.includes.is_empty() {
             return true;
         }
-        self.includes.iter().any(|re| re.is_match(path))
+        self.includes.iter().any(|m| m.is_match(&*path))
     }
 }
 
-/// Compile a single glob pattern to a regex.
-///
-/// Escapes all regex metacharacters first, then expands glob tokens (`**`, `*`)
-/// into their regex equivalents so that only glob semantics are exposed.
-fn compile_glob(pattern: &str) -> Result<Regex> {
-    // Normalize backslashes so Windows-style globs match forward-slash index paths
+/// Compile a single glob pattern into a `GlobMatcher`.
+fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
+    // Normalize backslashes so Windows-style globs work uniformly
     let pattern = pattern.replace('\\', "/");
-
-    // Preserve glob tokens by replacing them with placeholders before escaping
-    let pattern = pattern.replace("**/", "\x01");
-    let pattern = pattern.replace("**", "\x02");
-    let pattern = pattern.replace('*', "\x03");
-
-    // Escape all regex metacharacters in the literal parts
-    let pattern = regex::escape(&pattern);
-
-    // Restore glob tokens as regex equivalents
-    let pattern = pattern.replace('\x01', "(.*/)?");
-    let pattern = pattern.replace('\x02', ".*");
-    let pattern = pattern.replace('\x03', "[^/]*");
-
-    // Anchor with (^|/) so bare patterns like ".git" match at any path level
-    Regex::new(&format!("(?i)(^|/){pattern}$"))
-        .map_err(|e| anyhow::anyhow!("invalid glob pattern: {e}"))
+    let glob = GlobBuilder::new(&pattern)
+        .case_insensitive(true)
+        .literal_separator(true)
+        .build()?;
+    Ok(glob.compile_matcher())
 }
 
 #[cfg(test)]
@@ -92,12 +79,13 @@ mod tests {
     fn include_patterns() {
         let f = GlobFilter::new(&["**/*.cs".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
+        assert!(f.matches("bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
     }
 
     #[test]
     fn exclude_patterns() {
-        let f = GlobFilter::new(&["!.git".to_string()]).unwrap();
+        let f = GlobFilter::new(&["!**/.git".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches(".git"));
         assert!(!f.matches("foo/.git"));
@@ -125,10 +113,34 @@ mod tests {
     }
 
     #[test]
-    fn regex_metacharacters_are_literal() {
-        // Parentheses, brackets, plus, etc. should be treated as literal chars
-        let f = GlobFilter::new(&["**/(test)+[0].cs".to_string()]).unwrap();
-        assert!(f.matches("src/(test)+[0].cs"));
-        assert!(!f.matches("src/testtest0.cs"));
+    fn special_characters_are_literal() {
+        // Characters like `+` and `(` should be treated as literal glob chars
+        let f = GlobFilter::new(&["**/(test)+.cs".to_string()]).unwrap();
+        assert!(f.matches("src/(test)+.cs"));
+        assert!(!f.matches("src/testtest.cs"));
+    }
+
+    #[test]
+    fn glob_character_class() {
+        let f = GlobFilter::new(&["**/*.[ch]".to_string()]).unwrap();
+        assert!(f.matches("src/main.c"));
+        assert!(f.matches("src/main.h"));
+        assert!(!f.matches("src/main.rs"));
+    }
+
+    #[test]
+    fn question_mark_wildcard() {
+        let f = GlobFilter::new(&["**/*.?s".to_string()]).unwrap();
+        assert!(f.matches("src/foo.cs"));
+        assert!(f.matches("src/foo.rs"));
+        assert!(f.matches("src/foo.ts"));
+        assert!(!f.matches("src/foo.css"));
+    }
+
+    #[test]
+    fn directory_prefix_pattern() {
+        let f = GlobFilter::new(&["src/**".to_string()]).unwrap();
+        assert!(f.matches("src/foo/bar.cs"));
+        assert!(!f.matches("lib/foo/bar.cs"));
     }
 }

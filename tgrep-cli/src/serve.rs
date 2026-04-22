@@ -504,16 +504,18 @@ fn handle_search(
 
     // Resolve file contents from cache (LRU) or disk.
     // Two-phase approach: read-lock for cache hits, then disk I/O outside the
-    // lock, then a single write-lock to insert misses.
+    // lock, then a single write-lock to promote hits and insert misses.
     let t_resolve = Instant::now();
     let candidate_contents: Vec<(String, Arc<String>)> = {
-        // Phase 1: read-lock to find cache hits
+        // Phase 1: read-lock to find cache hits (peek avoids write-lock need)
+        let mut hit_keys: Vec<String> = Vec::new();
         let mut hits: Vec<(String, Arc<String>)> = Vec::with_capacity(candidate_info.len());
         let mut misses: Vec<(String, PathBuf)> = Vec::new();
         {
             let cache = state.cache.read().unwrap();
             for (rel_path, full_path) in &candidate_info {
                 if let Some(cached) = cache.peek(rel_path) {
+                    hit_keys.push(rel_path.clone());
                     hits.push((rel_path.clone(), Arc::clone(cached)));
                 } else {
                     misses.push((rel_path.clone(), full_path.clone()));
@@ -530,11 +532,18 @@ fn handle_search(
             })
             .collect();
 
-        // Phase 3: single write-lock to insert all misses
-        if !disk_results.is_empty() {
+        // Phase 3: single write-lock to promote hits and insert misses
+        if !hit_keys.is_empty() || !disk_results.is_empty() {
             let mut cache = state.cache.write().unwrap();
+            // Promote hit entries so LRU recency stays accurate
+            for key in &hit_keys {
+                cache.get(key);
+            }
+            // Insert disk results, re-checking for races with other threads
             for (rel_path, content) in &disk_results {
-                cache.put(rel_path.clone(), Arc::clone(content));
+                if cache.peek(rel_path).is_none() {
+                    cache.put(rel_path.clone(), Arc::clone(content));
+                }
             }
         }
 

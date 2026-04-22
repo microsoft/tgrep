@@ -24,6 +24,7 @@ pub fn builtin_types() -> HashMap<&'static str, &'static [&'static str]> {
     );
     m.insert("cs", &["*.cs"]);
     m.insert("csharp", &["*.cs"]);
+    m.insert("csproj", &["*.csproj"]);
     m.insert("css", &["*.css", "*.scss", "*.less"]);
     m.insert("csv", &["*.csv"]);
     m.insert("cuda", &["*.cu", "*.cuh"]);

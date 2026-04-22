@@ -1071,6 +1071,8 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
 }
 
 fn simple_glob_match(pattern: &str, path: &str) -> bool {
+    // Normalize backslashes so Windows-style globs match forward-slash index paths
+    let pattern = pattern.replace('\\', "/");
     let pattern = pattern.replace('.', r"\.");
     let pattern = pattern.replace("**", "§§");
     let pattern = pattern.replace('*', "[^/]*");
@@ -1952,6 +1954,32 @@ mod tests {
             &no_exclude,
             Some(&gi)
         ));
+    }
+
+    #[test]
+    fn simple_glob_match_unix_patterns() {
+        // Standard forward-slash globs against forward-slash index paths
+        assert!(simple_glob_match("**/*.cs", "src/foo/bar.cs"));
+        assert!(simple_glob_match("*.cs", "src/foo/bar.cs"));
+        assert!(simple_glob_match("*.cs", "bar.cs"));
+        assert!(!simple_glob_match("**/*.cs", "src/foo/bar.rs"));
+        assert!(simple_glob_match("src/**", "src/foo/bar.cs"));
+        assert!(!simple_glob_match("src/**", "lib/foo/bar.cs"));
+    }
+
+    #[test]
+    fn simple_glob_match_backslash_normalization() {
+        // Windows-style globs with backslashes must match forward-slash paths
+        assert!(simple_glob_match(r"**\*.cs", "src/foo/bar.cs"));
+        assert!(simple_glob_match(r"src\**\*.cs", "src/foo/bar.cs"));
+        assert!(simple_glob_match(r"src\**", "src/foo/bar.cs"));
+        assert!(!simple_glob_match(r"lib\**", "src/foo/bar.cs"));
+    }
+
+    #[test]
+    fn simple_glob_match_case_insensitive() {
+        assert!(simple_glob_match("**/*.CS", "src/foo/bar.cs"));
+        assert!(simple_glob_match("**/*.cs", "src/foo/BAR.CS"));
     }
 
     fn write_file(path: &Path, content: &[u8]) {

@@ -473,7 +473,7 @@ fn handle_search(
                     return None;
                 }
                 if !glob_filters.is_empty()
-                    && !glob_filters.iter().any(|g| simple_glob_match(g, &rel_path))
+                    && !glob_filter_matches(&glob_filters, &rel_path)
                 {
                     glob_filtered_count += 1;
                     if first_glob_rejected.is_none() {
@@ -1068,6 +1068,37 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
             let _ = std::fs::remove_dir_all(&staging_dir);
         }
     }
+}
+
+/// Check whether `path` passes the glob filter list.
+///
+/// Glob semantics:
+/// - Patterns starting with `!` are **exclusion** patterns (path must NOT match).
+/// - All other patterns are **inclusion** patterns (path must match at least one).
+/// - If only exclusion patterns are present, the path passes unless it matches
+///   an exclusion.
+/// - If inclusion patterns are present, the path must match at least one AND
+///   must not match any exclusion.
+fn glob_filter_matches(globs: &[String], path: &str) -> bool {
+    if globs.is_empty() {
+        return true;
+    }
+    let mut has_include = false;
+    let mut included = false;
+    for g in globs {
+        if let Some(neg) = g.strip_prefix('!') {
+            if simple_glob_match(neg, path) {
+                return false; // excluded
+            }
+        } else {
+            has_include = true;
+            if !included && simple_glob_match(g, path) {
+                included = true;
+            }
+        }
+    }
+    // If there were no inclusion patterns, the path passes (only exclusions existed)
+    !has_include || included
 }
 
 fn simple_glob_match(pattern: &str, path: &str) -> bool {
@@ -1980,6 +2011,31 @@ mod tests {
     fn simple_glob_match_case_insensitive() {
         assert!(simple_glob_match("**/*.CS", "src/foo/bar.cs"));
         assert!(simple_glob_match("**/*.cs", "src/foo/BAR.CS"));
+    }
+
+    #[test]
+    fn glob_filter_negation_only() {
+        // Only exclusion patterns: path passes unless it matches an exclusion
+        let globs = vec!["!.git".to_string()];
+        assert!(glob_filter_matches(&globs, "src/foo/bar.cs"));
+        assert!(glob_filter_matches(&globs, "README.md"));
+        assert!(!glob_filter_matches(&globs, ".git"));
+        assert!(!glob_filter_matches(&globs, "foo/.git"));
+    }
+
+    #[test]
+    fn glob_filter_inclusion_and_exclusion() {
+        // Mix of include and exclude: must match an include AND not match any exclude
+        let globs = vec!["**/*.cs".to_string(), "!**/test/**".to_string()];
+        assert!(glob_filter_matches(&globs, "src/foo/bar.cs"));
+        assert!(!glob_filter_matches(&globs, "src/test/bar.cs"));
+        assert!(!glob_filter_matches(&globs, "src/foo/bar.rs")); // no include match
+    }
+
+    #[test]
+    fn glob_filter_empty_passes_all() {
+        let globs: Vec<String> = vec![];
+        assert!(glob_filter_matches(&globs, "anything"));
     }
 
     fn write_file(path: &Path, content: &[u8]) {

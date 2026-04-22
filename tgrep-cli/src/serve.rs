@@ -454,6 +454,7 @@ fn handle_search(
         let mut no_path_count: usize = 0;
         let mut type_filtered_count: usize = 0;
         let mut glob_filtered_count: usize = 0;
+        let mut first_glob_rejected: Option<String> = None;
 
         let filtered: Vec<(String, PathBuf)> = candidates
             .iter()
@@ -475,6 +476,9 @@ fn handle_search(
                     && !glob_filters.iter().any(|g| simple_glob_match(g, &rel_path))
                 {
                     glob_filtered_count += 1;
+                    if first_glob_rejected.is_none() {
+                        first_glob_rejected = Some(rel_path);
+                    }
                     return None;
                 }
                 let full_path = index.resolve_full_path(fid, &reader_snapshot)?;
@@ -487,8 +491,8 @@ fn handle_search(
             eprintln!(
                 "[trace] filter: raw={raw_count} no_path={no_path_count} \
                  type_filtered={type_filtered_count} glob_filtered={glob_filtered_count} \
-                 file_type={file_type:?} globs={glob_count}",
-                glob_count = glob_filters.len(),
+                 file_type={file_type:?} glob_values={glob_filters:?} \
+                 sample_rejected={first_glob_rejected:?}",
             );
         }
 

@@ -110,7 +110,7 @@ impl SearchOptions {
 /// List files that would be searched (--files mode).
 pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
     let root = std::fs::canonicalize(root)?;
-    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob);
+    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
     let walk = walker::walk_dir(
         &root,
         &walker::WalkOptions {
@@ -296,7 +296,7 @@ fn search_local_index(
 ) -> Result<bool> {
     let start = Instant::now();
     let reader = IndexReader::open(index_dir)?;
-    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob);
+    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
 
     let all_patterns = opts.all_patterns()?;
     let re = build_combined_regex(
@@ -383,7 +383,7 @@ fn search_local_index(
 
 fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<bool> {
     let start = Instant::now();
-    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob);
+    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
 
     // If root is a file, walk its parent and filter to just that file
     let (walk_root, single_file) = if root.is_file() {

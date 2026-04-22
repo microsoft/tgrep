@@ -381,7 +381,10 @@ fn handle_search(
                 .collect()
         })
         .unwrap_or_default();
-    let glob_filter = crate::glob_filter::GlobFilter::new(&glob_filter_strs);
+    let glob_filter = match crate::glob_filter::GlobFilter::new(&glob_filter_strs) {
+        Ok(f) => f,
+        Err(e) => return json_rpc_error(id, -32602, &format!("{e}")),
+    };
     let file_type = params
         .get("file_type")
         .and_then(|t| t.as_str())
@@ -1955,11 +1958,11 @@ mod tests {
     #[test]
     fn glob_filter_unix_patterns() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["**/*.cs".to_string()]);
+        let f = GlobFilter::new(&["**/*.cs".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
-        let f2 = GlobFilter::new(&["src/**".to_string()]);
+        let f2 = GlobFilter::new(&["src/**".to_string()]).unwrap();
         assert!(f2.matches("src/foo/bar.cs"));
         assert!(!f2.matches("lib/foo/bar.cs"));
     }
@@ -1967,19 +1970,23 @@ mod tests {
     #[test]
     fn glob_filter_backslash_normalization() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&[r"**\*.cs".to_string()]);
+        let f = GlobFilter::new(&[r"**\*.cs".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
-        let f2 = GlobFilter::new(&[r"src\**\*.cs".to_string()]);
+        let f2 = GlobFilter::new(&[r"src\**\*.cs".to_string()]).unwrap();
         assert!(f2.matches("src/foo/bar.cs"));
-        let f3 = GlobFilter::new(&[r"src\**".to_string()]);
+        let f3 = GlobFilter::new(&[r"src\**".to_string()]).unwrap();
         assert!(f3.matches("src/foo/bar.cs"));
-        assert!(!GlobFilter::new(&[r"lib\**".to_string()]).matches("src/foo/bar.cs"));
+        assert!(
+            !GlobFilter::new(&[r"lib\**".to_string()])
+                .unwrap()
+                .matches("src/foo/bar.cs")
+        );
     }
 
     #[test]
     fn glob_filter_case_insensitive() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["**/*.CS".to_string()]);
+        let f = GlobFilter::new(&["**/*.CS".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("src/foo/BAR.CS"));
     }
@@ -1987,7 +1994,7 @@ mod tests {
     #[test]
     fn glob_filter_negation_only() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["!.git".to_string()]);
+        let f = GlobFilter::new(&["!.git".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("README.md"));
         assert!(!f.matches(".git"));
@@ -1997,7 +2004,7 @@ mod tests {
     #[test]
     fn glob_filter_inclusion_and_exclusion() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["**/*.cs".to_string(), "!**/test/**".to_string()]);
+        let f = GlobFilter::new(&["**/*.cs".to_string(), "!**/test/**".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches("src/test/bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
@@ -2006,7 +2013,7 @@ mod tests {
     #[test]
     fn glob_filter_empty_passes_all() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&[]);
+        let f = GlobFilter::new(&[]).unwrap();
         assert!(f.matches("anything"));
     }
 

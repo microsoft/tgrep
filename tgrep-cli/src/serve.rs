@@ -442,7 +442,12 @@ fn handle_search(
     let (candidate_info, raw_candidate_count): (Vec<(String, PathBuf)>, usize) = {
         let index = state.index.read().unwrap();
 
-        let candidates = index.execute_query_with_masks(&plan);
+        // The reader snapshot is returned alongside the file IDs so that
+        // path resolution below uses the *same* reader that produced the
+        // posting-list results.  Without this, a concurrent `swap_reader`
+        // between the query and the path lookups would silently drop every
+        // candidate whose ID does not exist in the new reader.
+        let (candidates, reader_snapshot) = index.execute_query_with_masks(&plan);
         let raw_count = candidates.len();
 
         // Diagnostic counters for filter stages
@@ -453,8 +458,8 @@ fn handle_search(
         let filtered: Vec<(String, PathBuf)> = candidates
             .iter()
             .filter_map(|&fid| {
-                let rel_path = match index.file_path(fid) {
-                    Some(p) => p.to_string(),
+                let rel_path = match index.resolve_path(fid, &reader_snapshot) {
+                    Some(p) => p,
                     None => {
                         no_path_count += 1;
                         return None;
@@ -472,7 +477,7 @@ fn handle_search(
                     glob_filtered_count += 1;
                     return None;
                 }
-                let full_path = index.full_path(fid)?;
+                let full_path = index.resolve_full_path(fid, &reader_snapshot)?;
                 Some((rel_path, full_path))
             })
             .collect();

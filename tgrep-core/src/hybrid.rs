@@ -176,15 +176,61 @@ impl HybridIndex {
     }
 
     /// Execute a query plan with mask-aware filtering.
-    pub fn execute_query_with_masks(&self, plan: &QueryPlan) -> Vec<u32> {
-        if plan.is_match_all() {
-            return self.all_file_ids();
-        }
-        // Snapshot reader once to ensure all trigram lookups use the same
-        // reader version — prevents race conditions during concurrent flushes.
+    ///
+    /// Returns the matching file IDs **and** the `Arc<IndexReader>` snapshot
+    /// used for the lookups.  Callers that need to resolve file paths from
+    /// the returned IDs **must** use [`resolve_path`] / [`resolve_full_path`]
+    /// with the same snapshot — calling [`file_path`] instead introduces a
+    /// race: a concurrent `swap_reader` between the query and the path
+    /// resolution would resolve IDs against a different reader, silently
+    /// dropping every candidate whose ID does not exist in the new reader.
+    pub fn execute_query_with_masks(&self, plan: &QueryPlan) -> (Vec<u32>, Arc<IndexReader>) {
         let reader = self.reader();
-        query::execute_plan_with_masks(plan, &|tri| {
-            self.lookup_trigram_with_masks_using_reader(tri, &reader)
+        let ids = if plan.is_match_all() {
+            self.all_file_ids_using(&reader)
+        } else {
+            query::execute_plan_with_masks(plan, &|tri| {
+                self.lookup_trigram_with_masks_using_reader(tri, &reader)
+            })
+        };
+        (ids, reader)
+    }
+
+    /// Like [`all_file_ids`] but uses a caller-provided reader snapshot.
+    fn all_file_ids_using(&self, reader: &Arc<IndexReader>) -> Vec<u32> {
+        let mut ids: Vec<u32> = reader
+            .all_file_ids()
+            .into_iter()
+            .filter(|&fid| {
+                if let Some(path) = reader.file_path(fid) {
+                    !self.live.is_deleted(path) && !self.live_has_path(path)
+                } else {
+                    false
+                }
+            })
+            .collect();
+        ids.extend(self.live.all_file_ids());
+        ids
+    }
+
+    /// Resolve a file ID to a relative path using a specific reader snapshot.
+    ///
+    /// Handles both reader IDs (looked up in the provided snapshot) and
+    /// overlay IDs (looked up in the live index).  Pair with the snapshot
+    /// returned by [`execute_query_with_masks`] to guarantee consistency.
+    pub fn resolve_path(&self, file_id: u32, reader: &IndexReader) -> Option<String> {
+        if live::LiveIndex::is_overlay_id(file_id) {
+            self.live.file_path(file_id).map(|s| s.to_string())
+        } else {
+            reader.file_path(file_id).map(|s| s.to_string())
+        }
+    }
+
+    /// Resolve a file ID to an absolute path using a specific reader snapshot.
+    pub fn resolve_full_path(&self, file_id: u32, reader: &IndexReader) -> Option<PathBuf> {
+        self.resolve_path(file_id, reader).map(|rel| {
+            self.root
+                .join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
         })
     }
 

@@ -39,17 +39,26 @@ impl GlobFilter {
 
     /// Check if a path passes this glob filter.
     pub fn matches(&self, path: &str) -> bool {
-        // Normalize backslashes for matching (index paths use forward slashes)
-        let path = path.replace('\\', "/");
+        if self.is_empty() {
+            return true;
+        }
+        // Normalize backslashes only when needed (index paths use forward slashes)
+        let normalized;
+        let path = if path.contains('\\') {
+            normalized = path.replace('\\', "/");
+            &*normalized
+        } else {
+            path
+        };
         for m in &self.excludes {
-            if m.is_match(&*path) {
+            if m.is_match(path) {
                 return false;
             }
         }
         if self.includes.is_empty() {
             return true;
         }
-        self.includes.iter().any(|m| m.is_match(&*path))
+        self.includes.iter().any(|m| m.is_match(path))
     }
 }
 
@@ -57,6 +66,13 @@ impl GlobFilter {
 fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
     // Normalize backslashes so Windows-style globs work uniformly
     let pattern = pattern.replace('\\', "/");
+    // Patterns without a path separator should match at any depth,
+    // e.g. "*.rs" behaves like "**/*.rs" (consistent with ripgrep --glob)
+    let pattern = if !pattern.contains('/') {
+        format!("**/{pattern}")
+    } else {
+        pattern
+    };
     let glob = GlobBuilder::new(&pattern)
         .case_insensitive(true)
         .literal_separator(true)
@@ -85,7 +101,7 @@ mod tests {
 
     #[test]
     fn exclude_patterns() {
-        let f = GlobFilter::new(&["!**/.git".to_string()]).unwrap();
+        let f = GlobFilter::new(&["!.git".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches(".git"));
         assert!(!f.matches("foo/.git"));
@@ -142,5 +158,14 @@ mod tests {
         let f = GlobFilter::new(&["src/**".to_string()]).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches("lib/foo/bar.cs"));
+    }
+
+    #[test]
+    fn bare_extension_matches_at_any_depth() {
+        // "*.cs" without path separator should match at any depth (like ripgrep --glob)
+        let f = GlobFilter::new(&["*.cs".to_string()]).unwrap();
+        assert!(f.matches("bar.cs"));
+        assert!(f.matches("src/foo/bar.cs"));
+        assert!(!f.matches("src/foo/bar.rs"));
     }
 }

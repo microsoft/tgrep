@@ -483,27 +483,14 @@ fn search_file_content(
     let after = opts.after_ctx();
     let has_context = before > 0 || after > 0;
 
-    // Find matching line indices
-    let mut match_indices: Vec<usize> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let is_match = re.is_match(line);
-        let include = if opts.invert_match {
-            !is_match
-        } else {
-            is_match
-        };
-        if include {
-            match_indices.push(i);
-            if opts.quiet || opts.files_without_match {
-                break;
-            }
-            if let Some(max) = opts.max_count
-                && match_indices.len() >= max
-            {
-                break;
-            }
-        }
-    }
+    // Find matching line indices (use max_count of 1 for quiet/files_without_match)
+    let effective_max = if opts.quiet || opts.files_without_match {
+        Some(1)
+    } else {
+        opts.max_count
+    };
+    let match_indices =
+        crate::matching::find_match_indices(&lines, re, opts.invert_match, effective_max);
 
     if match_indices.is_empty() {
         return Ok(false);
@@ -526,17 +513,10 @@ fn search_file_content(
 
     // Build set of lines to output (matches + context)
     if has_context {
-        let mut printed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        let mut is_match_line: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-        for &mi in &match_indices {
-            is_match_line.insert(mi);
-            let ctx_start = mi.saturating_sub(before);
-            let ctx_end = (mi + after + 1).min(lines.len());
-            for j in ctx_start..ctx_end {
-                printed.insert(j);
-            }
-        }
+        let printed =
+            crate::matching::expand_context_window(&match_indices, lines.len(), before, after);
+        let is_match_line: std::collections::HashSet<usize> =
+            match_indices.iter().copied().collect();
 
         let mut prev_line: Option<usize> = None;
         for &li in &printed {
@@ -548,7 +528,7 @@ fn search_file_content(
             }
 
             if is_match_line.contains(&li) {
-                let content = match_content(lines[li], re, opts.only_matching);
+                let content = crate::matching::match_content(lines[li], re, opts.only_matching);
                 let column = re.find(lines[li]).map(|m| m.start() + 1);
                 writer.write_match(&Match {
                     file: rel_path.to_string(),
@@ -567,7 +547,7 @@ fn search_file_content(
         }
     } else {
         for &mi in &match_indices {
-            let content = match_content(lines[mi], re, opts.only_matching);
+            let content = crate::matching::match_content(lines[mi], re, opts.only_matching);
             let column = re.find(lines[mi]).map(|m| m.start() + 1);
             writer.write_match(&Match {
                 file: rel_path.to_string(),
@@ -579,18 +559,6 @@ fn search_file_content(
     }
 
     Ok(true)
-}
-
-/// Extract match content — full line or only the matched portion.
-fn match_content(line: &str, re: &regex::Regex, only_matching: bool) -> String {
-    if only_matching {
-        re.find_iter(line)
-            .map(|m| m.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        line.to_string()
-    }
 }
 
 pub fn build_combined_regex(

@@ -81,6 +81,17 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
     }
 }
 
+/// Lock ordering (acquire in this order to avoid deadlocks):
+///
+///   1. `snapshot_gate` — coordinates watcher mutations with publish cycle
+///   2. `publish_lock`  — serializes on-disk index publication
+///   3. `index`         — guards the in-memory HybridIndex (read-heavy)
+///   4. `cache`         — guards the file content LRU cache
+///   5. `file_stamps`   — guards per-file mtime/size stamps
+///
+/// `flushing` is an AtomicBool, not a lock — no ordering constraint.
+/// Searches only acquire `index` (read) and `cache` (read then write);
+/// they never take `snapshot_gate` or `publish_lock`.
 struct ServerState {
     index: RwLock<HybridIndex>,
     cache: RwLock<LruCache<String, Arc<String>>>,
@@ -339,13 +350,20 @@ fn process_request(request: &str, state: &ServerState) -> String {
     }
 }
 
-fn handle_search(
-    id: Option<serde_json::Value>,
-    params: &serde_json::Value,
-    state: &ServerState,
-) -> String {
-    let start = Instant::now();
+/// Parsed and validated search request parameters.
+struct SearchRequest {
+    pattern: String,
+    case_insensitive: bool,
+    regex: regex::Regex,
+    plan: query::QueryPlan,
+    glob_filter: crate::glob_filter::GlobFilter,
+    file_type: Option<String>,
+    opts: SearchOpts,
+}
 
+/// Parse and validate all search parameters from a JSON-RPC request.
+/// Returns Err(String) with an error message suitable for json_rpc_error on failure.
+fn parse_search_params(params: &serde_json::Value) -> std::result::Result<SearchRequest, String> {
     let pattern = params.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
     let extra_patterns: Vec<String> = params
         .get("extra_patterns")
@@ -381,10 +399,8 @@ fn handle_search(
                 .collect()
         })
         .unwrap_or_default();
-    let glob_filter = match crate::glob_filter::GlobFilter::new(&glob_filter_strs) {
-        Ok(f) => f,
-        Err(e) => return json_rpc_error(id, -32602, &format!("{e}")),
-    };
+    let glob_filter =
+        crate::glob_filter::GlobFilter::new(&glob_filter_strs).map_err(|e| format!("{e}"))?;
     let file_type = params
         .get("file_type")
         .and_then(|t| t.as_str())
@@ -420,26 +436,59 @@ fn handle_search(
     let mut all_patterns = vec![pattern.to_string()];
     all_patterns.extend(extra_patterns);
 
-    let re = match crate::search::build_combined_regex(
+    let regex = crate::search::build_combined_regex(
         &all_patterns,
         case_insensitive,
         fixed_string,
         word_boundary,
         multiline,
-    ) {
-        Ok(r) => r,
-        Err(e) => return json_rpc_error(id, -32602, &format!("{e}")),
-    };
+    )
+    .map_err(|e| format!("{e}"))?;
 
     // Build query plan from primary pattern for index filtering
     let plan = if fixed_string {
         query::build_literal_plan(pattern, case_insensitive)
     } else {
-        match query::build_query_plan(pattern, case_insensitive) {
-            Ok(p) => p,
-            Err(e) => return json_rpc_error(id, -32602, &e),
-        }
+        query::build_query_plan(pattern, case_insensitive)?
     };
+
+    Ok(SearchRequest {
+        pattern: pattern.to_string(),
+        case_insensitive,
+        regex,
+        plan,
+        glob_filter,
+        file_type,
+        opts: SearchOpts {
+            files_only,
+            invert_match,
+            only_matching,
+            max_count,
+            before_context,
+            after_context,
+        },
+    })
+}
+
+fn handle_search(
+    id: Option<serde_json::Value>,
+    params: &serde_json::Value,
+    state: &ServerState,
+) -> String {
+    let start = Instant::now();
+
+    let req = match parse_search_params(params) {
+        Ok(r) => r,
+        Err(e) => return json_rpc_error(id, -32602, &e),
+    };
+
+    let re = req.regex;
+    let plan = req.plan;
+    let glob_filter = req.glob_filter;
+    let file_type = req.file_type;
+    let opts = req.opts;
+    let pattern = req.pattern;
+    let case_insensitive = req.case_insensitive;
 
     // Collect candidates and their paths/full_paths while holding the index lock briefly
     let t_index = Instant::now();
@@ -489,11 +538,12 @@ fn handle_search(
             .collect();
 
         // Log filter breakdown when raw candidates are dropped to zero
+        let glob_active = !glob_filter.is_empty();
         if raw_count > 0 && filtered.is_empty() {
             eprintln!(
                 "[trace] filter: raw={raw_count} no_path={no_path_count} \
                  type_filtered={type_filtered_count} glob_filtered={glob_filtered_count} \
-                 file_type={file_type:?} glob_values={glob_filter_strs:?} \
+                 file_type={file_type:?} glob_active={glob_active} \
                  sample_rejected={first_glob_rejected:?}",
             );
         }
@@ -567,15 +617,7 @@ fn handle_search(
     };
     let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
 
-    let has_context = before_context > 0 || after_context > 0;
-    let opts = SearchOpts {
-        files_only,
-        invert_match,
-        only_matching,
-        max_count,
-        before_context,
-        after_context,
-    };
+    let has_context = opts.before_context > 0 || opts.after_context > 0;
 
     // Parallel regex matching across candidate files
     let t_search = Instant::now();
@@ -633,25 +675,8 @@ fn search_file_matches(
     };
 
     let lines: Vec<&str> = content.lines().collect();
-
-    // Find matching line indices
-    let mut match_indices: Vec<usize> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let is_match = re.is_match(line);
-        let include = if opts.invert_match {
-            !is_match
-        } else {
-            is_match
-        };
-        if include {
-            match_indices.push(i);
-            if let Some(max) = effective_max
-                && match_indices.len() >= max
-            {
-                break;
-            }
-        }
-    }
+    let match_indices =
+        crate::matching::find_match_indices(&lines, re, opts.invert_match, effective_max);
 
     if match_indices.is_empty() {
         return Vec::new();
@@ -660,27 +685,19 @@ fn search_file_matches(
     let has_context = opts.before_context > 0 || opts.after_context > 0;
 
     if has_context {
+        let printed = crate::matching::expand_context_window(
+            &match_indices,
+            lines.len(),
+            opts.before_context,
+            opts.after_context,
+        );
+        let is_match_line: std::collections::HashSet<usize> =
+            match_indices.iter().copied().collect();
+
         let mut results = Vec::new();
-        let mut printed = std::collections::BTreeSet::new();
-        let mut is_match_line = std::collections::HashSet::new();
-        for &mi in &match_indices {
-            is_match_line.insert(mi);
-            let ctx_start = mi.saturating_sub(opts.before_context);
-            let ctx_end = (mi + opts.after_context + 1).min(lines.len());
-            for j in ctx_start..ctx_end {
-                printed.insert(j);
-            }
-        }
         for &li in &printed {
             if is_match_line.contains(&li) {
-                let mc = if opts.only_matching {
-                    re.find_iter(lines[li])
-                        .map(|m| m.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    lines[li].to_string()
-                };
+                let mc = crate::matching::match_content(lines[li], re, opts.only_matching);
                 let col = re.find(lines[li]).map(|m| m.start() + 1);
                 let mut entry = serde_json::json!({
                     "type": "match",
@@ -706,14 +723,7 @@ fn search_file_matches(
         match_indices
             .iter()
             .map(|&mi| {
-                let mc = if opts.only_matching {
-                    re.find_iter(lines[mi])
-                        .map(|m| m.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    lines[mi].to_string()
-                };
+                let mc = crate::matching::match_content(lines[mi], re, opts.only_matching);
                 let col = re.find(lines[mi]).map(|m| m.start() + 1);
                 let mut entry = serde_json::json!({
                     "type": "match",

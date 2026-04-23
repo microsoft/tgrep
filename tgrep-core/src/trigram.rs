@@ -118,6 +118,30 @@ pub fn check_next_byte(masks: &TrigramMasks, next_byte: u8) -> bool {
     masks.next_mask & next_bit(next_byte) != 0
 }
 
+/// Extract trigrams with masks from both original and lowercased content,
+/// merging masks per trigram. This is the standard extraction used by both
+/// the on-disk builder and the live index overlay.
+pub fn extract_merged_masks(content: &[u8]) -> HashMap<TrigramHash, TrigramMasks> {
+    let tri_masks = extract_with_masks(content);
+
+    let mut per_tri: HashMap<TrigramHash, TrigramMasks> = HashMap::with_capacity(tri_masks.len());
+    for (tri, m) in tri_masks {
+        per_tri.insert(tri, m);
+    }
+
+    let lower = content.to_ascii_lowercase();
+    if lower != content {
+        let lower_tri_masks = extract_with_masks(&lower);
+        for &(tri, m) in lower_tri_masks.iter() {
+            let entry = per_tri.entry(tri).or_default();
+            entry.loc_mask |= m.loc_mask;
+            entry.next_mask |= m.next_mask;
+        }
+    }
+
+    per_tri
+}
+
 /// Extract trigrams from a string pattern (for query planning).
 pub fn extract_from_literal(s: &str) -> Vec<TrigramHash> {
     extract(s.as_bytes())
@@ -211,6 +235,73 @@ mod tests {
                 masks.loc_mask, 0,
                 "loc_mask should have at least one bit set"
             );
+        }
+    }
+
+    #[test]
+    fn test_extract_merged_masks_ors_across_cases() {
+        // "Hello" produces trigrams for original ("Hel","ell","llo") and
+        // lowercase ("hel","ell","llo"). "ell"/"llo" appear in both passes
+        // so their masks should be OR'd together. The lowercase pass adds
+        // the new trigram "hel".
+        let merged = extract_merged_masks(b"Hello");
+
+        // "hel" only comes from lowercase pass
+        let hel = hash(b'h', b'e', b'l');
+        assert!(
+            merged.contains_key(&hel),
+            "should contain lowercase trigram 'hel'"
+        );
+
+        // "Hel" only comes from original pass
+        let big_hel = hash(b'H', b'e', b'l');
+        assert!(
+            merged.contains_key(&big_hel),
+            "should contain original trigram 'Hel'"
+        );
+
+        // "ell" appears in both passes — masks should be superset
+        let ell = hash(b'e', b'l', b'l');
+        let merged_ell = merged.get(&ell).unwrap();
+
+        let orig_masks = extract_with_masks(b"Hello");
+        let orig_ell = orig_masks
+            .iter()
+            .find(|(h, _)| *h == ell)
+            .map(|(_, m)| *m)
+            .unwrap();
+
+        let lower_masks = extract_with_masks(b"hello");
+        let lower_ell = lower_masks
+            .iter()
+            .find(|(h, _)| *h == ell)
+            .map(|(_, m)| *m)
+            .unwrap();
+
+        assert_eq!(
+            merged_ell.loc_mask,
+            orig_ell.loc_mask | lower_ell.loc_mask,
+            "loc_mask should be OR of both passes"
+        );
+        assert_eq!(
+            merged_ell.next_mask,
+            orig_ell.next_mask | lower_ell.next_mask,
+            "next_mask should be OR of both passes"
+        );
+    }
+
+    #[test]
+    fn test_extract_merged_masks_all_lowercase_no_dup() {
+        // All-lowercase input: lowercase pass should be skipped (content == lower).
+        // Result should match a single extract_with_masks pass.
+        let merged = extract_merged_masks(b"abcde");
+        let single = extract_with_masks(b"abcde");
+
+        assert_eq!(merged.len(), single.len());
+        for &(tri, masks) in &single {
+            let m = merged.get(&tri).unwrap();
+            assert_eq!(m.loc_mask, masks.loc_mask);
+            assert_eq!(m.next_mask, masks.next_mask);
         }
     }
 }

@@ -73,29 +73,7 @@ impl LiveIndex {
     /// (e.g. the file watcher) can do the heavy work without blocking
     /// concurrent searches.
     pub fn compute_trigram_masks(content: &[u8]) -> HashMap<u32, trigram::TrigramMasks> {
-        let tri_masks = trigram::extract_with_masks(content);
-
-        let mut per_tri: HashMap<u32, trigram::TrigramMasks> = HashMap::new();
-        for &(tri, m) in tri_masks.iter() {
-            let entry = per_tri.entry(tri).or_default();
-            entry.loc_mask |= m.loc_mask;
-            entry.next_mask |= m.next_mask;
-        }
-
-        // Skip the lowercase pass when content is already ASCII-lowercase —
-        // it would just re-emit the same trigrams. Mirrors the on-disk
-        // builder's optimization so watcher-driven reindexes don't pay for
-        // a redundant full scan + allocation on lowercase-heavy files.
-        let lower = content.to_ascii_lowercase();
-        if lower != content {
-            let lower_tri_masks = trigram::extract_with_masks(&lower);
-            for &(tri, m) in lower_tri_masks.iter() {
-                let entry = per_tri.entry(tri).or_default();
-                entry.loc_mask |= m.loc_mask;
-                entry.next_mask |= m.next_mask;
-            }
-        }
-        per_tri
+        trigram::extract_merged_masks(content)
     }
 
     /// Commit a pre-computed set of (trigram, masks) entries for a file.

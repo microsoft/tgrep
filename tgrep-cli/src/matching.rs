@@ -10,6 +10,9 @@ pub fn find_match_indices(
     invert_match: bool,
     max_count: Option<usize>,
 ) -> Vec<usize> {
+    if max_count == Some(0) {
+        return Vec::new();
+    }
     let mut indices = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let is_match = re.is_match(line);

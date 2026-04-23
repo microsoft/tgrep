@@ -122,10 +122,10 @@ pub fn default_index_dir(root: &Path) -> std::path::PathBuf {
 /// Both `write_index_v2` and `write_index_from_snapshot` delegate to this
 /// function after preparing their parameters. `paths` provides the file
 /// list (IDs are assigned by position: 0, 1, 2, …).
-fn write_index_files(
+fn write_index_files<S: AsRef<str>>(
     index_dir: &Path,
     root: &Path,
-    paths: &[&str],
+    paths: &[S],
     inverted: &HashMap<u32, Vec<PostingEntry>>,
     complete: Option<bool>,
 ) -> Result<()> {
@@ -169,7 +169,7 @@ fn write_index_files(
     let mut files_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
     for (id, path) in paths.iter().enumerate() {
-        files_file.write_all(&ondisk::encode_file_entry(id as u32, path)?)?;
+        files_file.write_all(&ondisk::encode_file_entry(id as u32, path.as_ref())?)?;
     }
     files_file.flush()?;
 
@@ -197,8 +197,7 @@ pub fn write_index_from_snapshot(
     inverted: &HashMap<u32, Vec<PostingEntry>>,
     complete: bool,
 ) -> Result<()> {
-    let borrowed: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-    write_index_files(index_dir, root, &borrowed, inverted, Some(complete))
+    write_index_files(index_dir, root, paths, inverted, Some(complete))
 }
 
 /// Internal: write v2 index with masks.

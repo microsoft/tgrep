@@ -124,11 +124,9 @@ pub fn check_next_byte(masks: &TrigramMasks, next_byte: u8) -> bool {
 pub fn extract_merged_masks(content: &[u8]) -> HashMap<TrigramHash, TrigramMasks> {
     let tri_masks = extract_with_masks(content);
 
-    let mut per_tri: HashMap<TrigramHash, TrigramMasks> = HashMap::new();
-    for &(tri, m) in tri_masks.iter() {
-        let entry = per_tri.entry(tri).or_default();
-        entry.loc_mask |= m.loc_mask;
-        entry.next_mask |= m.next_mask;
+    let mut per_tri: HashMap<TrigramHash, TrigramMasks> = HashMap::with_capacity(tri_masks.len());
+    for (tri, m) in tri_masks {
+        per_tri.insert(tri, m);
     }
 
     let lower = content.to_ascii_lowercase();
@@ -250,7 +248,10 @@ mod tests {
 
         // "hel" only comes from lowercase pass
         let hel = hash(b'h', b'e', b'l');
-        assert!(merged.contains_key(&hel), "should contain lowercase trigram 'hel'");
+        assert!(
+            merged.contains_key(&hel),
+            "should contain lowercase trigram 'hel'"
+        );
 
         // "Hel" only comes from original pass
         let big_hel = hash(b'H', b'e', b'l');

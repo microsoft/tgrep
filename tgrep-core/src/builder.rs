@@ -125,7 +125,7 @@ pub fn default_index_dir(root: &Path) -> std::path::PathBuf {
 fn write_index_files(
     index_dir: &Path,
     root: &Path,
-    paths: &[String],
+    paths: &[&str],
     inverted: &HashMap<u32, Vec<PostingEntry>>,
     meta_override: Option<Box<dyn FnOnce(&mut IndexMeta)>>,
 ) -> Result<()> {
@@ -197,10 +197,11 @@ pub fn write_index_from_snapshot(
     inverted: &HashMap<u32, Vec<PostingEntry>>,
     complete: bool,
 ) -> Result<()> {
+    let borrowed: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     write_index_files(
         index_dir,
         root,
-        paths,
+        &borrowed,
         inverted,
         Some(Box::new(move |meta| {
             meta.complete = complete;
@@ -221,6 +222,6 @@ fn write_index_v2(
         file_id_map.len()
     );
 
-    let paths: Vec<String> = file_id_map.iter().map(|(_, p)| p.clone()).collect();
+    let paths: Vec<&str> = file_id_map.iter().map(|(_, p)| p.as_str()).collect();
     write_index_files(index_dir, root, &paths, inverted, None)
 }

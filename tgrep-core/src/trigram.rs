@@ -239,4 +239,68 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_extract_merged_masks_ors_across_cases() {
+        // "Hello" produces trigrams for original ("Hel","ell","llo") and
+        // lowercase ("hel","ell","llo"). "ell"/"llo" appear in both passes
+        // so their masks should be OR'd together. The lowercase pass adds
+        // the new trigram "hel".
+        let merged = extract_merged_masks(b"Hello");
+
+        // "hel" only comes from lowercase pass
+        let hel = hash(b'h', b'e', b'l');
+        assert!(merged.contains_key(&hel), "should contain lowercase trigram 'hel'");
+
+        // "Hel" only comes from original pass
+        let big_hel = hash(b'H', b'e', b'l');
+        assert!(
+            merged.contains_key(&big_hel),
+            "should contain original trigram 'Hel'"
+        );
+
+        // "ell" appears in both passes — masks should be superset
+        let ell = hash(b'e', b'l', b'l');
+        let merged_ell = merged.get(&ell).unwrap();
+
+        let orig_masks = extract_with_masks(b"Hello");
+        let orig_ell = orig_masks
+            .iter()
+            .find(|(h, _)| *h == ell)
+            .map(|(_, m)| *m)
+            .unwrap();
+
+        let lower_masks = extract_with_masks(b"hello");
+        let lower_ell = lower_masks
+            .iter()
+            .find(|(h, _)| *h == ell)
+            .map(|(_, m)| *m)
+            .unwrap();
+
+        assert_eq!(
+            merged_ell.loc_mask,
+            orig_ell.loc_mask | lower_ell.loc_mask,
+            "loc_mask should be OR of both passes"
+        );
+        assert_eq!(
+            merged_ell.next_mask,
+            orig_ell.next_mask | lower_ell.next_mask,
+            "next_mask should be OR of both passes"
+        );
+    }
+
+    #[test]
+    fn test_extract_merged_masks_all_lowercase_no_dup() {
+        // All-lowercase input: lowercase pass should be skipped (content == lower).
+        // Result should match a single extract_with_masks pass.
+        let merged = extract_merged_masks(b"abcde");
+        let single = extract_with_masks(b"abcde");
+
+        assert_eq!(merged.len(), single.len());
+        for &(tri, masks) in &single {
+            let m = merged.get(&tri).unwrap();
+            assert_eq!(m.loc_mask, masks.loc_mask);
+            assert_eq!(m.next_mask, masks.next_mask);
+        }
+    }
 }

@@ -127,7 +127,7 @@ fn write_index_files(
     root: &Path,
     paths: &[&str],
     inverted: &HashMap<u32, Vec<PostingEntry>>,
-    meta_override: Option<Box<dyn FnOnce(&mut IndexMeta)>>,
+    complete: Option<bool>,
 ) -> Result<()> {
     std::fs::create_dir_all(index_dir)?;
 
@@ -180,8 +180,8 @@ fn write_index_files(
         paths.len() as u64,
         sorted_trigrams.len() as u64,
     );
-    if let Some(f) = meta_override {
-        f(&mut meta);
+    if let Some(c) = complete {
+        meta.complete = c;
     }
     meta.save(index_dir)?;
 
@@ -198,15 +198,7 @@ pub fn write_index_from_snapshot(
     complete: bool,
 ) -> Result<()> {
     let borrowed: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-    write_index_files(
-        index_dir,
-        root,
-        &borrowed,
-        inverted,
-        Some(Box::new(move |meta| {
-            meta.complete = complete;
-        })),
-    )
+    write_index_files(index_dir, root, &borrowed, inverted, Some(complete))
 }
 
 /// Internal: write v2 index with masks.

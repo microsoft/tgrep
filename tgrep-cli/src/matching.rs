@@ -1,6 +1,6 @@
-/// Shared matching logic used by both the server (serve.rs) and the local
-/// search path (search.rs). Extracts the core line-matching and context-window
-/// algorithms so both callers avoid duplicating them.
+//! Shared matching logic used by both the server (serve.rs) and the local
+//! search path (search.rs). Extracts the core line-matching and context-window
+//! algorithms so both callers avoid duplicating them.
 
 /// Find indices of matching lines in `lines`, respecting `invert_match` and
 /// `max_count`. Returns the indices into the `lines` slice.

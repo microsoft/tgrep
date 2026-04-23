@@ -7,20 +7,20 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 
 ## chromium/chromium (494K files)
 
-[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24805535539)
-[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24805536677)
+[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24811114641)
+[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24811115740)
 
-- **Repo**: [chromium/chromium](https://github.com/chromium/chromium) (494,093 files)
+- **Repo**: [chromium/chromium](https://github.com/chromium/chromium) (494,120 files)
 - **Queries**: 30 (mix of literals, multi-word, and regex)
-- **Index build time**: ~112s (Linux), ~293s (Windows), ~497s (macOS)
+- **Index build time**: ~97s (Linux), ~688s (Windows), ~540s (macOS)
 - **Index size**: 2,478 MB (~2.5 GB)
 
 ### Windows AMD64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 873,795 | 29,126.5 |
-| tgrep (client → serve) | 73,521 | 2,450.7 |
+| ripgrep | 848,569 | 28,285.6 |
+| tgrep (client → serve) | 73,143 | 2,438.1 |
 
 **tgrep is ~12x faster**
 
@@ -28,77 +28,77 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 2,079,314 | 69,310.5 |
-| tgrep (client → serve) | 87,352 | 2,911.7 |
+| ripgrep | 2,146,196 | 71,539.9 |
+| tgrep (client → serve) | 91,716 | 3,057.2 |
 
-**tgrep is ~24x faster**
+**tgrep is ~23x faster**
 
 ### Linux x86_64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 83,876 | 2,795.9 |
-| tgrep (client → serve) | 36,314 | 1,210.5 |
+| ripgrep | 83,530 | 2,784.3 |
+| tgrep (client → serve) | 34,688 | 1,156.3 |
 
-**tgrep is ~2.3x faster**
+**tgrep is ~2.4x faster**
 
 ---
 
 ## mozilla/gecko-dev (388K files)
 
-[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24805537755)
-[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24805538770)
+[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24811116791)
+[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24811117829)
 
 - **Repo**: [mozilla/gecko-dev](https://github.com/mozilla/gecko-dev) (387,841 files)
 - **Queries**: 122 (mix of C++, JavaScript, and Python patterns)
-- **Index build time**: ~92s (Linux), ~180s (Windows), ~257s (macOS)
+- **Index build time**: ~77s (Linux), ~314s (Windows), ~267s (macOS)
 - **Index size**: 1,938 MB (~1.9 GB)
 
 ### Windows AMD64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 2,301,586 | 18,865.5 |
-| tgrep (client → serve) | 83,381 | 683.5 |
+| ripgrep | 2,048,034 | 16,787.2 |
+| tgrep (client → serve) | 67,794 | 555.7 |
 
-**tgrep is ~28x faster**
+**tgrep is ~30x faster**
 
 ### macOS Apple Silicon (Darwin arm64)
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 5,579,958 | 45,737.4 |
-| tgrep (client → serve) | 62,027 | 508.4 |
+| ripgrep | 4,724,399 | 38,724.6 |
+| tgrep (client → serve) | 72,273 | 592.4 |
 
-**tgrep is ~90x faster**
+**tgrep is ~65x faster**
 
 ### Linux x86_64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 243,421 | 1,995.3 |
-| tgrep (client → serve) | 33,463 | 274.3 |
+| ripgrep | 212,783 | 1,744.1 |
+| tgrep (client → serve) | 34,589 | 283.5 |
 
-**tgrep is ~7x faster**
+**tgrep is ~6x faster**
 
 ---
 
 ## torvalds/linux (94K files)
 
-[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24805547294)
-[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24805548476)
+[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24811125540)
+[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24811126603)
 
 - **Repo**: [torvalds/linux](https://github.com/torvalds/linux) (93,931 files)
 - **Queries**: 102 (mix of literals, multi-word, and regex)
-- **Index build time**: ~41s (Linux), ~50s (Windows), ~144s (macOS)
+- **Index build time**: ~37s (Linux), ~77s (Windows), ~90s (macOS)
 - **Index size**: ~977 MB
 
 ### Windows AMD64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 323,962 | 3,176.1 |
-| tgrep (client → serve) | 75,612 | 741.3 |
+| ripgrep | 319,356 | 3,130.9 |
+| tgrep (client → serve) | 77,352 | 758.4 |
 
 **tgrep is ~4x faster**
 
@@ -106,17 +106,17 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 343,684 | 3,369.5 |
-| tgrep (client → serve) | 165,523 | 1,622.8 |
+| ripgrep | 123,740 | 1,213.1 |
+| tgrep (client → serve) | 100,269 | 983.0 |
 
-**tgrep is ~2x faster**
+**tgrep is ~1.2x faster**
 
 ### Linux x86_64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 47,120 | 462.0 |
-| tgrep (client → serve) | 49,511 | 485.4 |
+| ripgrep | 36,599 | 358.8 |
+| tgrep (client → serve) | 49,765 | 487.9 |
 
 **~1x (comparable — Linux I/O cache narrows the gap on this repo)**
 
@@ -124,59 +124,59 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 
 ## rust-lang/rust (59K files)
 
-[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24805544808)
-[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24805546001)
+[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24811123386)
+[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24811124502)
 
-- **Repo**: [rust-lang/rust](https://github.com/rust-lang/rust) (59,267 files)
+- **Repo**: [rust-lang/rust](https://github.com/rust-lang/rust) (59,293 files)
 - **Queries**: 102 (mix of Rust patterns, macros, traits, and regex)
-- **Index build time**: ~7s (Linux), ~11s (Windows/macOS)
+- **Index build time**: ~7s (Linux), ~8s (Windows), ~9s (macOS)
 - **Index size**: ~189 MB
 
 ### Windows AMD64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 203,367 | 1,993.8 |
-| tgrep (client → serve) | 19,362 | 189.8 |
+| ripgrep | 137,992 | 1,352.9 |
+| tgrep (client → serve) | 16,186 | 158.7 |
 
-**tgrep is ~10x faster**
+**tgrep is ~9x faster**
 
 ### macOS Apple Silicon (Darwin arm64)
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 38,985 | 382.2 |
-| tgrep (client → serve) | 12,795 | 125.4 |
+| ripgrep | 42,115 | 412.9 |
+| tgrep (client → serve) | 10,941 | 107.3 |
 
-**tgrep is ~3x faster**
+**tgrep is ~4x faster**
 
 ### Linux x86_64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 13,909 | 136.4 |
-| tgrep (client → serve) | 9,709 | 95.2 |
+| ripgrep | 19,216 | 188.4 |
+| tgrep (client → serve) | 9,912 | 97.2 |
 
-**tgrep is ~1.4x faster**
+**tgrep is ~1.9x faster**
 
 ---
 
 ## kubernetes/kubernetes (29K files)
 
-[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24805542622)
-[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24805543634)
+[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24811121029)
+[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24811122255)
 
-- **Repo**: [kubernetes/kubernetes](https://github.com/kubernetes/kubernetes) (29,232 files)
+- **Repo**: [kubernetes/kubernetes](https://github.com/kubernetes/kubernetes) (29,242 files)
 - **Queries**: 97 (mix of Go patterns, Kubernetes API types, and regex)
-- **Index build time**: ~9s (Linux/macOS), ~9s (Windows)
+- **Index build time**: ~8s (Linux/macOS), ~8s (Windows)
 - **Index size**: ~203 MB
 
 ### Windows AMD64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 95,187 | 981.3 |
-| tgrep (client → serve) | 13,253 | 136.6 |
+| ripgrep | 99,009 | 1,020.7 |
+| tgrep (client → serve) | 13,362 | 137.8 |
 
 **tgrep is ~7x faster**
 
@@ -184,38 +184,38 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 28,575 | 294.6 |
-| tgrep (client → serve) | 8,711 | 89.8 |
+| ripgrep | 24,786 | 255.5 |
+| tgrep (client → serve) | 6,402 | 66.0 |
 
-**tgrep is ~3x faster**
+**tgrep is ~4x faster**
 
 ### Linux x86_64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 15,659 | 161.4 |
-| tgrep (client → serve) | 8,505 | 87.7 |
+| ripgrep | 15,314 | 157.9 |
+| tgrep (client → serve) | 8,130 | 83.8 |
 
-**tgrep is ~1.8x faster**
+**tgrep is ~1.9x faster**
 
 ---
 
 ## golang/go (15K files)
 
-[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24805540173)
-[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24805541524)
+[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/24811118882)
+[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/24811120023)
 
 - **Repo**: [golang/go](https://github.com/golang/go) (15,302 files)
 - **Queries**: 103 (mix of Go stdlib patterns, testing, and regex)
-- **Index build time**: ~4s (Linux), ~5s (macOS), ~6s (Windows)
+- **Index build time**: ~4s (Linux), ~3s (macOS), ~4s (Windows)
 - **Index size**: ~105 MB
 
 ### Windows AMD64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 62,542 | 607.2 |
-| tgrep (client → serve) | 7,500 | 72.8 |
+| ripgrep | 45,996 | 446.6 |
+| tgrep (client → serve) | 6,130 | 59.5 |
 
 **tgrep is ~8x faster**
 
@@ -223,31 +223,31 @@ tgrep runs in client/server mode: `tgrep serve` runs in the background, and the 
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 12,250 | 118.9 |
-| tgrep (client → serve) | 5,304 | 51.5 |
+| ripgrep | 12,587 | 122.2 |
+| tgrep (client → serve) | 2,893 | 28.1 |
 
-**tgrep is ~2.3x faster**
+**tgrep is ~4x faster**
 
 ### Linux x86_64
 
 | Tool | Total (ms) | Avg per query (ms) |
 | --- | ---: | ---: |
-| ripgrep | 7,192 | 69.8 |
-| tgrep (client → serve) | 3,816 | 37.0 |
+| ripgrep | 7,276 | 70.6 |
+| tgrep (client → serve) | 3,958 | 38.4 |
 
-**tgrep is ~1.9x faster**
+**tgrep is ~1.8x faster**
 
 ---
 
 ## Key takeaways
 
 - tgrep's advantage grows with repo size — the trigram index eliminates scanning files that can't match
-- On the 494K-file Chromium repo, tgrep is up to **24x faster** (macOS) and **12x faster** (Windows)
-- On the 388K-file gecko-dev repo, tgrep is up to **90x faster** (macOS) and **28x faster** (Windows)
-- On the 94K-file Linux kernel, tgrep is **4x faster** on Windows, ~2x on macOS; on Linux x86_64 the two are comparable
-- On the 59K-file Rust repo, tgrep is **10x faster** on Windows, ~3x on macOS, ~1.4x on Linux
-- On the 29K-file Kubernetes repo, tgrep is **7x faster** on Windows, ~3x on macOS, ~1.8x on Linux
-- On the 15K-file Go repo, tgrep is **8x faster** on Windows, ~2x on macOS/Linux
-- On Windows, tgrep consistently shows the largest speedups (4–28x) due to slower Windows I/O
+- On the 494K-file Chromium repo, tgrep is up to **23x faster** (macOS) and **12x faster** (Windows)
+- On the 388K-file gecko-dev repo, tgrep is up to **65x faster** (macOS) and **30x faster** (Windows)
+- On the 94K-file Linux kernel, tgrep is **4x faster** on Windows; on Linux/macOS the two are comparable
+- On the 59K-file Rust repo, tgrep is **9x faster** on Windows, ~4x on macOS, ~2x on Linux
+- On the 29K-file Kubernetes repo, tgrep is **7x faster** on Windows, ~4x on macOS, ~2x on Linux
+- On the 15K-file Go repo, tgrep is **8x faster** on Windows, ~4x on macOS, ~2x on Linux
+- On Windows, tgrep consistently shows the largest speedups (4–30x) due to slower Windows I/O
 - On Linux, aggressive OS page caching often narrows the gap; tgrep is usually faster, but some repos (such as the Linux kernel on x86_64) can be comparable
 - Index build is a one-time cost; the server watches for file changes and updates incrementally

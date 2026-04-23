@@ -17,21 +17,21 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
-See [full benchmark results](BENCHMARKS.md) — up to **90x faster** than ripgrep on large repos.
+See [full benchmark results](BENCHMARKS.md) — up to **65x faster** than ripgrep on large repos.
 
 ### Benchmark highlights (avg latency per query, index pre-built)
 
 | Repo | Files | Platform | ripgrep | tgrep | Speedup |
 | --- | ---: | --- | ---: | ---: | ---: |
-| chromium | 494K | macOS arm64 | 69,311ms | 2,912ms | **24x** |
-| chromium | 494K | Windows | 29,127ms | 2,451ms | **12x** |
-| gecko-dev | 388K | macOS arm64 | 45,737ms | 508ms | **90x** |
-| gecko-dev | 388K | Windows | 18,866ms | 684ms | **28x** |
-| gecko-dev | 388K | Linux | 1,995ms | 274ms | **7x** |
-| linux | 94K | Windows | 3,176ms | 741ms | **4x** |
-| rust | 59K | Windows | 1,994ms | 190ms | **10x** |
-| kubernetes | 29K | Windows | 981ms | 137ms | **7x** |
-| go | 15K | Windows | 607ms | 73ms | **8x** |
+| chromium | 494K | macOS arm64 | 71,540ms | 3,057ms | **23x** |
+| chromium | 494K | Windows | 28,286ms | 2,438ms | **12x** |
+| gecko-dev | 388K | macOS arm64 | 38,725ms | 592ms | **65x** |
+| gecko-dev | 388K | Windows | 16,787ms | 556ms | **30x** |
+| gecko-dev | 388K | Linux | 1,744ms | 284ms | **6x** |
+| linux | 94K | Windows | 3,131ms | 758ms | **4x** |
+| rust | 59K | Windows | 1,353ms | 159ms | **9x** |
+| kubernetes | 29K | Windows | 1,021ms | 138ms | **7x** |
+| go | 15K | Windows | 447ms | 60ms | **8x** |
 
 ## Architecture
 

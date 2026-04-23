@@ -118,6 +118,32 @@ pub fn check_next_byte(masks: &TrigramMasks, next_byte: u8) -> bool {
     masks.next_mask & next_bit(next_byte) != 0
 }
 
+/// Extract trigrams with masks from both original and lowercased content,
+/// merging masks per trigram. This is the standard extraction used by both
+/// the on-disk builder and the live index overlay.
+pub fn extract_merged_masks(content: &[u8]) -> HashMap<TrigramHash, TrigramMasks> {
+    let tri_masks = extract_with_masks(content);
+
+    let mut per_tri: HashMap<TrigramHash, TrigramMasks> = HashMap::new();
+    for &(tri, m) in tri_masks.iter() {
+        let entry = per_tri.entry(tri).or_default();
+        entry.loc_mask |= m.loc_mask;
+        entry.next_mask |= m.next_mask;
+    }
+
+    let lower = content.to_ascii_lowercase();
+    if lower != content {
+        let lower_tri_masks = extract_with_masks(&lower);
+        for &(tri, m) in lower_tri_masks.iter() {
+            let entry = per_tri.entry(tri).or_default();
+            entry.loc_mask |= m.loc_mask;
+            entry.next_mask |= m.next_mask;
+        }
+    }
+
+    per_tri
+}
+
 /// Extract trigrams from a string pattern (for query planning).
 pub fn extract_from_literal(s: &str) -> Vec<TrigramHash> {
     extract(s.as_bytes())

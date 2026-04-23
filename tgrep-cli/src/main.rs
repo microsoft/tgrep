@@ -7,6 +7,7 @@
 ///   tgrep status [path]          Show index/server status
 mod glob_filter;
 mod index;
+mod matching;
 mod output;
 mod search;
 mod serve;

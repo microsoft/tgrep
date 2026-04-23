@@ -97,20 +97,23 @@ impl HybridIndex {
         Ok(())
     }
 
+    /// Check whether a reader file ID is still active (not deleted or
+    /// overridden by the live overlay).
+    fn reader_entry_active(&self, reader: &IndexReader, file_id: u32) -> bool {
+        if let Some(path) = reader.file_path(file_id) {
+            !self.live.is_deleted(path) && !self.live_has_path(path)
+        } else {
+            false
+        }
+    }
+
     /// Look up candidate file IDs for a trigram, merging reader + overlay.
     pub fn lookup_trigram(&self, trigram: u32) -> Vec<u32> {
         let reader = self.reader();
         let mut reader_ids = reader.lookup_trigram(trigram);
         let live_ids = self.live.lookup_trigram(trigram);
 
-        // Filter out reader IDs for files that are deleted or overridden in overlay
-        reader_ids.retain(|&fid| {
-            if let Some(path) = reader.file_path(fid) {
-                !self.live.is_deleted(path) && !self.live_has_path(path)
-            } else {
-                false
-            }
-        });
+        reader_ids.retain(|&fid| self.reader_entry_active(&reader, fid));
 
         reader_ids.extend(live_ids);
         reader_ids
@@ -122,13 +125,7 @@ impl HybridIndex {
         let mut reader_entries = reader.lookup_trigram_with_masks(trigram);
         let live_entries = self.live.lookup_trigram_with_masks(trigram);
 
-        reader_entries.retain(|e| {
-            if let Some(path) = reader.file_path(e.file_id) {
-                !self.live.is_deleted(path) && !self.live_has_path(path)
-            } else {
-                false
-            }
-        });
+        reader_entries.retain(|e| self.reader_entry_active(&reader, e.file_id));
 
         reader_entries.extend(live_entries);
         reader_entries
@@ -152,13 +149,7 @@ impl HybridIndex {
         let mut ids: Vec<u32> = reader
             .all_file_ids()
             .into_iter()
-            .filter(|&fid| {
-                if let Some(path) = reader.file_path(fid) {
-                    !self.live.is_deleted(path) && !self.live_has_path(path)
-                } else {
-                    false
-                }
-            })
+            .filter(|&fid| self.reader_entry_active(&reader, fid))
             .collect();
         ids.extend(self.live.all_file_ids());
         ids
@@ -201,13 +192,7 @@ impl HybridIndex {
         let mut ids: Vec<u32> = reader
             .all_file_ids()
             .into_iter()
-            .filter(|&fid| {
-                if let Some(path) = reader.file_path(fid) {
-                    !self.live.is_deleted(path) && !self.live_has_path(path)
-                } else {
-                    false
-                }
-            })
+            .filter(|&fid| self.reader_entry_active(reader, fid))
             .collect();
         ids.extend(self.live.all_file_ids());
         ids
@@ -240,13 +225,7 @@ impl HybridIndex {
         let mut reader_ids = reader.lookup_trigram(trigram);
         let live_ids = self.live.lookup_trigram(trigram);
 
-        reader_ids.retain(|&fid| {
-            if let Some(path) = reader.file_path(fid) {
-                !self.live.is_deleted(path) && !self.live_has_path(path)
-            } else {
-                false
-            }
-        });
+        reader_ids.retain(|&fid| self.reader_entry_active(reader, fid));
 
         reader_ids.extend(live_ids);
         reader_ids
@@ -262,13 +241,7 @@ impl HybridIndex {
         let mut reader_entries = reader.lookup_trigram_with_masks(trigram);
         let live_entries = self.live.lookup_trigram_with_masks(trigram);
 
-        reader_entries.retain(|e| {
-            if let Some(path) = reader.file_path(e.file_id) {
-                !self.live.is_deleted(path) && !self.live_has_path(path)
-            } else {
-                false
-            }
-        });
+        reader_entries.retain(|e| self.reader_entry_active(reader, e.file_id));
 
         reader_entries.extend(live_entries);
         reader_entries

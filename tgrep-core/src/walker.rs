@@ -15,6 +15,20 @@ const BINARY_EXTENSIONS: &[&str] = &[
     "sqlite", "sqlite3",
 ];
 
+/// Number of parallel walker threads (capped at 12 to avoid diminishing returns).
+fn walker_thread_count() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(12))
+}
+
+/// Check if a directory entry should be skipped based on exclude list.
+fn should_skip_dir(entry: &ignore::DirEntry, exclude_dirs: &[String]) -> bool {
+    !exclude_dirs.is_empty()
+        && entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| exclude_dirs.iter().any(|d| d == name))
+}
+
 pub struct WalkResult {
     pub files: Vec<PathBuf>,
     pub skipped_binary: usize,
@@ -58,7 +72,7 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         .git_ignore(!opts.no_ignore)
         .git_global(!opts.no_ignore)
         .git_exclude(!opts.no_ignore)
-        .threads(std::thread::available_parallelism().map_or(4, |n| n.get().min(12)))
+        .threads(walker_thread_count())
         .build_parallel();
 
     walker.run(|| {
@@ -75,12 +89,8 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
                 }
             };
 
-            // Skip excluded directories and their subtrees
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str()
-                    && !exclude.is_empty()
-                    && exclude.iter().any(|d| d == name)
-                {
+                if should_skip_dir(&entry, &exclude) {
                     return ignore::WalkState::Skip;
                 }
                 return ignore::WalkState::Continue;
@@ -136,7 +146,7 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta>
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .threads(std::thread::available_parallelism().map_or(4, |n| n.get().min(12)))
+        .threads(walker_thread_count())
         .build_parallel();
 
     walker.run(|| {
@@ -149,10 +159,7 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta>
             };
 
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str()
-                    && !exclude.is_empty()
-                    && exclude.iter().any(|d| d == name)
-                {
+                if should_skip_dir(&entry, &exclude) {
                     return ignore::WalkState::Skip;
                 }
                 return ignore::WalkState::Continue;

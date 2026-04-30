@@ -147,10 +147,11 @@ struct ServerState {
     /// Gitignore matcher used by the file watcher to drop events for
     /// paths the initial walk would have skipped via the `ignore` crate
     /// (`.gitignore`, `.git/info/exclude`, global gitignore, etc.).
-    /// Built once at startup; `None` if the matcher could not be built
-    /// (in which case the watcher just falls back to its hidden / exclude
-    /// filtering and accepts that gitignored files may be reindexed).
-    gitignore: Option<tgrep_core::gitignore::Gitignore>,
+    /// Built asynchronously after the server starts so large repos don't block
+    /// `serve ready` on a full-tree `.gitignore` discovery walk. `None` while
+    /// loading or if no matcher could be built; during that window the watcher
+    /// falls back to hidden / exclude filtering.
+    gitignore: RwLock<Option<tgrep_core::gitignore::Gitignore>>,
 }
 
 struct SearchOpts {
@@ -224,15 +225,7 @@ pub fn run(
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
         snapshot_gate: RwLock::new(()),
-        // Only pay the cost of walking the tree to gather .gitignore
-        // rules when we'll actually use them — i.e. when the file watcher
-        // is enabled. With --no-watch the matcher would just sit unused
-        // but we'd still have eaten a full-tree walk at startup.
-        gitignore: if no_watch {
-            None
-        } else {
-            tgrep_core::gitignore::build_matcher(&root)
-        },
+        gitignore: RwLock::new(None),
     });
 
     // Bind TCP listener on a random port
@@ -252,6 +245,23 @@ pub fn run(
         port,
         CACHE_CAPACITY
     );
+
+    if !no_watch {
+        let gitignore_state = Arc::clone(&state);
+        let gitignore_root = root.clone();
+        thread::spawn(move || {
+            let start = Instant::now();
+            eprintln!("[trace] gitignore matcher build started...");
+            let matcher = tgrep_core::gitignore::build_matcher(&gitignore_root);
+            let has_matcher = matcher.is_some();
+            *gitignore_state.gitignore.write().unwrap() = matcher;
+            eprintln!(
+                "[trace] gitignore matcher build complete in {:.1}ms{}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                if has_matcher { "" } else { " (no rules found)" }
+            );
+        });
+    }
 
     // If no pre-existing index, build into the LiveIndex in background
     if needs_build {
@@ -921,7 +931,8 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         // files the initial walk would have skipped — most notably
         // hidden directories like `.git/`, which fire frequent
         // `index.lock`/HEAD/refs writes during normal git operations.
-        if should_skip_watcher_path(&rel_path, &state.exclude_dirs, state.gitignore.as_ref()) {
+        let gitignore = state.gitignore.read().unwrap();
+        if should_skip_watcher_path(&rel_path, &state.exclude_dirs, gitignore.as_ref()) {
             continue;
         }
 

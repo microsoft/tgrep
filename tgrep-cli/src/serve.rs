@@ -84,10 +84,11 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
 /// Lock ordering (acquire in this order to avoid deadlocks):
 ///
 ///   1. `snapshot_gate` — coordinates watcher mutations with publish cycle
-///   2. `publish_lock`  — serializes on-disk index publication
-///   3. `index`         — guards the in-memory HybridIndex (read-heavy)
-///   4. `cache`         — guards the file content LRU cache
-///   5. `file_stamps`   — guards per-file mtime/size stamps
+///   2. `gitignore`     — guards the watcher matcher; drop before file/index work
+///   3. `publish_lock`  — serializes on-disk index publication
+///   4. `index`         — guards the in-memory HybridIndex (read-heavy)
+///   5. `cache`         — guards the file content LRU cache
+///   6. `file_stamps`   — guards per-file mtime/size stamps
 ///
 /// `flushing` is an AtomicBool, not a lock — no ordering constraint.
 /// Searches only acquire `index` (read) and `cache` (read then write);
@@ -108,6 +109,8 @@ struct ServerState {
     index_progress: std::sync::atomic::AtomicU64,
     /// Total files discovered for indexing.
     index_total: std::sync::atomic::AtomicU64,
+    /// True when file watching is enabled for this server.
+    watch_enabled: bool,
     /// Directories to exclude from indexing.
     exclude_dirs: Vec<String>,
     /// Serializes on-disk index publication across all publishers
@@ -147,10 +150,11 @@ struct ServerState {
     /// Gitignore matcher used by the file watcher to drop events for
     /// paths the initial walk would have skipped via the `ignore` crate
     /// (`.gitignore`, `.git/info/exclude`, global gitignore, etc.).
-    /// Built once at startup; `None` if the matcher could not be built
-    /// (in which case the watcher just falls back to its hidden / exclude
-    /// filtering and accepts that gitignored files may be reindexed).
-    gitignore: Option<tgrep_core::gitignore::Gitignore>,
+    /// Built asynchronously after the server starts so large repos don't block
+    /// `serve ready` on a full-tree `.gitignore` discovery walk. `None` while
+    /// loading or if no matcher could be built; during that window the watcher
+    /// falls back to hidden / exclude filtering.
+    gitignore: RwLock<Option<tgrep_core::gitignore::Gitignore>>,
 }
 
 struct SearchOpts {
@@ -220,19 +224,12 @@ pub fn run(
         flushing: std::sync::atomic::AtomicBool::new(false),
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
+        watch_enabled: !no_watch,
         exclude_dirs: exclude_dirs.to_vec(),
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
         snapshot_gate: RwLock::new(()),
-        // Only pay the cost of walking the tree to gather .gitignore
-        // rules when we'll actually use them — i.e. when the file watcher
-        // is enabled. With --no-watch the matcher would just sit unused
-        // but we'd still have eaten a full-tree walk at startup.
-        gitignore: if no_watch {
-            None
-        } else {
-            tgrep_core::gitignore::build_matcher(&root)
-        },
+        gitignore: RwLock::new(None),
     });
 
     // Bind TCP listener on a random port
@@ -268,6 +265,9 @@ pub fn run(
         let stale_index_dir = index_dir.clone();
         thread::spawn(move || {
             background_refresh_stale(&stale_state, &stale_root, &stale_index_dir);
+            if stale_state.watch_enabled {
+                build_gitignore_matcher_after_ready(&stale_state, &stale_root);
+            }
         });
     }
 
@@ -310,6 +310,19 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn build_gitignore_matcher_after_ready(state: &ServerState, root: &Path) {
+    let start = Instant::now();
+    eprintln!("[trace] gitignore matcher build started...");
+    let matcher = tgrep_core::gitignore::build_matcher(root);
+    let has_matcher = matcher.is_some();
+    *state.gitignore.write().unwrap() = matcher;
+    eprintln!(
+        "[trace] gitignore matcher build complete in {:.1}ms{}",
+        start.elapsed().as_secs_f64() * 1000.0,
+        if has_matcher { "" } else { " (no rules found)" }
+    );
 }
 
 fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
@@ -921,7 +934,11 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
         // files the initial walk would have skipped — most notably
         // hidden directories like `.git/`, which fire frequent
         // `index.lock`/HEAD/refs writes during normal git operations.
-        if should_skip_watcher_path(&rel_path, &state.exclude_dirs, state.gitignore.as_ref()) {
+        let should_skip = {
+            let gitignore = state.gitignore.read().unwrap();
+            should_skip_watcher_path(&rel_path, &state.exclude_dirs, gitignore.as_ref())
+        };
+        if should_skip {
             continue;
         }
 
@@ -1356,10 +1373,24 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         root,
         &WalkOptions {
             include_hidden: false,
+            collect_gitignore_files: state.watch_enabled,
             exclude_dirs: state.exclude_dirs.clone(),
             ..Default::default()
         },
     );
+
+    if state.watch_enabled {
+        let start = Instant::now();
+        let matcher = walker::build_gitignore_matcher_from_files(root, &walk.gitignore_files);
+        let has_matcher = matcher.is_some();
+        *state.gitignore.write().unwrap() = matcher;
+        eprintln!(
+            "[trace] gitignore matcher built from index walk in {:.1}ms ({} .gitignore files{})",
+            start.elapsed().as_secs_f64() * 1000.0,
+            walk.gitignore_files.len(),
+            if has_matcher { "" } else { ", no rules found" }
+        );
+    }
 
     // Filter out already-indexed files
     let new_files: Vec<_> = if skip_paths.is_empty() {

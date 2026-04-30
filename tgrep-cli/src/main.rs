@@ -34,9 +34,9 @@ struct Cli {
     #[arg(global = false)]
     pattern: Option<String>,
 
-    /// Root directory to search.
-    #[arg(global = false, default_value = ".")]
-    path: PathBuf,
+    /// Root directories or files to search.
+    #[arg(global = false, value_name = "PATH", num_args = 0..)]
+    paths: Vec<String>,
 
     // ── Matching ──────────────────────────────────────
     /// Case-insensitive matching.
@@ -235,9 +235,9 @@ enum Command {
         /// The regex pattern to search for.
         pattern: String,
 
-        /// Root directory to search.
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        /// Root directories or files to search.
+        #[arg(value_name = "PATH", num_args = 0..)]
+        paths: Vec<String>,
     },
 
     /// Show index and server status.
@@ -325,16 +325,16 @@ fn main() {
         }) => serve::run(&path, cli.index_path.as_deref(), no_watch, &exclude),
         Some(Command::Search {
             ref pattern,
-            ref path,
-        }) => run_search(&cli, pattern.clone(), path),
+            ref paths,
+        }) => run_search(&cli, pattern.clone(), paths),
         Some(Command::Status { path }) => status::run(&path, cli.index_path.as_deref()),
         Some(Command::CountFiles { path }) => walkcount::run(&path, cli.hidden, cli.no_ignore),
         None => {
             if cli.list_files {
                 let opts = cli.build_search_opts(String::new());
-                search::list_files(&cli.path, &opts)
+                list_files(&cli.paths, &opts)
             } else if let Some(pattern) = cli.pattern.clone() {
-                run_search(&cli, pattern, &cli.path)
+                run_search(&cli, pattern, &cli.paths)
             } else {
                 eprintln!("Usage: tgrep <pattern> [path]");
                 eprintln!("       tgrep index [path]");
@@ -352,14 +352,69 @@ fn main() {
     }
 }
 
-fn run_search(cli: &Cli, pattern: String, path: &std::path::Path) -> anyhow::Result<()> {
+fn normalize_search_paths(paths: &[String]) -> Vec<PathBuf> {
+    if paths.is_empty() {
+        return vec![PathBuf::from(".")];
+    }
+
+    paths
+        .iter()
+        .map(|path| {
+            let mut trimmed = path.trim();
+            loop {
+                let unquoted = trimmed
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .or_else(|| {
+                        trimmed
+                            .strip_prefix('\'')
+                            .and_then(|s| s.strip_suffix('\''))
+                    });
+                match unquoted {
+                    Some(inner) => trimmed = inner.trim(),
+                    None => break,
+                }
+            }
+            PathBuf::from(trimmed)
+        })
+        .collect()
+}
+
+fn list_files(paths: &[String], opts: &search::SearchOptions) -> anyhow::Result<()> {
+    for path in normalize_search_paths(paths) {
+        if !path.exists() {
+            continue;
+        }
+        search::list_files(&path, opts)?;
+    }
+    Ok(())
+}
+
+fn run_search(cli: &Cli, pattern: String, paths: &[String]) -> anyhow::Result<()> {
     let opts = cli.build_search_opts(pattern);
-    match search::run(path, cli.index_path.as_deref(), &opts) {
-        Ok(true) => process::exit(0),
-        Ok(false) => process::exit(1),
-        Err(e) => {
-            eprintln!("tgrep: {e}");
-            process::exit(2);
+    let mut had_matches = false;
+
+    for path in normalize_search_paths(paths) {
+        if !path.exists() {
+            continue;
+        }
+        match search::run(&path, cli.index_path.as_deref(), &opts) {
+            Ok(true) => {
+                had_matches = true;
+                if opts.quiet {
+                    process::exit(0);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("tgrep: {e}");
+                process::exit(2);
+            }
         }
     }
+
+    if had_matches {
+        process::exit(0);
+    }
+    process::exit(1);
 }

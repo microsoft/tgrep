@@ -54,6 +54,79 @@ fn tgrep() -> Command {
     Command::cargo_bin("tgrep").unwrap()
 }
 
+// ─── Multiple and normalized path arguments ───────────────────────────
+
+#[test]
+fn accepts_multiple_path_arguments() {
+    let dir = setup_fixture();
+    let root = dir.path().join("testdata");
+    let hello = root.join("hello.rs").to_str().unwrap().to_string();
+    let lib = root.join("lib.rs").to_str().unwrap().to_string();
+
+    tgrep()
+        .args(["--no-index", "--no-heading", "fn", &hello, &lib])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.rs"))
+        .stdout(predicate::str::contains("lib.rs"));
+}
+
+#[test]
+fn strips_extra_quotes_from_path_argument() {
+    let dir = setup_fixture();
+    let quoted = format!("\"{}\"", fixture_path(&dir));
+
+    tgrep()
+        .args(["--no-index", "--no-heading", "fn main", &quoted])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.rs"));
+}
+
+#[test]
+fn missing_path_is_treated_as_no_matches() {
+    let dir = setup_fixture();
+    let missing = dir
+        .path()
+        .join("testdata")
+        .join("does-not-exist.rs")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    tgrep()
+        .args(["--no-index", "--no-heading", "fn", &missing])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn supports_negative_lookahead_fallback() {
+    let dir = setup_fixture();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "hello(?! world)",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "hello(?! there)",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello world"));
+}
+
 // ─── --glob / -g (multiple) ───────────────────────────────────────────
 
 #[test]

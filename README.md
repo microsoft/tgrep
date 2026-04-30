@@ -104,7 +104,9 @@ simultaneously.
 
 ```bash
 tgrep "pattern" .                 # basic regex search
+tgrep "pattern" file1.rs file2.rs # search multiple files/paths
 tgrep "TODO|FIXME" .              # alternations
+tgrep '\w+(?!_test)' .            # PCRE-style lookahead fallback
 tgrep "error" . -i                # case-insensitive
 tgrep "error" . -S                # smart-case (auto if all lowercase)
 tgrep -F "Vec<T>" .               # literal string
@@ -131,6 +133,7 @@ tgrep "pattern" . -L              # files that DON'T match
 tgrep "pattern" . --no-filename   # suppress filenames
 tgrep "pattern" . -N              # suppress line numbers
 tgrep --files .                   # list searchable files
+tgrep --files src/main.rs         # list a single file if searchable
 tgrep --files -t rust .           # list Rust files only
 tgrep --type-list                 # show all file types
 ```

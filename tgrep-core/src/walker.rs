@@ -31,6 +31,7 @@ fn should_skip_dir(entry: &ignore::DirEntry, exclude_dirs: &[String]) -> bool {
 
 pub struct WalkResult {
     pub files: Vec<PathBuf>,
+    pub gitignore_files: Vec<PathBuf>,
     pub skipped_binary: usize,
     pub skipped_error: usize,
 }
@@ -40,6 +41,8 @@ pub struct WalkOptions {
     pub include_hidden: bool,
     pub no_ignore: bool,
     pub search_binary: bool,
+    /// Collect `.gitignore` file paths encountered during the walk.
+    pub collect_gitignore_files: bool,
     /// Directory names to exclude from walking (e.g., "vendor", "third_party").
     pub exclude_dirs: Vec<String>,
 }
@@ -62,22 +65,32 @@ fn is_binary_extension(path: &Path) -> bool {
 /// avoiding an extra 8KB read per file during the walk.
 pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
     let files = std::sync::Mutex::new(Vec::new());
+    let gitignore_files = std::sync::Mutex::new(Vec::new());
     let skipped_binary = std::sync::atomic::AtomicUsize::new(0);
     let skipped_error = std::sync::atomic::AtomicUsize::new(0);
     let exclude_dirs: std::sync::Arc<Vec<String>> = std::sync::Arc::new(opts.exclude_dirs.clone());
     let search_binary = opts.search_binary;
+    let include_hidden = opts.include_hidden;
+    let collect_gitignore_files = opts.collect_gitignore_files;
+    let root = root.to_path_buf();
 
-    let walker = WalkBuilder::new(root)
-        .hidden(!opts.include_hidden)
+    let mut builder = WalkBuilder::new(&root);
+    builder
+        // When collecting .gitignore paths, keep hidden entries visible to the
+        // walker and apply hidden filtering below so .gitignore files are seen
+        // while hidden directories/files still match normal index behavior.
+        .hidden(!include_hidden && !collect_gitignore_files)
         .git_ignore(!opts.no_ignore)
         .git_global(!opts.no_ignore)
         .git_exclude(!opts.no_ignore)
-        .threads(walker_thread_count())
-        .build_parallel();
+        .threads(walker_thread_count());
+    let walker = builder.build_parallel();
 
     walker.run(|| {
         let exclude = exclude_dirs.clone();
+        let root = root.clone();
         let files = &files;
+        let gitignore_files = &gitignore_files;
         let skipped_binary = &skipped_binary;
         let skipped_error = &skipped_error;
         Box::new(move |entry| {
@@ -90,6 +103,16 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
             };
 
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if collect_gitignore_files
+                    && entry.path() != root
+                    && !include_hidden
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with('.'))
+                {
+                    return ignore::WalkState::Skip;
+                }
                 if should_skip_dir(&entry, &exclude) {
                     return ignore::WalkState::Skip;
                 }
@@ -101,6 +124,23 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
             }
 
             let path = entry.path();
+
+            if collect_gitignore_files && entry.file_name() == ".gitignore" {
+                gitignore_files.lock().unwrap().push(path.to_path_buf());
+                if !include_hidden {
+                    return ignore::WalkState::Continue;
+                }
+            }
+
+            if collect_gitignore_files
+                && !include_hidden
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with('.'))
+            {
+                return ignore::WalkState::Continue;
+            }
 
             if !search_binary {
                 if is_binary_extension(path) {
@@ -123,9 +163,35 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
 
     WalkResult {
         files: files.into_inner().unwrap(),
+        gitignore_files: gitignore_files.into_inner().unwrap(),
         skipped_binary: skipped_binary.into_inner(),
         skipped_error: skipped_error.into_inner(),
     }
+}
+
+/// Build a point-query gitignore matcher from `.gitignore` files discovered by
+/// an existing walk, avoiding a second full-tree discovery pass.
+pub fn build_gitignore_matcher_from_files(
+    root: &Path,
+    gitignore_files: &[PathBuf],
+) -> Option<crate::gitignore::Gitignore> {
+    use ignore::gitignore::GitignoreBuilder;
+
+    let mut builder = GitignoreBuilder::new(root);
+
+    let info_exclude = root.join(".git").join("info").join("exclude");
+    if info_exclude.is_file() {
+        let _ = builder.add(&info_exclude);
+    }
+
+    for path in gitignore_files {
+        if path.is_file() {
+            let _ = builder.add(path);
+        }
+    }
+
+    let gi = builder.build().ok()?;
+    if gi.is_empty() { None } else { Some(gi) }
 }
 
 /// Filesystem metadata for a single file (no content read).
@@ -331,6 +397,103 @@ mod tests {
         );
         let names = sorted_filenames(&result, &root);
         assert!(!names.iter().any(|n| n.starts_with("vendor/")));
+    }
+
+    #[test]
+    fn walk_dir_can_collect_gitignore_files_without_indexing_them() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("testdata");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("src").join(".gitignore"), "*.tmp\n").unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+
+        let result = walk_dir(
+            &root,
+            &WalkOptions {
+                collect_gitignore_files: true,
+                ..Default::default()
+            },
+        );
+        let names = sorted_filenames(&result, &root);
+        let mut gitignores: Vec<_> = result
+            .gitignore_files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        gitignores.sort();
+
+        assert_eq!(names, vec!["src/main.rs"]);
+        assert_eq!(gitignores, vec![".gitignore", "src/.gitignore"]);
+    }
+
+    #[test]
+    fn walk_dir_collects_and_indexes_gitignore_when_hidden_included() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("testdata");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+
+        let result = walk_dir(
+            &root,
+            &WalkOptions {
+                include_hidden: true,
+                collect_gitignore_files: true,
+                ..Default::default()
+            },
+        );
+        let names = sorted_filenames(&result, &root);
+        let gitignores: Vec<_> = result
+            .gitignore_files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert_eq!(names, vec![".gitignore", "src/main.rs"]);
+        assert_eq!(gitignores, vec![".gitignore"]);
+    }
+
+    #[test]
+    fn build_gitignore_matcher_from_discovered_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("testdata");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("src").join(".gitignore"), "*.tmp\n").unwrap();
+
+        let walk = walk_dir(
+            &root,
+            &WalkOptions {
+                collect_gitignore_files: true,
+                ..Default::default()
+            },
+        );
+        let gi = build_gitignore_matcher_from_files(&root, &walk.gitignore_files)
+            .expect("matcher should build from discovered .gitignore files");
+
+        assert!(
+            gi.matched_path_or_any_parents("build/output.log", false)
+                .is_ignore()
+        );
+        assert!(
+            gi.matched_path_or_any_parents("src/cache.tmp", false)
+                .is_ignore()
+        );
+        assert!(
+            !gi.matched_path_or_any_parents("src/main.rs", false)
+                .is_ignore()
+        );
     }
 
     #[test]

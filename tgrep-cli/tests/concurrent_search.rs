@@ -255,6 +255,32 @@ fn concurrent_different_searches() {
 }
 
 #[test]
+fn server_supports_negative_lookahead_fallback() {
+    let dir = setup_fixture();
+    let server = start_server(dir.path().join("src").as_path());
+
+    let req = search_request(1, r"alpha_handler(?!\()");
+    let resp = send_request(server.port, &req).expect("request failed");
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("invalid JSON");
+    assert!(v.get("error").is_none(), "got error: {v}");
+    assert_eq!(
+        v.pointer("/result/num_matches").and_then(|n| n.as_u64()),
+        Some(0)
+    );
+
+    let req = search_request(2, r"alpha_handler(?!_missing)");
+    let resp = send_request(server.port, &req).expect("request failed");
+    let v: serde_json::Value = serde_json::from_str(&resp).expect("invalid JSON");
+    assert!(v.get("error").is_none(), "got error: {v}");
+    assert!(
+        v.pointer("/result/num_matches")
+            .and_then(|n| n.as_u64())
+            .is_some_and(|count| count > 0),
+        "expected matches for lookahead fallback, got {v}"
+    );
+}
+
+#[test]
 fn concurrent_searches_with_different_options() {
     let dir = setup_fixture();
     let server = start_server(dir.path().join("src").as_path());

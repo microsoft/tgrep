@@ -2,33 +2,6 @@
 //! search path (search.rs). Extracts the core line-matching and context-window
 //! algorithms so both callers avoid duplicating them.
 
-/// Find indices of matching lines in `lines`, respecting `invert_match` and
-/// `max_count`. Returns the indices into the `lines` slice.
-pub fn find_match_indices(
-    lines: &[&str],
-    re: &regex::Regex,
-    invert_match: bool,
-    max_count: Option<usize>,
-) -> Vec<usize> {
-    if max_count == Some(0) {
-        return Vec::new();
-    }
-    let mut indices = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let is_match = re.is_match(line);
-        let include = if invert_match { !is_match } else { is_match };
-        if include {
-            indices.push(i);
-            if let Some(max) = max_count
-                && indices.len() >= max
-            {
-                break;
-            }
-        }
-    }
-    indices
-}
-
 /// Expand match indices into the full set of line indices to display,
 /// including context lines. Returns a sorted, deduplicated set.
 pub fn expand_context_window(

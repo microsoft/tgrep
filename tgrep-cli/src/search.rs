@@ -18,6 +18,57 @@ use tgrep_core::walker;
 use crate::output::{ColorMode, ContextLine, Match, OutputConfig, OutputWriter};
 use crate::serve::ServerInfo;
 
+pub(crate) enum SearchMatcher {
+    Standard(regex::Regex),
+    Fancy(fancy_regex::Regex),
+}
+
+impl SearchMatcher {
+    pub(crate) fn is_standard(&self) -> bool {
+        matches!(self, SearchMatcher::Standard(_))
+    }
+
+    pub(crate) fn is_match(&self, line: &str) -> Result<bool> {
+        match self {
+            SearchMatcher::Standard(re) => Ok(re.is_match(line)),
+            SearchMatcher::Fancy(re) => re
+                .is_match(line)
+                .map_err(|e| anyhow::anyhow!("regex match error: {e}")),
+        }
+    }
+
+    pub(crate) fn find_start(&self, line: &str) -> Result<Option<usize>> {
+        match self {
+            SearchMatcher::Standard(re) => Ok(re.find(line).map(|m| m.start())),
+            SearchMatcher::Fancy(re) => re
+                .find(line)
+                .map(|m| m.map(|m| m.start()))
+                .map_err(|e| anyhow::anyhow!("regex match error: {e}")),
+        }
+    }
+
+    pub(crate) fn match_content(&self, line: &str, only_matching: bool) -> Result<String> {
+        if !only_matching {
+            return Ok(line.to_string());
+        }
+
+        match self {
+            SearchMatcher::Standard(re) => Ok(crate::matching::match_content(line, re, true)),
+            SearchMatcher::Fancy(re) => {
+                let mut matches = Vec::new();
+                for m in re.find_iter(line) {
+                    matches.push(
+                        m.map_err(|e| anyhow::anyhow!("regex match error: {e}"))?
+                            .as_str()
+                            .to_string(),
+                    );
+                }
+                Ok(matches.join("\n"))
+            }
+        }
+    }
+}
+
 pub struct SearchOptions {
     pub pattern: String,
     pub extra_patterns: Vec<String>,
@@ -109,8 +160,24 @@ impl SearchOptions {
 
 /// List files that would be searched (--files mode).
 pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
-    let root = std::fs::canonicalize(root)?;
+    let root = match std::fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
     let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
+
+    if root.is_file() {
+        let rel_path = explicit_file_display_path(&root);
+
+        if passes_filters(&rel_path, &glob_filter, &opts.file_type) {
+            let mut writer = OutputWriter::new(opts.make_output_config());
+            writer.write_file(&rel_path)?;
+            writer.flush()?;
+        }
+        return Ok(());
+    }
+
     let walk = walker::walk_dir(
         &root,
         &walker::WalkOptions {
@@ -143,7 +210,11 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
 }
 
 pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Result<bool> {
-    let root = std::fs::canonicalize(root)?;
+    let root = match std::fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
     let index_dir = index_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| builder::default_index_dir(&root));
@@ -299,7 +370,7 @@ fn search_local_index(
     let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
 
     let all_patterns = opts.all_patterns()?;
-    let re = build_combined_regex(
+    let matcher = build_search_matcher(
         &all_patterns,
         ci,
         opts.fixed_string,
@@ -307,8 +378,10 @@ fn search_local_index(
         opts.multiline,
     )?;
 
-    // Build query plan from primary pattern
-    let plan = if opts.fixed_string {
+    // Build query plan from primary pattern when the accelerated regex engine supports it.
+    let plan = if !matcher.is_standard() {
+        QueryPlan::MatchAll
+    } else if opts.fixed_string {
         query::build_literal_plan(&opts.pattern, ci)
     } else {
         query::build_query_plan(&opts.pattern, ci).map_err(|e| anyhow::anyhow!("{e}"))?
@@ -350,7 +423,7 @@ fn search_local_index(
             Err(_) => continue,
         };
 
-        let matched = search_file_content(&content, &re, &rel_path, opts, &mut writer)?;
+        let matched = search_file_content(&content, &matcher, &rel_path, opts, &mut writer)?;
         if matched {
             if !opts.files_without_match {
                 had_matches = true;
@@ -385,25 +458,8 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
     let start = Instant::now();
     let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
 
-    // If root is a file, walk its parent and filter to just that file
-    let (walk_root, single_file) = if root.is_file() {
-        let parent = root.parent().unwrap_or(root);
-        (parent.to_path_buf(), Some(root.to_path_buf()))
-    } else {
-        (root.to_path_buf(), None)
-    };
-
-    let walk = walker::walk_dir(
-        &walk_root,
-        &walker::WalkOptions {
-            include_hidden: opts.hidden,
-            no_ignore: opts.no_ignore,
-            ..Default::default()
-        },
-    );
-
     let all_patterns = opts.all_patterns()?;
-    let re = build_combined_regex(
+    let matcher = build_search_matcher(
         &all_patterns,
         ci,
         opts.fixed_string,
@@ -414,16 +470,47 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
     let mut writer = OutputWriter::new(opts.make_output_config());
     let mut had_matches = false;
 
-    for path in &walk.files {
-        // If we're searching a single file, skip everything else
-        if let Some(ref sf) = single_file
-            && path != sf
-        {
-            continue;
+    if root.is_file() {
+        let rel_path = explicit_file_display_path(root);
+        if passes_filters(&rel_path, &glob_filter, &opts.file_type) {
+            let content = std::fs::read_to_string(root)?;
+            let matched = search_file_content(&content, &matcher, &rel_path, opts, &mut writer)?;
+            if matched {
+                if !opts.files_without_match {
+                    had_matches = true;
+                }
+            } else if opts.files_without_match {
+                if !opts.quiet {
+                    writer.write_file(&rel_path)?;
+                }
+                had_matches = true;
+            }
         }
 
+        if opts.stats {
+            let elapsed = start.elapsed();
+            eprintln!(
+                "Brute-force search completed in {:.1}ms (1 files)",
+                elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+
+        writer.flush()?;
+        return Ok(had_matches);
+    }
+
+    let walk = walker::walk_dir(
+        root,
+        &walker::WalkOptions {
+            include_hidden: opts.hidden,
+            no_ignore: opts.no_ignore,
+            ..Default::default()
+        },
+    );
+
+    for path in &walk.files {
         let rel_path = path
-            .strip_prefix(&walk_root)
+            .strip_prefix(root)
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
@@ -437,7 +524,7 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
             Err(_) => continue,
         };
 
-        let matched = search_file_content(&content, &re, &rel_path, opts, &mut writer)?;
+        let matched = search_file_content(&content, &matcher, &rel_path, opts, &mut writer)?;
         if matched {
             if !opts.files_without_match {
                 had_matches = true;
@@ -473,7 +560,7 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
 /// Returns true if any matches were found.
 fn search_file_content(
     content: &str,
-    re: &regex::Regex,
+    matcher: &SearchMatcher,
     rel_path: &str,
     opts: &SearchOptions,
     writer: &mut OutputWriter,
@@ -489,8 +576,7 @@ fn search_file_content(
     } else {
         opts.max_count
     };
-    let match_indices =
-        crate::matching::find_match_indices(&lines, re, opts.invert_match, effective_max);
+    let match_indices = find_match_indices(&lines, matcher, opts.invert_match, effective_max)?;
 
     if match_indices.is_empty() {
         return Ok(false);
@@ -528,8 +614,8 @@ fn search_file_content(
             }
 
             if is_match_line.contains(&li) {
-                let content = crate::matching::match_content(lines[li], re, opts.only_matching);
-                let column = re.find(lines[li]).map(|m| m.start() + 1);
+                let content = matcher.match_content(lines[li], opts.only_matching)?;
+                let column = matcher.find_start(lines[li])?.map(|start| start + 1);
                 writer.write_match(&Match {
                     file: rel_path.to_string(),
                     line_number: li + 1,
@@ -547,8 +633,8 @@ fn search_file_content(
         }
     } else {
         for &mi in &match_indices {
-            let content = crate::matching::match_content(lines[mi], re, opts.only_matching);
-            let column = re.find(lines[mi]).map(|m| m.start() + 1);
+            let content = matcher.match_content(lines[mi], opts.only_matching)?;
+            let column = matcher.find_start(lines[mi])?.map(|start| start + 1);
             writer.write_match(&Match {
                 file: rel_path.to_string(),
                 line_number: mi + 1,
@@ -561,14 +647,45 @@ fn search_file_content(
     Ok(true)
 }
 
-pub fn build_combined_regex(
+pub(crate) fn build_search_matcher(
     patterns: &[String],
     case_insensitive: bool,
     fixed_string: bool,
     word_boundary: bool,
     multiline: bool,
-) -> Result<regex::Regex> {
-    let combined = if patterns.len() == 1 {
+) -> Result<SearchMatcher> {
+    let combined = combine_patterns(patterns, fixed_string, word_boundary);
+
+    match build_regex(&combined, case_insensitive, multiline) {
+        Ok(re) => Ok(SearchMatcher::Standard(re)),
+        Err(regex_err) if !fixed_string => {
+            let mut flags = String::new();
+            if case_insensitive {
+                flags.push('i');
+            }
+            if multiline {
+                flags.push('m');
+                flags.push('s');
+            }
+            let fancy_pattern = if flags.is_empty() {
+                combined
+            } else {
+                format!("(?{flags}:{combined})")
+            };
+            fancy_regex::Regex::new(&fancy_pattern)
+                .map(SearchMatcher::Fancy)
+                .map_err(|fancy_err| {
+                    anyhow::anyhow!(
+                        "regex error: {regex_err}; PCRE-style fallback failed: {fancy_err}"
+                    )
+                })
+        }
+        Err(regex_err) => Err(regex_err),
+    }
+}
+
+fn combine_patterns(patterns: &[String], fixed_string: bool, word_boundary: bool) -> String {
+    if patterns.len() == 1 {
         let mut p = if fixed_string {
             regex::escape(&patterns[0])
         } else {
@@ -594,9 +711,11 @@ pub fn build_combined_regex(
             })
             .collect();
         format!("(?:{})", parts.join("|"))
-    };
+    }
+}
 
-    RegexBuilder::new(&combined)
+fn build_regex(combined: &str, case_insensitive: bool, multiline: bool) -> Result<regex::Regex> {
+    RegexBuilder::new(combined)
         .case_insensitive(case_insensitive)
         .multi_line(multiline)
         .dot_matches_new_line(multiline)
@@ -605,6 +724,41 @@ pub fn build_combined_regex(
         .nest_limit(250)
         .build()
         .map_err(|e| anyhow::anyhow!("regex error: {e}"))
+}
+
+pub(crate) fn find_match_indices(
+    lines: &[&str],
+    matcher: &SearchMatcher,
+    invert_match: bool,
+    max_count: Option<usize>,
+) -> Result<Vec<usize>> {
+    if max_count == Some(0) {
+        return Ok(Vec::new());
+    }
+    let mut indices = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let is_match = matcher.is_match(line)?;
+        let include = if invert_match { !is_match } else { is_match };
+        if include {
+            indices.push(i);
+            if let Some(max) = max_count
+                && indices.len() >= max
+            {
+                break;
+            }
+        }
+    }
+    Ok(indices)
+}
+
+fn explicit_file_display_path(path: &Path) -> String {
+    let display_path = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+        .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| path.to_path_buf());
+
+    display_path.to_string_lossy().replace('\\', "/")
 }
 
 fn passes_filters(

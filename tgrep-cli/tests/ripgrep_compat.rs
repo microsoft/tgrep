@@ -54,6 +54,129 @@ fn tgrep() -> Command {
     Command::cargo_bin("tgrep").unwrap()
 }
 
+// ─── Multiple and normalized path arguments ───────────────────────────
+
+#[test]
+fn accepts_multiple_path_arguments() {
+    let dir = setup_fixture();
+    let root = dir.path().join("testdata");
+    let hello = root.join("hello.rs").to_str().unwrap().to_string();
+    let lib = root.join("lib.rs").to_str().unwrap().to_string();
+
+    tgrep()
+        .args(["--no-index", "--no-heading", "fn", &hello, &lib])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.rs"))
+        .stdout(predicate::str::contains("lib.rs"));
+}
+
+#[test]
+fn strips_extra_quotes_from_path_argument() {
+    let dir = setup_fixture();
+    let quoted = format!("\"{}\"", fixture_path(&dir));
+
+    tgrep()
+        .args(["--no-index", "--no-heading", "fn main", &quoted])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.rs"));
+}
+
+#[test]
+fn missing_path_is_treated_as_no_matches() {
+    let dir = setup_fixture();
+    let missing = dir
+        .path()
+        .join("testdata")
+        .join("does-not-exist.rs")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    tgrep()
+        .args(["--no-index", "--no-heading", "fn", &missing])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn supports_negative_lookahead_fallback() {
+    let dir = setup_fixture();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "hello(?! world)",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "hello(?! there)",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello world"));
+}
+
+#[test]
+fn files_mode_accepts_single_file_path() {
+    let dir = setup_fixture();
+    let hello = dir
+        .path()
+        .join("testdata")
+        .join("hello.rs")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    tgrep()
+        .args(["--files", &hello])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.rs"))
+        .stdout(predicate::str::contains("lib.rs").not());
+}
+
+#[test]
+fn files_mode_preserves_single_file_relative_path_for_globs() {
+    let dir = setup_fixture();
+
+    tgrep()
+        .current_dir(dir.path())
+        .args(["--files", "-g", "testdata/*", "testdata/hello.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("testdata/hello.rs"))
+        .stdout(predicate::str::contains("lib.rs").not());
+}
+
+#[test]
+fn explicit_file_search_bypasses_hidden_walk_filter() {
+    let dir = setup_fixture();
+    let hidden = dir.path().join("testdata").join(".hidden.rs");
+    fs::write(&hidden, "fn hidden_entry() {}\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "hidden_entry",
+            hidden.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".hidden.rs"));
+}
+
 // ─── --glob / -g (multiple) ───────────────────────────────────────────
 
 #[test]

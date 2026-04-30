@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive"] }
 notify = "7"
 rayon = "1"
 regex = "1"
+fancy-regex = "0.14"
 lru = "0.16.3"
 fs2 = "0.4.3"
 globset = "0.4.18"

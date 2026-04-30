@@ -18,17 +18,17 @@ use tgrep_core::walker;
 use crate::output::{ColorMode, ContextLine, Match, OutputConfig, OutputWriter};
 use crate::serve::ServerInfo;
 
-enum SearchMatcher {
+pub(crate) enum SearchMatcher {
     Standard(regex::Regex),
     Fancy(fancy_regex::Regex),
 }
 
 impl SearchMatcher {
-    fn is_standard(&self) -> bool {
+    pub(crate) fn is_standard(&self) -> bool {
         matches!(self, SearchMatcher::Standard(_))
     }
 
-    fn is_match(&self, line: &str) -> Result<bool> {
+    pub(crate) fn is_match(&self, line: &str) -> Result<bool> {
         match self {
             SearchMatcher::Standard(re) => Ok(re.is_match(line)),
             SearchMatcher::Fancy(re) => re
@@ -37,7 +37,7 @@ impl SearchMatcher {
         }
     }
 
-    fn find_start(&self, line: &str) -> Result<Option<usize>> {
+    pub(crate) fn find_start(&self, line: &str) -> Result<Option<usize>> {
         match self {
             SearchMatcher::Standard(re) => Ok(re.find(line).map(|m| m.start())),
             SearchMatcher::Fancy(re) => re
@@ -47,7 +47,7 @@ impl SearchMatcher {
         }
     }
 
-    fn match_content(&self, line: &str, only_matching: bool) -> Result<String> {
+    pub(crate) fn match_content(&self, line: &str, only_matching: bool) -> Result<String> {
         if !only_matching {
             return Ok(line.to_string());
         }
@@ -168,10 +168,7 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
     let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
 
     if root.is_file() {
-        let rel_path = root
-            .file_name()
-            .map(|name| name.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|| root.to_string_lossy().replace('\\', "/"));
+        let rel_path = explicit_file_display_path(&root);
 
         if passes_filters(&rel_path, &glob_filter, &opts.file_type) {
             let mut writer = OutputWriter::new(opts.make_output_config());
@@ -461,23 +458,6 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
     let start = Instant::now();
     let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
 
-    // If root is a file, walk its parent and filter to just that file
-    let (walk_root, single_file) = if root.is_file() {
-        let parent = root.parent().unwrap_or(root);
-        (parent.to_path_buf(), Some(root.to_path_buf()))
-    } else {
-        (root.to_path_buf(), None)
-    };
-
-    let walk = walker::walk_dir(
-        &walk_root,
-        &walker::WalkOptions {
-            include_hidden: opts.hidden,
-            no_ignore: opts.no_ignore,
-            ..Default::default()
-        },
-    );
-
     let all_patterns = opts.all_patterns()?;
     let matcher = build_search_matcher(
         &all_patterns,
@@ -490,16 +470,47 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
     let mut writer = OutputWriter::new(opts.make_output_config());
     let mut had_matches = false;
 
-    for path in &walk.files {
-        // If we're searching a single file, skip everything else
-        if let Some(ref sf) = single_file
-            && path != sf
-        {
-            continue;
+    if root.is_file() {
+        let rel_path = explicit_file_display_path(root);
+        if passes_filters(&rel_path, &glob_filter, &opts.file_type) {
+            let content = std::fs::read_to_string(root)?;
+            let matched = search_file_content(&content, &matcher, &rel_path, opts, &mut writer)?;
+            if matched {
+                if !opts.files_without_match {
+                    had_matches = true;
+                }
+            } else if opts.files_without_match {
+                if !opts.quiet {
+                    writer.write_file(&rel_path)?;
+                }
+                had_matches = true;
+            }
         }
 
+        if opts.stats {
+            let elapsed = start.elapsed();
+            eprintln!(
+                "Brute-force search completed in {:.1}ms (1 files)",
+                elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+
+        writer.flush()?;
+        return Ok(had_matches);
+    }
+
+    let walk = walker::walk_dir(
+        root,
+        &walker::WalkOptions {
+            include_hidden: opts.hidden,
+            no_ignore: opts.no_ignore,
+            ..Default::default()
+        },
+    );
+
+    for path in &walk.files {
         let rel_path = path
-            .strip_prefix(&walk_root)
+            .strip_prefix(root)
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
@@ -636,19 +647,7 @@ fn search_file_content(
     Ok(true)
 }
 
-pub fn build_combined_regex(
-    patterns: &[String],
-    case_insensitive: bool,
-    fixed_string: bool,
-    word_boundary: bool,
-    multiline: bool,
-) -> Result<regex::Regex> {
-    let combined = combine_patterns(patterns, fixed_string, word_boundary);
-
-    build_regex(&combined, case_insensitive, multiline)
-}
-
-fn build_search_matcher(
+pub(crate) fn build_search_matcher(
     patterns: &[String],
     case_insensitive: bool,
     fixed_string: bool,
@@ -727,7 +726,7 @@ fn build_regex(combined: &str, case_insensitive: bool, multiline: bool) -> Resul
         .map_err(|e| anyhow::anyhow!("regex error: {e}"))
 }
 
-fn find_match_indices(
+pub(crate) fn find_match_indices(
     lines: &[&str],
     matcher: &SearchMatcher,
     invert_match: bool,
@@ -750,6 +749,16 @@ fn find_match_indices(
         }
     }
     Ok(indices)
+}
+
+fn explicit_file_display_path(path: &Path) -> String {
+    let display_path = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+        .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| path.to_path_buf());
+
+    display_path.to_string_lossy().replace('\\', "/")
 }
 
 fn passes_filters(

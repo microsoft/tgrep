@@ -146,6 +146,37 @@ fn files_mode_accepts_single_file_path() {
         .stdout(predicate::str::contains("lib.rs").not());
 }
 
+#[test]
+fn files_mode_preserves_single_file_relative_path_for_globs() {
+    let dir = setup_fixture();
+
+    tgrep()
+        .current_dir(dir.path())
+        .args(["--files", "-g", "testdata/*", "testdata/hello.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("testdata/hello.rs"))
+        .stdout(predicate::str::contains("lib.rs").not());
+}
+
+#[test]
+fn explicit_file_search_bypasses_hidden_walk_filter() {
+    let dir = setup_fixture();
+    let hidden = dir.path().join("testdata").join(".hidden.rs");
+    fs::write(&hidden, "fn hidden_entry() {}\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "hidden_entry",
+            hidden.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".hidden.rs"));
+}
+
 // ─── --glob / -g (multiple) ───────────────────────────────────────────
 
 #[test]

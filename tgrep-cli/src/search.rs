@@ -166,6 +166,21 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
+
+    if root.is_file() {
+        let rel_path = root
+            .file_name()
+            .map(|name| name.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| root.to_string_lossy().replace('\\', "/"));
+
+        if passes_filters(&rel_path, &glob_filter, &opts.file_type) {
+            let mut writer = OutputWriter::new(opts.make_output_config());
+            writer.write_file(&rel_path)?;
+            writer.flush()?;
+        }
+        return Ok(());
+    }
+
     let walk = walker::walk_dir(
         &root,
         &walker::WalkOptions {

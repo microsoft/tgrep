@@ -127,6 +127,25 @@ fn supports_negative_lookahead_fallback() {
         .stdout(predicate::str::contains("hello world"));
 }
 
+#[test]
+fn files_mode_accepts_single_file_path() {
+    let dir = setup_fixture();
+    let hello = dir
+        .path()
+        .join("testdata")
+        .join("hello.rs")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    tgrep()
+        .args(["--files", &hello])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.rs"))
+        .stdout(predicate::str::contains("lib.rs").not());
+}
+
 // ─── --glob / -g (multiple) ───────────────────────────────────────────
 
 #[test]

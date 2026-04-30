@@ -332,14 +332,16 @@ fn main() {
         None => {
             if cli.list_files {
                 let opts = cli.build_search_opts(String::new());
-                list_files(&cli.paths, &opts)
+                let paths = list_files_paths(&cli);
+                list_files(&paths, &opts)
             } else if let Some(pattern) = cli.pattern.clone() {
                 run_search(&cli, pattern, &cli.paths)
             } else {
-                eprintln!("Usage: tgrep <pattern> [path]");
+                eprintln!("Usage: tgrep <pattern> [PATH ...]");
                 eprintln!("       tgrep index [path]");
                 eprintln!("       tgrep serve [path]");
                 eprintln!("       tgrep status [path]");
+                eprintln!("Search defaults to the current directory when no path is provided.");
                 eprintln!("Run `tgrep --help` for full usage.");
                 process::exit(2);
             }
@@ -378,6 +380,15 @@ fn normalize_search_paths(paths: &[String]) -> Vec<PathBuf> {
             PathBuf::from(trimmed)
         })
         .collect()
+}
+
+fn list_files_paths(cli: &Cli) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(pattern) = cli.pattern.clone() {
+        paths.push(pattern);
+    }
+    paths.extend(cli.paths.iter().cloned());
+    paths
 }
 
 fn list_files(paths: &[String], opts: &search::SearchOptions) -> anyhow::Result<()> {

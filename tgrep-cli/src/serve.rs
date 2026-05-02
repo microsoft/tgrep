@@ -183,6 +183,7 @@ pub fn run(
     let _lock_file = try_acquire_server_lock(&index_dir)?;
 
     let has_index = index_dir.join("lookup.bin").exists();
+    let mut needs_build = !has_index;
 
     if !has_index {
         // Create an empty on-disk index so HybridIndex can open it.
@@ -193,7 +194,17 @@ pub fn run(
 
     // Open the hybrid index (may be empty or partial from a previous checkpoint)
     let index_start = Instant::now();
-    let hybrid = HybridIndex::open(&index_dir, &root)?;
+    let hybrid = match HybridIndex::open(&index_dir, &root) {
+        Ok(hybrid) => hybrid,
+        Err(e) if has_index => {
+            eprintln!("[trace] existing index failed to load ({e}); rebuilding in background");
+            std::fs::create_dir_all(&index_dir)?;
+            create_empty_index(&index_dir)?;
+            needs_build = true;
+            HybridIndex::open(&index_dir, &root)?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let existing_files = hybrid.num_files();
 
     // Check meta.json complete flag to decide whether to rebuild
@@ -201,7 +212,7 @@ pub fn run(
         .map(|m| m.complete)
         .unwrap_or(false);
 
-    let needs_build = !has_index || !index_complete;
+    let needs_build = needs_build || !index_complete;
 
     eprintln!(
         "[trace] opened index: {} files, {} trigrams in {:.1}ms{}",

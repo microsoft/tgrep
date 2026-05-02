@@ -854,3 +854,52 @@ fn serve_rejects_second_server_on_same_index() {
     server1.kill().ok();
     server1.wait().ok();
 }
+
+#[test]
+fn serve_rebuilds_when_existing_index_is_corrupted() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("hello.txt"), "hello world").unwrap();
+
+    let index_dir = dir.path().join("idx");
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(index_dir.join("lookup.bin"), vec![0u8; 15]).unwrap();
+    fs::write(index_dir.join("index.bin"), vec![0u8; 6]).unwrap();
+    fs::write(index_dir.join("files.bin"), b"").unwrap();
+
+    let tgrep_bin = assert_cmd::cargo::cargo_bin("tgrep");
+    let mut server = std::process::Command::new(&tgrep_bin)
+        .args([
+            "serve",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--no-watch",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !index_dir.join("serve.json").exists() {
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("server exited before rebuilding corrupted index: {status}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server did not start after corrupted index recovery"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    server.kill().ok();
+    let output = server.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("existing index failed to load")
+            && stderr.contains("rebuilding in background"),
+        "expected corrupted-index recovery trace, got: {stderr}"
+    );
+}

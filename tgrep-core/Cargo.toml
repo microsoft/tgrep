@@ -20,4 +20,17 @@ rayon = "1"
 ignore = "0.4"
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3"
+
+[[bench]]
+name = "trigram_extraction"
+harness = false
+
+[[bench]]
+name = "query_execution"
+harness = false
+
+[[bench]]
+name = "index_build"
+harness = false

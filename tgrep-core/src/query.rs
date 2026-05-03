@@ -235,11 +235,13 @@ where
         QueryPlan::Or(plans) => {
             let mut result = Vec::new();
             for sub in plans {
-                let mut sub_result = execute_plan(sub, lookup);
-                result.append(&mut sub_result);
+                let sub_result = execute_plan(sub, lookup);
+                if result.is_empty() {
+                    result = sub_result;
+                } else if !sub_result.is_empty() {
+                    result = union_sorted(&result, &sub_result);
+                }
             }
-            result.sort_unstable();
-            result.dedup();
             result
         }
         QueryPlan::MatchAll => Vec::new(), // caller must handle: scan all files
@@ -322,11 +324,13 @@ where
         QueryPlan::Or(plans) => {
             let mut result = Vec::new();
             for sub in plans {
-                let mut sub_result = execute_plan_with_masks(sub, lookup);
-                result.append(&mut sub_result);
+                let sub_result = execute_plan_with_masks(sub, lookup);
+                if result.is_empty() {
+                    result = sub_result;
+                } else if !sub_result.is_empty() {
+                    result = union_sorted(&result, &sub_result);
+                }
             }
-            result.sort_unstable();
-            result.dedup();
             result
         }
         QueryPlan::MatchAll => Vec::new(),
@@ -347,6 +351,31 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
             std::cmp::Ordering::Greater => j += 1,
         }
     }
+    result
+}
+
+fn union_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut result = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                result.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                result.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                result.push(b[j]);
+                j += 1;
+            }
+        }
+    }
+    result.extend_from_slice(&a[i..]);
+    result.extend_from_slice(&b[j..]);
     result
 }
 
@@ -392,6 +421,36 @@ mod tests {
     fn test_intersect_sorted() {
         assert_eq!(intersect_sorted(&[1, 3, 5, 7], &[2, 3, 5, 8]), vec![3, 5]);
         assert_eq!(intersect_sorted(&[1, 2, 3], &[4, 5, 6]), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn test_union_sorted() {
+        assert_eq!(
+            union_sorted(&[1, 3, 5, 7], &[2, 3, 5, 8]),
+            vec![1, 2, 3, 5, 7, 8]
+        );
+        assert_eq!(union_sorted(&[], &[4, 5, 6]), vec![4, 5, 6]);
+        assert_eq!(union_sorted(&[1, 2, 3], &[]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_or_execution_returns_sorted_unique_candidates() {
+        let plan = QueryPlan::Or(vec![
+            QueryPlan::And(vec![TrigramQuery {
+                hash: 1,
+                expected_next: None,
+            }]),
+            QueryPlan::And(vec![TrigramQuery {
+                hash: 2,
+                expected_next: None,
+            }]),
+        ]);
+        let candidates = execute_plan(&plan, &|tri| match tri {
+            1 => vec![3, 1, 3],
+            2 => vec![2, 3, 4],
+            _ => Vec::new(),
+        });
+        assert_eq!(candidates, vec![1, 2, 3, 4]);
     }
 
     #[test]

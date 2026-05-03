@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use tgrep_core::PostingEntry;
-use tgrep_core::query::{QueryPlan, TrigramQuery, execute_plan_with_masks};
+use tgrep_core::query::{self, QueryPlan, TrigramQuery, execute_plan_with_masks};
+use tgrep_core::reader::IndexReader;
 
 fn posting_list(len: u32, stride: u32) -> Vec<PostingEntry> {
     (0..len)
@@ -29,6 +30,24 @@ fn and_plan(hashes: &[u32]) -> QueryPlan {
 
 fn or_plan(hashes: &[u32]) -> QueryPlan {
     QueryPlan::Or(hashes.iter().map(|hash| and_plan(&[*hash])).collect())
+}
+
+fn create_common_literal_index(file_count: usize) -> (tempfile::TempDir, IndexReader, QueryPlan) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 0..file_count {
+        std::fs::write(
+            src.join(format!("file_{i:05}.rs")),
+            format!("pub fn file_{i:05}() {{ let value = \"common_search_token_{i:05}\"; }}\n"),
+        )
+        .unwrap();
+    }
+    let index_dir = dir.path().join(".tgrep_bench");
+    tgrep_core::builder::build_index(dir.path(), Some(&index_dir), false, &[]).unwrap();
+    let reader = IndexReader::open(&index_dir).unwrap();
+    let plan = query::build_literal_plan("common_search_token", false);
+    (dir, reader, plan)
 }
 
 fn bench_query_execution(c: &mut Criterion) {
@@ -73,6 +92,21 @@ fn bench_query_execution(c: &mut Criterion) {
                 })
             });
         });
+    }
+
+    for file_count in [1_000usize, 5_000] {
+        let (_dir, reader, plan) = create_common_literal_index(file_count);
+        group.bench_with_input(
+            BenchmarkId::new("on_disk_common_literal", file_count),
+            &plan,
+            |b, plan| {
+                b.iter(|| {
+                    execute_plan_with_masks(black_box(plan), &|hash| {
+                        reader.lookup_trigram_with_masks(hash)
+                    })
+                });
+            },
+        );
     }
 
     group.finish();

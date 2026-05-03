@@ -270,13 +270,12 @@ where
             lists.sort_by_key(|(_, l)| l.len());
 
             // Start with smallest posting list
-            let (first_query, first_list) = lists.remove(0);
+            let (first_query, mut first_list) = lists.remove(0);
+            sort_dedup_postings_by_file_id(&mut first_list);
             let mut candidates: Vec<(u32, u8, u8)> = first_list
                 .into_iter()
                 .map(|e| (e.file_id, e.loc_mask, e.next_mask))
                 .collect();
-            candidates.sort_by_key(|&(fid, _, _)| fid);
-            candidates.dedup_by_key(|e| e.0);
 
             // Apply next_mask check for the first trigram
             if let Some(next_byte) = first_query.expected_next {
@@ -286,8 +285,7 @@ where
 
             // Intersect with remaining posting lists
             for (query, mut list) in lists {
-                list.sort_by_key(|e| e.file_id);
-                list.dedup_by_key(|e| e.file_id);
+                sort_dedup_postings_by_file_id(&mut list);
 
                 // Intersect by file_id, using next_mask to filter
                 let mut new_candidates = Vec::new();
@@ -379,6 +377,17 @@ fn union_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     result
 }
 
+fn sort_dedup_postings_by_file_id(entries: &mut Vec<PostingEntry>) {
+    if entries
+        .windows(2)
+        .all(|pair| pair[0].file_id < pair[1].file_id)
+    {
+        return;
+    }
+    entries.sort_by_key(|e| e.file_id);
+    entries.dedup_by_key(|e| e.file_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +460,51 @@ mod tests {
             _ => Vec::new(),
         });
         assert_eq!(candidates, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_sort_dedup_postings_keeps_sorted_unique_list_unchanged() {
+        let mut entries = vec![
+            PostingEntry {
+                file_id: 1,
+                loc_mask: 1,
+                next_mask: 1,
+            },
+            PostingEntry {
+                file_id: 2,
+                loc_mask: 2,
+                next_mask: 2,
+            },
+        ];
+        sort_dedup_postings_by_file_id(&mut entries);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].loc_mask, 1);
+        assert_eq!(entries[1].loc_mask, 2);
+    }
+
+    #[test]
+    fn test_sort_dedup_postings_sorts_and_dedups_unsorted_list() {
+        let mut entries = vec![
+            PostingEntry {
+                file_id: 2,
+                loc_mask: 2,
+                next_mask: 2,
+            },
+            PostingEntry {
+                file_id: 1,
+                loc_mask: 1,
+                next_mask: 1,
+            },
+            PostingEntry {
+                file_id: 2,
+                loc_mask: 3,
+                next_mask: 3,
+            },
+        ];
+        sort_dedup_postings_by_file_id(&mut entries);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].file_id, 1);
+        assert_eq!(entries[1].file_id, 2);
     }
 
     #[test]

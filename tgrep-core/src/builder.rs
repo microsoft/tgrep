@@ -56,9 +56,9 @@ pub fn build_index(
     let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
 
     for batch in walk.files.chunks(INDEX_BUILD_BATCH_SIZE) {
-        let batch_data: Vec<Option<(String, HashMap<u32, TrigramMasks>)>> = batch
+        let batch_data: Vec<(String, HashMap<u32, TrigramMasks>)> = batch
             .par_iter()
-            .map(|path| {
+            .filter_map(|path| {
                 let data = std::fs::read(path).ok()?;
                 if trigram::is_binary(&data) {
                     binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -74,7 +74,7 @@ pub fn build_index(
             })
             .collect();
 
-        for (path, per_tri) in batch_data.into_iter().flatten() {
+        for (path, per_tri) in batch_data {
             let file_id = file_id_map.len() as u32;
             file_id_map.push((file_id, path));
 

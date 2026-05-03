@@ -19,7 +19,9 @@ fn create_repo(file_count: usize, bytes_per_file: usize) -> TempDir {
 
 fn bench_index_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("index_build");
-    for (file_count, bytes_per_file) in [(100usize, 512usize), (500, 512)] {
+    for (file_count, bytes_per_file) in
+        [(100usize, 512usize), (500, 512), (2_000, 512), (5_000, 512)]
+    {
         group.throughput(Throughput::Bytes((file_count * bytes_per_file) as u64));
         group.bench_with_input(
             BenchmarkId::new("build_index", file_count),

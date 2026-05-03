@@ -1,5 +1,6 @@
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
 use std::path::Path;
+#[cfg(windows)]
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 

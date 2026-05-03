@@ -94,6 +94,40 @@ fn bench_query_execution(c: &mut Criterion) {
         });
     }
 
+    for branches in [4usize, 16, 64] {
+        let hashes: Vec<u32> = (0..branches).map(|i| 0x626364 + i as u32).collect();
+        let postings: HashMap<u32, Vec<PostingEntry>> = hashes
+            .iter()
+            .enumerate()
+            .map(|(branch, &hash)| {
+                let offset = branch as u32 * 1_000;
+                (
+                    hash,
+                    posting_list(1_000, 1)
+                        .into_iter()
+                        .map(|mut entry| {
+                            entry.file_id += offset;
+                            entry
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let plan = or_plan(&hashes);
+
+        group.bench_with_input(
+            BenchmarkId::new("or_union_disjoint", branches),
+            &plan,
+            |b, plan| {
+                b.iter(|| {
+                    execute_plan_with_masks(black_box(plan), &|hash| {
+                        postings.get(&hash).cloned().unwrap_or_default()
+                    })
+                });
+            },
+        );
+    }
+
     for file_count in [1_000usize, 5_000] {
         let (_dir, reader, plan) = create_common_literal_index(file_count);
         group.bench_with_input(

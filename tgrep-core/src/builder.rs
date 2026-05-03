@@ -129,14 +129,8 @@ pub fn default_index_dir(root: &Path) -> std::path::PathBuf {
     root.join(INDEX_DIR_NAME)
 }
 
-/// Write the on-disk index from a pre-computed snapshot (paths + inverted index).
-/// This allows the caller to snapshot under a brief lock, then write without holding it.
-///
-/// Internal: write the on-disk index files (index.bin, lookup.bin, files.bin, meta.json).
-///
-/// Both `write_index_v2` and `write_index_from_snapshot` delegate to this
-/// function after preparing their parameters. `paths` provides the file
-/// list (IDs are assigned by position: 0, 1, 2, …).
+/// Internal: write the on-disk index files from a pre-computed inverted map.
+/// `paths` provides the file list with IDs assigned by position: 0, 1, 2, …
 fn write_index_files<'a>(
     index_dir: &Path,
     root: &Path,
@@ -182,27 +176,14 @@ fn write_index_files<'a>(
     postings_file.flush()?;
     lookup_file.flush()?;
 
-    // Write files.bin
-    let mut files_file =
-        std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
-    for (id, path) in paths.into_iter().enumerate() {
-        ondisk::write_file_entry(&mut files_file, id as u32, path)?;
-    }
-    files_file.flush()?;
-
-    // Write meta.json
-    let canon_root = std::fs::canonicalize(root)?;
-    let mut meta = IndexMeta::new(
-        &canon_root.to_string_lossy(),
-        path_count as u64,
-        sorted_trigrams.len() as u64,
-    );
-    if let Some(c) = complete {
-        meta.complete = c;
-    }
-    meta.save(index_dir)?;
-
-    Ok(())
+    write_files_and_meta(
+        index_dir,
+        root,
+        path_count,
+        paths,
+        sorted_trigrams.len(),
+        complete,
+    )
 }
 
 fn write_posting_entries(
@@ -297,6 +278,35 @@ fn write_index_files_from_postings<'a>(
     postings_file.flush()?;
     lookup_file.flush()?;
 
+    write_files_and_meta(index_dir, root, path_count, paths, trigram_count, complete)
+}
+
+fn write_flat_posting_entries(
+    writer: &mut impl Write,
+    postings: &[TrigramPosting],
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    for chunk in postings.chunks(POSTING_WRITE_CHUNK_ENTRIES) {
+        scratch.clear();
+        for posting in chunk {
+            let entry = posting.entry;
+            scratch.extend_from_slice(&entry.file_id.to_le_bytes());
+            scratch.push(entry.loc_mask);
+            scratch.push(entry.next_mask);
+        }
+        writer.write_all(scratch)?;
+    }
+    Ok(())
+}
+
+fn write_files_and_meta<'a>(
+    index_dir: &Path,
+    root: &Path,
+    path_count: usize,
+    paths: impl IntoIterator<Item = &'a str>,
+    trigram_count: usize,
+    complete: Option<bool>,
+) -> Result<()> {
     let mut files_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
     for (id, path) in paths.into_iter().enumerate() {
@@ -315,24 +325,6 @@ fn write_index_files_from_postings<'a>(
     }
     meta.save(index_dir)?;
 
-    Ok(())
-}
-
-fn write_flat_posting_entries(
-    writer: &mut impl Write,
-    postings: &[TrigramPosting],
-    scratch: &mut Vec<u8>,
-) -> Result<()> {
-    for chunk in postings.chunks(POSTING_WRITE_CHUNK_ENTRIES) {
-        scratch.clear();
-        for posting in chunk {
-            let entry = posting.entry;
-            scratch.extend_from_slice(&entry.file_id.to_le_bytes());
-            scratch.push(entry.loc_mask);
-            scratch.push(entry.next_mask);
-        }
-        writer.write_all(scratch)?;
-    }
     Ok(())
 }
 
@@ -394,4 +386,41 @@ fn count_sorted_trigrams(postings: &[TrigramPosting]) -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reader::IndexReader;
+
+    #[test]
+    fn build_index_writes_readable_round_trip_index() {
+        let repo = tempfile::tempdir().unwrap();
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "hello world\nneedle one\n").unwrap();
+        std::fs::write(src.join("b.txt"), "needle two\nother content\n").unwrap();
+
+        let index = tempfile::tempdir().unwrap();
+        build_index(repo.path(), Some(index.path()), false, &[]).unwrap();
+
+        let reader = IndexReader::open(index.path()).unwrap();
+        reader.validate_lookup().unwrap();
+        assert_eq!(reader.num_files(), 2);
+
+        let hello = reader.lookup_trigram(crate::trigram::hash(b'h', b'e', b'l'));
+        let hello_paths: Vec<&str> = hello
+            .iter()
+            .filter_map(|&file_id| reader.file_path(file_id))
+            .collect();
+        assert_eq!(hello_paths, vec!["src/a.txt"]);
+
+        let needle = reader.lookup_trigram(crate::trigram::hash(b'n', b'e', b'e'));
+        let mut needle_paths: Vec<&str> = needle
+            .iter()
+            .filter_map(|&file_id| reader.file_path(file_id))
+            .collect();
+        needle_paths.sort_unstable();
+        assert_eq!(needle_paths, vec!["src/a.txt", "src/b.txt"]);
+    }
 }

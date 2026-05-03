@@ -146,6 +146,7 @@ fn measure_peak_working_set(
     peak
 }
 
+#[cfg(windows)]
 fn format_mib(bytes: u64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0
 }

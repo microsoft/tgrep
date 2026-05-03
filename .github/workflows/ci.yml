@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add clippy
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --benches -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -35,4 +35,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: cargo build --workspace --verbose
+      - run: cargo build --workspace --benches --verbose
       - run: cargo test --workspace --verbose

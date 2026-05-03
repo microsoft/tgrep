@@ -127,10 +127,11 @@ pub fn default_index_dir(root: &Path) -> std::path::PathBuf {
 /// Both `write_index_v2` and `write_index_from_snapshot` delegate to this
 /// function after preparing their parameters. `paths` provides the file
 /// list (IDs are assigned by position: 0, 1, 2, …).
-fn write_index_files<S: AsRef<str>>(
+fn write_index_files<'a>(
     index_dir: &Path,
     root: &Path,
-    paths: &[S],
+    path_count: usize,
+    paths: impl IntoIterator<Item = &'a str>,
     inverted: &HashMap<u32, Vec<PostingEntry>>,
     complete: Option<bool>,
 ) -> Result<()> {
@@ -173,8 +174,8 @@ fn write_index_files<S: AsRef<str>>(
     // Write files.bin
     let mut files_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
-    for (id, path) in paths.iter().enumerate() {
-        files_file.write_all(&ondisk::encode_file_entry(id as u32, path.as_ref())?)?;
+    for (id, path) in paths.into_iter().enumerate() {
+        ondisk::write_file_entry(&mut files_file, id as u32, path)?;
     }
     files_file.flush()?;
 
@@ -182,7 +183,7 @@ fn write_index_files<S: AsRef<str>>(
     let canon_root = std::fs::canonicalize(root)?;
     let mut meta = IndexMeta::new(
         &canon_root.to_string_lossy(),
-        paths.len() as u64,
+        path_count as u64,
         sorted_trigrams.len() as u64,
     );
     if let Some(c) = complete {
@@ -202,7 +203,14 @@ pub fn write_index_from_snapshot(
     inverted: &HashMap<u32, Vec<PostingEntry>>,
     complete: bool,
 ) -> Result<()> {
-    write_index_files(index_dir, root, paths, inverted, Some(complete))
+    write_index_files(
+        index_dir,
+        root,
+        paths.len(),
+        paths.iter().map(String::as_str),
+        inverted,
+        Some(complete),
+    )
 }
 
 /// Internal: write v2 index with masks.
@@ -218,6 +226,12 @@ fn write_index_v2(
         file_id_map.len()
     );
 
-    let paths: Vec<&str> = file_id_map.iter().map(|(_, p)| p.as_str()).collect();
-    write_index_files(index_dir, root, &paths, inverted, None)
+    write_index_files(
+        index_dir,
+        root,
+        file_id_map.len(),
+        file_id_map.iter().map(|(_, p)| p.as_str()),
+        inverted,
+        None,
+    )
 }

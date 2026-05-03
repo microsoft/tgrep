@@ -12,6 +12,7 @@ use crate::walker;
 
 const INDEX_DIR_NAME: &str = ".tgrep";
 const INDEX_BUILD_BATCH_SIZE: usize = 1024;
+const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
 
 /// Build a trigram index for all text files under `root`.
 pub fn build_index(
@@ -144,6 +145,8 @@ fn write_index_files<'a>(
     let mut postings_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
     let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_trigrams.len());
+    let mut posting_scratch =
+        Vec::with_capacity(POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE);
     let mut offset: u64 = 0;
 
     for &tri in &sorted_trigrams {
@@ -156,9 +159,7 @@ fn write_index_files<'a>(
             length,
         });
 
-        for entry in posting_list {
-            postings_file.write_all(&entry.encode())?;
-        }
+        write_posting_entries(&mut postings_file, posting_list, &mut posting_scratch)?;
         offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;
     }
     postings_file.flush()?;
@@ -191,6 +192,23 @@ fn write_index_files<'a>(
     }
     meta.save(index_dir)?;
 
+    Ok(())
+}
+
+fn write_posting_entries(
+    writer: &mut impl Write,
+    entries: &[PostingEntry],
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    for chunk in entries.chunks(POSTING_WRITE_CHUNK_ENTRIES) {
+        scratch.clear();
+        for entry in chunk {
+            scratch.extend_from_slice(&entry.file_id.to_le_bytes());
+            scratch.push(entry.loc_mask);
+            scratch.push(entry.next_mask);
+        }
+        writer.write_all(scratch)?;
+    }
     Ok(())
 }
 

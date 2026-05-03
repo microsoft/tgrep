@@ -233,14 +233,8 @@ where
             result
         }
         QueryPlan::Or(plans) => {
-            let mut result = Vec::new();
-            for sub in plans {
-                let mut sub_result = execute_plan(sub, lookup);
-                result.append(&mut sub_result);
-            }
-            result.sort_unstable();
-            result.dedup();
-            result
+            let lists = plans.iter().map(|sub| execute_plan(sub, lookup)).collect();
+            union_many_sorted(lists)
         }
         QueryPlan::MatchAll => Vec::new(), // caller must handle: scan all files
     }
@@ -268,13 +262,12 @@ where
             lists.sort_by_key(|(_, l)| l.len());
 
             // Start with smallest posting list
-            let (first_query, first_list) = lists.remove(0);
+            let (first_query, mut first_list) = lists.remove(0);
+            sort_dedup_postings_by_file_id(&mut first_list);
             let mut candidates: Vec<(u32, u8, u8)> = first_list
                 .into_iter()
                 .map(|e| (e.file_id, e.loc_mask, e.next_mask))
                 .collect();
-            candidates.sort_by_key(|&(fid, _, _)| fid);
-            candidates.dedup_by_key(|e| e.0);
 
             // Apply next_mask check for the first trigram
             if let Some(next_byte) = first_query.expected_next {
@@ -284,8 +277,7 @@ where
 
             // Intersect with remaining posting lists
             for (query, mut list) in lists {
-                list.sort_by_key(|e| e.file_id);
-                list.dedup_by_key(|e| e.file_id);
+                sort_dedup_postings_by_file_id(&mut list);
 
                 // Intersect by file_id, using next_mask to filter
                 let mut new_candidates = Vec::new();
@@ -320,14 +312,11 @@ where
             candidates.into_iter().map(|(fid, _, _)| fid).collect()
         }
         QueryPlan::Or(plans) => {
-            let mut result = Vec::new();
-            for sub in plans {
-                let mut sub_result = execute_plan_with_masks(sub, lookup);
-                result.append(&mut sub_result);
-            }
-            result.sort_unstable();
-            result.dedup();
-            result
+            let lists = plans
+                .iter()
+                .map(|sub| execute_plan_with_masks(sub, lookup))
+                .collect();
+            union_many_sorted(lists)
         }
         QueryPlan::MatchAll => Vec::new(),
     }
@@ -348,6 +337,80 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
         }
     }
     result
+}
+
+fn union_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut result = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                result.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                result.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                result.push(b[j]);
+                j += 1;
+            }
+        }
+    }
+    result.extend_from_slice(&a[i..]);
+    result.extend_from_slice(&b[j..]);
+    result
+}
+
+fn union_many_sorted(mut lists: Vec<Vec<u32>>) -> Vec<u32> {
+    lists.retain(|list| !list.is_empty());
+    let mut iter = lists.into_iter();
+    let Some(mut result) = iter.next() else {
+        return Vec::new();
+    };
+
+    while let Some(list) = iter.next() {
+        let previous_len = result.len();
+        let list_len = list.len();
+        result = union_sorted(&result, &list);
+        let added = result.len() - previous_len;
+        if added > list_len / 2 {
+            let mut remaining = Vec::with_capacity(iter.size_hint().0 + 1);
+            remaining.push(result);
+            remaining.extend(iter);
+            return union_many_sorted_balanced(remaining);
+        }
+    }
+    result
+}
+
+fn union_many_sorted_balanced(mut lists: Vec<Vec<u32>>) -> Vec<u32> {
+    while lists.len() > 1 {
+        let mut next = Vec::with_capacity(lists.len().div_ceil(2));
+        let mut iter = lists.into_iter();
+        while let Some(left) = iter.next() {
+            if let Some(right) = iter.next() {
+                next.push(union_sorted(&left, &right));
+            } else {
+                next.push(left);
+            }
+        }
+        lists = next;
+    }
+    lists.pop().unwrap_or_default()
+}
+
+fn sort_dedup_postings_by_file_id(entries: &mut Vec<PostingEntry>) {
+    if entries
+        .windows(2)
+        .all(|pair| pair[0].file_id < pair[1].file_id)
+    {
+        return;
+    }
+    entries.sort_by_key(|e| e.file_id);
+    entries.dedup_by_key(|e| e.file_id);
 }
 
 #[cfg(test)]
@@ -392,6 +455,87 @@ mod tests {
     fn test_intersect_sorted() {
         assert_eq!(intersect_sorted(&[1, 3, 5, 7], &[2, 3, 5, 8]), vec![3, 5]);
         assert_eq!(intersect_sorted(&[1, 2, 3], &[4, 5, 6]), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn test_union_sorted() {
+        assert_eq!(
+            union_sorted(&[1, 3, 5, 7], &[2, 3, 5, 8]),
+            vec![1, 2, 3, 5, 7, 8]
+        );
+        assert_eq!(union_sorted(&[], &[4, 5, 6]), vec![4, 5, 6]);
+        assert_eq!(union_sorted(&[1, 2, 3], &[]), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_union_many_sorted_handles_disjoint_lists_without_repeated_linear_growth() {
+        let lists = vec![vec![1, 3], vec![2, 4], vec![10, 12], vec![11, 13]];
+        assert_eq!(union_many_sorted(lists), vec![1, 2, 3, 4, 10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn test_or_execution_returns_sorted_unique_candidates() {
+        let plan = QueryPlan::Or(vec![
+            QueryPlan::And(vec![TrigramQuery {
+                hash: 1,
+                expected_next: None,
+            }]),
+            QueryPlan::And(vec![TrigramQuery {
+                hash: 2,
+                expected_next: None,
+            }]),
+        ]);
+        let candidates = execute_plan(&plan, &|tri| match tri {
+            1 => vec![3, 1, 3],
+            2 => vec![2, 3, 4],
+            _ => Vec::new(),
+        });
+        assert_eq!(candidates, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_sort_dedup_postings_keeps_sorted_unique_list_unchanged() {
+        let mut entries = vec![
+            PostingEntry {
+                file_id: 1,
+                loc_mask: 1,
+                next_mask: 1,
+            },
+            PostingEntry {
+                file_id: 2,
+                loc_mask: 2,
+                next_mask: 2,
+            },
+        ];
+        sort_dedup_postings_by_file_id(&mut entries);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].loc_mask, 1);
+        assert_eq!(entries[1].loc_mask, 2);
+    }
+
+    #[test]
+    fn test_sort_dedup_postings_sorts_and_dedups_unsorted_list() {
+        let mut entries = vec![
+            PostingEntry {
+                file_id: 2,
+                loc_mask: 2,
+                next_mask: 2,
+            },
+            PostingEntry {
+                file_id: 1,
+                loc_mask: 1,
+                next_mask: 1,
+            },
+            PostingEntry {
+                file_id: 2,
+                loc_mask: 3,
+                next_mask: 3,
+            },
+        ];
+        sort_dedup_postings_by_file_id(&mut entries);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].file_id, 1);
+        assert_eq!(entries[1].file_id, 2);
     }
 
     #[test]

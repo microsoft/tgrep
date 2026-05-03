@@ -129,14 +129,16 @@ pub fn extract_merged_masks(content: &[u8]) -> HashMap<TrigramHash, TrigramMasks
         per_tri.insert(tri, m);
     }
 
+    if !content.iter().any(|&b| b.is_ascii_uppercase()) {
+        return per_tri;
+    }
+
     let lower = content.to_ascii_lowercase();
-    if lower != content {
-        let lower_tri_masks = extract_with_masks(&lower);
-        for &(tri, m) in lower_tri_masks.iter() {
-            let entry = per_tri.entry(tri).or_default();
-            entry.loc_mask |= m.loc_mask;
-            entry.next_mask |= m.next_mask;
-        }
+    let lower_tri_masks = extract_with_masks(&lower);
+    for &(tri, m) in lower_tri_masks.iter() {
+        let entry = per_tri.entry(tri).or_default();
+        entry.loc_mask |= m.loc_mask;
+        entry.next_mask |= m.next_mask;
     }
 
     per_tri
@@ -302,6 +304,31 @@ mod tests {
             let m = merged.get(&tri).unwrap();
             assert_eq!(m.loc_mask, masks.loc_mask);
             assert_eq!(m.next_mask, masks.next_mask);
+        }
+    }
+
+    #[test]
+    fn test_extract_merged_masks_matches_lowercase_copy_semantics() {
+        let content = b"AbCDef abcDEF\nXYZ xyz";
+        let mut expected = HashMap::new();
+        for (tri, masks) in extract_with_masks(content) {
+            expected.insert(tri, masks);
+        }
+        let lower = content.to_ascii_lowercase();
+        for (tri, masks) in extract_with_masks(&lower) {
+            let entry = expected.entry(tri).or_insert_with(TrigramMasks::default);
+            entry.loc_mask |= masks.loc_mask;
+            entry.next_mask |= masks.next_mask;
+        }
+
+        let merged = extract_merged_masks(content);
+        assert_eq!(merged.len(), expected.len());
+        for (tri, expected_masks) in expected {
+            let actual = merged
+                .get(&tri)
+                .unwrap_or_else(|| panic!("missing trigram {tri:#010x}"));
+            assert_eq!(actual.loc_mask, expected_masks.loc_mask);
+            assert_eq!(actual.next_mask, expected_masks.next_mask);
         }
     }
 }

@@ -57,6 +57,7 @@ impl PostingEntry {
 }
 
 impl LookupEntry {
+    #[cfg(test)]
     pub fn encode(&self) -> [u8; LOOKUP_ENTRY_SIZE] {
         let mut buf = [0u8; LOOKUP_ENTRY_SIZE];
         buf[0..4].copy_from_slice(&self.trigram.to_le_bytes());
@@ -79,13 +80,7 @@ impl LookupEntry {
 /// Limited by the `u16` length prefix in the on-disk format.
 pub(crate) const MAX_PATH_LEN: usize = u16::MAX as usize;
 
-/// Encode a file entry for `files.bin`.
-///
-/// Returns `Error::IndexCorrupted` if the path exceeds [`MAX_PATH_LEN`] bytes,
-/// since the on-disk format uses a `u16` length prefix and a silent truncation
-/// here would corrupt the entire trailing portion of `files.bin` (the decoder
-/// reads variable-length records sequentially).
-pub(crate) fn encode_file_entry(file_id: u32, path: &str) -> crate::Result<Vec<u8>> {
+fn validate_file_path_len(path: &str) -> crate::Result<&[u8]> {
     let path_bytes = path.as_bytes();
     if path_bytes.len() > MAX_PATH_LEN {
         // Avoid embedding a 64KiB+ path into the error message (memory
@@ -105,12 +100,38 @@ pub(crate) fn encode_file_entry(file_id: u32, path: &str) -> crate::Result<Vec<u
             &path[..preview_end],
         )));
     }
+    Ok(path_bytes)
+}
+
+/// Encode a file entry for `files.bin`.
+///
+/// Returns `Error::IndexCorrupted` if the path exceeds [`MAX_PATH_LEN`] bytes,
+/// since the on-disk format uses a `u16` length prefix and a silent truncation
+/// here would corrupt the entire trailing portion of `files.bin` (the decoder
+/// reads variable-length records sequentially).
+#[cfg(test)]
+pub(crate) fn encode_file_entry(file_id: u32, path: &str) -> crate::Result<Vec<u8>> {
+    let path_bytes = validate_file_path_len(path)?;
     let path_len = path_bytes.len() as u16;
     let mut buf = Vec::with_capacity(4 + 2 + path_bytes.len());
     buf.extend_from_slice(&file_id.to_le_bytes());
     buf.extend_from_slice(&path_len.to_le_bytes());
     buf.extend_from_slice(path_bytes);
     Ok(buf)
+}
+
+/// Write a file entry directly to `files.bin` without allocating a temporary buffer.
+pub(crate) fn write_file_entry(
+    writer: &mut impl std::io::Write,
+    file_id: u32,
+    path: &str,
+) -> crate::Result<()> {
+    let path_bytes = validate_file_path_len(path)?;
+    let path_len = path_bytes.len() as u16;
+    writer.write_all(&file_id.to_le_bytes())?;
+    writer.write_all(&path_len.to_le_bytes())?;
+    writer.write_all(path_bytes)?;
+    Ok(())
 }
 
 /// Decode file entries from `files.bin` data.
@@ -172,6 +193,16 @@ mod tests {
         all.extend_from_slice(&encode_file_entry(12, "README.md").unwrap());
         let entries = decode_file_entries(&all).unwrap();
         assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (7, "src/main.rs".to_string()));
+        assert_eq!(entries[1], (12, "README.md".to_string()));
+    }
+
+    #[test]
+    fn test_write_file_entry_roundtrip() {
+        let mut all = Vec::new();
+        write_file_entry(&mut all, 7, "src/main.rs").unwrap();
+        write_file_entry(&mut all, 12, "README.md").unwrap();
+        let entries = decode_file_entries(&all).unwrap();
         assert_eq!(entries[0], (7, "src/main.rs".to_string()));
         assert_eq!(entries[1], (12, "README.md".to_string()));
     }

@@ -17,21 +17,21 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
-See [full benchmark results](BENCHMARKS.md) — up to **65x faster** than ripgrep on large repos.
+See [full benchmark results](BENCHMARKS.md) — up to **72x faster** than ripgrep on large repos.
 
 ### Benchmark highlights (avg latency per query, index pre-built)
 
 | Repo | Files | Platform | ripgrep | tgrep | Speedup |
 | --- | ---: | --- | ---: | ---: | ---: |
-| chromium | 494K | macOS arm64 | 71,540ms | 3,057ms | **23x** |
-| chromium | 494K | Windows | 28,286ms | 2,438ms | **12x** |
-| gecko-dev | 388K | macOS arm64 | 38,725ms | 592ms | **65x** |
-| gecko-dev | 388K | Windows | 16,787ms | 556ms | **30x** |
-| gecko-dev | 388K | Linux | 1,744ms | 284ms | **6x** |
-| linux | 94K | Windows | 3,131ms | 758ms | **4x** |
-| rust | 59K | Windows | 1,353ms | 159ms | **9x** |
-| kubernetes | 29K | Windows | 1,021ms | 138ms | **7x** |
-| go | 15K | Windows | 447ms | 60ms | **8x** |
+| chromium | 496K | macOS arm64 | 61,110ms | 2,630ms | **23x** |
+| chromium | 496K | Windows | 29,557ms | 2,491ms | **12x** |
+| gecko-dev | 388K | macOS arm64 | 35,413ms | 492ms | **72x** |
+| gecko-dev | 388K | Windows | 16,199ms | 310ms | **52x** |
+| gecko-dev | 388K | Linux | 1,931ms | 170ms | **11x** |
+| linux | 94K | Windows | 4,317ms | 934ms | **5x** |
+| rust | 59K | Windows | 1,989ms | 215ms | **9x** |
+| kubernetes | 30K | Windows | 1,489ms | 178ms | **8x** |
+| go | 15K | Windows | 450ms | 70ms | **6x** |
 
 ## Architecture
 
@@ -69,12 +69,21 @@ tgrep <pattern> ---TCP---> tgrep serve (multi-client)
 tgrep is designed to be significantly faster than ripgrep on large repos:
 
 - **Parallel search** — candidate files are searched in parallel using rayon
+- **Fast query planning** — sorted posting lists are intersected/unioned without
+  unnecessary resorting, and on-disk posting lists skip redundant deduplication
+- **Memory-efficient full builds** — index builds batch extraction and stream
+  sorted postings, file entries, and lookup entries instead of retaining the full
+  inverted index in memory
 - **Smart file walking** — extension-based binary rejection (50+ formats),
   8KB content check, 1MB file size limit
 - **Lock-free reads** — `RwLock<HashMap>` cache allows concurrent reads
   without contention
 - **Hot serving** — queries work immediately during background index building;
   no need to wait for full index
+
+See [BENCHMARKS.md](BENCHMARKS.md) for end-to-end large-repo benchmarks and
+Criterion microbenchmarks for query execution, trigram extraction, and index
+building.
 
 ## Usage
 
@@ -217,13 +226,15 @@ Prints the count to stdout (scriptable) and details to stderr:
 1. **Indexing** — walks the repo (respecting `.gitignore`), skips binary files
    by extension (50+ formats) and content check (first 8KB), extracts all
    overlapping 3-byte trigrams from each text file in parallel (rayon), and
-   writes a compact binary inverted index.
+   writes a compact binary inverted index. Full builds stream sorted posting
+   groups directly to disk to keep peak memory bounded.
 
 2. **Querying** — the regex is parsed with `regex-syntax`, decomposed into
    literal fragments, converted to trigram hashes, and looked up via binary
    search in the mmap'd index. Posting lists are intersected (AND) or
-   unioned (OR) to find candidate files. Only those candidates are verified
-   with the full regex engine in parallel (rayon).
+   unioned (OR) to find candidate files, reusing sorted posting-list order when
+   possible. Only those candidates are verified with the full regex engine in
+   parallel (rayon).
 
 3. **Serving** — `tgrep serve` wraps the index in a HybridIndex, watches for
    filesystem changes, and serves queries over TCP. If no index exists, it

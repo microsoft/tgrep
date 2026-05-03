@@ -6,6 +6,9 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Create a temp directory with a few source files for testing.
@@ -52,6 +55,17 @@ fn fixture_path(dir: &TempDir) -> String {
 
 fn tgrep() -> Command {
     Command::cargo_bin("tgrep").unwrap()
+}
+
+fn send_rpc_request(port: u16, request: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    writeln!(stream, "{request}")?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader.read_line(&mut response)?;
+    Ok(response)
 }
 
 // ─── Multiple and normalized path arguments ───────────────────────────
@@ -853,4 +867,111 @@ fn serve_rejects_second_server_on_same_index() {
     // Clean up: kill server1
     server1.kill().ok();
     server1.wait().ok();
+}
+
+#[test]
+fn serve_rebuilds_when_existing_index_is_corrupted() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("hello.txt"), "hello world").unwrap();
+
+    let index_dir = dir.path().join("idx");
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(index_dir.join("lookup.bin"), vec![0u8; 15]).unwrap();
+    fs::write(index_dir.join("index.bin"), vec![0u8; 6]).unwrap();
+    fs::write(index_dir.join("files.bin"), b"").unwrap();
+
+    let tgrep_bin = assert_cmd::cargo::cargo_bin("tgrep");
+    let mut server = std::process::Command::new(&tgrep_bin)
+        .args([
+            "serve",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--no-watch",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let serve_json = index_dir.join("serve.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let port = loop {
+        if let Some(status) = server.try_wait().unwrap() {
+            panic!("server exited before recovering corrupted index: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "server did not start after corrupted index recovery"
+        );
+        if let Ok(data) = fs::read_to_string(&serve_json)
+            && let Ok(info) = serde_json::from_str::<serde_json::Value>(&data)
+            && let Some(port) = info.get("port").and_then(|v| v.as_u64())
+            && TcpStream::connect(format!("127.0.0.1:{port}")).is_ok()
+        {
+            break port as u16;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "server did not finish rebuilding corrupted index"
+        );
+        let response = send_rpc_request(port, r#"{"jsonrpc":"2.0","method":"status","id":0}"#)
+            .expect("status request failed");
+        let status: serde_json::Value =
+            serde_json::from_str(&response).expect("invalid status JSON");
+        let indexing = status
+            .pointer("/result/indexing")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !indexing {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let search_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "search",
+        "id": 1,
+        "params": { "pattern": "hello" }
+    })
+    .to_string();
+    let response = send_rpc_request(port, &search_request).expect("search request failed");
+    let search: serde_json::Value = serde_json::from_str(&response).expect("invalid search JSON");
+    assert!(
+        search.get("error").is_none(),
+        "search returned error: {search}"
+    );
+    assert_eq!(
+        search
+            .pointer("/result/num_matches")
+            .and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    assert!(
+        search
+            .pointer("/result/matches")
+            .and_then(|v| v.as_array())
+            .is_some_and(|matches| matches.iter().any(|m| m
+                .get("file")
+                .and_then(|v| v.as_str())
+                .is_some_and(|path| path == "hello.txt"))),
+        "expected rebuilt index to find hello.txt, got: {search}"
+    );
+
+    server.kill().ok();
+    let output = server.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("existing index failed to load")
+            && stderr.contains("rebuilding in background"),
+        "expected corrupted-index recovery trace, got: {stderr}"
+    );
 }

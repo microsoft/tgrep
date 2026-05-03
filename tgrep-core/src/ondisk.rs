@@ -57,6 +57,7 @@ impl PostingEntry {
 }
 
 impl LookupEntry {
+    #[cfg(test)]
     pub fn encode(&self) -> [u8; LOOKUP_ENTRY_SIZE] {
         let mut buf = [0u8; LOOKUP_ENTRY_SIZE];
         buf[0..4].copy_from_slice(&self.trigram.to_le_bytes());

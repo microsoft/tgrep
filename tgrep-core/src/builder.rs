@@ -13,6 +13,7 @@ use crate::walker;
 const INDEX_DIR_NAME: &str = ".tgrep";
 const INDEX_BUILD_BATCH_SIZE: usize = 1024;
 const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
+const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 
 /// Build a trigram index for all text files under `root`.
 pub fn build_index(
@@ -144,7 +145,10 @@ fn write_index_files<'a>(
     // Write index.bin — v2 posting entries with masks
     let mut postings_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
-    let mut lookup_entries: Vec<LookupEntry> = Vec::with_capacity(sorted_trigrams.len());
+    let mut lookup_file =
+        std::io::BufWriter::new(std::fs::File::create(index_dir.join("lookup.bin"))?);
+    let mut lookup_scratch =
+        Vec::with_capacity(LOOKUP_WRITE_CHUNK_ENTRIES * ondisk::LOOKUP_ENTRY_SIZE);
     let mut posting_scratch =
         Vec::with_capacity(POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE);
     let mut offset: u64 = 0;
@@ -153,23 +157,21 @@ fn write_index_files<'a>(
         let posting_list = inverted.get(&tri).unwrap();
         let length = posting_list.len() as u32;
 
-        lookup_entries.push(LookupEntry {
-            trigram: tri,
-            offset,
-            length,
-        });
+        write_lookup_entry(
+            &mut lookup_file,
+            LookupEntry {
+                trigram: tri,
+                offset,
+                length,
+            },
+            &mut lookup_scratch,
+        )?;
 
         write_posting_entries(&mut postings_file, posting_list, &mut posting_scratch)?;
         offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;
     }
+    flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
     postings_file.flush()?;
-
-    // Write lookup.bin
-    let mut lookup_file =
-        std::io::BufWriter::new(std::fs::File::create(index_dir.join("lookup.bin"))?);
-    for entry in &lookup_entries {
-        lookup_file.write_all(&entry.encode())?;
-    }
     lookup_file.flush()?;
 
     // Write files.bin
@@ -208,6 +210,28 @@ fn write_posting_entries(
             scratch.push(entry.next_mask);
         }
         writer.write_all(scratch)?;
+    }
+    Ok(())
+}
+
+fn write_lookup_entry(
+    writer: &mut impl Write,
+    entry: LookupEntry,
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    if scratch.len() == scratch.capacity() {
+        flush_lookup_entries(writer, scratch)?;
+    }
+    scratch.extend_from_slice(&entry.trigram.to_le_bytes());
+    scratch.extend_from_slice(&entry.offset.to_le_bytes());
+    scratch.extend_from_slice(&entry.length.to_le_bytes());
+    Ok(())
+}
+
+fn flush_lookup_entries(writer: &mut impl Write, scratch: &mut Vec<u8>) -> Result<()> {
+    if !scratch.is_empty() {
+        writer.write_all(scratch)?;
+        scratch.clear();
     }
     Ok(())
 }

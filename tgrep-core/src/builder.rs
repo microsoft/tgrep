@@ -11,6 +11,7 @@ use crate::trigram::{self, TrigramMasks};
 use crate::walker;
 
 const INDEX_DIR_NAME: &str = ".tgrep";
+const INDEX_BUILD_BATCH_SIZE: usize = 1024;
 
 /// Build a trigram index for all text files under `root`.
 pub fn build_index(
@@ -42,53 +43,57 @@ pub fn build_index(
         walk.skipped_error
     );
 
-    // Read all files and extract trigrams with masks in parallel.
+    // Read files and extract trigrams with masks in bounded parallel batches.
     // Binary content check is done here (not in walker) to avoid an extra
     // 8KB read per file — we're already reading the full file anyway.
     eprintln!("Extracting trigrams...");
     let binary_skipped = std::sync::atomic::AtomicUsize::new(0);
-    let file_data: Vec<(String, HashMap<u32, TrigramMasks>)> = walk
-        .files
-        .par_iter()
-        .filter_map(|path| {
-            let data = std::fs::read(path).ok()?;
-            if trigram::is_binary(&data) {
-                binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return None;
+
+    // Assign file IDs and build inverted index with masks. Batching avoids
+    // retaining every file's per-trigram HashMap at once for large repos.
+    let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
+    // trigram → Vec<(file_id, loc_mask, next_mask)>
+    let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
+
+    for batch in walk.files.chunks(INDEX_BUILD_BATCH_SIZE) {
+        let batch_data: Vec<Option<(String, HashMap<u32, TrigramMasks>)>> = batch
+            .par_iter()
+            .map(|path| {
+                let data = std::fs::read(path).ok()?;
+                if trigram::is_binary(&data) {
+                    binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let per_tri = trigram::extract_merged_masks(&data);
+                Some((rel, per_tri))
+            })
+            .collect();
+
+        for (path, per_tri) in batch_data.into_iter().flatten() {
+            let file_id = file_id_map.len() as u32;
+            file_id_map.push((file_id, path));
+
+            for (tri, masks) in per_tri {
+                inverted.entry(tri).or_default().push(PostingEntry {
+                    file_id,
+                    loc_mask: masks.loc_mask,
+                    next_mask: masks.next_mask,
+                });
             }
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let per_tri = trigram::extract_merged_masks(&data);
-            Some((rel, per_tri))
-        })
-        .collect();
+        }
+    }
+
     let extra_binary = binary_skipped.into_inner();
     if extra_binary > 0 {
         eprintln!(
             "Skipped {} additional binary files (detected by content)",
             extra_binary
         );
-    }
-
-    // Assign file IDs and build inverted index with masks
-    let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(file_data.len());
-    // trigram → Vec<(file_id, loc_mask, next_mask)>
-    let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
-
-    for (id, (path, per_tri)) in file_data.iter().enumerate() {
-        let file_id = id as u32;
-        file_id_map.push((file_id, path.clone()));
-
-        for (&tri, masks) in per_tri {
-            inverted.entry(tri).or_default().push(PostingEntry {
-                file_id,
-                loc_mask: masks.loc_mask,
-                next_mask: masks.next_mask,
-            });
-        }
     }
 
     write_index_v2(&index_dir, &root, &file_id_map, &inverted)?;

@@ -15,6 +15,12 @@ const INDEX_BUILD_BATCH_SIZE: usize = 1024;
 const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
 const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 
+#[derive(Clone, Copy)]
+struct TrigramPosting {
+    trigram: u32,
+    entry: PostingEntry,
+}
+
 /// Build a trigram index for all text files under `root`.
 pub fn build_index(
     root: &Path,
@@ -51,11 +57,10 @@ pub fn build_index(
     eprintln!("Extracting trigrams...");
     let binary_skipped = std::sync::atomic::AtomicUsize::new(0);
 
-    // Assign file IDs and build inverted index with masks. Batching avoids
+    // Assign file IDs and collect posting entries. Batching avoids
     // retaining every file's per-trigram HashMap at once for large repos.
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
-    // trigram → Vec<(file_id, loc_mask, next_mask)>
-    let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
+    let mut postings: Vec<TrigramPosting> = Vec::new();
 
     for batch in walk.files.chunks(INDEX_BUILD_BATCH_SIZE) {
         let batch_data: Vec<(String, HashMap<u32, TrigramMasks>)> = batch
@@ -81,10 +86,13 @@ pub fn build_index(
             file_id_map.push((file_id, path));
 
             for (tri, masks) in per_tri {
-                inverted.entry(tri).or_default().push(PostingEntry {
-                    file_id,
-                    loc_mask: masks.loc_mask,
-                    next_mask: masks.next_mask,
+                postings.push(TrigramPosting {
+                    trigram: tri,
+                    entry: PostingEntry {
+                        file_id,
+                        loc_mask: masks.loc_mask,
+                        next_mask: masks.next_mask,
+                    },
                 });
             }
         }
@@ -98,7 +106,7 @@ pub fn build_index(
         );
     }
 
-    write_index_v2(&index_dir, &root, &file_id_map, &inverted)?;
+    write_index_v2_from_postings(&index_dir, &root, &file_id_map, &mut postings)?;
 
     // Write per-file stamps for ALL walked files (including those later
     // rejected as binary-by-content) so the stale check on next startup
@@ -236,6 +244,98 @@ fn flush_lookup_entries(writer: &mut impl Write, scratch: &mut Vec<u8>) -> Resul
     Ok(())
 }
 
+fn write_index_files_from_postings<'a>(
+    index_dir: &Path,
+    root: &Path,
+    path_count: usize,
+    paths: impl IntoIterator<Item = &'a str>,
+    postings: &[TrigramPosting],
+    trigram_count: usize,
+    complete: Option<bool>,
+) -> Result<()> {
+    std::fs::create_dir_all(index_dir)?;
+
+    let mut postings_file =
+        std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
+    let mut lookup_file =
+        std::io::BufWriter::new(std::fs::File::create(index_dir.join("lookup.bin"))?);
+    let mut lookup_scratch =
+        Vec::with_capacity(LOOKUP_WRITE_CHUNK_ENTRIES * ondisk::LOOKUP_ENTRY_SIZE);
+    let mut posting_scratch =
+        Vec::with_capacity(POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE);
+
+    let mut offset: u64 = 0;
+    let mut written_trigrams = 0usize;
+    let mut start = 0usize;
+    while start < postings.len() {
+        let trigram = postings[start].trigram;
+        let mut end = start + 1;
+        while end < postings.len() && postings[end].trigram == trigram {
+            end += 1;
+        }
+        let length = (end - start) as u32;
+        write_lookup_entry(
+            &mut lookup_file,
+            LookupEntry {
+                trigram,
+                offset,
+                length,
+            },
+            &mut lookup_scratch,
+        )?;
+        write_flat_posting_entries(
+            &mut postings_file,
+            &postings[start..end],
+            &mut posting_scratch,
+        )?;
+        offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;
+        written_trigrams += 1;
+        start = end;
+    }
+    debug_assert_eq!(written_trigrams, trigram_count);
+    flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
+    postings_file.flush()?;
+    lookup_file.flush()?;
+
+    let mut files_file =
+        std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
+    for (id, path) in paths.into_iter().enumerate() {
+        ondisk::write_file_entry(&mut files_file, id as u32, path)?;
+    }
+    files_file.flush()?;
+
+    let canon_root = std::fs::canonicalize(root)?;
+    let mut meta = IndexMeta::new(
+        &canon_root.to_string_lossy(),
+        path_count as u64,
+        trigram_count as u64,
+    );
+    if let Some(c) = complete {
+        meta.complete = c;
+    }
+    meta.save(index_dir)?;
+
+    Ok(())
+}
+
+fn write_flat_posting_entries(
+    writer: &mut impl Write,
+    postings: &[TrigramPosting],
+    scratch: &mut Vec<u8>,
+) -> Result<()> {
+    for chunk in postings.chunks(POSTING_WRITE_CHUNK_ENTRIES) {
+        scratch.clear();
+        for posting in chunk {
+            let entry = posting.entry;
+            scratch.extend_from_slice(&entry.file_id.to_le_bytes());
+            scratch.push(entry.loc_mask);
+            scratch.push(entry.next_mask);
+        }
+        writer.write_all(scratch)?;
+    }
+    Ok(())
+}
+
 /// Preserves mask data (loc_mask/next_mask) from the snapshot so Bloom-filter
 /// optimizations survive flush cycles.
 pub fn write_index_from_snapshot(
@@ -255,25 +355,43 @@ pub fn write_index_from_snapshot(
     )
 }
 
-/// Internal: write v2 index with masks.
-fn write_index_v2(
+fn write_index_v2_from_postings(
     index_dir: &Path,
     root: &Path,
     file_id_map: &[(u32, String)],
-    inverted: &HashMap<u32, Vec<PostingEntry>>,
+    postings: &mut [TrigramPosting],
 ) -> Result<()> {
+    postings.sort_unstable_by(|a, b| {
+        a.trigram
+            .cmp(&b.trigram)
+            .then_with(|| a.entry.file_id.cmp(&b.entry.file_id))
+    });
+    let trigram_count = count_sorted_trigrams(postings);
     eprintln!(
         "Writing index ({} trigrams, {} files)...",
-        inverted.len(),
+        trigram_count,
         file_id_map.len()
     );
-
-    write_index_files(
+    write_index_files_from_postings(
         index_dir,
         root,
         file_id_map.len(),
         file_id_map.iter().map(|(_, p)| p.as_str()),
-        inverted,
+        postings,
+        trigram_count,
         None,
-    )
+    )?;
+    Ok(())
+}
+
+fn count_sorted_trigrams(postings: &[TrigramPosting]) -> usize {
+    let mut count = 0usize;
+    let mut previous = None;
+    for posting in postings {
+        if previous != Some(posting.trigram) {
+            count += 1;
+            previous = Some(posting.trigram);
+        }
+    }
+    count
 }

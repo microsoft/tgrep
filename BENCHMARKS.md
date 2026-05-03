@@ -1,7 +1,71 @@
 # Benchmarks
 
-All benchmarks measure **search time only** — the trigram index is built before timing starts.
+The large-repo benchmarks measure **search time only** — the trigram index is built before timing starts.
 tgrep runs in client/server mode: `tgrep serve` runs in the background, and the `tgrep` client connects via TCP.
+
+The core benchmark suite also includes Criterion microbenchmarks for index building,
+query execution, and trigram extraction. These are useful for tracking lower-level
+performance changes that may not show up in end-to-end search latency.
+
+---
+
+## Core Criterion benchmarks
+
+Local Criterion run on Windows from the `perf-benchmarks` branch. The short
+measurement windows below are intended for PR validation; use larger sample sizes
+and measurement windows for publication-quality comparisons.
+
+```powershell
+cargo bench -p tgrep-core --bench trigram_extraction -- --sample-size 30 --warm-up-time 1 --measurement-time 2
+cargo bench -p tgrep-core --bench query_execution -- --sample-size 30 --warm-up-time 1 --measurement-time 2
+cargo bench -p tgrep-core --bench index_build -- --sample-size 10 --warm-up-time 0.5 --measurement-time 1
+cargo bench -p tgrep-core --bench index_build -- --peak-memory 5000
+cargo bench -p tgrep-core --bench index_build -- --peak-memory-high-diversity 1000
+```
+
+### Index build
+
+| Case | Mean | Throughput | Peak working set |
+| --- | ---: | ---: | ---: |
+| 100 files | 29.611ms | 1.6490 MiB/s | - |
+| 500 files | 100.77ms | 2.4228 MiB/s | - |
+| 2,000 files | 322.78ms | 3.0255 MiB/s | - |
+| 5,000 files | 776.27ms | 3.1450 MiB/s | 16.47 MiB |
+| 1,000 high-diversity files | 372.62ms | 2.6208 MiB/s | 43.68 MiB |
+
+The high-diversity case stresses the number of distinct trigrams and posting-list
+serialization. The flat sorted-posting writer reduced this case from roughly
+1.47s and 98.74 MiB peak working set to roughly 0.37s and 43.68 MiB in local runs.
+
+### Query execution
+
+| Case | Mean |
+| --- | ---: |
+| AND intersection, 100 files | 816.79ns |
+| AND intersection, 1,000 files | 3.7150us |
+| AND intersection, 10,000 files | 29.260us |
+| OR union, 4 terms | 6.4297us |
+| OR union, 16 terms | 29.912us |
+| OR union, 64 terms | 122.23us |
+| On-disk common literal, 1,000 files | 63.806us |
+| On-disk common literal, 5,000 files | 475.88us |
+
+The on-disk common-literal cases exercise a real built index through
+`IndexReader::lookup_trigram_with_masks`. Keeping on-disk posting lists sorted by
+file ID lets query execution skip redundant sorting and deduplication for these
+already-normalized posting lists.
+
+### Trigram extraction
+
+| Case | 1 KiB | 16 KiB | 256 KiB |
+| --- | ---: | ---: | ---: |
+| Extract masks, lowercase ASCII | 14.253us | 206.39us | 2.9378ms |
+| Extract merged masks, lowercase ASCII | 30.271us | 399.31us | 6.0330ms |
+| Extract merged masks, mixed case | 29.960us | 374.22us | 6.1909ms |
+
+For lowercase-only content, merged-mask extraction skips the lowercase copy and
+second extraction pass. In the 256 KiB case, that improved the local Criterion
+baseline by about 51%.
 
 ---
 

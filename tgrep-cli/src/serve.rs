@@ -3,7 +3,7 @@
 /// Keeps the trigram index in memory (HybridIndex), watches for filesystem
 /// changes, and serves search/status queries over TCP.
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -311,7 +311,9 @@ pub fn run(
             Ok(stream) => {
                 let state = Arc::clone(&state);
                 thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, &state) {
+                    if let Err(e) = handle_connection(stream, &state)
+                        && !is_normal_connection_close(&e)
+                    {
                         eprintln!("[trace] connection error: {e}");
                     }
                 });
@@ -349,6 +351,20 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_normal_connection_close(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }
 
 fn process_request(request: &str, state: &ServerState) -> String {
@@ -1931,6 +1947,25 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn normal_connection_closes_are_not_logged_as_errors() {
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            let err = anyhow::Error::from(std::io::Error::from(kind));
+            assert!(is_normal_connection_close(&err));
+        }
+    }
+
+    #[test]
+    fn non_disconnect_io_errors_are_still_logged() {
+        let err = anyhow::Error::from(std::io::Error::from(ErrorKind::PermissionDenied));
+        assert!(!is_normal_connection_close(&err));
+    }
 
     #[test]
     fn skip_watcher_path_skips_dot_components() {

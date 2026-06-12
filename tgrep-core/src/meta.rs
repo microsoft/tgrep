@@ -91,25 +91,27 @@ pub fn read_filestamps(index_dir: &Path) -> Result<HashMap<String, FileStamp>> {
 pub fn collect_filestamps(root: &Path, paths: &[String]) -> HashMap<String, FileStamp> {
     use rayon::prelude::*;
 
-    paths
-        .par_iter()
-        .filter_map(|rel_path| {
-            let full_path = root.join(rel_path);
-            std::fs::metadata(&full_path).ok().map(|metadata| {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                (
-                    rel_path.clone(),
-                    FileStamp {
-                        mtime,
-                        size: metadata.len(),
-                    },
-                )
+    crate::parallel::install(|| {
+        paths
+            .par_iter()
+            .filter_map(|rel_path| {
+                let full_path = root.join(rel_path);
+                std::fs::metadata(&full_path).ok().map(|metadata| {
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    (
+                        rel_path.clone(),
+                        FileStamp {
+                            mtime,
+                            size: metadata.len(),
+                        },
+                    )
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
 }

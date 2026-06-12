@@ -15,9 +15,10 @@ const BINARY_EXTENSIONS: &[&str] = &[
     "sqlite", "sqlite3",
 ];
 
-/// Number of parallel walker threads (capped at 12 to avoid diminishing returns).
+/// Number of parallel walker threads, capped by tgrep's CPU-capacity limit and
+/// by a walker-specific maximum to avoid diminishing returns.
 fn walker_thread_count() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get().min(12))
+    crate::parallel::walker_threads()
 }
 
 /// Check if a directory entry should be skipped based on exclude list.

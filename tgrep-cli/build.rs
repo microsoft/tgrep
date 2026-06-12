@@ -14,25 +14,34 @@ fn main() {
     // (e.g. x64 host -> arm64 target in OneBranch), #[cfg] would check the host
     // and skip VERSIONINFO embedding even though the output is a Windows .exe.
     // Reference: microsoft/vscode cli/build.rs uses the same pattern.
-    if std::env::var("CARGO_CFG_TARGET_OS")
-        .map(|os| os == "windows")
-        .unwrap_or(false)
-    {
-        let mut res = winresource::WindowsResource::new();
-        res.set("ProductName", "tgrep");
-        res.set(
-            "FileDescription",
-            "tgrep - trigram-indexed grep for large codebases",
-        );
-        res.set("CompanyName", "Microsoft Corporation");
-        res.set(
-            "LegalCopyright",
-            "Copyright (c) Microsoft Corporation. All rights reserved.",
-        );
-        res.set("InternalName", "tgrep");
-        res.set("OriginalFilename", "tgrep.exe");
-        // FileVersion and ProductVersion are auto-populated from Cargo.toml
-        // by winresource when not explicitly set.
-        res.compile().expect("Failed to compile Windows resources");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
     }
+
+    compile_windows_resources();
+}
+
+#[cfg(not(windows))]
+fn compile_windows_resources() {
+    println!("cargo:warning=Skipping Windows VERSIONINFO resource: build host is not Windows");
+}
+
+#[cfg(windows)]
+fn compile_windows_resources() {
+    let mut res = winresource::WindowsResource::new();
+    res.set("ProductName", "tgrep");
+    res.set(
+        "FileDescription",
+        "tgrep - trigram-indexed grep for large codebases",
+    );
+    res.set("CompanyName", "Microsoft Corporation");
+    res.set(
+        "LegalCopyright",
+        "Copyright (c) Microsoft Corporation. All rights reserved.",
+    );
+    res.set("InternalName", "tgrep");
+    res.set("OriginalFilename", "tgrep.exe");
+    // FileVersion and ProductVersion are auto-populated from Cargo.toml
+    // by winresource when not explicitly set.
+    res.compile().expect("Failed to compile Windows resources");
 }

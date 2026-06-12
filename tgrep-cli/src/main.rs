@@ -9,6 +9,7 @@ mod glob_filter;
 mod index;
 mod matching;
 mod output;
+mod repo_guard;
 mod search;
 mod serve;
 mod status;

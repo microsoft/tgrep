@@ -174,6 +174,7 @@ pub fn run(
 ) -> Result<()> {
     let serve_start = Instant::now();
     let root = std::fs::canonicalize(root)?;
+    crate::repo_guard::ensure_can_recursively_walk(&root, "serve")?;
     let index_dir = index_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| builder::default_index_dir(&root));

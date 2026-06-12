@@ -5,9 +5,9 @@ use std::sync::OnceLock;
 /// Maximum walker threads before applying the CPU-capacity limit.
 pub const MAX_WALKER_THREADS: usize = 12;
 
-static CPU_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+static CPU_POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
 
-/// Number of worker threads allowed for CPU-intensive work.
+/// Maximum concurrent threads allowed for CPU-intensive work.
 ///
 /// This is half of the available logical CPU capacity, rounded down so tgrep
 /// does not exceed half capacity on machines with an odd CPU count. A single
@@ -28,17 +28,46 @@ where
     OP: FnOnce() -> R + Send,
     R: Send,
 {
-    cpu_pool().install(op)
+    match cpu_pool() {
+        Some(pool) => pool.install(op),
+        None => op(),
+    }
 }
 
-fn cpu_pool() -> &'static rayon::ThreadPool {
-    CPU_POOL.get_or_init(|| {
+fn cpu_pool() -> Option<&'static rayon::ThreadPool> {
+    CPU_POOL
+        .get_or_init(|| {
+            let allowed_threads = worker_threads();
+            if allowed_threads == 1 {
+                return None;
+            }
+
+            // `ThreadPool::install` may run work on the caller too, so reserve
+            // one slot for that thread and keep total CPU work within the cap.
+            let pool_threads = allowed_threads - 1;
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(pool_threads)
+                    .thread_name(|index| format!("tgrep-worker-{index}"))
+                    .build()
+                    .expect("failed to initialize tgrep worker thread pool"),
+            )
+        })
+        .as_ref()
+}
+
+#[cfg(test)]
+fn build_cpu_pool_for_allowed_threads(allowed_threads: usize) -> Option<rayon::ThreadPool> {
+    if allowed_threads == 1 {
+        return None;
+    }
+
+    Some(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(worker_threads())
-            .thread_name(|index| format!("tgrep-worker-{index}"))
+            .num_threads(allowed_threads - 1)
             .build()
-            .expect("failed to initialize tgrep worker thread pool")
-    })
+            .unwrap(),
+    )
 }
 
 fn available_threads() -> usize {
@@ -75,5 +104,13 @@ mod tests {
         assert_eq!(capped_half_cpu_threads(23, MAX_WALKER_THREADS), 11);
         assert_eq!(capped_half_cpu_threads(8, MAX_WALKER_THREADS), 4);
         assert_eq!(capped_half_cpu_threads(2, MAX_WALKER_THREADS), 1);
+    }
+
+    #[test]
+    fn cpu_pool_reserves_one_thread_for_install_caller() {
+        assert!(build_cpu_pool_for_allowed_threads(1).is_none());
+
+        let pool = build_cpu_pool_for_allowed_threads(4).unwrap();
+        assert_eq!(pool.current_num_threads(), 3);
     }
 }

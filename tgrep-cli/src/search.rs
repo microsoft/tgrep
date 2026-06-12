@@ -178,6 +178,7 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
         return Ok(());
     }
 
+    crate::repo_guard::ensure_can_recursively_walk(&root, "--files")?;
     let walk = walker::walk_dir(
         &root,
         &walker::WalkOptions {
@@ -499,6 +500,7 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
         return Ok(had_matches);
     }
 
+    crate::repo_guard::ensure_can_recursively_walk(root, "search")?;
     let walk = walker::walk_dir(
         root,
         &walker::WalkOptions {

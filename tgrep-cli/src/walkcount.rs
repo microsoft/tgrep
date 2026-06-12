@@ -7,6 +7,7 @@ use tgrep_core::walker::{self, WalkOptions};
 
 pub fn run(root: &Path, include_hidden: bool, no_ignore: bool) -> Result<()> {
     let root = std::fs::canonicalize(root)?;
+    crate::repo_guard::ensure_can_recursively_walk(&root, "count-files")?;
     let start = Instant::now();
 
     let walk = walker::walk_dir(

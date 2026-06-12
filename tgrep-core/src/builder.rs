@@ -63,23 +63,26 @@ pub fn build_index(
     let mut postings: Vec<TrigramPosting> = Vec::new();
 
     for batch in walk.files.chunks(INDEX_BUILD_BATCH_SIZE) {
-        let batch_data: Vec<(String, HashMap<u32, TrigramMasks>)> = batch
-            .par_iter()
-            .filter_map(|path| {
-                let data = std::fs::read(path).ok()?;
-                if trigram::is_binary(&data) {
-                    binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return None;
-                }
-                let rel = path
-                    .strip_prefix(&root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let per_tri = trigram::extract_merged_masks(&data);
-                Some((rel, per_tri))
-            })
-            .collect();
+        let batch_data: Vec<(String, HashMap<u32, TrigramMasks>)> =
+            crate::parallel::install(|| {
+                batch
+                    .par_iter()
+                    .filter_map(|path| {
+                        let data = std::fs::read(path).ok()?;
+                        if trigram::is_binary(&data) {
+                            binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return None;
+                        }
+                        let rel = path
+                            .strip_prefix(&root)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        let per_tri = trigram::extract_merged_masks(&data);
+                        Some((rel, per_tri))
+                    })
+                    .collect()
+            });
 
         for (path, per_tri) in batch_data {
             let file_id = file_id_map.len() as u32;

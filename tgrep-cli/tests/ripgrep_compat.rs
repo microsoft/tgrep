@@ -723,6 +723,24 @@ fn count_files_skips_binary() {
     assert!(stderr.contains("1 binary skipped"));
 }
 
+#[test]
+fn count_files_rejects_windows_os_repo_root() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(
+        dir.path().join(".git").join("config"),
+        "[remote \"origin\"]\n    url = https://dev.azure.com/microsoft/OS/_git/OS\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+
+    tgrep()
+        .args(["count-files", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Windows OS repo"));
+}
+
 // ─── --exclude (index) ─────────────────────────────────────────────
 
 /// Create a fixture with subdirectories to test --exclude during indexing.

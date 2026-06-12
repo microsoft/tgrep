@@ -6,6 +6,7 @@ pub mod hybrid;
 pub mod live;
 pub mod meta;
 pub(crate) mod ondisk;
+pub mod parallel;
 pub mod query;
 pub mod reader;
 pub mod trigram;

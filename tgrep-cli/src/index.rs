@@ -10,6 +10,8 @@ pub fn run(
     include_hidden: bool,
     exclude_dirs: &[String],
 ) -> Result<()> {
-    builder::build_index(root, index_path, include_hidden, exclude_dirs)?;
+    let root = std::fs::canonicalize(root)?;
+    crate::repo_guard::ensure_can_recursively_walk(&root, "index")?;
+    builder::build_index(&root, index_path, include_hidden, exclude_dirs)?;
     Ok(())
 }

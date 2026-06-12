@@ -174,6 +174,7 @@ pub fn run(
 ) -> Result<()> {
     let serve_start = Instant::now();
     let root = std::fs::canonicalize(root)?;
+    crate::repo_guard::ensure_can_recursively_walk(&root, "serve")?;
     let index_dir = index_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| builder::default_index_dir(&root));
@@ -645,12 +646,16 @@ fn handle_search(
 
     // Parallel regex matching across candidate files
     let t_search = Instant::now();
-    let per_file: std::result::Result<Vec<Vec<serde_json::Value>>, String> = candidate_contents
-        .par_iter()
-        .map(|(rel_path, content)| {
-            search_file_matches(rel_path, content, &matcher, &opts).map_err(|e| format!("{e}"))
-        })
-        .collect();
+    let per_file: std::result::Result<Vec<Vec<serde_json::Value>>, String> =
+        tgrep_core::parallel::install(|| {
+            candidate_contents
+                .par_iter()
+                .map(|(rel_path, content)| {
+                    search_file_matches(rel_path, content, &matcher, &opts)
+                        .map_err(|e| format!("{e}"))
+                })
+                .collect()
+        });
     let matches: Vec<serde_json::Value> = match per_file {
         Ok(per_file) => per_file.into_iter().flatten().collect(),
         Err(e) => return json_rpc_error(id, -32603, &e),
@@ -1440,27 +1445,29 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // Phase 2: Process new files in parallel batches
     for (batch_idx, batch) in new_files.chunks(BATCH_SIZE).enumerate() {
         // Parallel: read files + extract trigrams (no locks held)
-        let batch_results: Vec<(String, Vec<u32>)> = batch
-            .par_iter()
-            .filter_map(|path| {
-                let data = std::fs::read(path).ok()?;
-                if tgrep_core::trigram::is_binary(&data) {
-                    return None;
-                }
-                let rel_path = path
-                    .strip_prefix(root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+        let batch_results: Vec<(String, Vec<u32>)> = tgrep_core::parallel::install(|| {
+            batch
+                .par_iter()
+                .filter_map(|path| {
+                    let data = std::fs::read(path).ok()?;
+                    if tgrep_core::trigram::is_binary(&data) {
+                        return None;
+                    }
+                    let rel_path = path
+                        .strip_prefix(root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
 
-                let mut trigrams = tgrep_core::trigram::extract(&data);
-                let lower = data.to_ascii_lowercase();
-                if lower != data {
-                    trigrams.extend(tgrep_core::trigram::extract(&lower));
-                }
-                Some((rel_path, trigrams))
-            })
-            .collect();
+                    let mut trigrams = tgrep_core::trigram::extract(&data);
+                    let lower = data.to_ascii_lowercase();
+                    if lower != data {
+                        trigrams.extend(tgrep_core::trigram::extract(&lower));
+                    }
+                    Some((rel_path, trigrams))
+                })
+                .collect()
+        });
 
         // Sequential: insert into LiveIndex (brief write lock per batch)
         {

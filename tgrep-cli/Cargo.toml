@@ -33,5 +33,5 @@ assert_cmd = "2"
 tempfile = "3"
 predicates = "3"
 
-[target.'cfg(windows)'.build-dependencies]
+[build-dependencies]
 winresource = "0.1"

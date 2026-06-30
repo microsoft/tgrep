@@ -414,6 +414,17 @@ pub fn append_overlay_to_index(
         let reader_next = (ri < reader_trigram_count)
             .then(|| reader.nth_trigram_raw(ri))
             .flatten();
+
+        // A reader entry that exists in the lookup table but whose raw posting
+        // bytes can't be read (truncated/corrupt mmap) yields `None` here while
+        // `ri` is still in range. Advance past it so we never stall consuming
+        // overlay keys against a dead reader slot, and never break the merge
+        // early while reader trigrams remain.
+        if ri < reader_trigram_count && reader_next.is_none() {
+            ri += 1;
+            continue;
+        }
+
         let overlay_next = overlay_trigrams.get(oi).copied();
 
         let (trigram, reader_bytes, overlay_seq) = match (reader_next, overlay_next) {
@@ -440,8 +451,7 @@ pub fn append_overlay_to_index(
                 oi += 1;
                 (ot, None, overlay_inverted.get(&ot))
             }
-            // A reader entry whose raw bytes could not be read (truncated mmap).
-            // Skip it rather than emit a corrupt posting range.
+            // Both streams exhausted (reader entries already skipped above).
             (None, None) => break,
         };
 
@@ -603,10 +613,7 @@ mod tests {
 
         // Build a live overlay of two brand-new files (append-only invariant).
         let mut live = LiveIndex::new();
-        live.upsert_file_with_trigrams(
-            "src/c.txt",
-            crate::trigram::extract(b"needle three\n"),
-        );
+        live.upsert_file_with_trigrams("src/c.txt", crate::trigram::extract(b"needle three\n"));
         live.upsert_file_with_trigrams("src/d.txt", crate::trigram::extract(b"zzz unique\n"));
         let (overlay_paths, overlay_inverted) = live.snapshot_for_disk();
 

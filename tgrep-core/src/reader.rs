@@ -327,7 +327,7 @@ impl IndexReader {
         let entry = self.read_lookup_entry(i);
         let postings = self.postings.as_ref()?;
         let start = entry.offset as usize;
-        let byte_len = entry.length as usize * POSTING_ENTRY_SIZE;
+        let byte_len = (entry.length as usize).checked_mul(POSTING_ENTRY_SIZE)?;
         let end = start.checked_add(byte_len)?;
         if end > postings.len() {
             return None;

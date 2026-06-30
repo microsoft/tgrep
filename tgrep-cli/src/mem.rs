@@ -30,9 +30,7 @@ pub fn process_rss_bytes() -> Option<u64> {
 #[cfg(target_os = "windows")]
 pub fn total_physical_memory_bytes() -> Option<u64> {
     use std::mem::MaybeUninit;
-    use windows_sys::Win32::System::SystemInformation::{
-        GlobalMemoryStatusEx, MEMORYSTATUSEX,
-    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
     unsafe {
         let mut status = MaybeUninit::<MEMORYSTATUSEX>::zeroed();
@@ -73,10 +71,20 @@ pub fn total_physical_memory_bytes() -> Option<u64> {
 pub fn process_rss_bytes() -> Option<u64> {
     use std::mem::MaybeUninit;
     unsafe {
-        let mut rusage = MaybeUninit::<libc::rusage>::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, rusage.as_mut_ptr()) == 0 {
-            // On macOS, ru_maxrss is in bytes
-            Some(rusage.assume_init().ru_maxrss as u64)
+        // `ru_maxrss` reports the *peak* RSS, so it never decreases after a
+        // flush reclaims memory and would keep the process looking over-budget
+        // forever. Query the *current* resident size via proc_pidinfo instead.
+        let mut info = MaybeUninit::<libc::proc_taskinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        let ret = libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr() as *mut libc::c_void,
+            size,
+        );
+        if ret == size {
+            Some(info.assume_init().pti_resident_size)
         } else {
             None
         }

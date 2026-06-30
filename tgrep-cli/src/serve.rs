@@ -155,6 +155,9 @@ struct ServerState {
     /// loading or if no matcher could be built; during that window the watcher
     /// falls back to hidden / exclude filtering.
     gitignore: RwLock<Option<tgrep_core::gitignore::Gitignore>>,
+    /// Maximum RSS budget (bytes). When the process exceeds this during
+    /// indexing, the build stops early and produces a partial index.
+    memory_cap_bytes: u64,
 }
 
 struct SearchOpts {
@@ -171,6 +174,7 @@ pub fn run(
     index_path: Option<&Path>,
     no_watch: bool,
     exclude_dirs: &[String],
+    memory_cap_bytes: u64,
 ) -> Result<()> {
     let serve_start = Instant::now();
     let root = std::fs::canonicalize(root)?;
@@ -241,6 +245,7 @@ pub fn run(
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
         snapshot_gate: RwLock::new(()),
         gitignore: RwLock::new(None),
+        memory_cap_bytes,
     });
 
     // Bind TCP listener on a random port
@@ -255,10 +260,11 @@ pub fn run(
     info.save(&index_dir)?;
 
     eprintln!(
-        "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries.",
+        "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries. Memory cap: {} MB.",
         serve_start.elapsed().as_secs_f64() * 1000.0,
         port,
-        CACHE_CAPACITY
+        CACHE_CAPACITY,
+        memory_cap_bytes / (1024 * 1024),
     );
 
     // If no pre-existing index, build into the LiveIndex in background
@@ -1438,7 +1444,23 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     );
 
     // Phase 2: Process new files in parallel batches
+    let mut memory_capped = false;
     for (batch_idx, batch) in new_files.chunks(BATCH_SIZE).enumerate() {
+        // Check memory budget before processing the next batch.
+        if let Some(rss) = crate::mem::process_rss_bytes()
+            && rss > state.memory_cap_bytes
+        {
+            eprintln!(
+                "[trace] memory cap reached ({} MB RSS > {} MB cap) after {} batches — \
+                 stopping indexing early",
+                rss / (1024 * 1024),
+                state.memory_cap_bytes / (1024 * 1024),
+                batch_idx,
+            );
+            memory_capped = true;
+            break;
+        }
+
         // Parallel: read files + extract trigrams (no locks held)
         let batch_results: Vec<(String, Vec<u32>)> = batch
             .par_iter()
@@ -1485,7 +1507,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     }
 
     eprintln!(
-        "[trace] background indexing complete: {} total files ({} new, {} seeded) in {:.1}s",
+        "[trace] background indexing {}: {} total files ({} new, {} seeded) in {:.1}s",
+        if memory_capped { "stopped (memory cap)" } else { "complete" },
         total,
         new_count,
         seeded_count,
@@ -1527,6 +1550,18 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // Final (and only) flush to disk for the bulk build.
     eprintln!("[trace] persisting final index to disk...");
     let pruned = flush_index_to_disk(state, root, index_dir, Some(&stamps));
+
+    // When the build was cut short by the memory cap, mark the on-disk
+    // index as partial so the next server start will attempt to continue
+    // indexing the remaining files.
+    if memory_capped
+        && pruned
+        && let Ok(mut meta) = tgrep_core::meta::IndexMeta::load(index_dir)
+    {
+        meta.complete = false;
+        let _ = meta.save(index_dir);
+    }
+
     state
         .flushing
         .store(false, std::sync::atomic::Ordering::Relaxed);

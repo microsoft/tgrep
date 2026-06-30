@@ -8,6 +8,7 @@
 mod glob_filter;
 mod index;
 mod matching;
+mod mem;
 mod output;
 mod search;
 mod serve;
@@ -225,6 +226,13 @@ enum Command {
         #[arg(long)]
         no_watch: bool,
 
+        /// Maximum memory budget in megabytes for the indexing process.
+        /// When the process RSS exceeds this limit, indexing stops early
+        /// and produces a partial index. Defaults to 50% of physical RAM
+        /// (clamped between 512 MB and 16 GB).
+        #[arg(long = "max-memory", value_name = "MB")]
+        max_memory_mb: Option<u64>,
+
         /// Exclude directories from indexing (can be specified multiple times).
         #[arg(long = "exclude", action = clap::ArgAction::Append)]
         exclude: Vec<String>,
@@ -321,8 +329,14 @@ fn main() {
         Some(Command::Serve {
             path,
             no_watch,
+            max_memory_mb,
             exclude,
-        }) => serve::run(&path, cli.index_path.as_deref(), no_watch, &exclude),
+        }) => {
+            let memory_cap = max_memory_mb
+                .map(|mb| mb * 1024 * 1024)
+                .unwrap_or_else(mem::default_memory_cap_bytes);
+            serve::run(&path, cli.index_path.as_deref(), no_watch, &exclude, memory_cap)
+        }
         Some(Command::Search {
             ref pattern,
             ref paths,

@@ -1045,6 +1045,7 @@ dependencies = [
  "fancy-regex",
  "fs2",
  "globset",
+ "libc",
  "lru",
  "notify",
  "predicates",
@@ -1054,6 +1055,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tgrep-core",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

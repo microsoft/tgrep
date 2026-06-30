@@ -311,6 +311,30 @@ impl IndexReader {
         None
     }
 
+    /// Return the `i`-th trigram (in ascending sorted order) together with the
+    /// raw, on-disk posting bytes for that trigram. Zero-copy: the returned
+    /// slice points directly into the mmap, so callers can copy the bytes
+    /// verbatim into a new index without decoding them into heap.
+    ///
+    /// Used by the streaming append-merge in the builder to keep the existing
+    /// on-disk postings out of heap while merging a live overlay into a new
+    /// index. Returns `None` if `i` is out of range or the postings mmap is
+    /// absent/truncated for the entry.
+    pub fn nth_trigram_raw(&self, i: usize) -> Option<(u32, &[u8])> {
+        if i >= self.num_entries {
+            return None;
+        }
+        let entry = self.read_lookup_entry(i);
+        let postings = self.postings.as_ref()?;
+        let start = entry.offset as usize;
+        let byte_len = entry.length as usize * POSTING_ENTRY_SIZE;
+        let end = start.checked_add(byte_len)?;
+        if end > postings.len() {
+            return None;
+        }
+        Some((entry.trigram, &postings[start..end]))
+    }
+
     fn read_lookup_entry(&self, index: usize) -> LookupEntry {
         let lookup = self.lookup.as_ref().unwrap();
         let start = index * LOOKUP_ENTRY_SIZE;

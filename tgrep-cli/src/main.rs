@@ -226,10 +226,11 @@ enum Command {
         #[arg(long)]
         no_watch: bool,
 
-        /// Maximum memory budget in megabytes for the indexing process.
-        /// When the process RSS exceeds this limit, indexing stops early
-        /// and produces a partial index. Defaults to 50% of physical RAM
-        /// (clamped between 512 MB and 16 GB).
+        /// Maximum memory budget in megabytes for the in-memory index built
+        /// during the initial scan. When the indexer's working set exceeds
+        /// this, it flushes to disk and continues, keeping peak memory bounded
+        /// while still producing a complete index. Defaults to 50% of physical
+        /// RAM (clamped between 512 MB and 16 GB).
         #[arg(long = "max-memory", value_name = "MB")]
         max_memory_mb: Option<u64>,
 

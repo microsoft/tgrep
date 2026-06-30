@@ -1444,23 +1444,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     );
 
     // Phase 2: Process new files in parallel batches
-    let mut memory_capped = false;
+    let mut incremental_flushes = 0u32;
     for (batch_idx, batch) in new_files.chunks(BATCH_SIZE).enumerate() {
-        // Check memory budget before processing the next batch.
-        if let Some(rss) = crate::mem::process_rss_bytes()
-            && rss > state.memory_cap_bytes
-        {
-            eprintln!(
-                "[trace] memory cap reached ({} MB RSS > {} MB cap) after {} batches — \
-                 stopping indexing early",
-                rss / (1024 * 1024),
-                state.memory_cap_bytes / (1024 * 1024),
-                batch_idx,
-            );
-            memory_capped = true;
-            break;
-        }
-
         // Parallel: read files + extract trigrams (no locks held)
         let batch_results: Vec<(String, Vec<u32>)> = batch
             .par_iter()
@@ -1504,14 +1489,42 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 start.elapsed().as_secs_f64()
             );
         }
+
+        // Memory-bounded build: if the in-heap overlay has pushed RSS past the
+        // budget, persist what we've indexed so far to disk and reclaim the
+        // heap before continuing. This keeps peak memory bounded (the flush
+        // copies existing on-disk postings verbatim from mmap rather than into
+        // heap) while still converging to a *complete* index — unlike simply
+        // stopping, which would leave a partial index.
+        if let Some(rss) = crate::mem::process_rss_bytes()
+            && rss > state.memory_cap_bytes
+        {
+            eprintln!(
+                "[trace] memory cap reached ({} MB RSS > {} MB cap) — flushing \
+                 overlay to disk to reclaim memory and continuing",
+                rss / (1024 * 1024),
+                state.memory_cap_bytes / (1024 * 1024),
+            );
+            if incremental_flush(state, index_dir) {
+                incremental_flushes += 1;
+                let mut index = state.index.write().unwrap();
+                index.live.shrink_to_fit();
+            } else {
+                eprintln!(
+                    "[trace] warning: incremental flush did not reclaim memory; \
+                     continuing (build may still exceed the budget)"
+                );
+            }
+        }
     }
 
     eprintln!(
-        "[trace] background indexing {}: {} total files ({} new, {} seeded) in {:.1}s",
-        if memory_capped { "stopped (memory cap)" } else { "complete" },
+        "[trace] background indexing complete: {} total files ({} new, {} seeded, \
+         {} incremental flushes) in {:.1}s",
         total,
         new_count,
         seeded_count,
+        incremental_flushes,
         start.elapsed().as_secs_f64()
     );
 
@@ -1547,20 +1560,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         .indexing
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
-    // Final (and only) flush to disk for the bulk build.
+    // Final flush to disk for the bulk build. This always publishes with
+    // `complete = true`; any intermediate incremental flushes published
+    // `complete = false` so a mid-build kill would resume rather than be
+    // treated as finished.
     eprintln!("[trace] persisting final index to disk...");
     let pruned = flush_index_to_disk(state, root, index_dir, Some(&stamps));
-
-    // When the build was cut short by the memory cap, mark the on-disk
-    // index as partial so the next server start will attempt to continue
-    // indexing the remaining files.
-    if memory_capped
-        && pruned
-        && let Ok(mut meta) = tgrep_core::meta::IndexMeta::load(index_dir)
-    {
-        meta.complete = false;
-        let _ = meta.save(index_dir);
-    }
 
     state
         .flushing
@@ -1656,16 +1661,109 @@ fn flush_index_to_disk(
         eprintln!("[trace] warning: failed to write staging filestamps: {e}");
     }
 
-    // Lock-free publish: rename staging files into place, build new reader,
-    // then swap. Search queries continue to be served throughout.
-    //
+    // Lock-free publish: rename staging files into place, build the new
+    // reader, swap it in, and prune the now-persisted overlay. Search queries
+    // continue to be served by the previous reader throughout.
+    let pruned = publish_staged_index(state, index_dir, &staging_dir, num_files);
+
+    eprintln!(
+        "[trace] index flushed: {num_files} files on disk in {:.1}s",
+        flush_start.elapsed().as_secs_f64()
+    );
+    pruned
+}
+
+/// Memory-bounded incremental flush used during the initial bulk build.
+///
+/// Unlike [`flush_index_to_disk`] (which builds a full reader+overlay snapshot
+/// in heap via `full_snapshot`, costing O(total index size) memory), this
+/// streams the live overlay onto the existing on-disk index via
+/// [`builder::append_overlay_to_index`]: the existing postings are copied
+/// verbatim from the reader's mmap and never enter the heap. Peak heap stays
+/// bounded to the overlay snapshot, so repeated calls keep the whole build
+/// under the memory budget while still converging to a complete index.
+///
+/// Relies on the bulk-build invariant that the overlay is **append-only**
+/// (watcher + auto-save suppressed while `indexing == true`), so every overlay
+/// file is new and the merge is a pure append.
+///
+/// The on-disk index is published with `complete = false`: a kill mid-build
+/// must leave the index marked partial so the next start resumes indexing the
+/// remaining files. The final end-of-build flush re-publishes with
+/// `complete = true`.
+///
+/// Returns `true` if the new reader was published and the overlay pruned.
+fn incremental_flush(state: &ServerState, index_dir: &Path) -> bool {
+    let flush_start = Instant::now();
+
+    // Hold the snapshot gate for the whole snapshot → publish → prune cycle,
+    // mirroring flush_index_to_disk. (During the bulk build the watcher is
+    // already suppressed, but auto-save coordination and future-proofing make
+    // the gate the right call.)
+    let _gate = state.snapshot_gate.write().unwrap();
+
+    // Snapshot the overlay (bounded heap) and the current reader (cheap Arc).
+    let (overlay_paths, overlay_inverted, reader) = {
+        let index = state.index.read().unwrap();
+        let (paths, inverted) = index.live.snapshot_for_disk();
+        (paths, inverted, index.reader_arc())
+    };
+    if overlay_paths.is_empty() {
+        return false;
+    }
+    let num_files = reader.num_files() + overlay_paths.len();
+
+    let staging_dir = index_dir.with_file_name(".tgrep_flush_staging");
+    let _ = std::fs::remove_dir_all(&staging_dir);
+
+    // Stream-merge overlay onto the existing on-disk index. `complete = false`
+    // so an interrupted build resumes rather than being treated as finished.
+    if let Err(e) = builder::append_overlay_to_index(
+        &state.root,
+        &staging_dir,
+        &reader,
+        &overlay_paths,
+        &overlay_inverted,
+        false,
+    ) {
+        eprintln!("[trace] warning: incremental flush write failed: {e}");
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return false;
+    }
+
+    let pruned = publish_staged_index(state, index_dir, &staging_dir, num_files);
+    eprintln!(
+        "[trace] incremental flush: {num_files} files on disk in {:.1}s",
+        flush_start.elapsed().as_secs_f64()
+    );
+    pruned
+}
+
+/// Publish a staged index directory: move the staged files into `index_dir`,
+/// reopen the on-disk reader (with Windows stale-NTFS-metadata retries),
+/// validate + warm it, swap it in without blocking searches, and prune the
+/// now-persisted overlay entries.
+///
+/// Shared by [`flush_index_to_disk`] and [`incremental_flush`]. The
+/// `publish_lock` is held across move + open + swap so concurrent publishers
+/// cannot interleave renames or swap readers out of order. `num_files` is the
+/// expected on-disk file count used to reject a partially-published reader.
+///
+/// Returns `true` when the swap + prune succeeded, `false` on any failure (the
+/// previous reader and the live overlay are retained as the fallback).
+fn publish_staged_index(
+    state: &ServerState,
+    index_dir: &Path,
+    staging_dir: &Path,
+    num_files: usize,
+) -> bool {
     // Held across move + open + swap so concurrent publishers (auto-save /
     // background-build / watcher reindex flush) cannot interleave renames
     // or swap readers out of order. Searches do not take this lock.
     let _publish = state.publish_lock.lock().unwrap();
-    if let Err(e) = move_staged_files(&staging_dir, index_dir) {
+    if let Err(e) = move_staged_files(staging_dir, index_dir) {
         eprintln!("[trace] warning: flush move failed: {e}");
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        let _ = std::fs::remove_dir_all(staging_dir);
         return false;
     }
 
@@ -1772,12 +1870,7 @@ fn flush_index_to_disk(
         }
         false
     };
-    let _ = std::fs::remove_dir_all(&staging_dir);
-
-    eprintln!(
-        "[trace] index flushed: {num_files} files on disk in {:.1}s",
-        flush_start.elapsed().as_secs_f64()
-    );
+    let _ = std::fs::remove_dir_all(staging_dir);
     pruned
 }
 

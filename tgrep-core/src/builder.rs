@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::Result;
 use crate::meta::{self, IndexMeta};
 use crate::ondisk::{self, LookupEntry, PostingEntry};
+use crate::reader::IndexReader;
 use crate::trigram::{self, TrigramMasks};
 use crate::walker;
 
@@ -347,6 +348,166 @@ pub fn write_index_from_snapshot(
     )
 }
 
+/// Append a live overlay of **brand-new** files onto an existing on-disk index,
+/// writing a fresh index into `out_dir` without ever materializing the existing
+/// postings on the heap.
+///
+/// This is the memory-bounded flush used by the bulk indexer: rather than
+/// merging reader + overlay into a single in-heap `HashMap` (which costs
+/// O(total index size) memory and would defeat a memory cap), it streams a
+/// 2-way merge of the reader's sorted lookup table (read straight from its mmap)
+/// with the overlay's sorted trigram postings. The reader's posting bytes are
+/// copied **verbatim** — they have the identical on-disk layout — so peak heap
+/// stays bounded to the size of the overlay snapshot plus small write buffers,
+/// independent of how large the existing index already is.
+///
+/// ## Append-only precondition
+/// Every overlay file must be **new** (not already present in `reader`, and not
+/// a deletion/supersession of a reader file). The bulk indexer guarantees this:
+/// the file watcher and auto-save are both suppressed while the initial build is
+/// in progress, so the overlay only ever accumulates fresh files. Under this
+/// precondition the merge is a pure append:
+/// - existing files keep their IDs `[0, base)`,
+/// - overlay files take IDs `[base, base + overlay_paths.len())` in the order
+///   given by `overlay_paths`,
+/// - for any trigram, `reader_postings (ids < base) ++ overlay_postings
+///   (ids >= base)` is already globally sorted by `file_id`.
+///
+/// `overlay_inverted` maps each trigram to the overlay's sorted, **zero-based**
+/// file indices (as produced by [`crate::live::LiveIndex::snapshot_for_disk`]);
+/// each index `k` refers to `overlay_paths[k]` and is written with disk ID
+/// `base + k`. Overlay entries carry the no-filter sentinel masks
+/// `(u8::MAX, u8::MAX)`, matching the bulk indexer's mask-free fast path.
+pub fn append_overlay_to_index(
+    root: &Path,
+    out_dir: &Path,
+    reader: &IndexReader,
+    overlay_paths: &[String],
+    overlay_inverted: &HashMap<u32, Vec<u32>>,
+    complete: bool,
+) -> Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+
+    let base = reader.num_files() as u32;
+
+    // Overlay trigrams in ascending order for the 2-way merge.
+    let mut overlay_trigrams: Vec<u32> = overlay_inverted.keys().copied().collect();
+    overlay_trigrams.sort_unstable();
+
+    let mut postings_file =
+        std::io::BufWriter::new(std::fs::File::create(out_dir.join("index.bin"))?);
+    let mut lookup_file =
+        std::io::BufWriter::new(std::fs::File::create(out_dir.join("lookup.bin"))?);
+    let mut lookup_scratch =
+        Vec::with_capacity(LOOKUP_WRITE_CHUNK_ENTRIES * ondisk::LOOKUP_ENTRY_SIZE);
+    let mut posting_scratch =
+        Vec::with_capacity(POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE);
+
+    let reader_trigram_count = reader.num_trigrams();
+    let mut ri = 0usize;
+    let mut oi = 0usize;
+    let mut offset: u64 = 0;
+    let mut trigram_count = 0usize;
+
+    // Standard 2-way merge over two ascending trigram streams.
+    while ri < reader_trigram_count || oi < overlay_trigrams.len() {
+        let reader_next = (ri < reader_trigram_count)
+            .then(|| reader.nth_trigram_raw(ri))
+            .flatten();
+        let overlay_next = overlay_trigrams.get(oi).copied();
+
+        let (trigram, reader_bytes, overlay_seq) = match (reader_next, overlay_next) {
+            (Some((rt, rbytes)), Some(ot)) => match rt.cmp(&ot) {
+                std::cmp::Ordering::Less => {
+                    ri += 1;
+                    (rt, Some(rbytes), None)
+                }
+                std::cmp::Ordering::Greater => {
+                    oi += 1;
+                    (ot, None, overlay_inverted.get(&ot))
+                }
+                std::cmp::Ordering::Equal => {
+                    ri += 1;
+                    oi += 1;
+                    (rt, Some(rbytes), overlay_inverted.get(&rt))
+                }
+            },
+            (Some((rt, rbytes)), None) => {
+                ri += 1;
+                (rt, Some(rbytes), None)
+            }
+            (None, Some(ot)) => {
+                oi += 1;
+                (ot, None, overlay_inverted.get(&ot))
+            }
+            // A reader entry whose raw bytes could not be read (truncated mmap).
+            // Skip it rather than emit a corrupt posting range.
+            (None, None) => break,
+        };
+
+        let reader_len = reader_bytes.map_or(0, |b| b.len() / ondisk::POSTING_ENTRY_SIZE);
+        let overlay_len = overlay_seq.map_or(0, |v| v.len());
+        let length = (reader_len + overlay_len) as u32;
+        if length == 0 {
+            continue;
+        }
+
+        write_lookup_entry(
+            &mut lookup_file,
+            LookupEntry {
+                trigram,
+                offset,
+                length,
+            },
+            &mut lookup_scratch,
+        )?;
+
+        // Reader postings: copy the on-disk bytes verbatim (zero decode).
+        if let Some(rbytes) = reader_bytes {
+            postings_file.write_all(rbytes)?;
+        }
+        // Overlay postings: encode with sentinel masks, IDs offset by `base`.
+        if let Some(seq) = overlay_seq {
+            for chunk in seq.chunks(POSTING_WRITE_CHUNK_ENTRIES) {
+                posting_scratch.clear();
+                for &k in chunk {
+                    let entry = PostingEntry {
+                        file_id: base + k,
+                        loc_mask: u8::MAX,
+                        next_mask: u8::MAX,
+                    };
+                    posting_scratch.extend_from_slice(&entry.encode());
+                }
+                postings_file.write_all(&posting_scratch)?;
+            }
+        }
+
+        offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;
+        trigram_count += 1;
+    }
+
+    flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
+    postings_file.flush()?;
+    lookup_file.flush()?;
+
+    // files.bin + meta.json: existing files keep IDs [0, base), overlay files
+    // follow at [base, base + N). Reader paths stream from its already-loaded
+    // file table; overlay paths from the snapshot.
+    let paths = reader
+        .all_paths()
+        .iter()
+        .map(String::as_str)
+        .chain(overlay_paths.iter().map(String::as_str));
+    write_files_and_meta(
+        out_dir,
+        root,
+        base as usize + overlay_paths.len(),
+        paths,
+        trigram_count,
+        Some(complete),
+    )
+}
+
 fn write_index_v2_from_postings(
     index_dir: &Path,
     root: &Path,
@@ -422,5 +583,95 @@ mod tests {
             .collect();
         needle_paths.sort_unstable();
         assert_eq!(needle_paths, vec!["src/a.txt", "src/b.txt"]);
+    }
+
+    #[test]
+    fn append_overlay_merges_new_files_into_complete_index() {
+        use crate::live::LiveIndex;
+
+        // Base index with two files.
+        let repo = tempfile::tempdir().unwrap();
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "hello world\nneedle one\n").unwrap();
+        std::fs::write(src.join("b.txt"), "needle two\nother content\n").unwrap();
+
+        let base_dir = tempfile::tempdir().unwrap();
+        build_index(repo.path(), Some(base_dir.path()), false, &[]).unwrap();
+        let base_reader = IndexReader::open(base_dir.path()).unwrap();
+        assert_eq!(base_reader.num_files(), 2);
+
+        // Build a live overlay of two brand-new files (append-only invariant).
+        let mut live = LiveIndex::new();
+        live.upsert_file_with_trigrams(
+            "src/c.txt",
+            crate::trigram::extract(b"needle three\n"),
+        );
+        live.upsert_file_with_trigrams("src/d.txt", crate::trigram::extract(b"zzz unique\n"));
+        let (overlay_paths, overlay_inverted) = live.snapshot_for_disk();
+
+        // Stream-merge overlay onto the base index into a fresh dir.
+        let merged_dir = tempfile::tempdir().unwrap();
+        append_overlay_to_index(
+            repo.path(),
+            merged_dir.path(),
+            &base_reader,
+            &overlay_paths,
+            &overlay_inverted,
+            true,
+        )
+        .unwrap();
+
+        let merged = IndexReader::open(merged_dir.path()).unwrap();
+        merged.validate_lookup().unwrap();
+        assert_eq!(merged.num_files(), 4, "all base + overlay files present");
+
+        // Base file IDs are preserved (copied verbatim at the front).
+        assert_eq!(merged.file_path(0), base_reader.file_path(0));
+        assert_eq!(merged.file_path(1), base_reader.file_path(1));
+        // Overlay files follow in insertion order.
+        assert_eq!(merged.file_path(2), Some("src/c.txt"));
+        assert_eq!(merged.file_path(3), Some("src/d.txt"));
+
+        // A trigram shared by base + overlay returns all three files, sorted.
+        let needle = crate::trigram::hash(b'n', b'e', b'e');
+        let mut needle_paths: Vec<&str> = merged
+            .lookup_trigram(needle)
+            .iter()
+            .filter_map(|&id| merged.file_path(id))
+            .collect();
+        needle_paths.sort_unstable();
+        assert_eq!(needle_paths, vec!["src/a.txt", "src/b.txt", "src/c.txt"]);
+
+        // An overlay-only trigram resolves to just the overlay file.
+        let uni = crate::trigram::hash(b'u', b'n', b'i');
+        let uni_paths: Vec<&str> = merged
+            .lookup_trigram(uni)
+            .iter()
+            .filter_map(|&id| merged.file_path(id))
+            .collect();
+        assert_eq!(uni_paths, vec!["src/d.txt"]);
+
+        // Posting lists stay globally sorted by file_id after the merge.
+        let needle_ids = merged.lookup_trigram(needle);
+        let mut sorted = needle_ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(needle_ids, sorted, "merged posting list must be sorted");
+
+        // Masks: base entries keep their real masks; overlay entries carry the
+        // no-filter sentinel (the bulk path stores no masks).
+        let c_id = (0..merged.num_files() as u32)
+            .find(|&id| merged.file_path(id) == Some("src/c.txt"))
+            .unwrap();
+        let entries = merged.lookup_trigram_with_masks(needle);
+        let c_entry = entries.iter().find(|e| e.file_id == c_id).unwrap();
+        assert_eq!(c_entry.loc_mask, u8::MAX);
+        assert_eq!(c_entry.next_mask, u8::MAX);
+        let base_entry = entries.iter().find(|e| e.file_id < 2).unwrap();
+        assert_ne!(
+            base_entry.loc_mask,
+            u8::MAX,
+            "base file's real loc_mask must be preserved verbatim"
+        );
     }
 }

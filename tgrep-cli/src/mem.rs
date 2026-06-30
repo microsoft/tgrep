@@ -93,13 +93,12 @@ pub fn process_rss_bytes() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 pub fn total_physical_memory_bytes() -> Option<u64> {
-    use std::mem::MaybeUninit;
     unsafe {
         let mut size: u64 = 0;
         let mut len = std::mem::size_of::<u64>();
-        let mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+        let mut mib = [libc::CTL_HW, libc::HW_MEMSIZE];
         let ret = libc::sysctl(
-            mib.as_ptr(),
+            mib.as_mut_ptr(),
             2,
             &mut size as *mut u64 as *mut libc::c_void,
             &mut len,

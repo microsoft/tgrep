@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -90,7 +91,9 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
 ///   5. `cache`         — guards the file content LRU cache
 ///   6. `file_stamps`   — guards per-file mtime/size stamps
 ///
-/// `flushing` is an AtomicBool, not a lock — no ordering constraint.
+/// `indexing` and `flushing` coordinate the handoff between bulk indexing and
+/// final flush with the auto-save loop; use sequentially consistent accesses
+/// for those flags so auto-save never observes both as false during handoff.
 /// Searches only acquire `index` (read) and `cache` (read then write);
 /// they never take `snapshot_gate` or `publish_lock`.
 struct ServerState {
@@ -777,7 +780,7 @@ fn search_file_matches(
 fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
     let index = state.index.read().unwrap();
     let cache = state.cache.read().unwrap();
-    let indexing = state.indexing.load(std::sync::atomic::Ordering::Relaxed);
+    let indexing = state.indexing.load(Ordering::SeqCst);
 
     let result = serde_json::json!({
         "num_files": index.num_files(),
@@ -920,7 +923,7 @@ fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
     // Skip file events while the initial background index build is in progress —
     // the indexer will pick up all files itself, and the watcher would just
     // cause duplicate reindex work.
-    if state.indexing.load(std::sync::atomic::Ordering::Relaxed) {
+    if state.indexing.load(Ordering::SeqCst) {
         return;
     }
 
@@ -1062,9 +1065,7 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
         // active — those paths handle their own publication and an
         // auto-save fired in parallel would just snapshot the same
         // overlay redundantly.
-        if state.indexing.load(std::sync::atomic::Ordering::Relaxed)
-            || state.flushing.load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if state.indexing.load(Ordering::SeqCst) || state.flushing.load(Ordering::SeqCst) {
             continue;
         }
 
@@ -1345,13 +1346,9 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
             )
         })
         .collect();
-    state
-        .flushing
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    state.flushing.store(true, Ordering::SeqCst);
     flush_index_to_disk(state, root, index_dir, Some(&new_stamps));
-    state
-        .flushing
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state.flushing.store(false, Ordering::SeqCst);
 
     // Refresh in-memory stamps so the watcher can dedupe spurious notify
     // events for files that already match what we just published.
@@ -1537,7 +1534,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 rss / (1024 * 1024),
                 state.memory_cap_bytes / (1024 * 1024),
             );
-            if incremental_flush(state, index_dir) {
+            if flush_append_only_overlay(state, index_dir, false, None) {
                 incremental_flushes += 1;
                 let mut index = state.index.write().unwrap();
                 index.live.shrink_to_fit();
@@ -1585,23 +1582,19 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // repos. Set `flushing` *before* clearing `indexing` so the auto-save
     // loop never observes both flags as false during the handoff and
     // races us into a redundant parallel snapshot of the bulk overlay.
-    state
-        .flushing
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    state
-        .indexing
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state.flushing.store(true, Ordering::SeqCst);
+    state.indexing.store(false, Ordering::SeqCst);
 
-    // Final flush to disk for the bulk build. This always publishes with
-    // `complete = true`; any intermediate incremental flushes published
-    // `complete = false` so a mid-build kill would resume rather than be
-    // treated as finished.
+    // Final flush to disk for the bulk build. Use the same streaming
+    // append-only path as incremental flushes so the final complete publish
+    // does not materialize the whole reader+overlay in heap and violate the
+    // memory cap. This always publishes with `complete = true`; any
+    // intermediate incremental flushes published `complete = false` so a
+    // mid-build kill would resume rather than be treated as finished.
     eprintln!("[trace] persisting final index to disk...");
-    let pruned = flush_index_to_disk(state, root, index_dir, Some(&stamps));
+    let pruned = flush_append_only_overlay(state, index_dir, true, Some(&stamps));
 
-    state
-        .flushing
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state.flushing.store(false, Ordering::SeqCst);
 
     // Refresh the in-memory file_stamps so the file watcher can recognize
     // unchanged files and skip spurious notify events (e.g. atime/attribute
@@ -1705,27 +1698,32 @@ fn flush_index_to_disk(
     pruned
 }
 
-/// Memory-bounded incremental flush used during the initial bulk build.
+/// Memory-bounded append-only flush used during the initial bulk build.
 ///
 /// Unlike [`flush_index_to_disk`] (which builds a full reader+overlay snapshot
 /// in heap via `full_snapshot`, costing O(total index size) memory), this
 /// streams the live overlay onto the existing on-disk index via
 /// [`builder::append_overlay_to_index`]: the existing postings are copied
 /// verbatim from the reader's mmap and never enter the heap. Peak heap stays
-/// bounded to the overlay snapshot, so repeated calls keep the whole build
-/// under the memory budget while still converging to a complete index.
+/// bounded to the overlay snapshot, so repeated checkpoint flushes and the
+/// final complete publish keep the whole build under the memory budget.
 ///
 /// Relies on the bulk-build invariant that the overlay is **append-only**
 /// (watcher + auto-save suppressed while `indexing == true`), so every overlay
 /// file is new and the merge is a pure append.
 ///
-/// The on-disk index is published with `complete = false`: a kill mid-build
-/// must leave the index marked partial so the next start resumes indexing the
-/// remaining files. The final end-of-build flush re-publishes with
-/// `complete = true`.
+/// Checkpoint flushes pass `complete = false`: a kill mid-build must leave the
+/// index marked partial so the next start resumes indexing the remaining files.
+/// The final end-of-build flush passes `complete = true` and may pass file
+/// stamps to publish alongside the index.
 ///
 /// Returns `true` if the new reader was published and the overlay pruned.
-fn incremental_flush(state: &ServerState, index_dir: &Path) -> bool {
+fn flush_append_only_overlay(
+    state: &ServerState,
+    index_dir: &Path,
+    complete: bool,
+    stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+) -> bool {
     let flush_start = Instant::now();
 
     // Hold the snapshot gate for the whole snapshot → publish → prune cycle,
@@ -1740,7 +1738,7 @@ fn incremental_flush(state: &ServerState, index_dir: &Path) -> bool {
         let (paths, inverted) = index.live.snapshot_for_disk();
         (paths, inverted, index.reader_arc())
     };
-    if overlay_paths.is_empty() {
+    if overlay_paths.is_empty() && !complete && stamps.is_none() {
         return false;
     }
     let num_files = reader.num_files() + overlay_paths.len();
@@ -1748,24 +1746,34 @@ fn incremental_flush(state: &ServerState, index_dir: &Path) -> bool {
     let staging_dir = index_dir.with_file_name(".tgrep_flush_staging");
     let _ = std::fs::remove_dir_all(&staging_dir);
 
-    // Stream-merge overlay onto the existing on-disk index. `complete = false`
-    // so an interrupted build resumes rather than being treated as finished.
+    // Stream-merge overlay onto the existing on-disk index. Incremental
+    // checkpoint flushes publish `complete = false`; the final bulk-build flush
+    // republishes the same stream with `complete = true` and stamps.
     if let Err(e) = builder::append_overlay_to_index(
         &state.root,
         &staging_dir,
         &reader,
         &overlay_paths,
         &overlay_inverted,
-        false,
+        complete,
     ) {
-        eprintln!("[trace] warning: incremental flush write failed: {e}");
+        eprintln!("[trace] warning: append-only flush write failed: {e}");
         let _ = std::fs::remove_dir_all(&staging_dir);
         return false;
     }
 
+    // Stage filestamps alongside the final complete index. If this fails we
+    // still publish the index: losing incremental stale-check state on next
+    // start is preferable to dropping the completed build.
+    if let Some(stamps) = stamps
+        && let Err(e) = tgrep_core::meta::write_filestamps(stamps, &staging_dir)
+    {
+        eprintln!("[trace] warning: failed to write staging filestamps: {e}");
+    }
+
     let pruned = publish_staged_index(state, index_dir, &staging_dir, num_files);
     eprintln!(
-        "[trace] incremental flush: {num_files} files on disk in {:.1}s",
+        "[trace] append-only flush: {num_files} files on disk (complete={complete}) in {:.1}s",
         flush_start.elapsed().as_secs_f64()
     );
     pruned
@@ -1776,7 +1784,7 @@ fn incremental_flush(state: &ServerState, index_dir: &Path) -> bool {
 /// validate + warm it, swap it in without blocking searches, and prune the
 /// now-persisted overlay entries.
 ///
-/// Shared by [`flush_index_to_disk`] and [`incremental_flush`]. The
+/// Shared by [`flush_index_to_disk`] and [`flush_append_only_overlay`]. The
 /// `publish_lock` is held across move + open + swap so concurrent publishers
 /// cannot interleave renames or swap readers out of order. `num_files` is the
 /// expected on-disk file count used to reject a partially-published reader.

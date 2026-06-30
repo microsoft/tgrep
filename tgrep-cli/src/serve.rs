@@ -155,9 +155,13 @@ struct ServerState {
     /// loading or if no matcher could be built; during that window the watcher
     /// falls back to hidden / exclude filtering.
     gitignore: RwLock<Option<tgrep_core::gitignore::Gitignore>>,
-    /// Maximum RSS budget (bytes). When the process exceeds this during
-    /// indexing, the build stops early and produces a partial index.
+    /// Maximum RSS budget (bytes). When the process exceeds this during the
+    /// initial build, the indexer flushes the overlay to disk and continues so
+    /// peak memory stays bounded while still producing a complete index.
     memory_cap_bytes: u64,
+    /// Number of worker threads used for the parallel file-reading/trigram
+    /// extraction during the initial build. Caps indexing CPU usage.
+    index_threads: usize,
 }
 
 struct SearchOpts {
@@ -175,6 +179,7 @@ pub fn run(
     no_watch: bool,
     exclude_dirs: &[String],
     memory_cap_bytes: u64,
+    index_threads: usize,
 ) -> Result<()> {
     let serve_start = Instant::now();
     let root = std::fs::canonicalize(root)?;
@@ -246,6 +251,7 @@ pub fn run(
         snapshot_gate: RwLock::new(()),
         gitignore: RwLock::new(None),
         memory_cap_bytes,
+        index_threads,
     });
 
     // Bind TCP listener on a random port
@@ -260,11 +266,13 @@ pub fn run(
     info.save(&index_dir)?;
 
     eprintln!(
-        "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries. Memory cap: {} MB.",
+        "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries. \
+         Memory cap: {} MB. Index threads: {}.",
         serve_start.elapsed().as_secs_f64() * 1000.0,
         port,
         CACHE_CAPACITY,
         memory_cap_bytes / (1024 * 1024),
+        index_threads,
     );
 
     // If no pre-existing index, build into the LiveIndex in background
@@ -1443,31 +1451,55 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         t_walk.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Phase 2: Process new files in parallel batches
+    // Phase 2: Process new files in parallel batches.
+    //
+    // Confine the CPU-heavy file-read + trigram-extraction work to a bounded
+    // worker pool (sized from the `--max-cpu` budget) so the initial build
+    // doesn't saturate every core and starve the host. Falls back to the
+    // global rayon pool if a dedicated pool can't be built.
+    let index_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(state.index_threads)
+        .thread_name(|i| format!("tgrep-index-{i}"))
+        .build()
+        .ok();
+    if index_pool.is_some() {
+        eprintln!(
+            "[trace] indexing with {} worker thread(s)",
+            state.index_threads
+        );
+    }
+
     let mut incremental_flushes = 0u32;
     for (batch_idx, batch) in new_files.chunks(BATCH_SIZE).enumerate() {
-        // Parallel: read files + extract trigrams (no locks held)
-        let batch_results: Vec<(String, Vec<u32>)> = batch
-            .par_iter()
-            .filter_map(|path| {
-                let data = std::fs::read(path).ok()?;
-                if tgrep_core::trigram::is_binary(&data) {
-                    return None;
-                }
-                let rel_path = path
-                    .strip_prefix(root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
+        // Parallel: read files + extract trigrams (no locks held). Run inside
+        // the bounded pool when available so indexing CPU stays capped.
+        let extract = || {
+            batch
+                .par_iter()
+                .filter_map(|path| {
+                    let data = std::fs::read(path).ok()?;
+                    if tgrep_core::trigram::is_binary(&data) {
+                        return None;
+                    }
+                    let rel_path = path
+                        .strip_prefix(root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
 
-                let mut trigrams = tgrep_core::trigram::extract(&data);
-                let lower = data.to_ascii_lowercase();
-                if lower != data {
-                    trigrams.extend(tgrep_core::trigram::extract(&lower));
-                }
-                Some((rel_path, trigrams))
-            })
-            .collect();
+                    let mut trigrams = tgrep_core::trigram::extract(&data);
+                    let lower = data.to_ascii_lowercase();
+                    if lower != data {
+                        trigrams.extend(tgrep_core::trigram::extract(&lower));
+                    }
+                    Some((rel_path, trigrams))
+                })
+                .collect::<Vec<(String, Vec<u32>)>>()
+        };
+        let batch_results: Vec<(String, Vec<u32>)> = match &index_pool {
+            Some(pool) => pool.install(extract),
+            None => extract(),
+        };
 
         // Sequential: insert into LiveIndex (brief write lock per batch)
         {

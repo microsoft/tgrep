@@ -332,7 +332,12 @@ impl IndexReader {
         let start = entry.offset;
         let byte_len = (entry.length as u64).checked_mul(POSTING_ENTRY_SIZE as u64)?;
         let end = start.checked_add(byte_len)?;
-        if end > postings.len() as u64 {
+        // Guard both ends against the mmap length. `end >= start` holds because
+        // `byte_len` is unsigned and `checked_add` rejects overflow, but check
+        // `start` explicitly so a zero-length entry with an out-of-range offset
+        // can never reach the slice below.
+        let len = postings.len() as u64;
+        if start > len || end > len {
             return None;
         }
         let start = usize::try_from(start).ok()?;

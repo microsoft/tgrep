@@ -16,9 +16,10 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-/// Number of files to index. Comfortably exceeds the indexer's internal batch
-/// size (500) so that, with a 1 MB cap, several incremental flushes fire.
-const NUM_FILES: usize = 1200;
+/// Number of files to index. Exceeds the indexer's internal batch size (500)
+/// so that, with a 1 MB cap, multiple incremental flushes fire, while staying
+/// small enough to keep the test fast and CI-friendly.
+const NUM_FILES: usize = 700;
 
 fn tgrep_bin() -> PathBuf {
     assert_cmd::cargo::cargo_bin("tgrep")

@@ -326,12 +326,17 @@ impl IndexReader {
         }
         let entry = self.read_lookup_entry(i);
         let postings = self.postings.as_ref()?;
-        let start = entry.offset as usize;
-        let byte_len = (entry.length as usize).checked_mul(POSTING_ENTRY_SIZE)?;
+        // Do the range math in u64 and validate against the mmap length before
+        // narrowing to usize, so a large/corrupt offset can't truncate on
+        // 32-bit targets and yield an in-bounds slice from the wrong region.
+        let start = entry.offset;
+        let byte_len = (entry.length as u64).checked_mul(POSTING_ENTRY_SIZE as u64)?;
         let end = start.checked_add(byte_len)?;
-        if end > postings.len() {
+        if end > postings.len() as u64 {
             return None;
         }
+        let start = usize::try_from(start).ok()?;
+        let end = usize::try_from(end).ok()?;
         Some((entry.trigram, &postings[start..end]))
     }
 

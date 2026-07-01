@@ -1582,6 +1582,17 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // repos. Set `flushing` *before* clearing `indexing` so the auto-save
     // loop never observes both flags as false during the handoff and
     // races us into a redundant parallel snapshot of the bulk overlay.
+    //
+    // Acquire the publish gate *before* clearing `indexing`. `handle_fs_event`
+    // only skips while `indexing` is true; once it's false a watcher event can
+    // run, and if it grabbed `snapshot_gate.read()` before our flush grabbed
+    // the write lock it could mutate the overlay in the gap between the flag
+    // flip and the final snapshot — updating/deleting a path already on disk in
+    // the reader and violating `append_overlay_to_index`'s brand-new-paths
+    // precondition. Holding the gate across the flip makes any such event block
+    // (not skip) until the flush publishes, after which it applies safely to
+    // the newly published reader; no event is lost.
+    let gate = state.snapshot_gate.write().unwrap();
     state.flushing.store(true, Ordering::SeqCst);
     state.indexing.store(false, Ordering::SeqCst);
 
@@ -1592,7 +1603,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // intermediate incremental flushes published `complete = false` so a
     // mid-build kill would resume rather than be treated as finished.
     eprintln!("[trace] persisting final index to disk...");
-    let pruned = flush_append_only_overlay(state, index_dir, true, Some(&stamps));
+    let pruned = flush_append_only_overlay_locked(state, index_dir, true, Some(&stamps));
+    drop(gate);
 
     state.flushing.store(false, Ordering::SeqCst);
 
@@ -1724,13 +1736,27 @@ fn flush_append_only_overlay(
     complete: bool,
     stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
 ) -> bool {
-    let flush_start = Instant::now();
-
     // Hold the snapshot gate for the whole snapshot → publish → prune cycle,
     // mirroring flush_index_to_disk. (During the bulk build the watcher is
     // already suppressed, but auto-save coordination and future-proofing make
     // the gate the right call.)
     let _gate = state.snapshot_gate.write().unwrap();
+    flush_append_only_overlay_locked(state, index_dir, complete, stamps)
+}
+
+/// Body of [`flush_append_only_overlay`] that assumes `snapshot_gate` is
+/// **already held for write** by the caller. Split out so the final bulk-build
+/// handoff can acquire the gate *before* clearing the `indexing` flag, closing
+/// the window where a filesystem event could observe `indexing == false`, take
+/// the gate first, and mutate the overlay between the flag flip and the final
+/// snapshot (which would break the append-only precondition).
+fn flush_append_only_overlay_locked(
+    state: &ServerState,
+    index_dir: &Path,
+    complete: bool,
+    stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+) -> bool {
+    let flush_start = Instant::now();
 
     // Snapshot the overlay (bounded heap) and the current reader (cheap Arc).
     let (overlay_paths, overlay_inverted, reader) = {

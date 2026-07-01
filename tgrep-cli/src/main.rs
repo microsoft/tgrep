@@ -232,7 +232,7 @@ enum Command {
         /// this, it flushes to disk and continues, keeping peak memory bounded
         /// while still producing a complete index. Defaults to 50% of physical
         /// RAM (clamped between 512 MB and 16 GB).
-        #[arg(long = "max-memory", value_name = "MB")]
+        #[arg(long = "max-memory", value_name = "MB", value_parser = clap::value_parser!(u64).range(1..))]
         max_memory_mb: Option<u64>,
 
         /// Maximum CPU budget for the initial index build, as a percentage of
@@ -343,7 +343,7 @@ fn main() {
             exclude,
         }) => {
             let memory_cap = max_memory_mb
-                .map(|mb| mb * 1024 * 1024)
+                .map(|mb| mb.saturating_mul(1024 * 1024))
                 .unwrap_or_else(mem::default_memory_cap_bytes);
             let index_threads = cpu::index_thread_count(max_cpu_percent.unwrap_or(50));
             serve::run(

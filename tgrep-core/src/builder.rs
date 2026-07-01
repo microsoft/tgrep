@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-use crate::Result;
 use crate::meta::{self, IndexMeta};
 use crate::ondisk::{self, LookupEntry, PostingEntry};
 use crate::reader::IndexReader;
 use crate::trigram::{self, TrigramMasks};
 use crate::walker;
+use crate::{Error, Result};
 
 const INDEX_DIR_NAME: &str = ".tgrep";
 const INDEX_BUILD_BATCH_SIZE: usize = 1024;
@@ -388,7 +388,13 @@ pub fn append_overlay_to_index(
 ) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
 
-    let base = reader.num_files() as u32;
+    // File IDs are `u32` on disk. Fail loudly rather than truncate.
+    let base = u32::try_from(reader.num_files()).map_err(|_| {
+        Error::IndexCorrupted(format!(
+            "reader has {} files, exceeding the u32 file-id limit",
+            reader.num_files()
+        ))
+    })?;
 
     // Overlay trigrams in ascending order for the 2-way merge.
     let mut overlay_trigrams: Vec<u32> = overlay_inverted.keys().copied().collect();
@@ -417,12 +423,15 @@ pub fn append_overlay_to_index(
 
         // A reader entry that exists in the lookup table but whose raw posting
         // bytes can't be read (truncated/corrupt mmap) yields `None` here while
-        // `ri` is still in range. Advance past it so we never stall consuming
-        // overlay keys against a dead reader slot, and never break the merge
-        // early while reader trigrams remain.
+        // `ri` is still in range. Silently skipping would drop that trigram yet
+        // still publish an index, turning reader corruption into silent data
+        // loss. Fail the flush instead so the caller keeps the previous reader
+        // plus the live overlay as a safe fallback.
         if ri < reader_trigram_count && reader_next.is_none() {
-            ri += 1;
-            continue;
+            return Err(Error::IndexCorrupted(format!(
+                "reader trigram entry {ri} of {reader_trigram_count} has unreadable \
+                 postings; refusing to publish an incomplete merged index"
+            )));
         }
 
         let overlay_next = overlay_trigrams.get(oi).copied();
@@ -451,13 +460,22 @@ pub fn append_overlay_to_index(
                 oi += 1;
                 (ot, None, overlay_inverted.get(&ot))
             }
-            // Both streams exhausted (reader entries already skipped above).
+            // Reader exhausted (in-range unreadable entries already errored above).
             (None, None) => break,
         };
 
         let reader_len = reader_bytes.map_or(0, |b| b.len() / ondisk::POSTING_ENTRY_SIZE);
         let overlay_len = overlay_seq.map_or(0, |v| v.len());
-        let length = (reader_len + overlay_len) as u32;
+        let length = u32::try_from(
+            reader_len
+                .checked_add(overlay_len)
+                .ok_or_else(|| Error::IndexCorrupted("posting list length overflow".into()))?,
+        )
+        .map_err(|_| {
+            Error::IndexCorrupted(format!(
+                "posting list for trigram {trigram} exceeds the u32 length limit"
+            ))
+        })?;
         if length == 0 {
             continue;
         }
@@ -481,8 +499,11 @@ pub fn append_overlay_to_index(
             for chunk in seq.chunks(POSTING_WRITE_CHUNK_ENTRIES) {
                 posting_scratch.clear();
                 for &k in chunk {
+                    let file_id = base.checked_add(k).ok_or_else(|| {
+                        Error::IndexCorrupted("overlay file id overflow beyond u32".into())
+                    })?;
                     let entry = PostingEntry {
-                        file_id: base + k,
+                        file_id,
                         loc_mask: u8::MAX,
                         next_mask: u8::MAX,
                     };

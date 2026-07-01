@@ -17,6 +17,8 @@ pub fn process_rss_bytes() -> Option<u64> {
         let handle = GetCurrentProcess();
         let mut counters = MaybeUninit::<PROCESS_MEMORY_COUNTERS>::zeroed();
         let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        // GetProcessMemoryInfo requires `cb` to hold the struct size on input.
+        (*counters.as_mut_ptr()).cb = size;
         let ok = GetProcessMemoryInfo(handle, counters.as_mut_ptr(), size);
         if ok != 0 {
             let counters = counters.assume_init();
@@ -131,4 +133,38 @@ pub fn default_memory_cap_bytes() -> u64 {
         .unwrap_or(4 * 1024 * 1024 * 1024); // fallback: 4 GB
 
     half_ram.clamp(FLOOR, CEILING)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // On supported platforms the queries must succeed and return non-zero
+    // values. This guards regressions like a missing `PROCESS_MEMORY_COUNTERS.cb`
+    // (or `MEMORYSTATUSEX.dwLength`) initialization, which would make the call
+    // fail and silently disable the memory cap.
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn process_rss_is_nonzero() {
+        let rss = process_rss_bytes().expect("process RSS query should succeed");
+        assert!(rss > 0, "process RSS should be non-zero, got {rss}");
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn total_physical_memory_is_nonzero() {
+        let total =
+            total_physical_memory_bytes().expect("total physical memory query should succeed");
+        assert!(
+            total > 0,
+            "total physical memory should be non-zero, got {total}"
+        );
+    }
+
+    #[test]
+    fn default_cap_is_within_bounds() {
+        let cap = default_memory_cap_bytes();
+        assert!(cap >= 512 * 1024 * 1024);
+        assert!(cap <= 16 * 1024 * 1024 * 1024);
+    }
 }

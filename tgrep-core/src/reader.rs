@@ -311,6 +311,40 @@ impl IndexReader {
         None
     }
 
+    /// Return the `i`-th trigram (in ascending sorted order) together with the
+    /// raw, on-disk posting bytes for that trigram. Zero-copy: the returned
+    /// slice points directly into the mmap, so callers can copy the bytes
+    /// verbatim into a new index without decoding them into heap.
+    ///
+    /// Used by the streaming append-merge in the builder to keep the existing
+    /// on-disk postings out of heap while merging a live overlay into a new
+    /// index. Returns `None` if `i` is out of range or the postings mmap is
+    /// absent/truncated for the entry.
+    pub fn nth_trigram_raw(&self, i: usize) -> Option<(u32, &[u8])> {
+        if i >= self.num_entries {
+            return None;
+        }
+        let entry = self.read_lookup_entry(i);
+        let postings = self.postings.as_ref()?;
+        // Do the range math in u64 and validate against the mmap length before
+        // narrowing to usize, so a large/corrupt offset can't truncate on
+        // 32-bit targets and yield an in-bounds slice from the wrong region.
+        let start = entry.offset;
+        let byte_len = (entry.length as u64).checked_mul(POSTING_ENTRY_SIZE as u64)?;
+        let end = start.checked_add(byte_len)?;
+        // Guard both ends against the mmap length. `end >= start` holds because
+        // `byte_len` is unsigned and `checked_add` rejects overflow, but check
+        // `start` explicitly so a zero-length entry with an out-of-range offset
+        // can never reach the slice below.
+        let len = postings.len() as u64;
+        if start > len || end > len {
+            return None;
+        }
+        let start = usize::try_from(start).ok()?;
+        let end = usize::try_from(end).ok()?;
+        Some((entry.trigram, &postings[start..end]))
+    }
+
     fn read_lookup_entry(&self, index: usize) -> LookupEntry {
         let lookup = self.lookup.as_ref().unwrap();
         let start = index * LOOKUP_ENTRY_SIZE;

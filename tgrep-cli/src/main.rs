@@ -5,9 +5,11 @@
 ///   tgrep serve [path]           Start the search server
 ///   tgrep <pattern> [path]       Search (auto-delegates to server)
 ///   tgrep status [path]          Show index/server status
+mod cpu;
 mod glob_filter;
 mod index;
 mod matching;
+mod mem;
 mod output;
 mod search;
 mod serve;
@@ -225,6 +227,21 @@ enum Command {
         #[arg(long)]
         no_watch: bool,
 
+        /// Maximum memory budget in megabytes for the in-memory index built
+        /// during the initial scan. When the indexer's working set exceeds
+        /// this, it flushes to disk and continues, keeping peak memory bounded
+        /// while still producing a complete index. Defaults to 50% of physical
+        /// RAM (clamped between 512 MB and 16 GB).
+        #[arg(long = "max-memory", value_name = "MB", value_parser = clap::value_parser!(u64).range(1..))]
+        max_memory_mb: Option<u64>,
+
+        /// Maximum CPU budget for the initial index build, as a percentage of
+        /// logical cores (1-100). The parallel file-reading/trigram-extraction
+        /// work is confined to this fraction of cores so the host stays
+        /// responsive. Defaults to 50%.
+        #[arg(long = "max-cpu", value_name = "PERCENT")]
+        max_cpu_percent: Option<u8>,
+
         /// Exclude directories from indexing (can be specified multiple times).
         #[arg(long = "exclude", action = clap::ArgAction::Append)]
         exclude: Vec<String>,
@@ -321,8 +338,23 @@ fn main() {
         Some(Command::Serve {
             path,
             no_watch,
+            max_memory_mb,
+            max_cpu_percent,
             exclude,
-        }) => serve::run(&path, cli.index_path.as_deref(), no_watch, &exclude),
+        }) => {
+            let memory_cap = max_memory_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024))
+                .unwrap_or_else(mem::default_memory_cap_bytes);
+            let index_threads = cpu::index_thread_count(max_cpu_percent.unwrap_or(50));
+            serve::run(
+                &path,
+                cli.index_path.as_deref(),
+                no_watch,
+                &exclude,
+                memory_cap,
+                index_threads,
+            )
+        }
         Some(Command::Search {
             ref pattern,
             ref paths,

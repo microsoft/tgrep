@@ -56,6 +56,15 @@ impl HybridIndex {
         Arc::clone(&self.reader.read().unwrap())
     }
 
+    /// Public snapshot of the current on-disk reader (cheap `Arc` clone).
+    ///
+    /// Exposed so callers performing a memory-bounded incremental flush can
+    /// stream-merge the live overlay onto the existing on-disk index without
+    /// materializing the reader's postings on the heap.
+    pub fn reader_arc(&self) -> Arc<IndexReader> {
+        self.reader()
+    }
+
     /// Atomically replace the on-disk reader with `new_reader`.
     ///
     /// Takes `&self` (not `&mut self`) so that callers can perform the swap

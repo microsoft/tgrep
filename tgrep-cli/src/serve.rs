@@ -278,6 +278,24 @@ pub fn run(
         index_threads,
     );
 
+    // Seed the watcher's ignore matcher from the root-level `.ignore` /
+    // `.gitignore` before the watcher starts, so events are filtered
+    // immediately. The background walk below then replaces it with a
+    // full-tree matcher that also covers nested ignore files.
+    if !no_watch {
+        let root_gitignore = [root.join(".gitignore")];
+        let root_ignore = [root.join(".ignore")];
+        let seed = tgrep_core::walker::build_gitignore_matcher_from_files(
+            &root,
+            &root_gitignore,
+            &root_ignore,
+        );
+        if seed.is_some() {
+            *state.gitignore.write().unwrap() = seed;
+            eprintln!("[trace] seeded watcher ignore matcher from root .ignore/.gitignore");
+        }
+    }
+
     // If no pre-existing index, build into the LiveIndex in background
     if needs_build {
         let build_state = Arc::clone(&state);
@@ -292,10 +310,8 @@ pub fn run(
         let stale_root = root.clone();
         let stale_index_dir = index_dir.clone();
         thread::spawn(move || {
+            // The stale check also builds the watcher's ignore matcher.
             background_refresh_stale(&stale_state, &stale_root, &stale_index_dir);
-            if stale_state.watch_enabled {
-                build_gitignore_matcher_after_ready(&stale_state, &stale_root);
-            }
         });
     }
 
@@ -338,19 +354,6 @@ pub fn run(
     }
 
     Ok(())
-}
-
-fn build_gitignore_matcher_after_ready(state: &ServerState, root: &Path) {
-    let start = Instant::now();
-    eprintln!("[trace] gitignore matcher build started...");
-    let matcher = tgrep_core::gitignore::build_matcher(root);
-    let has_matcher = matcher.is_some();
-    *state.gitignore.write().unwrap() = matcher;
-    eprintln!(
-        "[trace] gitignore matcher build complete in {:.1}ms{}",
-        start.elapsed().as_secs_f64() * 1000.0,
-        if has_matcher { "" } else { " (no rules found)" }
-    );
 }
 
 fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
@@ -1222,6 +1225,31 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
     let start = Instant::now();
     eprintln!("[trace] stale check: comparing index against filesystem...");
 
+    // Walk filesystem metadata (no content reads); the walk also collects the
+    // `.gitignore` / `.ignore` files for the watcher matcher.
+    let walk = walker::walk_file_metadata(root, &state.exclude_dirs);
+    let walk_ms = start.elapsed().as_millis();
+
+    // Build the watcher ignore matcher from the discovered files, before the
+    // early-return below, so it is ready even when the index is up-to-date.
+    if state.watch_enabled {
+        let m_start = Instant::now();
+        let matcher = walker::build_gitignore_matcher_from_files(
+            root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+        );
+        let has_matcher = matcher.is_some();
+        *state.gitignore.write().unwrap() = matcher;
+        eprintln!(
+            "[trace] gitignore matcher built from stale walk in {:.1}ms ({} .gitignore + {} .ignore files discovered{})",
+            m_start.elapsed().as_secs_f64() * 1000.0,
+            walk.gitignore_files.len(),
+            walk.ignore_files.len(),
+            if has_matcher { "" } else { ", no rules found" }
+        );
+    }
+
     // Load stored per-file stamps from last index write
     let old_stamps = match meta::read_filestamps(index_dir) {
         Ok(s) => s,
@@ -1235,9 +1263,7 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
         return;
     }
 
-    // Walk filesystem metadata (no content reads)
-    let current_meta = walker::walk_file_metadata(root, &state.exclude_dirs);
-    let walk_ms = start.elapsed().as_millis();
+    let current_meta = &walk.files;
 
     // Build lookup of current filesystem state
     let mut current_set: std::collections::HashSet<String> =
@@ -1245,7 +1271,7 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
     let mut changed: Vec<String> = Vec::new();
     let mut added: Vec<String> = Vec::new();
 
-    for fm in &current_meta {
+    for fm in current_meta {
         current_set.insert(fm.relative_path.clone());
         let stamp = FileStamp {
             mtime: fm.mtime,
@@ -1403,13 +1429,18 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     if state.watch_enabled {
         let start = Instant::now();
-        let matcher = walker::build_gitignore_matcher_from_files(root, &walk.gitignore_files);
+        let matcher = walker::build_gitignore_matcher_from_files(
+            root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+        );
         let has_matcher = matcher.is_some();
         *state.gitignore.write().unwrap() = matcher;
         eprintln!(
-            "[trace] gitignore matcher built from index walk in {:.1}ms ({} .gitignore files{})",
+            "[trace] gitignore matcher built from index walk in {:.1}ms ({} .gitignore + {} .ignore files{})",
             start.elapsed().as_secs_f64() * 1000.0,
             walk.gitignore_files.len(),
+            walk.ignore_files.len(),
             if has_matcher { "" } else { ", no rules found" }
         );
     }
@@ -1565,6 +1596,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // the next start.
     let walk_meta = tgrep_core::walker::walk_file_metadata(root, &state.exclude_dirs);
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta
+        .files
         .into_iter()
         .map(|fm| {
             (
@@ -2214,6 +2246,8 @@ mod tests {
         // Build the matcher via the public tgrep-core helper so this test
         // also exercises the shared loading logic.
         let tmp = TempDir::new().unwrap();
+        // `.gitignore` rules only apply inside a git repo.
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
         let gi_path = tmp.path().join(".gitignore");
         std::fs::write(&gi_path, "*.log\ntarget/\n").unwrap();
         let gi = tgrep_core::gitignore::build_matcher(tmp.path())

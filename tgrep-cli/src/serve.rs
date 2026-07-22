@@ -27,6 +27,10 @@ use tgrep_core::query;
 const CACHE_CAPACITY: usize = 50_000;
 const AUTO_SAVE_MUTATIONS: u32 = 5000;
 const AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
+/// Default bound on the watcher's pending-event queue (override with
+/// `--watcher-queue-cap`). Caps memory when a flush holds the gate while events
+/// pour in; overflow triggers a reconciling stale refresh.
+const WATCHER_QUEUE_CAP: usize = 16_384;
 
 /// Server discovery info, written to `serve.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,8 +187,10 @@ pub fn run(
     exclude_dirs: &[String],
     memory_cap_bytes: u64,
     index_threads: usize,
+    watcher_queue_cap: Option<usize>,
 ) -> Result<()> {
     let serve_start = Instant::now();
+    let watcher_queue_cap = watcher_queue_cap.unwrap_or(WATCHER_QUEUE_CAP);
     let root = std::fs::canonicalize(root)?;
     let index_dir = index_path
         .map(|p| p.to_path_buf())
@@ -270,12 +276,13 @@ pub fn run(
 
     eprintln!(
         "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries. \
-         Memory cap: {} MB. Index threads: {}.",
+         Memory cap: {} MB. Index threads: {}. Watcher queue cap: {}.",
         serve_start.elapsed().as_secs_f64() * 1000.0,
         port,
         CACHE_CAPACITY,
         memory_cap_bytes / (1024 * 1024),
         index_threads,
+        watcher_queue_cap,
     );
 
     // If no pre-existing index, build into the LiveIndex in background
@@ -306,7 +313,7 @@ pub fn run(
     } else {
         let watcher_state = Arc::clone(&state);
         let watcher_root = root.clone();
-        start_file_watcher(watcher_state, &watcher_root)
+        start_file_watcher(watcher_state, &watcher_root, &index_dir, watcher_queue_cap)
     };
 
     // Set up graceful shutdown
@@ -818,14 +825,61 @@ fn handle_reload(id: Option<serde_json::Value>, state: &ServerState) -> String {
     }
 }
 
-fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<RecommendedWatcher> {
+fn start_file_watcher(
+    state: Arc<ServerState>,
+    root: &Path,
+    index_dir: &Path,
+    queue_cap: usize,
+) -> Option<RecommendedWatcher> {
+    use std::sync::mpsc::{RecvTimeoutError, TrySendError};
+
     let root_path = root.to_path_buf();
-    let state_clone = Arc::clone(&state);
+    let index_dir = index_dir.to_path_buf();
+
+    // The callback only enqueues events; a worker thread drains the queue and
+    // runs `handle_fs_event`. The callback must return promptly (the OS event
+    // buffer drops events if it is slow), but `handle_fs_event` blocks on
+    // `snapshot_gate` for the duration of a flush. Queuing lets events that
+    // arrive during a flush wait in memory rather than being dropped.
+    //
+    // The queue is bounded so a long flush under heavy churn can't grow it
+    // without limit. On overflow the callback sets `overflowed` rather than
+    // blocking; once the flush releases the gate the worker runs a stale
+    // refresh, reconciling any events dropped while the queue was full.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Event>(queue_cap);
+    let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let worker_state = Arc::clone(&state);
+        let worker_root = root_path.clone();
+        let worker_overflowed = Arc::clone(&overflowed);
+        thread::spawn(move || {
+            loop {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(event) => handle_fs_event(&worker_state, &worker_root, &event),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+                if worker_overflowed.swap(false, Ordering::Relaxed) {
+                    eprintln!("[trace] watcher queue overflowed; reconciling with a stale refresh");
+                    background_refresh_stale(&worker_state, &worker_root, &index_dir);
+                }
+            }
+        });
+    }
 
     let mut watcher = match notify::recommended_watcher(
         move |result: std::result::Result<Event, notify::Error>| {
             if let Ok(event) = result {
-                handle_fs_event(&state_clone, &root_path, &event);
+                // Non-blocking hand-off to the worker thread.
+                match tx.try_send(event) {
+                    Ok(()) => {}
+                    // Queue full: flag for a reconciling refresh instead of
+                    // blocking the callback (which would overflow the OS buffer).
+                    Err(TrySendError::Full(_)) => overflowed.store(true, Ordering::Relaxed),
+                    Err(TrySendError::Disconnected(_)) => {
+                        eprintln!("[trace] warning: watcher worker stopped; event dropped");
+                    }
+                }
             }
         },
     ) {
@@ -1216,22 +1270,19 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
 /// Compares stored filestamps against current filesystem metadata, then upserts
 /// changed/new files and removes deleted files from the LiveIndex.
 fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &Path) {
-    use tgrep_core::meta::{self, FileStamp};
+    use tgrep_core::meta::FileStamp;
     use tgrep_core::walker;
 
     let start = Instant::now();
     eprintln!("[trace] stale check: comparing index against filesystem...");
 
-    // Load stored per-file stamps from last index write
-    let old_stamps = match meta::read_filestamps(index_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[trace] stale check: no filestamps found ({e}), skipping");
-            return;
-        }
-    };
+    // Diff the filesystem against the in-memory per-file stamps. They are
+    // loaded from disk at startup and kept current as the watcher applies
+    // events, so an overflow-triggered refresh repairs mid-session drops that
+    // the on-disk stamps (which lag until the next flush) would miss.
+    let old_stamps = state.file_stamps.read().unwrap().clone();
     if old_stamps.is_empty() {
-        eprintln!("[trace] stale check: no filestamps found, skipping");
+        eprintln!("[trace] stale check: no filestamps yet, skipping");
         return;
     }
 

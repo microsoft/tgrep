@@ -16,41 +16,27 @@ use std::path::Path;
 /// matcher without taking a direct dependency on the `ignore` crate.
 pub use ignore::gitignore::Gitignore;
 
-/// Build a `Gitignore` matcher rooted at `root`, mirroring the same
-/// gitignore semantics that `walker::walk_dir` / `walker::walk_file_metadata`
-/// apply during iteration. Loads:
-///   * `.git/info/exclude` (if present)
-///   * every `.gitignore` file inside the tree
-///   * the user's global gitignore (via `GitignoreBuilder`'s defaults)
-///
-/// Uses `WalkBuilder` to enumerate `.gitignore` files so we automatically
-/// skip the `.git` dir and gitignored subtrees while collecting rules.
-/// Returns `None` when no rules could be loaded.
+/// Build a `Gitignore` matcher rooted at `root`, mirroring the ignore
+/// semantics that `walker::walk_dir` / `walker::walk_file_metadata` apply
+/// during iteration: every `.ignore` file in the tree always applies, and
+/// `.gitignore` / `.git/info/exclude` apply only inside a git repository
+/// (git-gating is handled by [`crate::walker::build_gitignore_matcher_from_files`]).
+/// `.ignore` takes precedence over `.gitignore`. Returns `None` when no rules
+/// could be loaded.
 pub fn build_matcher(root: &Path) -> Option<Gitignore> {
-    use ignore::gitignore::GitignoreBuilder;
-
-    let mut builder = GitignoreBuilder::new(root);
-
-    let info_exclude = root.join(".git").join("info").join("exclude");
-    if info_exclude.is_file() {
-        let _ = builder.add(&info_exclude);
-    }
-
-    // Walk to find every `.gitignore` file. We can't use `hidden(true)`
-    // because `.gitignore` itself starts with `.` and would be filtered.
-    // Instead, walk with hidden=false and use `filter_entry` to skip
-    // all dot-prefixed *directories* (`.git`, `.tgrep`, `.vscode`, …) —
-    // this avoids unnecessary I/O into hidden subtrees while still
-    // letting dot-prefixed *files* like `.gitignore` through, since
-    // `filter_entry` only controls directory descent for directories.
+    // Walk to find every `.gitignore` / `.ignore` file. We can't use
+    // `hidden(true)` because those names start with `.` and would be
+    // filtered. Instead, walk with hidden=false and use `filter_entry` to
+    // skip all dot-prefixed *directories* (`.git`, `.tgrep`, `.vscode`, …) —
+    // this avoids unnecessary I/O into hidden subtrees while still letting
+    // dot-prefixed *files* through, since `filter_entry` only controls
+    // directory descent for directories.
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .filter_entry(|entry| {
-            // Allow files (we only care about .gitignore among them).
-            // For directories, skip any that start with '.'.
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 !entry
                     .file_name()
@@ -61,14 +47,23 @@ pub fn build_matcher(root: &Path) -> Option<Gitignore> {
             }
         })
         .build();
+
+    let mut gitignore_paths = Vec::new();
+    let mut ignore_paths = Vec::new();
     for entry in walker.flatten() {
-        if entry.file_name() == ".gitignore" && entry.path().is_file() {
-            let _ = builder.add(entry.path());
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        match path.file_name().and_then(|n| n.to_str()) {
+            Some(".gitignore") => gitignore_paths.push(path.to_path_buf()),
+            Some(".ignore") => ignore_paths.push(path.to_path_buf()),
+            _ => {}
         }
     }
 
-    let gi = builder.build().ok()?;
-    if gi.is_empty() { None } else { Some(gi) }
+    // Delegate so git-gating and precedence live in one place.
+    crate::walker::build_gitignore_matcher_from_files(root, &gitignore_paths, &ignore_paths)
 }
 
 #[cfg(test)]
@@ -79,6 +74,8 @@ mod tests {
     #[test]
     fn builds_matcher_from_root_gitignore() {
         let tmp = TempDir::new().unwrap();
+        // `.gitignore` only applies inside a git repo.
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::write(tmp.path().join(".gitignore"), "*.log\ntarget/\n").unwrap();
         let gi = build_matcher(tmp.path()).expect("matcher should build");
         assert!(
@@ -99,5 +96,50 @@ mod tests {
     fn returns_none_when_no_rules() {
         let tmp = TempDir::new().unwrap();
         assert!(build_matcher(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn builds_matcher_from_dot_ignore() {
+        // `.ignore` applies with no `.git` present, unlike `.gitignore`.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".ignore"), "*.log\ntarget/\n").unwrap();
+        let gi = build_matcher(tmp.path()).expect("matcher should build from .ignore");
+        assert!(
+            gi.matched_path_or_any_parents("build/output.log", false)
+                .is_ignore()
+        );
+        assert!(
+            gi.matched_path_or_any_parents("target/release/foo", false)
+                .is_ignore()
+        );
+        assert!(
+            !gi.matched_path_or_any_parents("src/main.rs", false)
+                .is_ignore()
+        );
+    }
+
+    #[test]
+    fn gitignore_ignored_without_git_dir() {
+        // No `.git`: `.gitignore` is git-gated and produces no rules, matching
+        // what the indexing walk does.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "*.log\ntarget/\n").unwrap();
+        assert!(build_matcher(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn dot_ignore_takes_precedence_over_gitignore() {
+        // `.gitignore` excludes the tree; `.ignore` re-includes it via a
+        // negation. Because `.ignore` is added last, its rule wins.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "logs/\n").unwrap();
+        std::fs::write(tmp.path().join(".ignore"), "!logs/\n").unwrap();
+        let gi = build_matcher(tmp.path()).expect("matcher should build");
+        assert!(
+            !gi.matched_path_or_any_parents("logs/today.txt", false)
+                .is_ignore(),
+            ".ignore negation should override the .gitignore rule"
+        );
     }
 }

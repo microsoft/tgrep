@@ -32,6 +32,10 @@ fn should_skip_dir(entry: &ignore::DirEntry, exclude_dirs: &[String]) -> bool {
 pub struct WalkResult {
     pub files: Vec<PathBuf>,
     pub gitignore_files: Vec<PathBuf>,
+    /// `.ignore` files encountered during the walk. Kept separate from
+    /// `gitignore_files` so a matcher can apply them last, giving them
+    /// precedence over `.gitignore`.
+    pub ignore_files: Vec<PathBuf>,
     pub skipped_binary: usize,
     pub skipped_error: usize,
 }
@@ -41,7 +45,8 @@ pub struct WalkOptions {
     pub include_hidden: bool,
     pub no_ignore: bool,
     pub search_binary: bool,
-    /// Collect `.gitignore` file paths encountered during the walk.
+    /// Collect `.gitignore` and `.ignore` file paths encountered during the
+    /// walk (into `WalkResult::gitignore_files` / `WalkResult::ignore_files`).
     pub collect_gitignore_files: bool,
     /// Directory names to exclude from walking (e.g., "vendor", "third_party").
     pub exclude_dirs: Vec<String>,
@@ -66,6 +71,7 @@ fn is_binary_extension(path: &Path) -> bool {
 pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
     let files = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
+    let ignore_files = std::sync::Mutex::new(Vec::new());
     let skipped_binary = std::sync::atomic::AtomicUsize::new(0);
     let skipped_error = std::sync::atomic::AtomicUsize::new(0);
     let exclude_dirs: std::sync::Arc<Vec<String>> = std::sync::Arc::new(opts.exclude_dirs.clone());
@@ -91,6 +97,7 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         let root = root.clone();
         let files = &files;
         let gitignore_files = &gitignore_files;
+        let ignore_files = &ignore_files;
         let skipped_binary = &skipped_binary;
         let skipped_error = &skipped_error;
         Box::new(move |entry| {
@@ -132,6 +139,13 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
                 }
             }
 
+            if collect_gitignore_files && entry.file_name() == ".ignore" {
+                ignore_files.lock().unwrap().push(path.to_path_buf());
+                if !include_hidden {
+                    return ignore::WalkState::Continue;
+                }
+            }
+
             if collect_gitignore_files
                 && !include_hidden
                 && entry
@@ -164,27 +178,70 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
     WalkResult {
         files: files.into_inner().unwrap(),
         gitignore_files: gitignore_files.into_inner().unwrap(),
+        ignore_files: ignore_files.into_inner().unwrap(),
         skipped_binary: skipped_binary.into_inner(),
         skipped_error: skipped_error.into_inner(),
     }
 }
 
-/// Build a point-query gitignore matcher from `.gitignore` files discovered by
-/// an existing walk, avoiding a second full-tree discovery pass.
+/// Build a point-query ignore matcher from `.gitignore` and `.ignore` files
+/// discovered by an existing walk, avoiding a second full-tree discovery pass.
+///
+/// Git-gated to match the walker (`WalkBuilder`'s `require_git` default):
+/// `.gitignore` applies only when `root` is inside a git repository (detected
+/// by scanning `root` and its ancestors for `.git`, so a subdirectory of a repo
+/// still counts). `.git/info/exclude` is additionally limited to the case where
+/// `root` is the repo root, since its patterns are repo-root-anchored and this
+/// matcher is queried with paths relative to `root`. `.ignore` always applies
+/// and is added last so it takes precedence.
+///
+/// Paths are added shallowest-first (by component depth, then lexically) so the
+/// result is independent of the walk's (parallel, nondeterministic) discovery
+/// order and nested rules are applied after the parent rules they refine.
 pub fn build_gitignore_matcher_from_files(
     root: &Path,
     gitignore_files: &[PathBuf],
+    ignore_files: &[PathBuf],
 ) -> Option<crate::gitignore::Gitignore> {
     use ignore::gitignore::GitignoreBuilder;
 
-    let mut builder = GitignoreBuilder::new(root);
-
-    let info_exclude = root.join(".git").join("info").join("exclude");
-    if info_exclude.is_file() {
-        let _ = builder.add(&info_exclude);
+    // Deterministic add order: shallow paths before deep, then lexical.
+    fn depth_ordered(paths: &[PathBuf]) -> Vec<&PathBuf> {
+        let mut ordered: Vec<&PathBuf> = paths.iter().collect();
+        ordered.sort_by(|a, b| {
+            a.components()
+                .count()
+                .cmp(&b.components().count())
+                .then_with(|| a.cmp(b))
+        });
+        ordered
     }
 
-    for path in gitignore_files {
+    let mut builder = GitignoreBuilder::new(root);
+
+    // `root` is inside a git repo if it or any ancestor holds a `.git` entry.
+    // `.gitignore` rules apply only inside a git repo (`root` or an ancestor
+    // holds a `.git` entry, so a subdirectory of a repo still counts).
+    let in_git_repo = root.ancestors().any(|dir| dir.join(".git").exists());
+    if in_git_repo {
+        // `.git/info/exclude` is anchored at the repo root, but this matcher is
+        // queried with paths relative to `root`. Only apply it when `root` is
+        // itself the repo root — a `.git` directory, not a worktree's `.git`
+        // file — so its anchoring matches.
+        if root.join(".git").is_dir() {
+            let info_exclude = root.join(".git").join("info").join("exclude");
+            if info_exclude.is_file() {
+                let _ = builder.add(&info_exclude);
+            }
+        }
+        for path in depth_ordered(gitignore_files) {
+            if path.is_file() {
+                let _ = builder.add(path);
+            }
+        }
+    }
+
+    for path in depth_ordered(ignore_files) {
         if path.is_file() {
             let _ = builder.add(path);
         }
@@ -201,14 +258,31 @@ pub struct FileMeta {
     pub size: u64,
 }
 
-/// Walk a directory tree collecting only filesystem metadata (mtime, size).
-/// No file content is read — this is used for stale file detection on startup.
-pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta> {
-    let results = std::sync::Mutex::new(Vec::new());
-    let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(exclude_dirs.to_vec());
+/// Result of [`walk_file_metadata`]: per-file metadata plus the `.gitignore` /
+/// `.ignore` files discovered along the way, from which a watcher ignore
+/// matcher can be built (see [`build_gitignore_matcher_from_files`]).
+pub struct MetaWalkResult {
+    pub files: Vec<FileMeta>,
+    pub gitignore_files: Vec<PathBuf>,
+    pub ignore_files: Vec<PathBuf>,
+}
 
-    let walker = WalkBuilder::new(root)
-        .hidden(true) // skip hidden by default
+/// Walk a directory tree collecting filesystem metadata (mtime, size) plus the
+/// `.gitignore` / `.ignore` files encountered. No file content is read — this
+/// is used for stale file detection on startup.
+///
+/// Hidden entries are visited so dot-files like `.gitignore` / `.ignore` are
+/// seen, but dot-directories are skipped and dot-files are excluded from
+/// `files`, so metadata covers the same set as a hidden-skipping walk.
+pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> MetaWalkResult {
+    let results = std::sync::Mutex::new(Vec::new());
+    let gitignore_files = std::sync::Mutex::new(Vec::new());
+    let ignore_files = std::sync::Mutex::new(Vec::new());
+    let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(exclude_dirs.to_vec());
+    let root = root.to_path_buf();
+
+    let walker = WalkBuilder::new(&root)
+        .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -217,7 +291,10 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta>
 
     walker.run(|| {
         let exclude = exclude.clone();
+        let root = root.clone();
         let results = &results;
+        let gitignore_files = &gitignore_files;
+        let ignore_files = &ignore_files;
         Box::new(move |entry| {
             let entry = match entry {
                 Ok(e) => e,
@@ -225,6 +302,15 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta>
             };
 
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                // Skip hidden (dot-prefixed) directories.
+                if entry.path() != root
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with('.'))
+                {
+                    return ignore::WalkState::Skip;
+                }
                 if should_skip_dir(&entry, &exclude) {
                     return ignore::WalkState::Skip;
                 }
@@ -237,11 +323,34 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta>
 
             let path = entry.path();
 
+            // Collect ignore files (kept separate for precedence); not part of
+            // the metadata set.
+            match entry.file_name().to_str() {
+                Some(".gitignore") => {
+                    gitignore_files.lock().unwrap().push(path.to_path_buf());
+                    return ignore::WalkState::Continue;
+                }
+                Some(".ignore") => {
+                    ignore_files.lock().unwrap().push(path.to_path_buf());
+                    return ignore::WalkState::Continue;
+                }
+                _ => {}
+            }
+
+            // Exclude other hidden (dot-prefixed) files from metadata.
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                return ignore::WalkState::Continue;
+            }
+
             if is_binary_extension(path) {
                 return ignore::WalkState::Continue;
             }
 
-            let rel_path = match path.strip_prefix(root) {
+            let rel_path = match path.strip_prefix(&root) {
                 Ok(p) => p.to_string_lossy().replace('\\', "/"),
                 Err(_) => return ignore::WalkState::Continue,
             };
@@ -267,7 +376,11 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta>
         })
     });
 
-    results.into_inner().unwrap()
+    MetaWalkResult {
+        files: results.into_inner().unwrap(),
+        gitignore_files: gitignore_files.into_inner().unwrap(),
+        ignore_files: ignore_files.into_inner().unwrap(),
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +582,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("testdata");
         fs::create_dir_all(root.join("src")).unwrap();
+        // `.gitignore` rules only apply inside a git repo.
+        fs::create_dir(root.join(".git")).unwrap();
         fs::write(root.join(".gitignore"), "*.log\n").unwrap();
         fs::write(root.join("src").join(".gitignore"), "*.tmp\n").unwrap();
 
@@ -479,8 +594,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let gi = build_gitignore_matcher_from_files(&root, &walk.gitignore_files)
-            .expect("matcher should build from discovered .gitignore files");
+        let gi =
+            build_gitignore_matcher_from_files(&root, &walk.gitignore_files, &walk.ignore_files)
+                .expect("matcher should build from discovered .gitignore files");
 
         assert!(
             gi.matched_path_or_any_parents("build/output.log", false)
@@ -497,12 +613,107 @@ mod tests {
     }
 
     #[test]
+    fn walk_dir_collects_dot_ignore_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("testdata");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".ignore"), "*.log\n").unwrap();
+        fs::write(root.join("src").join(".ignore"), "*.tmp\n").unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+
+        let result = walk_dir(
+            &root,
+            &WalkOptions {
+                collect_gitignore_files: true,
+                ..Default::default()
+            },
+        );
+        let names = sorted_filenames(&result, &root);
+        let mut ignores: Vec<_> = result
+            .ignore_files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        ignores.sort();
+
+        // `.ignore` files are collected (not indexed) and kept separate from
+        // `.gitignore` files.
+        assert_eq!(names, vec!["src/main.rs"]);
+        assert_eq!(ignores, vec![".ignore", "src/.ignore"]);
+        assert!(result.gitignore_files.is_empty());
+    }
+
+    #[test]
+    fn build_matcher_from_files_honors_dot_ignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("testdata");
+        fs::create_dir_all(&root).unwrap();
+        // No `.git` dir, so only `.ignore` applies.
+        fs::write(root.join(".ignore"), "*.log\nbuild/\n").unwrap();
+
+        let walk = walk_dir(
+            &root,
+            &WalkOptions {
+                collect_gitignore_files: true,
+                ..Default::default()
+            },
+        );
+        let gi =
+            build_gitignore_matcher_from_files(&root, &walk.gitignore_files, &walk.ignore_files)
+                .expect("matcher should build from discovered .ignore files");
+
+        assert!(
+            gi.matched_path_or_any_parents("server/output.log", false)
+                .is_ignore()
+        );
+        assert!(
+            gi.matched_path_or_any_parents("build/artifact.bin", false)
+                .is_ignore()
+        );
+        assert!(
+            !gi.matched_path_or_any_parents("src/main.rs", false)
+                .is_ignore()
+        );
+    }
+
+    #[test]
+    fn gitignore_applies_in_subdir_of_git_repo() {
+        // `.git` lives in an ancestor of `root`, not `root` itself, as when
+        // serving a subdirectory of a repository.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        let root = tmp.path().join("sub");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+
+        let walk = walk_dir(
+            &root,
+            &WalkOptions {
+                collect_gitignore_files: true,
+                ..Default::default()
+            },
+        );
+        let gi =
+            build_gitignore_matcher_from_files(&root, &walk.gitignore_files, &walk.ignore_files)
+                .expect("`.gitignore` should apply in a subdirectory of a git repo");
+        assert!(
+            gi.matched_path_or_any_parents("build/out.log", false)
+                .is_ignore()
+        );
+    }
+
+    #[test]
     fn walk_file_metadata_excludes_dirs() {
         let dir = setup_fixture();
         let root = dir.path().join("testdata");
 
-        let all = walk_file_metadata(&root, &[]);
-        let excluded = walk_file_metadata(&root, &["vendor".to_string()]);
+        let all = walk_file_metadata(&root, &[]).files;
+        let excluded = walk_file_metadata(&root, &["vendor".to_string()]).files;
 
         assert!(all.iter().any(|f| f.relative_path.starts_with("vendor/")));
         assert!(
@@ -511,5 +722,43 @@ mod tests {
                 .any(|f| f.relative_path.starts_with("vendor/"))
         );
         assert!(excluded.iter().any(|f| f.relative_path == "src/main.rs"));
+    }
+
+    #[test]
+    fn walk_file_metadata_collects_ignore_files_but_omits_them_from_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("testdata");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join(".ignore"), "*.tmp\n").unwrap();
+        fs::write(root.join("src").join(".ignore"), "*.bak\n").unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+
+        let result = walk_file_metadata(&root, &[]);
+
+        // Metadata excludes the dot-files themselves.
+        let names: Vec<_> = result
+            .files
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect();
+        assert_eq!(names, vec!["src/main.rs"]);
+
+        // Ignore files are collected, split by kind.
+        let rel = |v: &[PathBuf]| {
+            let mut out: Vec<_> = v
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(rel(&result.gitignore_files), vec![".gitignore"]);
+        assert_eq!(rel(&result.ignore_files), vec![".ignore", "src/.ignore"]);
     }
 }

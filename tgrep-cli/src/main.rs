@@ -245,6 +245,14 @@ enum Command {
         /// Exclude directories from indexing (can be specified multiple times).
         #[arg(long = "exclude", action = clap::ArgAction::Append)]
         exclude: Vec<String>,
+
+        /// Maximum number of pending file-change events the watcher buffers.
+        /// When exceeded (e.g. a large sync while a flush holds the index),
+        /// overflow triggers a reconciling stale refresh instead of unbounded
+        /// growth. Raise it to absorb bigger bursts without a refresh, at the
+        /// cost of more memory. Defaults to 16384.
+        #[arg(long = "watcher-queue-cap", value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        watcher_queue_cap: Option<u64>,
     },
 
     /// Search for a pattern.
@@ -341,6 +349,7 @@ fn main() {
             max_memory_mb,
             max_cpu_percent,
             exclude,
+            watcher_queue_cap,
         }) => {
             let memory_cap = max_memory_mb
                 .map(|mb| mb.saturating_mul(1024 * 1024))
@@ -353,6 +362,7 @@ fn main() {
                 &exclude,
                 memory_cap,
                 index_threads,
+                watcher_queue_cap.map(|n| n as usize),
             )
         }
         Some(Command::Search {

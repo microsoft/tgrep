@@ -175,6 +175,9 @@ pub fn build_matcher(root: &Path) -> Option<IgnoreMatcher> {
             {
                 return false;
             }
+            if entry.file_name() == ".gitignore" {
+                return true;
+            }
 
             let Some(matcher) = &p4ignore else {
                 return true;
@@ -207,6 +210,7 @@ mod tests {
     fn builds_matcher_from_root_gitignore() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".gitignore"), "*.log\ntarget/\n").unwrap();
+        std::fs::write(tmp.path().join(P4IGNORE_FILENAME), ".gitignore\n").unwrap();
         let gi = build_matcher(tmp.path()).expect("matcher should build");
         assert!(gi.is_ignored(Path::new("build/output.log"), false));
         assert!(gi.is_ignored(Path::new("target/release/foo"), false));

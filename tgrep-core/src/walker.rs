@@ -89,6 +89,9 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         .git_global(!opts.no_ignore)
         .git_exclude(!opts.no_ignore)
         .filter_entry(move |entry| {
+            if entry.file_name() == ".gitignore" {
+                return true;
+            }
             let Some(matcher) = &p4ignore else {
                 return true;
             };
@@ -440,6 +443,11 @@ mod tests {
         let root = tmp.path().join("testdata");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(
+            root.join(crate::gitignore::P4IGNORE_FILENAME),
+            ".gitignore\np4ignore.ini\n",
+        )
+        .unwrap();
         fs::write(root.join("src").join(".gitignore"), "*.tmp\n").unwrap();
         fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
 

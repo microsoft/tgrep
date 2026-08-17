@@ -191,16 +191,24 @@ struct SearchOpts {
     after_context: usize,
 }
 
-pub fn run(
-    root: &Path,
-    index_path: Option<&Path>,
-    no_watch: bool,
-    exclude_dirs: &[String],
-    memory_cap_bytes: u64,
-    index_threads: usize,
-    no_ignore: bool,
-    auto_save_mutations: Option<u32>,
-) -> Result<()> {
+pub struct ServeOptions<'a> {
+    pub no_watch: bool,
+    pub exclude_dirs: &'a [String],
+    pub memory_cap_bytes: u64,
+    pub index_threads: usize,
+    pub no_ignore: bool,
+    pub auto_save_mutations: Option<u32>,
+}
+
+pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) -> Result<()> {
+    let ServeOptions {
+        no_watch,
+        exclude_dirs,
+        memory_cap_bytes,
+        index_threads,
+        no_ignore,
+        auto_save_mutations,
+    } = options;
     let serve_start = Instant::now();
     let auto_save_mutations = auto_save_mutations.unwrap_or(AUTO_SAVE_MUTATIONS);
     let root = std::fs::canonicalize(root)?;

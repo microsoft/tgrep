@@ -362,12 +362,14 @@ fn main() {
             serve::run(
                 &path,
                 cli.index_path.as_deref(),
-                no_watch,
-                &exclude,
-                memory_cap,
-                index_threads,
-                no_ignore,
-                auto_save_mutations,
+                serve::ServeOptions {
+                    no_watch,
+                    exclude_dirs: &exclude,
+                    memory_cap_bytes: memory_cap,
+                    index_threads,
+                    no_ignore,
+                    auto_save_mutations,
+                },
             )
         }
         Some(Command::Search {

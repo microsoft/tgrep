@@ -44,7 +44,7 @@ fn create_common_literal_index(file_count: usize) -> (tempfile::TempDir, IndexRe
         .unwrap();
     }
     let index_dir = dir.path().join(".tgrep_bench");
-    tgrep_core::builder::build_index(dir.path(), Some(&index_dir), false, &[]).unwrap();
+    tgrep_core::builder::build_index(dir.path(), Some(&index_dir), false, false, &[]).unwrap();
     let reader = IndexReader::open(&index_dir).unwrap();
     let plan = query::build_literal_plan("common_search_token", false);
     (dir, reader, plan)

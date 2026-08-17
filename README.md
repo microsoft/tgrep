@@ -214,7 +214,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-0, --null` | NUL byte filename separator (for xargs) |
 | `--trim` | Trim leading/trailing whitespace |
 | `--hidden` | Include hidden files and directories |
-| `--no-ignore` | Don't respect .gitignore files |
+| `--no-ignore` | Don't respect `.gitignore` or `p4ignore.ini` files |
 | `-u` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden |
 | `--no-index` | Skip index, grep all files |
 | `--exclude <DIR>` | Exclude directory from indexing (repeatable) |
@@ -223,7 +223,8 @@ Prints the count to stdout (scriptable) and details to stderr:
 
 ## How It Works
 
-1. **Indexing** — walks the repo (respecting `.gitignore`), skips binary files
+1. **Indexing** — walks the repo (respecting `.gitignore` and root-level
+   `p4ignore.ini`), skips binary files
    by extension (50+ formats) and content check (first 8KB), extracts all
    overlapping 3-byte trigrams from each text file in parallel (rayon), and
    writes a compact binary inverted index. Full builds stream sorted posting
@@ -269,7 +270,7 @@ tgrep/
 │   └── src/
 │       ├── trigram.rs            # Trigram extraction & hashing
 │       ├── filetypes.rs          # File type definitions (rust, py, js, …)
-│       ├── walker.rs             # .gitignore-aware file traversal
+│       ├── walker.rs             # Git/Perforce ignore-aware file traversal
 │       ├── ondisk.rs             # On-disk binary format
 │       ├── builder.rs            # Index construction (parallel via rayon)
 │       ├── reader.rs             # Mmap'd index reader

@@ -8,8 +8,9 @@ pub fn run(
     root: &Path,
     index_path: Option<&Path>,
     include_hidden: bool,
+    no_ignore: bool,
     exclude_dirs: &[String],
 ) -> Result<()> {
-    builder::build_index(root, index_path, include_hidden, exclude_dirs)?;
+    builder::build_index(root, index_path, include_hidden, no_ignore, exclude_dirs)?;
     Ok(())
 }

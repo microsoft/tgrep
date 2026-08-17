@@ -113,8 +113,8 @@ struct ServerState {
     /// An ignore file changed during the initial build and requires a
     /// reconciliation after the build publishes.
     ignore_rules_dirty: std::sync::atomic::AtomicBool,
-    /// Serializes asynchronous ignore-rule rebuild and reconciliation work.
-    ignore_refresh_lock: Mutex<()>,
+    /// Ensures a burst of ignore-file events uses at most one refresh worker.
+    ignore_refresh_scheduled: std::sync::atomic::AtomicBool,
     /// Progress: number of files indexed so far.
     index_progress: std::sync::atomic::AtomicU64,
     /// Total files discovered for indexing.
@@ -272,7 +272,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
         flushing: std::sync::atomic::AtomicBool::new(false),
         ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
-        ignore_refresh_lock: Mutex::new(()),
+        ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
         watch_enabled: !no_watch,
@@ -956,27 +956,45 @@ fn should_skip_watcher_path(
     false
 }
 
-fn is_ignore_rules_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == ".gitignore" || name == "p4ignore.ini")
+fn is_ignore_rules_file(root: &Path, path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some(".gitignore")
+        || path == root.join(tgrep_core::gitignore::P4IGNORE_FILENAME)
 }
 
 fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
-    thread::spawn(move || {
-        let _refresh = state.ignore_refresh_lock.lock().unwrap();
-        if !state.ignore_rules_dirty.swap(false, Ordering::SeqCst) {
-            return;
-        }
+    if state
+        .ignore_refresh_scheduled
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
 
-        build_gitignore_matcher_after_ready(&state, &root);
-        let indexed_paths = {
-            let index = state.index.read().unwrap();
-            let mut paths = index.reader_paths();
-            paths.extend(index.live.overlay_paths());
-            paths
-        };
-        background_refresh_stale(&state, &root, &state.index_dir, Some(&indexed_paths));
+    thread::spawn(move || {
+        loop {
+            if state.ignore_rules_dirty.swap(false, Ordering::SeqCst) {
+                build_gitignore_matcher_after_ready(&state, &root);
+                let indexed_paths = {
+                    let index = state.index.read().unwrap();
+                    let mut paths = index.reader_paths();
+                    paths.extend(index.live.overlay_paths());
+                    paths
+                };
+                background_refresh_stale(&state, &root, &state.index_dir, Some(&indexed_paths));
+            }
+
+            state
+                .ignore_refresh_scheduled
+                .store(false, Ordering::SeqCst);
+            if !state.ignore_rules_dirty.load(Ordering::SeqCst)
+                || state
+                    .ignore_refresh_scheduled
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                break;
+            }
+        }
     });
 }
 
@@ -991,8 +1009,11 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         return;
     }
 
-    let ignore_rules_changed =
-        !state.no_ignore && event.paths.iter().any(|path| is_ignore_rules_file(path));
+    let ignore_rules_changed = !state.no_ignore
+        && event
+            .paths
+            .iter()
+            .any(|path| is_ignore_rules_file(root, path));
     if ignore_rules_changed {
         state.ignore_rules_dirty.store(true, Ordering::SeqCst);
         if state.indexing.load(Ordering::SeqCst) {
@@ -2339,10 +2360,27 @@ mod tests {
 
     #[test]
     fn identifies_live_ignore_rule_changes() {
-        assert!(is_ignore_rules_file(Path::new("nested/.gitignore")));
-        assert!(is_ignore_rules_file(Path::new("p4ignore.ini")));
-        assert!(!is_ignore_rules_file(Path::new(".git/info/exclude")));
-        assert!(!is_ignore_rules_file(Path::new("src/main.rs")));
+        let root = Path::new("workspace");
+        assert!(is_ignore_rules_file(
+            root,
+            Path::new("workspace/nested/.gitignore")
+        ));
+        assert!(is_ignore_rules_file(
+            root,
+            Path::new("workspace/p4ignore.ini")
+        ));
+        assert!(!is_ignore_rules_file(
+            root,
+            Path::new("workspace/nested/p4ignore.ini")
+        ));
+        assert!(!is_ignore_rules_file(
+            root,
+            Path::new("workspace/.git/info/exclude")
+        ));
+        assert!(!is_ignore_rules_file(
+            root,
+            Path::new("workspace/src/main.rs")
+        ));
     }
 
     #[test]

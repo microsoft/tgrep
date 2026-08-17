@@ -191,7 +191,7 @@ struct Cli {
     #[arg(long = "hidden", global = true)]
     hidden: bool,
 
-    /// Don't respect .gitignore files.
+    /// Don't respect .gitignore or p4ignore.ini files.
     #[arg(long = "no-ignore", global = true)]
     no_ignore: bool,
 

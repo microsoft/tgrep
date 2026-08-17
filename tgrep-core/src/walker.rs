@@ -73,6 +73,11 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
     let include_hidden = opts.include_hidden;
     let collect_gitignore_files = opts.collect_gitignore_files;
     let root = root.to_path_buf();
+    let p4ignore = (!opts.no_ignore)
+        .then(|| crate::gitignore::build_p4ignore_matcher(&root))
+        .flatten()
+        .map(std::sync::Arc::new);
+    let p4ignore_root = root.clone();
 
     let mut builder = WalkBuilder::new(&root);
     builder
@@ -83,6 +88,18 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         .git_ignore(!opts.no_ignore)
         .git_global(!opts.no_ignore)
         .git_exclude(!opts.no_ignore)
+        .filter_entry(move |entry| {
+            let Some(matcher) = &p4ignore else {
+                return true;
+            };
+            let Ok(relative) = entry.path().strip_prefix(&p4ignore_root) else {
+                return true;
+            };
+            !matcher.is_ignored(
+                relative,
+                entry.file_type().is_some_and(|kind| kind.is_dir()),
+            )
+        })
         .threads(walker_thread_count());
     let walker = builder.build_parallel();
 
@@ -183,6 +200,7 @@ pub fn build_gitignore_matcher_from_files(
     if info_exclude.is_file() {
         let _ = builder.add(&info_exclude);
     }
+    crate::gitignore::add_p4ignore_rules(&mut builder, root);
 
     for path in gitignore_files {
         if path.is_file() {
@@ -206,12 +224,26 @@ pub struct FileMeta {
 pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String]) -> Vec<FileMeta> {
     let results = std::sync::Mutex::new(Vec::new());
     let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(exclude_dirs.to_vec());
+    let p4ignore = crate::gitignore::build_p4ignore_matcher(root).map(std::sync::Arc::new);
+    let match_root = root.to_path_buf();
 
     let walker = WalkBuilder::new(root)
         .hidden(true) // skip hidden by default
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        .filter_entry(move |entry| {
+            let Some(matcher) = &p4ignore else {
+                return true;
+            };
+            let Ok(relative) = entry.path().strip_prefix(&match_root) else {
+                return true;
+            };
+            !matcher.is_ignored(
+                relative,
+                entry.file_type().is_some_and(|kind| kind.is_dir()),
+            )
+        })
         .threads(walker_thread_count())
         .build_parallel();
 
@@ -511,5 +543,34 @@ mod tests {
                 .any(|f| f.relative_path.starts_with("vendor/"))
         );
         assert!(excluded.iter().any(|f| f.relative_path == "src/main.rs"));
+    }
+
+    #[test]
+    fn walks_respect_root_p4ignore() {
+        let dir = setup_fixture();
+        let root = dir.path().join("testdata");
+        fs::write(
+            root.join(crate::gitignore::P4IGNORE_FILENAME),
+            "vendor\nthird_party\\*.rs\n",
+        )
+        .unwrap();
+
+        let walk = walk_dir(&root, &WalkOptions::default());
+        let names = sorted_filenames(&walk, &root);
+        assert!(!names.iter().any(|name| name.starts_with("vendor/")));
+        assert!(!names.contains(&"third_party/lib.rs".to_string()));
+        assert!(names.contains(&"src/main.rs".to_string()));
+
+        let metadata = walk_file_metadata(&root, &[]);
+        assert!(
+            !metadata
+                .iter()
+                .any(|file| file.relative_path.starts_with("vendor/"))
+        );
+        assert!(
+            !metadata
+                .iter()
+                .any(|file| file.relative_path == "third_party/lib.rs")
+        );
     }
 }

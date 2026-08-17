@@ -27,6 +27,7 @@ pub fn build_index(
     root: &Path,
     index_dir: Option<&Path>,
     include_hidden: bool,
+    no_ignore: bool,
     exclude_dirs: &[String],
 ) -> Result<()> {
     let root = std::fs::canonicalize(root)?;
@@ -41,6 +42,7 @@ pub fn build_index(
         &root,
         &walker::WalkOptions {
             include_hidden,
+            no_ignore,
             exclude_dirs: exclude_dirs.to_vec(),
             ..Default::default()
         },
@@ -594,7 +596,7 @@ mod tests {
         std::fs::write(src.join("b.txt"), "needle two\nother content\n").unwrap();
 
         let index = tempfile::tempdir().unwrap();
-        build_index(repo.path(), Some(index.path()), false, &[]).unwrap();
+        build_index(repo.path(), Some(index.path()), false, false, &[]).unwrap();
 
         let reader = IndexReader::open(index.path()).unwrap();
         reader.validate_lookup().unwrap();
@@ -617,6 +619,39 @@ mod tests {
     }
 
     #[test]
+    fn build_index_no_ignore_includes_p4ignored_files() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("keep.txt"), "keep searchable\n").unwrap();
+        std::fs::write(repo.path().join("asset.txt"), "asset searchable\n").unwrap();
+        std::fs::write(repo.path().join("p4ignore.ini"), "asset.txt\n").unwrap();
+
+        let ignored_index = tempfile::tempdir().unwrap();
+        build_index(repo.path(), Some(ignored_index.path()), false, false, &[]).unwrap();
+        let ignored_reader = IndexReader::open(ignored_index.path()).unwrap();
+        assert!(
+            !(0..ignored_reader.num_files() as u32)
+                .filter_map(|id| ignored_reader.file_path(id))
+                .any(|path| path == "asset.txt")
+        );
+
+        let unrestricted_index = tempfile::tempdir().unwrap();
+        build_index(
+            repo.path(),
+            Some(unrestricted_index.path()),
+            false,
+            true,
+            &[],
+        )
+        .unwrap();
+        let unrestricted_reader = IndexReader::open(unrestricted_index.path()).unwrap();
+        assert!(
+            (0..unrestricted_reader.num_files() as u32)
+                .filter_map(|id| unrestricted_reader.file_path(id))
+                .any(|path| path == "asset.txt")
+        );
+    }
+
+    #[test]
     fn append_overlay_merges_new_files_into_complete_index() {
         use crate::live::LiveIndex;
 
@@ -628,7 +663,7 @@ mod tests {
         std::fs::write(src.join("b.txt"), "needle two\nother content\n").unwrap();
 
         let base_dir = tempfile::tempdir().unwrap();
-        build_index(repo.path(), Some(base_dir.path()), false, &[]).unwrap();
+        build_index(repo.path(), Some(base_dir.path()), false, false, &[]).unwrap();
         let base_reader = IndexReader::open(base_dir.path()).unwrap();
         assert_eq!(base_reader.num_files(), 2);
 

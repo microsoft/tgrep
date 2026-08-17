@@ -108,6 +108,11 @@ struct ServerState {
     /// from kicking off a redundant parallel snapshot while the bulk
     /// flush (or stale-refresh flush) is still executing.
     flushing: std::sync::atomic::AtomicBool,
+    /// An ignore file changed during the initial build and requires a
+    /// reconciliation after the build publishes.
+    ignore_rules_dirty: std::sync::atomic::AtomicBool,
+    /// Serializes asynchronous ignore-rule rebuild and reconciliation work.
+    ignore_refresh_lock: Mutex<()>,
     /// Progress: number of files indexed so far.
     index_progress: std::sync::atomic::AtomicU64,
     /// Total files discovered for indexing.
@@ -116,6 +121,10 @@ struct ServerState {
     watch_enabled: bool,
     /// Directories to exclude from indexing.
     exclude_dirs: Vec<String>,
+    /// Disable all source-control ignore files for every server discovery path.
+    no_ignore: bool,
+    /// On-disk index directory used by live ignore-rule reconciliation.
+    index_dir: PathBuf,
     /// Serializes on-disk index publication across all publishers
     /// (auto-save, checkpoint, flush). Held across
     /// `move_staged_files` + `IndexReader::open` + `swap_reader` so
@@ -157,7 +166,7 @@ struct ServerState {
     /// `serve ready` on a full-tree `.gitignore` discovery walk. `None` while
     /// loading or if no matcher could be built; during that window the watcher
     /// falls back to hidden / exclude filtering.
-    gitignore: RwLock<Option<tgrep_core::gitignore::Gitignore>>,
+    gitignore: RwLock<Option<tgrep_core::gitignore::IgnoreMatcher>>,
     /// Maximum RSS budget (bytes). When the process exceeds this during the
     /// initial build, the indexer flushes the overlay to disk and continues so
     /// peak memory stays bounded while still producing a complete index.
@@ -183,6 +192,7 @@ pub fn run(
     exclude_dirs: &[String],
     memory_cap_bytes: u64,
     index_threads: usize,
+    no_ignore: bool,
 ) -> Result<()> {
     let serve_start = Instant::now();
     let root = std::fs::canonicalize(root)?;
@@ -245,10 +255,14 @@ pub fn run(
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
         flushing: std::sync::atomic::AtomicBool::new(false),
+        ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
+        ignore_refresh_lock: Mutex::new(()),
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
         watch_enabled: !no_watch,
         exclude_dirs: exclude_dirs.to_vec(),
+        no_ignore,
+        index_dir: index_dir.clone(),
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
         snapshot_gate: RwLock::new(()),
@@ -292,8 +306,8 @@ pub fn run(
         let stale_root = root.clone();
         let stale_index_dir = index_dir.clone();
         thread::spawn(move || {
-            background_refresh_stale(&stale_state, &stale_root, &stale_index_dir);
-            if stale_state.watch_enabled {
+            background_refresh_stale(&stale_state, &stale_root, &stale_index_dir, None);
+            if stale_state.watch_enabled && !stale_state.no_ignore {
                 build_gitignore_matcher_after_ready(&stale_state, &stale_root);
             }
         });
@@ -341,6 +355,10 @@ pub fn run(
 }
 
 fn build_gitignore_matcher_after_ready(state: &ServerState, root: &Path) {
+    if state.no_ignore {
+        *state.gitignore.write().unwrap() = None;
+        return;
+    }
     let start = Instant::now();
     eprintln!("[trace] gitignore matcher build started...");
     let matcher = tgrep_core::gitignore::build_matcher(root);
@@ -797,11 +815,16 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
 }
 
 fn handle_reload(id: Option<serde_json::Value>, state: &ServerState) -> String {
-    let index_dir = builder::default_index_dir(&state.root);
+    let index_dir = state.index_dir.clone();
 
     // Rebuild from disk
-    if let Err(e) = builder::build_index(&state.root, Some(&index_dir), false, &state.exclude_dirs)
-    {
+    if let Err(e) = builder::build_index(
+        &state.root,
+        Some(&index_dir),
+        false,
+        state.no_ignore,
+        &state.exclude_dirs,
+    ) {
         return json_rpc_error(id, -32000, &format!("rebuild failed: {e}"));
     }
 
@@ -876,7 +899,7 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
 fn should_skip_watcher_path(
     rel_path: &str,
     exclude_dirs: &[String],
-    gitignore: Option<&tgrep_core::gitignore::Gitignore>,
+    gitignore: Option<&tgrep_core::gitignore::IgnoreMatcher>,
 ) -> bool {
     // Single streaming pass over path components — no Vec allocation
     // on the hot watcher path. The hidden-component check applies to
@@ -908,8 +931,7 @@ fn should_skip_watcher_path(
         // Notify usually fires per-file events anyway, and gitignore
         // rules that target dirs would have already skipped the dir's
         // contents via `matched_path_or_any_parents`.
-        let m = gi.matched_path_or_any_parents(rel_path, /* is_dir = */ false);
-        if m.is_ignore() {
+        if gi.is_ignored(Path::new(rel_path), false) {
             return true;
         }
     }
@@ -917,21 +939,55 @@ fn should_skip_watcher_path(
     false
 }
 
-fn handle_fs_event(state: &ServerState, root: &Path, event: &Event) {
-    use tgrep_core::meta::FileStamp;
+fn is_ignore_rules_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".gitignore" || name == "p4ignore.ini")
+}
 
-    // Skip file events while the initial background index build is in progress —
-    // the indexer will pick up all files itself, and the watcher would just
-    // cause duplicate reindex work.
-    if state.indexing.load(Ordering::SeqCst) {
-        return;
-    }
+fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
+    thread::spawn(move || {
+        let _refresh = state.ignore_refresh_lock.lock().unwrap();
+        if !state.ignore_rules_dirty.swap(false, Ordering::SeqCst) {
+            return;
+        }
+
+        build_gitignore_matcher_after_ready(&state, &root);
+        let indexed_paths = {
+            let index = state.index.read().unwrap();
+            let mut paths = index.reader_paths();
+            paths.extend(index.live.overlay_paths());
+            paths
+        };
+        background_refresh_stale(&state, &root, &state.index_dir, Some(&indexed_paths));
+    });
+}
+
+fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
+    use tgrep_core::meta::FileStamp;
 
     let dominated_kinds = matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     );
     if !dominated_kinds {
+        return;
+    }
+
+    let ignore_rules_changed =
+        !state.no_ignore && event.paths.iter().any(|path| is_ignore_rules_file(path));
+    if ignore_rules_changed {
+        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+        if state.indexing.load(Ordering::SeqCst) {
+            return;
+        }
+        schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+        return;
+    }
+
+    // Skip ordinary file events while the initial background index build is in
+    // progress. The indexer will pick up those files itself.
+    if state.indexing.load(Ordering::SeqCst) {
         return;
     }
 
@@ -1215,7 +1271,52 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
 /// Detect files that changed while the server was not running.
 /// Compares stored filestamps against current filesystem metadata, then upserts
 /// changed/new files and removes deleted files from the LiveIndex.
-fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &Path) {
+fn classify_file_changes(
+    current_meta: &[tgrep_core::walker::FileMeta],
+    old_stamps: &std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    indexed_paths: Option<&std::collections::HashSet<String>>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    use tgrep_core::meta::FileStamp;
+
+    let mut current_set = std::collections::HashSet::with_capacity(current_meta.len());
+    let mut changed = Vec::new();
+    let mut added = Vec::new();
+
+    for fm in current_meta {
+        current_set.insert(fm.relative_path.clone());
+        let stamp = FileStamp {
+            mtime: fm.mtime,
+            size: fm.size,
+        };
+        if indexed_paths.is_some_and(|paths| !paths.contains(&fm.relative_path)) {
+            added.push(fm.relative_path.clone());
+            continue;
+        }
+        match old_stamps.get(&fm.relative_path) {
+            Some(old) if *old == stamp => {}
+            Some(_) => changed.push(fm.relative_path.clone()),
+            None => added.push(fm.relative_path.clone()),
+        }
+    }
+
+    let indexed_or_stamped_paths: Box<dyn Iterator<Item = &String>> = match indexed_paths {
+        Some(paths) => Box::new(paths.iter()),
+        None => Box::new(old_stamps.keys()),
+    };
+    let deleted = indexed_or_stamped_paths
+        .filter(|path| !current_set.contains(path.as_str()))
+        .cloned()
+        .collect();
+
+    (changed, added, deleted)
+}
+
+fn background_refresh_stale(
+    state: &Arc<ServerState>,
+    root: &Path,
+    index_dir: &Path,
+    indexed_paths: Option<&std::collections::HashSet<String>>,
+) {
     use tgrep_core::meta::{self, FileStamp};
     use tgrep_core::walker;
 
@@ -1230,48 +1331,17 @@ fn background_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &P
             return;
         }
     };
-    if old_stamps.is_empty() {
+    if old_stamps.is_empty() && indexed_paths.is_none() {
         eprintln!("[trace] stale check: no filestamps found, skipping");
         return;
     }
 
     // Walk filesystem metadata (no content reads)
-    let current_meta = walker::walk_file_metadata(root, &state.exclude_dirs);
+    let current_meta = walker::walk_file_metadata(root, &state.exclude_dirs, state.no_ignore);
     let walk_ms = start.elapsed().as_millis();
 
-    // Build lookup of current filesystem state
-    let mut current_set: std::collections::HashSet<String> =
-        std::collections::HashSet::with_capacity(current_meta.len());
-    let mut changed: Vec<String> = Vec::new();
-    let mut added: Vec<String> = Vec::new();
-
-    for fm in &current_meta {
-        current_set.insert(fm.relative_path.clone());
-        let stamp = FileStamp {
-            mtime: fm.mtime,
-            size: fm.size,
-        };
-        match old_stamps.get(&fm.relative_path) {
-            Some(old) if *old == stamp => {
-                // Unchanged — skip
-            }
-            Some(_) => {
-                // mtime or size differs — file changed
-                changed.push(fm.relative_path.clone());
-            }
-            None => {
-                // New file (not in previous index)
-                added.push(fm.relative_path.clone());
-            }
-        }
-    }
-
-    // Detect deleted files (in old stamps but not on filesystem)
-    let deleted: Vec<String> = old_stamps
-        .keys()
-        .filter(|p| !current_set.contains(p.as_str()))
-        .cloned()
-        .collect();
+    let (changed, added, deleted) =
+        classify_file_changes(&current_meta, &old_stamps, indexed_paths);
 
     let total_changes = changed.len() + added.len() + deleted.len();
     if total_changes == 0 {
@@ -1395,13 +1465,14 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         root,
         &WalkOptions {
             include_hidden: false,
-            collect_gitignore_files: state.watch_enabled,
+            no_ignore: state.no_ignore,
+            collect_gitignore_files: state.watch_enabled && !state.no_ignore,
             exclude_dirs: state.exclude_dirs.clone(),
             ..Default::default()
         },
     );
 
-    if state.watch_enabled {
+    if state.watch_enabled && !state.no_ignore {
         let start = Instant::now();
         let matcher = walker::build_gitignore_matcher_from_files(root, &walk.gitignore_files);
         let has_matcher = matcher.is_some();
@@ -1563,7 +1634,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // the index looks fully published but `filestamps.json` is missing — a
     // server kill in that window disables incremental stale detection on
     // the next start.
-    let walk_meta = tgrep_core::walker::walk_file_metadata(root, &state.exclude_dirs);
+    let walk_meta =
+        tgrep_core::walker::walk_file_metadata(root, &state.exclude_dirs, state.no_ignore);
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta
         .into_iter()
         .map(|fm| {
@@ -1621,6 +1693,10 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     if pruned {
         let mut index = state.index.write().unwrap();
         index.live.shrink_to_fit();
+    }
+
+    if state.ignore_rules_dirty.load(Ordering::SeqCst) {
+        schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
     }
 }
 
@@ -2242,6 +2318,47 @@ mod tests {
             &no_exclude,
             Some(&gi)
         ));
+    }
+
+    #[test]
+    fn identifies_live_ignore_rule_changes() {
+        assert!(is_ignore_rules_file(Path::new("nested/.gitignore")));
+        assert!(is_ignore_rules_file(Path::new("p4ignore.ini")));
+        assert!(!is_ignore_rules_file(Path::new(".git/info/exclude")));
+        assert!(!is_ignore_rules_file(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn ignore_reconcile_compares_against_actual_indexed_paths() {
+        use std::collections::{HashMap, HashSet};
+        use tgrep_core::meta::FileStamp;
+        use tgrep_core::walker::FileMeta;
+
+        let current = vec![
+            FileMeta {
+                relative_path: "kept.txt".to_string(),
+                mtime: 1,
+                size: 10,
+            },
+            FileMeta {
+                relative_path: "newly-unignored.txt".to_string(),
+                mtime: 2,
+                size: 20,
+            },
+        ];
+        let stamps = HashMap::from([
+            ("kept.txt".to_string(), FileStamp { mtime: 1, size: 10 }),
+            (
+                "newly-unignored.txt".to_string(),
+                FileStamp { mtime: 2, size: 20 },
+            ),
+        ]);
+        let indexed = HashSet::from(["kept.txt".to_string(), "newly-ignored.txt".to_string()]);
+
+        let (changed, added, deleted) = classify_file_changes(&current, &stamps, Some(&indexed));
+        assert!(changed.is_empty());
+        assert_eq!(added, vec!["newly-unignored.txt"]);
+        assert_eq!(deleted, vec!["newly-ignored.txt"]);
     }
 
     #[test]

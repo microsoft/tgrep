@@ -324,6 +324,7 @@ impl Cli {
 
 fn main() {
     let cli = Cli::parse();
+    let no_ignore = cli.no_ignore || cli.unrestricted >= 1;
 
     // Handle --type-list
     if cli.type_list {
@@ -332,9 +333,13 @@ fn main() {
     }
 
     let result = match cli.command {
-        Some(Command::Index { path, exclude, .. }) => {
-            index::run(&path, cli.index_path.as_deref(), cli.hidden, &exclude)
-        }
+        Some(Command::Index { path, exclude, .. }) => index::run(
+            &path,
+            cli.index_path.as_deref(),
+            cli.hidden,
+            no_ignore,
+            &exclude,
+        ),
         Some(Command::Serve {
             path,
             no_watch,
@@ -353,6 +358,7 @@ fn main() {
                 &exclude,
                 memory_cap,
                 index_threads,
+                no_ignore,
             )
         }
         Some(Command::Search {
@@ -360,7 +366,7 @@ fn main() {
             ref paths,
         }) => run_search(&cli, pattern.clone(), paths),
         Some(Command::Status { path }) => status::run(&path, cli.index_path.as_deref()),
-        Some(Command::CountFiles { path }) => walkcount::run(&path, cli.hidden, cli.no_ignore),
+        Some(Command::CountFiles { path }) => walkcount::run(&path, cli.hidden, no_ignore),
         None => {
             if cli.list_files {
                 let opts = cli.build_search_opts(String::new());

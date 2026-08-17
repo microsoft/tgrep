@@ -13,9 +13,37 @@ use std::path::Path;
 
 pub const P4IGNORE_FILENAME: &str = "p4ignore.ini";
 
+use ignore::Match;
 /// Re-export of `ignore::gitignore::Gitignore` so callers can hold a
 /// matcher without taking a direct dependency on the `ignore` crate.
 pub use ignore::gitignore::Gitignore;
+
+pub struct IgnoreMatcher {
+    local: Gitignore,
+    global: Gitignore,
+}
+
+impl IgnoreMatcher {
+    pub fn new(local: Gitignore, global: Gitignore) -> Option<Self> {
+        (!local.is_empty() || !global.is_empty()).then_some(Self { local, global })
+    }
+
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        match self.local.matched_path_or_any_parents(path, is_dir) {
+            Match::Ignore(_) => true,
+            Match::Whitelist(_) => false,
+            Match::None => self
+                .global
+                .matched_path_or_any_parents(path, is_dir)
+                .is_ignore(),
+        }
+    }
+}
+
+pub fn build_global_matcher(root: &Path) -> Gitignore {
+    let builder = ignore::gitignore::GitignoreBuilder::new(root);
+    builder.build_global().0
+}
 
 fn p4ignore_lines(root: &Path) -> Option<(std::path::PathBuf, Vec<String>)> {
     let path = root.join(P4IGNORE_FILENAME);
@@ -111,7 +139,7 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
 /// Uses `WalkBuilder` to enumerate `.gitignore` files so we automatically
 /// skip the `.git` dir and gitignored subtrees while collecting rules.
 /// Returns `None` when no rules could be loaded.
-pub fn build_matcher(root: &Path) -> Option<Gitignore> {
+pub fn build_matcher(root: &Path) -> Option<IgnoreMatcher> {
     use ignore::gitignore::GitignoreBuilder;
 
     let mut builder = GitignoreBuilder::new(root);
@@ -166,8 +194,8 @@ pub fn build_matcher(root: &Path) -> Option<Gitignore> {
         }
     }
 
-    let gi = builder.build().ok()?;
-    if gi.is_empty() { None } else { Some(gi) }
+    let local = builder.build().ok()?;
+    IgnoreMatcher::new(local, build_global_matcher(root))
 }
 
 #[cfg(test)]
@@ -180,24 +208,30 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".gitignore"), "*.log\ntarget/\n").unwrap();
         let gi = build_matcher(tmp.path()).expect("matcher should build");
-        assert!(
-            gi.matched_path_or_any_parents("build/output.log", false)
-                .is_ignore()
-        );
-        assert!(
-            gi.matched_path_or_any_parents("target/release/foo", false)
-                .is_ignore()
-        );
-        assert!(
-            !gi.matched_path_or_any_parents("src/main.rs", false)
-                .is_ignore()
-        );
+        assert!(gi.is_ignored(Path::new("build/output.log"), false));
+        assert!(gi.is_ignored(Path::new("target/release/foo"), false));
+        assert!(!gi.is_ignored(Path::new("src/main.rs"), false));
     }
 
     #[test]
     fn returns_none_when_no_rules() {
         let tmp = TempDir::new().unwrap();
         assert!(build_matcher(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn local_whitelist_overrides_global_ignore() {
+        use ignore::gitignore::GitignoreBuilder;
+
+        let tmp = TempDir::new().unwrap();
+        let mut local = GitignoreBuilder::new(tmp.path());
+        local.add_line(None, "!keep.log").unwrap();
+        let mut global = GitignoreBuilder::new(tmp.path());
+        global.add_line(None, "*.log").unwrap();
+        let matcher = IgnoreMatcher::new(local.build().unwrap(), global.build().unwrap()).unwrap();
+
+        assert!(!matcher.is_ignored(Path::new("keep.log"), false));
+        assert!(matcher.is_ignored(Path::new("drop.log"), false));
     }
 
     #[test]

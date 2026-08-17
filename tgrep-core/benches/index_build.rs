@@ -39,7 +39,7 @@ fn create_high_diversity_repo(file_count: usize, bytes_per_file: usize) -> TempD
 
 fn build_index_once(root: &Path) {
     let index_dir = root.join(".tgrep_bench");
-    tgrep_core::builder::build_index(root, Some(&index_dir), false, &[]).unwrap();
+    tgrep_core::builder::build_index(root, Some(&index_dir), false, false, &[]).unwrap();
 }
 
 fn bench_index_build(c: &mut Criterion) {

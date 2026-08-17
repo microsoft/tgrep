@@ -245,6 +245,13 @@ enum Command {
         /// Exclude directories from indexing (can be specified multiple times).
         #[arg(long = "exclude", action = clap::ArgAction::Append)]
         exclude: Vec<String>,
+
+        /// Number of accumulated index mutations that triggers a background
+        /// save. Higher values reduce save frequency (and the pauses they
+        /// cause during heavy churn) at the cost of more unsaved work if the
+        /// process is killed. Defaults to 5000.
+        #[arg(long = "auto-save-mutations", value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        auto_save_mutations: Option<u32>,
     },
 
     /// Search for a pattern.
@@ -346,6 +353,7 @@ fn main() {
             max_memory_mb,
             max_cpu_percent,
             exclude,
+            auto_save_mutations,
         }) => {
             let memory_cap = max_memory_mb
                 .map(|mb| mb.saturating_mul(1024 * 1024))
@@ -359,6 +367,7 @@ fn main() {
                 memory_cap,
                 index_threads,
                 no_ignore,
+                auto_save_mutations,
             )
         }
         Some(Command::Search {

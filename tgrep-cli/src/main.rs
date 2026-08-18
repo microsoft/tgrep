@@ -21,6 +21,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use output::ColorMode;
+use tgrep_core::builder;
 
 #[derive(Parser)]
 #[command(
@@ -200,6 +201,24 @@ struct Cli {
     unrestricted: u8,
 }
 
+/// Posting accumulation strategy for `tgrep index`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum IndexStrategyArg {
+    /// Accumulate all postings in memory and sort once.
+    Memory,
+    /// Bound peak memory with an external merge sort that spills to disk.
+    External,
+}
+
+impl From<IndexStrategyArg> for builder::IndexStrategy {
+    fn from(value: IndexStrategyArg) -> Self {
+        match value {
+            IndexStrategyArg::Memory => Self::InMemory,
+            IndexStrategyArg::External => Self::External,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Build or rebuild the trigram index.
@@ -215,6 +234,25 @@ enum Command {
         /// Exclude directories from indexing (can be specified multiple times).
         #[arg(long = "exclude", action = clap::ArgAction::Append)]
         exclude: Vec<String>,
+
+        /// How postings are accumulated during the build.
+        ///
+        /// `memory` holds every posting in RAM and sorts once — fastest when
+        /// the index fits comfortably, but peak memory grows with repo size.
+        /// `external` bounds peak memory with an external merge sort, spilling
+        /// sorted segments to disk when the arena fills.
+        #[arg(
+            long = "index-strategy",
+            value_name = "STRATEGY",
+            default_value = "memory"
+        )]
+        strategy: IndexStrategyArg,
+
+        /// Arena size in megabytes before `--index-strategy=external` spills to
+        /// disk. Lower values reduce peak memory at the cost of more spill
+        /// segments to merge. Ignored by `--index-strategy=memory`.
+        #[arg(long = "index-buffer", value_name = "MB", value_parser = clap::value_parser!(u64).range(1..))]
+        index_buffer_mb: Option<u64>,
     },
 
     /// Start the persistent search server.
@@ -340,12 +378,20 @@ fn main() {
     }
 
     let result = match cli.command {
-        Some(Command::Index { path, exclude, .. }) => index::run(
+        Some(Command::Index {
+            path,
+            exclude,
+            strategy,
+            index_buffer_mb,
+            ..
+        }) => index::run(
             &path,
             cli.index_path.as_deref(),
             cli.hidden,
             no_ignore,
             &exclude,
+            strategy.into(),
+            index_buffer_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
         ),
         Some(Command::Serve {
             path,

@@ -37,6 +37,71 @@ The high-diversity case stresses the number of distinct trigrams and posting-lis
 serialization. The flat sorted-posting writer reduced this case from roughly
 1.47s and 98.74 MiB peak working set to roughly 0.37s and 43.68 MiB in local runs.
 
+### Index build strategies
+
+`tgrep index --index-strategy=external` replaces the single in-heap posting
+vector with an external merge sort: postings fill a fixed-size arena that spills
+sorted, delta+varint encoded segments to disk, which are then k-way merged
+directly into `index.bin` / `lookup.bin`.
+
+The peak-memory probe runs both strategies back to back on the same fixture.
+Each of these runs uses a deliberately small 4 MB arena so bench-scale fixtures
+spill; the shipped default is 64 MB.
+
+```powershell
+cargo bench -p tgrep-core --bench index_build -- --peak-memory-high-diversity 16000
+```
+
+**Peak working set** (high-diversity fixture, Windows, local run):
+
+| Files | `memory` | `external` | Reduction |
+| ---: | ---: | ---: | ---: |
+| 2,000 | 66.93 MiB | 32.85 MiB | −51% |
+| 4,000 | 88.98 MiB | 34.29 MiB | −61% |
+| 8,000 | 185.21 MiB | 37.92 MiB | −80% |
+| 16,000 | 342.98 MiB | 50.30 MiB | −85% |
+
+The `memory` column grows roughly linearly with file count while `external`
+stays close to flat (+17 MiB across an 8x increase in files), which is the
+point: peak heap becomes a function of the arena budget rather than of repo
+size. The remaining growth in the `external` column is the file table and walk
+results, not postings.
+
+**Build time.** The fixture that matters most is real source code, which has
+realistic trigram diversity and genuinely spills. This one is 2,500 files /
+37.5 MiB built from tgrep's own `.rs` sources, timed end to end through the
+release binary (median of 3 runs), with peak working set sampled from the
+child process:
+
+| Strategy | Spill segments | Peak working set | Median build | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `memory` | - | 144.08 MiB | 0.725 s | - |
+| `external --index-buffer 64` | 2 | 118.75 MiB | 0.791 s | +9.1% |
+| `external --index-buffer 8` | 9 | 58.38 MiB | 0.789 s | +8.8% |
+
+All three produce the same 14,379 trigrams over 2,500 files. Note that shrinking
+the arena 8x costs nothing in time — going from 2 segments to 9 is free, because
+merge fan-in is not the bottleneck at this scale, the spill encode/decode
+round-trip is. The arena budget is therefore a fairly clean dial on peak memory.
+
+Criterion microbenchmarks bracket that number from both sides:
+
+| Case | `memory` | `external` | Delta | Spills? |
+| --- | ---: | ---: | ---: | --- |
+| 5,000 files | 1.2819 s | 1.2917 s | +0.8% | no |
+| 1,000 high-diversity files | 464.42ms | 540.11ms | +16% | yes |
+
+The 5,000-file case is the *no-spill* floor: its fixture repeats one line, so the
+whole repo is only 67 distinct trigrams and the arena never fills, which is why
+the overhead is indistinguishable from noise. The high-diversity case is the
+worst-case ceiling: random-byte content makes nearly every trigram unique, so
+segment groups hold a single posting each and per-group header overhead and
+merge fan-in work are both maximal. Real code sits between them, at roughly +9%.
+
+Total sort work is unchanged — `k` sorts of `n/k` elements plus an `n·log k`
+merge is still `O(n·log n)` — so the delta is purely the spill write plus the
+merge read.
+
 ### Query execution
 
 | Case | Mean |

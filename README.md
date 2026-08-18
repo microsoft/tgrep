@@ -96,6 +96,33 @@ tgrep index . --index-path /tmp/idx   # custom index location
 tgrep index . --exclude vendor --exclude third_party  # skip directories
 ```
 
+#### Bounding memory on very large repos
+
+By default the builder holds every posting in RAM and sorts once, so peak
+memory grows with repo size. `--index-strategy=external` bounds it instead with
+an external merge sort: postings accumulate in a fixed-size arena that spills
+sorted, compact segments to disk when full, and the segments are k-way merged
+straight into the index.
+
+```bash
+tgrep index . --index-strategy=external               # 64 MB arena (default)
+tgrep index . --index-strategy=external --index-buffer 256   # larger arena
+```
+
+Peak memory becomes roughly flat in repo size rather than linear:
+
+| High-diversity files | `memory` | `external` |
+| ---: | ---: | ---: |
+| 2,000 | 66.9 MiB | 32.9 MiB |
+| 8,000 | 185.2 MiB | 37.9 MiB |
+| 16,000 | 343.0 MiB | 50.3 MiB |
+
+On real source (2,500 files of tgrep's own `.rs`) it cuts peak working set from
+144 MiB to 58 MiB for about 9% more build time, and `--index-buffer` trades the
+two off directly. If the arena never fills, no segments are spilled and the
+build takes exactly the in-memory path. See
+[BENCHMARKS.md](BENCHMARKS.md#index-build-strategies) for full numbers.
+
 ### Start the server
 
 ```bash

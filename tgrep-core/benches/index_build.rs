@@ -3,6 +3,7 @@ use std::path::Path;
 #[cfg(windows)]
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
+use tgrep_core::builder::{BuildOptions, IndexStrategy};
 
 fn create_repo(file_count: usize, bytes_per_file: usize) -> TempDir {
     let dir = TempDir::new().unwrap();
@@ -38,8 +39,25 @@ fn create_high_diversity_repo(file_count: usize, bytes_per_file: usize) -> TempD
 }
 
 fn build_index_once(root: &Path) {
+    build_index_with(root, IndexStrategy::InMemory, DEFAULT_BENCH_BUFFER_BYTES);
+}
+
+/// Arena budget used by the external benchmark cases. Deliberately small so
+/// the bench-scale fixtures spill and exercise the merge path.
+const DEFAULT_BENCH_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+fn build_index_with(root: &Path, strategy: IndexStrategy, buffer_bytes: usize) {
     let index_dir = root.join(".tgrep_bench");
-    tgrep_core::builder::build_index(root, Some(&index_dir), false, false, &[]).unwrap();
+    tgrep_core::builder::build_index_with_options(
+        root,
+        Some(&index_dir),
+        &BuildOptions {
+            strategy,
+            buffer_bytes,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 }
 
 fn bench_index_build(c: &mut Criterion) {
@@ -68,6 +86,44 @@ fn bench_index_build(c: &mut Criterion) {
             || create_high_diversity_repo(1_000, 1024),
             |dir| {
                 build_index_once(dir.path());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    // Same fixtures under the external merge sort, so the added spill+merge
+    // cost is directly comparable against the in-memory cases above.
+    for (file_count, bytes_per_file) in [(2_000usize, 512usize), (5_000, 512)] {
+        group.throughput(Throughput::Bytes((file_count * bytes_per_file) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("build_index_external", file_count),
+            &(file_count, bytes_per_file),
+            |b, &(file_count, bytes_per_file)| {
+                b.iter_batched(
+                    || create_repo(file_count, bytes_per_file),
+                    |dir| {
+                        build_index_with(
+                            dir.path(),
+                            IndexStrategy::External,
+                            DEFAULT_BENCH_BUFFER_BYTES,
+                        );
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.throughput(Throughput::Bytes(1_000 * 1024));
+    group.bench_function("build_index_high_diversity_external/1000", |b| {
+        b.iter_batched(
+            || create_high_diversity_repo(1_000, 1024),
+            |dir| {
+                build_index_with(
+                    dir.path(),
+                    IndexStrategy::External,
+                    DEFAULT_BENCH_BUFFER_BYTES,
+                );
             },
             BatchSize::SmallInput,
         );
@@ -119,11 +175,16 @@ fn measure_peak_working_set(
     file_count: usize,
     bytes_per_file: usize,
     create: fn(usize, usize) -> TempDir,
+    strategy: IndexStrategy,
 ) -> u64 {
     let repo = create(file_count, bytes_per_file);
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--peak-memory-child")
         .arg(repo.path())
+        .arg(match strategy {
+            IndexStrategy::InMemory => "memory",
+            IndexStrategy::External => "external",
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -158,16 +219,25 @@ fn run_peak_memory_probe(file_count: usize, bytes_per_file: usize, high_diversit
     } else {
         create_repo
     };
-    let peak = measure_peak_working_set(file_count, bytes_per_file, create);
     let case_name = if high_diversity {
         "build_index_high_diversity"
     } else {
         "build_index"
     };
-    eprintln!(
-        "index_build/{case_name}/{file_count} peak working set: {peak} bytes ({:.2} MiB)",
-        format_mib(peak)
-    );
+
+    // Run both strategies back to back so the comparison is apples to apples
+    // on the same fixture shape and the same machine state.
+    for (label, strategy) in [
+        ("memory", IndexStrategy::InMemory),
+        ("external", IndexStrategy::External),
+    ] {
+        let peak = measure_peak_working_set(file_count, bytes_per_file, create, strategy);
+        eprintln!(
+            "index_build/{case_name}/{file_count} [{label}] peak working set: \
+             {peak} bytes ({:.2} MiB)",
+            format_mib(peak)
+        );
+    }
 }
 
 #[cfg(not(windows))]
@@ -182,7 +252,11 @@ fn main() {
         let root = args
             .get(2)
             .expect("missing root path for peak memory child");
-        build_index_once(Path::new(root));
+        let strategy = match args.get(3).map(String::as_str) {
+            Some("external") => IndexStrategy::External,
+            _ => IndexStrategy::InMemory,
+        };
+        build_index_with(Path::new(root), strategy, DEFAULT_BENCH_BUFFER_BYTES);
         return;
     }
 

@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod error;
+pub(crate) mod external;
 pub mod filetypes;
 pub mod gitignore;
 pub mod hybrid;

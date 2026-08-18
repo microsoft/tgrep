@@ -109,18 +109,22 @@ tgrep index . --index-strategy=external               # 64 MB arena (default)
 tgrep index . --index-strategy=external --index-buffer 256   # larger arena
 ```
 
-Peak memory becomes roughly flat in repo size rather than linear:
+Peak memory becomes roughly flat in repo size rather than linear. On the Linux
+kernel (94,634 files, 990 MiB index) this is a **20x reduction with no
+measurable time cost**:
 
-| High-diversity files | `memory` | `external` |
-| ---: | ---: | ---: |
-| 2,000 | 66.9 MiB | 32.9 MiB |
-| 8,000 | 185.2 MiB | 37.9 MiB |
-| 16,000 | 343.0 MiB | 50.3 MiB |
+| Strategy | Spill segments | Peak working set | Build |
+| --- | ---: | ---: | ---: |
+| `memory` | - | 2,803–3,855 MiB | ~23 s |
+| `external` (64 MiB default) | 31 | 151–159 MiB | ~23 s |
+| `external --index-buffer 16` | 122 | 109.6 MiB | ~23 s |
 
-On real source (2,500 files of tgrep's own `.rs`) it cuts peak working set from
-144 MiB to 58 MiB for about 9% more build time, and `--index-buffer` trades the
-two off directly. If the arena never fills, no segments are spilled and the
-build takes exactly the in-memory path. See
+`--index-buffer` trades peak memory against merge fan-in, and bounded memory is
+also *predictable* memory — the `memory` row varied by over a gigabyte across
+identical runs because `Vec` growth doubles, while `external` varied by 8 MiB.
+
+If the arena never fills, no segments are spilled and the build takes exactly
+the in-memory path, so small and mid-size repos are unaffected. See
 [BENCHMARKS.md](BENCHMARKS.md#index-build-strategies) for full numbers.
 
 ### Start the server

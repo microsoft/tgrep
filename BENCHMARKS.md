@@ -67,11 +67,56 @@ point: peak heap becomes a function of the arena budget rather than of repo
 size. The remaining growth in the `external` column is the file table and walk
 results, not postings.
 
-**Build time.** The fixture that matters most is real source code, which has
-realistic trigram diversity and genuinely spills. This one is 2,500 files /
-37.5 MiB built from tgrep's own `.rs` sources, timed end to end through the
-release binary (median of 3 runs), with peak working set sampled from the
-child process:
+**Real-world scale: the Linux kernel.** 94,634 indexed files / 446,892 trigrams
+/ 990 MiB index (`C:\repos\linux`, v7.2-rc7, warm page cache, peak working set
+sampled from the child process):
+
+| Strategy | Spill segments | Peak working set | Build |
+| --- | ---: | ---: | ---: |
+| `memory` | - | 2,803 - 3,855 MiB | ~23 s |
+| `external --index-buffer 256` | 8 | 430.6 MiB | ~24 s |
+| `external` (64 MiB default) | 31 | 151 - 159 MiB | ~23 s |
+| `external --index-buffer 16` | 122 | 109.6 MiB | ~23 s |
+| `external --index-buffer 4` | 487 | 102.0 MiB | ~24 s |
+| `external --index-buffer 1` | 1,946 | 98.9 MiB | ~29 s |
+
+At the default budget that is a **20x reduction in peak memory for no
+measurable time cost** — build time is flat within run-to-run noise for any
+budget at or above 4 MiB, and only degrades at 1,946-segment fan-in.
+
+Two things worth noting beyond the headline. First, the `memory` figure is a
+*range* because `Vec` growth doubles: peak lands wherever the final reallocation
+happens to fall, and during that realloc both the old and new buffers are
+resident. It varied by over a gigabyte across three identical runs. The
+`external` column varied by 8 MiB. Bounded memory is also *predictable* memory,
+which matters more than the average when the question is whether a machine can
+finish the build at all.
+
+Second, peak decreases monotonically as the budget shrinks, which is the whole
+point of the knob — but that property had to be fixed, not assumed. See below.
+
+All configurations produce identical results: 15 literal and regex queries over
+190,000+ matches returned byte-identical output against the `memory` index,
+including at 1,946-segment fan-in.
+
+**Why the merge shares one read budget.** The first implementation gave every
+open segment a fixed 256 KiB read-ahead buffer, which made merge memory
+`segments * 256 KiB` — unbounded in fan-in. Since a smaller arena spills *more*
+segments, asking for less memory delivered more of it, and peak traced a U:
+
+| Arena | Segments | Peak, fixed buffers | Peak, shared budget |
+| ---: | ---: | ---: | ---: |
+| 16 MiB | 122 | 114.7 MiB | 109.6 MiB |
+| 4 MiB | 487 | 195.8 MiB | 102.0 MiB |
+| 1 MiB | 1,946 | 565.8 MiB | 98.9 MiB |
+
+At a 1 MiB budget the read buffers alone were 486 MiB. Sizing them as
+`budget / segments` (floored at 4 KiB) removes the U entirely. This only
+reproduces at real scale — every synthetic fixture in this file spills too few
+segments to reach the crossover.
+
+**Smaller fixtures.** 2,500 files / 37.5 MiB built from tgrep's own `.rs`
+sources, timed end to end through the release binary (median of 3 runs):
 
 | Strategy | Spill segments | Peak working set | Median build | Delta |
 | --- | ---: | ---: | ---: | ---: |

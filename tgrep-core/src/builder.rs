@@ -1019,4 +1019,74 @@ mod tests {
             "base file's real loc_mask must be preserved verbatim"
         );
     }
+
+    /// Incremental flushes stream new files onto whatever index is already on
+    /// disk, so the append path must work identically on an external-built
+    /// base. `external` only changes how postings are accumulated in memory,
+    /// not the on-disk format, but that is exactly the kind of assumption worth
+    /// pinning down: a base built through the spill/merge path must remain a
+    /// valid input to `append_overlay_to_index`.
+    #[test]
+    fn append_overlay_merges_onto_an_external_built_index() {
+        use crate::live::LiveIndex;
+
+        let repo = tempfile::tempdir().unwrap();
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "hello world\nneedle one\n").unwrap();
+        std::fs::write(src.join("b.txt"), "needle two\nother content\n").unwrap();
+
+        // Build the base through the spill/merge path. A 1-byte budget floors
+        // the arena at its minimum so this is a real merge, not the fast path.
+        let base_dir = tempfile::tempdir().unwrap();
+        build_index_with_options(
+            repo.path(),
+            Some(base_dir.path()),
+            &BuildOptions {
+                strategy: IndexStrategy::External,
+                buffer_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let base_reader = IndexReader::open(base_dir.path()).unwrap();
+        assert_eq!(base_reader.num_files(), 2);
+
+        let mut live = LiveIndex::new();
+        live.upsert_file_with_trigrams("src/c.txt", crate::trigram::extract(b"needle three\n"));
+        live.upsert_file_with_trigrams("src/d.txt", crate::trigram::extract(b"zzz unique\n"));
+        let (overlay_paths, overlay_inverted) = live.snapshot_for_disk();
+
+        let merged_dir = tempfile::tempdir().unwrap();
+        append_overlay_to_index(
+            repo.path(),
+            merged_dir.path(),
+            &base_reader,
+            &overlay_paths,
+            &overlay_inverted,
+            true,
+        )
+        .unwrap();
+
+        let merged = IndexReader::open(merged_dir.path()).unwrap();
+        merged.validate_lookup().unwrap();
+        assert_eq!(merged.num_files(), 4);
+
+        // Base IDs preserved, overlay appended after them.
+        assert_eq!(merged.file_path(0), base_reader.file_path(0));
+        assert_eq!(merged.file_path(1), base_reader.file_path(1));
+        assert_eq!(merged.file_path(2), Some("src/c.txt"));
+        assert_eq!(merged.file_path(3), Some("src/d.txt"));
+
+        // A trigram spanning base and overlay resolves across both halves and
+        // stays file-id sorted, which is what query execution relies on.
+        let needle = crate::trigram::hash(b'n', b'e', b'e');
+        let ids = merged.lookup_trigram(needle);
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "merged posting list must be sorted");
+        let mut paths: Vec<&str> = ids.iter().filter_map(|&id| merged.file_path(id)).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["src/a.txt", "src/b.txt", "src/c.txt"]);
+    }
 }

@@ -96,46 +96,50 @@ tgrep index . --index-path /tmp/idx   # custom index location
 tgrep index . --exclude vendor --exclude third_party  # skip directories
 ```
 
-Each build reports its elapsed time and peak memory when it finishes, which
-makes the strategies below directly comparable:
+Each build reports its elapsed time and peak memory when it finishes:
 
 ```
 Index built successfully at /tmp/idx
-Indexed in 22.7s using memory strategy (peak memory 2.55 GiB)
+Indexed in 22.6s using external strategy (peak memory 160.1 MiB)
 ```
 
 The peak is the operating system's own high-water mark for the process, so it
 reflects the true maximum rather than a sampled snapshot.
 
-#### Bounding memory on very large repos
+#### Memory use on very large repos
 
-By default the builder holds every posting in RAM and sorts once, so peak
-memory grows with repo size. `--index-strategy=external` bounds it instead with
-an external merge sort: postings accumulate in a fixed-size arena that spills
+Builds default to `--index-strategy=external`, which bounds peak memory with an
+external merge sort: postings accumulate in a fixed-size arena that spills
 sorted, compact segments to disk when full, and the segments are k-way merged
-straight into the index.
+straight into the index. Peak memory is roughly flat in repo size rather than
+linear.
+
+If the arena never fills, nothing is spilled and the build takes exactly the
+in-memory path, so small and mid-size repos pay nothing for this default.
 
 ```bash
-tgrep index . --index-strategy=external               # 64 MB arena (default)
-tgrep index . --index-strategy=external --index-buffer 256   # larger arena
+tgrep index .                                 # external, 64 MB arena
+tgrep index . --index-buffer 16               # smaller arena, lower peak
+tgrep index . --index-strategy=memory         # opt out: sort entirely in RAM
 ```
 
-Peak memory becomes roughly flat in repo size rather than linear. On the Linux
-kernel (94,634 files, 990 MiB index) this is a **20x reduction with no
-measurable time cost**:
+On the Linux kernel (94,634 files, 990 MiB index) the default is a **~17x
+reduction in peak memory, and no slower**:
 
 | Strategy | Spill segments | Peak working set | Build |
 | --- | ---: | ---: | ---: |
-| `memory` | - | 2,803–3,855 MiB | ~23 s |
-| `external` (64 MiB default) | 31 | 151–159 MiB | ~23 s |
+| `external` (default, 64 MiB arena) | 31 | **160.1 MiB** | 22.6 s |
 | `external --index-buffer 16` | 122 | 109.6 MiB | ~23 s |
+| `memory` | - | 2.20 - 3.76 GiB | 23 - 32 s |
 
-`--index-buffer` trades peak memory against merge fan-in, and bounded memory is
-also *predictable* memory — the `memory` row varied by over a gigabyte across
-identical runs because `Vec` growth doubles, while `external` varied by 8 MiB.
+`--index-buffer` trades peak memory against merge fan-in. Bounded memory is also
+*predictable* memory — the `memory` row varied by over a gigabyte across
+identical runs because `Vec` growth doubles and both buffers are briefly
+resident during the final reallocation, while `external` varied by 8 MiB.
 
-If the arena never fills, no segments are spilled and the build takes exactly
-the in-memory path, so small and mid-size repos are unaffected. See
+`--index-strategy=memory` remains available as an escape hatch for environments
+where spilling is undesirable or impossible, such as a read-only or full index
+volume. Both strategies produce byte-identical indexes. See
 [BENCHMARKS.md](BENCHMARKS.md#index-build-strategies) for full numbers.
 
 ### Start the server

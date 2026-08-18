@@ -39,10 +39,12 @@ serialization. The flat sorted-posting writer reduced this case from roughly
 
 ### Index build strategies
 
-`tgrep index --index-strategy=external` replaces the single in-heap posting
+The default build strategy, `external`, replaces the single in-heap posting
 vector with an external merge sort: postings fill a fixed-size arena that spills
 sorted, delta+varint encoded segments to disk, which are then k-way merged
-directly into `index.bin` / `lookup.bin`.
+directly into `index.bin` / `lookup.bin`. `--index-strategy=memory` selects the
+older sort-everything-in-RAM path, retained as an escape hatch and as the
+reference implementation for differential tests.
 
 The peak-memory probe runs both strategies back to back on the same fixture.
 Each of these runs uses a deliberately small 4 MB arena so bench-scale fixtures
@@ -73,31 +75,35 @@ sampled from the child process):
 
 | Strategy | Spill segments | Peak working set | Build |
 | --- | ---: | ---: | ---: |
-| `memory` | - | 2,803 - 3,855 MiB | ~23 s |
+| `memory` | - | 2.20 - 3.76 GiB | 23 - 32 s |
 | `external --index-buffer 256` | 8 | 430.6 MiB | ~24 s |
-| `external` (64 MiB default) | 31 | 151 - 159 MiB | ~23 s |
+| `external` (64 MiB, **default**) | 31 | 151 - 160 MiB | ~23 s |
 | `external --index-buffer 16` | 122 | 109.6 MiB | ~23 s |
 | `external --index-buffer 4` | 487 | 102.0 MiB | ~24 s |
 | `external --index-buffer 1` | 1,946 | 98.9 MiB | ~29 s |
 
-At the default budget that is a **20x reduction in peak memory for no
-measurable time cost** — build time is flat within run-to-run noise for any
-budget at or above 4 MiB, and only degrades at 1,946-segment fan-in.
+At the default budget that is a **~17x reduction in peak memory for no time
+cost** — build time is flat within run-to-run noise for any budget at or above
+4 MiB, and only degrades at 1,946-segment fan-in. This is why `external` is the
+default. In several runs it was measurably *faster* than `memory` (22.6 s vs
+31.6 s), because sorting one ~2 GiB posting vector, and the doubling
+reallocations that grow it, cost more than encoding and merging spill segments.
 
 Two things worth noting beyond the headline. First, the `memory` figure is a
 *range* because `Vec` growth doubles: peak lands wherever the final reallocation
 happens to fall, and during that realloc both the old and new buffers are
-resident. It varied by over a gigabyte across three identical runs. The
-`external` column varied by 8 MiB. Bounded memory is also *predictable* memory,
-which matters more than the average when the question is whether a machine can
-finish the build at all.
+resident. It varied by over a gigabyte across identical runs. The `external`
+column varied by 8 MiB. Bounded memory is also *predictable* memory, which
+matters more than the average when the question is whether a machine can finish
+the build at all.
 
 Second, peak decreases monotonically as the budget shrinks, which is the whole
 point of the knob — but that property had to be fixed, not assumed. See below.
 
-All configurations produce identical results: 15 literal and regex queries over
+All configurations produce identical results. 15 literal and regex queries over
 190,000+ matches returned byte-identical output against the `memory` index,
-including at 1,946-segment fan-in.
+including at 1,946-segment fan-in; re-verified after `external` became the
+default with 7 queries over 100,130 matches.
 
 Peak figures here are the OS process high-water mark (`PeakWorkingSetSize` on
 Windows, `VmHWM` on Linux), sampled externally. `tgrep index` now reports the

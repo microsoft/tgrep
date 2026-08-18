@@ -16,11 +16,14 @@ pub fn run(
     strategy: IndexStrategy,
     buffer_bytes: Option<u64>,
 ) -> Result<()> {
+    let explicit_buffer = buffer_bytes.is_some();
     let buffer_bytes = buffer_bytes
         .and_then(|bytes| usize::try_from(bytes).ok())
         .unwrap_or(builder::DEFAULT_INDEX_BUFFER_BYTES);
 
-    if strategy == IndexStrategy::External {
+    // External is the default, so announcing it on every run would be noise.
+    // Confirm the arena only when the user explicitly tuned it.
+    if strategy == IndexStrategy::External && explicit_buffer {
         eprintln!(
             "Using external merge sort (arena {} MB before spilling)",
             buffer_bytes / (1024 * 1024)

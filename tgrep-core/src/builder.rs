@@ -25,16 +25,20 @@ pub use crate::external::DEFAULT_BUFFER_BYTES as DEFAULT_INDEX_BUFFER_BYTES;
 pub enum IndexStrategy {
     /// Hold every posting in heap, sort once, write once.
     ///
-    /// Fastest when the postings fit comfortably in RAM, but peak memory
-    /// grows linearly with repository size and is unbounded.
-    #[default]
+    /// Peak memory grows linearly with repository size and is unbounded. Kept
+    /// as an escape hatch for environments where spilling to disk is
+    /// undesirable or impossible (read-only or full index volume), and as the
+    /// independent reference implementation that [`IndexStrategy::External`]
+    /// is differentially tested against.
     InMemory,
     /// Bound peak memory with an external merge sort.
     ///
     /// Postings accumulate in a fixed-size arena that spills sorted, compact
     /// segments to disk when full; the segments are then k-way merged straight
     /// into the index. Peak heap is independent of repository size. If the
-    /// arena never fills this is identical to [`IndexStrategy::InMemory`].
+    /// arena never fills this is identical to [`IndexStrategy::InMemory`], so
+    /// small repositories pay nothing for the default.
+    #[default]
     External,
 }
 
@@ -749,6 +753,15 @@ mod tests {
             fingerprint.insert(trigram, resolved);
         }
         fingerprint
+    }
+
+    // The memory-bounded path is the default; a refactor that silently
+    // reverted it would reintroduce unbounded peak memory on large repos
+    // without failing any other test.
+    #[test]
+    fn external_is_the_default_strategy() {
+        assert_eq!(IndexStrategy::default(), IndexStrategy::External);
+        assert_eq!(BuildOptions::default().strategy, IndexStrategy::External);
     }
 
     #[test]

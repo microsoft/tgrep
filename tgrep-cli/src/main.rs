@@ -237,14 +237,15 @@ enum Command {
 
         /// How postings are accumulated during the build.
         ///
-        /// `memory` holds every posting in RAM and sorts once — fastest when
-        /// the index fits comfortably, but peak memory grows with repo size.
-        /// `external` bounds peak memory with an external merge sort, spilling
-        /// sorted segments to disk when the arena fills.
+        /// `external` (default) bounds peak memory with an external merge
+        /// sort, spilling sorted segments to disk when the arena fills. If the
+        /// arena never fills it is identical to `memory`, so small repos are
+        /// unaffected. `memory` holds every posting in RAM and sorts once;
+        /// peak memory then grows with repo size, unbounded.
         #[arg(
             long = "index-strategy",
             value_name = "STRATEGY",
-            default_value = "memory"
+            default_value = "external"
         )]
         strategy: IndexStrategyArg,
 

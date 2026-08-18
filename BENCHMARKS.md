@@ -99,6 +99,11 @@ All configurations produce identical results: 15 literal and regex queries over
 190,000+ matches returned byte-identical output against the `memory` index,
 including at 1,946-segment fan-in.
 
+Peak figures here are the OS process high-water mark (`PeakWorkingSetSize` on
+Windows, `VmHWM` on Linux), sampled externally. `tgrep index` now reports the
+same counter itself on completion, so these numbers are reproducible without
+external tooling; the self-reported and externally-sampled values agree exactly.
+
 **Why the merge shares one read budget.** The first implementation gave every
 open segment a fixed 256 KiB read-ahead buffer, which made merge memory
 `segments * 256 KiB` — unbounded in fan-in. Since a smaller arena spills *more*

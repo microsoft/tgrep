@@ -1,8 +1,11 @@
 /// `tgrep index` — build the trigram index.
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::Result;
 use tgrep_core::builder::{self, BuildOptions, IndexStrategy};
+
+use crate::mem;
 
 pub fn run(
     root: &Path,
@@ -24,6 +27,7 @@ pub fn run(
         );
     }
 
+    let started = Instant::now();
     builder::build_index_with_options(
         root,
         index_path,
@@ -35,5 +39,26 @@ pub fn run(
             buffer_bytes,
         },
     )?;
+    let elapsed = started.elapsed();
+
+    let strategy_label = match strategy {
+        IndexStrategy::InMemory => "memory",
+        IndexStrategy::External => "external",
+    };
+    // Peak is an OS high-water mark for the whole process. `tgrep index` does
+    // nothing substantial before the build, so it reads as the build's peak.
+    match mem::peak_rss_bytes() {
+        Some(peak) => eprintln!(
+            "Indexed in {:.1}s using {} strategy (peak memory {})",
+            elapsed.as_secs_f64(),
+            strategy_label,
+            mem::format_bytes(peak)
+        ),
+        None => eprintln!(
+            "Indexed in {:.1}s using {} strategy",
+            elapsed.as_secs_f64(),
+            strategy_label
+        ),
+    }
     Ok(())
 }

@@ -96,6 +96,17 @@ tgrep index . --index-path /tmp/idx   # custom index location
 tgrep index . --exclude vendor --exclude third_party  # skip directories
 ```
 
+Each build reports its elapsed time and peak memory when it finishes, which
+makes the strategies below directly comparable:
+
+```
+Index built successfully at /tmp/idx
+Indexed in 22.7s using memory strategy (peak memory 2.55 GiB)
+```
+
+The peak is the operating system's own high-water mark for the process, so it
+reflects the true maximum rather than a sampled snapshot.
+
 #### Bounding memory on very large repos
 
 By default the builder holds every posting in RAM and sorts once, so peak

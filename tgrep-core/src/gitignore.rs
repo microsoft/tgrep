@@ -8,6 +8,7 @@
 //! The canonical caller is the file watcher in `tgrep-cli`, which has to
 //! answer that per `notify` event without re-walking.
 
+use crate::walker::walker_thread_count;
 use ignore::WalkBuilder;
 use std::path::Path;
 
@@ -42,15 +43,6 @@ pub fn ignore_files_in(dir: &Path) -> (Option<std::path::PathBuf>, Option<std::p
         gitignore.is_file().then_some(gitignore),
         dot_ignore.is_file().then_some(dot_ignore),
     )
-}
-
-/// Thread count for the `.gitignore` enumeration walk.
-///
-/// Mirrors `walker::walker_thread_count`. The walk is I/O-bound rather than
-/// CPU-bound, so the cap exists to avoid thrashing network filesystems, not
-/// to match core count.
-fn matcher_walk_thread_count() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get().min(12))
 }
 
 use ignore::Match;
@@ -437,7 +429,7 @@ pub fn build_matcher(root: &Path) -> Option<IgnoreMatcher> {
                 entry.file_type().is_some_and(|kind| kind.is_dir()),
             )
         })
-        .threads(matcher_walk_thread_count())
+        .threads(walker_thread_count())
         .build_parallel();
 
     let gitignore_files = std::sync::Mutex::new(Vec::<std::path::PathBuf>::new());

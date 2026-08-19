@@ -297,7 +297,17 @@ enum Command {
         /// switches, builds) log watcher queue overflows; each overflow costs
         /// a full stale check instead of incremental updates. Defaults to
         /// 16384.
-        #[arg(long = "watcher-queue-cap", value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        // Bounded by `usize::MAX` so the value always survives the conversion
+        // at the call site. Without it, a value above `usize::MAX` would
+        // truncate on a 32-bit target — and truncating to 0 turns the
+        // watcher's `sync_channel` into a rendezvous channel, where every
+        // `try_send` fails and no event is ever delivered. Plain `//` so the
+        // rationale stays out of `--help`.
+        #[arg(
+            long = "watcher-queue-cap",
+            value_name = "N",
+            value_parser = clap::value_parser!(u64).range(1..=usize::MAX as u64)
+        )]
         watcher_queue_cap: Option<u64>,
     },
 
@@ -425,7 +435,11 @@ fn main() {
                     index_threads,
                     no_ignore,
                     auto_save_mutations,
-                    watcher_queue_cap: watcher_queue_cap.map(|n| n as usize),
+                    // Clap's range bound guarantees this fits; saturating keeps
+                    // the conversion total, and errs toward a large cap rather
+                    // than a zero-length (rendezvous) queue.
+                    watcher_queue_cap: watcher_queue_cap
+                        .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
                 },
             )
         }

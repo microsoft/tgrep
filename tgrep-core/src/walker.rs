@@ -16,7 +16,11 @@ const BINARY_EXTENSIONS: &[&str] = &[
 ];
 
 /// Number of parallel walker threads (capped at 12 to avoid diminishing returns).
-fn walker_thread_count() -> usize {
+///
+/// Shared with the `.gitignore` enumeration walk in [`crate::gitignore`] so both
+/// full-tree walks stay in lock-step: they traverse the same trees under the
+/// same I/O constraints, so tuning one without the other would be a bug.
+pub(crate) fn walker_thread_count() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get().min(12))
 }
 
@@ -213,9 +217,10 @@ pub struct MetaWalkResult {
 /// `.gitignore` / `.ignore` files encountered. No file content is read — this
 /// is used for stale file detection on startup.
 ///
-/// Hidden entries are visited so dot-files like `.gitignore` / `.ignore` are
-/// seen, but dot-*directories* are skipped and dot-files are excluded from
-/// `files`, so the metadata set still matches a hidden-skipping walk.
+/// Hidden entries are skipped, matching the indexing walk. Ignore files are
+/// still found because every directory the walk descends into is probed
+/// explicitly via [`crate::gitignore::ignore_files_in`], which also catches
+/// ignore files that their own rules would have filtered out of the walk.
 pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String], no_ignore: bool) -> MetaWalkResult {
     let results = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());

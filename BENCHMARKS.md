@@ -126,6 +126,37 @@ At a 1 MiB budget the read buffers alone were 486 MiB. Sizing them as
 reproduces at real scale — every synthetic fixture in this file spills too few
 segments to reach the crossover.
 
+### Server bootstrap
+
+`tgrep serve` on an empty index used to build through a different path than
+`tgrep index`: it walked the repo and accumulated every posting in the live
+in-memory overlay, flushing to disk once at the end. The soft memory cap that
+was supposed to bound this only trips above `--memory-cap` (16 GB by default),
+so on anything smaller than that the whole index simply stayed in heap.
+
+A cold start now delegates to the same memory-bounded builder as `tgrep index`.
+On the Linux kernel tree (94,181 files, same host as above, peak sampled
+externally, timed to the point the server reports the index ready):
+
+| Bootstrap path | Peak working set | Wall |
+| --- | ---: | ---: |
+| in-heap overlay (before) | 1,569.7 MiB | 73.6 s |
+| external builder (after) | 148.6 MiB | 28.7 s |
+
+That is a **10.6x reduction in peak memory and a 2.6x speedup**. The overlay
+path was slower because it pays twice: it builds the posting map in memory and
+*then* rewrites the whole thing through the append-overlay flush.
+
+Two behavioural notes. The server no longer answers from a partially built
+index during a cold start — queries see an empty index until the build
+finishes, which is a deliberate trade, since results from a fraction of the
+repo are misleading. And an interrupted bootstrap now leaves a usable index:
+the old path wrote nothing until its single end-of-build flush, so killing it
+at 99% left an empty index behind.
+
+Resuming a *partial* index still uses the incremental path, which can skip the
+files already on disk.
+
 **Smaller fixtures.** 2,500 files / 37.5 MiB built from tgrep's own `.rs`
 sources, timed end to end through the release binary (median of 3 runs):
 

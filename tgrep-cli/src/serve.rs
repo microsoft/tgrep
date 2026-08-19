@@ -1463,6 +1463,127 @@ fn background_refresh_stale(
     *state.file_stamps.write().unwrap() = new_stamps;
 }
 
+/// Restore a known-empty on-disk index after a failed bootstrap.
+///
+/// `build_index_with_options` writes the index files in place, so a failure
+/// partway through can leave truncated files that the currently mmap'd reader
+/// no longer matches. Resetting gives the fallback build a clean base.
+fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
+    if let Err(e) = create_empty_index(index_dir) {
+        eprintln!("[trace] warning: could not reset the index directory ({e})");
+        return;
+    }
+    match HybridIndex::open(index_dir, root) {
+        Ok(empty) => {
+            *state.index.write().unwrap() = empty;
+            state.cache.write().unwrap().clear();
+        }
+        Err(e) => eprintln!("[trace] warning: could not reopen an empty index ({e})"),
+    }
+}
+
+/// Bootstrap an empty index with the memory-bounded external merge sort.
+///
+/// The incremental path below accumulates every posting in the live overlay
+/// before flushing, so a cold start on a large repository holds the whole
+/// index in heap — on the Linux kernel tree that peaked at ~1.5 GiB. Handing a
+/// true bootstrap to the builder with [`IndexStrategy::External`] bounds peak
+/// memory to the arena budget instead, and is also faster, because it writes
+/// the index once rather than growing an overlay and then flushing it.
+///
+/// The trade-off is that queries see an empty index until the build finishes
+/// rather than a growing partial one. That is deliberate: results from a
+/// fraction of the repository are misleading, and `status` already reports
+/// that indexing is in progress.
+///
+/// Only used when nothing has been indexed yet. Resuming a partial index still
+/// takes the incremental path, which can skip the files already on disk.
+///
+/// Returns `false` if the index could not be built and published, leaving the
+/// caller to fall back.
+fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
+    let start = Instant::now();
+    eprintln!("[trace] bootstrapping index with the external merge sort (memory-bounded)...");
+
+    if let Err(e) = builder::build_index_with_options(
+        root,
+        Some(index_dir),
+        &builder::BuildOptions {
+            include_hidden: false,
+            no_ignore: state.no_ignore,
+            exclude_dirs: state.exclude_dirs.clone(),
+            // Match the walk `background_index_build` would have run, and the
+            // dot-prefix rule `should_skip_watcher_path` applies, so the
+            // watcher can maintain every file this build indexes.
+            collect_gitignore_files: true,
+            strategy: builder::IndexStrategy::External,
+            buffer_bytes: builder::DEFAULT_INDEX_BUFFER_BYTES,
+        },
+    ) {
+        eprintln!(
+            "[trace] warning: external bootstrap build failed ({e}); \
+             falling back to the in-heap build"
+        );
+        reset_to_empty_index(state, root, index_dir);
+        return false;
+    }
+
+    // Publish under the snapshot gate, and clear `indexing` before releasing
+    // it. `handle_fs_event` only skips while `indexing` is true, so flipping
+    // the flag outside the gate would let a watcher event mutate the overlay
+    // against the reader we are in the middle of replacing.
+    let gate = state.snapshot_gate.write().unwrap();
+    let opened = match HybridIndex::open(index_dir, root) {
+        Ok(index) => index,
+        Err(e) => {
+            drop(gate);
+            eprintln!(
+                "[trace] warning: bootstrapped index failed to open ({e}); \
+                 falling back to the in-heap build"
+            );
+            reset_to_empty_index(state, root, index_dir);
+            return false;
+        }
+    };
+    let indexed = opened.num_files() as u64;
+    *state.index.write().unwrap() = opened;
+    state.cache.write().unwrap().clear();
+    state.index_total.store(indexed, Ordering::Relaxed);
+    state.index_progress.store(indexed, Ordering::Relaxed);
+
+    // Everything the watcher consults must be in place before `indexing` goes
+    // false, since that flag is the only thing keeping `handle_fs_event` off
+    // the index. Without the stamps it would reindex on spurious events;
+    // without the matcher it would happily index gitignored paths that the
+    // build just skipped.
+    //
+    // The builder persisted filestamps.json as part of the build, but it does
+    // not collect .gitignore paths, so the matcher is built separately here.
+    match tgrep_core::meta::read_filestamps(index_dir) {
+        Ok(stamps) => *state.file_stamps.write().unwrap() = stamps,
+        Err(e) => eprintln!(
+            "[trace] warning: could not load file stamps ({e}); \
+             the watcher may reindex on spurious events"
+        ),
+    }
+    if state.watch_enabled {
+        build_gitignore_matcher_after_ready(state, root);
+    }
+
+    state.indexing.store(false, Ordering::SeqCst);
+    drop(gate);
+
+    eprintln!(
+        "[trace] bootstrap complete: {indexed} files indexed in {:.1}s",
+        start.elapsed().as_secs_f64()
+    );
+
+    if state.ignore_rules_dirty.load(Ordering::SeqCst) {
+        schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+    }
+    true
+}
+
 /// Walk the repo and populate the LiveIndex in batches in a background thread.
 /// Uses rayon for parallel trigram extraction. The bulk build is held entirely
 /// in the live overlay; only one final flush to disk happens once the walk
@@ -1496,6 +1617,13 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         paths
     };
     let seeded_count = skip_paths.len() as u64;
+
+    // Nothing indexed yet: build straight to disk with bounded memory instead
+    // of accumulating the whole repo in the live overlay. Resuming a partial
+    // index falls through, since that path can skip what is already on disk.
+    if skip_paths.is_empty() && bootstrap_index_build(state, root, index_dir) {
+        return;
+    }
 
     // Phase 1: Walk file paths (no content reads)
     let t_walk = Instant::now();

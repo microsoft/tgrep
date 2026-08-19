@@ -142,6 +142,13 @@ where spilling is undesirable or impossible, such as a read-only or full index
 volume. Both strategies produce byte-identical indexes. See
 [BENCHMARKS.md](BENCHMARKS.md#index-build-strategies) for full numbers.
 
+`tgrep serve` uses the same bounded builder when it has to create an index from
+scratch, so starting a server on an unindexed repo costs the same memory as
+`tgrep index` (**148.6 MiB** rather than 1.6 GiB on the Linux kernel, and 2.6x
+faster). While that first build runs the server answers from an empty index
+rather than a partial one; incremental updates after it completes are
+unaffected.
+
 ### Start the server
 
 ```bash

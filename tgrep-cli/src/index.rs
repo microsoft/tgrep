@@ -55,6 +55,7 @@ pub fn run(
             exclude_dirs: exclude_dirs.to_vec(),
             strategy,
             buffer_bytes,
+            ..Default::default()
         },
     )?;
     let elapsed = started.elapsed();

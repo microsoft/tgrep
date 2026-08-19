@@ -48,6 +48,18 @@ pub struct BuildOptions {
     pub include_hidden: bool,
     pub no_ignore: bool,
     pub exclude_dirs: Vec<String>,
+    /// Apply leading-dot ("hidden") filtering in the walk instead of the
+    /// platform's native hidden check, and treat `.gitignore` files as
+    /// hidden.
+    ///
+    /// The two differ on Windows, where the native check reads the
+    /// `FILE_ATTRIBUTE_HIDDEN` bit that git does not set on dotfiles, so a
+    /// default walk indexes `.gitignore`, `.mailmap`, and friends there but
+    /// not on Unix. `tgrep serve` walks with leading-dot semantics on every
+    /// platform, and its file watcher skips dot-prefixed paths outright, so a
+    /// build destined for a server must opt in — otherwise the server would
+    /// index dotfiles it can never afterwards update or remove.
+    pub collect_gitignore_files: bool,
     pub strategy: IndexStrategy,
     /// Arena budget in bytes for [`IndexStrategy::External`]. Ignored by
     /// [`IndexStrategy::InMemory`].
@@ -60,6 +72,7 @@ impl Default for BuildOptions {
             include_hidden: false,
             no_ignore: false,
             exclude_dirs: Vec::new(),
+            collect_gitignore_files: false,
             strategy: IndexStrategy::default(),
             buffer_bytes: external::DEFAULT_BUFFER_BYTES,
         }
@@ -141,6 +154,7 @@ pub fn build_index_with_options(
         &walker::WalkOptions {
             include_hidden,
             no_ignore,
+            collect_gitignore_files: opts.collect_gitignore_files,
             exclude_dirs: exclude_dirs.to_vec(),
             ..Default::default()
         },
@@ -762,6 +776,46 @@ mod tests {
     fn external_is_the_default_strategy() {
         assert_eq!(IndexStrategy::default(), IndexStrategy::External);
         assert_eq!(BuildOptions::default().strategy, IndexStrategy::External);
+    }
+
+    // `tgrep serve` walks with leading-dot hidden semantics and its watcher
+    // skips dot-prefixed paths, so a build that feeds a server must exclude
+    // dotfiles. On Windows the default walk keeps them (the native hidden
+    // check reads an attribute git never sets), which would leave the server
+    // holding entries it can never update or delete.
+    #[test]
+    fn collect_gitignore_files_excludes_dotfiles_from_the_index() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            "fn main() { needle(); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".gitignore"), "# needle marker\n*.log\n").unwrap();
+        std::fs::write(root.join(".mailmap"), "needle <needle@example.com>\n").unwrap();
+
+        let for_serve = tempfile::tempdir().unwrap();
+        build_index_with_options(
+            root,
+            Some(for_serve.path()),
+            &BuildOptions {
+                collect_gitignore_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let reader = IndexReader::open(for_serve.path()).unwrap();
+        let indexed: Vec<String> = (0..reader.num_files() as u32)
+            .filter_map(|id| reader.file_path(id).map(|p| p.to_string()))
+            .collect();
+        assert_eq!(
+            indexed,
+            vec!["src/main.rs".to_string()],
+            "a build destined for the server must skip dot-prefixed files"
+        );
     }
 
     #[test]

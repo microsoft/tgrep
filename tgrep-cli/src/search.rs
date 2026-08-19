@@ -234,11 +234,55 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
     }
 
     // No server — use on-disk index directly (or brute force)
-    if opts.no_index || !index_dir.join("lookup.bin").exists() {
+    if opts.no_index {
+        return brute_force_search(&root, opts, ci);
+    }
+    if !index_dir.join("lookup.bin").exists() {
+        warn_missing_index(&index_dir, index_path.is_some(), opts.quiet);
         return brute_force_search(&root, opts, ci);
     }
 
     search_local_index(&root, &index_dir, opts, ci)
+}
+
+/// Render a path the way the user typed it.
+///
+/// `std::fs::canonicalize` returns Windows extended-length paths (`\\?\C:\...`,
+/// or `\\?\UNC\server\share` for network paths). That prefix is an internal
+/// Win32 detail and only confuses people when it shows up in a diagnostic.
+fn display_path(p: &Path) -> String {
+    let s = p.display().to_string();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    }
+}
+
+/// Warn when a search silently degrades to scanning every file.
+///
+/// This is the difference between a sub-second query and a multi-minute one on
+/// a large tree, so it must never be silent. The most common cause is starting
+/// `serve` with `--index-path` but omitting it on the search: the flag is
+/// global, meaning it is accepted on every subcommand, not remembered between
+/// invocations. The client then looks for `serve.json` in the default location,
+/// finds nothing, and falls through to here without ever contacting the server.
+fn warn_missing_index(index_dir: &Path, explicit_path: bool, quiet: bool) {
+    if quiet {
+        return;
+    }
+    let dir = display_path(index_dir);
+    eprintln!("warning: no index at {dir} - scanning every file (slow on large trees)");
+    if explicit_path {
+        eprintln!("note: build one with `tgrep index --index-path {dir}`");
+    } else {
+        eprintln!(
+            "note: if a server is running with `--index-path <dir>`, pass the same \
+             --index-path here; otherwise build an index with `tgrep index`"
+        );
+    }
 }
 
 fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Result<bool> {
@@ -782,5 +826,36 @@ fn plan_summary(plan: &QueryPlan) -> String {
             format!("OR({})", subs.join(", "))
         }
         QueryPlan::MatchAll => "MatchAll (full scan)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_path_strips_extended_length_prefix() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\src\repo\.tgrep")),
+            r"C:\src\repo\.tgrep"
+        );
+    }
+
+    #[test]
+    fn display_path_restores_unc_paths() {
+        // Naively stripping `\\?\` would leave a bogus `UNC\server\...` path.
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\idx")),
+            r"\\server\share\idx"
+        );
+    }
+
+    #[test]
+    fn display_path_leaves_ordinary_paths_alone() {
+        assert_eq!(display_path(Path::new(r"C:\src\repo")), r"C:\src\repo");
+        assert_eq!(
+            display_path(Path::new("/home/user/repo")),
+            "/home/user/repo"
+        );
     }
 }

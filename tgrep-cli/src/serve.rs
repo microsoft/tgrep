@@ -30,6 +30,20 @@ const CACHE_CAPACITY: usize = 50_000;
 const AUTO_SAVE_MUTATIONS: u32 = 5000;
 const AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(600); // 10 minutes
 
+/// Default bound on the queue between the OS notification callback and the
+/// watcher worker (override with `--watcher-queue-cap`).
+///
+/// Sized to absorb a bulk change — a branch switch or a build — without
+/// dropping events, while staying small enough that a truly runaway producer
+/// is capped rather than growing memory without limit. Each queued `Event`
+/// holds only its paths, so this is on the order of a few MB at worst.
+const WATCHER_QUEUE_CAP: usize = 16_384;
+
+/// How long the watcher worker waits for an event before looking for an
+/// overflow to repair. Doubles as the quiet period that must elapse before a
+/// reconciling stale check runs.
+const WATCHER_IDLE_POLL: Duration = Duration::from_secs(1);
+
 /// Server discovery info, written to `serve.json`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerInfo {
@@ -208,6 +222,8 @@ pub struct ServeOptions<'a> {
     pub index_threads: usize,
     pub no_ignore: bool,
     pub auto_save_mutations: Option<u32>,
+    /// Bound on the watcher's hand-off queue. `None` uses [`WATCHER_QUEUE_CAP`].
+    pub watcher_queue_cap: Option<usize>,
 }
 
 pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) -> Result<()> {
@@ -218,8 +234,10 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         index_threads,
         no_ignore,
         auto_save_mutations,
+        watcher_queue_cap,
     } = options;
     let serve_start = Instant::now();
+    let watcher_queue_cap = watcher_queue_cap.unwrap_or(WATCHER_QUEUE_CAP);
     let auto_save_mutations = auto_save_mutations.unwrap_or(AUTO_SAVE_MUTATIONS);
     let root = std::fs::canonicalize(root)?;
     let index_dir = index_path
@@ -312,12 +330,13 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
 
     eprintln!(
         "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries. \
-         Memory cap: {} MB. Index threads: {}.",
+         Memory cap: {} MB. Index threads: {}. Watcher queue cap: {}.",
         serve_start.elapsed().as_secs_f64() * 1000.0,
         port,
         CACHE_CAPACITY,
         memory_cap_bytes / (1024 * 1024),
         index_threads,
+        watcher_queue_cap,
     );
 
     // If no pre-existing index, build into the LiveIndex in background
@@ -334,21 +353,22 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         let stale_root = root.clone();
         let stale_index_dir = index_dir.clone();
         thread::spawn(move || {
-            // Publish the gitignore matcher *before* the stale check, not
-            // after. On this path `indexing` is false from the very first
-            // event, so `gitignore_pending` is the only thing keeping the
-            // watcher off the index while the matcher is missing. That gate
-            // is armed when `ServerState` is built — before this thread is
-            // spawned and before `start_file_watcher` runs below — so it
-            // holds whichever of the two wins the race.
+            // The stale check owns publishing the gitignore matcher on this
+            // path: it walks the whole tree anyway, so it collects the ignore
+            // files as it goes rather than paying for a second traversal.
             //
-            // Doing this first also means the stale check that follows is
-            // what recovers the events dropped during the gap: it compares
-            // the whole tree against the index, so any edit that landed
-            // while the matcher was still building is picked up here.
-            if stale_state.watch_enabled && !stale_state.no_ignore {
-                build_gitignore_matcher_after_ready(&stale_state, &stale_root);
-            }
+            // On this path `indexing` is false from the very first event, so
+            // `gitignore_pending` is the only thing keeping the watcher off
+            // the index while the matcher is missing. That gate is armed when
+            // `ServerState` is built — before this thread is spawned and
+            // before `start_file_watcher` runs below — so it holds whichever
+            // of the two wins the race, and the stale check releases it
+            // before any of its early returns.
+            //
+            // The same stale check is also what recovers events dropped
+            // during the gap: it compares the whole tree against the index,
+            // so any edit that landed while the matcher was still building is
+            // picked up here.
             background_refresh_stale(&stale_state, &stale_root, &stale_index_dir, None);
         });
     }
@@ -360,7 +380,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     } else {
         let watcher_state = Arc::clone(&state);
         let watcher_root = root.clone();
-        start_file_watcher(watcher_state, &watcher_root)
+        start_file_watcher(watcher_state, &watcher_root, watcher_queue_cap)
     };
 
     // Set up graceful shutdown
@@ -394,25 +414,47 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     Ok(())
 }
 
-fn build_gitignore_matcher_after_ready(state: &ServerState, root: &Path) {
+/// Publish the watcher's ignore matcher from ignore files discovered by a walk
+/// that already happened, and release the `gitignore_pending` gate.
+///
+/// Reusing the caller's walk is the whole point: `gitignore::build_matcher`
+/// would traverse the entire tree a second time purely to find the same ignore
+/// files. On a 289k-file repo on a network drive that second walk cost 205s,
+/// against 1.6s for the stale-check walk over the same tree.
+///
+/// Every exit path clears the gate. A repo with no ignore rules at all yields
+/// `None`, which is a legitimate final answer rather than a missing matcher, so
+/// it clears the gate too — otherwise the watcher would stay muted forever.
+fn publish_watcher_matcher(
+    state: &ServerState,
+    root: &Path,
+    walk: &tgrep_core::walker::MetaWalkResult,
+) {
+    if !state.watch_enabled {
+        return;
+    }
     if state.no_ignore {
         *state.gitignore.write().unwrap() = None;
         state.gitignore_pending.store(false, Ordering::SeqCst);
         return;
     }
+
     let start = Instant::now();
-    eprintln!("[trace] gitignore matcher build started...");
-    let matcher = tgrep_core::gitignore::build_matcher(root);
+    let matcher = tgrep_core::walker::build_gitignore_matcher_from_files(
+        root,
+        &walk.gitignore_files,
+        &walk.ignore_files,
+    );
     let has_matcher = matcher.is_some();
     *state.gitignore.write().unwrap() = matcher;
-    // Release the watcher only once the matcher is actually readable. A repo
-    // with no ignore rules at all yields `None`, which is a legitimate final
-    // answer rather than a missing matcher, so it clears the gate too.
     state.gitignore_pending.store(false, Ordering::SeqCst);
     eprintln!(
-        "[trace] gitignore matcher build complete in {:.1}ms{}",
+        "[trace] gitignore matcher built from stale walk in {:.1}ms \
+         ({} .gitignore + {} .ignore files{})",
         start.elapsed().as_secs_f64() * 1000.0,
-        if has_matcher { "" } else { " (no rules found)" }
+        walk.gitignore_files.len(),
+        walk.ignore_files.len(),
+        if has_matcher { "" } else { ", no rules found" }
     );
 }
 
@@ -886,13 +928,39 @@ fn handle_reload(id: Option<serde_json::Value>, state: &ServerState) -> String {
     }
 }
 
-fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<RecommendedWatcher> {
-    let root_path = root.to_path_buf();
-    let state_clone = Arc::clone(&state);
+fn start_file_watcher(
+    state: Arc<ServerState>,
+    root: &Path,
+    queue_cap: usize,
+) -> Option<RecommendedWatcher> {
+    use std::sync::mpsc::{RecvTimeoutError, TrySendError};
 
+    let root_path = root.to_path_buf();
+
+    // Hand events to a worker thread instead of indexing inside the callback.
+    // The callback runs on the platform's notification thread, which on Windows
+    // owns a fixed-size `ReadDirectoryChangesW` buffer; doing file I/O and
+    // trigram extraction there stalls it, and everything arriving meanwhile is
+    // dropped by the OS with no error we can see. The queue is bounded so a
+    // burst (a branch switch, a build) can't grow it without limit.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Event>(queue_cap);
+    let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let callback_overflow = Arc::clone(&overflowed);
     let mut watcher = match notify::recommended_watcher(
         move |result: std::result::Result<Event, notify::Error>| match result {
-            Ok(event) => handle_fs_event(&state_clone, &root_path, &event),
+            Ok(event) => match tx.try_send(event) {
+                Ok(()) => {}
+                // Don't block the notification thread waiting for room —
+                // that's the stall this hand-off exists to avoid. Drop the
+                // event and note that we did; the worker reconciles with a
+                // stale check, which is cheaper and more reliable than
+                // trying to replay an unknown number of lost events.
+                Err(TrySendError::Full(_)) => {
+                    callback_overflow.store(true, Ordering::SeqCst);
+                }
+                Err(TrySendError::Disconnected(_)) => {}
+            },
             // Surface these. A dropped ReadDirectoryChangesW buffer looks
             // exactly like "the watcher stopped working" from the outside,
             // and silence makes it impossible to tell apart from a bug in
@@ -911,6 +979,50 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
         eprintln!("[trace] warning: failed to watch directory: {e}");
         return None;
     }
+
+    let worker_state = Arc::clone(&state);
+    let worker_root = root_path;
+    let worker_index_dir = state.index_dir.clone();
+    std::thread::Builder::new()
+        .name("tgrep-watcher".into())
+        .spawn(move || {
+            loop {
+                match rx.recv_timeout(WATCHER_IDLE_POLL) {
+                    Ok(event) => handle_fs_event(&worker_state, &worker_root, &event),
+                    // A quiet interval means the burst has drained, so this is
+                    // the point to repair an overflow: reconciling earlier
+                    // would run a full stale check while events are still
+                    // queued behind it, and repeat for each one.
+                    Err(RecvTimeoutError::Timeout) => {
+                        if !overflowed.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        // An index build or a pending matcher ends with its own
+                        // stale check, which reconciles the same drift. Leave
+                        // the flag set and let that run instead of racing it.
+                        if worker_state.indexing.load(Ordering::SeqCst)
+                            || worker_state.gitignore_pending.load(Ordering::SeqCst)
+                        {
+                            continue;
+                        }
+                        overflowed.store(false, Ordering::SeqCst);
+                        eprintln!(
+                            "[trace] watcher queue overflowed (cap {queue_cap}); \
+                             reconciling with a stale check"
+                        );
+                        background_refresh_stale(
+                            &worker_state,
+                            &worker_root,
+                            &worker_index_dir,
+                            None,
+                        );
+                    }
+                    // The watcher was dropped, so the server is shutting down.
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+        .ok()?;
 
     state
         .watcher_active
@@ -1004,7 +1116,9 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
     thread::spawn(move || {
         loop {
             if state.ignore_rules_dirty.swap(false, Ordering::SeqCst) {
-                build_gitignore_matcher_after_ready(&state, &root);
+                // The stale refresh walks the tree anyway and republishes the
+                // matcher from that walk, so the reload costs one traversal
+                // rather than a rebuild plus a re-scan.
                 let indexed_paths = {
                     let index = state.index.read().unwrap();
                     let mut paths = index.reader_paths();
@@ -1407,25 +1521,41 @@ fn background_refresh_stale(
     let start = Instant::now();
     eprintln!("[trace] stale check: comparing index against filesystem...");
 
+    // Walk first. This single traversal feeds both the stale diff and the
+    // watcher's ignore matcher, and it must run before the early returns
+    // below so the matcher is published — and `gitignore_pending` released —
+    // even when the index turns out to be up to date or has no stamps yet.
+    let walk = walker::walk_file_metadata(root, &state.exclude_dirs, state.no_ignore);
+    let walk_ms = start.elapsed().as_millis();
+    publish_watcher_matcher(state, root, &walk);
+    let current_meta = &walk.files;
+
     // Load stored per-file stamps from last index write
-    let old_stamps = match meta::read_filestamps(index_dir) {
+    let mut old_stamps = match meta::read_filestamps(index_dir) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[trace] stale check: no filestamps found ({e}), skipping");
             return;
         }
     };
+
+    // Fold in stamps the watcher recorded since the last flush. `filestamps.json`
+    // only advances when the index is written to disk, so mid-session it lags
+    // the live overlay. Comparing against the on-disk copy alone would re-index
+    // every file the watcher already handled since that write, and — worse —
+    // a file created and then deleted inside that window appears in neither the
+    // on-disk stamps nor the filesystem, so it would never be classified as
+    // deleted and would linger in the index. The in-memory stamps are the
+    // fresher record of what the index actually holds, so they win.
+    for (path, stamp) in state.file_stamps.read().unwrap().iter() {
+        old_stamps.insert(path.clone(), stamp.clone());
+    }
     if old_stamps.is_empty() && indexed_paths.is_none() {
         eprintln!("[trace] stale check: no filestamps found, skipping");
         return;
     }
 
-    // Walk filesystem metadata (no content reads)
-    let current_meta = walker::walk_file_metadata(root, &state.exclude_dirs, state.no_ignore);
-    let walk_ms = start.elapsed().as_millis();
-
-    let (changed, added, deleted) =
-        classify_file_changes(&current_meta, &old_stamps, indexed_paths);
+    let (changed, added, deleted) = classify_file_changes(current_meta, &old_stamps, indexed_paths);
 
     let total_changes = changed.len() + added.len() + deleted.len();
     if total_changes == 0 {
@@ -1608,9 +1738,9 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     // build just skipped.
     //
     // Both come out of the build itself: the builder persisted filestamps.json,
-    // and its walk handed back the .gitignore paths. Building the matcher from
-    // those is what keeps this cheap — `gitignore::build_matcher` would rewalk
-    // the whole tree single-threaded, which cost 49 s on a 289k-file repo.
+    // and its walk handed back the .gitignore / .ignore paths. Building the
+    // matcher from those is what keeps this cheap — `gitignore::build_matcher`
+    // would rewalk the whole tree, which cost 49 s on a 289k-file repo.
     match tgrep_core::meta::read_filestamps(index_dir) {
         Ok(stamps) => *state.file_stamps.write().unwrap() = stamps,
         Err(e) => eprintln!(
@@ -1620,8 +1750,11 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     }
     if state.watch_enabled && !state.no_ignore {
         let t_gi = Instant::now();
-        let matcher =
-            tgrep_core::walker::build_gitignore_matcher_from_files(root, &outcome.gitignore_files);
+        let matcher = tgrep_core::walker::build_gitignore_matcher_from_files(
+            root,
+            &outcome.gitignore_files,
+            &outcome.ignore_files,
+        );
         let found = matcher.is_some();
         *state.gitignore.write().unwrap() = matcher;
         state.gitignore_pending.store(false, Ordering::SeqCst);
@@ -1708,14 +1841,20 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     if state.watch_enabled && !state.no_ignore {
         let start = Instant::now();
-        let matcher = walker::build_gitignore_matcher_from_files(root, &walk.gitignore_files);
+        let matcher = walker::build_gitignore_matcher_from_files(
+            root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+        );
         let has_matcher = matcher.is_some();
         *state.gitignore.write().unwrap() = matcher;
         state.gitignore_pending.store(false, Ordering::SeqCst);
         eprintln!(
-            "[trace] gitignore matcher built from index walk in {:.1}ms ({} .gitignore files{})",
+            "[trace] gitignore matcher built from index walk in {:.1}ms \
+             ({} .gitignore + {} .ignore files{})",
             start.elapsed().as_secs_f64() * 1000.0,
             walk.gitignore_files.len(),
+            walk.ignore_files.len(),
             if has_matcher { "" } else { ", no rules found" }
         );
     }
@@ -1872,6 +2011,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     let walk_meta =
         tgrep_core::walker::walk_file_metadata(root, &state.exclude_dirs, state.no_ignore);
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta
+        .files
         .into_iter()
         .map(|fm| {
             (
@@ -2560,6 +2700,9 @@ mod tests {
         // Build the matcher via the public tgrep-core helper so this test
         // also exercises the shared loading logic.
         let tmp = TempDir::new().unwrap();
+        // `.gitignore` is git-gated, matching the indexing walk, so the
+        // matcher only picks it up inside a repo.
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
         let gi_path = tmp.path().join(".gitignore");
         std::fs::write(&gi_path, "*.log\ntarget/\n").unwrap();
         let gi = tgrep_core::gitignore::build_matcher(tmp.path())

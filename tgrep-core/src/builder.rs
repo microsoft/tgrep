@@ -128,9 +128,13 @@ pub struct BuildOutcome {
     ///
     /// Handing these back lets a caller that needs an ignore matcher build one
     /// with [`walker::build_gitignore_matcher_from_files`] instead of
-    /// [`crate::gitignore::build_matcher`], which would repeat the whole walk
-    /// serially — 49 s on a 289k-file repository.
+    /// [`crate::gitignore::build_matcher`], which would repeat the whole walk —
+    /// 49 s on a 289k-file repository.
     pub gitignore_files: Vec<std::path::PathBuf>,
+    /// Absolute `.ignore` paths seen during the same walk, kept separate from
+    /// `gitignore_files` so a matcher can apply them last and give them
+    /// precedence over `.gitignore`.
+    pub ignore_files: Vec<std::path::PathBuf>,
 }
 
 /// Build a trigram index for all text files under `root`.
@@ -188,6 +192,7 @@ pub fn build_index_with_options(
         walk.skipped_error
     );
     let gitignore_files = walk.gitignore_files;
+    let ignore_files = walk.ignore_files;
 
     // Read files and extract trigrams with masks in bounded parallel batches.
     // Binary content check is done here (not in walker) to avoid an extra
@@ -279,6 +284,7 @@ pub fn build_index_with_options(
     Ok(BuildOutcome {
         num_files: file_id_map.len(),
         gitignore_files,
+        ignore_files,
     })
 }
 

@@ -13,6 +13,15 @@ use std::path::Path;
 
 pub const P4IGNORE_FILENAME: &str = "p4ignore.ini";
 
+/// Thread count for the `.gitignore` enumeration walk.
+///
+/// Mirrors `walker::walker_thread_count`. The walk is I/O-bound rather than
+/// CPU-bound, so the cap exists to avoid thrashing network filesystems, not
+/// to match core count.
+fn matcher_walk_thread_count() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(12))
+}
+
 use ignore::Match;
 /// Re-export of `ignore::gitignore::Gitignore` so callers can hold a
 /// matcher without taking a direct dependency on the `ignore` crate.
@@ -288,6 +297,15 @@ pub fn matcher_from_gitignore_paths(
 /// Uses `WalkBuilder` to enumerate `.gitignore` files so we automatically
 /// skip the `.git` dir and gitignored subtrees while collecting rules.
 /// Returns `None` when no rules could be loaded.
+///
+/// The enumeration walk is *parallel*, matching `walker.rs`. It used to be
+/// single-threaded, which made this a latency trap on large or
+/// network-backed trees: the walk is almost pure I/O wait, so one thread
+/// serializes every directory read. On a 289k-file repo on a network drive
+/// it took 205 s, against 1.6 s for the parallel stale-check walk over the
+/// same tree immediately afterwards. Callers that already have the
+/// `.gitignore` paths from their own walk should still prefer
+/// `matcher_from_gitignore_paths` and skip this entirely.
 pub fn build_matcher(root: &Path) -> Option<IgnoreMatcher> {
     let p4ignore = build_p4ignore_matcher(root).map(std::sync::Arc::new);
     let match_root = root.to_path_buf();
@@ -330,13 +348,40 @@ pub fn build_matcher(root: &Path) -> Option<IgnoreMatcher> {
                 entry.file_type().is_some_and(|kind| kind.is_dir()),
             )
         })
-        .build();
-    let mut gitignore_files: Vec<std::path::PathBuf> = Vec::new();
-    for entry in walker.flatten() {
-        if entry.file_name() == ".gitignore" && entry.path().is_file() {
-            gitignore_files.push(entry.path().to_path_buf());
-        }
-    }
+        .threads(matcher_walk_thread_count())
+        .build_parallel();
+
+    let gitignore_files = std::sync::Mutex::new(Vec::<std::path::PathBuf>::new());
+    walker.run(|| {
+        let found = &gitignore_files;
+        Box::new(move |entry| {
+            if let Ok(entry) = entry
+                && entry.file_name() == ".gitignore"
+                && entry.path().is_file()
+            {
+                // Ignore poisoning: a panic in another worker must not
+                // cascade into every remaining thread.
+                found
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(entry.path().to_path_buf());
+            }
+            ignore::WalkState::Continue
+        })
+    });
+
+    // Sorting is not needed for correctness: `IgnoreMatcher::with_nested`
+    // re-sorts deepest-first, which is what actually establishes git's
+    // between-level precedence, and its remaining ties are same-depth
+    // same-length directories that anchor to disjoint subtrees and so can
+    // never both match one path. But that re-sort is *stable*, so leaving
+    // the input in parallel-completion order would let the built matcher
+    // vary run to run. Sorting here keeps builds reproducible, for a few
+    // hundred paths' worth of cost.
+    let mut gitignore_files = gitignore_files
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
+    gitignore_files.sort();
 
     matcher_from_gitignore_paths(root, &gitignore_files)
 }

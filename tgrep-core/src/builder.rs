@@ -117,8 +117,14 @@ impl PostingSink {
 pub struct BuildOutcome {
     /// Number of files written to the index.
     pub num_files: usize,
-    /// `.gitignore` paths seen during the walk, when
+    /// Absolute `.gitignore` paths seen during the walk, when
     /// [`BuildOptions::collect_gitignore_files`] was set; empty otherwise.
+    ///
+    /// These are absolute because `build_index_with_options` canonicalizes
+    /// `root` before walking. Consumers rely on that:
+    /// [`walker::build_gitignore_matcher_from_files`] anchors each nested
+    /// `.gitignore` by stripping `root` from its parent directory, so
+    /// repo-relative paths would leave every nested rule out of the matcher.
     ///
     /// Handing these back lets a caller that needs an ignore matcher build one
     /// with [`walker::build_gitignore_matcher_from_files`] instead of

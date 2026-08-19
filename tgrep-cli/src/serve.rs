@@ -225,7 +225,6 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
 
     if !has_index {
         // Create an empty on-disk index so HybridIndex can open it.
-        std::fs::create_dir_all(&index_dir)?;
         create_empty_index(&index_dir)?;
         eprintln!("[trace] no existing index found, will build in background");
     }
@@ -236,7 +235,6 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         Ok(hybrid) => hybrid,
         Err(e) if has_index => {
             eprintln!("[trace] existing index failed to load ({e}); rebuilding in background");
-            std::fs::create_dir_all(&index_dir)?;
             create_empty_index(&index_dir)?;
             needs_build = true;
             HybridIndex::open(&index_dir, &root)?
@@ -1299,6 +1297,10 @@ fn json_rpc_error(id: Option<serde_json::Value>, code: i32, message: &str) -> St
 /// The actual data will be populated into the LiveIndex in the background.
 fn create_empty_index(index_dir: &Path) -> Result<()> {
     use tgrep_core::meta::IndexMeta;
+    // Own the directory precondition here rather than leaving it to each
+    // caller: the recovery path in `reset_to_empty_index` runs after a failed
+    // build, which is exactly when the directory is least likely to be intact.
+    std::fs::create_dir_all(index_dir)?;
     // Empty lookup.bin, index.bin, files.bin
     std::fs::write(index_dir.join("lookup.bin"), b"")?;
     std::fs::write(index_dir.join("index.bin"), b"")?;
@@ -2391,6 +2393,41 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// `reset_to_empty_index` runs after a failed build, when the index
+    /// directory is least likely to be intact, so it must not assume the
+    /// directory survived.
+    #[test]
+    fn create_empty_index_makes_its_own_directory() {
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("missing").join("idx");
+        assert!(!index_dir.exists());
+
+        create_empty_index(&index_dir).expect("should create the directory it writes into");
+
+        assert!(index_dir.join("lookup.bin").is_file());
+        assert!(index_dir.join("index.bin").is_file());
+        assert!(index_dir.join("files.bin").is_file());
+        // A caller that already created the directory must still succeed.
+        create_empty_index(&index_dir).expect("should be idempotent");
+    }
+
+    /// A truncated index left by a failed build must be replaced, not reused.
+    #[test]
+    fn create_empty_index_replaces_partially_written_files() {
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("idx");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join("lookup.bin"), b"truncated garbage").unwrap();
+
+        create_empty_index(&index_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read(index_dir.join("lookup.bin")).unwrap().len(),
+            0
+        );
+        HybridIndex::open(&index_dir, tmp.path()).expect("reset index should reopen cleanly");
+    }
 
     #[test]
     fn skip_watcher_path_skips_dot_components() {

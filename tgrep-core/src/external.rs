@@ -699,9 +699,8 @@ mod tests {
         let postings: Vec<TrigramPosting> = (0..400u32)
             .flat_map(|file_id| (0..64u32).map(move |t| posting(t * 3, file_id)))
             .collect();
-        let mut sorter = ExternalSorter::new(Path::new("."), 1);
+        let sorter = ExternalSorter::new(Path::new("."), 1);
         assert_eq!(sorter.capacity, 1024, "budget should clamp to a floor");
-        sorter.arena = Vec::new();
 
         assert_paths_match(&postings, 1);
     }

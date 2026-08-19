@@ -214,6 +214,11 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
 
 /// Build an [`IgnoreMatcher`] from already-discovered `.gitignore` paths.
 ///
+/// `gitignore_files` must be **absolute** paths under `root` — that is what
+/// `walker::walk_dir` yields. Each nested file is anchored by stripping `root`
+/// from its parent directory, so repo-relative paths would leave every nested
+/// rule out of the matcher.
+///
 /// Root-level rules (`.git/info/exclude`, `p4ignore.ini`, and a `.gitignore`
 /// directly in `root`) share the root matcher. Every deeper `.gitignore` gets
 /// its own matcher anchored at its directory, because its patterns are written
@@ -238,9 +243,17 @@ pub fn matcher_from_gitignore_paths(
         }
         let dir = path.parent().unwrap_or(root);
         // A path we can't place relative to the root has unknown scope, and
-        // guessing is what broke this before. Walk results always strip
-        // cleanly, so this only skips genuinely malformed input.
+        // guessing is what broke this before. Skipping it only under-ignores,
+        // which is the safe direction, but it is still silent — so make it
+        // loud in debug builds rather than quietly dropping nested rules.
         let Ok(rel_dir) = dir.strip_prefix(root) else {
+            debug_assert!(
+                false,
+                "gitignore path {} is not under root {}; \
+                 pass absolute paths from the walk, not repo-relative ones",
+                path.display(),
+                root.display()
+            );
             continue;
         };
         let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
@@ -439,6 +452,32 @@ mod tests {
 
         // Root rules keep applying tree-wide.
         assert!(matcher.is_ignored(Path::new("kernel/sched/core.o"), false));
+    }
+
+    /// The contract is "absolute paths from the walk". Passing repo-relative
+    /// ones would silently drop every nested rule, so the guard must fire.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "not under root")]
+    fn relative_gitignore_paths_trip_the_debug_guard() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(".gitignore"), "*.log\n").unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            matcher_from_gitignore_paths(
+                Path::new("."),
+                &[std::path::PathBuf::from("sub/.gitignore")],
+            )
+        });
+        std::env::set_current_dir(cwd).unwrap();
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 
     #[test]

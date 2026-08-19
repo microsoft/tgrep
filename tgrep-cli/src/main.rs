@@ -291,6 +291,14 @@ enum Command {
         /// process is killed. Defaults to 5000.
         #[arg(long = "auto-save-mutations", value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
         auto_save_mutations: Option<u32>,
+
+        /// Maximum number of filesystem events buffered between the OS
+        /// watcher and the indexing worker. Raise it if bulk changes (branch
+        /// switches, builds) log watcher queue overflows; each overflow costs
+        /// a full stale check instead of incremental updates. Defaults to
+        /// 16384.
+        #[arg(long = "watcher-queue-cap", value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        watcher_queue_cap: Option<u64>,
     },
 
     /// Search for a pattern.
@@ -401,6 +409,7 @@ fn main() {
             max_cpu_percent,
             exclude,
             auto_save_mutations,
+            watcher_queue_cap,
         }) => {
             let memory_cap = max_memory_mb
                 .map(|mb| mb.saturating_mul(1024 * 1024))
@@ -416,6 +425,7 @@ fn main() {
                     index_threads,
                     no_ignore,
                     auto_save_mutations,
+                    watcher_queue_cap: watcher_queue_cap.map(|n| n as usize),
                 },
             )
         }

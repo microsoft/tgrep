@@ -96,6 +96,59 @@ tgrep index . --index-path /tmp/idx   # custom index location
 tgrep index . --exclude vendor --exclude third_party  # skip directories
 ```
 
+Each build reports its elapsed time and peak memory when it finishes:
+
+```
+Index built successfully at /tmp/idx
+Indexed in 22.6s using external strategy (peak memory 160.1 MiB)
+```
+
+The peak is the operating system's own high-water mark for the process, so it
+reflects the true maximum rather than a sampled snapshot.
+
+#### Memory use on very large repos
+
+Builds default to `--index-strategy=external`, which bounds peak memory with an
+external merge sort: postings accumulate in a fixed-size arena that spills
+sorted, compact segments to disk when full, and the segments are k-way merged
+straight into the index. Peak memory is roughly flat in repo size rather than
+linear.
+
+If the arena never fills, nothing is spilled and the build takes exactly the
+in-memory path, so small and mid-size repos pay nothing for this default.
+
+```bash
+tgrep index .                                 # external, 64 MB arena
+tgrep index . --index-buffer 16               # smaller arena, lower peak
+tgrep index . --index-strategy=memory         # opt out: sort entirely in RAM
+```
+
+On the Linux kernel (94,634 files, 990 MiB index) the default is a **~17x
+reduction in peak memory, and no slower**:
+
+| Strategy | Spill segments | Peak working set | Build |
+| --- | ---: | ---: | ---: |
+| `external` (default, 64 MiB arena) | 31 | **160.1 MiB** | 22.6 s |
+| `external --index-buffer 16` | 122 | 109.6 MiB | ~23 s |
+| `memory` | - | 2.20 - 3.76 GiB | 23 - 32 s |
+
+`--index-buffer` trades peak memory against merge fan-in. Bounded memory is also
+*predictable* memory — the `memory` row varied by over a gigabyte across
+identical runs because `Vec` growth doubles and both buffers are briefly
+resident during the final reallocation, while `external` varied by 8 MiB.
+
+`--index-strategy=memory` remains available as an escape hatch for environments
+where spilling is undesirable or impossible, such as a read-only or full index
+volume. Both strategies produce byte-identical indexes. See
+[BENCHMARKS.md](BENCHMARKS.md#index-build-strategies) for full numbers.
+
+`tgrep serve` uses the same bounded builder when it has to create an index from
+scratch, so starting a server on an unindexed repo costs the same memory as
+`tgrep index` (**148.6 MiB** rather than 1.6 GiB on the Linux kernel, and 2.6x
+faster). While that first build runs the server answers from an empty index
+rather than a partial one; incremental updates after it completes are
+unaffected.
+
 ### Start the server
 
 ```bash

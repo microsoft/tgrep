@@ -225,7 +225,6 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
 
     if !has_index {
         // Create an empty on-disk index so HybridIndex can open it.
-        std::fs::create_dir_all(&index_dir)?;
         create_empty_index(&index_dir)?;
         eprintln!("[trace] no existing index found, will build in background");
     }
@@ -236,7 +235,6 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         Ok(hybrid) => hybrid,
         Err(e) if has_index => {
             eprintln!("[trace] existing index failed to load ({e}); rebuilding in background");
-            std::fs::create_dir_all(&index_dir)?;
             create_empty_index(&index_dir)?;
             needs_build = true;
             HybridIndex::open(&index_dir, &root)?
@@ -863,10 +861,13 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
     let state_clone = Arc::clone(&state);
 
     let mut watcher = match notify::recommended_watcher(
-        move |result: std::result::Result<Event, notify::Error>| {
-            if let Ok(event) = result {
-                handle_fs_event(&state_clone, &root_path, &event);
-            }
+        move |result: std::result::Result<Event, notify::Error>| match result {
+            Ok(event) => handle_fs_event(&state_clone, &root_path, &event),
+            // Surface these. A dropped ReadDirectoryChangesW buffer looks
+            // exactly like "the watcher stopped working" from the outside,
+            // and silence makes it impossible to tell apart from a bug in
+            // our own filtering.
+            Err(e) => eprintln!("[trace] warning: file watcher error: {e}"),
         },
     ) {
         Ok(w) => w,
@@ -1296,6 +1297,10 @@ fn json_rpc_error(id: Option<serde_json::Value>, code: i32, message: &str) -> St
 /// The actual data will be populated into the LiveIndex in the background.
 fn create_empty_index(index_dir: &Path) -> Result<()> {
     use tgrep_core::meta::IndexMeta;
+    // Own the directory precondition here rather than leaving it to each
+    // caller: the recovery path in `reset_to_empty_index` runs after a failed
+    // build, which is exactly when the directory is least likely to be intact.
+    std::fs::create_dir_all(index_dir)?;
     // Empty lookup.bin, index.bin, files.bin
     std::fs::write(index_dir.join("lookup.bin"), b"")?;
     std::fs::write(index_dir.join("index.bin"), b"")?;
@@ -1463,6 +1468,148 @@ fn background_refresh_stale(
     *state.file_stamps.write().unwrap() = new_stamps;
 }
 
+/// Restore a known-empty on-disk index after a failed bootstrap.
+///
+/// `build_index_with_options` writes the index files in place, so a failure
+/// partway through can leave truncated files that the currently mmap'd reader
+/// no longer matches. Resetting gives the fallback build a clean base.
+fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
+    if let Err(e) = create_empty_index(index_dir) {
+        eprintln!("[trace] warning: could not reset the index directory ({e})");
+        return;
+    }
+    match HybridIndex::open(index_dir, root) {
+        Ok(empty) => {
+            *state.index.write().unwrap() = empty;
+            state.cache.write().unwrap().clear();
+        }
+        Err(e) => eprintln!("[trace] warning: could not reopen an empty index ({e})"),
+    }
+}
+
+/// Bootstrap an empty index with the memory-bounded external merge sort.
+///
+/// The incremental path below accumulates every posting in the live overlay
+/// before flushing, so a cold start on a large repository holds the whole
+/// index in heap — on the Linux kernel tree that peaked at ~1.5 GiB. Handing a
+/// true bootstrap to the builder with [`IndexStrategy::External`] bounds peak
+/// memory to the arena budget instead, and is also faster, because it writes
+/// the index once rather than growing an overlay and then flushing it.
+///
+/// The trade-off is that queries see an empty index until the build finishes
+/// rather than a growing partial one. That is deliberate: results from a
+/// fraction of the repository are misleading, and `status` already reports
+/// that indexing is in progress.
+///
+/// Only used when nothing has been indexed yet. Resuming a partial index still
+/// takes the incremental path, which can skip the files already on disk.
+///
+/// Returns `false` if the index could not be built and published, leaving the
+/// caller to fall back.
+fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
+    let start = Instant::now();
+    eprintln!("[trace] bootstrapping index with the external merge sort (memory-bounded)...");
+
+    let outcome = match builder::build_index_with_options(
+        root,
+        Some(index_dir),
+        &builder::BuildOptions {
+            include_hidden: false,
+            no_ignore: state.no_ignore,
+            exclude_dirs: state.exclude_dirs.clone(),
+            // Match the walk `background_index_build` would have run, and the
+            // dot-prefix rule `should_skip_watcher_path` applies, so the
+            // watcher can maintain every file this build indexes. Also makes
+            // the walk hand back the .gitignore paths for the matcher below.
+            collect_gitignore_files: true,
+            strategy: builder::IndexStrategy::External,
+            buffer_bytes: builder::DEFAULT_INDEX_BUFFER_BYTES,
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!(
+                "[trace] warning: external bootstrap build failed ({e}); \
+                 falling back to the in-heap build"
+            );
+            reset_to_empty_index(state, root, index_dir);
+            return false;
+        }
+    };
+
+    // Publish under the snapshot gate, and clear `indexing` before releasing
+    // it. `handle_fs_event` only skips while `indexing` is true, so flipping
+    // the flag outside the gate would let a watcher event mutate the overlay
+    // against the reader we are in the middle of replacing.
+    let gate = state.snapshot_gate.write().unwrap();
+    let opened = match HybridIndex::open(index_dir, root) {
+        Ok(index) => index,
+        Err(e) => {
+            drop(gate);
+            eprintln!(
+                "[trace] warning: bootstrapped index failed to open ({e}); \
+                 falling back to the in-heap build"
+            );
+            reset_to_empty_index(state, root, index_dir);
+            return false;
+        }
+    };
+    let indexed = opened.num_files() as u64;
+    *state.index.write().unwrap() = opened;
+    state.cache.write().unwrap().clear();
+    state.index_total.store(indexed, Ordering::Relaxed);
+    state.index_progress.store(indexed, Ordering::Relaxed);
+
+    // Everything the watcher consults must be in place before `indexing` goes
+    // false, since that flag is the only thing keeping `handle_fs_event` off
+    // the index. Without the stamps it would reindex on spurious events;
+    // without the matcher it would happily index gitignored paths that the
+    // build just skipped.
+    //
+    // Both come out of the build itself: the builder persisted filestamps.json,
+    // and its walk handed back the .gitignore paths. Building the matcher from
+    // those is what keeps this cheap — `gitignore::build_matcher` would rewalk
+    // the whole tree single-threaded, which cost 49 s on a 289k-file repo.
+    match tgrep_core::meta::read_filestamps(index_dir) {
+        Ok(stamps) => *state.file_stamps.write().unwrap() = stamps,
+        Err(e) => eprintln!(
+            "[trace] warning: could not load file stamps ({e}); \
+             the watcher may reindex on spurious events"
+        ),
+    }
+    if state.watch_enabled && !state.no_ignore {
+        let t_gi = Instant::now();
+        let matcher =
+            tgrep_core::walker::build_gitignore_matcher_from_files(root, &outcome.gitignore_files);
+        let found = matcher.is_some();
+        *state.gitignore.write().unwrap() = matcher;
+        eprintln!(
+            "[trace] gitignore matcher built from {} file(s) in {:.1}ms{}",
+            outcome.gitignore_files.len(),
+            t_gi.elapsed().as_secs_f64() * 1000.0,
+            if found { "" } else { " (no rules found)" }
+        );
+    }
+
+    state.indexing.store(false, Ordering::SeqCst);
+    drop(gate);
+
+    let elapsed = start.elapsed().as_secs_f64();
+    match crate::mem::peak_rss_bytes() {
+        Some(peak) => eprintln!(
+            "[trace] bootstrap complete: {indexed} files indexed in {elapsed:.1}s \
+             (peak memory {})",
+            crate::mem::format_bytes(peak)
+        ),
+        None => eprintln!("[trace] bootstrap complete: {indexed} files indexed in {elapsed:.1}s"),
+    }
+
+    if state.ignore_rules_dirty.load(Ordering::SeqCst) {
+        schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+    }
+    true
+}
+
 /// Walk the repo and populate the LiveIndex in batches in a background thread.
 /// Uses rayon for parallel trigram extraction. The bulk build is held entirely
 /// in the live overlay; only one final flush to disk happens once the walk
@@ -1496,6 +1643,13 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         paths
     };
     let seeded_count = skip_paths.len() as u64;
+
+    // Nothing indexed yet: build straight to disk with bounded memory instead
+    // of accumulating the whole repo in the live overlay. Resuming a partial
+    // index falls through, since that path can skip what is already on disk.
+    if skip_paths.is_empty() && bootstrap_index_build(state, root, index_dir) {
+        return;
+    }
 
     // Phase 1: Walk file paths (no content reads)
     let t_walk = Instant::now();
@@ -2239,6 +2393,41 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// `reset_to_empty_index` runs after a failed build, when the index
+    /// directory is least likely to be intact, so it must not assume the
+    /// directory survived.
+    #[test]
+    fn create_empty_index_makes_its_own_directory() {
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("missing").join("idx");
+        assert!(!index_dir.exists());
+
+        create_empty_index(&index_dir).expect("should create the directory it writes into");
+
+        assert!(index_dir.join("lookup.bin").is_file());
+        assert!(index_dir.join("index.bin").is_file());
+        assert!(index_dir.join("files.bin").is_file());
+        // A caller that already created the directory must still succeed.
+        create_empty_index(&index_dir).expect("should be idempotent");
+    }
+
+    /// A truncated index left by a failed build must be replaced, not reused.
+    #[test]
+    fn create_empty_index_replaces_partially_written_files() {
+        let tmp = TempDir::new().unwrap();
+        let index_dir = tmp.path().join("idx");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join("lookup.bin"), b"truncated garbage").unwrap();
+
+        create_empty_index(&index_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read(index_dir.join("lookup.bin")).unwrap().len(),
+            0
+        );
+        HybridIndex::open(&index_dir, tmp.path()).expect("reset index should reopen cleanly");
+    }
 
     #[test]
     fn skip_watcher_path_skips_dot_components() {

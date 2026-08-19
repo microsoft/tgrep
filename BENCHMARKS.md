@@ -37,6 +37,164 @@ The high-diversity case stresses the number of distinct trigrams and posting-lis
 serialization. The flat sorted-posting writer reduced this case from roughly
 1.47s and 98.74 MiB peak working set to roughly 0.37s and 43.68 MiB in local runs.
 
+### Index build strategies
+
+The default build strategy, `external`, replaces the single in-heap posting
+vector with an external merge sort: postings fill a fixed-size arena that spills
+sorted, delta+varint encoded segments to disk, which are then k-way merged
+directly into `index.bin` / `lookup.bin`. `--index-strategy=memory` selects the
+older sort-everything-in-RAM path, retained as an escape hatch and as the
+reference implementation for differential tests.
+
+The peak-memory probe runs both strategies back to back on the same fixture.
+Each of these runs uses a deliberately small 4 MB arena so bench-scale fixtures
+spill; the shipped default is 64 MB.
+
+```powershell
+cargo bench -p tgrep-core --bench index_build -- --peak-memory-high-diversity 16000
+```
+
+**Peak working set** (high-diversity fixture, Windows, local run):
+
+| Files | `memory` | `external` | Reduction |
+| ---: | ---: | ---: | ---: |
+| 2,000 | 66.93 MiB | 32.85 MiB | −51% |
+| 4,000 | 88.98 MiB | 34.29 MiB | −61% |
+| 8,000 | 185.21 MiB | 37.92 MiB | −80% |
+| 16,000 | 342.98 MiB | 50.30 MiB | −85% |
+
+The `memory` column grows roughly linearly with file count while `external`
+stays close to flat (+17 MiB across an 8x increase in files), which is the
+point: peak heap becomes a function of the arena budget rather than of repo
+size. The remaining growth in the `external` column is the file table and walk
+results, not postings.
+
+**Real-world scale: the Linux kernel.** 94,634 indexed files / 446,892 trigrams
+/ 990 MiB index (`C:\repos\linux`, v7.2-rc7, warm page cache, peak working set
+sampled from the child process):
+
+| Strategy | Spill segments | Peak working set | Build |
+| --- | ---: | ---: | ---: |
+| `memory` | - | 2.20 - 3.76 GiB | 23 - 32 s |
+| `external --index-buffer 256` | 8 | 430.6 MiB | ~24 s |
+| `external` (64 MiB, **default**) | 31 | 151 - 160 MiB | ~23 s |
+| `external --index-buffer 16` | 122 | 109.6 MiB | ~23 s |
+| `external --index-buffer 4` | 487 | 102.0 MiB | ~24 s |
+| `external --index-buffer 1` | 1,946 | 98.9 MiB | ~29 s |
+
+At the default budget that is a **~17x reduction in peak memory for no time
+cost** — build time is flat within run-to-run noise for any budget at or above
+4 MiB, and only degrades at 1,946-segment fan-in. This is why `external` is the
+default. In several runs it was measurably *faster* than `memory` (22.6 s vs
+31.6 s), because sorting one ~2 GiB posting vector, and the doubling
+reallocations that grow it, cost more than encoding and merging spill segments.
+
+Two things worth noting beyond the headline. First, the `memory` figure is a
+*range* because `Vec` growth doubles: peak lands wherever the final reallocation
+happens to fall, and during that realloc both the old and new buffers are
+resident. It varied by over a gigabyte across identical runs. The `external`
+column varied by 8 MiB. Bounded memory is also *predictable* memory, which
+matters more than the average when the question is whether a machine can finish
+the build at all.
+
+Second, peak decreases monotonically as the budget shrinks, which is the whole
+point of the knob — but that property had to be fixed, not assumed. See below.
+
+All configurations produce identical results. 15 literal and regex queries over
+190,000+ matches returned byte-identical output against the `memory` index,
+including at 1,946-segment fan-in; re-verified after `external` became the
+default with 7 queries over 100,130 matches.
+
+Peak figures here are the OS process high-water mark (`PeakWorkingSetSize` on
+Windows, `VmHWM` on Linux), sampled externally. `tgrep index` now reports the
+same counter itself on completion, so these numbers are reproducible without
+external tooling; the self-reported and externally-sampled values agree exactly.
+
+**Why the merge shares one read budget.** The first implementation gave every
+open segment a fixed 256 KiB read-ahead buffer, which made merge memory
+`segments * 256 KiB` — unbounded in fan-in. Since a smaller arena spills *more*
+segments, asking for less memory delivered more of it, and peak traced a U:
+
+| Arena | Segments | Peak, fixed buffers | Peak, shared budget |
+| ---: | ---: | ---: | ---: |
+| 16 MiB | 122 | 114.7 MiB | 109.6 MiB |
+| 4 MiB | 487 | 195.8 MiB | 102.0 MiB |
+| 1 MiB | 1,946 | 565.8 MiB | 98.9 MiB |
+
+At a 1 MiB budget the read buffers alone were 486 MiB. Sizing them as
+`budget / segments` (floored at 4 KiB) removes the U entirely. This only
+reproduces at real scale — every synthetic fixture in this file spills too few
+segments to reach the crossover.
+
+### Server bootstrap
+
+`tgrep serve` on an empty index used to build through a different path than
+`tgrep index`: it walked the repo and accumulated every posting in the live
+in-memory overlay, flushing to disk once at the end. The soft memory cap that
+was supposed to bound this only trips above `--memory-cap` (16 GB by default),
+so on anything smaller than that the whole index simply stayed in heap.
+
+A cold start now delegates to the same memory-bounded builder as `tgrep index`.
+On the Linux kernel tree (94,181 files, same host as above, peak sampled
+externally, timed to the point the server reports the index ready):
+
+| Bootstrap path | Peak working set | Wall |
+| --- | ---: | ---: |
+| in-heap overlay (before) | 1,569.7 MiB | 73.6 s |
+| external builder (after) | 148.6 MiB | 28.7 s |
+
+That is a **10.6x reduction in peak memory and a 2.6x speedup**. The overlay
+path was slower because it pays twice: it builds the posting map in memory and
+*then* rewrites the whole thing through the append-overlay flush.
+
+Two behavioural notes. The server no longer answers from a partially built
+index during a cold start — queries see an empty index until the build
+finishes, which is a deliberate trade, since results from a fraction of the
+repo are misleading. And an interrupted bootstrap now leaves a usable index:
+the old path wrote nothing until its single end-of-build flush, so killing it
+at 99% left an empty index behind.
+
+The watcher's ignore matcher is built from the `.gitignore` paths the build's
+walk already collected, not by `gitignore::build_matcher`, which repeats the
+entire walk single-threaded. That distinction is worth more than it sounds: on
+a 289k-file repository the rewalk took **48.9 s**, longer than indexing the
+repo. Reusing the walk's results makes it 0.07 s on the Linux tree.
+
+Resuming a *partial* index still uses the incremental path, which can skip the
+files already on disk.
+
+**Smaller fixtures.** 2,500 files / 37.5 MiB built from tgrep's own `.rs`
+sources, timed end to end through the release binary (median of 3 runs):
+
+| Strategy | Spill segments | Peak working set | Median build | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `memory` | - | 144.08 MiB | 0.725 s | - |
+| `external --index-buffer 64` | 2 | 118.75 MiB | 0.791 s | +9.1% |
+| `external --index-buffer 8` | 9 | 58.38 MiB | 0.789 s | +8.8% |
+
+All three produce the same 14,379 trigrams over 2,500 files. Note that shrinking
+the arena 8x costs nothing in time — going from 2 segments to 9 is free, because
+merge fan-in is not the bottleneck at this scale, the spill encode/decode
+round-trip is. The arena budget is therefore a fairly clean dial on peak memory.
+
+Criterion microbenchmarks bracket that number from both sides:
+
+| Case | `memory` | `external` | Delta | Spills? |
+| --- | ---: | ---: | ---: | --- |
+| 5,000 files | 1.2819 s | 1.2917 s | +0.8% | no |
+| 1,000 high-diversity files | 464.42ms | 540.11ms | +16% | yes |
+
+The 5,000-file case is the *no-spill* floor: its fixture repeats one line, so the
+whole repo is only 67 distinct trigrams and the arena never fills, which is why
+the overhead is indistinguishable from noise. The high-diversity case is the
+worst-case ceiling: random-byte content makes nearly every trigram unique, so
+segment groups hold a single posting each and per-group header overhead and
+merge fan-in work are both maximal. Real code sits between them, at roughly +9%.
+
+Total sort work is unchanged — `k` sorts of `n/k` elements plus an `n·log k`
+merge is still `O(n·log n)` — so the delta is purely the spill write plus the
+merge read.
+
 ### Query execution
 
 | Case | Mean |

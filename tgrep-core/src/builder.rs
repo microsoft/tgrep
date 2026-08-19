@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
+use crate::external::{self, ExternalSorter, TrigramPosting};
 use crate::meta::{self, IndexMeta};
 use crate::ondisk::{self, LookupEntry, PostingEntry};
 use crate::reader::IndexReader;
@@ -16,10 +17,120 @@ const INDEX_BUILD_BATCH_SIZE: usize = 1024;
 const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
 const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 
-#[derive(Clone, Copy)]
-struct TrigramPosting {
-    trigram: u32,
-    entry: PostingEntry,
+/// Default arena budget for [`IndexStrategy::External`] before spilling.
+pub use crate::external::DEFAULT_BUFFER_BYTES as DEFAULT_INDEX_BUFFER_BYTES;
+
+/// How the builder accumulates postings before writing them out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum IndexStrategy {
+    /// Hold every posting in heap, sort once, write once.
+    ///
+    /// Peak memory grows linearly with repository size and is unbounded. Kept
+    /// as an escape hatch for environments where spilling to disk is
+    /// undesirable or impossible (read-only or full index volume), and as the
+    /// independent reference implementation that [`IndexStrategy::External`]
+    /// is differentially tested against.
+    InMemory,
+    /// Bound peak memory with an external merge sort.
+    ///
+    /// Postings accumulate in a fixed-size arena that spills sorted, compact
+    /// segments to disk when full; the segments are then k-way merged straight
+    /// into the index. Peak heap is independent of repository size. If the
+    /// arena never fills this is identical to [`IndexStrategy::InMemory`], so
+    /// small repositories pay nothing for the default.
+    #[default]
+    External,
+}
+
+/// Tunables for [`build_index_with_options`].
+#[derive(Debug, Clone)]
+pub struct BuildOptions {
+    pub include_hidden: bool,
+    pub no_ignore: bool,
+    pub exclude_dirs: Vec<String>,
+    /// Apply leading-dot ("hidden") filtering in the walk instead of the
+    /// platform's native hidden check, and treat `.gitignore` files as
+    /// hidden.
+    ///
+    /// The two differ on Windows, where the native check reads the
+    /// `FILE_ATTRIBUTE_HIDDEN` bit that git does not set on dotfiles, so a
+    /// default walk indexes `.gitignore`, `.mailmap`, and friends there but
+    /// not on Unix. `tgrep serve` walks with leading-dot semantics on every
+    /// platform, and its file watcher skips dot-prefixed paths outright, so a
+    /// build destined for a server must opt in — otherwise the server would
+    /// index dotfiles it can never afterwards update or remove.
+    pub collect_gitignore_files: bool,
+    pub strategy: IndexStrategy,
+    /// Arena budget in bytes for [`IndexStrategy::External`]. Ignored by
+    /// [`IndexStrategy::InMemory`].
+    pub buffer_bytes: usize,
+}
+
+impl Default for BuildOptions {
+    fn default() -> Self {
+        Self {
+            include_hidden: false,
+            no_ignore: false,
+            exclude_dirs: Vec::new(),
+            collect_gitignore_files: false,
+            strategy: IndexStrategy::default(),
+            buffer_bytes: external::DEFAULT_BUFFER_BYTES,
+        }
+    }
+}
+
+/// Destination for postings as files are processed.
+enum PostingSink {
+    InMemory(Vec<TrigramPosting>),
+    External(ExternalSorter),
+}
+
+impl PostingSink {
+    fn push_file(
+        &mut self,
+        file_id: u32,
+        per_trigram: impl IntoIterator<Item = (u32, TrigramMasks)>,
+    ) -> Result<()> {
+        match self {
+            Self::InMemory(postings) => {
+                postings.extend(
+                    per_trigram
+                        .into_iter()
+                        .map(|(trigram, masks)| TrigramPosting {
+                            trigram,
+                            entry: PostingEntry {
+                                file_id,
+                                loc_mask: masks.loc_mask,
+                                next_mask: masks.next_mask,
+                            },
+                        }),
+                );
+                Ok(())
+            }
+            Self::External(sorter) => sorter.push_file(file_id, per_trigram),
+        }
+    }
+}
+
+/// What a build produced, beyond the index files themselves.
+#[derive(Debug, Default)]
+pub struct BuildOutcome {
+    /// Number of files written to the index.
+    pub num_files: usize,
+    /// Absolute `.gitignore` paths seen during the walk, when
+    /// [`BuildOptions::collect_gitignore_files`] was set; empty otherwise.
+    ///
+    /// These are absolute because `build_index_with_options` canonicalizes
+    /// `root` before walking. Consumers rely on that:
+    /// [`walker::build_gitignore_matcher_from_files`] anchors each nested
+    /// `.gitignore` by stripping `root` from its parent directory, so
+    /// repo-relative paths would leave every nested rule out of the matcher.
+    ///
+    /// Handing these back lets a caller that needs an ignore matcher build one
+    /// with [`walker::build_gitignore_matcher_from_files`] instead of
+    /// [`crate::gitignore::build_matcher`], which would repeat the whole walk
+    /// serially — 49 s on a 289k-file repository.
+    pub gitignore_files: Vec<std::path::PathBuf>,
 }
 
 /// Build a trigram index for all text files under `root`.
@@ -30,6 +141,28 @@ pub fn build_index(
     no_ignore: bool,
     exclude_dirs: &[String],
 ) -> Result<()> {
+    build_index_with_options(
+        root,
+        index_dir,
+        &BuildOptions {
+            include_hidden,
+            no_ignore,
+            exclude_dirs: exclude_dirs.to_vec(),
+            ..Default::default()
+        },
+    )
+    .map(|_| ())
+}
+
+/// Build a trigram index, choosing how postings are accumulated.
+pub fn build_index_with_options(
+    root: &Path,
+    index_dir: Option<&Path>,
+    opts: &BuildOptions,
+) -> Result<BuildOutcome> {
+    let include_hidden = opts.include_hidden;
+    let no_ignore = opts.no_ignore;
+    let exclude_dirs = opts.exclude_dirs.as_slice();
     let root = std::fs::canonicalize(root)?;
     let index_dir = match index_dir {
         Some(d) => d.to_path_buf(),
@@ -43,6 +176,7 @@ pub fn build_index(
         &walker::WalkOptions {
             include_hidden,
             no_ignore,
+            collect_gitignore_files: opts.collect_gitignore_files,
             exclude_dirs: exclude_dirs.to_vec(),
             ..Default::default()
         },
@@ -53,6 +187,7 @@ pub fn build_index(
         walk.skipped_binary,
         walk.skipped_error
     );
+    let gitignore_files = walk.gitignore_files;
 
     // Read files and extract trigrams with masks in bounded parallel batches.
     // Binary content check is done here (not in walker) to avoid an extra
@@ -63,7 +198,13 @@ pub fn build_index(
     // Assign file IDs and collect posting entries. Batching avoids
     // retaining every file's per-trigram HashMap at once for large repos.
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
-    let mut postings: Vec<TrigramPosting> = Vec::new();
+    let mut sink = match opts.strategy {
+        IndexStrategy::InMemory => PostingSink::InMemory(Vec::new()),
+        IndexStrategy::External => {
+            std::fs::create_dir_all(&index_dir)?;
+            PostingSink::External(ExternalSorter::new(&index_dir, opts.buffer_bytes))
+        }
+    };
 
     for batch in walk.files.chunks(INDEX_BUILD_BATCH_SIZE) {
         let batch_data: Vec<(String, HashMap<u32, TrigramMasks>)> = batch
@@ -87,17 +228,7 @@ pub fn build_index(
         for (path, per_tri) in batch_data {
             let file_id = file_id_map.len() as u32;
             file_id_map.push((file_id, path));
-
-            for (tri, masks) in per_tri {
-                postings.push(TrigramPosting {
-                    trigram: tri,
-                    entry: PostingEntry {
-                        file_id,
-                        loc_mask: masks.loc_mask,
-                        next_mask: masks.next_mask,
-                    },
-                });
-            }
+            sink.push_file(file_id, per_tri)?;
         }
     }
 
@@ -109,7 +240,28 @@ pub fn build_index(
         );
     }
 
-    write_index_v2_from_postings(&index_dir, &root, &file_id_map, &mut postings)?;
+    match sink {
+        PostingSink::InMemory(mut postings) => {
+            write_index_v2_from_postings(&index_dir, &root, &file_id_map, &mut postings)?;
+        }
+        PostingSink::External(sorter) => {
+            let (trigram_count, segments) = sorter.write_postings(&index_dir)?;
+            eprintln!(
+                "Writing index ({} trigrams, {} files, {} spill segment(s))...",
+                trigram_count,
+                file_id_map.len(),
+                segments
+            );
+            write_files_and_meta(
+                &index_dir,
+                &root,
+                file_id_map.len(),
+                file_id_map.iter().map(|(_, p)| p.as_str()),
+                trigram_count,
+                None,
+            )?;
+        }
+    }
 
     // Write per-file stamps for ALL walked files (including those later
     // rejected as binary-by-content) so the stale check on next startup
@@ -124,7 +276,10 @@ pub fn build_index(
     meta::write_filestamps(&stamps, &index_dir)?;
 
     eprintln!("Index built successfully at {}", index_dir.display());
-    Ok(())
+    Ok(BuildOutcome {
+        num_files: file_id_map.len(),
+        gitignore_files,
+    })
 }
 
 /// Return the default index directory for a given repo root.
@@ -587,6 +742,226 @@ mod tests {
     use super::*;
     use crate::reader::IndexReader;
 
+    /// Build a repo with enough varied content that a small arena spills.
+    fn write_sample_repo(root: &Path, file_count: usize) {
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..file_count {
+            let mut state = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+            let mut data = format!("// File {i}\nfn Handler{i}() {{ needle(); }}\n").into_bytes();
+            while data.len() < 2048 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                data.push(32 + ((state >> 33) % 94) as u8);
+            }
+            std::fs::write(src.join(format!("f{i:04}.rs")), data).unwrap();
+        }
+    }
+
+    /// Canonical, walk-order-independent view of an index: every trigram
+    /// mapped to its postings resolved to *paths* rather than file IDs.
+    ///
+    /// The parallel walker yields files in nondeterministic order, so two
+    /// builds of the same repo legitimately assign different file IDs and
+    /// produce different bytes. Resolving through paths compares what the
+    /// index actually means. (Byte-for-byte equivalence of the two write
+    /// paths for identical input is covered by `external`'s unit tests.)
+    fn index_fingerprint(
+        index_dir: &Path,
+    ) -> std::collections::BTreeMap<u32, Vec<(String, u8, u8)>> {
+        let reader = IndexReader::open(index_dir).unwrap();
+        let mut fingerprint = std::collections::BTreeMap::new();
+        for (trigram, entries) in reader.all_trigram_postings_with_masks() {
+            let ids: Vec<u32> = entries.iter().map(|e| e.file_id).collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                ids, sorted,
+                "posting list for trigram {trigram:#08x} is not file-id sorted"
+            );
+
+            let mut resolved: Vec<(String, u8, u8)> = entries
+                .iter()
+                .map(|e| {
+                    let path = reader
+                        .file_path(e.file_id)
+                        .unwrap_or_else(|| panic!("unresolved file id {}", e.file_id))
+                        .to_string();
+                    (path, e.loc_mask, e.next_mask)
+                })
+                .collect();
+            resolved.sort();
+            fingerprint.insert(trigram, resolved);
+        }
+        fingerprint
+    }
+
+    // The memory-bounded path is the default; a refactor that silently
+    // reverted it would reintroduce unbounded peak memory on large repos
+    // without failing any other test.
+    #[test]
+    fn external_is_the_default_strategy() {
+        assert_eq!(IndexStrategy::default(), IndexStrategy::External);
+        assert_eq!(BuildOptions::default().strategy, IndexStrategy::External);
+    }
+
+    // `tgrep serve` walks with leading-dot hidden semantics and its watcher
+    // skips dot-prefixed paths, so a build that feeds a server must exclude
+    // dotfiles. On Windows the default walk keeps them (the native hidden
+    // check reads an attribute git never sets), which would leave the server
+    // holding entries it can never update or delete.
+    #[test]
+    fn collect_gitignore_files_excludes_dotfiles_from_the_index() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("main.rs"),
+            "fn main() { needle(); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".gitignore"), "# needle marker\n*.log\n").unwrap();
+        std::fs::write(root.join(".mailmap"), "needle <needle@example.com>\n").unwrap();
+
+        let for_serve = tempfile::tempdir().unwrap();
+        build_index_with_options(
+            root,
+            Some(for_serve.path()),
+            &BuildOptions {
+                collect_gitignore_files: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let reader = IndexReader::open(for_serve.path()).unwrap();
+        let indexed: Vec<String> = (0..reader.num_files() as u32)
+            .filter_map(|id| reader.file_path(id).map(|p| p.to_string()))
+            .collect();
+        assert_eq!(
+            indexed,
+            vec!["src/main.rs".to_string()],
+            "a build destined for the server must skip dot-prefixed files"
+        );
+    }
+
+    #[test]
+    fn external_strategy_matches_in_memory_index_contents() {
+        let repo = tempfile::tempdir().unwrap();
+        write_sample_repo(repo.path(), 40);
+
+        let in_memory = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+
+        build_index_with_options(
+            repo.path(),
+            Some(in_memory.path()),
+            &BuildOptions {
+                strategy: IndexStrategy::InMemory,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // A 1-byte budget clamps to the minimum arena, forcing many spills.
+        build_index_with_options(
+            repo.path(),
+            Some(external.path()),
+            &BuildOptions {
+                strategy: IndexStrategy::External,
+                buffer_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Same total bytes: identical posting count, identical layout.
+        let expected_len = std::fs::metadata(in_memory.path().join("index.bin"))
+            .unwrap()
+            .len();
+        let actual_len = std::fs::metadata(external.path().join("index.bin"))
+            .unwrap()
+            .len();
+        assert!(expected_len > 0, "fixture should produce a non-empty index");
+        assert_eq!(expected_len, actual_len, "index.bin size differs");
+
+        let expected = index_fingerprint(in_memory.path());
+        let actual = index_fingerprint(external.path());
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "distinct trigram count differs"
+        );
+        for (trigram, expected_postings) in &expected {
+            let actual_postings = actual
+                .get(trigram)
+                .unwrap_or_else(|| panic!("trigram {trigram:#08x} missing from external index"));
+            assert!(
+                expected_postings == actual_postings,
+                "postings differ for trigram {trigram:#08x}: \
+                 in-memory has {} entries, external has {}",
+                expected_postings.len(),
+                actual_postings.len()
+            );
+        }
+    }
+
+    #[test]
+    fn external_strategy_index_is_searchable() {
+        let repo = tempfile::tempdir().unwrap();
+        write_sample_repo(repo.path(), 60);
+
+        let index = tempfile::tempdir().unwrap();
+        build_index_with_options(
+            repo.path(),
+            Some(index.path()),
+            &BuildOptions {
+                strategy: IndexStrategy::External,
+                buffer_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let reader = IndexReader::open(index.path()).unwrap();
+        reader.validate_lookup().unwrap();
+        assert_eq!(reader.num_files(), 60);
+
+        // "needle" appears in every file, so its trigram must list all of them
+        // in ascending file-id order after the merge.
+        let entries = reader.lookup_trigram_with_masks(crate::trigram::hash(b'n', b'e', b'e'));
+        assert_eq!(entries.len(), 60);
+        let ids: Vec<u32> = entries.iter().map(|e| e.file_id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "merged posting lists must be file-id sorted");
+    }
+
+    #[test]
+    fn external_strategy_leaves_no_spill_directory_behind() {
+        let repo = tempfile::tempdir().unwrap();
+        write_sample_repo(repo.path(), 40);
+
+        let index = tempfile::tempdir().unwrap();
+        build_index_with_options(
+            repo.path(),
+            Some(index.path()),
+            &BuildOptions {
+                strategy: IndexStrategy::External,
+                buffer_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let leftover: Vec<String> = std::fs::read_dir(index.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("spill-"))
+            .collect();
+        assert!(leftover.is_empty(), "spill dirs left behind: {leftover:?}");
+    }
+
     #[test]
     fn build_index_writes_readable_round_trip_index() {
         let repo = tempfile::tempdir().unwrap();
@@ -736,5 +1111,75 @@ mod tests {
             u8::MAX,
             "base file's real loc_mask must be preserved verbatim"
         );
+    }
+
+    /// Incremental flushes stream new files onto whatever index is already on
+    /// disk, so the append path must work identically on an external-built
+    /// base. `external` only changes how postings are accumulated in memory,
+    /// not the on-disk format, but that is exactly the kind of assumption worth
+    /// pinning down: a base built through the spill/merge path must remain a
+    /// valid input to `append_overlay_to_index`.
+    #[test]
+    fn append_overlay_merges_onto_an_external_built_index() {
+        use crate::live::LiveIndex;
+
+        let repo = tempfile::tempdir().unwrap();
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "hello world\nneedle one\n").unwrap();
+        std::fs::write(src.join("b.txt"), "needle two\nother content\n").unwrap();
+
+        // Build the base through the spill/merge path. A 1-byte budget floors
+        // the arena at its minimum so this is a real merge, not the fast path.
+        let base_dir = tempfile::tempdir().unwrap();
+        build_index_with_options(
+            repo.path(),
+            Some(base_dir.path()),
+            &BuildOptions {
+                strategy: IndexStrategy::External,
+                buffer_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let base_reader = IndexReader::open(base_dir.path()).unwrap();
+        assert_eq!(base_reader.num_files(), 2);
+
+        let mut live = LiveIndex::new();
+        live.upsert_file_with_trigrams("src/c.txt", crate::trigram::extract(b"needle three\n"));
+        live.upsert_file_with_trigrams("src/d.txt", crate::trigram::extract(b"zzz unique\n"));
+        let (overlay_paths, overlay_inverted) = live.snapshot_for_disk();
+
+        let merged_dir = tempfile::tempdir().unwrap();
+        append_overlay_to_index(
+            repo.path(),
+            merged_dir.path(),
+            &base_reader,
+            &overlay_paths,
+            &overlay_inverted,
+            true,
+        )
+        .unwrap();
+
+        let merged = IndexReader::open(merged_dir.path()).unwrap();
+        merged.validate_lookup().unwrap();
+        assert_eq!(merged.num_files(), 4);
+
+        // Base IDs preserved, overlay appended after them.
+        assert_eq!(merged.file_path(0), base_reader.file_path(0));
+        assert_eq!(merged.file_path(1), base_reader.file_path(1));
+        assert_eq!(merged.file_path(2), Some("src/c.txt"));
+        assert_eq!(merged.file_path(3), Some("src/d.txt"));
+
+        // A trigram spanning base and overlay resolves across both halves and
+        // stays file-id sorted, which is what query execution relies on.
+        let needle = crate::trigram::hash(b'n', b'e', b'e');
+        let ids = merged.lookup_trigram(needle);
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "merged posting list must be sorted");
+        let mut paths: Vec<&str> = ids.iter().filter_map(|&id| merged.file_path(id)).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec!["src/a.txt", "src/b.txt", "src/c.txt"]);
     }
 }

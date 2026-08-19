@@ -110,6 +110,16 @@ struct ServerState {
     /// from kicking off a redundant parallel snapshot while the bulk
     /// flush (or stale-refresh flush) is still executing.
     flushing: std::sync::atomic::AtomicBool,
+    /// True until the `.gitignore` matcher has been published for the first
+    /// time. The watcher must not touch the index while this is set: with no
+    /// matcher in place `should_skip_watcher_path` cannot apply gitignore
+    /// rules, so it would index build output the walk deliberately skipped.
+    ///
+    /// Only the *initial* publish is gated. Later rebuilds (an edited
+    /// `.gitignore`) swap the matcher atomically and leave the previous one
+    /// readable throughout, so events keep being filtered by slightly stale
+    /// but still valid rules rather than being dropped.
+    gitignore_pending: std::sync::atomic::AtomicBool,
     /// An ignore file changed during the initial build and requires a
     /// reconciliation after the build publishes.
     ignore_rules_dirty: std::sync::atomic::AtomicBool,
@@ -269,6 +279,9 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
         flushing: std::sync::atomic::AtomicBool::new(false),
+        // Only meaningful when the watcher runs with gitignore filtering
+        // enabled; otherwise there is no matcher to wait for.
+        gitignore_pending: std::sync::atomic::AtomicBool::new(!no_watch && !no_ignore),
         ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
         ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
         index_progress: std::sync::atomic::AtomicU64::new(0),
@@ -321,10 +334,22 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         let stale_root = root.clone();
         let stale_index_dir = index_dir.clone();
         thread::spawn(move || {
-            background_refresh_stale(&stale_state, &stale_root, &stale_index_dir, None);
+            // Publish the gitignore matcher *before* the stale check, not
+            // after. On this path `indexing` is false from the very first
+            // event, so `gitignore_pending` is the only thing keeping the
+            // watcher off the index while the matcher is missing. That gate
+            // is armed when `ServerState` is built — before this thread is
+            // spawned and before `start_file_watcher` runs below — so it
+            // holds whichever of the two wins the race.
+            //
+            // Doing this first also means the stale check that follows is
+            // what recovers the events dropped during the gap: it compares
+            // the whole tree against the index, so any edit that landed
+            // while the matcher was still building is picked up here.
             if stale_state.watch_enabled && !stale_state.no_ignore {
                 build_gitignore_matcher_after_ready(&stale_state, &stale_root);
             }
+            background_refresh_stale(&stale_state, &stale_root, &stale_index_dir, None);
         });
     }
 
@@ -372,6 +397,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
 fn build_gitignore_matcher_after_ready(state: &ServerState, root: &Path) {
     if state.no_ignore {
         *state.gitignore.write().unwrap() = None;
+        state.gitignore_pending.store(false, Ordering::SeqCst);
         return;
     }
     let start = Instant::now();
@@ -379,6 +405,10 @@ fn build_gitignore_matcher_after_ready(state: &ServerState, root: &Path) {
     let matcher = tgrep_core::gitignore::build_matcher(root);
     let has_matcher = matcher.is_some();
     *state.gitignore.write().unwrap() = matcher;
+    // Release the watcher only once the matcher is actually readable. A repo
+    // with no ignore rules at all yields `None`, which is a legitimate final
+    // answer rather than a missing matcher, so it clears the gate too.
+    state.gitignore_pending.store(false, Ordering::SeqCst);
     eprintln!(
         "[trace] gitignore matcher build complete in {:.1}ms{}",
         start.elapsed().as_secs_f64() * 1000.0,
@@ -1030,6 +1060,17 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         return;
     }
 
+    // Likewise, stay off the index until the gitignore matcher exists. On a
+    // warm start (complete index on disk) `indexing` is false from the very
+    // first event, so without this the watcher would run with a `None`
+    // matcher and index exactly the build output the walk skipped — the
+    // divergence `should_skip_watcher_path` exists to prevent. Events dropped
+    // here are recovered by the stale check that runs right after the
+    // matcher is published.
+    if state.gitignore_pending.load(Ordering::SeqCst) {
+        return;
+    }
+
     // Acquire the snapshot gate up-front for the whole event. While a
     // flush/auto-save is publishing (writer holds it), no reindex
     // *work* — file I/O, trigram extraction, even the [trace] line —
@@ -1583,6 +1624,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             tgrep_core::walker::build_gitignore_matcher_from_files(root, &outcome.gitignore_files);
         let found = matcher.is_some();
         *state.gitignore.write().unwrap() = matcher;
+        state.gitignore_pending.store(false, Ordering::SeqCst);
         eprintln!(
             "[trace] gitignore matcher built from {} file(s) in {:.1}ms{}",
             outcome.gitignore_files.len(),
@@ -1669,6 +1711,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         let matcher = walker::build_gitignore_matcher_from_files(root, &walk.gitignore_files);
         let has_matcher = matcher.is_some();
         *state.gitignore.write().unwrap() = matcher;
+        state.gitignore_pending.store(false, Ordering::SeqCst);
         eprintln!(
             "[trace] gitignore matcher built from index walk in {:.1}ms ({} .gitignore files{})",
             start.elapsed().as_secs_f64() * 1000.0,

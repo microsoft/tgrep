@@ -15,6 +15,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,7 +28,6 @@ fn tgrep_bin() -> std::path::PathBuf {
 
 struct ServerGuard {
     child: Child,
-    port: u16,
 }
 
 impl Drop for ServerGuard {
@@ -133,6 +134,38 @@ fn warm_start_watcher_does_not_index_gitignored_files() {
         .expect("failed to run tgrep index");
     assert!(status.success(), "initial index build failed");
 
+    // Hammer a gitignored file across the *whole* startup window. The writer
+    // starts before `serve` is spawned and keeps going until well after the
+    // port is up, so however long startup takes, writes straddle both the
+    // moment the watcher comes live and the moment the matcher lands.
+    //
+    // A fixed-duration loop that ran before waiting for readiness would be
+    // unsound as a regression test: on a slow or loaded runner every write
+    // could complete before the watcher existed, no event would ever reach
+    // the gap, and the test would pass having exercised nothing.
+    let ignored = root.join("build").join("leaked.txt");
+    let stop = Arc::new(AtomicBool::new(false));
+    let writes = Arc::new(AtomicU64::new(0));
+    let writer = {
+        let stop = Arc::clone(&stop);
+        let writes = Arc::clone(&writes);
+        thread::spawn(move || {
+            let mut last_err = None;
+            while !stop.load(Ordering::Relaxed) {
+                match fs::write(&ignored, "gitignored_leak_marker build artifact\n") {
+                    Ok(()) => {
+                        writes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Kept rather than swallowed so a probe that never ran
+                    // reports why instead of masquerading as a pass.
+                    Err(e) => last_err = Some(e),
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            last_err
+        })
+    };
+
     let child = Command::new(tgrep_bin())
         .args([
             "serve",
@@ -145,20 +178,23 @@ fn warm_start_watcher_does_not_index_gitignored_files() {
         .spawn()
         .expect("failed to start tgrep serve");
 
-    // Hammer a gitignored file for the whole startup window. Rewriting in a
-    // loop rather than once removes the race: whatever the exact moment the
-    // watcher comes up and the matcher lands, some write falls between them.
-    let ignored = root.join("build").join("leaked.txt");
-    let writer_deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < writer_deadline {
-        let _ = fs::write(&ignored, "gitignored_leak_marker build artifact\n");
-        thread::sleep(Duration::from_millis(10));
-    }
+    // Take ownership immediately so the child is reaped even if the readiness
+    // wait below times out and panics.
+    let _server = ServerGuard { child };
 
-    let server = ServerGuard {
-        child,
-        port: wait_for_port(&index_dir),
-    };
+    let port = wait_for_port(&index_dir);
+
+    // Keep writing past readiness: the matcher is built on a background
+    // thread and can land well after the port opens.
+    thread::sleep(Duration::from_secs(2));
+    stop.store(true, Ordering::Relaxed);
+    let last_err = writer.join().expect("writer thread panicked");
+
+    assert!(
+        writes.load(Ordering::Relaxed) > 0,
+        "the gitignored probe file was never written, so this test proved \
+         nothing about the warm-start window: {last_err:?}"
+    );
 
     // Let the stale check and any resulting flush settle.
     thread::sleep(Duration::from_secs(3));
@@ -166,12 +202,12 @@ fn warm_start_watcher_does_not_index_gitignored_files() {
     // Positive control: without this a broken search path would let the
     // real assertion below pass for entirely the wrong reason.
     assert!(
-        search_matches(server.port, "normal_source_marker") > 0,
+        search_matches(port, "normal_source_marker") > 0,
         "expected the indexed source files to be searchable"
     );
 
     assert_eq!(
-        search_matches(server.port, "gitignored_leak_marker"),
+        search_matches(port, "gitignored_leak_marker"),
         0,
         "watcher indexed a gitignored file during the warm-start window \
          before the .gitignore matcher was published"

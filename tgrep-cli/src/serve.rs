@@ -335,9 +335,12 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         let stale_index_dir = index_dir.clone();
         thread::spawn(move || {
             // Publish the gitignore matcher *before* the stale check, not
-            // after. The watcher is already live by now and `indexing` is
-            // false on this path, so `gitignore_pending` is the only thing
-            // keeping it off the index while the matcher is missing.
+            // after. On this path `indexing` is false from the very first
+            // event, so `gitignore_pending` is the only thing keeping the
+            // watcher off the index while the matcher is missing. That gate
+            // is armed when `ServerState` is built — before this thread is
+            // spawned and before `start_file_watcher` runs below — so it
+            // holds whichever of the two wins the race.
             //
             // Doing this first also means the stale check that follows is
             // what recovers the events dropped during the gap: it compares

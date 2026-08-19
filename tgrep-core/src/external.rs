@@ -80,15 +80,30 @@ fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
 /// Segments are written next to the index rather than under the system temp
 /// directory: they can total gigabytes for a large repository, and `TEMP` is
 /// frequently on a smaller (or differently quota'd) volume than the workspace.
+///
+/// The name carries both the process ID and a per-process sequence number.
+/// The PID separates concurrent processes; the sequence separates concurrent
+/// sorters *within* a process. Without the latter, two sorters sharing an
+/// `index_dir` would write the same `seg-NNNNN.bin` names into the same
+/// directory, and each would merge whatever the other last wrote there —
+/// silently, because a foreign segment is still a structurally valid segment.
 struct SpillDir {
     path: PathBuf,
 }
 
+/// Distinguishes spill directories created by different sorters in this
+/// process. Only uniqueness matters, so `Relaxed` is sufficient.
+static SPILL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl SpillDir {
     fn create(index_dir: &Path) -> Result<Self> {
-        let path = index_dir.join(format!("spill-{}.tmp", std::process::id()));
+        let seq = SPILL_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = index_dir.join(format!("spill-{}-{seq}.tmp", std::process::id()));
         // A leftover directory from a killed build would make stale segments
-        // visible to this run's merge, silently corrupting the index.
+        // visible to this run's merge, silently corrupting the index. The PID
+        // can be recycled by the OS and the sequence restarts at zero in a new
+        // process, so this name is reusable across runs even though it is
+        // unique among live sorters.
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path)?;
         Ok(Self { path })
@@ -617,10 +632,65 @@ mod tests {
         }
     }
 
+    /// Trigram IDs present in a written index, read straight out of
+    /// `lookup.bin` so no `meta.json` is required.
+    fn trigram_ids(index_dir: &Path) -> Vec<u32> {
+        std::fs::read(index_dir.join("lookup.bin"))
+            .unwrap()
+            .chunks_exact(ondisk::LOOKUP_ENTRY_SIZE)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
     // `Vec`'s own doubling would reserve up to 2x the budget (96 MB for the
     // 64 MB default), so the arena could hold half again as much as the caller
     // asked for. The allocation must stay inside the budget, both on the first
     // fill and after a spill reuses the buffer.
+    /// Two sorters sharing one `index_dir` in the same process must not see
+    /// each other's spill segments.
+    ///
+    /// Before spill directories carried a per-sorter sequence number, both
+    /// sorters wrote `seg-00000.bin`, `seg-00001.bin`, ... into the same
+    /// `spill-<pid>.tmp`, so the second one's writes landed on the first one's
+    /// recorded paths. The first then merged the second's postings without any
+    /// error, because a foreign segment is still a structurally valid segment:
+    /// a sorter fed only trigram 100 produced an index containing 100 *and*
+    /// 777. That is silent index corruption, so assert on content.
+    #[test]
+    fn concurrent_sorters_in_one_index_dir_do_not_share_segments() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut a = ExternalSorter::new(dir.path(), 1);
+        for file_id in 0..5000u32 {
+            a.push(posting(100, file_id)).unwrap();
+        }
+        assert!(a.segments.len() > 1, "A should have spilled");
+
+        // B starts on the same index_dir while A is still live.
+        let mut b = ExternalSorter::new(dir.path(), 1);
+        for file_id in 0..5000u32 {
+            b.push(posting(777, file_id)).unwrap();
+        }
+
+        assert_ne!(
+            a.spill.as_ref().unwrap().path,
+            b.spill.as_ref().unwrap().path,
+            "each sorter needs its own spill directory"
+        );
+
+        let out_a = dir.path().join("out_a");
+        let (trigrams_a, _) = a.write_postings(&out_a).unwrap();
+        assert_eq!(trigrams_a, 1, "A should see only its own trigram");
+        assert_eq!(trigram_ids(&out_a), vec![100]);
+
+        // B still merges correctly afterwards; A's completion dropped only its
+        // own spill directory.
+        let out_b = dir.path().join("out_b");
+        let (trigrams_b, _) = b.write_postings(&out_b).unwrap();
+        assert_eq!(trigrams_b, 1, "B should see only its own trigram");
+        assert_eq!(trigram_ids(&out_b), vec![777]);
+    }
+
     #[test]
     fn arena_allocation_never_exceeds_the_budget() {
         let dir = tempfile::tempdir().unwrap();

@@ -1531,13 +1531,25 @@ fn background_refresh_stale(
     let current_meta = &walk.files;
 
     // Load stored per-file stamps from last index write
-    let old_stamps = match meta::read_filestamps(index_dir) {
+    let mut old_stamps = match meta::read_filestamps(index_dir) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[trace] stale check: no filestamps found ({e}), skipping");
             return;
         }
     };
+
+    // Fold in stamps the watcher recorded since the last flush. `filestamps.json`
+    // only advances when the index is written to disk, so mid-session it lags
+    // the live overlay. Comparing against the on-disk copy alone would re-index
+    // every file the watcher already handled since that write, and — worse —
+    // a file created and then deleted inside that window appears in neither the
+    // on-disk stamps nor the filesystem, so it would never be classified as
+    // deleted and would linger in the index. The in-memory stamps are the
+    // fresher record of what the index actually holds, so they win.
+    for (path, stamp) in state.file_stamps.read().unwrap().iter() {
+        old_stamps.insert(path.clone(), stamp.clone());
+    }
     if old_stamps.is_empty() && indexed_paths.is_none() {
         eprintln!("[trace] stale check: no filestamps found, skipping");
         return;

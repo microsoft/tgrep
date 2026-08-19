@@ -284,16 +284,29 @@ impl IndexReader {
         result
     }
 
+    /// Decode the `i`-th trigram entry (ascending trigram order) with its full
+    /// posting list, including masks.
+    ///
+    /// Paired with [`Self::num_trigrams`] this lets a caller drive the decode
+    /// itself — across threads, and fused with its own per-entry transform, so
+    /// the whole index never has to be materialised on the heap just to be
+    /// walked once. That matters: a 94k-file tree carries ~170M posting
+    /// entries, so collecting them all first costs both the allocation and a
+    /// second copy in whatever the caller builds next.
+    pub fn trigram_posting_at(&self, i: usize) -> (u32, Vec<PostingEntry>) {
+        let entry = self.read_lookup_entry(i);
+        (
+            entry.trigram,
+            self.read_posting_entries(entry.offset, entry.length),
+        )
+    }
+
     /// Iterate all trigram entries with full posting data (including masks).
     /// Returns (trigram_hash, Vec<PostingEntry>) preserving loc_mask/next_mask.
     pub fn all_trigram_postings_with_masks(&self) -> Vec<(u32, Vec<PostingEntry>)> {
-        let mut result = Vec::with_capacity(self.num_entries);
-        for i in 0..self.num_entries {
-            let entry = self.read_lookup_entry(i);
-            let postings = self.read_posting_entries(entry.offset, entry.length);
-            result.push((entry.trigram, postings));
-        }
-        result
+        (0..self.num_entries)
+            .map(|i| self.trigram_posting_at(i))
+            .collect()
     }
 
     fn binary_search(&self, trigram: u32) -> Option<usize> {

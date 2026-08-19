@@ -341,22 +341,33 @@ impl HybridIndex {
         Vec<String>,
         std::collections::HashMap<u32, Vec<PostingEntry>>,
     ) {
+        use rayon::prelude::*;
         use std::collections::HashMap;
 
         let reader = self.reader();
 
         // Phase 1: Build merged file list (reader files not in overlay + overlay files)
         let mut paths: Vec<String> = Vec::new();
-        let mut reader_id_map: HashMap<u32, u32> = HashMap::new();
 
-        // Add reader files (skip those superseded by overlay or deleted)
-        for (old_id, path) in reader.all_paths().iter().enumerate() {
-            let old_id = old_id as u32;
+        // Add reader files (skip those superseded by overlay or deleted).
+        //
+        // The old -> new id table is a dense `Vec` rather than a `HashMap`
+        // because it is consulted once per *posting entry*, and there are
+        // hundreds of millions of those (170M for a 94k-file tree). Reader ids
+        // are exactly the contiguous range `0..num_files`, so an index into a
+        // Vec replaces a hash of a random u32 — and the lookups then run in
+        // file-id order within each posting list, which is sequential rather
+        // than scattered. `DROPPED` marks a reader file the overlay supersedes
+        // or deletes.
+        const DROPPED: u32 = u32::MAX;
+        let reader_paths = reader.all_paths();
+        let mut reader_id_map: Vec<u32> = Vec::with_capacity(reader_paths.len());
+        for path in reader_paths {
             if self.live.is_deleted(path) || self.live.has_path(path) {
-                continue; // superseded or deleted
+                reader_id_map.push(DROPPED);
+                continue;
             }
-            let new_id = paths.len() as u32;
-            reader_id_map.insert(old_id, new_id);
+            reader_id_map.push(paths.len() as u32);
             paths.push(path.clone());
         }
 
@@ -369,27 +380,30 @@ impl HybridIndex {
             paths.push(op.to_string());
         }
 
-        // Phase 2: Build merged inverted index with masks
-        let mut inverted: HashMap<u32, Vec<PostingEntry>> = HashMap::new();
-
-        // Reader trigram postings with masks (remapped, excluding superseded files)
-        for (trigram, posting) in reader.all_trigram_postings_with_masks() {
-            let remapped: Vec<PostingEntry> = posting
-                .into_iter()
-                .filter_map(|entry| {
-                    reader_id_map
-                        .get(&entry.file_id)
-                        .map(|&new_id| PostingEntry {
+        // Phase 2: Build merged inverted index with masks.
+        //
+        // Decode and remap in one parallel pass. Collecting the decoded index
+        // first and then transforming it would hold two full copies of every
+        // posting entry at once — for a 94k-file tree that is ~170M entries,
+        // and the flush is exactly when memory is most contended.
+        let mut inverted: HashMap<u32, Vec<PostingEntry>> = (0..reader.num_trigrams())
+            .into_par_iter()
+            .filter_map(|i| {
+                let (trigram, posting) = reader.trigram_posting_at(i);
+                let remapped: Vec<PostingEntry> = posting
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let new_id = *reader_id_map.get(entry.file_id as usize)?;
+                        (new_id != DROPPED).then_some(PostingEntry {
                             file_id: new_id,
                             loc_mask: entry.loc_mask,
                             next_mask: entry.next_mask,
                         })
-                })
-                .collect();
-            if !remapped.is_empty() {
-                inverted.entry(trigram).or_default().extend(remapped);
-            }
-        }
+                    })
+                    .collect();
+                (!remapped.is_empty()).then_some((trigram, remapped))
+            })
+            .collect();
 
         // Overlay trigram postings with masks (remapped)
         // Trigram keys in the live inverted index never have OVERLAY_BIT set
@@ -416,10 +430,16 @@ impl HybridIndex {
             }
         }
 
-        // Sort all posting lists by file_id
-        for posting in inverted.values_mut() {
-            posting.sort_by_key(|e| e.file_id);
-        }
+        // Sort all posting lists by file_id.
+        //
+        // Only trigrams the overlay touched are actually out of order — the
+        // reader's own lists are already sorted and the remap preserves that,
+        // since new ids are assigned in ascending old-id order. Sorting the lot
+        // anyway keeps the invariant obvious and, fanned out across cores,
+        // costs little next to the merge itself.
+        inverted.par_iter_mut().for_each(|(_, posting)| {
+            posting.sort_unstable_by_key(|e| e.file_id);
+        });
 
         (paths, inverted)
     }

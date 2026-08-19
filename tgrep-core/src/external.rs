@@ -123,7 +123,12 @@ impl ExternalSorter {
         // produce a zero-capacity arena that spills on every single posting.
         let capacity = (budget_bytes / entry_size).max(1024);
         Self {
-            arena: Vec::new(),
+            // Allocate the arena once, exactly. Letting `Vec` grow it would
+            // overshoot the budget: for the 64 MB default it doubles past the
+            // target and reserves 96 MB, half again the bound this type exists
+            // to enforce. Reserving up front also avoids repeatedly copying a
+            // multi-megabyte buffer while filling.
+            arena: Vec::with_capacity(capacity),
             capacity,
             budget_bytes,
             spill: None,
@@ -610,6 +615,41 @@ mod tests {
                 next_mask: (trigram as u8) | 1,
             },
         }
+    }
+
+    // `Vec`'s own doubling would reserve up to 2x the budget (96 MB for the
+    // 64 MB default), so the arena could hold half again as much as the caller
+    // asked for. The allocation must stay inside the budget, both on the first
+    // fill and after a spill reuses the buffer.
+    #[test]
+    fn arena_allocation_never_exceeds_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        // 64 KB budget: large enough to exercise several fills, small enough
+        // that the entry capacity is not clamped by the 1024-entry floor.
+        let budget = 64 * 1024;
+        let mut sorter = ExternalSorter::new(dir.path(), budget);
+        let capacity = sorter.capacity;
+        assert!(
+            capacity > 1024,
+            "budget should set capacity, not the floor: {capacity}"
+        );
+        assert_eq!(
+            sorter.arena.capacity(),
+            capacity,
+            "arena should be reserved exactly once, up front"
+        );
+
+        // Push well past one full arena so growth and post-spill reuse are
+        // both covered.
+        for i in 0..(capacity as u32 * 3) {
+            sorter.push(posting(i % 977, i)).unwrap();
+            assert!(
+                sorter.arena.capacity() <= capacity,
+                "arena capacity {} exceeded budget capacity {capacity}",
+                sorter.arena.capacity()
+            );
+        }
+        assert!(sorter.spilled_segments() > 0, "expected at least one spill");
     }
 
     /// Build both ways and assert the resulting index files are byte-identical.

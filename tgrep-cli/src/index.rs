@@ -2,10 +2,24 @@
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tgrep_core::builder::{self, BuildOptions, IndexStrategy};
 
 use crate::mem;
+
+/// Convert `--index-buffer <MB>` to bytes.
+///
+/// Rejects values this platform cannot represent instead of quietly falling
+/// back to the default: silently indexing with a 64 MB arena after the user
+/// asked for something else would misreport what actually ran.
+fn buffer_bytes_from_mb(mb: u64) -> Result<usize> {
+    let max_mb = (usize::MAX / (1024 * 1024)) as u64;
+    mb.checked_mul(1024 * 1024)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .with_context(|| {
+            format!("--index-buffer {mb} is too large for this platform (maximum {max_mb} MB)")
+        })
+}
 
 pub fn run(
     root: &Path,
@@ -14,11 +28,12 @@ pub fn run(
     no_ignore: bool,
     exclude_dirs: &[String],
     strategy: IndexStrategy,
-    buffer_bytes: Option<u64>,
+    index_buffer_mb: Option<u64>,
 ) -> Result<()> {
-    let explicit_buffer = buffer_bytes.is_some();
-    let buffer_bytes = buffer_bytes
-        .and_then(|bytes| usize::try_from(bytes).ok())
+    let explicit_buffer = index_buffer_mb.is_some();
+    let buffer_bytes = index_buffer_mb
+        .map(buffer_bytes_from_mb)
+        .transpose()?
         .unwrap_or(builder::DEFAULT_INDEX_BUFFER_BYTES);
 
     // External is the default, so announcing it on every run would be noise.

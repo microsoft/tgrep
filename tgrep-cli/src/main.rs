@@ -392,7 +392,7 @@ fn main() {
             no_ignore,
             &exclude,
             strategy.into(),
-            index_buffer_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+            index_buffer_mb,
         ),
         Some(Command::Serve {
             path,

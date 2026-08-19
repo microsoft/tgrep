@@ -863,10 +863,13 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path) -> Option<Recommende
     let state_clone = Arc::clone(&state);
 
     let mut watcher = match notify::recommended_watcher(
-        move |result: std::result::Result<Event, notify::Error>| {
-            if let Ok(event) = result {
-                handle_fs_event(&state_clone, &root_path, &event);
-            }
+        move |result: std::result::Result<Event, notify::Error>| match result {
+            Ok(event) => handle_fs_event(&state_clone, &root_path, &event),
+            // Surface these. A dropped ReadDirectoryChangesW buffer looks
+            // exactly like "the watcher stopped working" from the outside,
+            // and silence makes it impossible to tell apart from a bug in
+            // our own filtering.
+            Err(e) => eprintln!("[trace] warning: file watcher error: {e}"),
         },
     ) {
         Ok(w) => w,

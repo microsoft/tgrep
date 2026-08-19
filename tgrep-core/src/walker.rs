@@ -195,24 +195,7 @@ pub fn build_gitignore_matcher_from_files(
     root: &Path,
     gitignore_files: &[PathBuf],
 ) -> Option<crate::gitignore::IgnoreMatcher> {
-    use ignore::gitignore::GitignoreBuilder;
-
-    let mut builder = GitignoreBuilder::new(root);
-
-    let info_exclude = root.join(".git").join("info").join("exclude");
-    if info_exclude.is_file() {
-        let _ = builder.add(&info_exclude);
-    }
-    crate::gitignore::add_p4ignore_rules(&mut builder, root);
-
-    for path in gitignore_files {
-        if path.is_file() {
-            let _ = builder.add(path);
-        }
-    }
-
-    let local = builder.build().ok()?;
-    crate::gitignore::IgnoreMatcher::new(local, crate::gitignore::build_global_matcher(root))
+    crate::gitignore::matcher_from_gitignore_paths(root, gitignore_files)
 }
 
 /// Filesystem metadata for a single file (no content read).

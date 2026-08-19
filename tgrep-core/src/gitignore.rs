@@ -18,17 +18,91 @@ use ignore::Match;
 /// matcher without taking a direct dependency on the `ignore` crate.
 pub use ignore::gitignore::Gitignore;
 
+/// A `.gitignore` found below the repository root, kept anchored to its own
+/// directory rather than folded into the root matcher.
+struct NestedIgnore {
+    /// Directory holding the `.gitignore`, relative to the repo root,
+    /// `/`-separated with no trailing slash.
+    dir: String,
+    matcher: Gitignore,
+}
+
 pub struct IgnoreMatcher {
+    /// Root-scoped rules: the root `.gitignore`, `.git/info/exclude`, and
+    /// `p4ignore.ini`.
     local: Gitignore,
+    /// Nested `.gitignore` files, deepest first.
+    nested: Vec<NestedIgnore>,
     global: Gitignore,
 }
 
 impl IgnoreMatcher {
     pub fn new(local: Gitignore, global: Gitignore) -> Option<Self> {
-        (!local.is_empty() || !global.is_empty()).then_some(Self { local, global })
+        Self::with_nested(local, Vec::new(), global)
+    }
+
+    /// Build a matcher from root-scoped rules plus `.gitignore` files found
+    /// in subdirectories, each paired with its directory relative to the repo
+    /// root.
+    ///
+    /// Nested files **must** stay anchored to their own directory. Folding
+    /// them into one root-scoped matcher silently changes what they mean: the
+    /// Linux kernel has four `tools/testing/selftests/*/.gitignore` files
+    /// containing a bare `*`, which is "ignore everything beside me" in place
+    /// but becomes "ignore the entire repository" at the root. That made the
+    /// file watcher treat `README` and `kernel/sched/core.c` as ignored and
+    /// silently drop every event.
+    pub fn with_nested(
+        local: Gitignore,
+        nested: Vec<(String, Gitignore)>,
+        global: Gitignore,
+    ) -> Option<Self> {
+        let mut nested: Vec<NestedIgnore> = nested
+            .into_iter()
+            .filter(|(_, matcher)| !matcher.is_empty())
+            .map(|(dir, matcher)| NestedIgnore {
+                dir: dir.trim_matches('/').to_string(),
+                matcher,
+            })
+            .collect();
+        // Deepest first, so the innermost `.gitignore` decides — that is the
+        // precedence git applies between levels.
+        nested.sort_by(|a, b| {
+            b.dir
+                .matches('/')
+                .count()
+                .cmp(&a.dir.matches('/').count())
+                .then_with(|| b.dir.len().cmp(&a.dir.len()))
+        });
+
+        (!local.is_empty() || !nested.is_empty() || !global.is_empty()).then_some(Self {
+            local,
+            nested,
+            global,
+        })
     }
 
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let rel = rel.trim_start_matches("./").trim_start_matches('/');
+
+        for entry in &self.nested {
+            // Only consult a nested file for paths beneath its directory, and
+            // match against the path *relative to that directory*, which is
+            // the scope its patterns were written for.
+            let Some(under) = strip_dir_prefix(rel, &entry.dir) else {
+                continue;
+            };
+            match entry
+                .matcher
+                .matched_path_or_any_parents(Path::new(under), is_dir)
+            {
+                Match::Ignore(_) => return true,
+                Match::Whitelist(_) => return false,
+                Match::None => {}
+            }
+        }
+
         match self.local.matched_path_or_any_parents(path, is_dir) {
             Match::Ignore(_) => true,
             Match::Whitelist(_) => false,
@@ -38,6 +112,16 @@ impl IgnoreMatcher {
                 .is_ignore(),
         }
     }
+}
+
+/// Return `rel` relative to `dir`, or `None` when `rel` is not beneath it.
+/// An empty `dir` means the repository root, which matches everything.
+fn strip_dir_prefix<'a>(rel: &'a str, dir: &str) -> Option<&'a str> {
+    if dir.is_empty() {
+        return Some(rel);
+    }
+    let rest = rel.strip_prefix(dir)?;
+    rest.strip_prefix('/')
 }
 
 pub fn build_global_matcher(root: &Path) -> Gitignore {
@@ -128,6 +212,58 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
     })
 }
 
+/// Build an [`IgnoreMatcher`] from already-discovered `.gitignore` paths.
+///
+/// Root-level rules (`.git/info/exclude`, `p4ignore.ini`, and a `.gitignore`
+/// directly in `root`) share the root matcher. Every deeper `.gitignore` gets
+/// its own matcher anchored at its directory, because its patterns are written
+/// relative to that directory — see [`IgnoreMatcher::with_nested`].
+pub fn matcher_from_gitignore_paths(
+    root: &Path,
+    gitignore_files: &[std::path::PathBuf],
+) -> Option<IgnoreMatcher> {
+    use ignore::gitignore::GitignoreBuilder;
+
+    let mut root_builder = GitignoreBuilder::new(root);
+    let info_exclude = root.join(".git").join("info").join("exclude");
+    if info_exclude.is_file() {
+        let _ = root_builder.add(&info_exclude);
+    }
+    add_p4ignore_rules(&mut root_builder, root);
+
+    let mut nested: Vec<(String, Gitignore)> = Vec::new();
+    for path in gitignore_files {
+        if !path.is_file() {
+            continue;
+        }
+        let dir = path.parent().unwrap_or(root);
+        // A path we can't place relative to the root has unknown scope, and
+        // guessing is what broke this before. Walk results always strip
+        // cleanly, so this only skips genuinely malformed input.
+        let Ok(rel_dir) = dir.strip_prefix(root) else {
+            continue;
+        };
+        let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
+        let rel_dir = rel_dir.trim_matches('/');
+
+        if rel_dir.is_empty() {
+            let _ = root_builder.add(path);
+            continue;
+        }
+
+        let mut builder = GitignoreBuilder::new(dir);
+        if builder.add(path).is_some() {
+            continue;
+        }
+        if let Ok(matcher) = builder.build() {
+            nested.push((rel_dir.to_string(), matcher));
+        }
+    }
+
+    let local = root_builder.build().ok()?;
+    IgnoreMatcher::with_nested(local, nested, build_global_matcher(root))
+}
+
 /// Build a `Gitignore` matcher rooted at `root`, mirroring the same
 /// ignore semantics that `walker::walk_dir` / `walker::walk_file_metadata`
 /// apply during iteration. Loads:
@@ -140,17 +276,8 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
 /// skip the `.git` dir and gitignored subtrees while collecting rules.
 /// Returns `None` when no rules could be loaded.
 pub fn build_matcher(root: &Path) -> Option<IgnoreMatcher> {
-    use ignore::gitignore::GitignoreBuilder;
-
-    let mut builder = GitignoreBuilder::new(root);
     let p4ignore = build_p4ignore_matcher(root).map(std::sync::Arc::new);
     let match_root = root.to_path_buf();
-
-    let info_exclude = root.join(".git").join("info").join("exclude");
-    if info_exclude.is_file() {
-        let _ = builder.add(&info_exclude);
-    }
-    add_p4ignore_rules(&mut builder, root);
 
     // Walk to find every `.gitignore` file. We can't use `hidden(true)`
     // because `.gitignore` itself starts with `.` and would be filtered.
@@ -191,14 +318,14 @@ pub fn build_matcher(root: &Path) -> Option<IgnoreMatcher> {
             )
         })
         .build();
+    let mut gitignore_files: Vec<std::path::PathBuf> = Vec::new();
     for entry in walker.flatten() {
         if entry.file_name() == ".gitignore" && entry.path().is_file() {
-            let _ = builder.add(entry.path());
+            gitignore_files.push(entry.path().to_path_buf());
         }
     }
 
-    let local = builder.build().ok()?;
-    IgnoreMatcher::new(local, build_global_matcher(root))
+    matcher_from_gitignore_paths(root, &gitignore_files)
 }
 
 #[cfg(test)]
@@ -269,5 +396,65 @@ mod tests {
         assert!(!matcher.is_ignored(Path::new("Build/XboxOne"), true));
         assert!(matcher.is_ignored(Path::new("Build/XboxOne/game.exe"), false));
         assert!(!matcher.is_ignored(Path::new("Build/XboxOne/game.template"), false));
+    }
+
+    /// Regression test for the bug that silently disabled the serve file
+    /// watcher on the Linux kernel tree.
+    ///
+    /// Four `tools/testing/selftests/*/.gitignore` files there contain a bare
+    /// `*`, and `arch/riscv/kernel/vdso_cfi/.gitignore` contains `*.c`. When
+    /// every `.gitignore` was folded into one root-anchored matcher, those
+    /// patterns applied tree-wide, so `README` and `kernel/sched/core.c` both
+    /// reported as ignored and the watcher dropped every event.
+    #[test]
+    fn nested_gitignore_rules_stay_scoped_to_their_directory() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let selftest = root.join("tools/testing/selftests/kvm");
+        std::fs::create_dir_all(&selftest).unwrap();
+        std::fs::write(selftest.join(".gitignore"), "*\n").unwrap();
+
+        let vdso = root.join("arch/riscv/kernel/vdso_cfi");
+        std::fs::create_dir_all(&vdso).unwrap();
+        std::fs::write(vdso.join(".gitignore"), "*.c\n").unwrap();
+
+        std::fs::create_dir_all(root.join("kernel/sched")).unwrap();
+        std::fs::write(root.join(".gitignore"), "*.o\n").unwrap();
+        std::fs::write(root.join("README"), "hello").unwrap();
+        std::fs::write(root.join("kernel/sched/core.c"), "int main;").unwrap();
+        std::fs::write(vdso.join("vgetrandom.c"), "int x;").unwrap();
+        std::fs::write(selftest.join("kvm_util.c"), "int y;").unwrap();
+
+        let matcher = build_matcher(root).expect("matcher should build");
+
+        // Ordinary source outside those directories stays visible.
+        assert!(!matcher.is_ignored(Path::new("README"), false));
+        assert!(!matcher.is_ignored(Path::new("kernel/sched/core.c"), false));
+        assert!(!matcher.is_ignored(Path::new("arch/riscv/kernel/vdso_cfi/vdso.lds"), false));
+
+        // The nested rules still apply where they were written.
+        assert!(matcher.is_ignored(Path::new("arch/riscv/kernel/vdso_cfi/vgetrandom.c"), false));
+        assert!(matcher.is_ignored(Path::new("tools/testing/selftests/kvm/kvm_util.c"), false));
+
+        // Root rules keep applying tree-wide.
+        assert!(matcher.is_ignored(Path::new("kernel/sched/core.o"), false));
+    }
+
+    #[test]
+    fn deeper_gitignore_negation_overrides_a_shallower_ignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let inner = root.join("build/keep");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(root.join("build/.gitignore"), "*.log\n").unwrap();
+        std::fs::write(inner.join(".gitignore"), "!important.log\n").unwrap();
+        std::fs::write(root.join("build/noisy.log"), "x").unwrap();
+        std::fs::write(inner.join("important.log"), "x").unwrap();
+
+        let matcher = build_matcher(root).expect("matcher should build");
+        assert!(matcher.is_ignored(Path::new("build/noisy.log"), false));
+        assert!(!matcher.is_ignored(Path::new("build/keep/important.log"), false));
     }
 }

@@ -112,6 +112,21 @@ impl PostingSink {
     }
 }
 
+/// What a build produced, beyond the index files themselves.
+#[derive(Debug, Default)]
+pub struct BuildOutcome {
+    /// Number of files written to the index.
+    pub num_files: usize,
+    /// `.gitignore` paths seen during the walk, when
+    /// [`BuildOptions::collect_gitignore_files`] was set; empty otherwise.
+    ///
+    /// Handing these back lets a caller that needs an ignore matcher build one
+    /// with [`walker::build_gitignore_matcher_from_files`] instead of
+    /// [`crate::gitignore::build_matcher`], which would repeat the whole walk
+    /// serially — 49 s on a 289k-file repository.
+    pub gitignore_files: Vec<std::path::PathBuf>,
+}
+
 /// Build a trigram index for all text files under `root`.
 pub fn build_index(
     root: &Path,
@@ -130,6 +145,7 @@ pub fn build_index(
             ..Default::default()
         },
     )
+    .map(|_| ())
 }
 
 /// Build a trigram index, choosing how postings are accumulated.
@@ -137,7 +153,7 @@ pub fn build_index_with_options(
     root: &Path,
     index_dir: Option<&Path>,
     opts: &BuildOptions,
-) -> Result<()> {
+) -> Result<BuildOutcome> {
     let include_hidden = opts.include_hidden;
     let no_ignore = opts.no_ignore;
     let exclude_dirs = opts.exclude_dirs.as_slice();
@@ -165,6 +181,7 @@ pub fn build_index_with_options(
         walk.skipped_binary,
         walk.skipped_error
     );
+    let gitignore_files = walk.gitignore_files;
 
     // Read files and extract trigrams with masks in bounded parallel batches.
     // Binary content check is done here (not in walker) to avoid an extra
@@ -253,7 +270,10 @@ pub fn build_index_with_options(
     meta::write_filestamps(&stamps, &index_dir)?;
 
     eprintln!("Index built successfully at {}", index_dir.display());
-    Ok(())
+    Ok(BuildOutcome {
+        num_files: file_id_map.len(),
+        gitignore_files,
+    })
 }
 
 /// Return the default index directory for a given repo root.

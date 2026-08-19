@@ -154,6 +154,12 @@ repo are misleading. And an interrupted bootstrap now leaves a usable index:
 the old path wrote nothing until its single end-of-build flush, so killing it
 at 99% left an empty index behind.
 
+The watcher's ignore matcher is built from the `.gitignore` paths the build's
+walk already collected, not by `gitignore::build_matcher`, which repeats the
+entire walk single-threaded. That distinction is worth more than it sounds: on
+a 289k-file repository the rewalk took **48.9 s**, longer than indexing the
+repo. Reusing the walk's results makes it 0.07 s on the Linux tree.
+
 Resuming a *partial* index still uses the incremental path, which can skip the
 files already on disk.
 

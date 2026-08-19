@@ -1505,7 +1505,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     let start = Instant::now();
     eprintln!("[trace] bootstrapping index with the external merge sort (memory-bounded)...");
 
-    if let Err(e) = builder::build_index_with_options(
+    let outcome = match builder::build_index_with_options(
         root,
         Some(index_dir),
         &builder::BuildOptions {
@@ -1514,19 +1514,23 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             exclude_dirs: state.exclude_dirs.clone(),
             // Match the walk `background_index_build` would have run, and the
             // dot-prefix rule `should_skip_watcher_path` applies, so the
-            // watcher can maintain every file this build indexes.
+            // watcher can maintain every file this build indexes. Also makes
+            // the walk hand back the .gitignore paths for the matcher below.
             collect_gitignore_files: true,
             strategy: builder::IndexStrategy::External,
             buffer_bytes: builder::DEFAULT_INDEX_BUFFER_BYTES,
         },
     ) {
-        eprintln!(
-            "[trace] warning: external bootstrap build failed ({e}); \
-             falling back to the in-heap build"
-        );
-        reset_to_empty_index(state, root, index_dir);
-        return false;
-    }
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!(
+                "[trace] warning: external bootstrap build failed ({e}); \
+                 falling back to the in-heap build"
+            );
+            reset_to_empty_index(state, root, index_dir);
+            return false;
+        }
+    };
 
     // Publish under the snapshot gate, and clear `indexing` before releasing
     // it. `handle_fs_event` only skips while `indexing` is true, so flipping
@@ -1557,8 +1561,10 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     // without the matcher it would happily index gitignored paths that the
     // build just skipped.
     //
-    // The builder persisted filestamps.json as part of the build, but it does
-    // not collect .gitignore paths, so the matcher is built separately here.
+    // Both come out of the build itself: the builder persisted filestamps.json,
+    // and its walk handed back the .gitignore paths. Building the matcher from
+    // those is what keeps this cheap — `gitignore::build_matcher` would rewalk
+    // the whole tree single-threaded, which cost 49 s on a 289k-file repo.
     match tgrep_core::meta::read_filestamps(index_dir) {
         Ok(stamps) => *state.file_stamps.write().unwrap() = stamps,
         Err(e) => eprintln!(
@@ -1566,17 +1572,32 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
              the watcher may reindex on spurious events"
         ),
     }
-    if state.watch_enabled {
-        build_gitignore_matcher_after_ready(state, root);
+    if state.watch_enabled && !state.no_ignore {
+        let t_gi = Instant::now();
+        let matcher =
+            tgrep_core::walker::build_gitignore_matcher_from_files(root, &outcome.gitignore_files);
+        let found = matcher.is_some();
+        *state.gitignore.write().unwrap() = matcher;
+        eprintln!(
+            "[trace] gitignore matcher built from {} file(s) in {:.1}ms{}",
+            outcome.gitignore_files.len(),
+            t_gi.elapsed().as_secs_f64() * 1000.0,
+            if found { "" } else { " (no rules found)" }
+        );
     }
 
     state.indexing.store(false, Ordering::SeqCst);
     drop(gate);
 
-    eprintln!(
-        "[trace] bootstrap complete: {indexed} files indexed in {:.1}s",
-        start.elapsed().as_secs_f64()
-    );
+    let elapsed = start.elapsed().as_secs_f64();
+    match crate::mem::peak_rss_bytes() {
+        Some(peak) => eprintln!(
+            "[trace] bootstrap complete: {indexed} files indexed in {elapsed:.1}s \
+             (peak memory {})",
+            crate::mem::format_bytes(peak)
+        ),
+        None => eprintln!("[trace] bootstrap complete: {indexed} files indexed in {elapsed:.1}s"),
+    }
 
     if state.ignore_rules_dirty.load(Ordering::SeqCst) {
         schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());

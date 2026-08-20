@@ -8,72 +8,22 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
-use regex::RegexBuilder;
 use tgrep_core::builder;
 use tgrep_core::filetypes;
 use tgrep_core::query::{self, QueryPlan};
 use tgrep_core::reader::IndexReader;
 use tgrep_core::walker;
 
+use crate::matching::SearchMatcher;
 use crate::output::{ColorMode, ContextLine, Match, OutputConfig, OutputWriter};
 use crate::serve::ServerInfo;
-
-pub(crate) enum SearchMatcher {
-    Standard(regex::Regex),
-    Fancy(fancy_regex::Regex),
-}
-
-impl SearchMatcher {
-    pub(crate) fn is_standard(&self) -> bool {
-        matches!(self, SearchMatcher::Standard(_))
-    }
-
-    pub(crate) fn is_match(&self, line: &str) -> Result<bool> {
-        match self {
-            SearchMatcher::Standard(re) => Ok(re.is_match(line)),
-            SearchMatcher::Fancy(re) => re
-                .is_match(line)
-                .map_err(|e| anyhow::anyhow!("regex match error: {e}")),
-        }
-    }
-
-    pub(crate) fn find_start(&self, line: &str) -> Result<Option<usize>> {
-        match self {
-            SearchMatcher::Standard(re) => Ok(re.find(line).map(|m| m.start())),
-            SearchMatcher::Fancy(re) => re
-                .find(line)
-                .map(|m| m.map(|m| m.start()))
-                .map_err(|e| anyhow::anyhow!("regex match error: {e}")),
-        }
-    }
-
-    pub(crate) fn match_content(&self, line: &str, only_matching: bool) -> Result<String> {
-        if !only_matching {
-            return Ok(line.to_string());
-        }
-
-        match self {
-            SearchMatcher::Standard(re) => Ok(crate::matching::match_content(line, re, true)),
-            SearchMatcher::Fancy(re) => {
-                let mut matches = Vec::new();
-                for m in re.find_iter(line) {
-                    matches.push(
-                        m.map_err(|e| anyhow::anyhow!("regex match error: {e}"))?
-                            .as_str()
-                            .to_string(),
-                    );
-                }
-                Ok(matches.join("\n"))
-            }
-        }
-    }
-}
 
 pub struct SearchOptions {
     pub pattern: String,
     pub extra_patterns: Vec<String>,
     pub pattern_file: Option<String>,
     pub case_insensitive: bool,
+    pub case_sensitive: bool,
     pub smart_case: bool,
     pub fixed_string: bool,
     pub files_only: bool,
@@ -86,6 +36,8 @@ pub struct SearchOptions {
     pub stats: bool,
     pub no_index: bool,
     pub glob: Vec<String>,
+    pub iglob: Vec<String>,
+    pub glob_case_insensitive: bool,
     pub file_type: Option<String>,
     pub invert_match: bool,
     pub only_matching: bool,
@@ -97,23 +49,86 @@ pub struct SearchOptions {
     pub null: bool,
     pub trim: bool,
     pub multiline: bool,
+    pub multiline_dotall: bool,
     pub no_ignore: bool,
     pub hidden: bool,
     pub quiet: bool,
     pub no_filename: bool,
     pub no_line_number: bool,
+    pub text: bool,
+    pub max_filesize: Option<u64>,
+    pub follow: bool,
+    pub no_messages: bool,
 }
 
 impl SearchOptions {
     /// Resolve smart-case: case-insensitive if pattern is all lowercase.
     pub fn effective_case_insensitive(&self) -> bool {
+        // `-s` wins over `-S`, matching ripgrep, but `-i` still wins over `-s`.
         if self.case_insensitive {
             return true;
+        }
+        if self.case_sensitive {
+            return false;
         }
         if self.smart_case {
             return !self.pattern.chars().any(|c| c.is_uppercase());
         }
         false
+    }
+
+    /// Whether `.` should match a newline. ripgrep keeps this separate from
+    /// `-U`, so `-U` alone does not turn `.` into a line-crossing wildcard.
+    pub fn dotall(&self) -> bool {
+        self.multiline_dotall
+    }
+
+    /// Walk options shared by every non-indexed traversal.
+    ///
+    /// Unlike index building, searching has no size cap by default: ripgrep
+    /// searches files of any size, so a cap here silently hides results.
+    pub fn walk_options(&self) -> walker::WalkOptions {
+        walker::WalkOptions {
+            include_hidden: self.hidden,
+            no_ignore: self.no_ignore,
+            search_binary: self.text,
+            follow_links: self.follow,
+            max_file_size: self.max_filesize,
+            ..Default::default()
+        }
+    }
+
+    fn glob_filter(&self) -> Result<crate::glob_filter::GlobFilter> {
+        crate::glob_filter::GlobFilter::new(&self.glob, &self.iglob, self.glob_case_insensitive)
+    }
+
+    /// The matching-relevant subset, shared with the server path.
+    fn match_options(&self) -> crate::matching::MatchOptions {
+        crate::matching::MatchOptions {
+            invert_match: self.invert_match,
+            multiline: self.multiline,
+            only_matching: self.only_matching,
+            before_context: self.before_ctx(),
+            after_context: self.after_ctx(),
+            // `-q` and `--files-without-match` only need to know whether the
+            // file matched at all, so stop at the first hit.
+            max_count: if self.quiet || self.files_without_match {
+                Some(1)
+            } else {
+                self.max_count
+            },
+        }
+    }
+
+    fn matcher(&self, ci: bool) -> Result<SearchMatcher> {
+        crate::matching::build_search_matcher(
+            &self.all_patterns()?,
+            ci,
+            self.fixed_string,
+            self.word_boundary,
+            self.multiline,
+            self.dotall(),
+        )
     }
 
     /// Effective after-context lines.
@@ -138,6 +153,7 @@ impl SearchOptions {
             self.trim,
             self.no_filename,
             self.no_line_number,
+            self.after_ctx() > 0 || self.before_ctx() > 0,
         )
     }
 
@@ -165,7 +181,7 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
+    let glob_filter = opts.glob_filter()?;
 
     if root.is_file() {
         let rel_path = explicit_file_display_path(&root);
@@ -178,14 +194,7 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
         return Ok(());
     }
 
-    let walk = walker::walk_dir(
-        &root,
-        &walker::WalkOptions {
-            include_hidden: opts.hidden,
-            no_ignore: opts.no_ignore,
-            ..Default::default()
-        },
-    );
+    let walk = walker::walk_dir(&root, &opts.walk_options());
     let mut writer = OutputWriter::new(opts.make_output_config());
 
     for path in &walk.files {
@@ -251,13 +260,21 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
 /// or `\\?\UNC\server\share` for network paths). That prefix is an internal
 /// Win32 detail and only confuses people when it shows up in a diagnostic.
 fn display_path(p: &Path) -> String {
-    let s = p.display().to_string();
+    strip_verbatim_prefix(&p.display().to_string())
+}
+
+/// Drop the Windows extended-length (`\\?\`) prefix from an already-rendered
+/// path.
+///
+/// Kept separate from [`display_path`] because match output also needs it, and
+/// there the string has already been through `strip_prefix`/`to_string_lossy`.
+fn strip_verbatim_prefix(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
     } else if let Some(rest) = s.strip_prefix(r"\\?\") {
         rest.to_string()
     } else {
-        s
+        s.to_string()
     }
 }
 
@@ -289,24 +306,43 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
 
+    // Resolve `-f/--file` here rather than sending the path: the server has a
+    // different working directory and no `pattern_file` param, so forwarding
+    // only `pattern`/`extra_patterns` would silently drop the file's patterns
+    // and make results depend on whether a daemon happens to be running.
+    let patterns = opts.all_patterns()?;
+    let (primary, extras) = patterns
+        .split_first()
+        .map(|(p, rest)| (p.clone(), rest.to_vec()))
+        .unwrap_or_else(|| (opts.pattern.clone(), Vec::new()));
+
+    // Context lines are pure presentation; requesting them while counting would
+    // stream rows the count path has to filter back out.
+    let wants_context = !(opts.count || opts.files_only || opts.quiet);
+
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "search",
         "params": {
-            "pattern": opts.pattern,
-            "extra_patterns": opts.extra_patterns,
+            "pattern": primary,
+            "extra_patterns": extras,
             "case_insensitive": ci,
             "fixed_string": opts.fixed_string,
             "files_only": opts.files_only,
             "word_boundary": opts.word_boundary,
-            "max_count": opts.max_count,
+            "max_count": opts.match_options().max_count,
             "glob": opts.glob,  // sent as JSON array
+            "iglob": opts.iglob,
+            "glob_case_insensitive": opts.glob_case_insensitive,
             "file_type": opts.file_type,
             "invert_match": opts.invert_match,
             "only_matching": opts.only_matching,
-            "after_context": opts.after_ctx(),
-            "before_context": opts.before_ctx(),
+            "after_context": if wants_context { opts.after_ctx() } else { 0 },
+            "before_context": if wants_context { opts.before_ctx() } else { 0 },
             "multiline": opts.multiline,
+            "multiline_dotall": opts.dotall(),
+            "text": opts.text,
+            "max_filesize": opts.max_filesize,
         },
         "id": 1,
     });
@@ -355,14 +391,45 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
             }
         }
     } else if opts.count {
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        // `-c` counts matching *lines*, so collapse rows that share a line
+        // (`-o` emits one per match) and ignore context rows. This is what the
+        // local path reports via `FileMatches::matched_lines`.
+        let mut order: Vec<String> = Vec::new();
+        let mut lines: std::collections::HashMap<String, std::collections::HashSet<usize>> =
+            std::collections::HashMap::new();
+        // A binary file is summarised as a single `binary` row rather than one
+        // row per match, so it carries its own line count. The local path still
+        // prints a real count for it because `-c` returns before the binary
+        // guard, and dropping these rows here would silently omit the file.
+        let mut exact: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for m in matches {
-            if let Some(file) = m.get("file").and_then(|f| f.as_str()) {
-                *counts.entry(file.to_string()).or_default() += 1;
+            let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or("match");
+            if mtype != "match" && mtype != "binary" {
+                continue;
+            }
+            let Some(file) = m.get("file").and_then(|f| f.as_str()) else {
+                continue;
+            };
+            if !lines.contains_key(file) && !exact.contains_key(file) {
+                order.push(file.to_string());
+            }
+            if mtype == "binary" {
+                let n = m.get("lines").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
+                exact.insert(file.to_string(), n);
+            } else {
+                let line = m.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
+                lines.entry(file.to_string()).or_default().insert(line);
             }
         }
-        for (file, count) in &counts {
-            writer.write_count(file, *count)?;
+        // Emit in response order; iterating the maps would randomise the file
+        // order on every run, unlike the local path which prints in walk order.
+        for file in &order {
+            let n = exact
+                .get(file)
+                .copied()
+                .or_else(|| lines.get(file).map(|l| l.len()))
+                .unwrap_or(0);
+            writer.write_count(file, n)?;
         }
     } else {
         for m in matches {
@@ -370,20 +437,38 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
             let line = m.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
             let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
             let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or("match");
+            let offset = m.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
             if mtype == "context" {
                 writer.write_context_separator(file, line)?;
                 writer.write_context_line(&ContextLine {
                     file: file.to_string(),
                     line_number: line,
                     content: content.to_string(),
+                    absolute_offset: offset,
                 })?;
+            } else if mtype == "binary" {
+                writer.write_binary_note(file, offset)?;
             } else {
+                let spans = m
+                    .get("spans")
+                    .and_then(|s| s.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|p| {
+                                let p = p.as_array()?;
+                                Some((p.first()?.as_u64()? as usize, p.get(1)?.as_u64()? as usize))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 writer.write_context_separator(file, line)?;
                 writer.write_match(&Match {
                     file: file.to_string(),
                     line_number: line,
                     content: content.to_string(),
                     column: m.get("column").and_then(|c| c.as_u64()).map(|c| c as usize),
+                    spans,
+                    absolute_offset: offset,
                 })?;
             }
         }
@@ -411,29 +496,24 @@ fn search_local_index(
 ) -> Result<bool> {
     let start = Instant::now();
     let reader = IndexReader::open(index_dir)?;
-    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
+    let glob_filter = opts.glob_filter()?;
 
-    let all_patterns = opts.all_patterns()?;
-    let matcher = build_search_matcher(
-        &all_patterns,
-        ci,
-        opts.fixed_string,
-        opts.word_boundary,
-        opts.multiline,
-    )?;
+    let matcher = opts.matcher(ci)?;
 
-    // Build query plan from primary pattern when the accelerated regex engine supports it.
+    // Narrow candidates using every pattern, not just the primary one.
     let plan = if !matcher.is_standard() {
         QueryPlan::MatchAll
-    } else if opts.fixed_string {
-        query::build_literal_plan(&opts.pattern, ci)
     } else {
-        query::build_query_plan(&opts.pattern, ci).map_err(|e| anyhow::anyhow!("{e}"))?
+        query::build_multi_pattern_plan(&opts.all_patterns()?, opts.fixed_string, ci)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
     };
 
     let is_match_all = plan.is_match_all();
 
-    let candidates = if is_match_all || opts.files_without_match {
+    // `-v` inverts at the *line* level: a file matches when some line does not.
+    // The trigram plan selects files that contain the pattern, which is exactly
+    // the wrong filter, so it has to be bypassed. Same for `--files-without-match`.
+    let candidates = if is_match_all || opts.files_without_match || opts.invert_match {
         reader.all_file_ids()
     } else {
         query::execute_plan_with_masks(&plan, &|tri| reader.lookup_trigram_with_masks(tri))
@@ -462,7 +542,10 @@ fn search_local_index(
         }
 
         let full_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let content = match std::fs::read_to_string(&full_path) {
+        if exceeds_max_filesize(&full_path, opts) {
+            continue;
+        }
+        let content = match read_text_lossy(&full_path) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -500,24 +583,19 @@ fn search_local_index(
 
 fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<bool> {
     let start = Instant::now();
-    let glob_filter = crate::glob_filter::GlobFilter::new(&opts.glob)?;
+    let glob_filter = opts.glob_filter()?;
 
-    let all_patterns = opts.all_patterns()?;
-    let matcher = build_search_matcher(
-        &all_patterns,
-        ci,
-        opts.fixed_string,
-        opts.word_boundary,
-        opts.multiline,
-    )?;
+    let matcher = opts.matcher(ci)?;
 
     let mut writer = OutputWriter::new(opts.make_output_config());
     let mut had_matches = false;
 
     if root.is_file() {
         let rel_path = explicit_file_display_path(root);
-        if passes_filters(&rel_path, &glob_filter, &opts.file_type) {
-            let content = std::fs::read_to_string(root)?;
+        if passes_filters(&rel_path, &glob_filter, &opts.file_type)
+            && !exceeds_max_filesize(root, opts)
+        {
+            let content = read_text_lossy(root)?;
             let matched = search_file_content(&content, &matcher, &rel_path, opts, &mut writer)?;
             if matched {
                 if !opts.files_without_match {
@@ -543,14 +621,7 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
         return Ok(had_matches);
     }
 
-    let walk = walker::walk_dir(
-        root,
-        &walker::WalkOptions {
-            include_hidden: opts.hidden,
-            no_ignore: opts.no_ignore,
-            ..Default::default()
-        },
-    );
+    let walk = walker::walk_dir(root, &opts.walk_options());
 
     for path in &walk.files {
         let rel_path = path
@@ -563,7 +634,7 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
             continue;
         }
 
-        let content = match std::fs::read_to_string(path) {
+        let content = match read_text_lossy(path) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -600,6 +671,31 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
     Ok(had_matches)
 }
 
+/// Read a file as text, replacing invalid UTF-8 rather than failing.
+///
+/// ripgrep searches files that are not valid UTF-8; refusing them makes
+/// UTF-16, Latin-1 and mixed-encoding sources silently invisible.
+fn read_text_lossy(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
+}
+
+/// Whether `--max-filesize` excludes this file.
+///
+/// The brute-force walk applies the limit while walking, but the indexed path
+/// takes candidates straight from the index and the explicit-file path skips
+/// the walk entirely. Both check here so the flag means the same thing on every
+/// path instead of silently doing nothing on the default (indexed) one.
+fn exceeds_max_filesize(path: &Path, opts: &SearchOptions) -> bool {
+    let Some(limit) = opts.max_filesize else {
+        return false;
+    };
+    std::fs::metadata(path).is_ok_and(|md| md.len() > limit)
+}
+
 /// Search a single file's content and write output.
 /// Returns true if any matches were found.
 fn search_file_content(
@@ -609,20 +705,12 @@ fn search_file_content(
     opts: &SearchOptions,
     writer: &mut OutputWriter,
 ) -> Result<bool> {
-    let lines: Vec<&str> = content.lines().collect();
-    let before = opts.before_ctx();
-    let after = opts.after_ctx();
-    let has_context = before > 0 || after > 0;
+    writer.note_bytes_searched(content.len() as u64);
 
-    // Find matching line indices (use max_count of 1 for quiet/files_without_match)
-    let effective_max = if opts.quiet || opts.files_without_match {
-        Some(1)
-    } else {
-        opts.max_count
-    };
-    let match_indices = find_match_indices(&lines, matcher, opts.invert_match, effective_max)?;
+    let match_opts = opts.match_options();
+    let found = crate::matching::FileMatches::find(content, matcher, &match_opts)?;
 
-    if match_indices.is_empty() {
+    if found.is_empty() {
         return Ok(false);
     }
 
@@ -637,164 +725,59 @@ fn search_file_content(
     }
 
     if opts.count {
-        writer.write_count(rel_path, match_indices.len())?;
+        writer.write_count(rel_path, found.matched_lines())?;
         return Ok(true);
     }
 
-    // Build set of lines to output (matches + context)
-    if has_context {
-        let printed =
-            crate::matching::expand_context_window(&match_indices, lines.len(), before, after);
-        let is_match_line: std::collections::HashSet<usize> =
-            match_indices.iter().copied().collect();
+    // Never dump raw binary to a terminal; ripgrep reports a note instead.
+    if !opts.text
+        && let Some(off) = content.as_bytes().iter().position(|&b| b == 0)
+    {
+        writer.write_binary_note(rel_path, off)?;
+        return Ok(true);
+    }
 
-        let mut prev_line: Option<usize> = None;
-        for &li in &printed {
-            // Insert separator for gaps
-            if let Some(prev) = prev_line
-                && li > prev + 1
-            {
-                writer.write_context_separator(rel_path, li + 1)?;
-            }
-
-            if is_match_line.contains(&li) {
-                let content = matcher.match_content(lines[li], opts.only_matching)?;
-                let column = matcher.find_start(lines[li])?.map(|start| start + 1);
-                writer.write_match(&Match {
-                    file: rel_path.to_string(),
-                    line_number: li + 1,
-                    content,
-                    column,
-                })?;
-            } else {
-                writer.write_context_line(&ContextLine {
-                    file: rel_path.to_string(),
-                    line_number: li + 1,
-                    content: lines[li].to_string(),
-                })?;
-            }
-            prev_line = Some(li);
-        }
-    } else {
-        for &mi in &match_indices {
-            let content = matcher.match_content(lines[mi], opts.only_matching)?;
-            let column = matcher.find_start(lines[mi])?.map(|start| start + 1);
+    found.for_each(&match_opts, |emit| match emit {
+        crate::matching::Emit::Match {
+            line_number,
+            content,
+            column,
+            spans,
+            absolute_offset,
+        } => {
+            writer.write_context_separator(rel_path, line_number)?;
             writer.write_match(&Match {
                 file: rel_path.to_string(),
-                line_number: mi + 1,
-                content,
+                line_number,
+                content: content.to_string(),
                 column,
-            })?;
+                spans,
+                absolute_offset,
+            })
         }
-    }
+        crate::matching::Emit::Context {
+            line_number,
+            content,
+            absolute_offset,
+        } => {
+            writer.write_context_separator(rel_path, line_number)?;
+            writer.write_context_line(&ContextLine {
+                file: rel_path.to_string(),
+                line_number,
+                content: content.to_string(),
+                absolute_offset,
+            })
+        }
+    })?;
 
     Ok(true)
 }
 
-pub(crate) fn build_search_matcher(
-    patterns: &[String],
-    case_insensitive: bool,
-    fixed_string: bool,
-    word_boundary: bool,
-    multiline: bool,
-) -> Result<SearchMatcher> {
-    let combined = combine_patterns(patterns, fixed_string, word_boundary);
-
-    match build_regex(&combined, case_insensitive, multiline) {
-        Ok(re) => Ok(SearchMatcher::Standard(re)),
-        Err(regex_err) if !fixed_string => {
-            let mut flags = String::new();
-            if case_insensitive {
-                flags.push('i');
-            }
-            if multiline {
-                flags.push('m');
-                flags.push('s');
-            }
-            let fancy_pattern = if flags.is_empty() {
-                combined
-            } else {
-                format!("(?{flags}:{combined})")
-            };
-            fancy_regex::Regex::new(&fancy_pattern)
-                .map(SearchMatcher::Fancy)
-                .map_err(|fancy_err| {
-                    anyhow::anyhow!(
-                        "regex error: {regex_err}; PCRE-style fallback failed: {fancy_err}"
-                    )
-                })
-        }
-        Err(regex_err) => Err(regex_err),
-    }
-}
-
-fn combine_patterns(patterns: &[String], fixed_string: bool, word_boundary: bool) -> String {
-    if patterns.len() == 1 {
-        let mut p = if fixed_string {
-            regex::escape(&patterns[0])
-        } else {
-            patterns[0].clone()
-        };
-        if word_boundary {
-            p = format!(r"\b(?:{p})\b");
-        }
-        p
-    } else {
-        let parts: Vec<String> = patterns
-            .iter()
-            .map(|p| {
-                let mut p = if fixed_string {
-                    regex::escape(p)
-                } else {
-                    p.clone()
-                };
-                if word_boundary {
-                    p = format!(r"\b(?:{p})\b");
-                }
-                p
-            })
-            .collect();
-        format!("(?:{})", parts.join("|"))
-    }
-}
-
-fn build_regex(combined: &str, case_insensitive: bool, multiline: bool) -> Result<regex::Regex> {
-    RegexBuilder::new(combined)
-        .case_insensitive(case_insensitive)
-        .multi_line(multiline)
-        .dot_matches_new_line(multiline)
-        .size_limit(100 * (1 << 20))
-        .dfa_size_limit(1000 * (1 << 20))
-        .nest_limit(250)
-        .build()
-        .map_err(|e| anyhow::anyhow!("regex error: {e}"))
-}
-
-pub(crate) fn find_match_indices(
-    lines: &[&str],
-    matcher: &SearchMatcher,
-    invert_match: bool,
-    max_count: Option<usize>,
-) -> Result<Vec<usize>> {
-    if max_count == Some(0) {
-        return Ok(Vec::new());
-    }
-    let mut indices = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let is_match = matcher.is_match(line)?;
-        let include = if invert_match { !is_match } else { is_match };
-        if include {
-            indices.push(i);
-            if let Some(max) = max_count
-                && indices.len() >= max
-            {
-                break;
-            }
-        }
-    }
-    Ok(indices)
-}
-
+/// Path to print for a file the user named directly on the command line.
+///
+/// Relative to the cwd when the file lives under it, otherwise absolute. Either
+/// way the `\\?\` prefix is stripped first: `--vimgrep` and `--json` consumers
+/// feed these straight back to an editor, and no editor opens `//?/C:/...`.
 fn explicit_file_display_path(path: &Path) -> String {
     let display_path = std::env::current_dir()
         .ok()
@@ -802,7 +785,7 @@ fn explicit_file_display_path(path: &Path) -> String {
         .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| path.to_path_buf());
 
-    display_path.to_string_lossy().replace('\\', "/")
+    strip_verbatim_prefix(&display_path.to_string_lossy()).replace('\\', "/")
 }
 
 fn passes_filters(
@@ -856,6 +839,24 @@ mod tests {
         assert_eq!(
             display_path(Path::new("/home/user/repo")),
             "/home/user/repo"
+        );
+    }
+
+    #[test]
+    fn explicit_file_path_outside_cwd_is_editor_openable() {
+        // A file outside the cwd keeps its absolute path, but must not leak
+        // `\\?\` — rendered with forward slashes that becomes `//?/C:/...`,
+        // which no editor or `xargs` consumer can open.
+        let rendered = explicit_file_display_path(Path::new(r"\\?\D:\other\tree\main.rs"));
+        assert_eq!(rendered, "D:/other/tree/main.rs");
+        assert!(!rendered.contains("//?/"), "got: {rendered}");
+    }
+
+    #[test]
+    fn explicit_file_path_keeps_unc_shares_usable() {
+        assert_eq!(
+            explicit_file_display_path(Path::new(r"\\?\UNC\server\share\main.rs")),
+            "//server/share/main.rs"
         );
     }
 }

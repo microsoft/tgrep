@@ -2,8 +2,12 @@
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
-/// Maximum file size to index (1 MB). Larger files are skipped.
-const MAX_FILE_SIZE: u64 = 1_048_576;
+/// Default maximum file size to index (1 MB). Larger files are skipped.
+///
+/// This bounds the index, which is why it stays the default for index builds.
+/// Search paths that scan the filesystem directly (`--no-index`, `--files`)
+/// have no such constraint and default to no limit, matching ripgrep.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 
 /// Binary extensions that can be rejected without reading file content.
 const BINARY_EXTENSIONS: &[&str] = &[
@@ -42,18 +46,46 @@ pub struct WalkResult {
     pub ignore_files: Vec<PathBuf>,
     pub skipped_binary: usize,
     pub skipped_error: usize,
+    /// Files rejected only because they exceeded `WalkOptions::max_file_size`.
+    ///
+    /// Tracked separately from `skipped_binary` so callers can tell the user
+    /// that a size limit — not file content — is why a path was not searched.
+    /// A silently dropped oversize file is indistinguishable from "no match".
+    pub skipped_too_large: usize,
 }
 
-#[derive(Default)]
 pub struct WalkOptions {
     pub include_hidden: bool,
     pub no_ignore: bool,
+    /// Skip the binary-extension rejection list and consider every file text.
     pub search_binary: bool,
+    /// Follow symbolic links while walking (ripgrep's `--follow`).
+    pub follow_links: bool,
+    /// Reject files larger than this many bytes. `None` disables the limit.
+    pub max_file_size: Option<u64>,
     /// Collect `.gitignore` and `.ignore` file paths encountered during the
     /// walk (into `WalkResult::gitignore_files` / `WalkResult::ignore_files`).
     pub collect_gitignore_files: bool,
     /// Directory names to exclude from walking (e.g., "vendor", "third_party").
     pub exclude_dirs: Vec<String>,
+}
+
+// Hand-written rather than derived: `Option::default()` is `None`, which would
+// silently turn the size limit off for every existing caller that builds this
+// struct with `..Default::default()` (the index builder and the server among
+// them). The default has to keep bounding the index.
+impl Default for WalkOptions {
+    fn default() -> Self {
+        Self {
+            include_hidden: false,
+            no_ignore: false,
+            search_binary: false,
+            follow_links: false,
+            max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
+            collect_gitignore_files: false,
+            exclude_dirs: Vec::new(),
+        }
+    }
 }
 
 /// Check if a file extension indicates a binary format.
@@ -78,8 +110,10 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
     let ignore_files = std::sync::Mutex::new(Vec::new());
     let skipped_binary = std::sync::atomic::AtomicUsize::new(0);
     let skipped_error = std::sync::atomic::AtomicUsize::new(0);
+    let skipped_too_large = std::sync::atomic::AtomicUsize::new(0);
     let exclude_dirs: std::sync::Arc<Vec<String>> = std::sync::Arc::new(opts.exclude_dirs.clone());
     let search_binary = opts.search_binary;
+    let max_file_size = opts.max_file_size;
     let include_hidden = opts.include_hidden;
     let collect_gitignore_files = opts.collect_gitignore_files;
     let root = root.to_path_buf();
@@ -92,6 +126,7 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
     let mut builder = WalkBuilder::new(&root);
     builder
         .hidden(!include_hidden)
+        .follow_links(opts.follow_links)
         .git_ignore(!opts.no_ignore)
         .git_global(!opts.no_ignore)
         .git_exclude(!opts.no_ignore)
@@ -120,6 +155,7 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         let ignore_files = &ignore_files;
         let skipped_binary = &skipped_binary;
         let skipped_error = &skipped_error;
+        let skipped_too_large = &skipped_too_large;
         Box::new(move |entry| {
             let entry = match entry {
                 Ok(e) => e,
@@ -155,18 +191,20 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
 
             let path = entry.path();
 
-            if !search_binary {
-                if is_binary_extension(path) {
-                    skipped_binary.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return ignore::WalkState::Continue;
-                }
+            if !search_binary && is_binary_extension(path) {
+                skipped_binary.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return ignore::WalkState::Continue;
+            }
 
-                if let Ok(meta) = entry.metadata()
-                    && meta.len() > MAX_FILE_SIZE
-                {
-                    skipped_binary.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return ignore::WalkState::Continue;
-                }
+            // Size is checked independently of `search_binary` so `--text`
+            // and `--max-filesize` stay orthogonal, the way ripgrep treats
+            // `-a` and `--max-filesize`.
+            if let Some(limit) = max_file_size
+                && let Ok(meta) = entry.metadata()
+                && meta.len() > limit
+            {
+                skipped_too_large.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return ignore::WalkState::Continue;
             }
 
             files.lock().unwrap().push(entry.into_path());
@@ -180,6 +218,7 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         ignore_files: ignore_files.into_inner().unwrap(),
         skipped_binary: skipped_binary.into_inner(),
         skipped_error: skipped_error.into_inner(),
+        skipped_too_large: skipped_too_large.into_inner(),
     }
 }
 
@@ -298,7 +337,7 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String], no_ignore: bool)
             };
 
             if let Ok(meta) = entry.metadata() {
-                if meta.len() > MAX_FILE_SIZE {
+                if meta.len() > DEFAULT_MAX_FILE_SIZE {
                     return ignore::WalkState::Continue;
                 }
                 let mtime = meta

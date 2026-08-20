@@ -99,7 +99,27 @@ fn strips_extra_quotes_from_path_argument() {
 }
 
 #[test]
-fn missing_path_is_treated_as_no_matches() {
+fn missing_path_reports_error_and_exits_2() {
+    let dir = setup_fixture();
+    let missing = dir
+        .path()
+        .join("testdata")
+        .join("does-not-exist.rs")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // ripgrep reports unreadable paths on stderr and exits 2 rather than
+    // silently pretending there were no matches.
+    tgrep()
+        .args(["--no-index", "--no-heading", "fn", &missing])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("does-not-exist.rs"));
+}
+
+#[test]
+fn missing_path_stays_quiet_with_no_messages() {
     let dir = setup_fixture();
     let missing = dir
         .path()
@@ -110,10 +130,36 @@ fn missing_path_is_treated_as_no_matches() {
         .to_string();
 
     tgrep()
-        .args(["--no-index", "--no-heading", "fn", &missing])
+        .args([
+            "--no-index",
+            "--no-messages",
+            "--no-heading",
+            "fn",
+            &missing,
+        ])
         .assert()
-        .code(1)
+        .code(2)
         .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn missing_path_does_not_stop_remaining_paths() {
+    let dir = setup_fixture();
+    let missing = dir.path().join("nope").to_str().unwrap().to_string();
+
+    // A bad path must not swallow results from the good ones.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-messages",
+            "--no-heading",
+            "fn main",
+            &missing,
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("hello.rs"));
 }
 
 #[test]
@@ -443,7 +489,12 @@ fn no_filename_and_no_line_number() {
 fn files_without_match_short() {
     let dir = setup_fixture();
     let output = tgrep()
-        .args(["--no-index", "-L", "fn", &fixture_path(&dir)])
+        .args([
+            "--no-index",
+            "--files-without-match",
+            "fn",
+            &fixture_path(&dir),
+        ])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -479,7 +530,12 @@ fn files_without_match_all_match() {
     let dir = setup_fixture();
     // Every file contains a newline, so "." (any char) matches all files
     tgrep()
-        .args(["--no-index", "-L", ".", &fixture_path(&dir)])
+        .args([
+            "--no-index",
+            "--files-without-match",
+            ".",
+            &fixture_path(&dir),
+        ])
         .assert()
         .code(1) // no files without matches → exit 1
         .stdout(predicate::str::is_empty());
@@ -491,7 +547,7 @@ fn files_without_match_none_match() {
     let output = tgrep()
         .args([
             "--no-index",
-            "-L",
+            "--files-without-match",
             "zzz_nonexistent_pattern_zzz",
             &fixture_path(&dir),
         ])
@@ -511,7 +567,7 @@ fn files_without_match_with_glob() {
     let output = tgrep()
         .args([
             "--no-index",
-            "-L",
+            "--files-without-match",
             "-g",
             "*.rs",
             "fn main",
@@ -583,7 +639,13 @@ fn quiet_with_files_without_match() {
     let dir = setup_fixture();
     // -q -L: exit 0 if any file doesn't match, no output
     tgrep()
-        .args(["--no-index", "-q", "-L", "fn main", &fixture_path(&dir)])
+        .args([
+            "--no-index",
+            "-q",
+            "--files-without-match",
+            "fn main",
+            &fixture_path(&dir),
+        ])
         .assert()
         .success()
         .stdout(predicate::str::is_empty());
@@ -594,7 +656,13 @@ fn quiet_with_files_without_match_all_match() {
     let dir = setup_fixture();
     // Every file matches "." so -L finds nothing → exit 1
     tgrep()
-        .args(["--no-index", "-q", "-L", ".", &fixture_path(&dir)])
+        .args([
+            "--no-index",
+            "-q",
+            "--files-without-match",
+            ".",
+            &fixture_path(&dir),
+        ])
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty());
@@ -651,7 +719,12 @@ fn files_without_match_exit_code_success() {
     let dir = setup_fixture();
     // "fn main" only matches hello.rs; lib.rs, config.toml, notes.txt don't
     tgrep()
-        .args(["--no-index", "-L", "fn main", &fixture_path(&dir)])
+        .args([
+            "--no-index",
+            "--files-without-match",
+            "fn main",
+            &fixture_path(&dir),
+        ])
         .assert()
         .success(); // exit 0 because files without matches were found
 }
@@ -1635,13 +1708,24 @@ fn json_output_flag() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Each line should be valid JSON
-    for line in stdout.lines() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(line).unwrap_or_else(|_| panic!("invalid JSON line: {line}"));
-        assert_eq!(parsed["type"], "match");
-        assert!(parsed["line"].is_number());
-        assert!(parsed["content"].is_string());
+    // ripgrep emits a begin/match.../end envelope per file, then a summary.
+    let msgs: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|_| panic!("invalid JSON line: {line}"))
+        })
+        .collect();
+    let kinds: Vec<&str> = msgs.iter().map(|m| m["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds.first(), Some(&"begin"), "stream: {kinds:?}");
+    assert_eq!(kinds.last(), Some(&"summary"), "stream: {kinds:?}");
+    assert!(kinds.contains(&"match"), "stream: {kinds:?}");
+    assert!(kinds.contains(&"end"), "stream: {kinds:?}");
+
+    for m in msgs.iter().filter(|m| m["type"] == "match") {
+        assert!(m["data"]["line_number"].is_number());
+        assert!(m["data"]["lines"]["text"].is_string());
+        assert!(m["data"]["absolute_offset"].is_number());
+        assert!(m["data"]["submatches"].is_array());
     }
 }
 
@@ -1659,14 +1743,29 @@ fn json_output_includes_file_and_line() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
-    assert_eq!(parsed["line"], 1);
-    assert!(parsed["content"].as_str().unwrap().contains("fn main"));
-    let file = parsed["file"].as_str().unwrap();
+    let first_match: serde_json::Value = stdout
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|m| m["type"] == "match")
+        .expect("expected a match message");
+
+    assert_eq!(first_match["data"]["line_number"], 1);
+    let text = first_match["data"]["lines"]["text"].as_str().unwrap();
+    assert!(text.contains("fn main"));
+    // ripgrep includes the trailing newline in `lines.text`.
+    assert!(text.ends_with('\n'), "expected trailing newline: {text:?}");
+
+    let file = first_match["data"]["path"]["text"].as_str().unwrap();
     assert!(
         file.contains("hello.rs"),
-        "expected hello.rs in file, got: {file}"
+        "expected hello.rs in path, got: {file}"
     );
+
+    let submatches = first_match["data"]["submatches"].as_array().unwrap();
+    assert_eq!(submatches.len(), 1);
+    assert_eq!(submatches[0]["match"]["text"], "fn main");
+    assert!(submatches[0]["start"].is_number());
+    assert!(submatches[0]["end"].is_number());
 }
 
 #[test]
@@ -1685,15 +1784,18 @@ fn json_context_lines_have_context_type() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert!(
-        lines.len() >= 2,
-        "expected at least 2 JSON lines, got: {stdout}"
-    );
-    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-    assert_eq!(first["type"], "match");
-    assert_eq!(second["type"], "context");
+    let kinds: Vec<String> = stdout
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kinds[0], "begin", "stream: {kinds:?}");
+    assert_eq!(kinds[1], "match", "stream: {kinds:?}");
+    assert_eq!(kinds[2], "context", "stream: {kinds:?}");
 }
 
 // ─── Vimgrep output (--vimgrep) ────────────────────────────────────
@@ -2178,6 +2280,7 @@ fn json_output_with_context() {
         match parsed["type"].as_str().unwrap() {
             "match" => has_match = true,
             "context" => has_context = true,
+            "begin" | "end" | "summary" => {}
             other => panic!("unexpected type: {other}"),
         }
     }
@@ -2332,7 +2435,13 @@ fn files_without_match_with_invert_match() {
     // Using "." which matches every non-empty line; files without match on -v
     // means files where every line matches "."
     let output = tgrep()
-        .args(["--no-index", "-v", "-L", ".", &fixture_path(&dir)])
+        .args([
+            "--no-index",
+            "-v",
+            "--files-without-match",
+            ".",
+            &fixture_path(&dir),
+        ])
         .output()
         .unwrap();
     // All our test files have content on every line, so -v "." finds no
@@ -2551,7 +2660,7 @@ fn indexed_files_without_match() {
         .args([
             "--index-path",
             &idx,
-            "-L",
+            "--files-without-match",
             "fn",
             &indexed_fixture_path(&dir),
         ])
@@ -2739,13 +2848,22 @@ fn indexed_json_output() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut saw_match = false;
     for line in stdout.lines() {
         let parsed: serde_json::Value =
             serde_json::from_str(line).unwrap_or_else(|_| panic!("invalid JSON: {line}"));
-        assert_eq!(parsed["type"], "match");
-        assert!(parsed["line"].is_number());
-        assert!(parsed["content"].as_str().unwrap().contains("fn main"));
+        if parsed["type"] == "match" {
+            saw_match = true;
+            assert!(parsed["data"]["line_number"].is_number());
+            assert!(
+                parsed["data"]["lines"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("fn main")
+            );
+        }
     }
+    assert!(saw_match, "expected a match message in: {stdout}");
 }
 
 #[test]
@@ -2800,4 +2918,1025 @@ fn indexed_no_filename_no_line_number() {
     for line in stdout.lines() {
         assert_eq!(line.trim(), "fn main() {");
     }
+}
+
+// ─── Large files, binary files and encodings ───────────────────────
+//
+// These cover cases where tgrep used to silently return no results, which is
+// far worse than an error: a search that finds nothing looks like a clean bill
+// of health.
+
+/// A file above the old hard-coded 1 MiB walker cap.
+fn setup_large_file_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+
+    let mut big = String::with_capacity(1_200_000);
+    while big.len() < 1_200_000 {
+        big.push_str("filler line that is not interesting\n");
+    }
+    big.push_str("needle_in_a_big_file\n");
+    fs::write(sub.join("big.txt"), big).unwrap();
+    dir
+}
+
+#[test]
+fn searches_files_larger_than_one_mib() {
+    let dir = setup_large_file_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "needle_in_a_big_file",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("needle_in_a_big_file"));
+}
+
+#[test]
+fn max_filesize_excludes_large_files() {
+    let dir = setup_large_file_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--max-filesize",
+            "1K",
+            "needle_in_a_big_file",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn max_filesize_accepts_suffixes() {
+    let dir = setup_large_file_fixture();
+    // 2M is above the 1.2 MB fixture, so the match must still be found.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--max-filesize",
+            "2M",
+            "needle_in_a_big_file",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn invalid_max_filesize_is_an_error_not_a_silent_fallback() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--max-filesize",
+            "notanumber",
+            "fn main",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("max-filesize"));
+}
+
+#[test]
+fn text_flag_searches_binary_files() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("blob.bin"), b"prefix\x00binary_needle\x00suffix").unwrap();
+
+    // Without -a the file is skipped as binary.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "binary_needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+
+    // With -a it is searched, and reported without dumping raw bytes.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-a",
+            "binary_needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("binary_needle"));
+}
+
+#[test]
+fn unrestricted_uuu_enables_binary_search() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("blob.bin"), b"prefix\x00binary_needle\x00suffix").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-uuu",
+            "binary_needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn searches_files_that_are_not_valid_utf8() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    // Latin-1 encoded "café" followed by an ASCII marker.
+    fs::write(sub.join("latin1.txt"), b"caf\xe9 latin_needle\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "latin_needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("latin_needle"));
+}
+
+// ─── Multiline (-U / --multiline-dotall) ───────────────────────────
+
+fn setup_multiline_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("span.txt"), "alpha\nstart\nmiddle\nend\nomega\n").unwrap();
+    dir
+}
+
+#[test]
+fn multiline_matches_across_lines() {
+    let dir = setup_multiline_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-U",
+            r"start\nmiddle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("start"))
+        .stdout(predicate::str::contains("middle"));
+}
+
+#[test]
+fn multiline_alone_does_not_make_dot_match_newline() {
+    let dir = setup_multiline_fixture();
+    // ripgrep requires --multiline-dotall for this; -U alone must not match.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-U",
+            "start.middle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn multiline_dotall_makes_dot_match_newline() {
+    let dir = setup_multiline_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--multiline-dotall",
+            "start.middle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("start"));
+}
+
+#[test]
+fn non_multiline_anchors_per_line() {
+    let dir = setup_multiline_fixture();
+    // `^middle` must match line 3 even though it is not the start of the file.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "^middle$",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("middle"));
+}
+
+// ─── Per-match output (--vimgrep, -o, --color) ─────────────────────
+
+fn setup_repeats_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("repeats.txt"), "foo bar foo baz foo\n").unwrap();
+    dir
+}
+
+#[test]
+fn vimgrep_emits_one_row_per_match() {
+    let dir = setup_repeats_fixture();
+    let sub = dir.path().join("testdata");
+    let output = tgrep()
+        .current_dir(&sub)
+        .args(["--no-index", "--vimgrep", "foo", "repeats.txt"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows.len(), 3, "expected one row per match, got: {stdout}");
+
+    // Columns are 1-based byte offsets of each match: "foo bar foo baz foo".
+    let cols: Vec<&str> = rows.iter().map(|r| r.split(':').nth(2).unwrap()).collect();
+    assert_eq!(cols, vec!["1", "9", "17"], "rows: {stdout}");
+}
+
+#[test]
+fn only_matching_prints_one_line_per_match() {
+    let dir = setup_repeats_fixture();
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-o",
+            "foo",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let rows: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(rows.len(), 3, "expected 3 output lines, got: {stdout}");
+    for row in rows {
+        assert!(row.ends_with("foo"), "unexpected row: {row}");
+    }
+}
+
+#[test]
+fn color_always_highlights_the_match() {
+    let dir = setup_repeats_fixture();
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--color",
+            "always",
+            "bar",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\x1b[1;31mbar\x1b[0m"),
+        "expected the match itself to be colored, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn color_never_leaves_output_plain() {
+    let dir = setup_repeats_fixture();
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--color",
+            "never",
+            "bar",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains('\x1b'), "unexpected escapes: {stdout:?}");
+}
+
+#[test]
+fn json_submatches_cover_every_match_on_a_line() {
+    let dir = setup_repeats_fixture();
+    let output = tgrep()
+        .args(["--no-index", "--json", "foo", &fixture_path(&dir)])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let m: serde_json::Value = stdout
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|m| m["type"] == "match")
+        .expect("expected a match message");
+    let subs = m["data"]["submatches"].as_array().unwrap();
+    assert_eq!(subs.len(), 3, "expected 3 submatches, got: {subs:?}");
+    assert_eq!(subs[0]["start"], 0);
+    assert_eq!(subs[1]["start"], 8);
+    assert_eq!(subs[2]["start"], 16);
+}
+
+// ─── Glob case sensitivity ─────────────────────────────────────────
+
+fn setup_case_glob_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("lower.txt"), "needle\n").unwrap();
+    fs::write(sub.join("UPPER.TXT"), "needle\n").unwrap();
+    dir
+}
+
+#[test]
+fn globs_are_case_sensitive_by_default() {
+    let dir = setup_case_glob_fixture();
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-g",
+            "*.txt",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("lower.txt"), "got: {stdout}");
+    assert!(!stdout.contains("UPPER.TXT"), "got: {stdout}");
+}
+
+#[test]
+fn iglob_matches_case_insensitively() {
+    let dir = setup_case_glob_fixture();
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--iglob",
+            "*.txt",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("lower.txt"), "got: {stdout}");
+    assert!(stdout.contains("UPPER.TXT"), "got: {stdout}");
+}
+
+#[test]
+fn glob_case_insensitive_flag_applies_to_globs() {
+    let dir = setup_case_glob_fixture();
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--glob-case-insensitive",
+            "-g",
+            "*.txt",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("UPPER.TXT"), "got: {stdout}");
+}
+
+// ─── Newly added ripgrep short flags ───────────────────────────────
+
+#[test]
+fn case_sensitive_flag_overrides_smart_case() {
+    let dir = setup_fixture();
+    // notes.txt contains "Nothing important here." — smart case makes an
+    // all-lowercase pattern case-insensitive, so it matches.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-S",
+            "nothing",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0);
+
+    // -s forces case sensitivity back on, so the same pattern no longer matches.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-S",
+            "-s",
+            "nothing",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn ignore_case_still_wins_over_case_sensitive() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-s",
+            "-i",
+            "HELLO",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn capital_i_suppresses_filenames() {
+    let dir = setup_fixture();
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-I",
+            "fn main",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("hello.rs"), "got: {stdout}");
+    assert!(stdout.contains("fn main"), "got: {stdout}");
+}
+
+#[test]
+fn dot_flag_is_an_alias_for_hidden() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join(".hidden.txt"), "hidden_needle\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "hidden_needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-.",
+            "hidden_needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn follow_flag_is_accepted_as_dash_l() {
+    let dir = setup_fixture();
+    // -L is --follow in ripgrep; it must no longer mean --files-without-match.
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-L",
+            "fn main",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("fn main"),
+        "-L should follow links, not list non-matching files: {stdout}"
+    );
+}
+
+// ─── Exit codes ────────────────────────────────────────────────────
+
+#[test]
+fn quiet_with_match_exits_zero_even_after_an_error() {
+    let dir = setup_fixture();
+    let missing = dir.path().join("nope").to_str().unwrap().to_string();
+
+    // ripgrep: `matched && (quiet || !errored)` → 0.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-messages",
+            "-q",
+            "fn main",
+            &fixture_path(&dir),
+            &missing,
+        ])
+        .assert()
+        .code(0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Regressions found in review
+//
+// Each of these was a real defect: the first two produced wrong output on
+// the local path, the rest made results depend on whether a server or index
+// happened to be in play.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Two matching lines with a gap between them, and no context requested.
+fn setup_gap_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(
+        sub.join("gap.txt"),
+        "alpha\nbeta\ngamma\ndelta\nalpha again\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn no_context_separator_without_context_flags() {
+    let dir = setup_gap_fixture();
+    let output = tgrep()
+        .args(["--no-index", "--no-heading", "alpha", &fixture_path(&dir)])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.lines().any(|l| l.trim() == "--"),
+        "`--` must only appear when context is requested, got: {stdout}"
+    );
+}
+
+#[test]
+fn no_context_separator_in_vimgrep_output() {
+    let dir = setup_gap_fixture();
+    let output = tgrep()
+        .args(["--no-index", "--vimgrep", "alpha", &fixture_path(&dir)])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // A bare `--` row breaks quickfix parsing.
+    for line in stdout.lines().filter(|l| !l.is_empty()) {
+        assert!(
+            line.contains(".txt:"),
+            "unparseable vimgrep row {line:?} in: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn context_separator_still_appears_with_context() {
+    let dir = setup_gap_fixture();
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-C",
+            "1",
+            "alpha",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|l| l.trim() == "--"),
+        "expected a `--` separator, got: {stdout}"
+    );
+}
+
+#[test]
+fn max_count_keeps_multiline_matches_whole() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("m.txt"), "start\nmiddle\nend\ntail\n").unwrap();
+
+    let full = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-U",
+            r"start[\s\S]*end",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let full = String::from_utf8_lossy(&full.stdout).to_string();
+
+    // --max-count limits matches, not lines: one match must still print whole.
+    let capped = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-U",
+            "-m",
+            "1",
+            r"start[\s\S]*end",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let capped = String::from_utf8_lossy(&capped.stdout).to_string();
+
+    assert_eq!(full.lines().count(), 3, "baseline changed: {full}");
+    assert_eq!(
+        capped, full,
+        "-m 1 truncated a single multiline match mid-way"
+    );
+}
+
+#[test]
+fn indexed_max_filesize_is_honored() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    let mut big = String::new();
+    while big.len() < 4000 {
+        big.push_str("padding padding padding padding\n");
+    }
+    big.push_str("indexed_size_needle\n");
+    fs::write(sub.join("big.txt"), big).unwrap();
+
+    let index_dir = dir.path().join("idx");
+    let idx = index_dir.to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", &fixture_path(&dir), "--index-path", &idx])
+        .assert()
+        .success();
+
+    // Sanity: found through the index without a limit.
+    tgrep()
+        .args([
+            "--no-heading",
+            "--index-path",
+            &idx,
+            "indexed_size_needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0);
+
+    // The flag must apply on the indexed path too, not just --no-index.
+    tgrep()
+        .args([
+            "--no-heading",
+            "--index-path",
+            &idx,
+            "--max-filesize",
+            "1K",
+            "indexed_size_needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn indexed_pattern_file_is_honored() {
+    let (dir, idx) = setup_indexed_fixture();
+    let pats = dir.path().join("pats.txt");
+    fs::write(&pats, "hello world\n").unwrap();
+
+    // -f patterns must survive the trip through the index/server path.
+    tgrep()
+        .args([
+            "--no-heading",
+            "--index-path",
+            &idx,
+            "-f",
+            pats.to_str().unwrap(),
+            "zzz_no_such_pattern",
+            &indexed_fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("hello world"));
+}
+
+#[test]
+fn indexed_extra_patterns_reach_the_query_plan() {
+    let (dir, idx) = setup_indexed_fixture();
+    // The trigram plan must union every pattern. Narrowing candidates with
+    // only the primary pattern hides files that just the -e pattern matches.
+    tgrep()
+        .args([
+            "--no-heading",
+            "--index-path",
+            &idx,
+            "-e",
+            "hello world",
+            "zzz_no_such_pattern",
+            &indexed_fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("hello world"));
+}
+
+#[test]
+fn indexed_multiple_patterns_match_the_same_as_brute_force() {
+    let (dir, idx) = setup_indexed_fixture();
+    let path = indexed_fixture_path(&dir);
+
+    let lines = |extra: &[&str]| -> Vec<String> {
+        let mut args: Vec<&str> = vec!["--no-heading"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["-e", "hello world", "-e", "version", "pub fn add", &path]);
+        let out = tgrep().args(&args).output().unwrap();
+        let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v
+    };
+
+    let brute = lines(&["--no-index"]);
+    let indexed = lines(&["--index-path", &idx]);
+
+    assert_eq!(brute.len(), 3, "expected 3 matches, got: {brute:?}");
+    assert_eq!(brute, indexed, "indexed path missed -e patterns");
+}
+
+#[test]
+fn indexed_fixed_string_multiple_patterns() {
+    let (dir, idx) = setup_indexed_fixture();
+    tgrep()
+        .args([
+            "--no-heading",
+            "--index-path",
+            &idx,
+            "-F",
+            "-e",
+            "println!(\"hello world\")",
+            "a + b",
+            &indexed_fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("hello world"))
+        .stdout(predicate::str::contains("a + b"));
+}
+#[test]
+fn indexed_count_ignores_context_lines() {
+    let (dir, idx) = setup_indexed_fixture();
+
+    let local = tgrep()
+        .args([
+            "--no-index",
+            "-c",
+            "-A",
+            "2",
+            "fn",
+            &indexed_fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let indexed = tgrep()
+        .args([
+            "--index-path",
+            &idx,
+            "-c",
+            "-A",
+            "2",
+            "fn",
+            &indexed_fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+
+    let mut a: Vec<String> = String::from_utf8_lossy(&local.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut b: Vec<String> = String::from_utf8_lossy(&indexed.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    a.sort();
+    b.sort();
+    assert!(!a.is_empty(), "expected some counts");
+    assert_eq!(a, b, "-c must count matching lines, not context lines");
+}
+
+#[test]
+fn indexed_search_reads_non_utf8_files() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("latin1.txt"), b"caf\xe9 indexed_latin_needle\n").unwrap();
+
+    let index_dir = dir.path().join("idx");
+    let idx = index_dir.to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", &fixture_path(&dir), "--index-path", &idx])
+        .assert()
+        .success();
+
+    tgrep()
+        .args([
+            "--no-heading",
+            "--index-path",
+            &idx,
+            "indexed_latin_needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("indexed_latin_needle"));
+}
+
+// ─── Second review round: -v candidate soundness and -c on binary files ───
+
+/// `-v` inverts at the *line* level, so a file matches when some line does not
+/// match. Filtering candidates by the trigram plan selects exactly the wrong
+/// files, so the plan has to be bypassed. Regression: the indexed path used to
+/// return only files that *contained* the pattern.
+#[test]
+fn indexed_invert_match_returns_files_without_the_pattern() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    // Only `has.txt` contains the pattern, so its trigrams are the only ones in
+    // the index. `none.txt` must still be reported by `-v`.
+    fs::write(sub.join("has.txt"), "zebraqux marker\n").unwrap();
+    fs::write(sub.join("none.txt"), "totally unrelated text\n").unwrap();
+
+    let idx = dir.path().join("idx").to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", &fixture_path(&dir), "--index-path", &idx])
+        .assert()
+        .success();
+
+    let local = tgrep()
+        .args(["--no-index", "-v", "-l", "zebraqux", &fixture_path(&dir)])
+        .output()
+        .unwrap();
+    let indexed = tgrep()
+        .args([
+            "--index-path",
+            &idx,
+            "-v",
+            "-l",
+            "zebraqux",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+
+    let mut a: Vec<String> = String::from_utf8_lossy(&local.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut b: Vec<String> = String::from_utf8_lossy(&indexed.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    a.sort();
+    b.sort();
+    assert!(
+        a.iter().any(|l| l.contains("none.txt")),
+        "brute force should report none.txt, got {a:?}"
+    );
+    assert_eq!(a, b, "-v must not be narrowed by the trigram plan");
+}
+
+/// A file whose NUL byte sits past the 8 KiB binary sniff window is indexed as
+/// ordinary text, so it becomes a normal search candidate. `-c` must still
+/// report a count for it: ripgrep prints the count rather than a binary note.
+#[test]
+fn count_reports_binary_files_with_late_nul() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+
+    let mut content = String::new();
+    for i in 0..800 {
+        content.push_str(&format!("lateneedle line {i}\n"));
+    }
+    content.push_str("binary\u{0}marker\n");
+    content.push_str("tail lateneedle only\n");
+    fs::write(sub.join("big.txt"), &content).unwrap();
+    fs::write(sub.join("plain.txt"), "a lateneedle in plain\n").unwrap();
+
+    let idx = dir.path().join("idx").to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", &fixture_path(&dir), "--index-path", &idx])
+        .assert()
+        .success();
+
+    let local = tgrep()
+        .args(["--no-index", "-c", "lateneedle", &fixture_path(&dir)])
+        .output()
+        .unwrap();
+    let indexed = tgrep()
+        .args([
+            "--index-path",
+            &idx,
+            "-c",
+            "lateneedle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+
+    let mut a: Vec<String> = String::from_utf8_lossy(&local.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut b: Vec<String> = String::from_utf8_lossy(&indexed.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    a.sort();
+    b.sort();
+    assert!(
+        a.iter()
+            .any(|l| l.contains("big.txt") && l.ends_with(":801")),
+        "expected big.txt:801, got {a:?}"
+    );
+    assert_eq!(a, b, "-c must report binary files, not drop them");
+}
+
+/// Without `-c`, the same file is summarised as a binary note on both paths.
+#[test]
+fn binary_note_matches_between_indexed_and_brute_force() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+
+    let mut content = String::new();
+    for i in 0..800 {
+        content.push_str(&format!("notaneedle line {i}\n"));
+    }
+    content.push_str("binary\u{0}marker\n");
+    content.push_str("tail notaneedle only\n");
+    fs::write(sub.join("big.txt"), &content).unwrap();
+
+    let idx = dir.path().join("idx").to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", &fixture_path(&dir), "--index-path", &idx])
+        .assert()
+        .success();
+
+    let local = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "tail notaneedle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let indexed = tgrep()
+        .args([
+            "--index-path",
+            &idx,
+            "--no-heading",
+            "tail notaneedle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+
+    let a = String::from_utf8_lossy(&local.stdout).to_string();
+    let b = String::from_utf8_lossy(&indexed.stdout).to_string();
+    assert!(
+        a.contains("Binary file"),
+        "expected a binary note, got {a:?}"
+    );
+    assert_eq!(a, b, "binary notes must agree across search paths");
 }

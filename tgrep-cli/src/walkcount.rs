@@ -23,9 +23,10 @@ pub fn run(root: &Path, include_hidden: bool, no_ignore: bool) -> Result<()> {
 
     println!("{total}");
     eprintln!(
-        "{} text files ({} binary skipped, {} errors) in {:.0}ms",
+        "{} text files ({} binary skipped, {} too large, {} errors) in {:.0}ms",
         total,
         walk.skipped_binary,
+        walk.skipped_too_large,
         walk.skipped_error,
         elapsed.as_secs_f64() * 1000.0
     );

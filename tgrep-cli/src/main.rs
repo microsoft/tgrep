@@ -18,10 +18,16 @@ mod walkcount;
 
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::AtomicBool;
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use output::ColorMode;
 use tgrep_core::builder;
+
+/// Set when anything is reported to stderr, mirroring ripgrep's `messages`
+/// module, which drives the exit code.
+static ERRORED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
 #[command(
@@ -45,6 +51,10 @@ struct Cli {
     /// Case-insensitive matching.
     #[arg(short = 'i', long = "ignore-case", global = true)]
     ignore_case: bool,
+
+    /// Force case-sensitive matching (overrides --smart-case).
+    #[arg(short = 's', long = "case-sensitive", global = true)]
+    case_sensitive: bool,
 
     /// Smart case: case-insensitive if pattern is all lowercase.
     #[arg(short = 'S', long = "smart-case", global = true)]
@@ -70,9 +80,13 @@ struct Cli {
     #[arg(short = 'f', long = "file", global = true)]
     pattern_file: Option<String>,
 
-    /// Enable multiline matching.
+    /// Enable multiline matching (patterns may span line boundaries).
     #[arg(short = 'U', long = "multiline", global = true)]
     multiline: bool,
+
+    /// Allow `.` to match a newline. Implies --multiline.
+    #[arg(long = "multiline-dotall", global = true)]
+    multiline_dotall: bool,
 
     // ── Output mode ──────────────────────────────────
     /// Print only filenames with matches.
@@ -80,7 +94,7 @@ struct Cli {
     files_only: bool,
 
     /// Print files that do NOT match the pattern.
-    #[arg(short = 'L', long = "files-without-match", global = true)]
+    #[arg(long = "files-without-match", global = true)]
     files_without_match: bool,
 
     /// Print match count per file.
@@ -108,6 +122,14 @@ struct Cli {
     #[arg(short = 'g', long = "glob", global = true, action = clap::ArgAction::Append)]
     glob: Vec<String>,
 
+    /// Like --glob, but case-insensitive.
+    #[arg(long = "iglob", global = true, action = clap::ArgAction::Append)]
+    iglob: Vec<String>,
+
+    /// Treat all --glob patterns as case-insensitive.
+    #[arg(long = "glob-case-insensitive", global = true)]
+    glob_case_insensitive: bool,
+
     /// Filter files by type (e.g., rust, py, js). Use --type-list to see all.
     #[arg(short = 't', long = "type", global = true)]
     file_type: Option<String>,
@@ -115,6 +137,14 @@ struct Cli {
     /// Print all supported file types.
     #[arg(long = "type-list", global = true)]
     type_list: bool,
+
+    /// Ignore files larger than NUM bytes (suffixes K, M, G allowed).
+    #[arg(long = "max-filesize", global = true, value_name = "NUM")]
+    max_filesize: Option<String>,
+
+    /// Search binary files as if they were text.
+    #[arg(short = 'a', long = "text", global = true)]
+    text: bool,
 
     // ── Context ──────────────────────────────────────
     /// Lines of context after each match.
@@ -134,7 +164,7 @@ struct Cli {
     with_filename: bool,
 
     /// Suppress filenames in output.
-    #[arg(long = "no-filename", global = true)]
+    #[arg(short = 'I', long = "no-filename", global = true)]
     no_filename: bool,
 
     /// Show line numbers (default behavior, ripgrep compatibility).
@@ -189,16 +219,41 @@ struct Cli {
 
     // ── File discovery ───────────────────────────────
     /// Include hidden files and directories.
-    #[arg(long = "hidden", global = true)]
+    #[arg(short = '.', long = "hidden", global = true)]
     hidden: bool,
 
     /// Don't respect .gitignore or p4ignore.ini files.
     #[arg(long = "no-ignore", global = true)]
     no_ignore: bool,
 
+    /// Follow symbolic links while searching.
+    #[arg(short = 'L', long = "follow", global = true)]
+    follow: bool,
+
+    /// Suppress error messages about nonexistent or unreadable files.
+    #[arg(long = "no-messages", global = true)]
+    no_messages: bool,
+
     /// Unrestricted search. -u = no-ignore, -uu = +hidden, -uuu = +binary.
     #[arg(short = 'u', long = "unrestricted", action = clap::ArgAction::Count, global = true)]
     unrestricted: u8,
+}
+
+/// Parse a `--max-filesize` value, accepting K/M/G suffixes like ripgrep.
+fn parse_max_filesize(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (digits, mult) = match s.chars().last() {
+        Some('K') | Some('k') => (&s[..s.len() - 1], 1024u64),
+        Some('M') | Some('m') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('G') | Some('g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid --max-filesize value: {s}"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| anyhow::anyhow!("--max-filesize value is too large: {s}"))
 }
 
 /// Posting accumulation strategy for `tgrep index`.
@@ -337,7 +392,20 @@ enum Command {
 }
 
 impl Cli {
-    fn build_search_opts(&self, pattern: String) -> search::SearchOptions {
+    /// Resolve `--max-filesize` once, so a malformed value is reported instead
+    /// of silently falling back to a different limit than the user asked for.
+    fn max_filesize_bytes(&self) -> Result<Option<u64>> {
+        self.max_filesize
+            .as_deref()
+            .map(parse_max_filesize)
+            .transpose()
+    }
+
+    fn build_search_opts(
+        &self,
+        pattern: String,
+        max_filesize: Option<u64>,
+    ) -> search::SearchOptions {
         let heading = if self.heading {
             Some(true)
         } else if self.no_heading {
@@ -348,12 +416,14 @@ impl Cli {
         let color = ColorMode::from_str_opt(&self.color).unwrap_or(ColorMode::Auto);
         let no_ignore = self.no_ignore || self.unrestricted >= 1;
         let hidden = self.hidden || self.unrestricted >= 2;
+        let text = self.text || self.unrestricted >= 3;
 
         search::SearchOptions {
             pattern,
             extra_patterns: self.regexp.clone(),
             pattern_file: self.pattern_file.clone(),
             case_insensitive: self.ignore_case,
+            case_sensitive: self.case_sensitive,
             smart_case: self.smart_case,
             fixed_string: self.fixed_strings,
             files_only: self.files_only,
@@ -366,6 +436,8 @@ impl Cli {
             stats: self.stats,
             no_index: self.no_index,
             glob: self.glob.clone(),
+            iglob: self.iglob.clone(),
+            glob_case_insensitive: self.glob_case_insensitive,
             file_type: self.file_type.clone(),
             invert_match: self.invert_match,
             only_matching: self.only_matching,
@@ -376,12 +448,18 @@ impl Cli {
             color,
             null: self.null,
             trim: self.trim,
-            multiline: self.multiline,
+            // --multiline-dotall implies --multiline, as in ripgrep.
+            multiline: self.multiline || self.multiline_dotall,
+            multiline_dotall: self.multiline_dotall,
             no_ignore,
             hidden,
             quiet: self.quiet,
             no_filename: self.no_filename,
             no_line_number: self.no_line_number,
+            text,
+            max_filesize,
+            follow: self.follow,
+            no_messages: self.no_messages,
         }
     }
 }
@@ -396,6 +474,16 @@ fn main() {
         process::exit(0);
     }
 
+    // Validate up front: a bad --max-filesize must fail loudly rather than
+    // silently searching with a different limit than the user asked for.
+    let max_filesize = match cli.max_filesize_bytes() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("tgrep: {e}");
+            process::exit(2);
+        }
+    };
+
     let result = match cli.command {
         Some(Command::Index {
             path,
@@ -403,15 +491,17 @@ fn main() {
             strategy,
             index_buffer_mb,
             ..
-        }) => index::run(
-            &path,
-            cli.index_path.as_deref(),
-            cli.hidden,
+        }) => index::run(index::RunOptions {
+            root: &path,
+            index_path: cli.index_path.as_deref(),
+            include_hidden: cli.hidden,
             no_ignore,
-            &exclude,
-            strategy.into(),
+            exclude_dirs: &exclude,
+            strategy: strategy.into(),
             index_buffer_mb,
-        ),
+            // Indexing keeps a size cap by default; searching does not.
+            max_file_size: max_filesize.or(Some(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE)),
+        }),
         Some(Command::Serve {
             path,
             no_watch,
@@ -446,16 +536,16 @@ fn main() {
         Some(Command::Search {
             ref pattern,
             ref paths,
-        }) => run_search(&cli, pattern.clone(), paths),
+        }) => run_search(&cli, pattern.clone(), paths, max_filesize),
         Some(Command::Status { path }) => status::run(&path, cli.index_path.as_deref()),
         Some(Command::CountFiles { path }) => walkcount::run(&path, cli.hidden, no_ignore),
         None => {
             if cli.list_files {
-                let opts = cli.build_search_opts(String::new());
+                let opts = cli.build_search_opts(String::new(), max_filesize);
                 let paths = list_files_paths(&cli);
                 list_files(&paths, &opts)
             } else if let Some(pattern) = cli.pattern.clone() {
-                run_search(&cli, pattern, &cli.paths)
+                run_search(&cli, pattern, &cli.paths, max_filesize)
             } else {
                 eprintln!("Usage: tgrep <pattern> [PATH ...]");
                 eprintln!("       tgrep index [path]");
@@ -514,6 +604,7 @@ fn list_files_paths(cli: &Cli) -> Vec<String> {
 fn list_files(paths: &[String], opts: &search::SearchOptions) -> anyhow::Result<()> {
     for path in normalize_search_paths(paths) {
         if !path.exists() {
+            report_missing_path(&path, opts.no_messages);
             continue;
         }
         search::list_files(&path, opts)?;
@@ -521,12 +612,30 @@ fn list_files(paths: &[String], opts: &search::SearchOptions) -> anyhow::Result<
     Ok(())
 }
 
-fn run_search(cli: &Cli, pattern: String, paths: &[String]) -> anyhow::Result<()> {
-    let opts = cli.build_search_opts(pattern);
+/// ripgrep reports unreadable paths on stderr and finishes the remaining
+/// paths, then exits 2. Silently skipping them hides typos and broken globs.
+fn report_missing_path(path: &std::path::Path, no_messages: bool) {
+    ERRORED.store(true, std::sync::atomic::Ordering::SeqCst);
+    if !no_messages {
+        eprintln!(
+            "tgrep: {}: The system cannot find the path specified. (os error 3)",
+            path.display()
+        );
+    }
+}
+
+fn run_search(
+    cli: &Cli,
+    pattern: String,
+    paths: &[String],
+    max_filesize: Option<u64>,
+) -> anyhow::Result<()> {
+    let opts = cli.build_search_opts(pattern, max_filesize);
     let mut had_matches = false;
 
     for path in normalize_search_paths(paths) {
         if !path.exists() {
+            report_missing_path(&path, opts.no_messages);
             continue;
         }
         match search::run(&path, cli.index_path.as_deref(), &opts) {
@@ -538,14 +647,22 @@ fn run_search(cli: &Cli, pattern: String, paths: &[String]) -> anyhow::Result<()
             }
             Ok(false) => {}
             Err(e) => {
-                eprintln!("tgrep: {e}");
+                if !opts.no_messages {
+                    eprintln!("tgrep: {e}");
+                }
                 process::exit(2);
             }
         }
     }
 
-    if had_matches {
+    // ripgrep's exit code: 0 on a match with no errors, 2 if anything was
+    // reported to stderr, otherwise 1 for "no matches".
+    let errored = ERRORED.load(std::sync::atomic::Ordering::SeqCst);
+    if had_matches && (opts.quiet || !errored) {
         process::exit(0);
+    }
+    if errored {
+        process::exit(2);
     }
     process::exit(1);
 }

@@ -213,6 +213,29 @@ struct SearchOpts {
     max_count: Option<usize>,
     before_context: usize,
     after_context: usize,
+    multiline: bool,
+    /// `-a/--text`: search binary files instead of reporting a note.
+    text: bool,
+    /// `--max-filesize`: skip candidates larger than this.
+    max_filesize: Option<u64>,
+}
+
+impl SearchOpts {
+    /// The matching-relevant subset, shared with the local search path.
+    fn match_options(&self) -> crate::matching::MatchOptions {
+        crate::matching::MatchOptions {
+            invert_match: self.invert_match,
+            multiline: self.multiline,
+            only_matching: self.only_matching,
+            before_context: self.before_context,
+            after_context: self.after_context,
+            max_count: if self.files_only {
+                Some(1)
+            } else {
+                self.max_count
+            },
+        }
+    }
 }
 
 pub struct ServeOptions<'a> {
@@ -500,7 +523,7 @@ fn process_request(request: &str, state: &ServerState) -> String {
 struct SearchRequest {
     pattern: String,
     case_insensitive: bool,
-    matcher: crate::search::SearchMatcher,
+    matcher: crate::matching::SearchMatcher,
     plan: query::QueryPlan,
     glob_filter: crate::glob_filter::GlobFilter,
     file_type: Option<String>,
@@ -545,8 +568,22 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
                 .collect()
         })
         .unwrap_or_default();
+    let iglob_strs: Vec<String> = params
+        .get("iglob")
+        .and_then(|g| g.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let glob_case_insensitive = params
+        .get("glob_case_insensitive")
+        .and_then(|g| g.as_bool())
+        .unwrap_or(false);
     let glob_filter =
-        crate::glob_filter::GlobFilter::new(&glob_filter_strs).map_err(|e| format!("{e}"))?;
+        crate::glob_filter::GlobFilter::new(&glob_filter_strs, &iglob_strs, glob_case_insensitive)
+            .map_err(|e| format!("{e}"))?;
     let file_type = params
         .get("file_type")
         .and_then(|t| t.as_str())
@@ -573,31 +610,41 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .get("multiline")
         .and_then(|m| m.as_bool())
         .unwrap_or(false);
+    let multiline_dotall = params
+        .get("multiline_dotall")
+        .and_then(|m| m.as_bool())
+        .unwrap_or(false);
     let files_only = params
         .get("files_only")
         .and_then(|f| f.as_bool())
         .unwrap_or(false);
+    let text = params
+        .get("text")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    let max_filesize = params.get("max_filesize").and_then(|m| m.as_u64());
 
     // Build combined regex from all patterns
     let mut all_patterns = vec![pattern.to_string()];
     all_patterns.extend(extra_patterns);
 
-    let matcher = crate::search::build_search_matcher(
+    let matcher = crate::matching::build_search_matcher(
         &all_patterns,
         case_insensitive,
         fixed_string,
         word_boundary,
         multiline,
+        multiline_dotall,
     )
     .map_err(|e| format!("{e}"))?;
 
-    // Build query plan from primary pattern for index filtering
-    let plan = if !matcher.is_standard() {
+    // Build query plan from every pattern for index filtering. `-v` inverts at
+    // the line level, so a file matches when some line does *not* match; the
+    // trigram plan would select exactly the wrong candidates.
+    let plan = if !matcher.is_standard() || invert_match {
         query::QueryPlan::MatchAll
-    } else if fixed_string {
-        query::build_literal_plan(pattern, case_insensitive)
     } else {
-        query::build_query_plan(pattern, case_insensitive)?
+        query::build_multi_pattern_plan(&all_patterns, fixed_string, case_insensitive)?
     };
 
     Ok(SearchRequest {
@@ -614,6 +661,9 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             max_count,
             before_context,
             after_context,
+            multiline,
+            text,
+            max_filesize,
         },
     })
 }
@@ -681,6 +731,11 @@ fn handle_search(
                     return None;
                 }
                 let full_path = index.resolve_full_path(fid, &reader_snapshot)?;
+                if let Some(limit) = opts.max_filesize
+                    && std::fs::metadata(&full_path).is_ok_and(|md| md.len() > limit)
+                {
+                    return None;
+                }
                 Some((rel_path, full_path))
             })
             .collect();
@@ -725,7 +780,14 @@ fn handle_search(
         let disk_results: Vec<(String, Arc<String>)> = misses
             .into_iter()
             .filter_map(|(rel_path, full_path)| {
-                let content = std::fs::read_to_string(&full_path).ok()?;
+                // Lossy, like the local path: refusing invalid UTF-8 would make
+                // UTF-16 and Latin-1 sources silently invisible over the server
+                // while the same query works with --no-index.
+                let bytes = std::fs::read(&full_path).ok()?;
+                let content = match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+                };
                 Some((rel_path, Arc::new(content)))
             })
             .collect();
@@ -807,79 +869,73 @@ fn handle_search(
 fn search_file_matches(
     rel_path: &str,
     content: &str,
-    matcher: &crate::search::SearchMatcher,
+    matcher: &crate::matching::SearchMatcher,
     opts: &SearchOpts,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let effective_max = if opts.files_only {
-        Some(1)
-    } else {
-        opts.max_count
-    };
+    use crate::matching::{Emit, FileMatches};
 
-    let lines: Vec<&str> = content.lines().collect();
-    let match_indices =
-        crate::search::find_match_indices(&lines, matcher, opts.invert_match, effective_max)?;
-
-    if match_indices.is_empty() {
+    let match_opts = opts.match_options();
+    let found = FileMatches::find(content, matcher, &match_opts)?;
+    if found.is_empty() {
         return Ok(Vec::new());
     }
 
-    let has_context = opts.before_context > 0 || opts.after_context > 0;
+    // Never stream raw binary back to the client; report a note instead, the
+    // same way the local path does. Placed after `files_only` has already been
+    // reduced to "did it match", so `-l`/`-q` are unaffected.
+    if !opts.text
+        && !opts.files_only
+        && let Some(off) = content.as_bytes().iter().position(|&b| b == 0)
+    {
+        return Ok(vec![serde_json::json!({
+            "type": "binary",
+            "file": rel_path,
+            "offset": off,
+            // `-c` still reports a real count for binary files, so carry it
+            // here instead of streaming the file's raw contents back.
+            "lines": found.matched_lines(),
+        })]);
+    }
 
-    if has_context {
-        let printed = crate::matching::expand_context_window(
-            &match_indices,
-            lines.len(),
-            opts.before_context,
-            opts.after_context,
-        );
-        let is_match_line: std::collections::HashSet<usize> =
-            match_indices.iter().copied().collect();
-
-        let mut results = Vec::new();
-        for &li in &printed {
-            if is_match_line.contains(&li) {
-                let mc = matcher.match_content(lines[li], opts.only_matching)?;
-                let col = matcher.find_start(lines[li])?.map(|start| start + 1);
+    let mut results = Vec::new();
+    found.for_each(&match_opts, |emit| -> anyhow::Result<()> {
+        match emit {
+            Emit::Match {
+                line_number,
+                content,
+                column,
+                spans,
+                absolute_offset,
+            } => {
                 let mut entry = serde_json::json!({
                     "type": "match",
                     "file": rel_path,
-                    "line": li + 1,
-                    "content": mc,
+                    "line": line_number,
+                    "content": content,
+                    "spans": spans.iter().map(|&(s, e)| [s, e]).collect::<Vec<_>>(),
+                    "offset": absolute_offset,
                 });
-                if let Some(c) = col {
+                if let Some(c) = column {
                     entry["column"] = serde_json::json!(c);
                 }
                 results.push(entry);
-            } else {
-                results.push(serde_json::json!({
-                    "type": "context",
-                    "file": rel_path,
-                    "line": li + 1,
-                    "content": lines[li],
-                }));
             }
+            Emit::Context {
+                line_number,
+                content,
+                absolute_offset,
+            } => results.push(serde_json::json!({
+                "type": "context",
+                "file": rel_path,
+                "line": line_number,
+                "content": content,
+                "offset": absolute_offset,
+            })),
         }
-        Ok(results)
-    } else {
-        match_indices
-            .iter()
-            .map(|&mi| {
-                let mc = matcher.match_content(lines[mi], opts.only_matching)?;
-                let col = matcher.find_start(lines[mi])?.map(|start| start + 1);
-                let mut entry = serde_json::json!({
-                    "type": "match",
-                    "file": rel_path,
-                    "line": mi + 1,
-                    "content": mc,
-                });
-                if let Some(c) = col {
-                    entry["column"] = serde_json::json!(c);
-                }
-                Ok(entry)
-            })
-            .collect()
-    }
+        Ok(())
+    })?;
+
+    Ok(results)
 }
 
 fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
@@ -1695,6 +1751,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             collect_gitignore_files: true,
             strategy: builder::IndexStrategy::External,
             buffer_bytes: builder::DEFAULT_INDEX_BUFFER_BYTES,
+            ..Default::default()
         },
     ) {
         Ok(outcome) => outcome,
@@ -1885,10 +1942,11 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         .index_progress
         .store(seeded_count, std::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "[trace] walk complete: {} new files to index ({} already indexed, {} binary skipped, {} errors) in {:.1}ms",
+        "[trace] walk complete: {} new files to index ({} already indexed, {} binary skipped, {} too large, {} errors) in {:.1}ms",
         new_count,
         seeded_count,
         walk.skipped_binary,
+        walk.skipped_too_large,
         walk.skipped_error,
         t_walk.elapsed().as_secs_f64() * 1000.0
     );
@@ -2794,11 +2852,11 @@ mod tests {
     #[test]
     fn glob_filter_unix_patterns() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["**/*.cs".to_string()]).unwrap();
+        let f = GlobFilter::new(&["**/*.cs".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
-        let f2 = GlobFilter::new(&["src/**".to_string()]).unwrap();
+        let f2 = GlobFilter::new(&["src/**".to_string()], &[], false).unwrap();
         assert!(f2.matches("src/foo/bar.cs"));
         assert!(!f2.matches("lib/foo/bar.cs"));
     }
@@ -2806,14 +2864,14 @@ mod tests {
     #[test]
     fn glob_filter_backslash_normalization() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&[r"**\*.cs".to_string()]).unwrap();
+        let f = GlobFilter::new(&[r"**\*.cs".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
-        let f2 = GlobFilter::new(&[r"src\**\*.cs".to_string()]).unwrap();
+        let f2 = GlobFilter::new(&[r"src\**\*.cs".to_string()], &[], false).unwrap();
         assert!(f2.matches("src/foo/bar.cs"));
-        let f3 = GlobFilter::new(&[r"src\**".to_string()]).unwrap();
+        let f3 = GlobFilter::new(&[r"src\**".to_string()], &[], false).unwrap();
         assert!(f3.matches("src/foo/bar.cs"));
         assert!(
-            !GlobFilter::new(&[r"lib\**".to_string()])
+            !GlobFilter::new(&[r"lib\**".to_string()], &[], false)
                 .unwrap()
                 .matches("src/foo/bar.cs")
         );
@@ -2822,15 +2880,21 @@ mod tests {
     #[test]
     fn glob_filter_case_insensitive() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["**/*.CS".to_string()]).unwrap();
-        assert!(f.matches("src/foo/bar.cs"));
-        assert!(f.matches("src/foo/BAR.CS"));
+        // Globs are case-sensitive by default, as in ripgrep.
+        let sensitive = GlobFilter::new(&["**/*.CS".to_string()], &[], false).unwrap();
+        assert!(!sensitive.matches("src/foo/bar.cs"));
+        assert!(sensitive.matches("src/foo/BAR.CS"));
+
+        // --iglob opts a pattern into case-insensitive matching.
+        let insensitive = GlobFilter::new(&[], &["**/*.CS".to_string()], false).unwrap();
+        assert!(insensitive.matches("src/foo/bar.cs"));
+        assert!(insensitive.matches("src/foo/BAR.CS"));
     }
 
     #[test]
     fn glob_filter_negation_only() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["!.git".to_string()]).unwrap();
+        let f = GlobFilter::new(&["!.git".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("README.md"));
         assert!(!f.matches(".git"));
@@ -2840,7 +2904,12 @@ mod tests {
     #[test]
     fn glob_filter_inclusion_and_exclusion() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["**/*.cs".to_string(), "!**/test/**".to_string()]).unwrap();
+        let f = GlobFilter::new(
+            &["**/*.cs".to_string(), "!**/test/**".to_string()],
+            &[],
+            false,
+        )
+        .unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches("src/test/bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
@@ -2849,7 +2918,7 @@ mod tests {
     #[test]
     fn glob_filter_empty_passes_all() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&[]).unwrap();
+        let f = GlobFilter::new(&[], &[], false).unwrap();
         assert!(f.matches("anything"));
     }
 

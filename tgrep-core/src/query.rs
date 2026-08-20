@@ -55,6 +55,40 @@ pub fn build_literal_plan(literal: &str, case_insensitive: bool) -> QueryPlan {
     literals_to_query_plan(text.as_bytes())
 }
 
+/// Build one plan covering every pattern the user supplied.
+///
+/// A file matches if *any* pattern matches, so the plans are unioned. Building
+/// from only the first pattern would narrow candidates using one pattern and
+/// then search for all of them, silently hiding files that only the `-e`/`-f`
+/// patterns match.
+///
+/// As with alternation, a single `MatchAll` branch absorbs the whole plan: an
+/// unindexable pattern can match anywhere, so no candidate set is safe.
+pub fn build_multi_pattern_plan(
+    patterns: &[String],
+    fixed_string: bool,
+    case_insensitive: bool,
+) -> Result<QueryPlan, String> {
+    let mut plans = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        let plan = if fixed_string {
+            build_literal_plan(pattern, case_insensitive)
+        } else {
+            build_query_plan(pattern, case_insensitive)?
+        };
+        if plan.is_match_all() {
+            return Ok(QueryPlan::MatchAll);
+        }
+        plans.push(plan);
+    }
+
+    Ok(match plans.len() {
+        0 => QueryPlan::MatchAll,
+        1 => plans.pop().unwrap(),
+        _ => QueryPlan::Or(plans),
+    })
+}
+
 /// Convert a byte sequence into a QueryPlan of AND'd trigram queries.
 /// Each `TrigramQuery` carries the expected next byte (if any) so that
 /// next_mask Bloom-filter checks use the correct literal byte — not the
@@ -673,5 +707,45 @@ mod tests {
             candidates.is_empty(),
             "mask filtering should reject file not containing 'mutex_lock' trigrams"
         );
+    }
+
+    #[test]
+    fn multi_pattern_plan_unions_every_pattern() {
+        let patterns = vec!["alphaword".to_string(), "betaword".to_string()];
+        match build_multi_pattern_plan(&patterns, false, false).unwrap() {
+            QueryPlan::Or(branches) => assert_eq!(branches.len(), 2),
+            other => panic!("expected an OR over both patterns, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_pattern_plan_collapses_to_single_branch() {
+        let patterns = vec!["alphaword".to_string()];
+        match build_multi_pattern_plan(&patterns, false, false).unwrap() {
+            QueryPlan::And(_) => {}
+            other => panic!("a lone pattern should not be wrapped in OR, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_pattern_plan_absorbs_unindexable_patterns() {
+        // `.` matches anywhere, so no candidate set is safe: the union must
+        // degrade to a full scan rather than silently dropping that branch.
+        let patterns = vec!["alphaword".to_string(), ".".to_string()];
+        assert!(
+            build_multi_pattern_plan(&patterns, false, false)
+                .unwrap()
+                .is_match_all()
+        );
+    }
+
+    #[test]
+    fn multi_pattern_plan_supports_fixed_strings() {
+        let patterns = vec!["a.b.c(d)".to_string(), "x[y]z".to_string()];
+        // These are invalid/odd regexes but valid literals; -F must not error.
+        match build_multi_pattern_plan(&patterns, true, false).unwrap() {
+            QueryPlan::Or(branches) => assert_eq!(branches.len(), 2),
+            other => panic!("expected an OR, got {other:?}"),
+        }
     }
 }

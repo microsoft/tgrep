@@ -75,7 +75,8 @@ tgrep is designed to be significantly faster than ripgrep on large repos:
   sorted postings, file entries, and lookup entries instead of retaining the full
   inverted index in memory
 - **Smart file walking** — extension-based binary rejection (50+ formats),
-  8KB content check, 1MB file size limit
+  8KB content check, and a 1 MB size cap when *indexing* (searching is
+  uncapped by default; see `--max-filesize`)
 - **Lock-free reads** — `RwLock<HashMap>` cache allows concurrent reads
   without contention
 - **Hot serving** — queries work immediately during background index building;
@@ -185,13 +186,13 @@ tgrep "pattern" . -e "also_this"  # multiple patterns
 tgrep "pattern" . -A 3            # 3 lines after match
 tgrep "pattern" . -B 2            # 2 lines before match
 tgrep "pattern" . -C 3            # 3 lines before & after
-tgrep "pattern" . --json          # JSON output
+tgrep "pattern" . --json          # ripgrep-compatible JSON stream
 tgrep "pattern" . --vimgrep       # vim-compatible output
 tgrep "pattern" . --stats         # show query plan & timing
 tgrep "pattern" . --no-index      # brute-force (skip index)
 tgrep "pattern" . -U              # multiline matching
 tgrep "pattern" . -q              # quiet: exit code only
-tgrep "pattern" . -L              # files that DON'T match
+tgrep "pattern" . --files-without-match  # files that DON'T match
 tgrep "pattern" . --no-filename   # suppress filenames
 tgrep "pattern" . -N              # suppress line numbers
 tgrep --files .                   # list searchable files
@@ -236,6 +237,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | Flag | Description |
 |------|-------------|
 | `-i, --ignore-case` | Case-insensitive matching |
+| `-s, --case-sensitive` | Force case-sensitive matching (overrides `-S`) |
 | `-S, --smart-case` | Case-insensitive if pattern is all lowercase |
 | `-F, --fixed-strings` | Treat pattern as a literal string |
 | `-w, --word-regexp` | Match whole words only |
@@ -243,15 +245,18 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-o, --only-matching` | Print only the matched parts |
 | `-e, --regexp <PAT>` | Additional pattern (repeatable for OR) |
 | `-f, --file <FILE>` | Read patterns from file (one per line) |
-| `-U, --multiline` | Enable multiline matching |
+| `-U, --multiline` | Enable multiline matching (`.` still excludes `\n`) |
+| `--multiline-dotall` | Make `.` match `\n`; implies `-U` |
 | `-n, --line-number` | Show line numbers (default: on) |
 | `-N, --no-line-number` | Suppress line numbers |
 | `-c, --count` | Print match count per file |
 | `-l, --files-with-matches` | Print only filenames |
-| `-L, --files-without-match` | Print files that do NOT match |
+| `--files-without-match` | Print files that do NOT match |
 | `-q, --quiet` | Suppress output; exit code only |
 | `-m, --max-count <N>` | Limit matches per file |
-| `-g, --glob <GLOB>` | Filter files by glob pattern (repeatable) |
+| `-g, --glob <GLOB>` | Filter files by glob pattern, case-sensitive (repeatable) |
+| `--iglob <GLOB>` | Case-insensitive glob filter (repeatable) |
+| `--glob-case-insensitive` | Treat all `-g` globs as case-insensitive |
 | `-t, --type <TYPE>` | Filter by file type (`rust`, `py`, `js`, …) |
 | `--type-list` | Print all supported file types |
 | `--files` | List files that would be searched |
@@ -260,19 +265,46 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-C, --context <N>` | Lines of context before and after |
 | `--heading / --no-heading` | Grouped vs flat output |
 | `-H, --with-filename` | Show filenames (default: on) |
-| `--no-filename` | Suppress filenames in output |
-| `--json` | JSON output (one object per line) |
-| `--vimgrep` | Vim-compatible `file:line:col:content` |
+| `-I, --no-filename` | Suppress filenames in output |
+| `--json` | ripgrep-compatible JSON stream (one object per line) |
+| `--vimgrep` | Vim-compatible `file:line:col:content`, one row per match |
 | `--color auto/always/never` | Color mode control |
 | `-0, --null` | NUL byte filename separator (for xargs) |
 | `--trim` | Trim leading/trailing whitespace |
-| `--hidden` | Include hidden files and directories |
+| `-., --hidden` | Include hidden files and directories |
 | `--no-ignore` | Don't respect `.gitignore` or `p4ignore.ini` files |
-| `-u` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden |
+| `-a, --text` | Search binary files as if they were text |
+| `-u` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden, `-uuu` = +binary |
+| `--max-filesize <SIZE>` | Skip files larger than `SIZE` (`K`/`M`/`G` suffixes) |
+| `-L, --follow` | Follow symbolic links |
+| `--no-messages` | Suppress error messages about unreadable/missing paths |
 | `--no-index` | Skip index, grep all files |
 | `--exclude <DIR>` | Exclude directory from indexing (repeatable) |
 | `--stats` | Print query plan and candidate stats |
 | `--index-path <DIR>` | Custom index directory |
+
+> **Note:** `-L` means `--follow` (as in ripgrep). Use the long
+> `--files-without-match` for the non-matching-files listing.
+
+### File size limits
+
+Searching has **no size limit** by default — every text file is searched
+regardless of size. Pass `--max-filesize` to opt into one.
+
+`tgrep index` still caps indexed files at 1 MiB by default (large files are
+mostly generated data and bloat the index); `--max-filesize` overrides that too.
+
+### Exit codes
+
+Same as ripgrep:
+
+| Code | Meaning |
+|------|---------|
+| `0` | At least one match was found |
+| `1` | No matches |
+| `2` | An error occurred (e.g. a path could not be read) |
+
+A match plus an error yields `2`, unless `-q` is set, which yields `0`.
 
 ## How It Works
 

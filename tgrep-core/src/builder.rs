@@ -64,6 +64,12 @@ pub struct BuildOptions {
     /// Arena budget in bytes for [`IndexStrategy::External`]. Ignored by
     /// [`IndexStrategy::InMemory`].
     pub buffer_bytes: usize,
+    /// Skip files larger than this. `None` indexes files of any size.
+    ///
+    /// Indexing every byte of a huge repository is expensive, so the default
+    /// keeps a cap — but searching must be able to raise it, otherwise large
+    /// files are invisible to indexed queries.
+    pub max_file_size: Option<u64>,
 }
 
 impl Default for BuildOptions {
@@ -75,6 +81,7 @@ impl Default for BuildOptions {
             collect_gitignore_files: false,
             strategy: IndexStrategy::default(),
             buffer_bytes: external::DEFAULT_BUFFER_BYTES,
+            max_file_size: Some(walker::DEFAULT_MAX_FILE_SIZE),
         }
     }
 }
@@ -182,13 +189,15 @@ pub fn build_index_with_options(
             no_ignore,
             collect_gitignore_files: opts.collect_gitignore_files,
             exclude_dirs: exclude_dirs.to_vec(),
+            max_file_size: opts.max_file_size,
             ..Default::default()
         },
     );
     eprintln!(
-        "Found {} text files ({} binary skipped, {} errors)",
+        "Found {} text files ({} binary skipped, {} too large, {} errors)",
         walk.files.len(),
         walk.skipped_binary,
+        walk.skipped_too_large,
         walk.skipped_error
     );
     let gitignore_files = walk.gitignore_files;

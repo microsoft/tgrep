@@ -264,10 +264,11 @@ impl LiveIndex {
         let full_path = root.join(rel_path);
         match std::fs::read(&full_path) {
             Ok(data) => {
-                if trigram::is_binary(&data) {
+                let text = crate::encoding::decode_for_index(&data);
+                if trigram::is_binary(&text) {
                     self.delete_file(rel_path);
                 } else {
-                    self.upsert_file(rel_path, &data);
+                    self.upsert_file(rel_path, &text);
                 }
             }
             Err(_) => {

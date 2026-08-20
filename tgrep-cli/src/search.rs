@@ -4,7 +4,7 @@
 /// over TCP. Otherwise, the on-disk index is loaded directly.
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -15,7 +15,7 @@ use tgrep_core::reader::IndexReader;
 use tgrep_core::walker;
 
 use crate::matching::SearchMatcher;
-use crate::output::{ColorMode, ContextLine, Match, OutputConfig, OutputWriter};
+use crate::output::{ColorMode, ContextLine, Match, OutputConfig, OutputFormat, OutputWriter};
 use crate::serve::ServerInfo;
 
 pub struct SearchOptions {
@@ -38,7 +38,10 @@ pub struct SearchOptions {
     pub glob: Vec<String>,
     pub iglob: Vec<String>,
     pub glob_case_insensitive: bool,
-    pub file_type: Option<String>,
+    pub types: Vec<String>,
+    pub types_not: Vec<String>,
+    pub type_add: Vec<String>,
+    pub type_clear: Vec<String>,
     pub invert_match: bool,
     pub only_matching: bool,
     pub after_context: Option<usize>,
@@ -57,8 +60,102 @@ pub struct SearchOptions {
     pub no_line_number: bool,
     pub text: bool,
     pub max_filesize: Option<u64>,
+    pub encoding: tgrep_core::encoding::EncodingMode,
     pub follow: bool,
     pub no_messages: bool,
+    // ── Matching ──
+    pub line_regexp: bool,
+    pub no_unicode: bool,
+    pub engine: crate::matching::RegexEngine,
+    pub regex_size_limit: Option<usize>,
+    pub dfa_size_limit: Option<usize>,
+    pub replace: Option<String>,
+    pub passthru: bool,
+    pub stop_on_nonmatch: bool,
+    // ── Output detail ──
+    pub column: bool,
+    pub byte_offset: bool,
+    pub max_columns: Option<usize>,
+    pub max_columns_preview: bool,
+    pub count_matches: bool,
+    pub include_zero: bool,
+    pub context_separator: Option<String>,
+    pub field_match_separator: String,
+    pub field_context_separator: String,
+    pub path_separator: Option<String>,
+    pub sort: Option<SortMode>,
+    // ── File discovery ──
+    pub max_depth: Option<usize>,
+    pub one_file_system: bool,
+    pub ignore_files: Vec<String>,
+    pub ignore_file_case_insensitive: bool,
+    pub no_ignore_dot: bool,
+    pub no_ignore_exclude: bool,
+    pub no_ignore_global: bool,
+    pub no_ignore_parent: bool,
+    pub no_ignore_vcs: bool,
+    pub no_require_git: bool,
+    pub threads: Option<usize>,
+    pub line_buffered: bool,
+}
+
+/// What `--sort`/`--sortr` orders results by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SortMode {
+    pub key: SortKey,
+    pub reverse: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortKey {
+    Path,
+    Modified,
+    Accessed,
+    Created,
+}
+
+impl SortKey {
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "path" => Some(Self::Path),
+            "modified" => Some(Self::Modified),
+            "accessed" => Some(Self::Accessed),
+            "created" => Some(Self::Created),
+            _ => None,
+        }
+    }
+}
+
+impl SortMode {
+    /// Order paths for `--sort`/`--sortr`.
+    ///
+    /// Metadata reads can fail (races, permissions); those paths sort first
+    /// ascending so a transient error can't drop a file from the results.
+    pub fn apply(&self, paths: &mut [PathBuf]) {
+        match self.key {
+            SortKey::Path => paths.sort(),
+            _ => {
+                let key = self.key;
+                // Cached: `sort_by_key` re-reads the key on every comparison,
+                // which would be O(n log n) metadata syscalls over a large repo.
+                paths.sort_by_cached_key(|p| (time_key(p, key), p.clone()));
+            }
+        }
+        if self.reverse {
+            paths.reverse();
+        }
+    }
+}
+
+/// Read the timestamp `--sort` selected, if the platform records it.
+fn time_key(path: &Path, key: SortKey) -> Option<std::time::SystemTime> {
+    let md = std::fs::metadata(path).ok()?;
+    match key {
+        SortKey::Modified => md.modified().ok(),
+        SortKey::Accessed => md.accessed().ok(),
+        SortKey::Created => md.created().ok(),
+        SortKey::Path => None,
+    }
 }
 
 impl SearchOptions {
@@ -94,6 +191,18 @@ impl SearchOptions {
             search_binary: self.text,
             follow_links: self.follow,
             max_file_size: self.max_filesize,
+            max_depth: self.max_depth,
+            same_file_system: self.one_file_system,
+            ignore_files: self.ignore_files.iter().map(Into::into).collect(),
+            ignore_files_case_insensitive: self.ignore_file_case_insensitive,
+            no_ignore_dot: self.no_ignore_dot,
+            no_ignore_exclude: self.no_ignore_exclude,
+            no_ignore_global: self.no_ignore_global,
+            no_ignore_parent: self.no_ignore_parent,
+            no_ignore_vcs: self.no_ignore_vcs,
+            no_require_git: self.no_require_git,
+            no_ignore_messages: self.no_messages,
+            threads: self.threads,
             ..Default::default()
         }
     }
@@ -117,17 +226,49 @@ impl SearchOptions {
             } else {
                 self.max_count
             },
+            // `--passthru` prints the whole file, so it cannot also stop early
+            // at a match limit, and it is meaningless when only file names or
+            // counts are printed.
+            passthru: self.passthru
+                && !self.files_only
+                && !self.files_without_match
+                && !self.count
+                && !self.count_matches
+                && !self.quiet,
+            replace: self.replace.clone(),
+            stop_on_nonmatch: self.stop_on_nonmatch,
         }
     }
 
     fn matcher(&self, ci: bool) -> Result<SearchMatcher> {
-        crate::matching::build_search_matcher(
-            &self.all_patterns()?,
-            ci,
-            self.fixed_string,
-            self.word_boundary,
-            self.multiline,
-            self.dotall(),
+        crate::matching::build_search_matcher(&self.all_patterns()?, &self.matcher_config(ci))
+    }
+
+    /// Pattern-compilation settings, shared with the server path.
+    pub fn matcher_config(&self, ci: bool) -> crate::matching::MatcherConfig {
+        crate::matching::MatcherConfig {
+            case_insensitive: ci,
+            fixed_string: self.fixed_string,
+            word_boundary: self.word_boundary,
+            line_regexp: self.line_regexp,
+            multiline: self.multiline,
+            dotall: self.dotall(),
+            no_unicode: self.no_unicode,
+            engine: self.engine,
+            regex_size_limit: self.regex_size_limit,
+            dfa_size_limit: self.dfa_size_limit,
+        }
+    }
+
+    /// Compile `--type-add`/`--type-clear` into the effective definitions, then
+    /// build the `-t`/`-T` matcher. Shared with the server via the same fields
+    /// so both sides derive an identical filter.
+    pub fn type_filter(&self) -> Result<filetypes::TypeFilter> {
+        build_type_filter(
+            &self.type_add,
+            &self.type_clear,
+            &self.types,
+            &self.types_not,
         )
     }
 
@@ -135,26 +276,43 @@ impl SearchOptions {
     pub fn after_ctx(&self) -> usize {
         self.after_context.or(self.context).unwrap_or(0)
     }
-
     /// Effective before-context lines.
     pub fn before_ctx(&self) -> usize {
         self.before_context.or(self.context).unwrap_or(0)
     }
 
     fn make_output_config(&self) -> OutputConfig {
-        OutputConfig::from_flags(
-            self.json,
-            self.files_only,
-            self.count,
-            self.vimgrep,
-            self.heading,
-            self.color,
-            self.null,
-            self.trim,
-            self.no_filename,
-            self.no_line_number,
-            self.after_ctx() > 0 || self.before_ctx() > 0,
-        )
+        let format = if self.json {
+            OutputFormat::Json
+        } else if self.files_only {
+            OutputFormat::FilesOnly
+        } else if self.count || self.count_matches {
+            OutputFormat::Count
+        } else if self.vimgrep {
+            OutputFormat::Vimgrep
+        } else {
+            // Heading vs flat is resolved in the writer.
+            OutputFormat::Heading
+        };
+        OutputConfig {
+            format,
+            color: self.color,
+            heading: self.heading,
+            null: self.null,
+            trim: self.trim,
+            no_filename: self.no_filename,
+            no_line_number: self.no_line_number,
+            context: self.after_ctx() > 0 || self.before_ctx() > 0,
+            column: self.column,
+            byte_offset: self.byte_offset,
+            max_columns: self.max_columns,
+            max_columns_preview: self.max_columns_preview,
+            context_separator: self.context_separator.clone(),
+            field_match_separator: self.field_match_separator.clone(),
+            field_context_separator: self.field_context_separator.clone(),
+            path_separator: self.path_separator.clone(),
+            line_buffered: self.line_buffered,
+        }
     }
 
     /// Collect all patterns (primary + -e extras + -f file patterns).
@@ -182,11 +340,12 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     let glob_filter = opts.glob_filter()?;
+    let type_filter = opts.type_filter()?;
 
     if root.is_file() {
         let rel_path = explicit_file_display_path(&root);
 
-        if passes_filters(&rel_path, &glob_filter, &opts.file_type) {
+        if passes_filters(&rel_path, &glob_filter, &type_filter) {
             let mut writer = OutputWriter::new(opts.make_output_config());
             writer.write_file(&rel_path)?;
             writer.flush()?;
@@ -204,12 +363,7 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
             .to_string_lossy()
             .replace('\\', "/");
 
-        if let Some(ref type_name) = opts.file_type
-            && !filetypes::matches_type(&rel_path, type_name)
-        {
-            continue;
-        }
-        if !glob_filter.matches(&rel_path) {
+        if !passes_filters(&rel_path, &glob_filter, &type_filter) {
             continue;
         }
         writer.write_file(&rel_path)?;
@@ -230,20 +384,31 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
 
     let ci = opts.effective_case_insensitive();
 
+    // A non-default `--encoding` re-decodes files into text the index never
+    // saw. Worse, a file the indexer classified as binary (BOM-less UTF-16 is
+    // nothing but NUL-interleaved bytes) is absent from the index entirely, so
+    // even a full-scan plan cannot reach it. The only way `-E` means the same
+    // thing with and without an index is to walk the tree.
+    let bypass_index = opts.encoding.may_differ_from_index();
+
     // Try to delegate to a running server (skip for files_without_match
-    // since the server only returns matching files).
+    // since the server only returns matching files). `--include-zero` needs
+    // the same bypass: a zero-count row can only come from a file the server
+    // never reports.
     if !opts.no_index
+        && !bypass_index
         && !opts.files_without_match
+        && !opts.include_zero
         && let Ok(info) = ServerInfo::load(&index_dir)
     {
-        if let Ok(had_matches) = search_via_server(&info, opts, ci) {
+        if let Ok(had_matches) = search_via_server(&info, &root, opts, ci) {
             return Ok(had_matches);
         }
         eprintln!("Server unreachable, falling back to local index");
     }
 
     // No server — use on-disk index directly (or brute force)
-    if opts.no_index {
+    if opts.no_index || bypass_index {
         return brute_force_search(&root, opts, ci);
     }
     if !index_dir.join("lookup.bin").exists() {
@@ -302,7 +467,12 @@ fn warn_missing_index(index_dir: &Path, explicit_path: bool, quiet: bool) {
     }
 }
 
-fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Result<bool> {
+fn search_via_server(
+    info: &ServerInfo,
+    root: &Path,
+    opts: &SearchOptions,
+    ci: bool,
+) -> Result<bool> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
 
@@ -318,7 +488,7 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
 
     // Context lines are pure presentation; requesting them while counting would
     // stream rows the count path has to filter back out.
-    let wants_context = !(opts.count || opts.files_only || opts.quiet);
+    let wants_context = !(opts.count || opts.count_matches || opts.files_only || opts.quiet);
 
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -334,7 +504,10 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
             "glob": opts.glob,  // sent as JSON array
             "iglob": opts.iglob,
             "glob_case_insensitive": opts.glob_case_insensitive,
-            "file_type": opts.file_type,
+            "types": opts.types,
+            "types_not": opts.types_not,
+            "type_add": opts.type_add,
+            "type_clear": opts.type_clear,
             "invert_match": opts.invert_match,
             "only_matching": opts.only_matching,
             "after_context": if wants_context { opts.after_ctx() } else { 0 },
@@ -343,6 +516,15 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
             "multiline_dotall": opts.dotall(),
             "text": opts.text,
             "max_filesize": opts.max_filesize,
+            "encoding": opts.encoding.label(),
+            "line_regexp": opts.line_regexp,
+            "no_unicode": opts.no_unicode,
+            "engine": opts.engine.label(),
+            "regex_size_limit": opts.regex_size_limit,
+            "dfa_size_limit": opts.dfa_size_limit,
+            "replace": opts.replace,
+            "passthru": opts.match_options().passthru,
+            "stop_on_nonmatch": opts.stop_on_nonmatch,
         },
         "id": 1,
     });
@@ -373,6 +555,55 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
         .and_then(|m| m.as_array())
         .unwrap_or(&empty_vec);
 
+    // `--sort` reorders whole files. Ranking distinct files once (one metadata
+    // read each) and sorting rows by rank keeps every file's rows in the
+    // server's line order. The key is a `PathBuf` so the order matches the
+    // brute-force walk, which compares paths component-wise.
+    let sorted;
+    let matches = match opts.sort {
+        None => matches,
+        Some(sort) => {
+            let mut ranked: Vec<(Option<std::time::SystemTime>, PathBuf, String)> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for m in matches {
+                let Some(rel) = m.get("file").and_then(|f| f.as_str()) else {
+                    continue;
+                };
+                if !seen.insert(rel.to_string()) {
+                    continue;
+                }
+                let t = if sort.key == SortKey::Path {
+                    None
+                } else {
+                    time_key(
+                        &root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+                        sort.key,
+                    )
+                };
+                ranked.push((t, PathBuf::from(rel), rel.to_string()));
+            }
+            ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            if sort.reverse {
+                ranked.reverse();
+            }
+            let rank: std::collections::HashMap<&str, usize> = ranked
+                .iter()
+                .enumerate()
+                .map(|(i, (_, _, f))| (f.as_str(), i))
+                .collect();
+
+            let mut rows = matches.clone();
+            rows.sort_by_key(|m| {
+                m.get("file")
+                    .and_then(|f| f.as_str())
+                    .and_then(|f| rank.get(f).copied())
+                    .unwrap_or(usize::MAX)
+            });
+            sorted = rows;
+            &sorted
+        }
+    };
+
     let mut writer = OutputWriter::new(opts.make_output_config());
     let had_matches = !matches.is_empty();
 
@@ -390,13 +621,16 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
                 writer.write_file(file)?;
             }
         }
-    } else if opts.count {
+    } else if opts.count || opts.count_matches {
         // `-c` counts matching *lines*, so collapse rows that share a line
         // (`-o` emits one per match) and ignore context rows. This is what the
         // local path reports via `FileMatches::matched_lines`.
+        // `--count-matches` instead sums the spans on each row, which is what
+        // `FileMatches::match_count` reports locally.
         let mut order: Vec<String> = Vec::new();
         let mut lines: std::collections::HashMap<String, std::collections::HashSet<usize>> =
             std::collections::HashMap::new();
+        let mut spans: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         // A binary file is summarised as a single `binary` row rather than one
         // row per match, so it carries its own line count. The local path still
         // prints a real count for it because `-c` returns before the binary
@@ -419,6 +653,14 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
             } else {
                 let line = m.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
                 lines.entry(file.to_string()).or_default().insert(line);
+                // A row with no spans is still one match (`-v` reports inverted
+                // lines with an empty span list).
+                let n = m
+                    .get("spans")
+                    .and_then(|s| s.as_array())
+                    .map(|s| s.len().max(1))
+                    .unwrap_or(1);
+                *spans.entry(file.to_string()).or_default() += n;
             }
         }
         // Emit in response order; iterating the maps would randomise the file
@@ -427,7 +669,13 @@ fn search_via_server(info: &ServerInfo, opts: &SearchOptions, ci: bool) -> Resul
             let n = exact
                 .get(file)
                 .copied()
-                .or_else(|| lines.get(file).map(|l| l.len()))
+                .or_else(|| {
+                    if opts.count_matches {
+                        spans.get(file).copied()
+                    } else {
+                        lines.get(file).map(|l| l.len())
+                    }
+                })
                 .unwrap_or(0);
             writer.write_count(file, n)?;
         }
@@ -497,11 +745,14 @@ fn search_local_index(
     let start = Instant::now();
     let reader = IndexReader::open(index_dir)?;
     let glob_filter = opts.glob_filter()?;
+    let type_filter = opts.type_filter()?;
 
     let matcher = opts.matcher(ci)?;
 
-    // Narrow candidates using every pattern, not just the primary one.
-    let plan = if !matcher.is_standard() {
+    // Narrow candidates using every pattern, not just the primary one. A
+    // non-default `--encoding` re-decodes files into text the index never saw,
+    // so the trigram plan cannot be trusted to find them.
+    let plan = if !matcher.is_standard() || opts.encoding.may_differ_from_index() {
         QueryPlan::MatchAll
     } else {
         query::build_multi_pattern_plan(&opts.all_patterns()?, opts.fixed_string, ci)
@@ -512,11 +763,43 @@ fn search_local_index(
 
     // `-v` inverts at the *line* level: a file matches when some line does not.
     // The trigram plan selects files that contain the pattern, which is exactly
-    // the wrong filter, so it has to be bypassed. Same for `--files-without-match`.
-    let candidates = if is_match_all || opts.files_without_match || opts.invert_match {
-        reader.all_file_ids()
-    } else {
-        query::execute_plan_with_masks(&plan, &|tri| reader.lookup_trigram_with_masks(tri))
+    // the wrong filter, so it has to be bypassed. Same for `--files-without-match`
+    // and `--include-zero`, which both have to report files the plan excluded.
+    let candidates =
+        if is_match_all || opts.files_without_match || opts.invert_match || opts.include_zero {
+            reader.all_file_ids()
+        } else {
+            query::execute_plan_with_masks(&plan, &|tri| reader.lookup_trigram_with_masks(tri))
+        };
+
+    // `--sort` has to apply here too, otherwise it would silently do nothing on
+    // the default (indexed) code path. The key is a `PathBuf` so the order
+    // matches the brute-force walk, which compares paths component-wise; a raw
+    // string compare would sort `src.rs` before `src/lib.rs`.
+    let candidates = match opts.sort {
+        None => candidates,
+        Some(sort) => {
+            let mut keyed: Vec<_> = candidates
+                .iter()
+                .map(|&fid| {
+                    let rel = reader.file_path(fid).unwrap_or_default().to_string();
+                    let t = if sort.key == SortKey::Path {
+                        None
+                    } else {
+                        time_key(
+                            &root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
+                            sort.key,
+                        )
+                    };
+                    (t, PathBuf::from(rel), fid)
+                })
+                .collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            if sort.reverse {
+                keyed.reverse();
+            }
+            keyed.into_iter().map(|(_, _, fid)| fid).collect()
+        }
     };
 
     if opts.stats {
@@ -537,7 +820,7 @@ fn search_local_index(
             None => continue,
         };
 
-        if !passes_filters(&rel_path, &glob_filter, &opts.file_type) {
+        if !passes_filters(&rel_path, &glob_filter, &type_filter) {
             continue;
         }
 
@@ -545,7 +828,7 @@ fn search_local_index(
         if exceeds_max_filesize(&full_path, opts) {
             continue;
         }
-        let content = match read_text_lossy(&full_path) {
+        let content = match read_text_lossy(&full_path, opts.encoding) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -584,6 +867,7 @@ fn search_local_index(
 fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<bool> {
     let start = Instant::now();
     let glob_filter = opts.glob_filter()?;
+    let type_filter = opts.type_filter()?;
 
     let matcher = opts.matcher(ci)?;
 
@@ -592,10 +876,10 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
 
     if root.is_file() {
         let rel_path = explicit_file_display_path(root);
-        if passes_filters(&rel_path, &glob_filter, &opts.file_type)
+        if passes_filters(&rel_path, &glob_filter, &type_filter)
             && !exceeds_max_filesize(root, opts)
         {
-            let content = read_text_lossy(root)?;
+            let content = read_text_lossy(root, opts.encoding)?;
             let matched = search_file_content(&content, &matcher, &rel_path, opts, &mut writer)?;
             if matched {
                 if !opts.files_without_match {
@@ -621,7 +905,10 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
         return Ok(had_matches);
     }
 
-    let walk = walker::walk_dir(root, &opts.walk_options());
+    let mut walk = walker::walk_dir(root, &opts.walk_options());
+    if let Some(sort) = opts.sort {
+        sort.apply(&mut walk.files);
+    }
 
     for path in &walk.files {
         let rel_path = path
@@ -630,11 +917,11 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
             .to_string_lossy()
             .replace('\\', "/");
 
-        if !passes_filters(&rel_path, &glob_filter, &opts.file_type) {
+        if !passes_filters(&rel_path, &glob_filter, &type_filter) {
             continue;
         }
 
-        let content = match read_text_lossy(path) {
+        let content = match read_text_lossy(path, opts.encoding) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -671,16 +958,17 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
     Ok(had_matches)
 }
 
-/// Read a file as text, replacing invalid UTF-8 rather than failing.
+/// Read a file as text, applying `--encoding` and replacing invalid UTF-8
+/// rather than failing.
 ///
 /// ripgrep searches files that are not valid UTF-8; refusing them makes
 /// UTF-16, Latin-1 and mixed-encoding sources silently invisible.
-fn read_text_lossy(path: &Path) -> std::io::Result<String> {
+fn read_text_lossy(
+    path: &Path,
+    encoding: tgrep_core::encoding::EncodingMode,
+) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
-    Ok(match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    })
+    Ok(tgrep_core::encoding::decode(&bytes, encoding))
 }
 
 /// Whether `--max-filesize` excludes this file.
@@ -711,6 +999,12 @@ fn search_file_content(
     let found = crate::matching::FileMatches::find(content, matcher, &match_opts)?;
 
     if found.is_empty() {
+        // `--include-zero` still reports files that were searched but had no
+        // match, which is the only way to tell them apart from files that were
+        // never looked at.
+        if opts.include_zero && (opts.count || opts.count_matches) && !opts.quiet {
+            writer.write_count(rel_path, 0)?;
+        }
         return Ok(false);
     }
 
@@ -724,8 +1018,13 @@ fn search_file_content(
         return Ok(true);
     }
 
-    if opts.count {
-        writer.write_count(rel_path, found.matched_lines())?;
+    if opts.count || opts.count_matches {
+        let n = if opts.count_matches {
+            found.match_count()
+        } else {
+            found.matched_lines()
+        };
+        writer.write_count(rel_path, n)?;
         return Ok(true);
     }
 
@@ -737,37 +1036,40 @@ fn search_file_content(
         return Ok(true);
     }
 
-    found.for_each(&match_opts, |emit| match emit {
-        crate::matching::Emit::Match {
-            line_number,
-            content,
-            column,
-            spans,
-            absolute_offset,
-        } => {
-            writer.write_context_separator(rel_path, line_number)?;
-            writer.write_match(&Match {
-                file: rel_path.to_string(),
+    found.for_each(&match_opts, matcher, |emit| -> Result<()> {
+        match emit {
+            crate::matching::Emit::Match {
                 line_number,
-                content: content.to_string(),
+                content,
                 column,
                 spans,
                 absolute_offset,
-            })
-        }
-        crate::matching::Emit::Context {
-            line_number,
-            content,
-            absolute_offset,
-        } => {
-            writer.write_context_separator(rel_path, line_number)?;
-            writer.write_context_line(&ContextLine {
-                file: rel_path.to_string(),
+            } => {
+                writer.write_context_separator(rel_path, line_number)?;
+                writer.write_match(&Match {
+                    file: rel_path.to_string(),
+                    line_number,
+                    content: content.into_owned(),
+                    column,
+                    spans,
+                    absolute_offset,
+                })?;
+            }
+            crate::matching::Emit::Context {
                 line_number,
-                content: content.to_string(),
+                content,
                 absolute_offset,
-            })
+            } => {
+                writer.write_context_separator(rel_path, line_number)?;
+                writer.write_context_line(&ContextLine {
+                    file: rel_path.to_string(),
+                    line_number,
+                    content: content.to_string(),
+                    absolute_offset,
+                })?;
+            }
         }
+        Ok(())
     })?;
 
     Ok(true)
@@ -791,14 +1093,33 @@ fn explicit_file_display_path(path: &Path) -> String {
 fn passes_filters(
     rel_path: &str,
     glob_filter: &crate::glob_filter::GlobFilter,
-    file_type: &Option<String>,
+    type_filter: &filetypes::TypeFilter,
 ) -> bool {
-    if let Some(type_name) = file_type
-        && !filetypes::matches_type(rel_path, type_name)
-    {
-        return false;
+    type_filter.matches(rel_path) && glob_filter.matches(rel_path)
+}
+
+/// Apply `--type-clear` then `--type-add` to the built-in definitions and
+/// compile the `-t`/`-T` selections. Lives here rather than on `SearchOptions`
+/// so the server can reuse it verbatim from its own request fields.
+pub fn build_type_filter(
+    type_add: &[String],
+    type_clear: &[String],
+    types: &[String],
+    types_not: &[String],
+) -> Result<filetypes::TypeFilter> {
+    if type_add.is_empty() && type_clear.is_empty() && types.is_empty() && types_not.is_empty() {
+        return Ok(filetypes::TypeFilter::default());
     }
-    glob_filter.matches(rel_path)
+    let mut defs = filetypes::TypeDefs::builtin();
+    // Clears run first so `--type-clear foo --type-add foo:*.x` redefines a
+    // type from scratch, which is the documented ripgrep idiom.
+    for name in type_clear {
+        defs.clear(name);
+    }
+    for spec in type_add {
+        defs.add(spec)?;
+    }
+    defs.build_filter(types, types_not)
 }
 
 fn plan_summary(plan: &QueryPlan) -> String {

@@ -3,6 +3,7 @@
 //! the match-and-context traversal so the two callers cannot drift apart —
 //! they differ only in how they render the resulting events.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use anyhow::Result;
@@ -195,6 +196,105 @@ impl SearchMatcher {
         }
         Ok(spans)
     }
+
+    /// Rewrite every match in `hay` using `replacement`, which may reference
+    /// capture groups as `$1` or `${name}`.
+    ///
+    /// Returns the rewritten text plus the byte ranges the replacements now
+    /// occupy, so `--replace` still highlights and reports columns correctly.
+    pub fn replace_all(
+        &self,
+        hay: &str,
+        replacement: &str,
+    ) -> Result<(String, Vec<(usize, usize)>)> {
+        let mut out = String::with_capacity(hay.len());
+        let mut spans = Vec::new();
+        let mut last = 0usize;
+        for (start, end, expanded) in self.expansions(hay, replacement)? {
+            out.push_str(&hay[last..start]);
+            let span_start = out.len();
+            out.push_str(&expanded);
+            spans.push((span_start, out.len()));
+            last = end;
+        }
+        out.push_str(&hay[last..]);
+        Ok((out, spans))
+    }
+
+    /// The expanded replacement for each match, with the match's byte range.
+    fn expansions(&self, hay: &str, replacement: &str) -> Result<Vec<(usize, usize, String)>> {
+        let mut out = Vec::new();
+        match self {
+            SearchMatcher::Standard(re) => {
+                for caps in re.captures_iter(hay) {
+                    let m = caps.get(0).expect("group 0 always participates");
+                    let mut dst = String::new();
+                    caps.expand(replacement, &mut dst);
+                    out.push((m.start(), m.end(), dst));
+                }
+            }
+            SearchMatcher::Fancy(re) => {
+                for caps in re.captures_iter(hay) {
+                    let caps = caps.map_err(|e| anyhow::anyhow!("regex match error: {e}"))?;
+                    let m = caps.get(0).expect("group 0 always participates");
+                    let mut dst = String::new();
+                    caps.expand(replacement, &mut dst);
+                    out.push((m.start(), m.end(), dst));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Which regex engine to use, mirroring ripgrep's `--engine`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RegexEngine {
+    /// Rust's `regex`, falling back to the PCRE-style engine when a pattern
+    /// uses backreferences or lookaround.
+    #[default]
+    Auto,
+    /// Rust's `regex` only; an unsupported pattern is an error.
+    Default,
+    /// Always use the PCRE-style engine (`-P/--pcre2`).
+    Pcre2,
+}
+
+impl RegexEngine {
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "default" => Some(Self::Default),
+            "pcre2" => Some(Self::Pcre2),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    /// The canonical name, used to transport the choice over RPC.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Pcre2 => "pcre2",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// Everything that affects how the pattern itself is compiled.
+#[derive(Clone, Debug, Default)]
+pub struct MatcherConfig {
+    pub case_insensitive: bool,
+    pub fixed_string: bool,
+    pub word_boundary: bool,
+    /// `-x/--line-regexp`: the pattern must match a whole line.
+    pub line_regexp: bool,
+    pub multiline: bool,
+    pub dotall: bool,
+    /// `--no-unicode`: disable Unicode-aware character classes.
+    pub no_unicode: bool,
+    pub engine: RegexEngine,
+    pub regex_size_limit: Option<usize>,
+    pub dfa_size_limit: Option<usize>,
 }
 
 /// Compile `patterns` into a single matcher.
@@ -202,54 +302,73 @@ impl SearchMatcher {
 /// `multiline` lets a match cross line boundaries; `dotall` is kept separate
 /// so `-U` alone does not silently turn `.` into a line-crossing wildcard,
 /// matching ripgrep's split between `--multiline` and `--multiline-dotall`.
-pub fn build_search_matcher(
-    patterns: &[String],
-    case_insensitive: bool,
-    fixed_string: bool,
-    word_boundary: bool,
-    multiline: bool,
-    dotall: bool,
-) -> Result<SearchMatcher> {
-    let combined = combine_patterns(patterns, fixed_string, word_boundary);
+pub fn build_search_matcher(patterns: &[String], cfg: &MatcherConfig) -> Result<SearchMatcher> {
+    let combined = combine_patterns(
+        patterns,
+        cfg.fixed_string,
+        cfg.word_boundary,
+        cfg.line_regexp,
+    );
 
-    match build_regex(&combined, case_insensitive, multiline, dotall) {
+    if cfg.engine == RegexEngine::Pcre2 {
+        return build_fancy(&combined, cfg).map_err(|e| {
+            anyhow::anyhow!("regex error: PCRE-style engine rejected the pattern: {e}")
+        });
+    }
+
+    match build_regex(&combined, cfg) {
         Ok(re) => Ok(SearchMatcher::Standard(re)),
-        Err(regex_err) if !fixed_string => {
-            let mut flags = String::new();
-            if case_insensitive {
-                flags.push('i');
-            }
-            if multiline {
-                flags.push('m');
-            }
-            if dotall {
-                flags.push('s');
-            }
-            let fancy_pattern = if flags.is_empty() {
-                combined
-            } else {
-                format!("(?{flags}:{combined})")
-            };
-            fancy_regex::Regex::new(&fancy_pattern)
-                .map(SearchMatcher::Fancy)
-                .map_err(|fancy_err| {
-                    anyhow::anyhow!(
-                        "regex error: {regex_err}; PCRE-style fallback failed: {fancy_err}"
-                    )
-                })
+        // Exceeding `--regex-size-limit`/`--dfa-size-limit` is a resource error,
+        // not an unsupported construct. Retrying on the backtracking engine
+        // would silently ignore the limit the user asked for.
+        Err(e @ regex::Error::CompiledTooBig(_)) => Err(anyhow::anyhow!("regex error: {e}")),
+        Err(regex_err) if !cfg.fixed_string && cfg.engine == RegexEngine::Auto => {
+            build_fancy(&combined, cfg).map_err(|fancy_err| {
+                anyhow::anyhow!("regex error: {regex_err}; PCRE-style fallback failed: {fancy_err}")
+            })
         }
-        Err(regex_err) => Err(regex_err),
+        Err(regex_err) => Err(anyhow::anyhow!("regex error: {regex_err}")),
     }
 }
 
-fn combine_patterns(patterns: &[String], fixed_string: bool, word_boundary: bool) -> String {
+fn build_fancy(combined: &str, cfg: &MatcherConfig) -> Result<SearchMatcher> {
+    let mut flags = String::new();
+    if cfg.case_insensitive {
+        flags.push('i');
+    }
+    if cfg.multiline {
+        flags.push('m');
+    }
+    if cfg.dotall {
+        flags.push('s');
+    }
+    let pattern = if flags.is_empty() {
+        combined.to_string()
+    } else {
+        format!("(?{flags}:{combined})")
+    };
+    fancy_regex::Regex::new(&pattern)
+        .map(SearchMatcher::Fancy)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn combine_patterns(
+    patterns: &[String],
+    fixed_string: bool,
+    word_boundary: bool,
+    line_regexp: bool,
+) -> String {
     let wrap = |p: &String| {
         let mut p = if fixed_string {
             regex::escape(p)
         } else {
             p.clone()
         };
-        if word_boundary {
+        // `-x` beats `-w`: a whole-line match is already at word boundaries,
+        // and applying both would reject lines starting with punctuation.
+        if line_regexp {
+            p = format!(r"^(?:{p})$");
+        } else if word_boundary {
             p = format!(r"\b(?:{p})\b");
         }
         p
@@ -265,24 +384,22 @@ fn combine_patterns(patterns: &[String], fixed_string: bool, word_boundary: bool
 
 fn build_regex(
     combined: &str,
-    case_insensitive: bool,
-    multiline: bool,
-    dotall: bool,
-) -> Result<regex::Regex> {
+    cfg: &MatcherConfig,
+) -> std::result::Result<regex::Regex, regex::Error> {
     RegexBuilder::new(combined)
-        .case_insensitive(case_insensitive)
-        .multi_line(multiline)
-        .dot_matches_new_line(dotall)
-        .size_limit(100 * (1 << 20))
-        .dfa_size_limit(1000 * (1 << 20))
+        .case_insensitive(cfg.case_insensitive)
+        .multi_line(cfg.multiline)
+        .dot_matches_new_line(cfg.dotall)
+        .unicode(!cfg.no_unicode)
+        .size_limit(cfg.regex_size_limit.unwrap_or(100 * (1 << 20)))
+        .dfa_size_limit(cfg.dfa_size_limit.unwrap_or(1000 * (1 << 20)))
         .nest_limit(250)
         .build()
-        .map_err(|e| anyhow::anyhow!("regex error: {e}"))
 }
 
 /// The subset of search options that affects which lines match and which are
 /// emitted. Shared so the server and the local search path cannot drift.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct MatchOptions {
     pub invert_match: bool,
     pub multiline: bool,
@@ -290,13 +407,20 @@ pub struct MatchOptions {
     pub before_context: usize,
     pub after_context: usize,
     pub max_count: Option<usize>,
+    /// `--passthru`: emit every line, matching or not.
+    pub passthru: bool,
+    /// `-r/--replace`: rewrite each match before printing.
+    pub replace: Option<String>,
+    /// `--stop-on-nonmatch`: stop at the first non-matching line that follows
+    /// a matching one.
+    pub stop_on_nonmatch: bool,
 }
 
 /// One unit of output produced by searching a single file.
 pub enum Emit<'a> {
     Match {
         line_number: usize,
-        content: &'a str,
+        content: Cow<'a, str>,
         column: Option<usize>,
         spans: Vec<(usize, usize)>,
         absolute_offset: usize,
@@ -339,13 +463,26 @@ impl<'a> FileMatches<'a> {
         self.hits.len()
     }
 
+    /// Total number of individual matches, which is what `--count-matches`
+    /// reports. Inverted matches have no spans but still count as one.
+    pub fn match_count(&self) -> usize {
+        self.hits
+            .iter()
+            .map(|h| h.spans.len().max(1))
+            .sum::<usize>()
+    }
+
     /// Walk the output in line order, expanding context and fanning
     /// `--only-matching` out to one event per match.
     pub fn for_each<E>(
         &self,
         opts: &MatchOptions,
+        matcher: &SearchMatcher,
         mut on_emit: impl FnMut(Emit<'a>) -> std::result::Result<(), E>,
-    ) -> std::result::Result<(), E> {
+    ) -> std::result::Result<(), E>
+    where
+        E: From<anyhow::Error>,
+    {
         let emit_hit = |hit: &LineHit,
                         on_emit: &mut dyn FnMut(Emit<'a>) -> std::result::Result<(), E>|
          -> std::result::Result<(), E> {
@@ -353,11 +490,26 @@ impl<'a> FileMatches<'a> {
             let offset = self.index.line_start(hit.idx);
 
             if opts.only_matching && !hit.spans.is_empty() {
+                // With `-r`, `-o` prints the replacement of each match rather
+                // than the matched text itself.
+                if let Some(rep) = &opts.replace {
+                    for (start, _, text) in matcher.expansions(line, rep).map_err(E::from)? {
+                        let len = text.len();
+                        on_emit(Emit::Match {
+                            line_number: hit.idx + 1,
+                            content: Cow::Owned(text),
+                            column: Some(start + 1),
+                            spans: vec![(0, len)],
+                            absolute_offset: offset + start,
+                        })?;
+                    }
+                    return Ok(());
+                }
                 for &(s, e) in &hit.spans {
                     let text = &line[s..e];
                     on_emit(Emit::Match {
                         line_number: hit.idx + 1,
-                        content: text,
+                        content: Cow::Borrowed(text),
                         column: Some(s + 1),
                         spans: vec![(0, text.len())],
                         absolute_offset: offset + s,
@@ -366,14 +518,40 @@ impl<'a> FileMatches<'a> {
                 return Ok(());
             }
 
+            let (content, spans) = match &opts.replace {
+                Some(rep) if !hit.spans.is_empty() => {
+                    let (text, spans) = matcher.replace_all(line, rep).map_err(E::from)?;
+                    (Cow::Owned(text), spans)
+                }
+                _ => (Cow::Borrowed(line), hit.spans.clone()),
+            };
+            let column = spans.first().map(|&(s, _)| s + 1);
             on_emit(Emit::Match {
                 line_number: hit.idx + 1,
-                content: line,
-                column: hit.spans.first().map(|&(s, _)| s + 1),
-                spans: hit.spans.clone(),
+                content,
+                column,
+                spans,
                 absolute_offset: offset,
             })
         };
+
+        // `--passthru` prints the whole file, so every non-matching line is a
+        // context line no matter what `-A`/`-B`/`-C` said.
+        if opts.passthru {
+            let by_line: std::collections::HashMap<usize, &LineHit> =
+                self.hits.iter().map(|h| (h.idx, h)).collect();
+            for li in 0..self.index.line_count() {
+                match by_line.get(&li) {
+                    Some(hit) => emit_hit(hit, &mut on_emit)?,
+                    None => on_emit(Emit::Context {
+                        line_number: li + 1,
+                        content: self.index.line_text(self.content, li),
+                        absolute_offset: self.index.line_start(li),
+                    })?,
+                }
+            }
+            return Ok(());
+        }
 
         if opts.before_context == 0 && opts.after_context == 0 {
             for hit in &self.hits {
@@ -426,6 +604,9 @@ fn collect_hits(
                 if max.is_some_and(|m| out.len() >= m) {
                     break;
                 }
+            } else if opts.stop_on_nonmatch && !out.is_empty() {
+                // Under `-v` a *matching* line is the non-matching case.
+                break;
             }
         }
         return Ok(out);
@@ -452,6 +633,8 @@ fn collect_hits(
             if max.is_some_and(|m| out.len() >= m) {
                 break;
             }
+        } else if opts.stop_on_nonmatch && !out.is_empty() {
+            break;
         }
     }
     Ok(out)

@@ -68,6 +68,31 @@ pub struct WalkOptions {
     pub collect_gitignore_files: bool,
     /// Directory names to exclude from walking (e.g., "vendor", "third_party").
     pub exclude_dirs: Vec<String>,
+    /// `--max-depth`: descend at most this many directories below each root.
+    pub max_depth: Option<usize>,
+    /// `--one-file-system`: don't cross file system boundaries.
+    pub same_file_system: bool,
+    /// `--ignore-file`: extra ignore files, applied in order (later wins).
+    pub ignore_files: Vec<PathBuf>,
+    /// `--ignore-file-case-insensitive`: match `--ignore-file` globs without
+    /// regard to case.
+    pub ignore_files_case_insensitive: bool,
+    /// `--no-ignore-dot`: don't respect `.ignore` files.
+    pub no_ignore_dot: bool,
+    /// `--no-ignore-exclude`: don't respect `.git/info/exclude`.
+    pub no_ignore_exclude: bool,
+    /// `--no-ignore-global`: don't respect the global gitignore.
+    pub no_ignore_global: bool,
+    /// `--no-ignore-parent`: don't respect ignore files above each root.
+    pub no_ignore_parent: bool,
+    /// `--no-ignore-vcs`: don't respect `.gitignore` files.
+    pub no_ignore_vcs: bool,
+    /// `--no-require-git`: respect gitignore rules outside a git repository.
+    pub no_require_git: bool,
+    /// `--no-ignore-messages`: swallow errors from unparseable ignore files.
+    pub no_ignore_messages: bool,
+    /// `--threads`: walker thread count. `None` sizes the pool automatically.
+    pub threads: Option<usize>,
 }
 
 // Hand-written rather than derived: `Option::default()` is `None`, which would
@@ -84,6 +109,18 @@ impl Default for WalkOptions {
             max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
             collect_gitignore_files: false,
             exclude_dirs: Vec::new(),
+            max_depth: None,
+            same_file_system: false,
+            ignore_files: Vec::new(),
+            ignore_files_case_insensitive: false,
+            no_ignore_dot: false,
+            no_ignore_exclude: false,
+            no_ignore_global: false,
+            no_ignore_parent: false,
+            no_ignore_vcs: false,
+            no_require_git: false,
+            no_ignore_messages: false,
+            threads: None,
         }
     }
 }
@@ -127,9 +164,15 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
     builder
         .hidden(!include_hidden)
         .follow_links(opts.follow_links)
-        .git_ignore(!opts.no_ignore)
-        .git_global(!opts.no_ignore)
-        .git_exclude(!opts.no_ignore)
+        .max_depth(opts.max_depth)
+        .same_file_system(opts.same_file_system)
+        .ignore(!opts.no_ignore && !opts.no_ignore_dot)
+        .parents(!opts.no_ignore && !opts.no_ignore_parent)
+        .require_git(!opts.no_require_git)
+        .git_ignore(!opts.no_ignore && !opts.no_ignore_vcs)
+        .git_global(!opts.no_ignore && !opts.no_ignore_global)
+        .git_exclude(!opts.no_ignore && !opts.no_ignore_exclude)
+        .ignore_case_insensitive(opts.ignore_files_case_insensitive)
         .filter_entry(move |entry| {
             if entry.file_name() == ".gitignore" {
                 return true;
@@ -145,7 +188,16 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
                 entry.file_type().is_some_and(|kind| kind.is_dir()),
             )
         })
-        .threads(walker_thread_count());
+        .threads(opts.threads.unwrap_or_else(walker_thread_count).max(1));
+    // `--ignore-file` is applied even under `--no-ignore`: the user asked for
+    // these rules explicitly, so only `--no-ignore-files` turns them off.
+    for path in &opts.ignore_files {
+        if let Some(err) = builder.add_ignore(path)
+            && !opts.no_ignore_messages
+        {
+            eprintln!("tgrep: {}: {err}", path.display());
+        }
+    }
     let walker = builder.build_parallel();
 
     walker.run(|| {

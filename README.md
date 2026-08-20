@@ -257,8 +257,11 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-g, --glob <GLOB>` | Filter files by glob pattern, case-sensitive (repeatable) |
 | `--iglob <GLOB>` | Case-insensitive glob filter (repeatable) |
 | `--glob-case-insensitive` | Treat all `-g` globs as case-insensitive |
-| `-t, --type <TYPE>` | Filter by file type (`rust`, `py`, `js`, …) |
-| `--type-list` | Print all supported file types |
+| `-t, --type <TYPE>` | Filter by file type (`rust`, `py`, `js`, …; repeatable) |
+| `-T, --type-not <TYPE>` | Exclude a file type (repeatable) |
+| `--type-add <SPEC>` | Add/extend a type, e.g. `--type-add 'web:*.html'` |
+| `--type-clear <TYPE>` | Remove a type's definitions |
+| `--type-list` | Print all supported file types (reflects `--type-add`/`--type-clear`) |
 | `--files` | List files that would be searched |
 | `-A, --after-context <N>` | Lines of context after match |
 | `-B, --before-context <N>` | Lines of context before match |
@@ -282,6 +285,83 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `--exclude <DIR>` | Exclude directory from indexing (repeatable) |
 | `--stats` | Print query plan and candidate stats |
 | `--index-path <DIR>` | Custom index directory |
+
+**Pattern matching**
+
+| Flag | Description |
+|------|-------------|
+| `-x, --line-regexp` | The pattern must match a whole line (beats `-w`) |
+| `-P, --pcre2` | Use the backtracking engine (lookaround, backreferences) |
+| `--engine <auto\|default\|pcre2>` | Pick the regex engine explicitly; `auto` falls back to `pcre2` |
+| `--pcre2-version` | Print the backtracking engine in use and exit |
+| `--no-unicode` | Disable Unicode-aware character classes |
+| `--regex-size-limit <SIZE>` | Cap the compiled regex size (`K`/`M`/`G` suffixes) |
+| `--dfa-size-limit <SIZE>` | Cap the regex DFA cache size |
+| `-r, --replace <TEXT>` | Replace each match; `$1`/`${name}` expand capture groups |
+| `--passthru` | Print every line, matching or not |
+| `--stop-on-nonmatch` | Stop searching a file at its first non-matching line |
+
+**Output formatting**
+
+| Flag | Description |
+|------|-------------|
+| `--column` / `--no-column` | Show the 1-based column of the first match |
+| `-b, --byte-offset` | Show the byte offset of the line (or match, with `-o`) |
+| `-M, --max-columns <N>` | Omit lines longer than `N` bytes |
+| `--max-columns-preview` | Show a truncated preview instead of omitting |
+| `--count-matches` | Count matches rather than matching lines |
+| `--include-zero` | With `-c`, also print files with a count of `0` |
+| `-p, --pretty` | Alias for `--color always --heading -n` |
+| `--context-separator <SEP>` | Separator between context groups (default `--`) |
+| `--no-context-separator` | Print no separator between context groups |
+| `--field-match-separator <SEP>` | Separator between match fields (default `:`) |
+| `--field-context-separator <SEP>` | Separator between context fields (default `-`) |
+| `--path-separator <SEP>` | Rewrite the separator in printed paths |
+| `--sort <KEY>` / `--sortr <KEY>` | Sort by `path`/`modified`/`accessed`/`created`/`none` |
+| `--sort-files` | Shorthand for `--sort path` |
+| `--line-buffered` / `--block-buffered` | Force line- or block-buffered stdout |
+
+**Encoding**
+
+| Flag | Description |
+|------|-------------|
+| `-E, --encoding <LABEL>` | Decode files as `LABEL` (e.g. `utf-16le`, `latin1`, `sjis`), or `none` for raw bytes |
+| `--no-encoding` | Restore BOM-sniffing auto-detection |
+
+By default tgrep sniffs a UTF-8/UTF-16LE/UTF-16BE BOM and decodes accordingly,
+so BOM-marked UTF-16 files are searched as text rather than reported as binary.
+A BOM always wins over `-E`, matching ripgrep. Because the index is built with
+auto-detection, an explicit `-E` bypasses the index and server and searches
+files directly, so results stay correct.
+
+**File walking**
+
+| Flag | Description |
+|------|-------------|
+| `--max-depth <N>` | Limit directory recursion depth |
+| `--one-file-system` | Don't cross file-system boundaries |
+| `--ignore-file <FILE>` | Read extra ignore rules from `FILE` (repeatable) |
+| `--ignore-file-case-insensitive` | Match ignore rules case-insensitively |
+| `--no-ignore-dot` | Ignore `.ignore` files |
+| `--no-ignore-exclude` | Ignore `.git/info/exclude` |
+| `--no-ignore-files` | Ignore any `--ignore-file` arguments |
+| `--no-ignore-global` | Ignore the global gitignore |
+| `--no-ignore-parent` | Ignore rules from parent directories |
+| `--no-ignore-vcs` | Ignore `.gitignore` files |
+| `--no-ignore-messages` | Suppress errors about malformed ignore files |
+| `--no-require-git` | Apply git ignore rules outside a git repository |
+| `-j, --threads <N>` | Number of search threads |
+
+**Accepted for compatibility**
+
+`--mmap`/`--no-mmap` (tgrep always reads files directly), `--crlf`/`--no-crlf`
+(a trailing `\r` is always stripped), `--no-config` (tgrep reads no config
+file), and `--colors <SPEC>` (colors are not yet configurable) are accepted and
+ignored so ripgrep command lines keep working. `--debug`/`--trace` imply
+`--stats`.
+
+`-z/--search-zip` is **not** supported and exits with code `2` rather than
+silently reporting no matches in compressed files.
 
 > **Note:** `-L` means `--follow` (as in ripgrep). Use the long
 > `--files-without-match` for the non-matching-files listing.

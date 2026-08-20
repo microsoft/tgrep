@@ -2,6 +2,7 @@
 ///
 /// Supports heading/flat/JSON/vimgrep formats, color control,
 /// context lines, null separators, and trimming.
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::time::Instant;
 
@@ -73,46 +74,56 @@ pub struct OutputConfig {
     /// Gates the `--` separator: without context, a gap between two matching
     /// lines is the normal case, and ripgrep prints nothing between them.
     pub context: bool,
+    /// `--column`: prefix each matching line with its first match's column.
+    pub column: bool,
+    /// `-b/--byte-offset`: prefix each line with its 0-based byte offset.
+    pub byte_offset: bool,
+    /// `-M/--max-columns`: suppress lines longer than this many bytes.
+    pub max_columns: Option<usize>,
+    /// `--max-columns-preview`: print a truncated preview instead of dropping
+    /// an over-long line entirely.
+    pub max_columns_preview: bool,
+    /// `--context-separator` / `--no-context-separator`. `None` suppresses it.
+    pub context_separator: Option<String>,
+    /// `--field-match-separator`, between the fields of a matching line.
+    pub field_match_separator: String,
+    /// `--field-context-separator`, between the fields of a context line.
+    pub field_context_separator: String,
+    /// `--path-separator`, substituted for the platform separator in paths.
+    pub path_separator: Option<String>,
+    /// `--line-buffered`: flush after every line.
+    pub line_buffered: bool,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            format: OutputFormat::Heading,
+            color: ColorMode::Auto,
+            heading: None,
+            null: false,
+            trim: false,
+            no_filename: false,
+            no_line_number: false,
+            context: false,
+            column: false,
+            byte_offset: false,
+            max_columns: None,
+            max_columns_preview: false,
+            context_separator: Some("--".to_string()),
+            field_match_separator: ":".to_string(),
+            field_context_separator: "-".to_string(),
+            path_separator: None,
+            line_buffered: false,
+        }
+    }
 }
 
 impl OutputConfig {
-    /// Build config from CLI flags, auto-detecting format and color.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_flags(
-        json: bool,
-        files_only: bool,
-        count: bool,
-        vimgrep: bool,
-        heading: Option<bool>,
-        color: ColorMode,
-        null: bool,
-        trim: bool,
-        no_filename: bool,
-        no_line_number: bool,
-        context: bool,
-    ) -> Self {
-        let format = if json {
-            OutputFormat::Json
-        } else if files_only {
-            OutputFormat::FilesOnly
-        } else if count {
-            OutputFormat::Count
-        } else if vimgrep {
-            OutputFormat::Vimgrep
-        } else {
-            // Heading vs flat is resolved in the writer
-            OutputFormat::Heading
-        };
-        Self {
-            format,
-            color,
-            heading,
-            null,
-            trim,
-            no_filename,
-            no_line_number,
-            context,
-        }
+    /// Whether output is a count of matching lines or files.
+    #[allow(dead_code)]
+    pub fn is_count(&self) -> bool {
+        self.format == OutputFormat::Count
     }
 }
 
@@ -298,13 +309,91 @@ impl OutputWriter {
         if self.is_json() || !self.config.context {
             return Ok(());
         }
+        let Some(sep) = self.config.context_separator.clone() else {
+            return Ok(());
+        };
         if let Some((ref last_file, last_line)) = self.last_printed_line
             && last_file == file
             && line_num > last_line + 1
         {
-            writeln!(self.stdout, "--")?;
+            writeln!(self.stdout, "{sep}")?;
         }
         Ok(())
+    }
+
+    /// Render a path, applying `--path-separator`.
+    fn display_path(&self, file: &str) -> String {
+        match &self.config.path_separator {
+            Some(sep) => file.replace(['/', '\\'], sep),
+            None => file.to_string(),
+        }
+    }
+
+    /// Apply `-M/--max-columns`, returning `None` when the line is suppressed.
+    ///
+    /// ripgrep measures the *original* line, so a preview still reports how
+    /// many bytes were dropped from the full line.
+    fn apply_max_columns<'b>(
+        &self,
+        content: &'b str,
+        matches: Option<usize>,
+    ) -> Option<Cow<'b, str>> {
+        let Some(limit) = self.config.max_columns else {
+            return Some(Cow::Borrowed(content));
+        };
+        if content.len() <= limit {
+            return Some(Cow::Borrowed(content));
+        }
+        if self.config.max_columns_preview {
+            let cut = floor_boundary(content, limit);
+            return Some(Cow::Owned(format!(
+                "{} [... omitted end of long line]",
+                &content[..cut]
+            )));
+        }
+        let count = matches?;
+        Some(Cow::Owned(format!(
+            "[Omitted long line with {count} matches]"
+        )))
+    }
+
+    /// The `file:line:col:offset:` prefix shared by match and context lines.
+    fn field_prefix(
+        &self,
+        file: &str,
+        line_number: usize,
+        column: Option<usize>,
+        offset: usize,
+        is_match: bool,
+    ) -> String {
+        let sep = if is_match {
+            &self.config.field_match_separator
+        } else {
+            &self.config.field_context_separator
+        };
+        let mut out = String::new();
+        let heading_active = self.use_heading && !self.config.no_filename;
+        if !heading_active && !self.config.no_filename {
+            out.push_str(&self.display_path(file));
+            out.push_str(sep);
+        }
+        if !self.config.no_line_number {
+            if self.use_color {
+                out.push_str(&format!("\x1b[32m{line_number}\x1b[0m"));
+            } else {
+                out.push_str(&line_number.to_string());
+            }
+            out.push_str(sep);
+        }
+        if self.config.column && is_match {
+            out.push_str(&column.unwrap_or(1).to_string());
+            out.push_str(sep);
+        }
+        if self.config.byte_offset {
+            out.push_str(&offset.to_string());
+            out.push_str(sep);
+        }
+        out
     }
 
     /// Write a context (non-matching) line.
@@ -315,7 +404,7 @@ impl OutputWriter {
             let msg = serde_json::json!({
                 "type": "context",
                 "data": {
-                    "path": { "text": ctx.file },
+                    "path": { "text": self.display_path(&ctx.file) },
                     "lines": { "text": format!("{content}\n") },
                     "line_number": ctx.line_number,
                     "absolute_offset": ctx.absolute_offset,
@@ -333,29 +422,15 @@ impl OutputWriter {
             self.ensure_heading(&ctx.file)?;
         }
         let (content, _) = self.trim_adjust(&ctx.content, &[]);
-        let content = content.to_string();
-        if self.use_heading && !self.config.no_filename {
-            if self.config.no_line_number {
-                writeln!(self.stdout, "{content}")?;
-            } else if self.use_color {
-                writeln!(self.stdout, "\x1b[32m{}\x1b[0m-{content}", ctx.line_number)?;
-            } else {
-                writeln!(self.stdout, "{}-{content}", ctx.line_number)?;
-            }
-        } else {
-            let show_file = !self.config.no_filename;
-            let show_line = !self.config.no_line_number;
-            match (show_file, show_line) {
-                (true, true) => {
-                    writeln!(self.stdout, "{}-{}-{content}", ctx.file, ctx.line_number)?
-                }
-                (true, false) => writeln!(self.stdout, "{}-{content}", ctx.file)?,
-                (false, true) => writeln!(self.stdout, "{}-{content}", ctx.line_number)?,
-                (false, false) => writeln!(self.stdout, "{content}")?,
-            }
-        }
+        let Some(content) = self.apply_max_columns(content, None) else {
+            self.last_printed_line = Some((ctx.file.clone(), ctx.line_number));
+            return Ok(());
+        };
+        let prefix =
+            self.field_prefix(&ctx.file, ctx.line_number, None, ctx.absolute_offset, false);
+        writeln!(self.stdout, "{prefix}{content}")?;
         self.last_printed_line = Some((ctx.file.clone(), ctx.line_number));
-        Ok(())
+        self.maybe_flush()
     }
 
     pub fn write_match(&mut self, m: &Match) -> io::Result<()> {
@@ -366,41 +441,34 @@ impl OutputWriter {
                 if !self.config.no_filename {
                     self.ensure_heading(&m.file)?;
                 }
-                let rendered = self.highlight(&content, &spans);
-                if self.use_heading && !self.config.no_filename {
-                    if self.config.no_line_number {
-                        writeln!(self.stdout, "{rendered}")?;
-                    } else if self.use_color {
-                        writeln!(self.stdout, "\x1b[32m{}\x1b[0m:{rendered}", m.line_number)?;
-                    } else {
-                        writeln!(self.stdout, "{}:{rendered}", m.line_number)?;
-                    }
+                let Some(clipped) = self.apply_max_columns(&content, Some(spans.len().max(1)))
+                else {
+                    self.last_printed_line = Some((m.file.clone(), m.line_number));
+                    return Ok(());
+                };
+                // Highlighting only lines up when the text was not clipped.
+                let rendered = if clipped.len() == content.len() {
+                    self.highlight(&content, &spans)
                 } else {
-                    let show_file = !self.config.no_filename;
-                    let show_line = !self.config.no_line_number;
-                    match (show_file, show_line) {
-                        (true, true) => {
-                            writeln!(self.stdout, "{}:{}:{rendered}", m.file, m.line_number)?
-                        }
-                        (true, false) => writeln!(self.stdout, "{}:{rendered}", m.file)?,
-                        (false, true) => writeln!(self.stdout, "{}:{rendered}", m.line_number)?,
-                        (false, false) => writeln!(self.stdout, "{rendered}")?,
-                    }
-                }
+                    clipped.into_owned()
+                };
+                let prefix =
+                    self.field_prefix(&m.file, m.line_number, m.column, m.absolute_offset, true);
+                writeln!(self.stdout, "{prefix}{rendered}")?;
             }
             OutputFormat::Vimgrep => {
                 // ripgrep emits one row per match, not per matching line, so
                 // editors can step through every hit.
                 let rendered = self.highlight(&content, &spans);
+                let file = self.display_path(&m.file);
                 if spans.is_empty() {
                     let col = m.column.unwrap_or(1);
-                    writeln!(self.stdout, "{}:{}:{col}:{rendered}", m.file, m.line_number)?;
+                    writeln!(self.stdout, "{file}:{}:{col}:{rendered}", m.line_number)?;
                 } else {
                     for &(start, _) in &spans {
                         writeln!(
                             self.stdout,
-                            "{}:{}:{}:{rendered}",
-                            m.file,
+                            "{file}:{}:{}:{rendered}",
                             m.line_number,
                             start + 1
                         )?;
@@ -424,7 +492,7 @@ impl OutputWriter {
                 let msg = serde_json::json!({
                     "type": "match",
                     "data": {
-                        "path": { "text": m.file },
+                        "path": { "text": self.display_path(&m.file) },
                         "lines": { "text": format!("{content}\n") },
                         "line_number": m.line_number,
                         "absolute_offset": m.absolute_offset,
@@ -438,23 +506,34 @@ impl OutputWriter {
             OutputFormat::FilesOnly | OutputFormat::Count => {}
         }
         self.last_printed_line = Some((m.file.clone(), m.line_number));
-        Ok(())
+        self.maybe_flush()
     }
 
     pub fn write_file(&mut self, path: &str) -> io::Result<()> {
+        let path = self.display_path(path);
         if self.config.null {
             write!(self.stdout, "{path}\0")?;
         } else {
             writeln!(self.stdout, "{path}")?;
         }
-        Ok(())
+        self.maybe_flush()
     }
 
     pub fn write_count(&mut self, file: &str, count: usize) -> io::Result<()> {
         if self.config.no_filename {
             writeln!(self.stdout, "{count}")?;
         } else {
-            writeln!(self.stdout, "{file}:{count}")?;
+            let file = self.display_path(file);
+            let sep = &self.config.field_match_separator;
+            writeln!(self.stdout, "{file}{sep}{count}")?;
+        }
+        self.maybe_flush()
+    }
+
+    /// Honour `--line-buffered` so a pipeline sees results as they are found.
+    fn maybe_flush(&mut self) -> io::Result<()> {
+        if self.config.line_buffered {
+            self.stdout.flush()?;
         }
         Ok(())
     }
@@ -511,10 +590,11 @@ impl OutputWriter {
             if self.current_file.is_some() {
                 writeln!(self.stdout)?;
             }
+            let shown = self.display_path(file);
             if self.use_color {
-                writeln!(self.stdout, "\x1b[35m{file}\x1b[0m")?;
+                writeln!(self.stdout, "\x1b[35m{shown}\x1b[0m")?;
             } else {
-                writeln!(self.stdout, "{file}")?;
+                writeln!(self.stdout, "{shown}")?;
             }
             self.current_file = Some(file.to_string());
             self.last_printed_line = None;

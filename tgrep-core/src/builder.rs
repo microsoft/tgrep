@@ -225,7 +225,8 @@ pub fn build_index_with_options(
             .par_iter()
             .filter_map(|path| {
                 let data = std::fs::read(path).ok()?;
-                if trigram::is_binary(&data) {
+                let text = crate::encoding::decode_for_index(&data);
+                if trigram::is_binary(&text) {
                     binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return None;
                 }
@@ -234,7 +235,7 @@ pub fn build_index_with_options(
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                let per_tri = trigram::extract_merged_masks(&data);
+                let per_tri = trigram::extract_merged_masks(&text);
                 Some((rel, per_tri))
             })
             .collect();

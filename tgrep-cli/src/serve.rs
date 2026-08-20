@@ -218,6 +218,12 @@ struct SearchOpts {
     text: bool,
     /// `--max-filesize`: skip candidates larger than this.
     max_filesize: Option<u64>,
+    /// `--passthru`: emit every line, matching or not.
+    passthru: bool,
+    /// `-r/--replace`: template substituted for each match.
+    replace: Option<String>,
+    /// `--stop-on-nonmatch`: stop searching a file at its first non-match.
+    stop_on_nonmatch: bool,
 }
 
 impl SearchOpts {
@@ -234,6 +240,9 @@ impl SearchOpts {
             } else {
                 self.max_count
             },
+            passthru: self.passthru,
+            replace: self.replace.clone(),
+            stop_on_nonmatch: self.stop_on_nonmatch,
         }
     }
 }
@@ -526,7 +535,8 @@ struct SearchRequest {
     matcher: crate::matching::SearchMatcher,
     plan: query::QueryPlan,
     glob_filter: crate::glob_filter::GlobFilter,
-    file_type: Option<String>,
+    type_filter: tgrep_core::filetypes::TypeFilter,
+    encoding: tgrep_core::encoding::EncodingMode,
     opts: SearchOpts,
 }
 
@@ -584,10 +594,27 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
     let glob_filter =
         crate::glob_filter::GlobFilter::new(&glob_filter_strs, &iglob_strs, glob_case_insensitive)
             .map_err(|e| format!("{e}"))?;
-    let file_type = params
-        .get("file_type")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string());
+    let str_array = |key: &str| -> Vec<String> {
+        params
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The client sends the raw `-t`/`-T`/`--type-add`/`--type-clear` values and
+    // the server rebuilds the filter with the same shared helper, so both sides
+    // are guaranteed to derive an identical definition table.
+    let type_filter = crate::search::build_type_filter(
+        &str_array("type_add"),
+        &str_array("type_clear"),
+        &str_array("types"),
+        &str_array("types_not"),
+    )
+    .map_err(|e| format!("{e}"))?;
     let invert_match = params
         .get("invert_match")
         .and_then(|v| v.as_bool())
@@ -623,6 +650,48 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .and_then(|t| t.as_bool())
         .unwrap_or(false);
     let max_filesize = params.get("max_filesize").and_then(|m| m.as_u64());
+    let line_regexp = params
+        .get("line_regexp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let no_unicode = params
+        .get("no_unicode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let engine = crate::matching::RegexEngine::from_str_opt(
+        params
+            .get("engine")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto"),
+    )
+    .ok_or_else(|| "unrecognized regex engine".to_string())?;
+    let regex_size_limit = params
+        .get("regex_size_limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let dfa_size_limit = params
+        .get("dfa_size_limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let replace = params
+        .get("replace")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let passthru = params
+        .get("passthru")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let stop_on_nonmatch = params
+        .get("stop_on_nonmatch")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let encoding = tgrep_core::encoding::parse_encoding(
+        params
+            .get("encoding")
+            .and_then(|e| e.as_str())
+            .unwrap_or("auto"),
+    )
+    .map_err(|e| format!("{e}"))?;
 
     // Build combined regex from all patterns
     let mut all_patterns = vec![pattern.to_string()];
@@ -630,18 +699,28 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
 
     let matcher = crate::matching::build_search_matcher(
         &all_patterns,
-        case_insensitive,
-        fixed_string,
-        word_boundary,
-        multiline,
-        multiline_dotall,
+        &crate::matching::MatcherConfig {
+            case_insensitive,
+            fixed_string,
+            word_boundary,
+            line_regexp,
+            multiline,
+            dotall: multiline_dotall,
+            no_unicode,
+            engine,
+            regex_size_limit,
+            dfa_size_limit,
+        },
     )
     .map_err(|e| format!("{e}"))?;
 
     // Build query plan from every pattern for index filtering. `-v` inverts at
     // the line level, so a file matches when some line does *not* match; the
-    // trigram plan would select exactly the wrong candidates.
-    let plan = if !matcher.is_standard() || invert_match {
+    // trigram plan would select exactly the wrong candidates. A non-default
+    // `--encoding` is unsound for the same reason: the index holds trigrams of
+    // the BOM-sniffed text, so a re-decoded file can match bytes that were
+    // never indexed.
+    let plan = if !matcher.is_standard() || invert_match || encoding.may_differ_from_index() {
         query::QueryPlan::MatchAll
     } else {
         query::build_multi_pattern_plan(&all_patterns, fixed_string, case_insensitive)?
@@ -653,7 +732,8 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         matcher,
         plan,
         glob_filter,
-        file_type,
+        type_filter,
+        encoding,
         opts: SearchOpts {
             files_only,
             invert_match,
@@ -664,6 +744,9 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             multiline,
             text,
             max_filesize,
+            passthru,
+            replace,
+            stop_on_nonmatch,
         },
     })
 }
@@ -683,7 +766,8 @@ fn handle_search(
     let matcher = req.matcher;
     let plan = req.plan;
     let glob_filter = req.glob_filter;
-    let file_type = req.file_type;
+    let type_filter = req.type_filter;
+    let encoding = req.encoding;
     let opts = req.opts;
     let pattern = req.pattern;
     let case_insensitive = req.case_insensitive;
@@ -717,9 +801,7 @@ fn handle_search(
                         return None;
                     }
                 };
-                if let Some(ref type_name) = file_type
-                    && !tgrep_core::filetypes::matches_type(&rel_path, type_name)
-                {
+                if !type_filter.matches(&rel_path) {
                     type_filtered_count += 1;
                     return None;
                 }
@@ -742,11 +824,12 @@ fn handle_search(
 
         // Log filter breakdown when raw candidates are dropped to zero
         let glob_active = !glob_filter.is_empty();
+        let type_active = !type_filter.is_empty();
         if raw_count > 0 && filtered.is_empty() {
             eprintln!(
                 "[trace] filter: raw={raw_count} no_path={no_path_count} \
                  type_filtered={type_filtered_count} glob_filtered={glob_filtered_count} \
-                 file_type={file_type:?} glob_active={glob_active} \
+                 type_active={type_active} glob_active={glob_active} \
                  sample_rejected={first_glob_rejected:?}",
             );
         }
@@ -759,7 +842,20 @@ fn handle_search(
     // Two-phase approach: read-lock for cache hits, then disk I/O outside the
     // lock, then a single write-lock to promote hits and insert misses.
     let t_resolve = Instant::now();
-    let candidate_contents: Vec<(String, Arc<String>)> = {
+    let candidate_contents: Vec<(String, Arc<String>)> = if encoding.may_differ_from_index() {
+        // The cache holds text decoded with the default (BOM-sniffing) rules and
+        // is shared by every client. A request that asked for a different
+        // `--encoding` must neither read those entries nor write its own, or one
+        // client's `-E sjis` would silently change what the next client sees.
+        candidate_info
+            .iter()
+            .filter_map(|(rel_path, full_path)| {
+                let bytes = std::fs::read(full_path).ok()?;
+                let content = tgrep_core::encoding::decode(&bytes, encoding);
+                Some((rel_path.clone(), Arc::new(content)))
+            })
+            .collect()
+    } else {
         // Phase 1: read-lock to find cache hits (peek avoids write-lock need)
         let mut hit_keys: Vec<String> = Vec::new();
         let mut hits: Vec<(String, Arc<String>)> = Vec::with_capacity(candidate_info.len());
@@ -784,10 +880,8 @@ fn handle_search(
                 // UTF-16 and Latin-1 sources silently invisible over the server
                 // while the same query works with --no-index.
                 let bytes = std::fs::read(&full_path).ok()?;
-                let content = match String::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-                };
+                let content =
+                    tgrep_core::encoding::decode(&bytes, tgrep_core::encoding::EncodingMode::Auto);
                 Some((rel_path, Arc::new(content)))
             })
             .collect();
@@ -898,7 +992,7 @@ fn search_file_matches(
     }
 
     let mut results = Vec::new();
-    found.for_each(&match_opts, |emit| -> anyhow::Result<()> {
+    found.for_each(&match_opts, matcher, |emit| -> anyhow::Result<()> {
         match emit {
             Emit::Match {
                 line_number,
@@ -1333,11 +1427,12 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             Ok(d) => d,
             Err(_) => continue,
         };
-        let is_binary = tgrep_core::trigram::is_binary(&data);
+        let text = tgrep_core::encoding::decode_for_index(&data);
+        let is_binary = tgrep_core::trigram::is_binary(&text);
         let per_tri = if is_binary {
             None
         } else {
-            Some(tgrep_core::live::LiveIndex::compute_trigram_masks(&data))
+            Some(tgrep_core::live::LiveIndex::compute_trigram_masks(&text))
         };
 
         eprintln!("[trace] reindex: modified {rel_path}");
@@ -1978,6 +2073,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 .par_iter()
                 .filter_map(|path| {
                     let data = std::fs::read(path).ok()?;
+                    let data = tgrep_core::encoding::decode_for_index(&data);
                     if tgrep_core::trigram::is_binary(&data) {
                         return None;
                     }
@@ -1989,7 +2085,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
                     let mut trigrams = tgrep_core::trigram::extract(&data);
                     let lower = data.to_ascii_lowercase();
-                    if lower != data {
+                    if lower != *data {
                         trigrams.extend(tgrep_core::trigram::extract(&lower));
                     }
                     Some((rel_path, trigrams))

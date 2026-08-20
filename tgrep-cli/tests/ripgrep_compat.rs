@@ -3940,3 +3940,1121 @@ fn binary_note_matches_between_indexed_and_brute_force() {
     );
     assert_eq!(a, b, "binary notes must agree across search paths");
 }
+
+// ---------------------------------------------------------------------------
+// File types (-t/-T/--type-add/--type-clear/--type-list)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn type_filter_restricts_to_rust_files() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-t",
+            "rust",
+            "fn",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.rs").or(predicate::str::contains("lib.rs")))
+        .stdout(predicate::str::contains("config.toml").not());
+}
+
+#[test]
+fn type_not_excludes_a_type() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-T",
+            "rust",
+            "-l",
+            "e",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .stdout(predicate::str::contains(".rs").not());
+}
+
+#[test]
+fn type_flag_is_repeatable() {
+    let dir = setup_fixture();
+    let out = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-t",
+            "rust",
+            "-t",
+            "toml",
+            "-l",
+            "e",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains(".rs"), "expected rust files, got {s:?}");
+    assert!(s.contains(".toml"), "expected toml files, got {s:?}");
+    assert!(!s.contains(".txt"), "txt must be excluded, got {s:?}");
+}
+
+#[test]
+fn unknown_type_is_a_usage_error() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "-t",
+            "definitelynotatype",
+            "fn",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unrecognized file type"));
+}
+
+#[test]
+fn type_add_defines_a_new_type() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--type-add",
+            "note:*.txt",
+            "-t",
+            "note",
+            "-l",
+            "note",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("notes.txt"));
+}
+
+#[test]
+fn type_clear_removes_a_builtin_type() {
+    let dir = setup_fixture();
+    // ripgrep drops the definition entirely, so selecting it afterwards is an
+    // unrecognized-type usage error rather than a match-nothing filter.
+    tgrep()
+        .args([
+            "--no-index",
+            "--type-clear",
+            "rust",
+            "-t",
+            "rust",
+            "fn",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unrecognized file type"));
+}
+
+#[test]
+fn type_list_includes_ripgrep_builtins() {
+    tgrep()
+        .arg("--type-list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rust:"))
+        .stdout(predicate::str::contains("cpp:"))
+        .stdout(predicate::str::contains("py:"));
+}
+
+#[test]
+fn type_list_reflects_type_add() {
+    tgrep()
+        .args(["--type-list", "--type-add", "zzz:*.zzz"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("zzz:"));
+}
+
+// ---------------------------------------------------------------------------
+// Encoding (-E/--encoding)
+// ---------------------------------------------------------------------------
+
+/// Write `text` as UTF-16LE, optionally with a BOM.
+fn write_utf16le(path: &std::path::Path, text: &str, bom: bool) {
+    let mut bytes = Vec::new();
+    if bom {
+        bytes.extend_from_slice(&[0xFF, 0xFE]);
+    }
+    for u in text.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn utf16_bom_files_are_searched_as_text() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    write_utf16le(&sub.join("wide.txt"), "hello needle here\n", true);
+
+    tgrep()
+        .args(["--no-index", "--no-heading", "needle", &fixture_path(&dir)])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("needle"))
+        .stdout(predicate::str::contains("Binary file").not());
+}
+
+#[test]
+fn explicit_encoding_finds_bomless_utf16() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    write_utf16le(&sub.join("wide.txt"), "hello needle here\n", false);
+
+    // Without -E the file has no BOM, so it is treated as raw bytes.
+    tgrep()
+        .args(["--no-index", "--no-heading", "needle", &fixture_path(&dir)])
+        .assert()
+        .code(1);
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-E",
+            "utf-16le",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("needle"));
+}
+
+#[test]
+fn encoding_none_disables_bom_sniffing() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    write_utf16le(&sub.join("wide.txt"), "hello needle here\n", true);
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-E",
+            "none",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn no_encoding_restores_auto_detection() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    write_utf16le(&sub.join("wide.txt"), "hello needle here\n", true);
+
+    // `--no-encoding` comes last, so it wins over `-E none`.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-E",
+            "none",
+            "--no-encoding",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("needle"));
+}
+
+#[test]
+fn latin1_encoding_decodes_high_bytes() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    // "café" in Latin-1: the 0xE9 byte is not valid UTF-8.
+    fs::write(sub.join("l1.txt"), b"caf\xE9 au lait\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-E",
+            "latin1",
+            "café",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("café"));
+}
+
+#[test]
+fn unknown_encoding_is_a_usage_error() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "-E",
+            "definitelynotanencoding",
+            "fn",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unsupported encoding"));
+}
+
+#[test]
+fn encoding_results_agree_across_search_paths() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    write_utf16le(&sub.join("wide.txt"), "hello needle here\n", false);
+    fs::write(sub.join("plain.txt"), "needle in plain text\n").unwrap();
+
+    let idx = dir.path().join("idx").to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", &fixture_path(&dir), "--index-path", &idx])
+        .assert()
+        .success();
+
+    let local = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-E",
+            "utf-16le",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let indexed = tgrep()
+        .args([
+            "--index-path",
+            &idx,
+            "--no-heading",
+            "-E",
+            "utf-16le",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+
+    let mut a: Vec<_> = String::from_utf8_lossy(&local.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut b: Vec<_> = String::from_utf8_lossy(&indexed.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    a.sort();
+    b.sort();
+    assert!(!a.is_empty(), "expected matches, got none");
+    assert_eq!(a, b, "--encoding must agree across search paths");
+}
+
+// ---------------------------------------------------------------------------
+// New ripgrep flags: matching, output, and walking
+// ---------------------------------------------------------------------------
+
+#[test]
+fn line_regexp_requires_a_whole_line_match() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-x",
+            "hello",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-x",
+            "    a \\+ b",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("a + b"));
+}
+
+#[test]
+fn line_regexp_beats_word_regexp() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("p.txt"), "(flag)\n").unwrap();
+
+    // `-w` alone would reject a line that starts and ends with punctuation.
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-x",
+            "-w",
+            r"\(flag\)",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(flag)"));
+}
+
+#[test]
+fn pcre2_enables_lookaround() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-P",
+            "hello(?! world)",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-P",
+            "hello(?= world)",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn default_engine_rejects_lookaround() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--engine",
+            "default",
+            "hello(?= world)",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("regex error"));
+}
+
+#[test]
+fn unknown_engine_is_a_usage_error() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--engine",
+            "bogus",
+            "hello",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unrecognized regex engine"));
+}
+
+#[test]
+fn pcre2_version_reports_the_engine() {
+    tgrep()
+        .arg("--pcre2-version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fancy-regex"));
+}
+
+#[test]
+fn regex_size_limit_rejects_an_oversized_pattern() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--regex-size-limit",
+            "1",
+            "\\w{3,20}x[a-z]+",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("size limit"));
+}
+
+#[test]
+fn replace_rewrites_matches() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-r",
+            "REP",
+            "hello",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("REP world"));
+}
+
+#[test]
+fn replace_expands_capture_groups() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-r",
+            "<${1}>",
+            "hel(lo)",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<lo> world"));
+}
+
+#[test]
+fn replace_with_only_matching_prints_replacements() {
+    let dir = setup_fixture();
+    let out = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--no-filename",
+            "-o",
+            "-r",
+            "REP",
+            "hello",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.lines().any(|l| l.ends_with("REP")), "got {s:?}");
+    assert!(
+        !s.contains("world"),
+        "-o must not print the rest, got {s:?}"
+    );
+}
+
+#[test]
+fn passthru_prints_every_line() {
+    let dir = setup_fixture();
+    let out = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--passthru",
+            "hello",
+            dir.path()
+                .join("testdata")
+                .join("hello.rs")
+                .to_str()
+                .unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(s.lines().count(), 3, "expected the whole file, got {s:?}");
+    assert!(s.contains("fn main()"), "got {s:?}");
+}
+
+#[test]
+fn stop_on_nonmatch_halts_at_the_first_gap() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("s.txt"), "hit\nhit\nmiss\nhit\n").unwrap();
+
+    let out = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--no-filename",
+            "--stop-on-nonmatch",
+            "hit",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        s.lines().count(),
+        2,
+        "expected to stop at line 3, got {s:?}"
+    );
+}
+
+#[test]
+fn column_flag_prints_match_columns() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--column",
+            "world",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(":2:21:"));
+}
+
+#[test]
+fn byte_offset_flag_prints_line_offsets() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-b",
+            "world",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(":2:12:"));
+}
+
+#[test]
+fn max_columns_omits_long_lines() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(
+        sub.join("long.txt"),
+        format!("needle {}\n", "x".repeat(200)),
+    )
+    .unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-M",
+            "20",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[Omitted long line with 1 matches]",
+        ));
+}
+
+#[test]
+fn max_columns_preview_truncates_instead() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(
+        sub.join("long.txt"),
+        format!("needle {}\n", "x".repeat(200)),
+    )
+    .unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-M",
+            "20",
+            "--max-columns-preview",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[... omitted end of long line]"));
+}
+
+#[test]
+fn count_matches_counts_matches_not_lines() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("m.txt"), "aa aa aa\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-c",
+            "aa",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(":1"));
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--count-matches",
+            "aa",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(":3"));
+}
+
+#[test]
+fn include_zero_reports_unmatched_files() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-c",
+            "--include-zero",
+            "definitelynothere",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("hello.rs:0"));
+}
+
+#[test]
+fn context_separator_is_configurable() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("g.txt"), "hit\na\nb\nc\nd\nhit\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-C1",
+            "--context-separator",
+            "=====",
+            "hit",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("====="));
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-C1",
+            "--no-context-separator",
+            "hit",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--").not());
+}
+
+#[test]
+fn field_separators_are_configurable() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--field-match-separator",
+            "@@",
+            "world",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("@@2@@"));
+}
+
+#[test]
+fn path_separator_rewrites_printed_paths() {
+    let dir = setup_fixture();
+    let nested = dir.path().join("testdata").join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("deep.txt"), "world\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--path-separator",
+            "::",
+            "-l",
+            "world",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nested::deep.txt"));
+}
+
+#[test]
+fn sort_path_orders_results_deterministically() {
+    let dir = setup_fixture();
+    let out = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--sort",
+            "path",
+            "-l",
+            "e",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let lines: Vec<_> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut sorted = lines.clone();
+    sorted.sort();
+    assert_eq!(lines, sorted, "--sort path must emit ascending order");
+
+    let rev = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--sortr",
+            "path",
+            "-l",
+            "e",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let mut rev_lines: Vec<_> = String::from_utf8_lossy(&rev.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    rev_lines.reverse();
+    assert_eq!(rev_lines, sorted, "--sortr path must emit descending order");
+}
+
+#[test]
+fn unknown_sort_criteria_is_a_usage_error() {
+    let dir = setup_fixture();
+    tgrep()
+        .args(["--no-index", "--sort", "bogus", "e", &fixture_path(&dir)])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unrecognized sort criteria"));
+}
+
+#[test]
+fn max_depth_limits_recursion() {
+    let dir = setup_fixture();
+    let deep = dir.path().join("testdata").join("nested");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("deep.txt"), "needle\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--max-depth",
+            "1",
+            "-l",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .code(1);
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--max-depth",
+            "2",
+            "-l",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deep.txt"));
+}
+
+#[test]
+fn ignore_file_applies_extra_rules() {
+    let dir = setup_fixture();
+    let ignore = dir.path().join("extra-ignore");
+    fs::write(&ignore, "hello.rs\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--ignore-file",
+            ignore.to_str().unwrap(),
+            "-l",
+            "fn",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello.rs").not())
+        .stdout(predicate::str::contains("lib.rs"));
+}
+
+#[test]
+fn threads_flag_is_accepted() {
+    let dir = setup_fixture();
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-j",
+            "1",
+            "hello",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello world"));
+}
+
+#[test]
+fn pretty_implies_color_and_heading() {
+    let dir = setup_fixture();
+    let out = tgrep()
+        .args(["--no-index", "-p", "hello", &fixture_path(&dir)])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("\u{1b}["), "expected ANSI colour, got {s:?}");
+    assert!(s.contains("hello.rs"), "expected a heading, got {s:?}");
+}
+
+#[test]
+fn new_flags_agree_across_search_paths() {
+    let dir = setup_fixture();
+    let idx = dir.path().join("idx").to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", &fixture_path(&dir), "--index-path", &idx])
+        .assert()
+        .success();
+
+    let cases: &[&[&str]] = &[
+        &["--no-heading", "-r", "REP", "hello"],
+        &["--no-heading", "--passthru", "hello"],
+        &["--no-heading", "--column", "-b", "hello"],
+        &["--no-heading", "-x", "}"],
+        &["--no-heading", "--count-matches", "n"],
+        &["--no-heading", "-c", "n"],
+        &["--no-heading", "-M", "10", "hello"],
+        &["--no-heading", "-P", "hello(?= world)"],
+        &["--no-heading", "--sort", "path", "-l", "n"],
+        &["--no-heading", "-o", "-r", "REP", "hello"],
+    ];
+
+    let path = fixture_path(&dir);
+    for case in cases {
+        let mut local_args = vec!["--no-index"];
+        local_args.extend_from_slice(case);
+        local_args.push(&path);
+        let local = tgrep().args(&local_args).output().unwrap();
+
+        let mut idx_args = vec!["--index-path", &idx];
+        idx_args.extend_from_slice(case);
+        idx_args.push(&path);
+        let indexed = tgrep().args(&idx_args).output().unwrap();
+
+        let mut a: Vec<_> = String::from_utf8_lossy(&local.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let mut b: Vec<_> = String::from_utf8_lossy(&indexed.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "paths disagree for {case:?}");
+    }
+}
+
+#[test]
+fn search_zip_is_rejected_rather_than_ignored() {
+    let dir = setup_fixture();
+    tgrep()
+        .args(["--no-index", "-z", "hello", &fixture_path(&dir)])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("not supported"));
+}
+
+#[test]
+fn compatibility_no_op_flags_are_accepted() {
+    let dir = setup_fixture();
+    for flag in ["--mmap", "--no-mmap", "--crlf", "--no-crlf", "--no-config"] {
+        tgrep()
+            .args([
+                "--no-index",
+                "--no-heading",
+                flag,
+                "hello",
+                &fixture_path(&dir),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("hello world"));
+    }
+}
+
+#[test]
+fn column_is_not_printed_on_context_lines() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("f.txt"), "alpha\nbravo NEEDLE here\ncharlie\n").unwrap();
+
+    let out = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--no-filename",
+            "--column",
+            "-C1",
+            "NEEDLE",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("2:7:bravo"), "match needs a column, got {s:?}");
+    assert!(
+        s.contains("1-alpha"),
+        "context must have no column, got {s:?}"
+    );
+    assert!(
+        s.contains("3-charlie"),
+        "context must have no column, got {s:?}"
+    );
+}
+
+#[test]
+fn include_zero_agrees_across_search_paths() {
+    let dir = setup_fixture();
+    let idx = dir.path().join("idx").to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", &fixture_path(&dir), "--index-path", &idx])
+        .assert()
+        .success();
+
+    let local = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-c",
+            "--include-zero",
+            "definitelynothere",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let indexed = tgrep()
+        .args([
+            "--index-path",
+            &idx,
+            "--no-heading",
+            "-c",
+            "--include-zero",
+            "definitelynothere",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+
+    let mut a: Vec<_> = String::from_utf8_lossy(&local.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let mut b: Vec<_> = String::from_utf8_lossy(&indexed.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    a.sort();
+    b.sort();
+    assert!(!a.is_empty(), "expected zero-count rows, got none");
+    assert_eq!(a, b, "--include-zero must agree across search paths");
+}
+
+#[test]
+fn sort_path_uses_the_same_order_on_every_search_path() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(sub.join("src")).unwrap();
+    // `.` and `x` straddle `/` in ASCII, so a raw string sort disagrees with a
+    // component-wise path sort here.
+    fs::write(sub.join("src.rs"), "needle\n").unwrap();
+    fs::write(sub.join("srcx.rs"), "needle\n").unwrap();
+    fs::write(sub.join("src").join("lib.rs"), "needle\n").unwrap();
+
+    let idx = dir.path().join("idx").to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", &fixture_path(&dir), "--index-path", &idx])
+        .assert()
+        .success();
+
+    let local = tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--sort",
+            "path",
+            "-l",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+    let indexed = tgrep()
+        .args([
+            "--index-path",
+            &idx,
+            "--no-heading",
+            "--sort",
+            "path",
+            "-l",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .output()
+        .unwrap();
+
+    // Deliberately NOT sorted: the order itself is what is under test.
+    let a = String::from_utf8_lossy(&local.stdout).to_string();
+    let b = String::from_utf8_lossy(&indexed.stdout).to_string();
+    assert_eq!(a.lines().count(), 3, "expected three files, got {a:?}");
+    assert_eq!(a, b, "--sort path must use one order on every search path");
+}

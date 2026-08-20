@@ -264,6 +264,10 @@ struct Cli {
     #[arg(short = 'u', long = "unrestricted", action = clap::ArgAction::Count, global = true)]
     unrestricted: u8,
 
+    /// Search binary files, reporting a note instead of printing their lines.
+    #[arg(long = "binary", global = true)]
+    binary: bool,
+
     // ── Matching ─────────────────────────────────────
     /// Only match when the whole line matches the pattern.
     #[arg(short = 'x', long = "line-regexp", global = true)]
@@ -714,6 +718,26 @@ impl Cli {
         })
     }
 
+    /// Split the positional arguments into a pattern and a list of paths.
+    ///
+    /// ripgrep only treats the first positional as the pattern when no pattern
+    /// was supplied another way. Once `-e` or `-f` is present every positional
+    /// is a path, so `rg -e foo src` searches `src` rather than also searching
+    /// for the literal string `src`.
+    fn split_pattern_and_paths(
+        &self,
+        positional: Option<&String>,
+        rest: &[String],
+    ) -> (String, Vec<String>) {
+        if self.regexp.is_empty() && self.pattern_file.is_none() {
+            return (positional.cloned().unwrap_or_default(), rest.to_vec());
+        }
+        let mut paths = Vec::with_capacity(rest.len() + 1);
+        paths.extend(positional.cloned());
+        paths.extend(rest.iter().cloned());
+        (String::new(), paths)
+    }
+
     fn build_search_opts(&self, pattern: String, resolved: &ResolvedArgs) -> search::SearchOptions {
         // `-p/--pretty` is ripgrep's alias for --color always --heading -n.
         let heading = if self.heading || self.pretty {
@@ -772,8 +796,19 @@ impl Cli {
             hidden,
             quiet: self.quiet,
             no_filename: self.no_filename,
-            no_line_number: self.no_line_number,
+            // ripgrep only turns line numbers on for a terminal, so a piped
+            // stream stays `path:content` for whatever parses it. `--column`,
+            // `--vimgrep` and `-p` all ask for the line number explicitly.
+            no_line_number: self.no_line_number
+                || !(self.line_number
+                    || self.column
+                    || self.vimgrep
+                    || self.pretty
+                    || crate::output::atty_check()),
             text,
+            binary: self.binary,
+            // Replaced per path argument in `run_search`.
+            path_display: crate::output::PathDisplay::Bare,
             max_filesize: resolved.max_filesize,
             encoding: resolved.encoding,
             follow: self.follow,
@@ -946,7 +981,10 @@ fn run_cli() {
         Some(Command::Search {
             ref pattern,
             ref paths,
-        }) => run_search(&cli, pattern.clone(), paths, &resolved),
+        }) => {
+            let (pattern, paths) = cli.split_pattern_and_paths(Some(pattern), paths);
+            run_search(&cli, pattern, &paths, &resolved)
+        }
         Some(Command::Status { path }) => status::run(&path, cli.index_path.as_deref()),
         Some(Command::CountFiles { path }) => walkcount::run(&path, cli.hidden, no_ignore),
         None => {
@@ -954,8 +992,11 @@ fn run_cli() {
                 let opts = cli.build_search_opts(String::new(), &resolved);
                 let paths = list_files_paths(&cli);
                 list_files(&paths, &opts)
-            } else if let Some(pattern) = cli.pattern.clone() {
-                run_search(&cli, pattern, &cli.paths, &resolved)
+            } else if cli.pattern.is_some() || !cli.regexp.is_empty() || cli.pattern_file.is_some()
+            {
+                let (pattern, paths) =
+                    cli.split_pattern_and_paths(cli.pattern.as_ref(), &cli.paths);
+                run_search(&cli, pattern, &paths, &resolved)
             } else {
                 eprintln!("Usage: tgrep <pattern> [PATH ...]");
                 eprintln!("       tgrep index [path]");
@@ -974,9 +1015,41 @@ fn run_cli() {
     }
 }
 
-fn normalize_search_paths(paths: &[String]) -> Vec<PathBuf> {
+/// A path argument, kept alongside the exact text the user typed.
+///
+/// ripgrep echoes the argument verbatim into every path it prints, so the
+/// original spelling (`.`, `./src`, `src\`, an absolute path) has to survive
+/// past the point where the path is canonicalised for the actual walk.
+struct SearchTarget {
+    path: PathBuf,
+    typed: String,
+}
+
+impl SearchTarget {
+    /// How paths found under this argument should be printed.
+    fn display(&self) -> output::PathDisplay {
+        if self.typed.is_empty() {
+            return output::PathDisplay::Bare;
+        }
+        if self.path.is_file() {
+            return output::PathDisplay::Exact(self.typed.clone());
+        }
+        // A trailing separator the user typed is kept as typed; otherwise
+        // ripgrep joins with the platform separator.
+        let mut prefix = self.typed.clone();
+        if !prefix.ends_with(['/', '\\']) {
+            prefix.push(std::path::MAIN_SEPARATOR);
+        }
+        output::PathDisplay::Prefix(prefix)
+    }
+}
+
+fn normalize_search_paths(paths: &[String]) -> Vec<SearchTarget> {
     if paths.is_empty() {
-        return vec![PathBuf::from(".")];
+        return vec![SearchTarget {
+            path: PathBuf::from("."),
+            typed: String::new(),
+        }];
     }
 
     paths
@@ -997,7 +1070,10 @@ fn normalize_search_paths(paths: &[String]) -> Vec<PathBuf> {
                     None => break,
                 }
             }
-            PathBuf::from(trimmed)
+            SearchTarget {
+                path: PathBuf::from(trimmed),
+                typed: trimmed.to_string(),
+            }
         })
         .collect()
 }
@@ -1012,12 +1088,14 @@ fn list_files_paths(cli: &Cli) -> Vec<String> {
 }
 
 fn list_files(paths: &[String], opts: &search::SearchOptions) -> anyhow::Result<()> {
-    for path in normalize_search_paths(paths) {
-        if !path.exists() {
-            report_missing_path(&path, opts.no_messages);
+    let mut opts = opts.clone();
+    for target in normalize_search_paths(paths) {
+        if !target.path.exists() {
+            report_missing_path(&target.path, opts.no_messages);
             continue;
         }
-        search::list_files(&path, opts)?;
+        opts.path_display = target.display();
+        search::list_files(&target.path, &opts)?;
     }
     Ok(())
 }
@@ -1040,15 +1118,23 @@ fn run_search(
     paths: &[String],
     resolved: &ResolvedArgs,
 ) -> anyhow::Result<()> {
-    let opts = cli.build_search_opts(pattern, resolved);
+    let mut opts = cli.build_search_opts(pattern, resolved);
     let mut had_matches = false;
 
-    for path in normalize_search_paths(paths) {
-        if !path.exists() {
-            report_missing_path(&path, opts.no_messages);
+    // ripgrep decides these once, from the whole argument list: file names are
+    // shown unless exactly one file was named, and line numbers only when
+    // writing to a terminal.
+    let targets = normalize_search_paths(paths);
+    opts.no_filename = cli.no_filename
+        || (!cli.with_filename && !cli.vimgrep && targets.len() == 1 && targets[0].path.is_file());
+
+    for target in targets {
+        if !target.path.exists() {
+            report_missing_path(&target.path, opts.no_messages);
             continue;
         }
-        match search::run(&path, cli.index_path.as_deref(), &opts) {
+        opts.path_display = target.display();
+        match search::run(&target.path, cli.index_path.as_deref(), &opts) {
             Ok(true) => {
                 had_matches = true;
                 if opts.quiet {

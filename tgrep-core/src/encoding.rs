@@ -81,13 +81,72 @@ pub fn decode_bytes(bytes: &[u8], mode: EncodingMode) -> Cow<'_, [u8]> {
 
 /// Decode `bytes` into searchable text.
 pub fn decode(bytes: &[u8], mode: EncodingMode) -> String {
+    decode_with_fixups(bytes, mode).0
+}
+
+/// Decode `bytes` and record where invalid input was replaced.
+///
+/// Callers that report byte offsets or columns need [`LossyFixups`] to map an
+/// offset in the decoded text back to one in the file, since every repaired
+/// byte turns into a three-byte `U+FFFD`.
+pub fn decode_with_fixups(bytes: &[u8], mode: EncodingMode) -> (String, LossyFixups) {
     match decode_bytes(bytes, mode) {
         Cow::Borrowed(body) => lossy_utf8(body),
-        // Transcoded output is always valid UTF-8, so this is a move.
-        Cow::Owned(body) => String::from_utf8(body)
-            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        // Transcoded output is always valid UTF-8, and its offsets bear no
+        // relation to the source bytes anyway, so there is nothing to map.
+        Cow::Owned(body) => (
+            String::from_utf8(body)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+            LossyFixups::default(),
+        ),
     }
 }
+
+/// Where lossy UTF-8 decoding replaced invalid bytes with `U+FFFD`.
+///
+/// ripgrep reports columns and `--byte-offset` in terms of the bytes on disk.
+/// tgrep searches repaired text, where each replacement is three bytes wide no
+/// matter how many bytes it stood in for, so offsets have to be mapped back.
+#[derive(Debug, Default, Clone)]
+pub struct LossyFixups {
+    /// `(offset of the replacement in the decoded text, total bytes gained up
+    /// to and including it)`, ascending by offset.
+    shifts: Vec<(usize, usize)>,
+}
+
+impl LossyFixups {
+    pub fn is_empty(&self) -> bool {
+        self.shifts.is_empty()
+    }
+
+    /// Map an offset in the decoded text to the corresponding offset in the
+    /// source bytes.
+    ///
+    /// An offset may land *inside* a `U+FFFD` rather than on its boundary: the
+    /// repaired text is what gets searched, so a pattern can match starting
+    /// part-way through the replacement. Such an offset is clamped to the
+    /// replacement's own source position, because there is no finer-grained
+    /// answer and because subtracting a gain the offset has not yet realised
+    /// would underflow.
+    pub fn to_source_offset(&self, decoded: usize) -> usize {
+        if self.shifts.is_empty() {
+            return decoded;
+        }
+        let i = self.shifts.partition_point(|&(at, _)| at < decoded);
+        if i == 0 {
+            return decoded;
+        }
+        let (at, gained) = self.shifts[i - 1];
+        let gained_before = if i >= 2 { self.shifts[i - 2].1 } else { 0 };
+        if decoded < at + REPLACEMENT_LEN {
+            return at - gained_before;
+        }
+        decoded - gained
+    }
+}
+
+/// Byte length of `U+FFFD`, the character lossy decoding substitutes in.
+const REPLACEMENT_LEN: usize = '\u{FFFD}'.len_utf8();
 
 /// Decode using the same rules the index builder uses.
 ///
@@ -104,11 +163,43 @@ fn transcode(enc: &'static Encoding, bytes: &[u8]) -> String {
     decoded.into_owned()
 }
 
-fn lossy_utf8(bytes: &[u8]) -> String {
-    match String::from_utf8(bytes.to_vec()) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+/// `String::from_utf8_lossy`, but recording each repair.
+///
+/// The loop mirrors the standard library's: one `U+FFFD` per maximal invalid
+/// subsequence, so the text produced here is identical.
+fn lossy_utf8(bytes: &[u8]) -> (String, LossyFixups) {
+    let mut rest = match std::str::from_utf8(bytes) {
+        Ok(s) => return (s.to_string(), LossyFixups::default()),
+        Err(_) => bytes,
+    };
+
+    let mut out = String::with_capacity(bytes.len());
+    let mut shifts = Vec::new();
+    let mut gained = 0usize;
+    loop {
+        let err = match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => e,
+        };
+        let valid = err.valid_up_to();
+        out.push_str(std::str::from_utf8(&rest[..valid]).unwrap_or_default());
+        // `None` means the input ended mid-sequence: everything left is one
+        // replacement and there is nothing after it.
+        let replaced = err.error_len().unwrap_or(rest.len() - valid);
+        shifts.push((out.len(), {
+            gained += REPLACEMENT_LEN - replaced.min(REPLACEMENT_LEN);
+            gained
+        }));
+        out.push(char::REPLACEMENT_CHARACTER);
+        match err.error_len() {
+            Some(n) => rest = &rest[valid + n..],
+            None => break,
+        }
     }
+    (out, LossyFixups { shifts })
 }
 
 #[cfg(test)]

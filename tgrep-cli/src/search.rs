@@ -10,6 +10,7 @@ use std::time::Instant;
 use anyhow::Result;
 use tgrep_core::builder;
 use tgrep_core::filetypes;
+use tgrep_core::meta::IndexMeta;
 use tgrep_core::query::{self, QueryPlan};
 use tgrep_core::reader::IndexReader;
 use tgrep_core::walker;
@@ -18,6 +19,7 @@ use crate::matching::SearchMatcher;
 use crate::output::{ColorMode, ContextLine, Match, OutputConfig, OutputFormat, OutputWriter};
 use crate::serve::ServerInfo;
 
+#[derive(Clone)]
 pub struct SearchOptions {
     pub pattern: String,
     pub extra_patterns: Vec<String>,
@@ -59,6 +61,12 @@ pub struct SearchOptions {
     pub no_filename: bool,
     pub no_line_number: bool,
     pub text: bool,
+    /// `--binary`: walk into files an extension check would reject, and report
+    /// a "binary file matches" note for them instead of printing their lines.
+    pub binary: bool,
+    /// How to rebuild printed paths from the search-root-relative ones. Set per
+    /// path argument, since each argument is echoed back exactly as typed.
+    pub path_display: crate::output::PathDisplay,
     pub max_filesize: Option<u64>,
     pub encoding: tgrep_core::encoding::EncodingMode,
     pub follow: bool,
@@ -188,7 +196,7 @@ impl SearchOptions {
         walker::WalkOptions {
             include_hidden: self.hidden,
             no_ignore: self.no_ignore,
-            search_binary: self.text,
+            search_binary: self.text || self.binary,
             follow_links: self.follow,
             max_file_size: self.max_filesize,
             max_depth: self.max_depth,
@@ -311,13 +319,22 @@ impl SearchOptions {
             field_match_separator: self.field_match_separator.clone(),
             field_context_separator: self.field_context_separator.clone(),
             path_separator: self.path_separator.clone(),
+            path_display: self.path_display.clone(),
             line_buffered: self.line_buffered,
         }
     }
 
     /// Collect all patterns (primary + -e extras + -f file patterns).
     fn all_patterns(&self) -> Result<Vec<String>> {
-        let mut patterns = vec![self.pattern.clone()];
+        let has_extra = !self.extra_patterns.is_empty() || self.pattern_file.is_some();
+        // `-e`/`-f` move the positional argument into the path list, leaving the
+        // base pattern empty. Keeping it would contribute an empty alternative
+        // that matches every line.
+        let mut patterns = if has_extra && self.pattern.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.pattern.clone()]
+        };
         patterns.extend(self.extra_patterns.iter().cloned());
         if let Some(ref path) = self.pattern_file {
             let content = std::fs::read_to_string(path)?;
@@ -342,6 +359,13 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
     let glob_filter = opts.glob_filter()?;
     let type_filter = opts.type_filter()?;
 
+    // `--files` lists what would be searched without reading anything, so it
+    // must not drop files on an extension guess the way a search does.
+    let walk_opts = walker::WalkOptions {
+        search_binary: true,
+        ..opts.walk_options()
+    };
+
     if root.is_file() {
         let rel_path = explicit_file_display_path(&root);
 
@@ -353,7 +377,7 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
         return Ok(());
     }
 
-    let walk = walker::walk_dir(&root, &opts.walk_options());
+    let walk = walker::walk_dir(&root, &walk_opts);
     let mut writer = OutputWriter::new(opts.make_output_config());
 
     for path in &walk.files {
@@ -388,8 +412,25 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
     // saw. Worse, a file the indexer classified as binary (BOM-less UTF-16 is
     // nothing but NUL-interleaved bytes) is absent from the index entirely, so
     // even a full-scan plan cannot reach it. The only way `-E` means the same
-    // thing with and without an index is to walk the tree.
-    let bypass_index = opts.encoding.may_differ_from_index();
+    // thing with and without an index is to walk the tree. `-a`/`--binary` are
+    // the same story, as is anything that widens the walk: the index was built
+    // skipping hidden and ignored files, so `--hidden`/`--no-ignore` can only
+    // find them by walking.
+    //
+    // A single named file is bypassed too. The index deliberately omits binary
+    // and ignored files, but naming one explicitly is exactly how ripgrep asks
+    // for it — and reading one file directly is cheaper than loading an index.
+    let bypass_index = root.is_file()
+        || opts.encoding.may_differ_from_index()
+        || opts.text
+        || opts.binary
+        || opts.hidden
+        || opts.no_ignore
+        || opts.no_ignore_dot
+        || opts.no_ignore_exclude
+        || opts.no_ignore_global
+        || opts.no_ignore_parent
+        || opts.no_ignore_vcs;
 
     // Try to delegate to a running server (skip for files_without_match
     // since the server only returns matching files). `--include-zero` needs
@@ -400,8 +441,9 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
         && !opts.files_without_match
         && !opts.include_zero
         && let Ok(info) = ServerInfo::load(&index_dir)
+        && let Some((index_root, scope)) = resolve_scope(&index_dir, &root)
     {
-        if let Ok(had_matches) = search_via_server(&info, &root, opts, ci) {
+        if let Ok(had_matches) = search_via_server(&info, &root, &index_root, &scope, opts, ci) {
             return Ok(had_matches);
         }
         eprintln!("Server unreachable, falling back to local index");
@@ -470,6 +512,8 @@ fn warn_missing_index(index_dir: &Path, explicit_path: bool, quiet: bool) {
 fn search_via_server(
     info: &ServerInfo,
     root: &Path,
+    index_root: &Path,
+    scope: &IndexScope,
     opts: &SearchOptions,
     ci: bool,
 ) -> Result<bool> {
@@ -555,6 +599,38 @@ fn search_via_server(
         .and_then(|m| m.as_array())
         .unwrap_or(&empty_vec);
 
+    // The server always searches its whole indexed tree and reports paths
+    // relative to the index root, so a subdirectory argument and `--max-depth`
+    // have to be applied to the reply.
+    //
+    // ripgrep only surfaces a binary file when the user named it explicitly, so
+    // `binary` rows for anything reached by traversal are dropped here.
+    let drop_binary = !opts.binary
+        && !matches!(scope, IndexScope::File(_))
+        && matches
+            .iter()
+            .any(|m| m.get("type").and_then(|t| t.as_str()) == Some("binary"));
+    let scoped;
+    let matches = if matches!(scope, IndexScope::Whole) && opts.max_depth.is_none() && !drop_binary
+    {
+        matches
+    } else {
+        scoped = matches
+            .iter()
+            .filter_map(|m| {
+                if drop_binary && m.get("type").and_then(|t| t.as_str()) == Some("binary") {
+                    return None;
+                }
+                let rel = scope.relativize(m.get("file")?.as_str()?, root)?;
+                within_max_depth(&rel, opts).then_some(())?;
+                let mut m = m.clone();
+                m["file"] = serde_json::Value::String(rel);
+                Some(m)
+            })
+            .collect::<Vec<_>>();
+        &scoped
+    };
+
     // `--sort` reorders whole files. Ranking distinct files once (one metadata
     // read each) and sorting rows by rank keeps every file's rows in the
     // server's line order. The key is a `PathBuf` so the order matches the
@@ -575,10 +651,7 @@ fn search_via_server(
                 let t = if sort.key == SortKey::Path {
                     None
                 } else {
-                    time_key(
-                        &root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
-                        sort.key,
-                    )
+                    time_key(&scope.full_path(index_root, rel), sort.key)
                 };
                 ranked.push((t, PathBuf::from(rel), rel.to_string()));
             }
@@ -686,6 +759,10 @@ fn search_via_server(
             let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
             let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or("match");
             let offset = m.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
+            // `-M/--max-columns` counts the line terminator, which only the
+            // server knows; an older server omits it and simply measures the
+            // visible text.
+            let terminator_len = m.get("term").and_then(|t| t.as_u64()).unwrap_or(0) as usize;
             if mtype == "context" {
                 writer.write_context_separator(file, line)?;
                 writer.write_context_line(&ContextLine {
@@ -693,6 +770,7 @@ fn search_via_server(
                     line_number: line,
                     content: content.to_string(),
                     absolute_offset: offset,
+                    terminator_len,
                 })?;
             } else if mtype == "binary" {
                 writer.write_binary_note(file, offset)?;
@@ -714,9 +792,18 @@ fn search_via_server(
                     file: file.to_string(),
                     line_number: line,
                     content: content.to_string(),
-                    column: m.get("column").and_then(|c| c.as_u64()).map(|c| c as usize),
+                    columns: m
+                        .get("columns")
+                        .and_then(|c| c.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|c| c.as_u64().map(|c| c as usize))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     spans,
                     absolute_offset: offset,
+                    terminator_len,
                 })?;
             }
         }
@@ -744,6 +831,16 @@ fn search_local_index(
 ) -> Result<bool> {
     let start = Instant::now();
     let reader = IndexReader::open(index_dir)?;
+
+    // Index paths are relative to the root the index was built for, which is
+    // not necessarily the directory being searched. Without translating between
+    // the two, `tgrep --index-path IDX foo src` looks for `src/src/lib.rs` and
+    // silently reports nothing.
+    let Some((index_root, scope)) = resolve_scope(index_dir, root) else {
+        // The index covers an unrelated tree, so it cannot answer this search.
+        return brute_force_search(root, opts, ci);
+    };
+
     let glob_filter = opts.glob_filter()?;
     let type_filter = opts.type_filter()?;
 
@@ -765,42 +862,51 @@ fn search_local_index(
     // The trigram plan selects files that contain the pattern, which is exactly
     // the wrong filter, so it has to be bypassed. Same for `--files-without-match`
     // and `--include-zero`, which both have to report files the plan excluded.
-    let candidates =
+    let candidate_ids =
         if is_match_all || opts.files_without_match || opts.invert_match || opts.include_zero {
             reader.all_file_ids()
         } else {
             query::execute_plan_with_masks(&plan, &|tri| reader.lookup_trigram_with_masks(tri))
         };
 
+    // Drop everything outside the searched subtree and re-express the survivors
+    // relative to it, so globs, `--max-depth` and printed paths all agree with
+    // what the brute-force walk of the same directory would produce.
+    let mut candidates: Vec<(u32, String)> = candidate_ids
+        .iter()
+        .filter_map(|&fid| {
+            let indexed = reader.file_path(fid)?;
+            let rel = scope.relativize(indexed, root)?;
+            within_max_depth(&rel, opts).then_some(())?;
+            Some((fid, rel))
+        })
+        .collect();
+
     // `--sort` has to apply here too, otherwise it would silently do nothing on
     // the default (indexed) code path. The key is a `PathBuf` so the order
     // matches the brute-force walk, which compares paths component-wise; a raw
     // string compare would sort `src.rs` before `src/lib.rs`.
-    let candidates = match opts.sort {
-        None => candidates,
-        Some(sort) => {
-            let mut keyed: Vec<_> = candidates
-                .iter()
-                .map(|&fid| {
-                    let rel = reader.file_path(fid).unwrap_or_default().to_string();
-                    let t = if sort.key == SortKey::Path {
-                        None
-                    } else {
-                        time_key(
-                            &root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR)),
-                            sort.key,
-                        )
-                    };
-                    (t, PathBuf::from(rel), fid)
-                })
-                .collect();
-            keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            if sort.reverse {
-                keyed.reverse();
-            }
-            keyed.into_iter().map(|(_, _, fid)| fid).collect()
+    if let Some(sort) = opts.sort {
+        let mut keyed: Vec<_> = candidates
+            .into_iter()
+            .map(|(fid, rel)| {
+                let t = if sort.key == SortKey::Path {
+                    None
+                } else {
+                    time_key(&scope.full_path(&index_root, &rel), sort.key)
+                };
+                (t, PathBuf::from(&rel), fid, rel)
+            })
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        if sort.reverse {
+            keyed.reverse();
         }
-    };
+        candidates = keyed
+            .into_iter()
+            .map(|(_, _, fid, rel)| (fid, rel))
+            .collect();
+    }
 
     if opts.stats {
         eprintln!(
@@ -813,42 +919,52 @@ fn search_local_index(
 
     let mut writer = OutputWriter::new(opts.make_output_config());
     let mut had_matches = false;
+    // A single-file search root is a file the user named on the command line,
+    // which is what makes binary files visible in ripgrep.
+    let explicit = matches!(scope, IndexScope::File(_));
 
-    for &fid in &candidates {
-        let rel_path = match reader.file_path(fid) {
-            Some(p) => p.to_string(),
-            None => continue,
-        };
-
-        if !passes_filters(&rel_path, &glob_filter, &type_filter) {
+    for (_, rel_path) in &candidates {
+        if !passes_filters(rel_path, &glob_filter, &type_filter) {
             continue;
         }
 
-        let full_path = root.join(rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let full_path = scope.full_path(&index_root, rel_path);
         if exceeds_max_filesize(&full_path, opts) {
             continue;
         }
-        let content = match read_text_lossy(&full_path, opts.encoding) {
+        let (content, fixups) = match read_text_lossy(&full_path, opts.encoding) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
-        let matched = search_file_content(&content, &matcher, &rel_path, opts, &mut writer)?;
-        if matched {
-            if !opts.files_without_match {
+        let outcome = search_decoded_file(
+            &content,
+            &fixups,
+            &matcher,
+            rel_path,
+            opts,
+            &mut writer,
+            explicit,
+        )?;
+        match outcome {
+            FileOutcome::Matched => {
+                if !opts.files_without_match {
+                    had_matches = true;
+                    if opts.quiet {
+                        break;
+                    }
+                }
+            }
+            FileOutcome::NoMatch if opts.files_without_match => {
+                if !opts.quiet {
+                    writer.write_file(rel_path)?;
+                }
                 had_matches = true;
                 if opts.quiet {
                     break;
                 }
             }
-        } else if opts.files_without_match {
-            if !opts.quiet {
-                writer.write_file(&rel_path)?;
-            }
-            had_matches = true;
-            if opts.quiet {
-                break;
-            }
+            FileOutcome::NoMatch | FileOutcome::Skipped => {}
         }
     }
 
@@ -862,6 +978,81 @@ fn search_local_index(
 
     writer.flush()?;
     Ok(had_matches)
+}
+
+/// Which slice of an index a search root covers.
+///
+/// An index stores paths relative to the root it was built for. A search root
+/// may be that same directory, a directory inside it, or a single file inside
+/// it; each needs a different translation to and from index-relative paths.
+enum IndexScope {
+    Whole,
+    Subtree(String),
+    File(String),
+}
+
+impl IndexScope {
+    /// `None` when `search_root` lies outside the indexed tree, which means the
+    /// index cannot answer the search at all.
+    fn resolve(index_root: &Path, search_root: &Path) -> Option<Self> {
+        let rel = search_root.strip_prefix(index_root).ok()?;
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel.is_empty() {
+            Some(IndexScope::Whole)
+        } else if search_root.is_file() {
+            Some(IndexScope::File(rel))
+        } else {
+            Some(IndexScope::Subtree(format!("{rel}/")))
+        }
+    }
+
+    /// Re-express an index-relative path relative to the search root, or `None`
+    /// when the file is outside it.
+    fn relativize(&self, indexed: &str, search_root: &Path) -> Option<String> {
+        match self {
+            IndexScope::Whole => Some(indexed.to_string()),
+            IndexScope::Subtree(prefix) => indexed.strip_prefix(prefix).map(str::to_string),
+            // A named file prints as the user reached it, exactly as the
+            // brute-force path does.
+            IndexScope::File(f) => (f == indexed).then(|| explicit_file_display_path(search_root)),
+        }
+    }
+
+    fn full_path(&self, index_root: &Path, rel: &str) -> PathBuf {
+        let indexed = match self {
+            IndexScope::Whole => rel.to_string(),
+            IndexScope::Subtree(prefix) => format!("{prefix}{rel}"),
+            // `rel` is the path as the user typed it, so go back to the one the
+            // index stores.
+            IndexScope::File(f) => f.clone(),
+        };
+        index_root.join(indexed.replace('/', std::path::MAIN_SEPARATOR_STR))
+    }
+}
+
+/// The slice of the index at `index_dir` that covers `root`, with the absolute
+/// root the index was built for.
+fn resolve_scope(index_dir: &Path, root: &Path) -> Option<(PathBuf, IndexScope)> {
+    let index_root = IndexMeta::load(index_dir)
+        .ok()
+        .and_then(|m| std::fs::canonicalize(m.root_path).ok())
+        .unwrap_or_else(|| root.to_path_buf());
+    let scope = IndexScope::resolve(&index_root, root)?;
+    Some((index_root, scope))
+}
+
+/// `true` when the path is shallow enough to keep under `--max-depth`.
+///
+/// The walker applies this while descending; the indexed paths never went
+/// through it, so it has to be re-applied by counting components.
+fn within_max_depth(rel: &str, opts: &SearchOptions) -> bool {
+    match opts.max_depth {
+        // `rel` is search-root-relative, so its separator count is the number
+        // of directory levels below the root; a depth of 1 means "directly in
+        // the root", matching ripgrep's `--max-depth`.
+        Some(max) => rel.matches('/').count() < max,
+        None => true,
+    }
 }
 
 fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<bool> {
@@ -879,17 +1070,29 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
         if passes_filters(&rel_path, &glob_filter, &type_filter)
             && !exceeds_max_filesize(root, opts)
         {
-            let content = read_text_lossy(root, opts.encoding)?;
-            let matched = search_file_content(&content, &matcher, &rel_path, opts, &mut writer)?;
-            if matched {
-                if !opts.files_without_match {
+            let (content, fixups) = read_text_lossy(root, opts.encoding)?;
+            let outcome = search_decoded_file(
+                &content,
+                &fixups,
+                &matcher,
+                &rel_path,
+                opts,
+                &mut writer,
+                true,
+            )?;
+            match outcome {
+                FileOutcome::Matched => {
+                    if !opts.files_without_match {
+                        had_matches = true;
+                    }
+                }
+                FileOutcome::NoMatch if opts.files_without_match => {
+                    if !opts.quiet {
+                        writer.write_file(&rel_path)?;
+                    }
                     had_matches = true;
                 }
-            } else if opts.files_without_match {
-                if !opts.quiet {
-                    writer.write_file(&rel_path)?;
-                }
-                had_matches = true;
+                FileOutcome::NoMatch | FileOutcome::Skipped => {}
             }
         }
 
@@ -921,27 +1124,39 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
             continue;
         }
 
-        let content = match read_text_lossy(path, opts.encoding) {
+        let (content, fixups) = match read_text_lossy(path, opts.encoding) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
-        let matched = search_file_content(&content, &matcher, &rel_path, opts, &mut writer)?;
-        if matched {
-            if !opts.files_without_match {
+        let outcome = search_decoded_file(
+            &content,
+            &fixups,
+            &matcher,
+            &rel_path,
+            opts,
+            &mut writer,
+            false,
+        )?;
+        match outcome {
+            FileOutcome::Matched => {
+                if !opts.files_without_match {
+                    had_matches = true;
+                    if opts.quiet {
+                        break;
+                    }
+                }
+            }
+            FileOutcome::NoMatch if opts.files_without_match => {
+                if !opts.quiet {
+                    writer.write_file(&rel_path)?;
+                }
                 had_matches = true;
                 if opts.quiet {
                     break;
                 }
             }
-        } else if opts.files_without_match {
-            if !opts.quiet {
-                writer.write_file(&rel_path)?;
-            }
-            had_matches = true;
-            if opts.quiet {
-                break;
-            }
+            FileOutcome::NoMatch | FileOutcome::Skipped => {}
         }
     }
 
@@ -966,9 +1181,9 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
 fn read_text_lossy(
     path: &Path,
     encoding: tgrep_core::encoding::EncodingMode,
-) -> std::io::Result<String> {
+) -> std::io::Result<(String, tgrep_core::encoding::LossyFixups)> {
     let bytes = std::fs::read(path)?;
-    Ok(tgrep_core::encoding::decode(&bytes, encoding))
+    Ok(tgrep_core::encoding::decode_with_fixups(&bytes, encoding))
 }
 
 /// Whether `--max-filesize` excludes this file.
@@ -984,15 +1199,95 @@ fn exceeds_max_filesize(path: &Path, opts: &SearchOptions) -> bool {
     std::fs::metadata(path).is_ok_and(|md| md.len() > limit)
 }
 
-/// Search a single file's content and write output.
-/// Returns true if any matches were found.
-fn search_file_content(
+/// Map line-relative columns from decoded text to the source bytes.
+///
+/// Columns count bytes from the start of the line, so both ends have to be
+/// mapped before subtracting.
+pub(crate) fn to_source_columns(
+    columns: &[usize],
+    line_offset: usize,
+    fixups: &tgrep_core::encoding::LossyFixups,
+) -> Vec<usize> {
+    if fixups.is_empty() {
+        return columns.to_vec();
+    }
+    let line = fixups.to_source_offset(line_offset);
+    columns
+        .iter()
+        .map(|&c| fixups.to_source_offset(line_offset + c - 1) - line + 1)
+        .collect()
+}
+
+/// Map one emitted match's columns and absolute offset onto the bytes on disk.
+///
+/// Shared by the brute-force/index path and the server so the two can never
+/// disagree about coordinates. Columns arrive indexing the decoded source line
+/// and are mapped back through `fixups`; `--replace` then moves each of them by
+/// its entry in `column_shifts`, because ripgrep reports positions in the
+/// rewritten line rather than in the original one.
+///
+/// The shifts are measured on the decoded text, so they are exact unless a
+/// *replaced* match itself covered bytes that failed to decode — a case with no
+/// ripgrep equivalent, since ripgrep searches raw bytes and never matches the
+/// `U+FFFD` that repairing them produces. Columns are clamped to stay 1-based.
+pub(crate) fn to_source_positions(
+    columns: &[usize],
+    column_shifts: &[isize],
+    absolute_offset: usize,
+    offset_shift: isize,
+    line_offset: usize,
+    fixups: &tgrep_core::encoding::LossyFixups,
+) -> (Vec<usize>, usize) {
+    let mut columns = to_source_columns(columns, line_offset, fixups);
+    for (col, &shift) in columns.iter_mut().zip(column_shifts) {
+        *col = col.saturating_add_signed(shift).max(1);
+    }
+    let offset = fixups
+        .to_source_offset(absolute_offset)
+        .saturating_add_signed(offset_shift);
+    (columns, offset)
+}
+
+/// What happened to one file during a search.
+///
+/// `Skipped` exists because ripgrep hides binary files found by traversal
+/// entirely: they must not surface as "no match" either, or they would leak
+/// into `--files-without-match`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileOutcome {
+    Matched,
+    NoMatch,
+    Skipped,
+}
+
+/// Search one file's decoded text, mapping reported offsets back to the bytes
+/// on disk using `fixups`.
+///
+/// `explicit` is true when the user named this file directly on the command
+/// line. ripgrep only surfaces binary files that were named explicitly (or
+/// when `--binary` is given); binary files reached by directory traversal are
+/// skipped silently, so they appear in neither `-l`, `-c`, `-L`, nor the plain
+/// output.
+fn search_decoded_file(
     content: &str,
+    fixups: &tgrep_core::encoding::LossyFixups,
     matcher: &SearchMatcher,
     rel_path: &str,
     opts: &SearchOptions,
     writer: &mut OutputWriter,
-) -> Result<bool> {
+    explicit: bool,
+) -> Result<FileOutcome> {
+    // ripgrep only surfaces a binary file when the user named it explicitly (or
+    // passed `--binary`).
+    let binary_offset = if opts.text {
+        None
+    } else {
+        content.as_bytes().iter().position(|&b| b == 0)
+    };
+    if binary_offset.is_some() && !explicit && !opts.binary {
+        return Ok(FileOutcome::Skipped);
+    }
+
     writer.note_bytes_searched(content.len() as u64);
 
     let match_opts = opts.match_options();
@@ -1005,17 +1300,17 @@ fn search_file_content(
         if opts.include_zero && (opts.count || opts.count_matches) && !opts.quiet {
             writer.write_count(rel_path, 0)?;
         }
-        return Ok(false);
+        return Ok(FileOutcome::NoMatch);
     }
 
-    // For quiet/files_without_match, we only need the boolean result.
+    // For quiet/files_without_match, we only need the outcome.
     if opts.quiet || opts.files_without_match {
-        return Ok(true);
+        return Ok(FileOutcome::Matched);
     }
 
     if opts.files_only {
         writer.write_file(rel_path)?;
-        return Ok(true);
+        return Ok(FileOutcome::Matched);
     }
 
     if opts.count || opts.count_matches {
@@ -1025,15 +1320,13 @@ fn search_file_content(
             found.matched_lines()
         };
         writer.write_count(rel_path, n)?;
-        return Ok(true);
+        return Ok(FileOutcome::Matched);
     }
 
     // Never dump raw binary to a terminal; ripgrep reports a note instead.
-    if !opts.text
-        && let Some(off) = content.as_bytes().iter().position(|&b| b == 0)
-    {
+    if let Some(off) = binary_offset {
         writer.write_binary_note(rel_path, off)?;
-        return Ok(true);
+        return Ok(FileOutcome::Matched);
     }
 
     found.for_each(&match_opts, matcher, |emit| -> Result<()> {
@@ -1041,38 +1334,53 @@ fn search_file_content(
             crate::matching::Emit::Match {
                 line_number,
                 content,
-                column,
+                columns,
                 spans,
                 absolute_offset,
+                line_offset,
+                column_shifts,
+                offset_shift,
+                terminator_len,
             } => {
                 writer.write_context_separator(rel_path, line_number)?;
+                let (columns, absolute_offset) = to_source_positions(
+                    &columns,
+                    &column_shifts,
+                    absolute_offset,
+                    offset_shift,
+                    line_offset,
+                    fixups,
+                );
                 writer.write_match(&Match {
                     file: rel_path.to_string(),
                     line_number,
                     content: content.into_owned(),
-                    column,
+                    columns,
                     spans,
                     absolute_offset,
+                    terminator_len,
                 })?;
             }
             crate::matching::Emit::Context {
                 line_number,
                 content,
                 absolute_offset,
+                terminator_len,
             } => {
                 writer.write_context_separator(rel_path, line_number)?;
                 writer.write_context_line(&ContextLine {
                     file: rel_path.to_string(),
                     line_number,
                     content: content.to_string(),
-                    absolute_offset,
+                    absolute_offset: fixups.to_source_offset(absolute_offset),
+                    terminator_len,
                 })?;
             }
         }
         Ok(())
     })?;
 
-    Ok(true)
+    Ok(FileOutcome::Matched)
 }
 
 /// Path to print for a file the user named directly on the command line.

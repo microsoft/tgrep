@@ -11,13 +11,23 @@ pub struct Match {
     pub file: String,
     pub line_number: usize,
     pub content: String,
-    /// Column (1-based) of first match in content (for vimgrep).
-    pub column: Option<usize>,
+    /// 1-based byte columns of each match in `content`, in source-byte terms.
+    pub columns: Vec<usize>,
     /// Byte ranges of the matches inside `content`, used for highlighting,
     /// per-match `--vimgrep` rows, and JSON `submatches`.
     pub spans: Vec<(usize, usize)>,
     /// Byte offset of the start of `content` within the file (JSON only).
     pub absolute_offset: usize,
+    /// Bytes of line terminator stripped from `content`. `-M/--max-columns`
+    /// measures the line including its terminator, as ripgrep does.
+    pub terminator_len: usize,
+}
+
+impl Match {
+    /// Column reported by `--column`, which is the first match on the line.
+    fn column(&self) -> Option<usize> {
+        self.columns.first().copied()
+    }
 }
 
 /// A context (non-matching) line surrounding a match.
@@ -27,6 +37,8 @@ pub struct ContextLine {
     pub content: String,
     /// Byte offset of the start of `content` within the file (JSON only).
     pub absolute_offset: usize,
+    /// See [`Match::terminator_len`].
+    pub terminator_len: usize,
 }
 
 /// ANSI escape wrapping a matched substring: bold red, as ripgrep does.
@@ -91,8 +103,26 @@ pub struct OutputConfig {
     pub field_context_separator: String,
     /// `--path-separator`, substituted for the platform separator in paths.
     pub path_separator: Option<String>,
+    /// How to reconstruct the printed path from a search-root-relative one.
+    pub path_display: PathDisplay,
     /// `--line-buffered`: flush after every line.
     pub line_buffered: bool,
+}
+
+/// How to render the path of a file found under a search argument.
+///
+/// ripgrep builds output paths by pushing onto the path the user typed, so the
+/// argument survives verbatim into every printed path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PathDisplay {
+    /// No path argument: print the path relative to the current directory.
+    #[default]
+    Bare,
+    /// A directory argument, as typed and already terminated with a separator.
+    /// The relative remainder is appended to it.
+    Prefix(String),
+    /// A single-file argument, as typed. Printed verbatim.
+    Exact(String),
 }
 
 impl Default for OutputConfig {
@@ -114,6 +144,7 @@ impl Default for OutputConfig {
             field_match_separator: ":".to_string(),
             field_context_separator: "-".to_string(),
             path_separator: None,
+            path_display: PathDisplay::Bare,
             line_buffered: false,
         }
     }
@@ -244,15 +275,20 @@ impl OutputWriter {
     }
 
     /// Report that a matching file was suppressed because it looks binary.
+    ///
+    /// ripgrep prefixes the note with the file name the same way it prefixes a
+    /// match line, and omits it entirely when file names are suppressed.
     pub fn write_binary_note(&mut self, file: &str, offset: usize) -> io::Result<()> {
         if self.is_json() {
             self.ensure_json_begin(file)?;
             return Ok(());
         }
-        writeln!(
-            self.stdout,
-            "Binary file {file} matches (found \"\\0\" byte around offset {offset})"
-        )
+        let note = format!("binary file matches (found \"\\0\" byte around offset {offset})");
+        if self.config.no_filename {
+            writeln!(self.stdout, "{note}")
+        } else {
+            writeln!(self.stdout, "{}: {note}", self.display_path(file))
+        }
     }
 
     /// Emit ripgrep's `begin` message when a new file starts producing output,
@@ -264,7 +300,7 @@ impl OutputWriter {
         self.finish_json_file()?;
         let msg = serde_json::json!({
             "type": "begin",
-            "data": { "path": { "text": file } },
+            "data": { "path": { "text": self.display_path(file) } },
         });
         let line = format!("{msg}\n");
         self.file_stats.searches = 1;
@@ -286,7 +322,7 @@ impl OutputWriter {
         let msg = serde_json::json!({
             "type": "end",
             "data": {
-                "path": { "text": file },
+                "path": { "text": self.display_path(&file) },
                 "binary_offset": serde_json::Value::Null,
                 "stats": self.file_stats.to_json(self.started.elapsed()),
             },
@@ -321,40 +357,55 @@ impl OutputWriter {
         Ok(())
     }
 
-    /// Render a path, applying `--path-separator`.
+    /// Render a path the way ripgrep does.
+    ///
+    /// ripgrep builds output paths by pushing onto the path the user typed, so
+    /// the argument survives verbatim — `rg foo ./src` prints `./src\lib.rs` on
+    /// Windows — while everything appended to it uses the platform separator.
     fn display_path(&self, file: &str) -> String {
+        let joined = match &self.config.path_display {
+            PathDisplay::Exact(p) => p.clone(),
+            PathDisplay::Prefix(p) => format!("{p}{}", native_separators(file)),
+            PathDisplay::Bare => native_separators(file),
+        };
         match &self.config.path_separator {
-            Some(sep) => file.replace(['/', '\\'], sep),
-            None => file.to_string(),
+            Some(sep) => joined.replace(['/', '\\'], sep),
+            None => joined,
         }
     }
 
-    /// Apply `-M/--max-columns`, returning `None` when the line is suppressed.
+    /// Apply `-M/--max-columns`, replacing an over-long line with a note.
     ///
-    /// ripgrep measures the *original* line, so a preview still reports how
-    /// many bytes were dropped from the full line.
+    /// ripgrep measures the line *including* its terminator, so an 80-byte line
+    /// in an LF file is over a limit of 80 but the same text on a final,
+    /// unterminated line is not. It also measures the *original* line, so a
+    /// preview still reports how many bytes were dropped from the full line. A
+    /// suppressed line is still printed, as a placeholder that names whether it
+    /// was a match or context.
     fn apply_max_columns<'b>(
         &self,
         content: &'b str,
-        matches: Option<usize>,
-    ) -> Option<Cow<'b, str>> {
+        terminator_len: usize,
+        is_match: bool,
+    ) -> Cow<'b, str> {
         let Some(limit) = self.config.max_columns else {
-            return Some(Cow::Borrowed(content));
+            return Cow::Borrowed(content);
         };
-        if content.len() <= limit {
-            return Some(Cow::Borrowed(content));
+        if content.len() + terminator_len <= limit {
+            return Cow::Borrowed(content);
         }
         if self.config.max_columns_preview {
             let cut = floor_boundary(content, limit);
-            return Some(Cow::Owned(format!(
+            return Cow::Owned(format!(
                 "{} [... omitted end of long line]",
                 &content[..cut]
-            )));
+            ));
         }
-        let count = matches?;
-        Some(Cow::Owned(format!(
-            "[Omitted long line with {count} matches]"
-        )))
+        Cow::Borrowed(if is_match {
+            "[Omitted long matching line]"
+        } else {
+            "[Omitted long context line]"
+        })
     }
 
     /// The `file:line:col:offset:` prefix shared by match and context lines.
@@ -422,10 +473,7 @@ impl OutputWriter {
             self.ensure_heading(&ctx.file)?;
         }
         let (content, _) = self.trim_adjust(&ctx.content, &[]);
-        let Some(content) = self.apply_max_columns(content, None) else {
-            self.last_printed_line = Some((ctx.file.clone(), ctx.line_number));
-            return Ok(());
-        };
+        let content = self.apply_max_columns(content, ctx.terminator_len, false);
         let prefix =
             self.field_prefix(&ctx.file, ctx.line_number, None, ctx.absolute_offset, false);
         writeln!(self.stdout, "{prefix}{content}")?;
@@ -441,11 +489,7 @@ impl OutputWriter {
                 if !self.config.no_filename {
                     self.ensure_heading(&m.file)?;
                 }
-                let Some(clipped) = self.apply_max_columns(&content, Some(spans.len().max(1)))
-                else {
-                    self.last_printed_line = Some((m.file.clone(), m.line_number));
-                    return Ok(());
-                };
+                let clipped = self.apply_max_columns(&content, m.terminator_len, true);
                 // Highlighting only lines up when the text was not clipped.
                 let rendered = if clipped.len() == content.len() {
                     self.highlight(&content, &spans)
@@ -453,7 +497,7 @@ impl OutputWriter {
                     clipped.into_owned()
                 };
                 let prefix =
-                    self.field_prefix(&m.file, m.line_number, m.column, m.absolute_offset, true);
+                    self.field_prefix(&m.file, m.line_number, m.column(), m.absolute_offset, true);
                 writeln!(self.stdout, "{prefix}{rendered}")?;
             }
             OutputFormat::Vimgrep => {
@@ -461,22 +505,23 @@ impl OutputWriter {
                 // editors can step through every hit.
                 let rendered = self.highlight(&content, &spans);
                 let file = self.display_path(&m.file);
-                if spans.is_empty() {
-                    let col = m.column.unwrap_or(1);
-                    writeln!(self.stdout, "{file}:{}:{col}:{rendered}", m.line_number)?;
+                if m.columns.is_empty() {
+                    writeln!(self.stdout, "{file}:{}:1:{rendered}", m.line_number)?;
                 } else {
-                    for &(start, _) in &spans {
-                        writeln!(
-                            self.stdout,
-                            "{file}:{}:{}:{rendered}",
-                            m.line_number,
-                            start + 1
-                        )?;
+                    for col in &m.columns {
+                        writeln!(self.stdout, "{file}:{}:{col}:{rendered}", m.line_number)?;
                     }
                 }
             }
             OutputFormat::Json => {
                 self.ensure_json_begin(&m.file)?;
+                // `start`/`end` index `lines.text` as emitted, which is the
+                // decoded text. ripgrep sidesteps the question by emitting
+                // `lines.bytes` (base64 of the raw line) whenever a line is not
+                // valid UTF-8, and then reporting source offsets. tgrep always
+                // emits `text`, so its offsets stay usable for slicing it —
+                // they can differ from `absolute_offset`, which is a real file
+                // offset, on a line containing invalid UTF-8.
                 let submatches: Vec<serde_json::Value> = spans
                     .iter()
                     .map(|&(s, e)| {
@@ -626,7 +671,16 @@ impl OutputWriter {
 }
 
 /// Simple TTY check using std::io::IsTerminal (stable since Rust 1.70).
-fn atty_check() -> bool {
+pub(crate) fn atty_check() -> bool {
     use std::io::IsTerminal;
     io::stdout().is_terminal()
+}
+
+/// Convert the index's `/`-separated relative paths to the platform separator.
+fn native_separators(path: &str) -> String {
+    if std::path::MAIN_SEPARATOR == '/' {
+        path.to_string()
+    } else {
+        path.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
 }

@@ -112,9 +112,24 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
 /// for those flags so auto-save never observes both as false during handoff.
 /// Searches only acquire `index` (read) and `cache` (read then write);
 /// they never take `snapshot_gate` or `publish_lock`.
+/// A file's searchable text together with the map back to its on-disk byte
+/// offsets, so columns and `--byte-offset` mean the same thing over the server
+/// as they do locally even when lossy decoding widened invalid bytes.
+struct DecodedFile {
+    text: String,
+    fixups: tgrep_core::encoding::LossyFixups,
+}
+
+impl DecodedFile {
+    fn new(bytes: &[u8], encoding: tgrep_core::encoding::EncodingMode) -> Self {
+        let (text, fixups) = tgrep_core::encoding::decode_with_fixups(bytes, encoding);
+        Self { text, fixups }
+    }
+}
+
 struct ServerState {
     index: RwLock<HybridIndex>,
-    cache: RwLock<LruCache<String, Arc<String>>>,
+    cache: RwLock<LruCache<String, Arc<DecodedFile>>>,
     root: PathBuf,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
@@ -842,7 +857,7 @@ fn handle_search(
     // Two-phase approach: read-lock for cache hits, then disk I/O outside the
     // lock, then a single write-lock to promote hits and insert misses.
     let t_resolve = Instant::now();
-    let candidate_contents: Vec<(String, Arc<String>)> = if encoding.may_differ_from_index() {
+    let candidate_contents: Vec<(String, Arc<DecodedFile>)> = if encoding.may_differ_from_index() {
         // The cache holds text decoded with the default (BOM-sniffing) rules and
         // is shared by every client. A request that asked for a different
         // `--encoding` must neither read those entries nor write its own, or one
@@ -851,14 +866,16 @@ fn handle_search(
             .iter()
             .filter_map(|(rel_path, full_path)| {
                 let bytes = std::fs::read(full_path).ok()?;
-                let content = tgrep_core::encoding::decode(&bytes, encoding);
-                Some((rel_path.clone(), Arc::new(content)))
+                Some((
+                    rel_path.clone(),
+                    Arc::new(DecodedFile::new(&bytes, encoding)),
+                ))
             })
             .collect()
     } else {
         // Phase 1: read-lock to find cache hits (peek avoids write-lock need)
         let mut hit_keys: Vec<String> = Vec::new();
-        let mut hits: Vec<(String, Arc<String>)> = Vec::with_capacity(candidate_info.len());
+        let mut hits: Vec<(String, Arc<DecodedFile>)> = Vec::with_capacity(candidate_info.len());
         let mut misses: Vec<(String, PathBuf)> = Vec::new();
         {
             let cache = state.cache.read().unwrap();
@@ -873,16 +890,15 @@ fn handle_search(
         } // read lock released
 
         // Phase 2: read cache misses from disk (no lock held)
-        let disk_results: Vec<(String, Arc<String>)> = misses
+        let disk_results: Vec<(String, Arc<DecodedFile>)> = misses
             .into_iter()
             .filter_map(|(rel_path, full_path)| {
                 // Lossy, like the local path: refusing invalid UTF-8 would make
                 // UTF-16 and Latin-1 sources silently invisible over the server
                 // while the same query works with --no-index.
                 let bytes = std::fs::read(&full_path).ok()?;
-                let content =
-                    tgrep_core::encoding::decode(&bytes, tgrep_core::encoding::EncodingMode::Auto);
-                Some((rel_path, Arc::new(content)))
+                let decoded = DecodedFile::new(&bytes, tgrep_core::encoding::EncodingMode::Auto);
+                Some((rel_path, Arc::new(decoded)))
             })
             .collect();
 
@@ -902,7 +918,7 @@ fn handle_search(
         }
 
         // Combine hits and disk results, preserving candidate order
-        let mut result_map: std::collections::HashMap<&str, Arc<String>> =
+        let mut result_map: std::collections::HashMap<&str, Arc<DecodedFile>> =
             std::collections::HashMap::with_capacity(hits.len() + disk_results.len());
         for (rel_path, content) in &hits {
             result_map.insert(rel_path, Arc::clone(content));
@@ -962,25 +978,33 @@ fn handle_search(
 
 fn search_file_matches(
     rel_path: &str,
-    content: &str,
+    file: &DecodedFile,
     matcher: &crate::matching::SearchMatcher,
     opts: &SearchOpts,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     use crate::matching::{Emit, FileMatches};
 
+    let content = file.text.as_str();
+    let fixups = &file.fixups;
     let match_opts = opts.match_options();
+
+    // The client applies ripgrep's "only explicitly named binary files are
+    // visible" rule, so the offset is reported here and filtered there.
+    let binary_offset = if opts.text {
+        None
+    } else {
+        content.as_bytes().iter().position(|&b| b == 0)
+    };
+
     let found = FileMatches::find(content, matcher, &match_opts)?;
     if found.is_empty() {
         return Ok(Vec::new());
     }
 
     // Never stream raw binary back to the client; report a note instead, the
-    // same way the local path does. Placed after `files_only` has already been
-    // reduced to "did it match", so `-l`/`-q` are unaffected.
-    if !opts.text
-        && !opts.files_only
-        && let Some(off) = content.as_bytes().iter().position(|&b| b == 0)
-    {
+    // same way the local path does. Emitted for `-l`/`-c` too so the client can
+    // apply ripgrep's "implicit binary files are invisible" rule uniformly.
+    if let Some(off) = binary_offset {
         return Ok(vec![serde_json::json!({
             "type": "binary",
             "file": rel_path,
@@ -997,33 +1021,45 @@ fn search_file_matches(
             Emit::Match {
                 line_number,
                 content,
-                column,
+                columns,
                 spans,
                 absolute_offset,
+                line_offset,
+                column_shifts,
+                offset_shift,
+                terminator_len,
             } => {
-                let mut entry = serde_json::json!({
+                let (columns, offset) = crate::search::to_source_positions(
+                    &columns,
+                    &column_shifts,
+                    absolute_offset,
+                    offset_shift,
+                    line_offset,
+                    fixups,
+                );
+                results.push(serde_json::json!({
                     "type": "match",
                     "file": rel_path,
                     "line": line_number,
                     "content": content,
                     "spans": spans.iter().map(|&(s, e)| [s, e]).collect::<Vec<_>>(),
-                    "offset": absolute_offset,
-                });
-                if let Some(c) = column {
-                    entry["column"] = serde_json::json!(c);
-                }
-                results.push(entry);
+                    "offset": offset,
+                    "columns": columns,
+                    "term": terminator_len,
+                }));
             }
             Emit::Context {
                 line_number,
                 content,
                 absolute_offset,
+                terminator_len,
             } => results.push(serde_json::json!({
                 "type": "context",
                 "file": rel_path,
                 "line": line_number,
                 "content": content,
-                "offset": absolute_offset,
+                "offset": fixups.to_source_offset(absolute_offset),
+                "term": terminator_len,
             })),
         }
         Ok(())

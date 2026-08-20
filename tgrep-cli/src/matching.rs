@@ -76,6 +76,16 @@ impl LineIndex {
         end
     }
 
+    /// Byte length of line `idx`'s terminator in `content`: 2 for `\r\n`, 1 for
+    /// a bare `\n`, 0 for a final line that the file does not terminate.
+    ///
+    /// `-M/--max-columns` measures the line *including* its terminator, so this
+    /// is needed to decide whether a line is over the limit.
+    pub fn line_terminator_len(&self, content: &str, idx: usize) -> usize {
+        let end = self.starts.get(idx + 1).copied().unwrap_or(self.len);
+        end - self.line_end(content, idx)
+    }
+
     pub fn line_text<'a>(&self, content: &'a str, idx: usize) -> &'a str {
         &content[self.line_start(idx)..self.line_end(content, idx)]
     }
@@ -421,14 +431,36 @@ pub enum Emit<'a> {
     Match {
         line_number: usize,
         content: Cow<'a, str>,
-        column: Option<usize>,
+        /// 1-based byte columns of each match on the line, in order.
+        columns: Vec<usize>,
         spans: Vec<(usize, usize)>,
         absolute_offset: usize,
+        /// Offset of the start of the line. `absolute_offset` points at the
+        /// match itself under `-o`, so a caller translating offsets back to the
+        /// source encoding needs this separately.
+        line_offset: usize,
+        /// Bytes each column moves by once `--replace` has rewritten the line,
+        /// parallel to `columns`. Empty when nothing was replaced.
+        ///
+        /// `columns` always indexes the *decoded source* line, so it can be
+        /// mapped back to the bytes on disk; ripgrep then reports the position
+        /// in the rewritten line, which is that mapped column plus the length
+        /// delta of every replacement before it.
+        column_shifts: Vec<isize>,
+        /// The same correction for `absolute_offset`. Non-zero only under `-o`,
+        /// where the offset points at an individual replacement.
+        offset_shift: isize,
+        /// Bytes of the line terminator that `content` was stripped of, which
+        /// `-M/--max-columns` counts towards the line's length. Zero under `-o`,
+        /// where ripgrep measures the matched text on its own.
+        terminator_len: usize,
     },
     Context {
         line_number: usize,
         content: &'a str,
         absolute_offset: usize,
+        /// See [`Emit::Match::terminator_len`].
+        terminator_len: usize,
     },
 }
 
@@ -493,15 +525,26 @@ impl<'a> FileMatches<'a> {
                 // With `-r`, `-o` prints the replacement of each match rather
                 // than the matched text itself.
                 if let Some(rep) = &opts.replace {
-                    for (start, _, text) in matcher.expansions(line, rep).map_err(E::from)? {
+                    // ripgrep rewrites the line and reports offsets into the
+                    // result, so each match moves by the length delta of the
+                    // ones before it. Columns stay in source terms here and are
+                    // corrected by `column_shifts` after the caller has mapped
+                    // them back through any lossy-decoding repairs.
+                    let mut shift: isize = 0;
+                    for (start, end, text) in matcher.expansions(line, rep).map_err(E::from)? {
                         let len = text.len();
                         on_emit(Emit::Match {
                             line_number: hit.idx + 1,
                             content: Cow::Owned(text),
-                            column: Some(start + 1),
+                            columns: vec![start + 1],
                             spans: vec![(0, len)],
                             absolute_offset: offset + start,
+                            line_offset: offset,
+                            column_shifts: vec![shift],
+                            offset_shift: shift,
+                            terminator_len: 0,
                         })?;
+                        shift += len as isize - (end - start) as isize;
                     }
                     return Ok(());
                 }
@@ -510,28 +553,52 @@ impl<'a> FileMatches<'a> {
                     on_emit(Emit::Match {
                         line_number: hit.idx + 1,
                         content: Cow::Borrowed(text),
-                        column: Some(s + 1),
+                        columns: vec![s + 1],
                         spans: vec![(0, text.len())],
                         absolute_offset: offset + s,
+                        line_offset: offset,
+                        column_shifts: Vec::new(),
+                        offset_shift: 0,
+                        terminator_len: 0,
                     })?;
                 }
                 return Ok(());
             }
 
-            let (content, spans) = match &opts.replace {
+            let (content, spans, columns, column_shifts) = match &opts.replace {
                 Some(rep) if !hit.spans.is_empty() => {
                     let (text, spans) = matcher.replace_all(line, rep).map_err(E::from)?;
-                    (Cow::Owned(text), spans)
+                    // `spans` locate each replacement in the rewritten line;
+                    // `hit.spans` locate the matches they stand in for. The
+                    // difference is exactly how far that column moved.
+                    let columns = hit.spans.iter().map(|&(s, _)| s + 1).collect();
+                    let shifts = hit
+                        .spans
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(s, _))| {
+                            spans.get(i).map_or(0, |&(rs, _)| rs as isize - s as isize)
+                        })
+                        .collect();
+                    (Cow::Owned(text), spans, columns, shifts)
                 }
-                _ => (Cow::Borrowed(line), hit.spans.clone()),
+                _ => (
+                    Cow::Borrowed(line),
+                    hit.spans.clone(),
+                    hit.spans.iter().map(|&(s, _)| s + 1).collect(),
+                    Vec::new(),
+                ),
             };
-            let column = spans.first().map(|&(s, _)| s + 1);
             on_emit(Emit::Match {
                 line_number: hit.idx + 1,
                 content,
-                column,
+                columns,
                 spans,
                 absolute_offset: offset,
+                line_offset: offset,
+                column_shifts,
+                offset_shift: 0,
+                terminator_len: self.index.line_terminator_len(self.content, hit.idx),
             })
         };
 
@@ -547,6 +614,7 @@ impl<'a> FileMatches<'a> {
                         line_number: li + 1,
                         content: self.index.line_text(self.content, li),
                         absolute_offset: self.index.line_start(li),
+                        terminator_len: self.index.line_terminator_len(self.content, li),
                     })?,
                 }
             }
@@ -577,6 +645,7 @@ impl<'a> FileMatches<'a> {
                     line_number: li + 1,
                     content: self.index.line_text(self.content, li),
                     absolute_offset: self.index.line_start(li),
+                    terminator_len: self.index.line_terminator_len(self.content, li),
                 })?,
             }
         }

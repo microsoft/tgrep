@@ -230,6 +230,7 @@ fn explicit_file_search_bypasses_hidden_walk_filter() {
         .args([
             "--no-index",
             "--no-heading",
+            "-H",
             "hidden_entry",
             hidden.to_str().unwrap(),
         ])
@@ -429,13 +430,15 @@ fn no_line_number_flat() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Should have file:content (no line number between them)
+    // Should have file:content (no line number between them). The fixture path
+    // is absolute, so split on the file suffix rather than the first colon.
     for line in stdout.lines() {
-        // In flat mode: "file:content" — should NOT have "file:N:content"
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        assert_eq!(parts.len(), 2, "expected file:content, got: {line}");
+        let content = line
+            .rsplit_once(".rs:")
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| panic!("expected file:content, got: {line}"));
         assert!(
-            parts[1].starts_with("fn main"),
+            content.starts_with("fn main"),
             "content should follow filename directly, got: {line}"
         );
     }
@@ -456,9 +459,8 @@ fn no_line_number_long() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        assert_eq!(parts.len(), 2);
-        assert!(parts[1].starts_with("fn main"));
+        let content = line.rsplit_once(".rs:").map(|(_, c)| c).unwrap();
+        assert!(content.starts_with("fn main"));
     }
 }
 
@@ -1501,13 +1503,14 @@ fn files_with_matches_long_flag() {
 #[test]
 fn multiple_patterns_with_e_flag() {
     let dir = setup_fixture();
-    // Primary pattern as positional arg, extra pattern via -e
+    // With -e in play, every positional is a path, so both patterns need -e.
     let output = tgrep()
         .args([
             "--no-index",
             "--no-heading",
             "-e",
             "fn add",
+            "-e",
             "fn main",
             &fixture_path(&dir),
         ])
@@ -1521,13 +1524,13 @@ fn multiple_patterns_with_e_flag() {
 #[test]
 fn multiple_patterns_long_flag() {
     let dir = setup_fixture();
-    // Primary pattern as positional, extra via --regexp
     let output = tgrep()
         .args([
             "--no-index",
             "--no-heading",
             "--regexp",
             "version",
+            "--regexp",
             "hello",
             &fixture_path(&dir),
         ])
@@ -1545,8 +1548,8 @@ fn pattern_file_short_flag() {
     let dir = setup_fixture();
     let sub = dir.path().join("testdata");
     let pattern_file = sub.join("patterns.txt");
-    // Put extra pattern in the file; primary pattern is positional
-    fs::write(&pattern_file, "version\n").unwrap();
+    // -f also makes every positional a path, so both patterns come from here.
+    fs::write(&pattern_file, "version\nfn main\n").unwrap();
 
     let output = tgrep()
         .args([
@@ -1554,7 +1557,6 @@ fn pattern_file_short_flag() {
             "--no-heading",
             "-f",
             pattern_file.to_str().unwrap(),
-            "fn main",
             &fixture_path(&dir),
         ])
         .output()
@@ -2407,7 +2409,7 @@ fn multiple_patterns_with_fixed_strings() {
     let sub = dir.path().join("testdata");
     fs::write(sub.join("special2.txt"), "a+b\nc+d\na*b\n").unwrap();
 
-    // -F with positional pattern "a+b" and -e "c+d"
+    // -F with both patterns via -e, since -e makes positionals paths.
     let output = tgrep()
         .args([
             "--no-index",
@@ -2417,6 +2419,7 @@ fn multiple_patterns_with_fixed_strings() {
             "-F",
             "-e",
             "c+d",
+            "-e",
             "a+b",
             sub.join("special2.txt").to_str().unwrap(),
         ])
@@ -3628,7 +3631,7 @@ fn indexed_max_filesize_is_honored() {
 fn indexed_pattern_file_is_honored() {
     let (dir, idx) = setup_indexed_fixture();
     let pats = dir.path().join("pats.txt");
-    fs::write(&pats, "hello world\n").unwrap();
+    fs::write(&pats, "hello world\nzzz_no_such_pattern\n").unwrap();
 
     // -f patterns must survive the trip through the index/server path.
     tgrep()
@@ -3638,7 +3641,6 @@ fn indexed_pattern_file_is_honored() {
             &idx,
             "-f",
             pats.to_str().unwrap(),
-            "zzz_no_such_pattern",
             &indexed_fixture_path(&dir),
         ])
         .assert()
@@ -3658,6 +3660,7 @@ fn indexed_extra_patterns_reach_the_query_plan() {
             &idx,
             "-e",
             "hello world",
+            "-e",
             "zzz_no_such_pattern",
             &indexed_fixture_path(&dir),
         ])
@@ -3674,7 +3677,15 @@ fn indexed_multiple_patterns_match_the_same_as_brute_force() {
     let lines = |extra: &[&str]| -> Vec<String> {
         let mut args: Vec<&str> = vec!["--no-heading"];
         args.extend_from_slice(extra);
-        args.extend_from_slice(&["-e", "hello world", "-e", "version", "pub fn add", &path]);
+        args.extend_from_slice(&[
+            "-e",
+            "hello world",
+            "-e",
+            "version",
+            "-e",
+            "pub fn add",
+            &path,
+        ]);
         let out = tgrep().args(&args).output().unwrap();
         let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -3702,6 +3713,7 @@ fn indexed_fixed_string_multiple_patterns() {
             "-F",
             "-e",
             "println!(\"hello world\")",
+            "-e",
             "a + b",
             &indexed_fixture_path(&dir),
         ])
@@ -3835,8 +3847,9 @@ fn indexed_invert_match_returns_files_without_the_pattern() {
 }
 
 /// A file whose NUL byte sits past the 8 KiB binary sniff window is indexed as
-/// ordinary text, so it becomes a normal search candidate. `-c` must still
-/// report a count for it: ripgrep prints the count rather than a binary note.
+/// ordinary text, so it becomes a normal search candidate. ripgrep hides binary
+/// files found by traversal but reports a count for one named explicitly, and
+/// both search paths must agree on each.
 #[test]
 fn count_reports_binary_files_with_late_nul() {
     let dir = TempDir::new().unwrap();
@@ -3858,40 +3871,40 @@ fn count_reports_binary_files_with_late_nul() {
         .assert()
         .success();
 
-    let local = tgrep()
-        .args(["--no-index", "-c", "lateneedle", &fixture_path(&dir)])
-        .output()
-        .unwrap();
-    let indexed = tgrep()
-        .args([
-            "--index-path",
-            &idx,
-            "-c",
-            "lateneedle",
-            &fixture_path(&dir),
-        ])
-        .output()
-        .unwrap();
+    let count = |mode: &[&str], target: &str| -> Vec<String> {
+        let mut args: Vec<&str> = mode.to_vec();
+        args.extend_from_slice(&["-c", "lateneedle", target]);
+        let out = tgrep().args(&args).output().unwrap();
+        let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        v.sort();
+        v
+    };
 
-    let mut a: Vec<String> = String::from_utf8_lossy(&local.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect();
-    let mut b: Vec<String> = String::from_utf8_lossy(&indexed.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect();
-    a.sort();
-    b.sort();
+    // Traversal: the binary file is invisible on both paths.
+    let dir_local = count(&["--no-index"], &fixture_path(&dir));
+    let dir_indexed = count(&["--index-path", &idx], &fixture_path(&dir));
     assert!(
-        a.iter()
-            .any(|l| l.contains("big.txt") && l.ends_with(":801")),
-        "expected big.txt:801, got {a:?}"
+        !dir_local.iter().any(|l| l.contains("big.txt")),
+        "an implicitly found binary file must be hidden, got {dir_local:?}"
     );
-    assert_eq!(a, b, "-c must report binary files, not drop them");
+    assert_eq!(dir_local, dir_indexed, "-c must agree across search paths");
+
+    // Named explicitly: the count is reported on both paths.
+    let big = sub.join("big.txt").to_str().unwrap().to_string();
+    let file_local = count(&["--no-index"], &big);
+    let file_indexed = count(&["--index-path", &idx], &big);
+    assert_eq!(file_local, vec!["801".to_string()], "expected 801 matches");
+    assert_eq!(
+        file_local, file_indexed,
+        "-c must report explicit binary files on both paths"
+    );
 }
 
-/// Without `-c`, the same file is summarised as a binary note on both paths.
+/// Without `-c`, an explicitly named binary file is summarised as a note on
+/// both paths, and one found by traversal is hidden on both.
 #[test]
 fn binary_note_matches_between_indexed_and_brute_force() {
     let dir = TempDir::new().unwrap();
@@ -3912,33 +3925,32 @@ fn binary_note_matches_between_indexed_and_brute_force() {
         .assert()
         .success();
 
-    let local = tgrep()
-        .args([
-            "--no-index",
-            "--no-heading",
-            "tail notaneedle",
-            &fixture_path(&dir),
-        ])
-        .output()
-        .unwrap();
-    let indexed = tgrep()
-        .args([
-            "--index-path",
-            &idx,
-            "--no-heading",
-            "tail notaneedle",
-            &fixture_path(&dir),
-        ])
-        .output()
-        .unwrap();
+    let run = |mode: &[&str], target: &str| -> String {
+        let mut args: Vec<&str> = mode.to_vec();
+        args.extend_from_slice(&["--no-heading", "tail notaneedle", target]);
+        let out = tgrep().args(&args).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
 
-    let a = String::from_utf8_lossy(&local.stdout).to_string();
-    let b = String::from_utf8_lossy(&indexed.stdout).to_string();
+    let big = sub.join("big.txt").to_str().unwrap().to_string();
+    let file_local = run(&["--no-index"], &big);
+    let file_indexed = run(&["--index-path", &idx], &big);
     assert!(
-        a.contains("Binary file"),
-        "expected a binary note, got {a:?}"
+        file_local.contains("binary file matches"),
+        "expected a binary note, got {file_local:?}"
     );
-    assert_eq!(a, b, "binary notes must agree across search paths");
+    assert_eq!(
+        file_local, file_indexed,
+        "binary notes must agree across search paths"
+    );
+
+    let dir_local = run(&["--no-index"], &fixture_path(&dir));
+    let dir_indexed = run(&["--index-path", &idx], &fixture_path(&dir));
+    assert_eq!(dir_local, "", "traversal must hide binary files");
+    assert_eq!(
+        dir_local, dir_indexed,
+        "binary suppression must agree across search paths"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4533,6 +4545,7 @@ fn byte_offset_flag_prints_line_offsets() {
         .args([
             "--no-index",
             "--no-heading",
+            "-n",
             "-b",
             "world",
             &fixture_path(&dir),
@@ -4564,9 +4577,7 @@ fn max_columns_omits_long_lines() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "[Omitted long line with 1 matches]",
-        ));
+        .stdout(predicate::str::contains("[Omitted long matching line]"));
 }
 
 #[test]
@@ -4685,6 +4696,7 @@ fn field_separators_are_configurable() {
         .args([
             "--no-index",
             "--no-heading",
+            "-n",
             "--field-match-separator",
             "@@",
             "world",

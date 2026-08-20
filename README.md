@@ -247,7 +247,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-f, --file <FILE>` | Read patterns from file (one per line) |
 | `-U, --multiline` | Enable multiline matching (`.` still excludes `\n`) |
 | `--multiline-dotall` | Make `.` match `\n`; implies `-U` |
-| `-n, --line-number` | Show line numbers (default: on) |
+| `-n, --line-number` | Show line numbers (default: on when stdout is a terminal) |
 | `-N, --no-line-number` | Suppress line numbers |
 | `-c, --count` | Print match count per file |
 | `-l, --files-with-matches` | Print only filenames |
@@ -267,7 +267,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-B, --before-context <N>` | Lines of context before match |
 | `-C, --context <N>` | Lines of context before and after |
 | `--heading / --no-heading` | Grouped vs flat output |
-| `-H, --with-filename` | Show filenames (default: on) |
+| `-H, --with-filename` | Show filenames (default: on unless a single file was named) |
 | `-I, --no-filename` | Suppress filenames in output |
 | `--json` | ripgrep-compatible JSON stream (one object per line) |
 | `--vimgrep` | Vim-compatible `file:line:col:content`, one row per match |
@@ -277,6 +277,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-., --hidden` | Include hidden files and directories |
 | `--no-ignore` | Don't respect `.gitignore` or `p4ignore.ini` files |
 | `-a, --text` | Search binary files as if they were text |
+| `--binary` | Search binary files, reporting a note instead of their contents |
 | `-u` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden, `-uuu` = +binary |
 | `--max-filesize <SIZE>` | Skip files larger than `SIZE` (`K`/`M`/`G` suffixes) |
 | `-L, --follow` | Follow symbolic links |
@@ -365,6 +366,71 @@ silently reporting no matches in compressed files.
 
 > **Note:** `-L` means `--follow` (as in ripgrep). Use the long
 > `--files-without-match` for the non-matching-files listing.
+
+### Patterns and paths
+
+Without `-e`/`-f`, the first positional argument is the pattern and the rest are
+paths. As soon as `-e` or `-f` supplies a pattern, **every** positional becomes
+a path, matching ripgrep:
+
+```bash
+tgrep -e needle .            # searches for "needle" under .
+tgrep -e needle -e other .   # both patterns, still just one path
+```
+
+### Output defaults
+
+tgrep matches ripgrep's context-dependent defaults rather than fixed ones:
+
+- **Line numbers** are on only when stdout is a terminal. Piping to another
+  command drops them, so `tgrep needle . | cut -d: -f1` behaves the same as it
+  does with ripgrep. `--column`, `--vimgrep` and `-p` turn them back on;
+  `-b` and `-A/-B/-C` do not.
+- **Filenames** are shown unless you named exactly one *file*. A directory
+  argument always shows them. `-H`/`-I` override either way.
+- **Paths** are printed by appending onto the argument you typed: the argument
+  survives verbatim and only the appended part uses the platform separator. So
+  `tgrep needle src/` prints `src/main.rs` while `tgrep needle src` prints
+  `src\main.rs` on Windows. `--path-separator` rewrites every separator.
+
+### Binary files
+
+A file is binary if it contains a NUL byte. Following ripgrep:
+
+- Binary files found by walking a directory are **skipped silently** — they
+  appear in neither the output, `-l`, `-c`, nor `--files-without-match`.
+- A binary file **named explicitly** on the command line reports a note:
+  `bin.dat: binary file matches (found "\0" byte around offset 7)`.
+- `--binary` promotes traversal to the explicit behaviour, so binary files are
+  searched and summarised with that note.
+- `-a`/`--text` disables binary detection entirely and prints matches as text.
+
+tgrep additionally rejects ~65 binary file *extensions* during the walk to keep
+indexing cheap, which ripgrep does not do. `--binary` and `-a` also lift that
+restriction, and `--files` never applies it.
+
+### Flags that bypass the index
+
+The index is built over text files only, skipping hidden and ignored ones, so
+flags that widen or re-interpret that set are answered by walking the tree
+instead: `-E/--encoding`, `-a/--text`, `--binary`, `-./--hidden`, and every
+`--no-ignore*` variant. Naming a single file also skips the index, since
+reading one file directly is cheaper than loading one.
+
+### Invalid UTF-8
+
+ripgrep searches raw bytes. tgrep decodes first, repairing any undecodable byte
+into a `U+FFFD`, which is what makes the trigram index possible. Reported
+positions are mapped back, so `--column`, `-b`, `--vimgrep` and `-r` all report
+the byte offsets on disk exactly as ripgrep does. Two differences remain on
+lines that are not valid UTF-8:
+
+- A pattern can match the substituted `U+FFFD`; ripgrep, seeing raw bytes, never
+  matches there. So `tgrep '.' ` finds one more match per repaired byte.
+- `--json` always reports `lines.text` with the substitutions in place, and
+  submatch offsets that index it. ripgrep instead emits `lines.bytes` as base64
+  and reports source offsets. `absolute_offset` is a real file offset either
+  way.
 
 ### File size limits
 

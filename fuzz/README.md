@@ -16,6 +16,7 @@ cargo install cargo-fuzz
 | `fuzz_trigram` | Trigram extraction, mask generation, binary detection |
 | `fuzz_query` | Regex → query plan decomposition (arbitrary patterns) |
 | `fuzz_ondisk` | On-disk format encode/decode roundtrips |
+| `fuzz_reader` | `IndexReader` against arbitrary `lookup.bin`/`index.bin`/`files.bin` bytes |
 
 ## Running
 
@@ -26,6 +27,7 @@ cd fuzz
 cargo fuzz run fuzz_trigram
 cargo fuzz run fuzz_query
 cargo fuzz run fuzz_ondisk
+cargo fuzz run fuzz_reader
 
 # Run with a time limit (e.g., 60 seconds)
 cargo fuzz run fuzz_trigram -- -max_total_time=60

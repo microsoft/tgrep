@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "tgrep-core"
-version = "0.1.4"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "ignore",

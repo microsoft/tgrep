@@ -366,20 +366,57 @@ impl IndexReader {
         LookupEntry::decode(buf)
     }
 
+    /// Decode the posting entries a lookup entry points at.
+    ///
+    /// `offset` and `length` are read verbatim out of `lookup.bin`, so on a
+    /// corrupt or truncated index they are arbitrary and must not be trusted
+    /// to describe a range that exists. Two invariants are enforced here:
+    ///
+    /// * The range is validated against the mmap length *before* `offset` is
+    ///   narrowed to `usize`. Adding to a `usize` first and testing
+    ///   `pos + POSTING_ENTRY_SIZE <= postings.len()` is not merely incomplete,
+    ///   it is inverted: the sum wraps, so the further past the end `offset`
+    ///   sits, the smaller the wrapped sum and the more likely the guard is to
+    ///   accept it (`offset = u64::MAX` wraps to `POSTING_ENTRY_SIZE - 1` and
+    ///   then slices out of range). It also truncates rather than wraps on
+    ///   32-bit targets, which can fold an out-of-range offset back into the
+    ///   mapping and decode the wrong region.
+    /// * The trip count and the reserved capacity come from how many entries
+    ///   the postings mmap actually holds, never from `length`. Otherwise a
+    ///   corrupt `length` of `u32::MAX` reserves ~25 GiB and spins through
+    ///   4.29 billion iterations to produce nothing, even against a 60-byte
+    ///   `index.bin`.
+    ///
+    /// Entries past the end of the mapping are dropped, which preserves the
+    /// existing best-effort behaviour for a truncated index: this is the hot
+    /// query path and has no error channel. Callers that want corruption
+    /// surfaced as [`crate::Error::IndexCorrupted`] should run
+    /// [`Self::validate_lookup`] first, as `HybridIndex::open` and the server's
+    /// reader swap already do.
     fn read_posting_entries(&self, offset: u64, length: u32) -> Vec<PostingEntry> {
         let postings = match self.postings.as_ref() {
             Some(p) => p,
             None => return Vec::new(),
         };
-        let mut result = Vec::with_capacity(length as usize);
-        let start = offset as usize;
-        for i in 0..length as usize {
+        // Narrow only after the mmap length has vetted the value, so an offset
+        // wider than `usize` can never truncate into range on a 32-bit target.
+        let Ok(start) = usize::try_from(offset) else {
+            return Vec::new();
+        };
+        // `None` when `start` is past the end of the mapping — no entries.
+        let Some(remaining) = postings.len().checked_sub(start) else {
+            return Vec::new();
+        };
+        let count = (length as usize).min(remaining / POSTING_ENTRY_SIZE);
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            // `count * POSTING_ENTRY_SIZE <= remaining` and
+            // `start + remaining == postings.len()`, so both `start + i * SIZE`
+            // and its `+ SIZE` end stay within the mapping without overflow.
             let pos = start + i * POSTING_ENTRY_SIZE;
-            if pos + POSTING_ENTRY_SIZE <= postings.len() {
-                let buf: &[u8; POSTING_ENTRY_SIZE] =
-                    postings[pos..pos + POSTING_ENTRY_SIZE].try_into().unwrap();
-                result.push(PostingEntry::decode(buf));
-            }
+            let buf: &[u8; POSTING_ENTRY_SIZE] =
+                postings[pos..pos + POSTING_ENTRY_SIZE].try_into().unwrap();
+            result.push(PostingEntry::decode(buf));
         }
         result
     }
@@ -612,5 +649,152 @@ mod tests {
         write_index(tmp.path(), &[], &[], &[]);
         let reader = IndexReader::open(tmp.path()).unwrap();
         assert!(reader.validate_lookup().is_ok());
+    }
+
+    /// `n` posting entries with `file_id` 0..n so decoded content is checkable.
+    fn make_postings(n: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for file_id in 0..n {
+            buf.extend_from_slice(
+                &PostingEntry {
+                    file_id,
+                    loc_mask: 0xFF,
+                    next_mask: 0xFF,
+                }
+                .encode(),
+            );
+        }
+        buf
+    }
+
+    /// A single-entry `lookup.bin` pointing at an arbitrary (possibly corrupt)
+    /// posting range, so the reader's trust in `offset`/`length` can be probed
+    /// through the public API.
+    fn open_with_lookup(dir: &Path, trigram: u32, offset: u64, length: u32, postings: &[u8]) {
+        let lookup = LookupEntry {
+            trigram,
+            offset,
+            length,
+        }
+        .encode();
+        let files = ondisk::encode_file_entry(0, "a.rs").unwrap();
+        write_index(dir, &lookup, postings, &files);
+    }
+
+    #[test]
+    fn lookup_survives_offset_that_overflows_the_bounds_check() {
+        // `offset = u64::MAX` used to wrap `pos + POSTING_ENTRY_SIZE` around to
+        // a small value that passed the guard, then slice far out of range:
+        // "attempt to add with overflow" in debug, an out-of-range slice panic
+        // in release.
+        let tmp = TempDir::new().unwrap();
+        open_with_lookup(tmp.path(), 1, u64::MAX, 5, &make_postings(10));
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        assert!(reader.lookup_trigram_with_masks(1).is_empty());
+        // Every offset in the top of the u64 range must be rejected, not just
+        // the one that happens to wrap to zero.
+        for offset in [u64::MAX, u64::MAX - 1, u64::MAX - 5, u64::MAX / 2] {
+            let tmp = TempDir::new().unwrap();
+            open_with_lookup(tmp.path(), 1, offset, 5, &make_postings(10));
+            let reader = IndexReader::open(tmp.path()).unwrap();
+            assert!(
+                reader.lookup_trigram_with_masks(1).is_empty(),
+                "offset {offset} must decode to nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_bounds_work_by_postings_len_not_declared_length() {
+        // `length = u32::MAX` used to reserve ~25 GiB and iterate 4.29 billion
+        // times against a 60-byte index.bin (~1.65 s release, ~55 s debug).
+        // Both the trip count and the reservation must derive from the mapping.
+        let tmp = TempDir::new().unwrap();
+        open_with_lookup(tmp.path(), 1, 0, u32::MAX, &make_postings(10));
+        let reader = IndexReader::open(tmp.path()).unwrap();
+
+        let started = std::time::Instant::now();
+        let entries = reader.lookup_trigram_with_masks(1);
+        let elapsed = started.elapsed();
+
+        assert_eq!(entries.len(), 10, "only the 10 entries on disk exist");
+        assert!(
+            entries.capacity() < 1_000,
+            "capacity {} must be bounded by index.bin, not by `length`",
+            entries.capacity()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "decoding 10 entries took {elapsed:?}; work is scaling with `length`"
+        );
+    }
+
+    #[test]
+    fn lookup_with_offset_past_end_returns_empty() {
+        let postings = make_postings(10);
+        for offset in [postings.len() as u64, postings.len() as u64 + 1, 4096] {
+            let tmp = TempDir::new().unwrap();
+            open_with_lookup(tmp.path(), 1, offset, 5, &postings);
+            let reader = IndexReader::open(tmp.path()).unwrap();
+            assert!(
+                reader.lookup_trigram_with_masks(1).is_empty(),
+                "offset {offset} is not inside index.bin"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_clamps_length_to_the_entries_that_fit() {
+        // Truncated index.bin: the lookup entry claims 10 postings but only
+        // 4 whole entries follow the offset. Decode the 4, drop the rest.
+        let tmp = TempDir::new().unwrap();
+        let postings = make_postings(6);
+        open_with_lookup(tmp.path(), 1, 2 * POSTING_ENTRY_SIZE as u64, 10, &postings);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        let ids: Vec<u32> = reader
+            .lookup_trigram_with_masks(1)
+            .into_iter()
+            .map(|e| e.file_id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn lookup_with_offset_inside_a_partial_trailing_entry_returns_empty() {
+        // Offset lands 1 byte into the last entry, so no whole entry remains.
+        let tmp = TempDir::new().unwrap();
+        let postings = make_postings(2);
+        let offset = postings.len() as u64 - (POSTING_ENTRY_SIZE as u64 - 1);
+        open_with_lookup(tmp.path(), 1, offset, 4, &postings);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        assert!(reader.lookup_trigram_with_masks(1).is_empty());
+    }
+
+    #[test]
+    fn lookup_still_returns_every_entry_of_a_well_formed_range() {
+        let tmp = TempDir::new().unwrap();
+        let postings = make_postings(10);
+        open_with_lookup(tmp.path(), 1, 0, 10, &postings);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        let entries = reader.lookup_trigram_with_masks(1);
+        let ids: Vec<u32> = entries.iter().map(|e| e.file_id).collect();
+        assert_eq!(ids, (0..10).collect::<Vec<u32>>());
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.loc_mask == 0xFF && e.next_mask == 0xFF)
+        );
+    }
+
+    #[test]
+    fn validate_lookup_reports_offset_that_overflows_the_range_math() {
+        // The loud-error counterpart: callers that validate up front (as
+        // `HybridIndex::open` does) get `IndexCorrupted` for the same entry
+        // the query path silently skips.
+        let tmp = TempDir::new().unwrap();
+        open_with_lookup(tmp.path(), 1, u64::MAX, 5, &make_postings(10));
+        let reader = IndexReader::open(tmp.path()).unwrap();
+        let err = reader.validate_lookup().unwrap_err();
+        assert!(err.contains("exceeds"), "expected bounds error, got: {err}");
     }
 }

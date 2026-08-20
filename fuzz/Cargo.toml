@@ -35,3 +35,9 @@ name = "fuzz_ondisk"
 path = "fuzz_targets/fuzz_ondisk.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_reader"
+path = "fuzz_targets/fuzz_reader.rs"
+test = false
+doc = false

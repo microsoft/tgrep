@@ -1938,17 +1938,70 @@ fn null_separator_long_flag() {
 #[test]
 fn no_heading_outputs_flat_format() {
     let dir = setup_fixture();
+    // Run from inside the fixture so printed paths are relative. An absolute
+    // path would carry a drive-letter colon on Windows and silently supply the
+    // extra field this test is looking for.
+    let sub = dir.path().join("testdata");
     let output = tgrep()
-        .args(["--no-index", "--no-heading", "fn", &fixture_path(&dir)])
+        .current_dir(&sub)
+        .args(["--no-index", "--no-heading", "fn", "hello.rs", "lib.rs"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // In flat format: every match line should contain file:line:content
+    assert!(!stdout.is_empty(), "expected matches");
+    // Flat format prefixes every match with its filename rather than printing
+    // the name once as a heading. ripgrep omits line numbers when stdout is not
+    // a terminal and `-n` was not asked for, so the shape here is file:content.
+    for line in stdout.lines() {
+        let (file, content) = line
+            .split_once(':')
+            .unwrap_or_else(|| panic!("expected file:content in flat mode, got: {line}"));
+        assert!(
+            file == "hello.rs" || file == "lib.rs",
+            "expected a filename prefix on every line, got: {line}"
+        );
+        assert!(
+            content.contains("fn"),
+            "expected the matching content after the filename, got: {line}"
+        );
+    }
+}
+
+#[test]
+fn no_heading_with_line_numbers_is_file_line_content() {
+    let dir = setup_fixture();
+    let sub = dir.path().join("testdata");
+    // Two file arguments: naming exactly one file would suppress the filename,
+    // leaving line:content.
+    let output = tgrep()
+        .current_dir(&sub)
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-n",
+            "fn",
+            "hello.rs",
+            "lib.rs",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.is_empty(), "expected matches");
     for line in stdout.lines() {
         let parts: Vec<&str> = line.splitn(3, ':').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "expected file:line:content once -n is given, got: {line}"
+        );
         assert!(
-            parts.len() >= 3,
-            "expected file:line:content in flat mode, got: {line}"
+            parts[0] == "hello.rs" || parts[0] == "lib.rs",
+            "expected a filename prefix, got: {line}"
+        );
+        assert!(
+            parts[1].parse::<usize>().is_ok(),
+            "expected a line number, got: {}",
+            parts[1]
         );
     }
 }

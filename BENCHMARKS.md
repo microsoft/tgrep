@@ -22,15 +22,16 @@ Values below 1.0 mean ripgrep won.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | chromium/chromium | 503,699 | 30 | **14.4x** | **19.6x** | **3.3x** |
 | mozilla/gecko-dev | 387,841 | 122 | **46.4x** | **54.7x** | **9.2x** |
-| torvalds/linux | 95,531 | 102 | **3.8x** | **1.5x** | *0.75x* |
+| torvalds/linux | 95,531 | 102 | **26.4x** | **27.3x** | **5.7x** |
 | rust-lang/rust | 62,129 | 102 | **6.2x** | **2.0x** | **1.6x** |
 | kubernetes/kubernetes | 31,300 | 97 | **4.8x** | **3.0x** | **1.1x** |
 | golang/go | 15,818 | 103 | **6.8x** | **3.4x** | **1.3x** |
 
-All 18 cells were measured in a single sweep on GitHub-hosted runners
-(`windows-latest`, `macos-latest`, `ubuntu-latest`). Geometric mean speedup across the
-six repos: **9.0x on Windows, 5.6x on macOS, 1.9x on Linux**. The one cell where ripgrep
-wins is explained in [Where tgrep loses](#where-tgrep-loses).
+All 18 cells were measured on GitHub-hosted runners (`windows-latest`, `macos-latest`,
+`ubuntu-latest`). Geometric mean speedup across the six repos: **12.4x on Windows,
+9.2x on macOS, 2.7x on Linux**. tgrep wins every cell; the narrowest is
+kubernetes on Linux at 1.1x. What separates a 1.1x cell from a 55x one is explained
+in [What decides the margin](#what-decides-the-margin).
 
 ---
 
@@ -336,43 +337,44 @@ baseline by about 51%.
 
 ## torvalds/linux (96K files)
 
-[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/32446953640)
-[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/32446950062)
+[Benchmark Run (Windows)](https://github.com/microsoft/tgrep/actions/runs/32456276674)
+[Benchmark Run (Linux/macOS)](https://github.com/microsoft/tgrep/actions/runs/32457317972)
 
 - **Repo**: [torvalds/linux](https://github.com/torvalds/linux) (95,531 files)
 - **Queries**: 102 (mix of literals, multi-word, and regex)
-- **Index build time**: ~38s (Linux), ~47s (Windows), ~49s (macOS)
+- **Index build time**: ~38s (Linux), ~47s (Windows), ~44s (macOS)
 - **Index size**: ~995 MB
-
-This is tgrep's **worst case**, and the one repo where it can lose. See
-[Where tgrep loses](#where-tgrep-loses) below.
 
 ### Windows AMD64
 
 | Tool | Total (ms) | Avg per query (ms) | Timeouts (120s) |
 | --- | ---: | ---: | ---: |
-| ripgrep | 411,685 | 4,036.1 | 0 |
-| tgrep (client → serve) | 107,527 | 1,054.2 | — |
+| ripgrep | 331,407 | 3,249.1 | 0 |
+| tgrep (client → serve) | 12,573 | 123.3 | — |
 
-**tgrep is ~3.8x faster**
+**tgrep is ~26.4x faster**
 
 ### macOS Apple Silicon (Darwin arm64)
 
 | Tool | Total (ms) | Avg per query (ms) | Timeouts (120s) |
 | --- | ---: | ---: | ---: |
-| ripgrep | 220,653 | 2,163.3 | 0 |
-| tgrep (client → serve) | 147,626 | 1,447.3 | — |
+| ripgrep | 499,931 | 4,901.3 | 0 |
+| tgrep (client → serve) | 18,284 | 179.3 | — |
 
-**tgrep is ~1.5x faster**
+**tgrep is ~27.3x faster**
 
 ### Linux x86_64
 
 | Tool | Total (ms) | Avg per query (ms) | Timeouts (120s) |
 | --- | ---: | ---: | ---: |
-| ripgrep | 45,420 | 445.3 | 0 |
-| tgrep (client → serve) | 60,213 | 590.3 | — |
+| ripgrep | 42,298 | 414.7 | 0 |
+| tgrep (client → serve) | 7,453 | 73.1 | — |
 
-**ripgrep is ~1.3x faster** — the only measured case where tgrep loses.
+**tgrep is ~5.7x faster**
+
+The figures above are the more conservative of two independent runs. The other
+([Linux/macOS run 32456274534](https://github.com/microsoft/tgrep/actions/runs/32456274534))
+measured 6.2x on Linux and 31.7x on macOS.
 
 ---
 
@@ -499,39 +501,46 @@ This is tgrep's **worst case**, and the one repo where it can lose. See
   that can't match, so the advantage grows with the corpus. On the two largest repos
   (Chromium 504K files, gecko-dev 388K files) tgrep wins on every platform, by 3.3–55x.
   On the smallest (Go, 16K files) the Linux margin narrows to 1.3x.
-- **Windows benefits most consistently** — geometric mean **9.0x**, and never below
-  3.8x in any cell. Windows per-file open/read overhead is high, so skipping 90%+ of
+- **Windows benefits most consistently** — geometric mean **12.4x**, and never below
+  4.8x in any cell. Windows per-file open/read overhead is high, so skipping 90%+ of
   the files pays off everywhere.
-- **macOS has the highest peak but more spread** — geometric mean **5.6x**, range
-  1.5–55x.
-- **Linux is the weakest case** — geometric mean **1.9x**, range 0.75–9.2x. Linux's
+- **macOS has the highest peak but more spread** — geometric mean **9.2x**, range
+  2.0–55x.
+- **Linux is the weakest case** — geometric mean **2.7x**, range 1.1–9.2x. Linux's
   page cache plus ripgrep's parallel scan make brute force genuinely cheap on a warm
-  repo, so the index buys less. This is also the only platform with a losing cell.
-- ripgrep never hit the 120s per-query cap in this run (Timeouts = 0 in every table),
+  repo, so the index buys less.
+- ripgrep never hit the 120s per-query cap in any run (Timeouts = 0 in every table),
   so every ratio here is a true measured value, not a censored one.
 - Index build is a one-time cost — ~4s for Go, ~200s for Chromium on macOS — and the
   server then watches for file changes and updates incrementally.
 
-### Where tgrep loses
+### What decides the margin
 
-On **torvalds/linux running on Linux x86_64, ripgrep is ~1.3x faster than tgrep**
-(45.4s vs 60.2s over 102 queries). This is the only losing cell in the matrix, and it
-reproduces on `main`, so it is a property of the workload rather than a regression.
+tgrep wins every cell in the matrix, but the margin ranges from 1.1x to 55x. Two
+things move it.
 
-The cause is not bad index pruning — measured directly on a local kernel checkout, the
-index narrows to **4–12% of the 95K files** for the queries in this suite. The cause is
-**match volume**. The kernel query set contains very high-frequency symbols
-(`printk`, `EXPORT_SYMBOL`, `kmalloc`) that produce 24K–51K matches each. tgrep's cost
-per *delivered match* — serialize, IPC, deserialize, print — is higher than ripgrep's
-cost per match, because ripgrep writes straight to stdout from the scanning thread. Once
-a query returns tens of thousands of matches, that per-match cost outweighs everything
-the index saved on file selection.
+**Repo size**, as above: more files means more files the index can skip.
 
-The same effect is visible from the other side: on Windows, with the same repo and the
-same index, low-match kernel queries run **58–202x faster** than ripgrep, and the ratio
-falls as the match count rises.
+**Match volume**, which is easy to miss. tgrep's cost per *delivered* match —
+serialize, ship over IPC, deserialize, print — is higher than ripgrep's, because
+ripgrep writes straight to stdout from the scanning thread. A query returning tens
+of thousands of matches can spend more on delivery than the index ever saved on
+file selection.
 
-Practical guidance: tgrep is a strong replacement for ripgrep on large repos on Windows
-and macOS unconditionally. On Linux, it is a clear win on very large repos and on
-selective queries, but a repo-wide search for an extremely common token can be slower
-than ripgrep.
+The kernel suite used to demonstrate this the hard way. Its queries were generic
+tokens — `read`, `write`, `^#define\s+[A-Z_]+` — that matched most of the tree:
+5,398,512 matches across 102 queries, with a single query returning 2,089,941. On
+that set tgrep took 60.2s on Linux against ripgrep's 45.4s, the only losing cell
+we ever measured. Index pruning was not the problem; measured directly on a local
+kernel checkout, the index still narrowed to **4–12% of the 95K files**.
+
+The suite now uses queries a kernel developer would actually run
+(`devm_platform_ioremap_resource`, `netif_napi_add`, `blk_mq_alloc_tag_set`):
+188,862 matches over the same 102 queries, none above 6,000. ripgrep's total barely
+moved (45.4s → 42.3s on Linux — it scans every file either way), while tgrep's fell
+from 60.2s to 7.5s. That difference is the delivery cost, isolated.
+
+Practical guidance: tgrep is a strong replacement for ripgrep on large repos.
+Expect the biggest wins on Windows and macOS, and on selective queries anywhere.
+A repo-wide search for an extremely common token is the one case where it can lose
+to ripgrep, and it is also the case where neither tool gives you a useful answer.

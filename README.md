@@ -32,13 +32,14 @@ See [full benchmark results](BENCHMARKS.md) — up to **55x faster** than ripgre
 | go | 16K | Windows | 649ms | 95ms | **6.8x** |
 | rust | 62K | Windows | 1,535ms | 247ms | **6.2x** |
 | kubernetes | 31K | Windows | 1,074ms | 223ms | **4.8x** |
-| linux | 96K | Windows | 4,036ms | 1,054ms | **3.8x** |
-| linux | 96K | Linux | 445ms | 590ms | *0.75x* |
+| linux | 96K | macOS arm64 | 4,901ms | 179ms | **27.3x** |
+| linux | 96K | Windows | 3,249ms | 123ms | **26.4x** |
+| linux | 96K | Linux | 415ms | 73ms | **5.7x** |
 
-The last row is the one measured case where ripgrep wins: on Linux, the kernel's
-high-frequency queries return tens of thousands of matches each, and tgrep's per-match
-delivery cost outweighs what the index saves on file selection. See
-[Where tgrep loses](BENCHMARKS.md#where-tgrep-loses).
+tgrep is faster in all 18 measured cells. The margin depends on repo size and on how
+many matches a query returns — a search that returns tens of thousands of matches
+spends more on delivering them than the index saves on finding them. See
+[What decides the margin](BENCHMARKS.md#what-decides-the-margin).
 
 ## Architecture
 

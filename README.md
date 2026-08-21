@@ -452,6 +452,11 @@ Same as ripgrep:
 
 A match plus an error yields `2`, unless `-q` is set, which yields `0`.
 
+An ignore file that fails to parse is *not* one of these errors. Like ripgrep,
+tgrep reports it on stderr, skips the offending rule and carries on, leaving the
+exit code determined by the search alone. Suppress the message with
+`--no-ignore-messages`, or with `--no-messages`, which covers it as well.
+
 ## How It Works
 
 1. **Indexing** — walks the repo (respecting `.gitignore` and root-level

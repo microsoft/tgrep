@@ -680,14 +680,17 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             .unwrap_or("auto"),
     )
     .ok_or_else(|| "unrecognized regex engine".to_string())?;
+    // Saturate rather than truncate: these arrive from a client that already
+    // rejected values too large for its own `usize`, so this only guards
+    // against a malformed request applying a silently smaller limit.
     let regex_size_limit = params
         .get("regex_size_limit")
         .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX));
     let dfa_size_limit = params
         .get("dfa_size_limit")
         .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX));
     let replace = params
         .get("replace")
         .and_then(|v| v.as_str())

@@ -135,6 +135,31 @@ fn is_binary_extension(path: &Path) -> bool {
         })
 }
 
+/// Render a non-fatal ignore-file error for display.
+///
+/// The error embeds the absolute path the walker was handed, which on Windows
+/// is an extended-length path (`\\?\C:\...`) left over from `canonicalize`.
+/// Show it relative to the search root instead, so it reads like the paths
+/// printed alongside matches rather than an internal Win32 detail.
+fn display_ignore_error(err: &ignore::Error, root: &Path) -> String {
+    let ignore::Error::WithPath { path, err: inner } = err else {
+        return err.to_string();
+    };
+    let shown = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    let shown = if let Some(rest) = shown.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = shown.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        shown
+    };
+    format!("{shown}: {inner}")
+}
+
 /// Walk a directory tree, respecting .gitignore rules (unless disabled).
 /// Returns paths of text files suitable for indexing/searching.
 ///
@@ -153,6 +178,7 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
     let max_file_size = opts.max_file_size;
     let include_hidden = opts.include_hidden;
     let collect_gitignore_files = opts.collect_gitignore_files;
+    let no_ignore_messages = opts.no_ignore_messages;
     let root = root.to_path_buf();
     let p4ignore = (!opts.no_ignore)
         .then(|| crate::gitignore::build_p4ignore_matcher(&root))
@@ -195,7 +221,9 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         if let Some(err) = builder.add_ignore(path)
             && !opts.no_ignore_messages
         {
-            eprintln!("tgrep: {}: {err}", path.display());
+            // `err` already renders as `<path>: line N: ...`, so printing the
+            // path again would repeat it.
+            eprintln!("tgrep: {err}");
         }
     }
     let walker = builder.build_parallel();
@@ -208,6 +236,7 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         let skipped_binary = &skipped_binary;
         let skipped_error = &skipped_error;
         let skipped_too_large = &skipped_too_large;
+        let walk_root = &root;
         Box::new(move |entry| {
             let entry = match entry {
                 Ok(e) => e,
@@ -216,6 +245,15 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
                     return ignore::WalkState::Continue;
                 }
             };
+            // An entry can carry a non-fatal error from parsing an ignore file
+            // found while descending into it. ripgrep reports these (gated on
+            // the same flags) and keeps walking, rather than treating a
+            // malformed `.gitignore` as a reason to stop.
+            if let Some(err) = entry.error()
+                && !no_ignore_messages
+            {
+                eprintln!("tgrep: {}", display_ignore_error(err, walk_root));
+            }
 
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if should_skip_dir(&entry, &exclude) {

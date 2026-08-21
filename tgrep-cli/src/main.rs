@@ -506,8 +506,11 @@ fn parse_sort(key: &str, reverse: bool) -> Result<Option<search::SortMode>> {
     Ok(Some(search::SortMode { key, reverse }))
 }
 
-/// Parse a `--max-filesize` value, accepting K/M/G suffixes like ripgrep.
-fn parse_max_filesize(s: &str) -> Result<u64> {
+/// Parse a byte size, accepting K/M/G suffixes like ripgrep.
+///
+/// `flag` names the option in the error message so a bad `--regex-size-limit`
+/// does not report a problem with `--max-filesize`.
+fn parse_byte_size(flag: &str, s: &str) -> Result<u64> {
     let s = s.trim();
     let (digits, mult) = match s.chars().last() {
         Some('K') | Some('k') => (&s[..s.len() - 1], 1024u64),
@@ -518,9 +521,21 @@ fn parse_max_filesize(s: &str) -> Result<u64> {
     let n: u64 = digits
         .trim()
         .parse()
-        .map_err(|_| anyhow::anyhow!("invalid --max-filesize value: {s}"))?;
+        .map_err(|_| anyhow::anyhow!("invalid {flag} value: {s}"))?;
     n.checked_mul(mult)
-        .ok_or_else(|| anyhow::anyhow!("--max-filesize value is too large: {s}"))
+        .ok_or_else(|| anyhow::anyhow!("{flag} value is too large: {s}"))
+}
+
+/// Parse a size limit that the regex engines take as a `usize`.
+///
+/// ripgrep stores these limits as `usize` and rejects a value that does not
+/// fit ("size is too big") instead of truncating it. Truncating would apply a
+/// silently different limit than the one asked for on a 32-bit target, so
+/// reject it here too.
+fn parse_size_limit(flag: &str, s: &str) -> Result<usize> {
+    let bytes = parse_byte_size(flag, s)?;
+    usize::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("{flag} value is too large for this platform: {s}"))
 }
 
 /// Posting accumulation strategy for `tgrep index`.
@@ -664,7 +679,7 @@ impl Cli {
     fn max_filesize_bytes(&self) -> Result<Option<u64>> {
         self.max_filesize
             .as_deref()
-            .map(parse_max_filesize)
+            .map(|s| parse_byte_size("--max-filesize", s))
             .transpose()
     }
 
@@ -705,15 +720,13 @@ impl Cli {
             regex_size_limit: self
                 .regex_size_limit
                 .as_deref()
-                .map(parse_max_filesize)
-                .transpose()?
-                .map(|v| v as usize),
+                .map(|s| parse_size_limit("--regex-size-limit", s))
+                .transpose()?,
             dfa_size_limit: self
                 .dfa_size_limit
                 .as_deref()
-                .map(parse_max_filesize)
-                .transpose()?
-                .map(|v| v as usize),
+                .map(|s| parse_size_limit("--dfa-size-limit", s))
+                .transpose()?,
             sort,
         })
     }
@@ -813,6 +826,7 @@ impl Cli {
             encoding: resolved.encoding,
             follow: self.follow,
             no_messages: self.no_messages,
+            no_ignore_messages: self.no_ignore_messages,
             line_regexp: self.line_regexp,
             no_unicode: self.no_unicode,
             engine: resolved.engine,

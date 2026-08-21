@@ -71,6 +71,9 @@ pub struct SearchOptions {
     pub encoding: tgrep_core::encoding::EncodingMode,
     pub follow: bool,
     pub no_messages: bool,
+    /// `--no-ignore-messages`: suppress errors from unparseable ignore files.
+    /// Independent of `--no-messages`, which suppresses them as well.
+    pub no_ignore_messages: bool,
     // ── Matching ──
     pub line_regexp: bool,
     pub no_unicode: bool,
@@ -209,7 +212,9 @@ impl SearchOptions {
             no_ignore_parent: self.no_ignore_parent,
             no_ignore_vcs: self.no_ignore_vcs,
             no_require_git: self.no_require_git,
-            no_ignore_messages: self.no_messages,
+            // ripgrep gates ignore-file errors on both flags: `--no-messages`
+            // suppresses them too, "regardless of" `--no-ignore-messages`.
+            no_ignore_messages: self.no_messages || self.no_ignore_messages,
             threads: self.threads,
             ..Default::default()
         }

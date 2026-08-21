@@ -1122,3 +1122,202 @@ fn max_columns_under_only_matching_measures_the_match_alone() {
         "the same match exceeds a limit of 9, with no terminator counted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 14. Unparseable ignore files
+//
+// Verified against rg 15.2.0 using an ignore file containing `a[z-a]`:
+//   rg --ignore-file bad.ignore needle .
+//     -> rg: bad.ignore: line 1: error parsing glob 'a[z-a]': invalid range
+//     -> exit 0 (a match was still found)
+// Both `--no-ignore-messages` and `--no-messages` suppress it: ripgrep's
+// `ignore_message!` requires messages AND ignore-messages to be enabled.
+// Crucially it does *not* set the "errored" flag the way `err_message!` does,
+// so a malformed ignore file never turns a successful search into exit 2.
+// The same message is emitted for ignore files discovered during the walk.
+// ---------------------------------------------------------------------------
+
+fn stderr_of(cmd: &mut Command) -> String {
+    let out = cmd.output().unwrap();
+    String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+/// A fixture whose ignore files contain a glob the parser rejects.
+fn bad_ignore_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.txt"), "needle here\n").unwrap();
+    fs::write(dir.path().join("bad.ignore"), "a[z-a]\n").unwrap();
+    dir
+}
+
+#[test]
+fn unparseable_ignore_file_is_reported() {
+    let dir = bad_ignore_fixture();
+    let err = stderr_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--ignore-file",
+        "bad.ignore",
+        "needle",
+        ".",
+    ]));
+    assert!(
+        err.contains("bad.ignore: line 1: error parsing glob"),
+        "expected a parse error naming the ignore file, got: {err:?}"
+    );
+    // The path must appear exactly once: the error already renders as
+    // `<path>: line N: ...`, so prefixing it again would repeat it.
+    assert_eq!(
+        err.matches("bad.ignore").count(),
+        1,
+        "the ignore file path should not be printed twice: {err:?}"
+    );
+}
+
+#[test]
+fn no_ignore_messages_suppresses_ignore_file_errors() {
+    let dir = bad_ignore_fixture();
+    let err = stderr_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--no-ignore-messages",
+        "--ignore-file",
+        "bad.ignore",
+        "needle",
+        ".",
+    ]));
+    assert!(
+        !err.contains("error parsing glob"),
+        "--no-ignore-messages must suppress the parse error, got: {err:?}"
+    );
+}
+
+#[test]
+fn no_messages_also_suppresses_ignore_file_errors() {
+    let dir = bad_ignore_fixture();
+    let err = stderr_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--no-messages",
+        "--ignore-file",
+        "bad.ignore",
+        "needle",
+        ".",
+    ]));
+    assert!(
+        !err.contains("error parsing glob"),
+        "--no-messages suppresses ignore messages too, got: {err:?}"
+    );
+}
+
+#[test]
+fn unparseable_ignore_file_does_not_change_the_exit_code() {
+    let dir = bad_ignore_fixture();
+    let out = tgrep()
+        .current_dir(dir.path())
+        .args(["--no-index", "--ignore-file", "bad.ignore", "needle", "."])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "ripgrep reports the error but still exits 0 when a match was found"
+    );
+}
+
+#[test]
+fn unparseable_gitignore_found_during_the_walk_is_reported() {
+    let dir = bad_ignore_fixture();
+    fs::create_dir_all(dir.path().join("sub")).unwrap();
+    fs::write(dir.path().join("sub").join("b.txt"), "needle deep\n").unwrap();
+    fs::write(dir.path().join("sub").join(".gitignore"), "a[z-a]\n").unwrap();
+    let err = stderr_of(
+        tgrep()
+            .current_dir(dir.path())
+            .args(["--no-index", "needle", "."]),
+    );
+    assert!(
+        err.contains("error parsing glob"),
+        "a malformed .gitignore met during the walk must be reported, got: {err:?}"
+    );
+    // Reported relative to the search root, not as the extended-length path
+    // that `canonicalize` hands the walker on Windows.
+    assert!(
+        err.contains(&format!("sub{}.gitignore", sep())) && !err.contains(r"\\?\"),
+        "the path should be root-relative and free of a verbatim prefix, got: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 15. `--regex-size-limit` / `--dfa-size-limit`
+//
+// ripgrep stores both as `usize` and rejects a value that does not fit
+// ("size is too big") rather than truncating it, so the search either uses the
+// limit that was asked for or fails outright. A malformed value exits 2:
+//   rg --regex-size-limit abc  -> rg: error parsing flag --regex-size-limit: ...
+// ---------------------------------------------------------------------------
+
+#[test]
+fn regex_size_limit_error_names_its_own_flag() {
+    let dir = fixture();
+    let out = tgrep()
+        .current_dir(dir.path())
+        .args(["--no-index", "--regex-size-limit", "abc", "needle", "."])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "a bad flag value exits 2");
+    assert!(
+        err.contains("--regex-size-limit"),
+        "the error must name the flag that was actually wrong, got: {err:?}"
+    );
+}
+
+#[test]
+fn dfa_size_limit_error_names_its_own_flag() {
+    let dir = fixture();
+    let out = tgrep()
+        .current_dir(dir.path())
+        .args(["--no-index", "--dfa-size-limit", "abc", "needle", "."])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "a bad flag value exits 2");
+    assert!(
+        err.contains("--dfa-size-limit"),
+        "the error must name the flag that was actually wrong, got: {err:?}"
+    );
+}
+
+#[test]
+fn oversized_size_limit_is_rejected_rather_than_truncated() {
+    let dir = fixture();
+    let out = tgrep()
+        .current_dir(dir.path())
+        .args([
+            "--no-index",
+            "--regex-size-limit",
+            "99999999999999999G",
+            "needle",
+            ".",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a limit too large to represent must fail, not wrap around"
+    );
+}
+
+#[test]
+fn a_large_but_representable_size_limit_is_accepted() {
+    let dir = fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--regex-size-limit",
+        "1G",
+        "--dfa-size-limit",
+        "1G",
+        "needle",
+        "alpha.txt",
+    ]));
+    assert_eq!(out, "needle at top\n", "a 1G limit is well within usize");
+}

@@ -164,6 +164,11 @@ struct ServerState {
     exclude_dirs: Vec<String>,
     /// Disable all source-control ignore files for every server discovery path.
     no_ignore: bool,
+    /// Respect `.gitignore` outside a git repository, for every server
+    /// discovery path. Must be applied consistently to the index build, the
+    /// startup metadata walk and the watcher's rescan, or those disagree about
+    /// which files belong in the index.
+    no_require_git: bool,
     /// On-disk index directory used by live ignore-rule reconciliation.
     index_dir: PathBuf,
     /// Serializes on-disk index publication across all publishers
@@ -289,6 +294,8 @@ pub struct ServeOptions<'a> {
     pub memory_cap_bytes: u64,
     pub index_threads: usize,
     pub no_ignore: bool,
+    /// `--no-require-git`: respect `.gitignore` outside a git repository.
+    pub no_require_git: bool,
     pub auto_save_mutations: Option<u32>,
     /// Bound on the watcher's hand-off queue. `None` uses [`WATCHER_QUEUE_CAP`].
     pub watcher_queue_cap: Option<usize>,
@@ -301,6 +308,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         memory_cap_bytes,
         index_threads,
         no_ignore,
+        no_require_git,
         auto_save_mutations,
         watcher_queue_cap,
     } = options;
@@ -375,6 +383,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         watch_enabled: !no_watch,
         exclude_dirs: exclude_dirs.to_vec(),
         no_ignore,
+        no_require_git,
         index_dir: index_dir.clone(),
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
@@ -1202,13 +1211,18 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
 fn handle_reload(id: Option<serde_json::Value>, state: &ServerState) -> String {
     let index_dir = state.index_dir.clone();
 
-    // Rebuild from disk
-    if let Err(e) = builder::build_index(
+    // Rebuild from disk. Uses the options form rather than `build_index` so the
+    // rebuild keeps the ignore semantics the server started with — a reload that
+    // silently changed them would rewrite the index against different rules.
+    if let Err(e) = builder::build_index_with_options(
         &state.root,
         Some(&index_dir),
-        false,
-        state.no_ignore,
-        &state.exclude_dirs,
+        &builder::BuildOptions {
+            no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
+            exclude_dirs: state.exclude_dirs.clone(),
+            ..Default::default()
+        },
     ) {
         return json_rpc_error(id, -32000, &format!("rebuild failed: {e}"));
     }
@@ -1824,7 +1838,14 @@ fn background_refresh_stale(
     // watcher's ignore matcher, and it must run before the early returns
     // below so the matcher is published — and `gitignore_pending` released —
     // even when the index turns out to be up to date or has no stamps yet.
-    let walk = walker::walk_file_metadata(root, &state.exclude_dirs, state.no_ignore);
+    let walk = walker::walk_file_metadata(
+        root,
+        &walker::MetaWalkOptions {
+            exclude_dirs: state.exclude_dirs.clone(),
+            no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
+        },
+    );
     let walk_ms = start.elapsed().as_millis();
     publish_watcher_matcher(state, root, &walk);
     let current_meta = &walk.files;
@@ -1986,6 +2007,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         &builder::BuildOptions {
             include_hidden: false,
             no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
             exclude_dirs: state.exclude_dirs.clone(),
             // Match the walk `background_index_build` would have run, and the
             // dot-prefix rule `should_skip_watcher_path` applies, so the
@@ -2133,6 +2155,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         &WalkOptions {
             include_hidden: false,
             no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
             collect_gitignore_files: state.watch_enabled && !state.no_ignore,
             exclude_dirs: state.exclude_dirs.clone(),
             ..Default::default()
@@ -2310,8 +2333,14 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // the index looks fully published but `filestamps.json` is missing — a
     // server kill in that window disables incremental stale detection on
     // the next start.
-    let walk_meta =
-        tgrep_core::walker::walk_file_metadata(root, &state.exclude_dirs, state.no_ignore);
+    let walk_meta = tgrep_core::walker::walk_file_metadata(
+        root,
+        &tgrep_core::walker::MetaWalkOptions {
+            exclude_dirs: state.exclude_dirs.clone(),
+            no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
+        },
+    );
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta
         .files
         .into_iter()

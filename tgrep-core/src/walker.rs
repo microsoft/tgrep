@@ -342,6 +342,25 @@ pub struct MetaWalkResult {
     pub ignore_files: Vec<PathBuf>,
 }
 
+/// Options for [`walk_file_metadata`].
+///
+/// A struct rather than positional `bool`s: the metadata walk needs both
+/// `no_ignore` and `no_require_git`, and two adjacent bare booleans at a call
+/// site are trivially transposed.
+#[derive(Debug, Clone, Default)]
+pub struct MetaWalkOptions {
+    /// Directory names to prune from the walk.
+    pub exclude_dirs: Vec<String>,
+    /// `--no-ignore`: don't respect any ignore files.
+    pub no_ignore: bool,
+    /// `--no-require-git`: respect gitignore rules outside a git repository.
+    ///
+    /// Must track the indexing walk's setting. If the two disagree, startup
+    /// stale-file detection compares a file set built under one rule against an
+    /// index built under the other, and every extra file looks new.
+    pub no_require_git: bool,
+}
+
 /// Walk a directory tree collecting filesystem metadata (mtime, size) plus the
 /// `.gitignore` / `.ignore` files encountered. No file content is read — this
 /// is used for stale file detection on startup.
@@ -350,11 +369,12 @@ pub struct MetaWalkResult {
 /// still found because every directory the walk descends into is probed
 /// explicitly via [`crate::gitignore::ignore_files_in`], which also catches
 /// ignore files that their own rules would have filtered out of the walk.
-pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String], no_ignore: bool) -> MetaWalkResult {
+pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult {
+    let no_ignore = opts.no_ignore;
     let results = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
-    let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(exclude_dirs.to_vec());
+    let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(opts.exclude_dirs.clone());
     let p4ignore = (!no_ignore)
         .then(|| crate::gitignore::build_p4ignore_matcher(root))
         .flatten()
@@ -364,6 +384,7 @@ pub fn walk_file_metadata(root: &Path, exclude_dirs: &[String], no_ignore: bool)
 
     let walker = WalkBuilder::new(&root)
         .hidden(true)
+        .require_git(!opts.no_require_git)
         .git_ignore(!no_ignore)
         .git_global(!no_ignore)
         .git_exclude(!no_ignore)
@@ -774,7 +795,7 @@ mod tests {
         fs::write(root.join("src").join(".ignore"), "*.bak\n").unwrap();
         fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
 
-        let result = walk_file_metadata(&root, &[], false);
+        let result = walk_file_metadata(&root, &MetaWalkOptions::default());
 
         // The dot-files themselves stay out of the metadata set, exactly as
         // they did under the previous `hidden(true)` walk.
@@ -807,8 +828,15 @@ mod tests {
         let dir = setup_fixture();
         let root = dir.path().join("testdata");
 
-        let all = walk_file_metadata(&root, &[], false).files;
-        let excluded = walk_file_metadata(&root, &["vendor".to_string()], false).files;
+        let all = walk_file_metadata(&root, &MetaWalkOptions::default()).files;
+        let excluded = walk_file_metadata(
+            &root,
+            &MetaWalkOptions {
+                exclude_dirs: vec!["vendor".to_string()],
+                ..Default::default()
+            },
+        )
+        .files;
 
         assert!(all.iter().any(|f| f.relative_path.starts_with("vendor/")));
         assert!(
@@ -835,7 +863,7 @@ mod tests {
         assert!(!names.contains(&"third_party/lib.rs".to_string()));
         assert!(names.contains(&"src/main.rs".to_string()));
 
-        let metadata = walk_file_metadata(&root, &[], false).files;
+        let metadata = walk_file_metadata(&root, &MetaWalkOptions::default()).files;
         assert!(
             !metadata
                 .iter()
@@ -867,11 +895,94 @@ mod tests {
                 .any(|name| name == "vendor/dep.rs")
         );
 
-        let metadata = walk_file_metadata(&root, &[], true).files;
+        let metadata = walk_file_metadata(
+            &root,
+            &MetaWalkOptions {
+                no_ignore: true,
+                ..Default::default()
+            },
+        )
+        .files;
         assert!(
             metadata
                 .iter()
                 .any(|file| file.relative_path == "vendor/dep.rs")
         );
+    }
+
+    /// `--no-require-git` lifts the `ignore` crate's rule that `.gitignore`
+    /// only applies inside a git repository. Without it, non-git enlistments
+    /// (Perforce/Source Depot trees, source drops) index their build output.
+    #[test]
+    fn no_require_git_applies_gitignore_outside_a_git_repo() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Deliberately no `.git` anywhere.
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "build/\n*.log\n").unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("build").join("out.rs"), "generated\n").unwrap();
+        fs::write(root.join("noisy.log"), "log\n").unwrap();
+
+        let gated = sorted_filenames(&walk_dir(root, &WalkOptions::default()), root);
+        assert!(
+            gated.contains(&"build/out.rs".to_string()),
+            "default is git-gated, matching ripgrep: {gated:?}"
+        );
+        assert!(gated.contains(&"noisy.log".to_string()));
+
+        let lifted = sorted_filenames(
+            &walk_dir(
+                root,
+                &WalkOptions {
+                    no_require_git: true,
+                    ..Default::default()
+                },
+            ),
+            root,
+        );
+        assert_eq!(
+            lifted,
+            vec!["src/main.rs".to_string()],
+            "`.gitignore` must apply once the git gate is lifted"
+        );
+    }
+
+    /// The metadata walk feeds startup stale-file detection. If it stayed
+    /// git-gated while the index build honoured `--no-require-git`, every
+    /// ignored file would look new on every start.
+    #[test]
+    fn metadata_walk_honours_no_require_git() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("build").join("out.rs"), "generated\n").unwrap();
+
+        let gated: Vec<_> = walk_file_metadata(root, &MetaWalkOptions::default())
+            .files
+            .into_iter()
+            .map(|f| f.relative_path)
+            .collect();
+        assert!(
+            gated.iter().any(|p| p.starts_with("build/")),
+            "default stays git-gated: {gated:?}"
+        );
+
+        let lifted: Vec<_> = walk_file_metadata(
+            root,
+            &MetaWalkOptions {
+                no_require_git: true,
+                ..Default::default()
+            },
+        )
+        .files
+        .into_iter()
+        .map(|f| f.relative_path)
+        .collect();
+        assert_eq!(lifted, vec!["src/main.rs".to_string()]);
     }
 }

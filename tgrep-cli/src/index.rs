@@ -31,6 +31,7 @@ pub struct RunOptions<'a> {
     pub index_path: Option<&'a Path>,
     pub include_hidden: bool,
     pub no_ignore: bool,
+    pub no_require_git: bool,
     pub exclude_dirs: &'a [String],
     pub strategy: IndexStrategy,
     pub index_buffer_mb: Option<u64>,
@@ -43,6 +44,7 @@ pub fn run(opts: RunOptions<'_>) -> Result<()> {
         index_path,
         include_hidden,
         no_ignore,
+        no_require_git,
         exclude_dirs,
         strategy,
         index_buffer_mb,
@@ -70,6 +72,7 @@ pub fn run(opts: RunOptions<'_>) -> Result<()> {
         &BuildOptions {
             include_hidden,
             no_ignore,
+            no_require_git,
             exclude_dirs: exclude_dirs.to_vec(),
             strategy,
             buffer_bytes,

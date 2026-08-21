@@ -5123,3 +5123,107 @@ fn sort_path_uses_the_same_order_on_every_search_path() {
     assert_eq!(a.lines().count(), 3, "expected three files, got {a:?}");
     assert_eq!(a, b, "--sort path must use one order on every search path");
 }
+
+// ---------------------------------------------------------------------------
+// `--no-require-git` reaches the index, not just the search
+//
+// `.gitignore` is git-gated by default (ripgrep's own rule), so enlistments
+// that are not git checkouts -- Perforce and Source Depot trees, exported
+// source drops -- have their `.gitignore` files ignored and index build
+// output. `--no-require-git` is the documented escape hatch, and because it is
+// a global flag clap accepted it on `index` and `serve` while the value was
+// dropped on the floor: the search path honoured it and the index path did
+// not, so the two disagreed about which files existed.
+// ---------------------------------------------------------------------------
+
+/// A tree with a real `.gitignore` and deliberately no `.git` directory.
+fn non_git_enlistment() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("build")).unwrap();
+    fs::write(root.join(".gitignore"), "build/\n*.log\n").unwrap();
+    fs::write(root.join("src").join("main.rs"), "let needle = 1;\n").unwrap();
+    fs::write(root.join("build").join("gen.rs"), "let needle = 2;\n").unwrap();
+    fs::write(root.join("out.log"), "needle\n").unwrap();
+    dir
+}
+
+fn indexed_file_count(root: &str, idx: &str, extra: &[&str]) -> usize {
+    let mut args = vec!["index", root, "--index-path", idx];
+    args.extend_from_slice(extra);
+    let out = tgrep().args(&args).output().unwrap();
+    assert!(out.status.success(), "index failed: {out:?}");
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("Found "))
+        .unwrap_or_else(|| panic!("no 'Found' line in: {text}"));
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+#[test]
+fn index_is_git_gated_by_default_like_ripgrep() {
+    let dir = non_git_enlistment();
+    let idx = dir.path().join("idx");
+    let n = indexed_file_count(&indexed_fixture_path(&dir), idx.to_str().unwrap(), &[]);
+    // src/main.rs + build/gen.rs + out.log. `.gitignore` is dot-prefixed and so
+    // is filtered by the walk's hidden rule regardless of the git gate.
+    assert_eq!(n, 3, "no `.git`, so `.gitignore` must not apply by default");
+}
+
+#[test]
+fn index_honours_no_require_git() {
+    let dir = non_git_enlistment();
+    let idx = dir.path().join("idx");
+    let n = indexed_file_count(
+        &indexed_fixture_path(&dir),
+        idx.to_str().unwrap(),
+        &["--no-require-git"],
+    );
+    // Only src/main.rs survives; `.gitignore` is dot-prefixed and hidden anyway.
+    assert_eq!(
+        n, 1,
+        "`--no-require-git` must reach the indexing walk, not just search"
+    );
+}
+
+/// The actual user-visible symptom: build output stays searchable through the
+/// index even though `.gitignore` excludes it.
+#[test]
+fn indexed_search_excludes_ignored_files_under_no_require_git() {
+    let dir = non_git_enlistment();
+    let idx = dir.path().join("idx");
+    let root = indexed_fixture_path(&dir);
+    tgrep()
+        .args([
+            "index",
+            &root,
+            "--index-path",
+            idx.to_str().unwrap(),
+            "--no-require-git",
+        ])
+        .assert()
+        .success();
+
+    let out = tgrep()
+        .args([
+            "--no-heading",
+            "--index-path",
+            idx.to_str().unwrap(),
+            "--no-require-git",
+            "needle",
+            &root,
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("main.rs"),
+        "expected the source hit: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("gen.rs") && !stdout.contains("out.log"),
+        "ignored build output must not be searchable: {stdout:?}"
+    );
+}

@@ -959,6 +959,7 @@ fn run_cli() {
             index_path: cli.index_path.as_deref(),
             include_hidden: cli.hidden,
             no_ignore,
+            no_require_git: cli.no_require_git,
             exclude_dirs: &exclude,
             strategy: strategy.into(),
             index_buffer_mb,
@@ -987,6 +988,7 @@ fn run_cli() {
                     memory_cap_bytes: memory_cap,
                     index_threads,
                     no_ignore,
+                    no_require_git: cli.no_require_git,
                     auto_save_mutations,
                     // Clap's range bound guarantees this fits; saturating keeps
                     // the conversion total, and errs toward a large cap rather

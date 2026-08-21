@@ -416,6 +416,18 @@ One divergence: ripgrep stops reading a file once the limit is reached, so its
 `--stats` `bytes_searched` is lower than tgrep's, which searches from a
 whole-file buffer. The match counts themselves agree.
 
+### Multiline matches
+
+`-U/--multiline` lets a match cross line boundaries, and every line a match
+covers is printed. `--vimgrep` is the exception: it reports one row per match
+so editors get one jump target each, so a match spanning several lines is
+reported only on the line it starts on.
+
+Two divergences, both cases where ripgrep names a column that doesn't exist on
+the line it prints — `rg -U --column` reports the same column for every line of
+a match, and `rg -U --vimgrep -o` can report column 19 of a 7-character line.
+tgrep reports the real match position instead.
+
 ### Binary files
 
 A file is binary if it contains a NUL byte. Following ripgrep:

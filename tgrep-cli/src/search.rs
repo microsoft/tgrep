@@ -250,6 +250,7 @@ impl SearchOptions {
                 && !self.quiet,
             replace: self.replace.clone(),
             stop_on_nonmatch: self.stop_on_nonmatch,
+            vimgrep: self.vimgrep,
         }
     }
 
@@ -579,6 +580,7 @@ fn search_via_server(
             "replace": opts.replace,
             "passthru": opts.match_options().passthru,
             "stop_on_nonmatch": opts.stop_on_nonmatch,
+            "vimgrep": opts.vimgrep,
         },
         "id": 1,
     });

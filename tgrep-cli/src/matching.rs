@@ -137,6 +137,25 @@ fn limit_to_line_blocks(
     kept
 }
 
+/// Trim each span to the end of the line it starts on.
+///
+/// `--vimgrep` reports one row per match, so a multiline match has to stay on a
+/// single line. ripgrep keeps the line the match *starts* on, which is the
+/// position an editor should jump to.
+fn clip_spans_to_start_line(
+    content: &str,
+    index: &LineIndex,
+    spans: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    spans
+        .iter()
+        .map(|&(s, e)| {
+            let line_end = index.line_end(content, index.line_of(s));
+            (s, e.min(line_end))
+        })
+        .collect()
+}
+
 /// Clip absolute match ranges onto the lines they cover.
 ///
 /// Under `--multiline` a single match can cover several lines, and every line
@@ -454,6 +473,10 @@ pub struct MatchOptions {
     /// `--stop-on-nonmatch`: stop at the first non-matching line that follows
     /// a matching one.
     pub stop_on_nonmatch: bool,
+    /// `--vimgrep`: report one row per match. Under `--multiline` this collapses
+    /// a match spanning several lines onto the line it starts on, as ripgrep
+    /// does, so editors get one jump target per match.
+    pub vimgrep: bool,
 }
 
 /// One unit of output produced by searching a single file.
@@ -726,6 +749,16 @@ fn collect_hits(
         // that doesn't actually match the pattern, with its spans clipped.
         let spans = matcher.find_spans(content)?;
         let spans = limit_to_line_blocks(index, &spans, max);
+        if opts.vimgrep {
+            // `--vimgrep` wants one jump target per match, so a match that runs
+            // past the end of its line is reported only on the line it starts
+            // on rather than once per line it touches.
+            return Ok(group_spans_by_line(
+                content,
+                index,
+                &clip_spans_to_start_line(content, index, &spans),
+            ));
+        }
         return Ok(group_spans_by_line(content, index, &spans));
     }
 

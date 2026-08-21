@@ -1795,3 +1795,89 @@ fn multiline_max_count_counts_lines_for_dash_c() {
         "-c counts the one matching line, not its 3 matches"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 19. `--vimgrep` under `--multiline` reports one row per match
+//
+// Verified against rg 15.2.0. `--vimgrep` gives editors one jump target per
+// match, so a match that runs across a line boundary is reported only on the
+// line it starts on rather than once per line it covers:
+//
+//   $ printf 'a foo\nbar foo\nbaz foo\nqux foo\n' > ml.txt
+//   $ rg -U --vimgrep '(?s)foo.*?foo' ml.txt
+//   ml.txt:1:3:a foo
+//   ml.txt:3:5:baz foo
+//
+// Without `--vimgrep`, `-U` still prints every line a match covers.
+//
+// Known divergence: rg's `-U --vimgrep -o` and `-U --column` report columns
+// that don't exist on the line they name (e.g. column 19 of a 7-character
+// line). tgrep reports the real match position instead of reproducing that.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multiline_vimgrep_reports_a_spanning_match_once() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-U",
+        "--vimgrep",
+        "(?s)foo.*?foo",
+        "ml.txt",
+    ]));
+    assert_eq!(
+        out, "ml.txt:1:3:a foo\nml.txt:3:5:baz foo\n",
+        "one row per match, at the line and column the match starts on"
+    );
+}
+
+#[test]
+fn multiline_without_vimgrep_still_prints_every_line_of_a_match() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-U",
+        "(?s)foo.*?foo",
+        "ml.txt",
+    ]));
+    assert_eq!(
+        out, "a foo\nbar foo\nbaz foo\nqux foo\n",
+        "collapsing to the start line is a --vimgrep rule, not a --multiline one"
+    );
+}
+
+#[test]
+fn multiline_vimgrep_still_reports_every_match_on_one_line() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-U",
+        "--vimgrep",
+        "foo",
+        "m.txt",
+    ]));
+    assert_eq!(
+        out,
+        "m.txt:1:1:foo foo foo\nm.txt:1:5:foo foo foo\nm.txt:1:9:foo foo foo\n\
+         m.txt:2:1:foo bar\nm.txt:3:1:foo baz\n",
+        "matches that fit on one line are unaffected by the collapse"
+    );
+}
+
+#[test]
+fn multiline_vimgrep_honours_max_count_over_line_blocks() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-U",
+        "-m",
+        "1",
+        "--vimgrep",
+        "(?s)foo.*?foo",
+        "ml.txt",
+    ]));
+    assert_eq!(
+        out, "ml.txt:1:3:a foo\n",
+        "the one counted match collapses to a single row"
+    );
+}

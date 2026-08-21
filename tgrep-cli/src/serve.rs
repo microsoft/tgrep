@@ -242,6 +242,9 @@ struct SearchOpts {
     replace: Option<String>,
     /// `--stop-on-nonmatch`: stop searching a file at its first non-match.
     stop_on_nonmatch: bool,
+    /// `--vimgrep`: collapse a multiline match onto the line it starts on so
+    /// the client emits one row per match.
+    vimgrep: bool,
 }
 
 impl SearchOpts {
@@ -261,6 +264,7 @@ impl SearchOpts {
             passthru: self.passthru,
             replace: self.replace.clone(),
             stop_on_nonmatch: self.stop_on_nonmatch,
+            vimgrep: self.vimgrep,
         }
     }
 }
@@ -712,6 +716,10 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .get("stop_on_nonmatch")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let vimgrep = params
+        .get("vimgrep")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let encoding = tgrep_core::encoding::parse_encoding(
         params
             .get("encoding")
@@ -775,6 +783,7 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             passthru,
             replace,
             stop_on_nonmatch,
+            vimgrep,
         },
     })
 }

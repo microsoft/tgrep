@@ -348,7 +348,10 @@ impl OutputWriter {
         let Some(file) = self.current_file.take() else {
             return Ok(());
         };
-        if self.file_stats.matches > 0 {
+        // Keyed off emitted match events rather than `matches`, which counts
+        // submatch spans and is legitimately 0 for an inverted match that did
+        // produce output.
+        if self.file_stats.matched_lines > 0 {
             self.file_stats.searches_with_match = 1;
         }
         let binary_offset = match self.current_binary_offset.take() {
@@ -569,7 +572,10 @@ impl OutputWriter {
                     })
                     .collect();
                 self.file_stats.matched_lines += 1;
-                self.file_stats.matches += submatches.len().max(1) as u64;
+                // Count submatch spans, not lines. An inverted match emits a
+                // line with no spans, and ripgrep counts those as zero matches
+                // while still reporting a non-zero `matched_lines`.
+                self.file_stats.matches += submatches.len() as u64;
                 let msg = serde_json::json!({
                     "type": "match",
                     "data": {

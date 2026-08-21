@@ -1486,6 +1486,44 @@ fn json_bytes_searched_stops_at_the_binary_offset_without_a_match() {
     );
 }
 
+/// An inverted search reports the lines it printed, but no match spans: those
+/// lines are the ones the pattern did *not* hit, so there is nothing to count.
+/// ripgrep 15.2.0 on this fixture: matches 0, matched_lines 2, and the search
+/// still counts as one that produced output.
+#[test]
+fn json_stats_for_an_inverted_search_count_lines_not_matches() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("a.txt"),
+        "alpha\nbeta\ngamma\nalpha again alpha\n",
+    )
+    .unwrap();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "-v",
+        "alpha",
+        "a.txt",
+    ]));
+    let summary = json_events(&out)
+        .into_iter()
+        .find(|e| e["type"] == "summary")
+        .unwrap_or_else(|| panic!("expected a summary: {out}"));
+    let stats = &summary["data"]["stats"];
+    assert_eq!(
+        stats["matches"], 0,
+        "an inverted search has no match spans to count: {out}"
+    );
+    assert_eq!(
+        stats["matched_lines"], 2,
+        "beta and gamma are the lines that did not match: {out}"
+    );
+    assert_eq!(
+        stats["searches_with_match"], 1,
+        "the file still produced output, so it counts as a search with a match: {out}"
+    );
+}
+
 #[test]
 fn json_hides_a_binary_file_reached_by_traversal() {
     let dir = binary_json_fixture();

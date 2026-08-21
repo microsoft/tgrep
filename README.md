@@ -17,24 +17,24 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
-See [full benchmark results](BENCHMARKS.md) — up to **55x faster** than ripgrep on large repos.
+See [full benchmark results](BENCHMARKS.md) — up to **58x faster** than ripgrep on large repos.
 
 ### Benchmark highlights (avg latency per query, index pre-built)
 
 | Repo | Files | Platform | ripgrep | tgrep | Speedup |
 | --- | ---: | --- | ---: | ---: | ---: |
-| gecko-dev | 388K | macOS arm64 | 31,468ms | 576ms | **54.7x** |
-| gecko-dev | 388K | Windows | 15,875ms | 343ms | **46x** |
-| gecko-dev | 388K | Linux | 1,761ms | 192ms | **9.2x** |
-| chromium | 504K | macOS arm64 | 37,901ms | 1,937ms | **19.6x** |
-| chromium | 504K | Windows | 25,500ms | 1,776ms | **14.4x** |
-| chromium | 504K | Linux | 2,369ms | 711ms | **3.3x** |
-| go | 16K | Windows | 649ms | 95ms | **6.8x** |
-| rust | 62K | Windows | 1,535ms | 247ms | **6.2x** |
-| kubernetes | 31K | Windows | 1,074ms | 223ms | **4.8x** |
-| linux | 96K | macOS arm64 | 4,901ms | 179ms | **27.3x** |
-| linux | 96K | Windows | 3,249ms | 123ms | **26.4x** |
-| linux | 96K | Linux | 415ms | 73ms | **5.7x** |
+| gecko-dev | 388K | macOS arm64 | 31,364ms | 544ms | **58x** |
+| gecko-dev | 388K | Windows | 17,447ms | 376ms | **46x** |
+| gecko-dev | 388K | Linux | 1,760ms | 207ms | **8.5x** |
+| chromium | 504K | macOS arm64 | 45,728ms | 2,226ms | **21x** |
+| chromium | 504K | Windows | 25,262ms | 1,690ms | **15x** |
+| chromium | 504K | Linux | 2,377ms | 762ms | **3.1x** |
+| go | 16K | Windows | 480ms | 93ms | **5.2x** |
+| rust | 62K | Windows | 1,897ms | 229ms | **8.3x** |
+| kubernetes | 31K | Windows | 1,378ms | 202ms | **6.8x** |
+| linux | 96K | macOS arm64 | 3,804ms | 154ms | **25x** |
+| linux | 96K | Windows | 2,599ms | 132ms | **20x** |
+| linux | 96K | Linux | 328ms | 64ms | **5.2x** |
 
 tgrep is faster in all 18 measured cells. The margin depends on repo size and on how
 many matches a query returns — a search that returns tens of thousands of matches

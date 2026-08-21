@@ -236,6 +236,10 @@ pub struct OutputWriter {
     /// Track the last line we printed for context-gap detection.
     last_printed_line: Option<(String, usize)>,
     started: Instant,
+    /// Start of the file currently open in JSON mode. ripgrep's per-file `end`
+    /// stats report time spent on that file, so this is reset per file and
+    /// `started` is left to the final `summary`.
+    file_started: Instant,
     /// Stats for the file currently open in JSON mode.
     file_stats: Stats,
     total_stats: Stats,
@@ -275,6 +279,7 @@ impl OutputWriter {
             use_heading,
             last_printed_line: None,
             started: Instant::now(),
+            file_started: Instant::now(),
             file_stats: Stats::default(),
             total_stats: Stats::default(),
             pending_bytes_searched: 0,
@@ -334,6 +339,7 @@ impl OutputWriter {
         self.file_stats.bytes_printed += line.len() as u64;
         self.stdout.write_all(line.as_bytes())?;
         self.current_file = Some(file.to_string());
+        self.file_started = Instant::now();
         self.last_printed_line = None;
         Ok(())
     }
@@ -354,7 +360,7 @@ impl OutputWriter {
             "data": {
                 "path": { "text": self.display_path(&file) },
                 "binary_offset": binary_offset,
-                "stats": self.file_stats.to_json(self.started.elapsed()),
+                "stats": self.file_stats.to_json(self.file_started.elapsed()),
             },
         });
         let line = format!("{msg}\n");

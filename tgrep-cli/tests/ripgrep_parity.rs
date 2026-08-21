@@ -1929,3 +1929,90 @@ fn indexed_search_finds_matches_in_repaired_invalid_utf8() {
         "the repaired file has to be found: {indexed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Missing paths
+//
+// ripgrep asks the OS for the failure text rather than describing it itself:
+//
+//   rg: nope.txt: IO error for operation on nope.txt: \
+//       The system cannot find the file specified. (os error 2)
+//   rg: nodir/nope.txt: IO error for operation on nodir/nope.txt: \
+//       The system cannot find the path specified. (os error 3)
+//
+// The two differ on Windows (a missing file is error 2, a missing directory
+// component is error 3) and both differ again on Unix, so the message cannot
+// be a constant.
+// ---------------------------------------------------------------------------
+
+fn assert_reports_os_error(relative: &str) {
+    let dir = fixture();
+    let missing = dir.path().join(relative);
+    let expected = fs::metadata(&missing).expect_err("fixture path must be absent");
+
+    let stderr = stderr_of(tgrep().current_dir(dir.path()).args(["needle", relative]));
+
+    assert!(
+        stderr.contains(&expected.to_string()),
+        "expected the OS message {:?} for {relative}, got {stderr:?}",
+        expected.to_string()
+    );
+    assert!(
+        stderr.contains(&format!("IO error for operation on {relative}")),
+        "expected ripgrep's wording for {relative}, got {stderr:?}"
+    );
+}
+
+#[test]
+fn missing_file_reports_the_error_the_os_gives_for_a_missing_file() {
+    assert_reports_os_error("nope.txt");
+}
+
+#[test]
+fn missing_directory_reports_the_error_the_os_gives_for_a_missing_directory() {
+    assert_reports_os_error("nodir/nope.txt");
+}
+
+// ---------------------------------------------------------------------------
+// Per-file JSON stats
+//
+// `stats.elapsed` on a JSON `end` message is the time spent on *that* file, so
+// the values fluctuate between files. Reading them off the writer's overall
+// start instead makes them cumulative, which is both wrong per file and, once
+// there are a few files, larger in total than the whole search took.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn per_file_json_elapsed_is_scoped_to_that_file() {
+    let dir = TempDir::new().unwrap();
+    for i in 0..8 {
+        fs::write(dir.path().join(format!("f{i}.txt")), "needle\n").unwrap();
+    }
+
+    let stdout = stdout_of(tgrep().current_dir(dir.path()).args(["--json", "needle"]));
+
+    let mut per_file = Vec::new();
+    let mut total = None;
+    for line in stdout.lines() {
+        let msg: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match msg["type"].as_str() {
+            Some("end") => {
+                per_file.push(msg["data"]["stats"]["elapsed"]["nanos"].as_u64().unwrap())
+            }
+            Some("summary") => total = msg["data"]["elapsed_total"]["nanos"].as_u64(),
+            _ => {}
+        }
+    }
+
+    assert_eq!(per_file.len(), 8, "every file should report stats");
+    let total = total.expect("summary must carry the total");
+    let sum: u64 = per_file.iter().sum();
+    assert!(
+        sum <= total,
+        "per-file elapsed must partition the search, not repeat it: \
+         sum {sum} > total {total} (values {per_file:?})"
+    );
+}

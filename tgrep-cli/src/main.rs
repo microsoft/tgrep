@@ -1123,10 +1123,16 @@ fn list_files(paths: &[String], opts: &search::SearchOptions) -> anyhow::Result<
 fn report_missing_path(path: &std::path::Path, no_messages: bool) {
     ERRORED.store(true, std::sync::atomic::Ordering::SeqCst);
     if !no_messages {
-        eprintln!(
-            "tgrep: {}: The system cannot find the path specified. (os error 3)",
-            path.display()
-        );
+        // Ask the OS for the message instead of hard-coding one: the text and
+        // the errno differ per platform, and on Windows even between a missing
+        // file (error 2) and a missing directory component (error 3).
+        let reason = match std::fs::metadata(path) {
+            Err(err) => err.to_string(),
+            // The path appeared between the existence check and this call.
+            Ok(_) => std::io::Error::from(std::io::ErrorKind::NotFound).to_string(),
+        };
+        let path = path.display();
+        eprintln!("tgrep: {path}: IO error for operation on {path}: {reason}");
     }
 }
 

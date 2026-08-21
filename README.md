@@ -17,21 +17,28 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
-See [full benchmark results](BENCHMARKS.md) — up to **72x faster** than ripgrep on large repos.
+See [full benchmark results](BENCHMARKS.md) — up to **55x faster** than ripgrep on large repos.
 
 ### Benchmark highlights (avg latency per query, index pre-built)
 
 | Repo | Files | Platform | ripgrep | tgrep | Speedup |
 | --- | ---: | --- | ---: | ---: | ---: |
-| chromium | 496K | macOS arm64 | 61,110ms | 2,630ms | **23x** |
-| chromium | 496K | Windows | 29,557ms | 2,491ms | **12x** |
-| gecko-dev | 388K | macOS arm64 | 35,413ms | 492ms | **72x** |
-| gecko-dev | 388K | Windows | 16,199ms | 310ms | **52x** |
-| gecko-dev | 388K | Linux | 1,931ms | 170ms | **11x** |
-| linux | 94K | Windows | 4,317ms | 934ms | **5x** |
-| rust | 59K | Windows | 1,989ms | 215ms | **9x** |
-| kubernetes | 30K | Windows | 1,489ms | 178ms | **8x** |
-| go | 15K | Windows | 450ms | 70ms | **6x** |
+| gecko-dev | 388K | macOS arm64 | 31,468ms | 576ms | **54.7x** |
+| gecko-dev | 388K | Windows | 15,875ms | 343ms | **46x** |
+| gecko-dev | 388K | Linux | 1,761ms | 192ms | **9.2x** |
+| chromium | 504K | macOS arm64 | 37,901ms | 1,937ms | **19.6x** |
+| chromium | 504K | Windows | 25,500ms | 1,776ms | **14.4x** |
+| chromium | 504K | Linux | 2,369ms | 711ms | **3.3x** |
+| go | 16K | Windows | 649ms | 95ms | **6.8x** |
+| rust | 62K | Windows | 1,535ms | 247ms | **6.2x** |
+| kubernetes | 31K | Windows | 1,074ms | 223ms | **4.8x** |
+| linux | 96K | Windows | 4,036ms | 1,054ms | **3.8x** |
+| linux | 96K | Linux | 445ms | 590ms | *0.75x* |
+
+The last row is the one measured case where ripgrep wins: on Linux, the kernel's
+high-frequency queries return tens of thousands of matches each, and tgrep's per-match
+delivery cost outweighs what the index saves on file selection. See
+[Where tgrep loses](BENCHMARKS.md#where-tgrep-loses).
 
 ## Architecture
 

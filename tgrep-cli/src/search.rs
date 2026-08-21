@@ -20,6 +20,7 @@ use crate::output::{ColorMode, ContextLine, Match, OutputConfig, OutputFormat, O
 use crate::serve::ServerInfo;
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Default))]
 pub struct SearchOptions {
     pub pattern: String,
     pub extra_patterns: Vec<String>,
@@ -239,6 +240,7 @@ impl SearchOptions {
             || self.count_matches    // counts matches, not matching lines
             || self.only_matching    // prints the spans themselves
             || self.replace.is_some() // rewrites the matched text
+            || self.stats // reports a match total, not a line total
     }
 
     /// Whether the reply has to carry per-row `offset` and `term`.
@@ -869,11 +871,12 @@ fn search_via_server(
     if opts.stats
         && let Some(elapsed) = result.get("elapsed_ms").and_then(|e| e.as_f64())
     {
-        let num = result
-            .get("num_matches")
-            .and_then(|n| n.as_u64())
-            .unwrap_or(0);
-        eprintln!("{num} matches in {elapsed:.1}ms (via server)");
+        // Count the rows that survived scoping, not the server's `num_matches`.
+        // The server searches the whole indexed tree and counts every row it
+        // built, so that field includes files outside a subdirectory argument
+        // and counts context lines as matches.
+        let (num, lines) = count_reported_matches(matches);
+        eprintln!("{num} matches ({lines} matched lines) in {elapsed:.1}ms (via server)");
     }
 
     writer.flush()?;
@@ -1495,6 +1498,48 @@ pub fn build_type_filter(
     defs.build_filter(types, types_not)
 }
 
+/// Match and matched-line totals for `--stats`, counted from the rows the
+/// client is actually going to print.
+///
+/// ripgrep reports these two numbers separately and neither of them counts
+/// context lines, so `-C 2` must not change either total. `-o` makes the server
+/// emit one row per match, so matches are summed from each row's spans while
+/// matched lines are de-duplicated by file and line.
+///
+/// An inverted row (`-v`) carries an empty span list: ripgrep reports those as
+/// matched lines but as zero matches, because no part of the line matched.
+/// `--stats` implies `wants_match_detail`, so the spans are always present here
+/// and an absent list means the row genuinely had none.
+fn count_reported_matches(rows: &[serde_json::Value]) -> (u64, u64) {
+    let mut matches = 0u64;
+    let mut lines: std::collections::HashSet<(&str, u64)> = std::collections::HashSet::new();
+    let mut binary_lines = 0u64;
+
+    for row in rows {
+        let file = row.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        match row.get("type").and_then(|t| t.as_str()).unwrap_or("match") {
+            // A binary file is summarised as one row carrying its own count
+            // rather than one row per match, which is what `-c` reports for it.
+            "binary" => {
+                let n = row.get("lines").and_then(|l| l.as_u64()).unwrap_or(0);
+                matches += n;
+                binary_lines += n;
+            }
+            "match" => {
+                matches += row
+                    .get("spans")
+                    .and_then(|s| s.as_array())
+                    .map_or(0, |s| s.len() as u64);
+                lines.insert((file, row.get("line").and_then(|l| l.as_u64()).unwrap_or(0)));
+            }
+            // "context" and anything else is not a match.
+            _ => {}
+        }
+    }
+
+    (matches, lines.len() as u64 + binary_lines)
+}
+
 fn plan_summary(plan: &QueryPlan) -> String {
     match plan {
         QueryPlan::And(queries) => format!("AND({} trigrams)", queries.len()),
@@ -1509,6 +1554,101 @@ fn plan_summary(plan: &QueryPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- `--stats` counting -------------------------------------------------
+    //
+    // These pin the reply-row semantics that `--stats` reports over the server.
+    // The server counts every row it built across the whole indexed tree, so
+    // reporting its `num_matches` made `--stats` disagree with both the printed
+    // output and ripgrep. Verified against ripgrep 15.2.0.
+
+    fn row(kind: &str, file: &str, line: u64, spans: usize) -> serde_json::Value {
+        serde_json::json!({
+            "type": kind,
+            "file": file,
+            "line": line,
+            "spans": (0..spans).map(|i| serde_json::json!([i, i + 1])).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn stats_counts_one_match_per_span() {
+        // `rg --stats` on a line with 3 hits: "3 matches / 1 matched lines".
+        let rows = vec![row("match", "a.rs", 1, 3)];
+        assert_eq!(count_reported_matches(&rows), (3, 1));
+    }
+
+    #[test]
+    fn stats_ignores_context_rows() {
+        // `-C 2` must not change either total; counting raw rows made a
+        // 90-match search report 445.
+        let rows = vec![
+            row("context", "a.rs", 1, 0),
+            row("match", "a.rs", 2, 1),
+            row("context", "a.rs", 3, 0),
+        ];
+        assert_eq!(count_reported_matches(&rows), (1, 1));
+    }
+
+    #[test]
+    fn stats_deduplicates_lines_across_rows() {
+        // `-o` emits one row per match, so the same line arrives twice; ripgrep
+        // still reports it as a single matched line.
+        let rows = vec![row("match", "a.rs", 7, 1), row("match", "a.rs", 7, 1)];
+        assert_eq!(count_reported_matches(&rows), (2, 1));
+    }
+
+    #[test]
+    fn stats_keeps_same_line_number_in_different_files_apart() {
+        let rows = vec![row("match", "a.rs", 4, 1), row("match", "b.rs", 4, 1)];
+        assert_eq!(count_reported_matches(&rows), (2, 2));
+    }
+
+    #[test]
+    fn stats_reports_no_matches_for_inverted_rows() {
+        // `rg -v --stats` reports "0 matches" with a non-zero matched-line
+        // count, because no part of an inverted line matched.
+        let rows = vec![row("match", "a.rs", 1, 0), row("match", "a.rs", 2, 0)];
+        assert_eq!(count_reported_matches(&rows), (0, 2));
+    }
+
+    #[test]
+    fn stats_uses_the_line_count_a_binary_row_carries() {
+        // A binary file is summarised as one row rather than one row per match.
+        let rows = vec![serde_json::json!({
+            "type": "binary", "file": "a.bin", "lines": 5,
+        })];
+        assert_eq!(count_reported_matches(&rows), (5, 5));
+    }
+
+    #[test]
+    fn stats_on_no_rows_is_zero() {
+        assert_eq!(count_reported_matches(&[]), (0, 0));
+    }
+
+    #[test]
+    fn stats_treats_a_row_without_spans_as_no_matches() {
+        // `--stats` implies `wants_match_detail`, so a missing span list means
+        // the row genuinely had none rather than that detail was suppressed.
+        let rows = vec![serde_json::json!({
+            "type": "match", "file": "a.rs", "line": 1,
+        })];
+        assert_eq!(count_reported_matches(&rows), (0, 1));
+    }
+
+    #[test]
+    fn stats_requests_match_detail_so_spans_are_available_to_count() {
+        let mut opts = SearchOptions {
+            stats: true,
+            ..Default::default()
+        };
+        assert!(
+            opts.wants_match_detail(),
+            "--stats must request spans, or the match total silently reads 0"
+        );
+        opts.stats = false;
+        assert!(!opts.wants_match_detail());
+    }
 
     #[test]
     fn display_path_strips_extended_length_prefix() {

@@ -46,7 +46,9 @@ const MATCH_COLOR: &str = "\x1b[1;31m";
 const COLOR_RESET: &str = "\x1b[0m";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Default))]
 pub enum ColorMode {
+    #[cfg_attr(test, default)]
     Auto,
     Always,
     Never,

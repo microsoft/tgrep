@@ -1013,6 +1013,10 @@ fn handle_search(
 
     let result = serde_json::json!({
         "matches": matches,
+        // The number of rows in `matches`, which is not a ripgrep-style match
+        // count: it spans the whole indexed tree (the client applies any
+        // subdirectory argument to the reply) and includes context rows. A
+        // client reporting `--stats` has to count the rows it actually prints.
         "num_matches": matches.len(),
         "elapsed_ms": elapsed_ms,
     });

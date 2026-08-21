@@ -115,6 +115,30 @@ Indexed in 22.6s using external strategy (peak memory 160.1 MiB)
 The peak is the operating system's own high-water mark for the process, so it
 reflects the true maximum rather than a sampled snapshot.
 
+#### Repositories without a `.git` directory
+
+`.gitignore` files only take effect inside a git repository. This matches
+ripgrep, which gates them the same way, but it surprises people indexing a
+Perforce, Source Depot, or plain-directory enlistment: the root `.gitignore` is
+read by nothing, and the only symptom is an index far larger than expected.
+
+tgrep says so rather than leaving you to guess:
+
+```
+Walking /src/enlistment...
+warning: /src/enlistment has a .gitignore but is not a git repository, so it is
+not applied (this matches ripgrep). Pass --no-require-git to apply it.
+Found 289320 text files (2893 binary skipped, 698 too large, 0 errors)
+```
+
+`--no-require-git` applies the rules anyway, and works on `index`, `serve`, and
+search alike, so the index and your queries agree on which files exist:
+
+```bash
+tgrep index . --no-require-git
+tgrep serve --no-require-git
+```
+
 #### Memory use on very large repos
 
 Builds default to `--index-strategy=external`, which bounds peak memory with an

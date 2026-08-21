@@ -139,6 +139,22 @@ tgrep index . --no-require-git
 tgrep serve --no-require-git
 ```
 
+#### Keep `index` and `serve` flags in step
+
+Flags that decide *which files belong in the index* — `--no-require-git`,
+`--no-ignore`, `--max-filesize`, `--exclude` — must match between the `tgrep
+index` that built an index and the `tgrep serve` that serves it.
+
+The server compares the index against the filesystem at startup and treats an
+indexed file it cannot see as deleted. So serving an index built with
+`--max-filesize 10M` under the 1 MB default drops every file above 1 MB from
+that index, permanently. Pass the same flags to both:
+
+```bash
+tgrep index . --max-filesize 10M
+tgrep serve   --max-filesize 10M
+```
+
 #### Memory use on very large repos
 
 Builds default to `--index-strategy=external`, which bounds peak memory with an

@@ -169,6 +169,10 @@ struct ServerState {
     /// startup metadata walk and the watcher's rescan, or those disagree about
     /// which files belong in the index.
     no_require_git: bool,
+    /// Size cap for indexable files, shared by the index build and the startup
+    /// metadata walk. They must agree: a file the index holds but the metadata
+    /// walk skips looks *deleted* to the stale check and is evicted.
+    max_file_size: Option<u64>,
     /// On-disk index directory used by live ignore-rule reconciliation.
     index_dir: PathBuf,
     /// Serializes on-disk index publication across all publishers
@@ -296,6 +300,9 @@ pub struct ServeOptions<'a> {
     pub no_ignore: bool,
     /// `--no-require-git`: respect `.gitignore` outside a git repository.
     pub no_require_git: bool,
+    /// `--max-filesize`: skip files larger than this when building and when
+    /// checking for stale files. `None` means no limit.
+    pub max_file_size: Option<u64>,
     pub auto_save_mutations: Option<u32>,
     /// Bound on the watcher's hand-off queue. `None` uses [`WATCHER_QUEUE_CAP`].
     pub watcher_queue_cap: Option<usize>,
@@ -309,6 +316,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         index_threads,
         no_ignore,
         no_require_git,
+        max_file_size,
         auto_save_mutations,
         watcher_queue_cap,
     } = options;
@@ -384,6 +392,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         exclude_dirs: exclude_dirs.to_vec(),
         no_ignore,
         no_require_git,
+        max_file_size,
         index_dir: index_dir.clone(),
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
@@ -1220,6 +1229,7 @@ fn handle_reload(id: Option<serde_json::Value>, state: &ServerState) -> String {
         &builder::BuildOptions {
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
             exclude_dirs: state.exclude_dirs.clone(),
             ..Default::default()
         },
@@ -1844,6 +1854,7 @@ fn background_refresh_stale(
             exclude_dirs: state.exclude_dirs.clone(),
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
         },
     );
     let walk_ms = start.elapsed().as_millis();
@@ -2008,6 +2019,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             include_hidden: false,
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
             exclude_dirs: state.exclude_dirs.clone(),
             // Match the walk `background_index_build` would have run, and the
             // dot-prefix rule `should_skip_watcher_path` applies, so the
@@ -2016,7 +2028,6 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             collect_gitignore_files: true,
             strategy: builder::IndexStrategy::External,
             buffer_bytes: builder::DEFAULT_INDEX_BUFFER_BYTES,
-            ..Default::default()
         },
     ) {
         Ok(outcome) => outcome,
@@ -2156,6 +2167,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             include_hidden: false,
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
             collect_gitignore_files: state.watch_enabled && !state.no_ignore,
             exclude_dirs: state.exclude_dirs.clone(),
             ..Default::default()
@@ -2339,6 +2351,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             exclude_dirs: state.exclude_dirs.clone(),
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
         },
     );
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta

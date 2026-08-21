@@ -347,7 +347,7 @@ pub struct MetaWalkResult {
 /// A struct rather than positional `bool`s: the metadata walk needs both
 /// `no_ignore` and `no_require_git`, and two adjacent bare booleans at a call
 /// site are trivially transposed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MetaWalkOptions {
     /// Directory names to prune from the walk.
     pub exclude_dirs: Vec<String>,
@@ -359,6 +359,28 @@ pub struct MetaWalkOptions {
     /// stale-file detection compares a file set built under one rule against an
     /// index built under the other, and every extra file looks new.
     pub no_require_git: bool,
+    /// Skip files larger than this. `None` means no limit.
+    ///
+    /// Must track [`WalkOptions::max_file_size`] for the same reason as
+    /// `no_require_git`. A file the index holds but this walk skips is absent
+    /// from [`MetaWalkResult::files`], which the stale check reads as *deleted*
+    /// — so a lower limit here silently evicts oversized files from an index
+    /// that was built with a higher one.
+    pub max_file_size: Option<u64>,
+}
+
+impl Default for MetaWalkOptions {
+    /// Hand-written rather than derived: `#[derive(Default)]` would make
+    /// `max_file_size` `None`, which means *no limit* and so would quietly
+    /// invert the default rather than matching [`WalkOptions::default`].
+    fn default() -> Self {
+        Self {
+            exclude_dirs: Vec::new(),
+            no_ignore: false,
+            no_require_git: false,
+            max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
+        }
+    }
 }
 
 /// Walk a directory tree collecting filesystem metadata (mtime, size) plus the
@@ -371,6 +393,7 @@ pub struct MetaWalkOptions {
 /// ignore files that their own rules would have filtered out of the walk.
 pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult {
     let no_ignore = opts.no_ignore;
+    let max_file_size = opts.max_file_size;
     let results = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
@@ -448,7 +471,7 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
             };
 
             if let Ok(meta) = entry.metadata() {
-                if meta.len() > DEFAULT_MAX_FILE_SIZE {
+                if max_file_size.is_some_and(|limit| meta.len() > limit) {
                     return ignore::WalkState::Continue;
                 }
                 let mtime = meta
@@ -984,5 +1007,55 @@ mod tests {
         .map(|f| f.relative_path)
         .collect();
         assert_eq!(lifted, vec!["src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn metadata_walk_honours_a_raised_max_file_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("small.txt"), "small").unwrap();
+        std::fs::write(root.join("big.txt"), vec![b'x'; 2 * 1024 * 1024]).unwrap();
+
+        let names = |opts: &MetaWalkOptions| {
+            let mut v: Vec<String> = walk_file_metadata(root, opts)
+                .files
+                .into_iter()
+                .map(|f| f.relative_path)
+                .collect();
+            v.sort();
+            v
+        };
+
+        // Default cap is 1 MiB, so the 2 MiB file is skipped.
+        assert_eq!(names(&MetaWalkOptions::default()), vec!["small.txt"]);
+
+        // Raising the cap must reveal it. If it does not, the stale check reads
+        // the file as deleted and evicts it from an index built with this cap.
+        assert_eq!(
+            names(&MetaWalkOptions {
+                max_file_size: Some(10 * 1024 * 1024),
+                ..Default::default()
+            }),
+            vec!["big.txt", "small.txt"]
+        );
+
+        // `None` means no limit, matching `WalkOptions`.
+        assert_eq!(
+            names(&MetaWalkOptions {
+                max_file_size: None,
+                ..Default::default()
+            }),
+            vec!["big.txt", "small.txt"]
+        );
+    }
+
+    #[test]
+    fn meta_walk_options_default_matches_the_indexing_walk() {
+        // A derived `Default` would give `None` here, which means *no limit* —
+        // the opposite of the indexing walk's default.
+        assert_eq!(
+            MetaWalkOptions::default().max_file_size,
+            WalkOptions::default().max_file_size
+        );
     }
 }

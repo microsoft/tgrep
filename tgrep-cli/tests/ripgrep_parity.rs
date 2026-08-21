@@ -1881,3 +1881,51 @@ fn multiline_vimgrep_honours_max_count_over_line_blocks() {
         "the one counted match collapses to a single row"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 20. The index holds the same repaired text a search reads
+//
+// Searches decode invalid UTF-8 lossily, so every bad sequence becomes U+FFFD.
+// U+FFFD is three bytes, which makes it indexable, so a pattern containing one
+// produces a real trigram plan. If the index were built from the un-repaired
+// bytes that plan would select no candidates and the indexed search would
+// silently report fewer matches than the brute-force path — the one failure
+// mode a search tool must never have.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn indexed_search_finds_matches_in_repaired_invalid_utf8() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("bad.txt"), b"bad: \xff\xff\xff end\n").unwrap();
+    fs::write(
+        dir.path().join("good.txt"),
+        "plain \u{FFFD}\u{FFFD}\u{FFFD} text\n".as_bytes(),
+    )
+    .unwrap();
+
+    let built = tgrep()
+        .current_dir(dir.path())
+        .args(["index", "."])
+        .output()
+        .expect("build index");
+    assert!(built.status.success(), "index build failed");
+
+    let pattern = "\u{FFFD}\u{FFFD}\u{FFFD}";
+    let indexed = sorted_lines(&stdout_of(
+        tgrep().current_dir(dir.path()).args([pattern, "."]),
+    ));
+    let brute = sorted_lines(&stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        pattern,
+        ".",
+    ])));
+
+    assert_eq!(
+        indexed, brute,
+        "the indexed path must not miss what brute force finds"
+    );
+    assert!(
+        indexed.iter().any(|l| l.contains("bad.txt")),
+        "the repaired file has to be found: {indexed:?}"
+    );
+}

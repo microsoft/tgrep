@@ -152,8 +152,32 @@ const REPLACEMENT_LEN: usize = '\u{FFFD}'.len_utf8();
 ///
 /// Indexes are always built in [`EncodingMode::Auto`]; see
 /// [`EncodingMode::may_differ_from_index`].
+///
+/// Invalid UTF-8 is repaired here for the same reason searches repair it: a
+/// search reads text where every invalid sequence has become `U+FFFD`, so the
+/// index has to hold those same bytes. Otherwise a pattern containing `U+FFFD`
+/// — which is three bytes, and so perfectly indexable — would find no candidate
+/// postings for the file and the indexed search would silently miss a match the
+/// brute-force path reports.
 pub fn decode_for_index(bytes: &[u8]) -> Cow<'_, [u8]> {
-    decode_bytes(bytes, EncodingMode::Auto)
+    match decode_bytes(bytes, EncodingMode::Auto) {
+        // Transcoded output is already valid UTF-8.
+        owned @ Cow::Owned(_) => owned,
+        Cow::Borrowed(body) => {
+            if std::str::from_utf8(body).is_ok() {
+                return Cow::Borrowed(body);
+            }
+            // A file that will be rejected as binary is not worth repairing,
+            // and repairing it first could push a NUL past the window
+            // `is_binary` looks at, changing how it is classified.
+            if crate::trigram::is_binary(body) {
+                return Cow::Borrowed(body);
+            }
+            // `lossy_utf8` is what the search path uses, so this produces the
+            // exact bytes a later search will match against.
+            Cow::Owned(lossy_utf8(body).0.into_bytes())
+        }
+    }
 }
 
 fn transcode(enc: &'static Encoding, bytes: &[u8]) -> String {
@@ -332,5 +356,42 @@ mod tests {
         assert!(!EncodingMode::Auto.may_differ_from_index());
         assert!(EncodingMode::None.may_differ_from_index());
         assert!(parse_encoding("utf-16le").unwrap().may_differ_from_index());
+    }
+
+    #[test]
+    fn index_sees_the_same_repaired_bytes_a_search_does() {
+        // The trigrams of an invalid sequence have to be the U+FFFD ones, or a
+        // pattern containing U+FFFD selects no candidates and the indexed
+        // search misses a file the brute-force path reports.
+        let raw = b"bad: \xff\xff\xff end\n";
+        let indexed = decode_for_index(raw);
+        let searched = decode(raw, EncodingMode::Auto);
+        assert_eq!(
+            indexed.as_ref(),
+            searched.as_bytes(),
+            "index and search must agree byte for byte"
+        );
+        assert!(
+            indexed.windows(3).any(|w| w == "\u{FFFD}".as_bytes()),
+            "the replacement character has to be indexable"
+        );
+    }
+
+    #[test]
+    fn valid_utf8_is_still_borrowed_for_the_index() {
+        let raw = b"plain ascii text\n";
+        assert!(
+            matches!(decode_for_index(raw), Cow::Borrowed(_)),
+            "the common case must not allocate"
+        );
+    }
+
+    #[test]
+    fn binary_files_are_left_alone_for_the_index() {
+        // Repairing first could shift a NUL past the window `is_binary` reads,
+        // so a file that is about to be discarded is returned untouched.
+        let raw = b"\x00\xff\xff binary\n";
+        assert!(matches!(decode_for_index(raw), Cow::Borrowed(_)));
+        assert!(crate::trigram::is_binary(&decode_for_index(raw)));
     }
 }

@@ -231,6 +231,9 @@ struct SearchOpts {
     multiline: bool,
     /// `-a/--text`: search binary files instead of reporting a note.
     text: bool,
+    /// Send the matching lines of a binary file along with the marker, for
+    /// clients whose output format reports them (currently `--json`).
+    binary_lines: bool,
     /// `--max-filesize`: skip candidates larger than this.
     max_filesize: Option<u64>,
     /// `--passthru`: emit every line, matching or not.
@@ -664,6 +667,12 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .get("text")
         .and_then(|t| t.as_bool())
         .unwrap_or(false);
+    // Clients rendering JSON want the matching lines of a binary file, not just
+    // the marker. Defaults to false so an older client keeps today's behaviour.
+    let binary_lines = params
+        .get("binary_lines")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
     let max_filesize = params.get("max_filesize").and_then(|m| m.as_u64());
     let line_regexp = params
         .get("line_regexp")
@@ -761,6 +770,7 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             after_context,
             multiline,
             text,
+            binary_lines,
             max_filesize,
             passthru,
             replace,
@@ -985,7 +995,7 @@ fn search_file_matches(
     matcher: &crate::matching::SearchMatcher,
     opts: &SearchOpts,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    use crate::matching::{Emit, FileMatches};
+    use crate::matching::FileMatches;
 
     let content = file.text.as_str();
     let fixups = &file.fixups;
@@ -1008,18 +1018,45 @@ fn search_file_matches(
     // same way the local path does. Emitted for `-l`/`-c` too so the client can
     // apply ripgrep's "implicit binary files are invisible" rule uniformly.
     if let Some(off) = binary_offset {
-        return Ok(vec![serde_json::json!({
+        let marker = serde_json::json!({
             "type": "binary",
             "file": rel_path,
             "offset": off,
             // `-c` still reports a real count for binary files, so carry it
             // here instead of streaming the file's raw contents back.
             "lines": found.matched_lines(),
-        })]);
+        });
+        // `--json` reports binary matches as ordinary match events carrying a
+        // `binary_offset`, so those clients ask for the lines as well.
+        if !opts.binary_lines {
+            return Ok(vec![marker]);
+        }
+        let mut results = vec![marker];
+        results.extend(collect_match_rows(
+            &found,
+            &match_opts,
+            matcher,
+            rel_path,
+            fixups,
+        )?);
+        return Ok(results);
     }
 
+    collect_match_rows(&found, &match_opts, matcher, rel_path, fixups)
+}
+
+/// Turn a file's matches into the protocol's `match`/`context` rows.
+fn collect_match_rows(
+    found: &crate::matching::FileMatches,
+    match_opts: &crate::matching::MatchOptions,
+    matcher: &crate::matching::SearchMatcher,
+    rel_path: &str,
+    fixups: &tgrep_core::encoding::LossyFixups,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    use crate::matching::Emit;
+
     let mut results = Vec::new();
-    found.for_each(&match_opts, matcher, |emit| -> anyhow::Result<()> {
+    found.for_each(match_opts, matcher, |emit| -> anyhow::Result<()> {
         match emit {
             Emit::Match {
                 line_number,

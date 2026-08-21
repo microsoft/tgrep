@@ -564,6 +564,11 @@ fn search_via_server(
             "multiline": opts.multiline,
             "multiline_dotall": opts.dotall(),
             "text": opts.text,
+            // JSON output reports binary matches the same way ripgrep does —
+            // the matching lines plus a `binary_offset` — so ask the server to
+            // send the lines alongside the marker. An older server ignores this
+            // and returns the marker alone.
+            "binary_lines": opts.json,
             "max_filesize": opts.max_filesize,
             "encoding": opts.encoding.label(),
             "line_regexp": opts.line_regexp,
@@ -609,12 +614,23 @@ fn search_via_server(
     // have to be applied to the reply.
     //
     // ripgrep only surfaces a binary file when the user named it explicitly, so
-    // `binary` rows for anything reached by traversal are dropped here.
+    // `binary` rows for anything reached by traversal are dropped here — along
+    // with the match rows a `--json` client asked to be sent with them, which
+    // would otherwise leak the file's raw contents.
     let drop_binary = !opts.binary
         && !matches!(scope, IndexScope::File(_))
         && matches
             .iter()
             .any(|m| m.get("type").and_then(|t| t.as_str()) == Some("binary"));
+    let dropped_binary_files: std::collections::HashSet<&str> = if drop_binary {
+        matches
+            .iter()
+            .filter(|m| m.get("type").and_then(|t| t.as_str()) == Some("binary"))
+            .filter_map(|m| m.get("file").and_then(|f| f.as_str()))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let scoped;
     let matches = if matches!(scope, IndexScope::Whole) && opts.max_depth.is_none() && !drop_binary
     {
@@ -623,10 +639,11 @@ fn search_via_server(
         scoped = matches
             .iter()
             .filter_map(|m| {
-                if drop_binary && m.get("type").and_then(|t| t.as_str()) == Some("binary") {
+                let file = m.get("file")?.as_str()?;
+                if dropped_binary_files.contains(file) {
                     return None;
                 }
-                let rel = scope.relativize(m.get("file")?.as_str()?, root)?;
+                let rel = scope.relativize(file, root)?;
                 within_max_depth(&rel, opts).then_some(())?;
                 let mut m = m.clone();
                 m["file"] = serde_json::Value::String(rel);
@@ -1293,7 +1310,9 @@ fn search_decoded_file(
         return Ok(FileOutcome::Skipped);
     }
 
-    writer.note_bytes_searched(content.len() as u64);
+    // ripgrep's searcher quits at the NUL byte, so it reports only the bytes it
+    // got through rather than the file's full length.
+    writer.note_bytes_searched(binary_offset.map_or(content.len(), |off| off) as u64);
 
     let match_opts = opts.match_options();
     let found = crate::matching::FileMatches::find(content, matcher, &match_opts)?;
@@ -1329,9 +1348,13 @@ fn search_decoded_file(
     }
 
     // Never dump raw binary to a terminal; ripgrep reports a note instead.
+    // JSON has no such note — the matches are emitted normally and the offset
+    // rides along on the `end` message — so only stop early for text output.
     if let Some(off) = binary_offset {
         writer.write_binary_note(rel_path, off)?;
-        return Ok(FileOutcome::Matched);
+        if !writer.is_json() {
+            return Ok(FileOutcome::Matched);
+        }
     }
 
     found.for_each(&match_opts, matcher, |emit| -> Result<()> {

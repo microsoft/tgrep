@@ -404,6 +404,11 @@ A file is binary if it contains a NUL byte. Following ripgrep:
 - `--binary` promotes traversal to the explicit behaviour, so binary files are
   searched and summarised with that note.
 - `-a`/`--text` disables binary detection entirely and prints matches as text.
+- `--json` has no note. As in ripgrep, the matching lines are emitted as
+  ordinary `match` events and the file's `end` message carries
+  `binary_offset` — the offset of the first NUL — so a consumer can still tell
+  a binary hit apart from a text one. `stats.bytes_searched` stops at that
+  offset rather than counting the whole file.
 
 tgrep additionally rejects ~65 binary file *extensions* during the walk to keep
 indexing cheap, which ripgrep does not do. `--binary` and `-a` also lift that

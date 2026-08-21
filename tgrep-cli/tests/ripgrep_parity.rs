@@ -1321,3 +1321,212 @@ fn a_large_but_representable_size_limit_is_accepted() {
     ]));
     assert_eq!(out, "needle at top\n", "a 1G limit is well within usize");
 }
+
+// ---------------------------------------------------------------------------
+// 16. Binary files in `--json` output
+//
+// The human-readable printer collapses a matching binary file into a
+// "binary file matches" note, but ripgrep's JSON printer has no such note: it
+// emits the matches as ordinary `match` events and records the offset of the
+// first NUL byte on the file's `end` message.
+//
+//   $ rg --json needle bin.dat        # "needle here\n\0\x01\ntail\n"
+//   {"type":"begin",...}
+//   {"type":"match",...,"line_number":1,...}
+//   {"type":"end","data":{...,"binary_offset":12,
+//                         "stats":{...,"bytes_searched":12,"matches":1}}}
+//
+// ripgrep also stops counting bytes at that offset rather than at the end of
+// the file, and still hides binary files that were only reached by traversal.
+// ---------------------------------------------------------------------------
+
+/// A directory holding one binary file (NUL after the matching line) and one
+/// ordinary text file, both matching `needle`.
+fn binary_json_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let mut bin = b"needle here\n".to_vec();
+    bin.extend_from_slice(&[0x00, 0x01]);
+    bin.extend_from_slice(b"\ntail\n");
+    fs::write(dir.path().join("bin.dat"), bin).unwrap();
+    fs::write(dir.path().join("plain.txt"), "needle in text\n").unwrap();
+    dir
+}
+
+fn json_events(out: &str) -> Vec<serde_json::Value> {
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect()
+}
+
+#[test]
+fn json_emits_match_events_for_an_explicit_binary_file() {
+    let dir = binary_json_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "needle",
+        "bin.dat",
+    ]));
+    let events = json_events(&out);
+    let matches: Vec<_> = events.iter().filter(|e| e["type"] == "match").collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "ripgrep reports binary matches in JSON rather than swallowing them: {out}"
+    );
+    assert_eq!(matches[0]["data"]["lines"]["text"], "needle here\n");
+    assert_eq!(matches[0]["data"]["line_number"], 1);
+}
+
+#[test]
+fn json_end_message_carries_the_binary_offset() {
+    let dir = binary_json_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "needle",
+        "bin.dat",
+    ]));
+    let events = json_events(&out);
+    let end = events
+        .iter()
+        .find(|e| e["type"] == "end")
+        .unwrap_or_else(|| panic!("expected an end message: {out}"));
+    // "needle here\n" is 12 bytes, so the first NUL sits at offset 12.
+    assert_eq!(
+        end["data"]["binary_offset"], 12,
+        "binary_offset is what tells a JSON consumer the hit was binary"
+    );
+    assert_eq!(
+        end["data"]["stats"]["matches"], 1,
+        "the match must be counted, not dropped"
+    );
+    assert_eq!(
+        end["data"]["stats"]["searches_with_match"], 1,
+        "a binary hit is still a file with a match"
+    );
+}
+
+#[test]
+fn json_binary_offset_is_null_for_a_text_file() {
+    let dir = binary_json_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "needle",
+        "plain.txt",
+    ]));
+    let events = json_events(&out);
+    let end = events.iter().find(|e| e["type"] == "end").unwrap();
+    assert!(
+        end["data"]["binary_offset"].is_null(),
+        "a text file must not claim a binary offset: {out}"
+    );
+}
+
+#[test]
+fn json_binary_offset_is_null_under_dash_a() {
+    let dir = binary_json_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "-a",
+        "needle",
+        "bin.dat",
+    ]));
+    let events = json_events(&out);
+    let end = events.iter().find(|e| e["type"] == "end").unwrap();
+    assert!(
+        end["data"]["binary_offset"].is_null(),
+        "-a searches the file as text, so there is no binary offset: {out}"
+    );
+    assert_eq!(
+        end["data"]["stats"]["bytes_searched"], 20,
+        "as text, the whole file is searched"
+    );
+}
+
+#[test]
+fn json_bytes_searched_stops_at_the_binary_offset() {
+    let dir = binary_json_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "needle",
+        "bin.dat",
+    ]));
+    let events = json_events(&out);
+    let end = events.iter().find(|e| e["type"] == "end").unwrap();
+    assert_eq!(
+        end["data"]["stats"]["bytes_searched"], 12,
+        "ripgrep quits at the NUL byte instead of reading the rest: {out}"
+    );
+}
+
+#[test]
+fn json_bytes_searched_stops_at_the_binary_offset_without_a_match() {
+    let dir = TempDir::new().unwrap();
+    let mut bin = b"nothing\n".to_vec();
+    bin.extend_from_slice(&[0x00]);
+    bin.extend_from_slice(b"here\n");
+    fs::write(dir.path().join("nomatch.dat"), bin).unwrap();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "needle",
+        "nomatch.dat",
+    ]));
+    let summary = json_events(&out)
+        .into_iter()
+        .find(|e| e["type"] == "summary")
+        .unwrap_or_else(|| panic!("expected a summary: {out}"));
+    assert_eq!(
+        summary["data"]["stats"]["bytes_searched"], 8,
+        "the byte count stops at the NUL even when nothing matched: {out}"
+    );
+}
+
+#[test]
+fn json_hides_a_binary_file_reached_by_traversal() {
+    let dir = binary_json_fixture();
+    let out =
+        stdout_of(
+            tgrep()
+                .current_dir(dir.path())
+                .args(["--no-index", "--json", "needle", "."]),
+        );
+    assert!(
+        !out.contains("bin.dat"),
+        "ripgrep only surfaces a binary file that was named explicitly: {out}"
+    );
+    assert!(
+        out.contains("plain.txt"),
+        "the text file must still be reported: {out}"
+    );
+}
+
+#[test]
+fn text_output_still_collapses_a_binary_file_to_a_note() {
+    let dir = binary_json_fixture();
+    let out = stdout_of(
+        tgrep()
+            .current_dir(dir.path())
+            .args(["--no-index", "needle", "bin.dat"]),
+    );
+    assert_eq!(
+        out, "binary file matches (found \"\\0\" byte around offset 12)\n",
+        "only JSON reports the lines; the human printer keeps the note"
+    );
+}
+
+#[test]
+fn count_of_a_binary_file_is_not_double_counted() {
+    let dir = binary_json_fixture();
+    let out =
+        stdout_of(
+            tgrep()
+                .current_dir(dir.path())
+                .args(["--no-index", "-c", "needle", "bin.dat"]),
+        );
+    assert_eq!(out, "1\n", "one matching line, counted once");
+}

@@ -227,6 +227,12 @@ pub struct OutputWriter {
     total_stats: Stats,
     /// Size of the file currently being searched, for per-file JSON stats.
     pending_bytes_searched: u64,
+    /// Offset of the first NUL byte in the file currently open in JSON mode.
+    ///
+    /// ripgrep reports this in the `end` message so consumers can tell a binary
+    /// hit apart from a plain text one; the human-readable printer says
+    /// "binary file matches" instead.
+    current_binary_offset: Option<u64>,
     all_bytes_searched: u64,
     all_searches: u64,
 }
@@ -258,12 +264,13 @@ impl OutputWriter {
             file_stats: Stats::default(),
             total_stats: Stats::default(),
             pending_bytes_searched: 0,
+            current_binary_offset: None,
             all_bytes_searched: 0,
             all_searches: 0,
         }
     }
 
-    fn is_json(&self) -> bool {
+    pub fn is_json(&self) -> bool {
         self.config.format == OutputFormat::Json
     }
 
@@ -278,9 +285,14 @@ impl OutputWriter {
     ///
     /// ripgrep prefixes the note with the file name the same way it prefixes a
     /// match line, and omits it entirely when file names are suppressed.
+    ///
+    /// In JSON mode there is no note: ripgrep emits the matches as usual and
+    /// records the offset on the `end` message instead, so record it here and
+    /// let the caller go on to print the matches.
     pub fn write_binary_note(&mut self, file: &str, offset: usize) -> io::Result<()> {
         if self.is_json() {
             self.ensure_json_begin(file)?;
+            self.current_binary_offset = Some(offset as u64);
             return Ok(());
         }
         let note = format!("binary file matches (found \"\\0\" byte around offset {offset})");
@@ -319,11 +331,15 @@ impl OutputWriter {
         if self.file_stats.matches > 0 {
             self.file_stats.searches_with_match = 1;
         }
+        let binary_offset = match self.current_binary_offset.take() {
+            Some(off) => serde_json::Value::from(off),
+            None => serde_json::Value::Null,
+        };
         let msg = serde_json::json!({
             "type": "end",
             "data": {
                 "path": { "text": self.display_path(&file) },
-                "binary_offset": serde_json::Value::Null,
+                "binary_offset": binary_offset,
                 "stats": self.file_stats.to_json(self.started.elapsed()),
             },
         });

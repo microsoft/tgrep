@@ -767,7 +767,11 @@ impl Cli {
         };
         let no_ignore = self.no_ignore || self.unrestricted >= 1;
         let hidden = self.hidden || self.unrestricted >= 2;
-        let text = self.text || self.unrestricted >= 3;
+        // ripgrep's third `-u` is `--binary`, not `-a/--text`: binary files
+        // become visible and are summarised with a note, rather than having
+        // their lines dumped as text.
+        let binary = self.binary || self.unrestricted >= 3;
+        let text = self.text;
 
         search::SearchOptions {
             pattern,
@@ -819,7 +823,7 @@ impl Cli {
                     || self.pretty
                     || crate::output::atty_check()),
             text,
-            binary: self.binary,
+            binary,
             // Replaced per path argument in `run_search`.
             path_display: crate::output::PathDisplay::Bare,
             max_filesize: resolved.max_filesize,

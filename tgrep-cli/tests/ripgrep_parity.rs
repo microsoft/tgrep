@@ -1530,3 +1530,114 @@ fn count_of_a_binary_file_is_not_double_counted() {
         );
     assert_eq!(out, "1\n", "one matching line, counted once");
 }
+
+// ---------------------------------------------------------------------------
+// 17. `-u/--unrestricted` levels
+//
+// ripgrep's manual defines the three levels as:
+//
+//   -u    == --no-ignore
+//   -uu   == --no-ignore --hidden
+//   -uuu  == --no-ignore --hidden --binary
+//
+// The third level is `--binary`, *not* `-a/--text`: a binary file becomes
+// visible and is summarised with a note, rather than having its lines printed.
+//
+//   $ rg -uuu needle .
+//   ./bin.dat: binary file matches (found "\0" byte around offset 11)
+// ---------------------------------------------------------------------------
+
+/// Four files, each reachable only at a different `-u` level.
+fn unrestricted_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+    fs::write(dir.path().join("plain.txt"), "needle plain\n").unwrap();
+    fs::write(dir.path().join("ignored.txt"), "needle ignored\n").unwrap();
+    fs::write(dir.path().join(".hidden.txt"), "needle hidden\n").unwrap();
+    let mut bin = b"needle bin\n".to_vec();
+    bin.extend_from_slice(&[0x00, 0x01]);
+    fs::write(dir.path().join("bin.dat"), bin).unwrap();
+    dir
+}
+
+fn sorted_lines(out: &str) -> Vec<String> {
+    let mut v: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn single_u_lifts_only_gitignore() {
+    let dir = unrestricted_fixture();
+    let out = stdout_of(
+        tgrep()
+            .current_dir(dir.path())
+            .args(["--no-index", "-u", "needle", "."]),
+    );
+    assert_eq!(
+        sorted_lines(&out),
+        vec![
+            format!(".{}ignored.txt:needle ignored", sep()),
+            format!(".{}plain.txt:needle plain", sep()),
+        ],
+        "-u is --no-ignore and nothing more"
+    );
+}
+
+#[test]
+fn double_u_adds_hidden_files() {
+    let dir = unrestricted_fixture();
+    let out = stdout_of(
+        tgrep()
+            .current_dir(dir.path())
+            .args(["--no-index", "-uu", "needle", "."]),
+    );
+    assert_eq!(
+        sorted_lines(&out),
+        vec![
+            format!(".{}.hidden.txt:needle hidden", sep()),
+            format!(".{}ignored.txt:needle ignored", sep()),
+            format!(".{}plain.txt:needle plain", sep()),
+        ],
+        "-uu adds --hidden"
+    );
+}
+
+#[test]
+fn triple_u_surfaces_binary_files_as_a_note() {
+    let dir = unrestricted_fixture();
+    let out =
+        stdout_of(
+            tgrep()
+                .current_dir(dir.path())
+                .args(["--no-index", "-uuu", "needle", "."]),
+        );
+    let bin_line = format!(
+        ".{}bin.dat: binary file matches (found \"\\0\" byte around offset 11)",
+        sep()
+    );
+    assert!(
+        out.lines().any(|l| l == bin_line),
+        "-uuu is --binary, so the file is summarised with a note: {out}"
+    );
+    assert!(
+        !out.contains("bin.dat:needle bin"),
+        "-uuu must not print binary lines as text; that is -a: {out}"
+    );
+}
+
+#[test]
+fn triple_u_still_needs_dash_a_to_print_binary_lines() {
+    let dir = unrestricted_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-uuu",
+        "-a",
+        "needle",
+        "bin.dat",
+    ]));
+    assert_eq!(
+        out, "needle bin\n",
+        "-a is what turns a binary file into text, even alongside -uuu"
+    );
+}

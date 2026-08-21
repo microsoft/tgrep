@@ -163,6 +163,16 @@ The server builds the index in the background if none exists, and serves
 queries immediately from partial data. Multiple clients can connect
 simultaneously.
 
+Resource use during that initial build can be tuned. These apply to both
+`tgrep serve` and `tgrep index`:
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--max-memory <MB>` | 50% of RAM (512 MB–16 GB) | Flush to disk once the in-memory index exceeds this, bounding peak memory |
+| `--max-cpu <PERCENT>` | `50` | Confine parallel reading and trigram extraction to this share of logical cores |
+| `--auto-save-mutations <N>` | `5000` | Accumulated index changes that trigger a background save; higher means fewer pauses but more to redo if killed |
+| `--watcher-queue-cap <N>` | `16384` | Filesystem events buffered between the OS watcher and the indexing worker; raise it if bulk changes log watcher queue overflows, since each overflow forces a full stale check |
+
 ### Search
 
 ```bash
@@ -278,7 +288,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `--no-ignore` | Don't respect `.gitignore` or `p4ignore.ini` files |
 | `-a, --text` | Search binary files as if they were text |
 | `--binary` | Search binary files, reporting a note instead of their contents |
-| `-u` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden, `-uuu` = +binary |
+| `-u, --unrestricted` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden, `-uuu` = +binary |
 | `--max-filesize <SIZE>` | Skip files larger than `SIZE` (`K`/`M`/`G` suffixes) |
 | `-L, --follow` | Follow symbolic links |
 | `--no-messages` | Suppress error messages about unreadable/missing paths |

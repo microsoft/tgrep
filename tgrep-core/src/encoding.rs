@@ -102,6 +102,37 @@ pub fn decode_with_fixups(bytes: &[u8], mode: EncodingMode) -> (String, LossyFix
     }
 }
 
+/// Decode owned `bytes`, reusing the buffer instead of copying it.
+///
+/// [`decode_with_fixups`] borrows its input, so it has to copy the whole file
+/// to produce a `String`. Searching reads entire files, which made that copy a
+/// second full-size allocation on top of the read. Taking ownership lets plain
+/// UTF-8 — very nearly every source file — be converted in place.
+pub fn decode_owned_with_fixups(bytes: Vec<u8>, mode: EncodingMode) -> (String, LossyFixups) {
+    if !borrows_whole_input(&bytes, mode) {
+        return decode_with_fixups(&bytes, mode);
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => (text, LossyFixups::default()),
+        Err(err) => lossy_utf8(err.as_bytes()),
+    }
+}
+
+/// Whether [`decode_bytes`] would hand back the entire input untouched.
+///
+/// That is the only case where the caller's buffer is exactly the bytes to be
+/// searched and can therefore be reused; a trimmed BOM or a transcode means the
+/// result is a different sequence of bytes.
+fn borrows_whole_input(bytes: &[u8], mode: EncodingMode) -> bool {
+    match mode {
+        EncodingMode::None => true,
+        EncodingMode::Auto => Encoding::for_bom(bytes).is_none(),
+        EncodingMode::Explicit(enc) => {
+            Encoding::for_bom(bytes).is_none() && enc == encoding_rs::UTF_8
+        }
+    }
+}
+
 /// Where lossy UTF-8 decoding replaced invalid bytes with `U+FFFD`.
 ///
 /// ripgrep reports columns and `--byte-offset` in terms of the bytes on disk.
@@ -393,5 +424,54 @@ mod tests {
         let raw = b"\x00\xff\xff binary\n";
         assert!(matches!(decode_for_index(raw), Cow::Borrowed(_)));
         assert!(crate::trigram::is_binary(&decode_for_index(raw)));
+    }
+
+    #[test]
+    fn decoding_owned_bytes_matches_decoding_borrowed_ones() {
+        // The owned path exists purely to skip a copy, so it has to be
+        // indistinguishable from the borrowed one on every input shape.
+        let utf16 = {
+            let mut v = vec![0xFF, 0xFE];
+            v.extend_from_slice(&[0x68, 0x00, 0x69, 0x00]);
+            v
+        };
+        let cases: Vec<Vec<u8>> = vec![
+            b"plain ascii\n".to_vec(),
+            b"caf\xc3\xa9 utf8\n".to_vec(),
+            b"broken \xff\xfe utf8\n".to_vec(),
+            b"\xef\xbb\xbfutf8 with bom\n".to_vec(),
+            utf16,
+            Vec::new(),
+        ];
+        for mode in [
+            EncodingMode::Auto,
+            EncodingMode::None,
+            EncodingMode::Explicit(encoding_rs::UTF_8),
+            EncodingMode::Explicit(encoding_rs::WINDOWS_1252),
+        ] {
+            for raw in &cases {
+                let (want, want_fixups) = decode_with_fixups(raw, mode);
+                let (got, got_fixups) = decode_owned_with_fixups(raw.clone(), mode);
+                assert_eq!(got, want, "text differs for {raw:?} in {mode:?}");
+                assert_eq!(
+                    got_fixups.is_empty(),
+                    want_fixups.is_empty(),
+                    "fixups differ for {raw:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_valid_utf8_reuses_the_buffer() {
+        let raw = b"plain ascii text\n".to_vec();
+        let ptr = raw.as_ptr();
+        let (text, fixups) = decode_owned_with_fixups(raw, EncodingMode::Auto);
+        assert!(fixups.is_empty());
+        assert_eq!(
+            text.as_ptr(),
+            ptr,
+            "the common case must convert in place, not copy"
+        );
     }
 }

@@ -121,8 +121,8 @@ struct DecodedFile {
 }
 
 impl DecodedFile {
-    fn new(bytes: &[u8], encoding: tgrep_core::encoding::EncodingMode) -> Self {
-        let (text, fixups) = tgrep_core::encoding::decode_with_fixups(bytes, encoding);
+    fn new(bytes: Vec<u8>, encoding: tgrep_core::encoding::EncodingMode) -> Self {
+        let (text, fixups) = tgrep_core::encoding::decode_owned_with_fixups(bytes, encoding);
         Self { text, fixups }
     }
 }
@@ -245,6 +245,15 @@ struct SearchOpts {
     /// `--vimgrep`: collapse a multiline match onto the line it starts on so
     /// the client emits one row per match.
     vimgrep: bool,
+    /// Whether the client will read per-match `spans` and `columns`.
+    ///
+    /// They dominate the size of a reply, so a client that only prints lines
+    /// asks for them to be left out.
+    detail: bool,
+    /// Whether the client will read per-row `offset` and `term`.
+    ///
+    /// Only `-b/--byte-offset` and `-M/--max-columns` look at them.
+    positions: bool,
 }
 
 impl SearchOpts {
@@ -265,6 +274,7 @@ impl SearchOpts {
             replace: self.replace.clone(),
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
+            all_spans: self.detail,
         }
     }
 }
@@ -720,6 +730,16 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .get("vimgrep")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // Older clients do not send this and do read the arrays, so absence has to
+    // mean "send them".
+    let detail = params
+        .get("detail")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let positions = params
+        .get("positions")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let encoding = tgrep_core::encoding::parse_encoding(
         params
             .get("encoding")
@@ -784,6 +804,8 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             replace,
             stop_on_nonmatch,
             vimgrep,
+            detail,
+            positions,
         },
     })
 }
@@ -890,7 +912,7 @@ fn handle_search(
                 let bytes = std::fs::read(full_path).ok()?;
                 Some((
                     rel_path.clone(),
-                    Arc::new(DecodedFile::new(&bytes, encoding)),
+                    Arc::new(DecodedFile::new(bytes, encoding)),
                 ))
             })
             .collect()
@@ -919,7 +941,7 @@ fn handle_search(
                 // UTF-16 and Latin-1 sources silently invisible over the server
                 // while the same query works with --no-index.
                 let bytes = std::fs::read(&full_path).ok()?;
-                let decoded = DecodedFile::new(&bytes, tgrep_core::encoding::EncodingMode::Auto);
+                let decoded = DecodedFile::new(bytes, tgrep_core::encoding::EncodingMode::Auto);
                 Some((rel_path, Arc::new(decoded)))
             })
             .collect();
@@ -1047,11 +1069,21 @@ fn search_file_matches(
             matcher,
             rel_path,
             fixups,
+            opts.detail,
+            opts.positions,
         )?);
         return Ok(results);
     }
 
-    collect_match_rows(&found, &match_opts, matcher, rel_path, fixups)
+    collect_match_rows(
+        &found,
+        &match_opts,
+        matcher,
+        rel_path,
+        fixups,
+        opts.detail,
+        opts.positions,
+    )
 }
 
 /// Turn a file's matches into the protocol's `match`/`context` rows.
@@ -1061,6 +1093,8 @@ fn collect_match_rows(
     matcher: &crate::matching::SearchMatcher,
     rel_path: &str,
     fixups: &tgrep_core::encoding::LossyFixups,
+    detail: bool,
+    positions: bool,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     use crate::matching::Emit;
 
@@ -1086,30 +1120,42 @@ fn collect_match_rows(
                     line_offset,
                     fixups,
                 );
-                results.push(serde_json::json!({
+                let mut entry = serde_json::json!({
                     "type": "match",
                     "file": rel_path,
                     "line": line_number,
                     "content": content,
-                    "spans": spans.iter().map(|&(s, e)| [s, e]).collect::<Vec<_>>(),
-                    "offset": offset,
-                    "columns": columns,
-                    "term": terminator_len,
-                }));
+                });
+                // The two arrays are what make a reply large; see `SearchOpts::detail`.
+                if detail {
+                    entry["spans"] =
+                        serde_json::json!(spans.iter().map(|&(s, e)| [s, e]).collect::<Vec<_>>());
+                    entry["columns"] = serde_json::json!(columns);
+                }
+                if positions {
+                    entry["offset"] = serde_json::json!(offset);
+                    entry["term"] = serde_json::json!(terminator_len);
+                }
+                results.push(entry);
             }
             Emit::Context {
                 line_number,
                 content,
                 absolute_offset,
                 terminator_len,
-            } => results.push(serde_json::json!({
-                "type": "context",
-                "file": rel_path,
-                "line": line_number,
-                "content": content,
-                "offset": fixups.to_source_offset(absolute_offset),
-                "term": terminator_len,
-            })),
+            } => {
+                let mut entry = serde_json::json!({
+                    "type": "context",
+                    "file": rel_path,
+                    "line": line_number,
+                    "content": content,
+                });
+                if positions {
+                    entry["offset"] = serde_json::json!(fixups.to_source_offset(absolute_offset));
+                    entry["term"] = serde_json::json!(terminator_len);
+                }
+                results.push(entry);
+            }
         }
         Ok(())
     })?;

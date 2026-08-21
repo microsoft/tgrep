@@ -53,6 +53,18 @@ pub enum ColorMode {
 }
 
 impl ColorMode {
+    /// Whether highlighting will actually be emitted.
+    ///
+    /// Mirrors the decision [`OutputWriter::new`] makes, so callers can tell
+    /// ahead of time whether match spans are going to be used for anything.
+    pub fn is_enabled(self) -> bool {
+        match self {
+            ColorMode::Auto => atty_check(),
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+        }
+    }
+
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s {
             "auto" => Some(Self::Auto),

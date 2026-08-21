@@ -256,6 +256,20 @@ impl SearchMatcher {
         Ok(spans)
     }
 
+    /// The first match range in `hay`, or none.
+    ///
+    /// The cheap counterpart to [`find_spans`](Self::find_spans) for callers
+    /// that only need to know whether the line matched and where it starts.
+    pub fn find_first_span(&self, hay: &str) -> Result<Option<(usize, usize)>> {
+        match self {
+            SearchMatcher::Standard(re) => Ok(re.find(hay).map(|m| (m.start(), m.end()))),
+            SearchMatcher::Fancy(re) => re
+                .find(hay)
+                .map(|m| m.map(|m| (m.start(), m.end())))
+                .map_err(|e| anyhow::anyhow!("regex match error: {e}")),
+        }
+    }
+
     /// Rewrite every match in `hay` using `replacement`, which may reference
     /// capture groups as `$1` or `${name}`.
     ///
@@ -477,6 +491,13 @@ pub struct MatchOptions {
     /// a match spanning several lines onto the line it starts on, as ripgrep
     /// does, so editors get one jump target per match.
     pub vimgrep: bool,
+    /// Whether every match on a line has to be located, or just the first.
+    ///
+    /// Only highlighting, `--vimgrep`, `--json`, `-o`, `-r` and
+    /// `--count-matches` care where the later matches on a line are; a plain
+    /// search only needs to know the line matched at all. Scanning the rest of
+    /// each matching line is pure overhead in that case, so this turns it off.
+    pub all_spans: bool,
 }
 
 /// One unit of output produced by searching a single file.
@@ -766,7 +787,14 @@ fn collect_hits(
     // per line, as ripgrep does.
     let mut out = Vec::new();
     for i in 0..index.line_count() {
-        let spans = matcher.find_spans(index.line_text(content, i))?;
+        let spans = if opts.all_spans {
+            matcher.find_spans(index.line_text(content, i))?
+        } else {
+            matcher
+                .find_first_span(index.line_text(content, i))?
+                .into_iter()
+                .collect()
+        };
         if !spans.is_empty() {
             out.push(LineHit { idx: i, spans });
             if max.is_some_and(|m| out.len() >= m) {

@@ -225,6 +225,29 @@ impl SearchOptions {
     }
 
     /// The matching-relevant subset, shared with the server path.
+    /// Whether the reply has to carry per-match spans and columns.
+    ///
+    /// Every consumer of that data is listed here; anything else prints the
+    /// line as the server rendered it, so the arrays would be built, sent,
+    /// parsed and dropped. The check is conservative — when in doubt the data
+    /// is requested, because missing spans degrade output silently.
+    fn wants_match_detail(&self) -> bool {
+        self.color.is_enabled()      // highlighting brackets each span
+            || self.json             // reports them as `submatches`
+            || self.vimgrep          // one row per column
+            || self.column           // leading column field
+            || self.count_matches    // counts matches, not matching lines
+            || self.only_matching    // prints the spans themselves
+            || self.replace.is_some() // rewrites the matched text
+    }
+
+    /// Whether the reply has to carry per-row `offset` and `term`.
+    ///
+    /// Only these two flags read them, and both default off.
+    fn wants_position_detail(&self) -> bool {
+        self.byte_offset || self.max_columns.is_some()
+    }
+
     fn match_options(&self) -> crate::matching::MatchOptions {
         crate::matching::MatchOptions {
             invert_match: self.invert_match,
@@ -251,6 +274,7 @@ impl SearchOptions {
             replace: self.replace.clone(),
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
+            all_spans: self.wants_match_detail(),
         }
     }
 
@@ -540,6 +564,13 @@ fn search_via_server(
     // stream rows the count path has to filter back out.
     let wants_context = !(opts.count || opts.count_matches || opts.files_only || opts.quiet);
 
+    // Spans and columns are the bulk of a reply — a nested array for every
+    // match — and most searches never read them. Asking for them only when
+    // something will consume them keeps a 21k-hit query from building, sending
+    // and parsing 21k arrays that are then dropped.
+    let detail = opts.wants_match_detail();
+    let positions = opts.wants_position_detail();
+
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "search",
@@ -581,6 +612,8 @@ fn search_via_server(
             "passthru": opts.match_options().passthru,
             "stop_on_nonmatch": opts.stop_on_nonmatch,
             "vimgrep": opts.vimgrep,
+            "detail": detail,
+            "positions": positions,
         },
         "id": 1,
     });
@@ -1207,7 +1240,9 @@ fn read_text_lossy(
     encoding: tgrep_core::encoding::EncodingMode,
 ) -> std::io::Result<(String, tgrep_core::encoding::LossyFixups)> {
     let bytes = std::fs::read(path)?;
-    Ok(tgrep_core::encoding::decode_with_fixups(&bytes, encoding))
+    Ok(tgrep_core::encoding::decode_owned_with_fixups(
+        bytes, encoding,
+    ))
 }
 
 /// Whether `--max-filesize` excludes this file.

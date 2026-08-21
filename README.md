@@ -403,6 +403,19 @@ tgrep matches ripgrep's context-dependent defaults rather than fixed ones:
   `tgrep needle src/` prints `src/main.rs` while `tgrep needle src` prints
   `src\main.rs` on Windows. `--path-separator` rewrites every separator.
 
+### Match limits
+
+`-m/--max-count` limits matching *lines*, as ripgrep does, not individual
+matches. A line holding several matches spends one unit of the budget and all
+of its matches are still reported, so `tgrep -m1 --vimgrep foo` prints one row
+per match on the first matching line. Under `-U/--multiline` the unit is the
+contiguous block of lines a match covers, which keeps a match that straddles a
+line boundary whole instead of truncating it mid-pattern.
+
+One divergence: ripgrep stops reading a file once the limit is reached, so its
+`--stats` `bytes_searched` is lower than tgrep's, which searches from a
+whole-file buffer. The match counts themselves agree.
+
 ### Binary files
 
 A file is binary if it contains a NUL byte. Following ripgrep:

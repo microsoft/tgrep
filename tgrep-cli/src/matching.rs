@@ -101,6 +101,42 @@ pub struct LineHit {
     pub spans: Vec<(usize, usize)>,
 }
 
+/// Keep only the spans falling in the first `max` contiguous blocks of lines.
+///
+/// A block is the run of lines covered by one or more matches that touch or
+/// overlap one another. This is the unit ripgrep's multiline searcher counts
+/// for `--max-count`, so several matches sharing a line spend one unit between
+/// them, and a match straddling two lines also spends just one.
+fn limit_to_line_blocks(
+    index: &LineIndex,
+    spans: &[(usize, usize)],
+    max: Option<usize>,
+) -> Vec<(usize, usize)> {
+    let Some(max) = max else {
+        return spans.to_vec();
+    };
+    let mut kept = Vec::with_capacity(spans.len().min(max));
+    let mut blocks = 0usize;
+    let mut block_end: Option<usize> = None;
+    for &(s, e) in spans {
+        let first = index.line_of(s);
+        // An empty match sits entirely on its start line.
+        let last = if e > s { index.line_of(e - 1) } else { first };
+        match block_end {
+            Some(end) if first <= end => block_end = Some(end.max(last)),
+            _ => {
+                if blocks == max {
+                    break;
+                }
+                blocks += 1;
+                block_end = Some(last);
+            }
+        }
+        kept.push((s, e));
+    }
+    kept
+}
+
 /// Clip absolute match ranges onto the lines they cover.
 ///
 /// Under `--multiline` a single match can cover several lines, and every line
@@ -183,24 +219,18 @@ impl SearchMatcher {
     }
 
     /// All non-overlapping match ranges in `hay`, as byte offsets.
-    pub fn find_spans(&self, hay: &str, limit: Option<usize>) -> Result<Vec<(usize, usize)>> {
+    pub fn find_spans(&self, hay: &str) -> Result<Vec<(usize, usize)>> {
         let mut spans: Vec<(usize, usize)> = Vec::new();
         match self {
             SearchMatcher::Standard(re) => {
                 for m in re.find_iter(hay) {
                     spans.push((m.start(), m.end()));
-                    if limit.is_some_and(|l| spans.len() >= l) {
-                        break;
-                    }
                 }
             }
             SearchMatcher::Fancy(re) => {
                 for m in re.find_iter(hay) {
                     let m = m.map_err(|e| anyhow::anyhow!("regex match error: {e}"))?;
                     spans.push((m.start(), m.end()));
-                    if limit.is_some_and(|l| spans.len() >= l) {
-                        break;
-                    }
                 }
             }
         }
@@ -684,11 +714,18 @@ fn collect_hits(
     if opts.multiline {
         // Match against the whole buffer so a single match can cross lines.
         //
-        // `--max-count` limits *matches*, not lines, so it is applied to the
-        // spans before they are exploded into lines. Truncating the grouped
-        // lines instead would print a partial match — output that doesn't
-        // actually match the pattern, with submatch spans clipped to match.
-        let spans = matcher.find_spans(content, max)?;
+        // ripgrep counts *matching lines* here rather than match spans: its
+        // multiline searcher reports one unit per contiguous block of lines
+        // that matches cover, and everything inside that block comes with it.
+        // So three matches on one line are a single unit under `-m 1` (all
+        // three are reported, which `--vimgrep` shows as three rows), and a
+        // match spanning two lines is also one unit (both lines print).
+        //
+        // Limiting the spans themselves would under-report the first case, and
+        // truncating the grouped lines would print a partial match — output
+        // that doesn't actually match the pattern, with its spans clipped.
+        let spans = matcher.find_spans(content)?;
+        let spans = limit_to_line_blocks(index, &spans, max);
         return Ok(group_spans_by_line(content, index, &spans));
     }
 
@@ -696,7 +733,7 @@ fn collect_hits(
     // per line, as ripgrep does.
     let mut out = Vec::new();
     for i in 0..index.line_count() {
-        let spans = matcher.find_spans(index.line_text(content, i), None)?;
+        let spans = matcher.find_spans(index.line_text(content, i))?;
         if !spans.is_empty() {
             out.push(LineHit { idx: i, spans });
             if max.is_some_and(|m| out.len() >= m) {
@@ -712,6 +749,47 @@ fn collect_hits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_blocks_merge_matches_that_share_a_line() {
+        let content = "foo foo foo\nfoo bar\n";
+        let index = LineIndex::new(content);
+        let spans = vec![(0, 3), (4, 7), (8, 11), (12, 15)];
+
+        // All three matches on line 0 are one unit, so `-m 1` keeps them all.
+        assert_eq!(
+            limit_to_line_blocks(&index, &spans, Some(1)),
+            vec![(0, 3), (4, 7), (8, 11)]
+        );
+        // Line 1 starts a second unit.
+        assert_eq!(limit_to_line_blocks(&index, &spans, Some(2)), spans);
+        assert_eq!(limit_to_line_blocks(&index, &spans, None), spans);
+        assert!(limit_to_line_blocks(&index, &spans, Some(0)).is_empty());
+    }
+
+    #[test]
+    fn line_blocks_keep_a_span_that_crosses_lines_whole() {
+        let content = "a foo\nbar foo\nbaz foo\n";
+        let index = LineIndex::new(content);
+        // One match covering lines 0-1, then one on line 2.
+        let spans = vec![(2, 13), (18, 21)];
+
+        assert_eq!(limit_to_line_blocks(&index, &spans, Some(1)), vec![(2, 13)]);
+        assert_eq!(limit_to_line_blocks(&index, &spans, Some(2)), spans);
+    }
+
+    #[test]
+    fn line_blocks_treat_an_empty_match_as_one_line() {
+        let content = "ab\ncd\n";
+        let index = LineIndex::new(content);
+        let spans = vec![(0, 0), (1, 1), (3, 3)];
+
+        assert_eq!(
+            limit_to_line_blocks(&index, &spans, Some(1)),
+            vec![(0, 0), (1, 1)],
+            "both empty matches sit on line 0"
+        );
+    }
 
     #[test]
     fn line_index_matches_str_lines() {

@@ -1641,3 +1641,157 @@ fn triple_u_still_needs_dash_a_to_print_binary_lines() {
         "-a is what turns a binary file into text, even alongside -uuu"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 18. `--max-count` counts matching *lines*, not matches
+//
+// Verified against rg 15.2.0. `-m` limits matching lines, so a line holding
+// several matches spends a single unit of the budget and every match on it is
+// still reported:
+//
+//   $ printf 'foo foo foo\nfoo bar\nfoo baz\n' > m.txt
+//   $ rg -m1 --vimgrep foo m.txt
+//   m.txt:1:1:foo foo foo
+//   m.txt:1:5:foo foo foo
+//   m.txt:1:9:foo foo foo
+//
+// Under `-U` the unit is the contiguous *block* of lines matches cover, which
+// keeps a match that straddles a line boundary whole:
+//
+//   $ printf 'a foo\nbar foo\nbaz foo\nqux foo\n' > ml.txt
+//   $ rg -U -m1 '(?s)foo.*?foo' ml.txt
+//   a foo
+//   bar foo
+//
+// Known divergence: rg stops reading a file once the limit is reached, so
+// `--stats` reports a smaller `bytes_searched` than tgrep, which searches from
+// a whole-file buffer. Match counts themselves agree.
+// ---------------------------------------------------------------------------
+
+/// Three matches on line 1, then one match on each of lines 2 and 3.
+fn max_count_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("m.txt"), "foo foo foo\nfoo bar\nfoo baz\n").unwrap();
+    fs::write(
+        dir.path().join("ml.txt"),
+        "a foo\nbar foo\nbaz foo\nqux foo\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn max_count_one_keeps_every_match_on_the_matching_line() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-m",
+        "1",
+        "--vimgrep",
+        "foo",
+        "m.txt",
+    ]));
+    assert_eq!(
+        out, "m.txt:1:1:foo foo foo\nm.txt:1:5:foo foo foo\nm.txt:1:9:foo foo foo\n",
+        "-m limits matching lines, so all three matches on line 1 are reported"
+    );
+}
+
+#[test]
+fn multiline_max_count_one_keeps_every_match_on_the_matching_line() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-U",
+        "-m",
+        "1",
+        "--vimgrep",
+        "foo",
+        "m.txt",
+    ]));
+    assert_eq!(
+        out, "m.txt:1:1:foo foo foo\nm.txt:1:5:foo foo foo\nm.txt:1:9:foo foo foo\n",
+        "-U must count lines too; limiting match spans would print only the first"
+    );
+}
+
+#[test]
+fn multiline_max_count_keeps_a_match_that_spans_lines_whole() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-U",
+        "-m",
+        "1",
+        "(?s)foo.*?foo",
+        "ml.txt",
+    ]));
+    assert_eq!(
+        out, "a foo\nbar foo\n",
+        "the single match covers both lines, so both print rather than a partial match"
+    );
+}
+
+#[test]
+fn multiline_max_count_two_takes_two_line_blocks() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-U",
+        "-m",
+        "2",
+        "(?s)foo.*?foo",
+        "ml.txt",
+    ]));
+    assert_eq!(
+        out, "a foo\nbar foo\nbaz foo\nqux foo\n",
+        "two matches of two lines each are two units of the budget"
+    );
+}
+
+#[test]
+fn multiline_max_count_counts_separate_lines_separately() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-U",
+        "-m",
+        "2",
+        "foo",
+        "ml.txt",
+    ]));
+    assert_eq!(
+        out, "a foo\nbar foo\n",
+        "one match per line means each line spends its own unit"
+    );
+}
+
+#[test]
+fn multiline_max_count_zero_reports_nothing() {
+    let dir = max_count_fixture();
+    let out = tgrep()
+        .current_dir(dir.path())
+        .args(["--no-index", "-U", "-m", "0", "foo", "ml.txt"])
+        .output()
+        .expect("run tgrep");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(out.status.code(), Some(1), "-m 0 finds nothing, so exit 1");
+}
+
+#[test]
+fn multiline_max_count_counts_lines_for_dash_c() {
+    let dir = max_count_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "-U",
+        "-m",
+        "1",
+        "-c",
+        "foo",
+        "m.txt",
+    ]));
+    assert_eq!(
+        out, "1\n",
+        "-c counts the one matching line, not its 3 matches"
+    );
+}

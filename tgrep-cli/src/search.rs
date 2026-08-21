@@ -1341,18 +1341,30 @@ fn search_decoded_file(
 ) -> Result<FileOutcome> {
     // ripgrep only surfaces a binary file when the user named it explicitly (or
     // passed `--binary`).
+    //
+    // The NUL is located in the repaired text but reported in terms of the file
+    // on disk, so it goes back through `fixups`: repairing invalid UTF-8 ahead
+    // of the NUL widens every bad byte to three, which would otherwise push the
+    // reported offset past where the byte actually is.
     let binary_offset = if opts.text {
         None
     } else {
-        content.as_bytes().iter().position(|&b| b == 0)
+        content
+            .as_bytes()
+            .iter()
+            .position(|&b| b == 0)
+            .map(|off| fixups.to_source_offset(off))
     };
     if binary_offset.is_some() && !explicit && !opts.binary {
         return Ok(FileOutcome::Skipped);
     }
 
     // ripgrep's searcher quits at the NUL byte, so it reports only the bytes it
-    // got through rather than the file's full length.
-    writer.note_bytes_searched(binary_offset.map_or(content.len(), |off| off) as u64);
+    // got through rather than the file's full length. Both are counted on disk,
+    // so the whole-file case needs the same mapping the offset just got.
+    writer.note_bytes_searched(
+        binary_offset.unwrap_or_else(|| fixups.to_source_offset(content.len())) as u64,
+    );
 
     let match_opts = opts.match_options();
     let found = crate::matching::FileMatches::find(content, matcher, &match_opts)?;

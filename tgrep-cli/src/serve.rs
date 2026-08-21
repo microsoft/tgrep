@@ -221,6 +221,10 @@ struct ServerState {
     auto_save_mutations: u32,
 }
 
+/// `Default` exists only for tests, which need to vary one field at a time.
+/// Production builds construct every field from the request so a new one can
+/// never be silently left at its zero value.
+#[cfg_attr(test, derive(Default))]
 struct SearchOpts {
     files_only: bool,
     invert_match: bool,
@@ -1038,10 +1042,19 @@ fn search_file_matches(
 
     // The client applies ripgrep's "only explicitly named binary files are
     // visible" rule, so the offset is reported here and filtered there.
+    //
+    // It is mapped back to the file's own bytes first: the NUL is found in the
+    // repaired text, where each byte of invalid UTF-8 ahead of it has grown to
+    // a three-byte U+FFFD. The client has no fixups for a server-side file, so
+    // this is the only place the mapping can happen.
     let binary_offset = if opts.text {
         None
     } else {
-        content.as_bytes().iter().position(|&b| b == 0)
+        content
+            .as_bytes()
+            .iter()
+            .position(|&b| b == 0)
+            .map(|off| fixups.to_source_offset(off))
     };
 
     let found = FileMatches::find(content, matcher, &match_opts)?;
@@ -2865,6 +2878,52 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A binary marker's offset is a position in the file, not in the repaired
+    /// text.
+    ///
+    /// Lossy decoding widens every invalid byte to a three-byte U+FFFD, so a
+    /// NUL preceded by invalid UTF-8 sits further along the searched text than
+    /// it does on disk. `rg 15.2.0` reports the on-disk byte (verified: this
+    /// fixture gives `found "\0" byte around offset 9`).
+    ///
+    /// The mapping has to happen here because the client never reads a file the
+    /// server searched, so it has no fixups of its own to map with.
+    #[test]
+    fn binary_marker_offset_is_mapped_back_to_the_source_bytes() {
+        let mut bytes = vec![0xFF, 0xFF];
+        bytes.extend_from_slice(b"needle\n");
+        bytes.push(0);
+        bytes.extend_from_slice(b"tail\n");
+        let nul_on_disk = bytes.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(nul_on_disk, 9, "fixture changed");
+
+        let file = DecodedFile::new(bytes, tgrep_core::encoding::EncodingMode::Auto);
+        assert_eq!(
+            file.text.as_bytes().iter().position(|&b| b == 0),
+            Some(13),
+            "the fixture must actually shift the offset, or this proves nothing"
+        );
+
+        let matcher = crate::matching::build_search_matcher(
+            &["needle".to_string()],
+            &crate::matching::MatcherConfig::default(),
+        )
+        .unwrap();
+
+        let rows = search_file_matches("f.txt", &file, &matcher, &SearchOpts::default()).unwrap();
+
+        let marker = rows
+            .iter()
+            .find(|r| r["type"] == "binary")
+            .expect("a file containing a NUL is reported as binary");
+        assert_eq!(
+            marker["offset"].as_u64(),
+            Some(nul_on_disk as u64),
+            "offset must be the byte on disk (9), not the decoded position \
+             (13): {marker}"
+        );
+    }
 
     /// `reset_to_empty_index` runs after a failed build, when the index
     /// directory is least likely to be intact, so it must not assume the

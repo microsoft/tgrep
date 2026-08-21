@@ -2016,3 +2016,94 @@ fn per_file_json_elapsed_is_scoped_to_that_file() {
          sum {sum} > total {total} (values {per_file:?})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 21. Binary offsets are positions in the file, not in the repaired text
+//
+// `rg` reports both `found "\0" byte around offset N` and `--json`'s
+// `binary_offset`/`bytes_searched` as byte positions in the file on disk.
+// tgrep searches text in which invalid UTF-8 has been repaired to U+FFFD,
+// which is three bytes wide however many bytes it replaced, so a NUL preceded
+// by invalid bytes sits further along the repaired text than it does in the
+// file.
+//
+// Verified against rg 15.2.0 on the fixtures below:
+//   `lossy_binary_file`  -> offset 9,     bytes_searched 9     (unmapped: 13)
+//   `lossy_binary_deep`  -> offset 10009, bytes_searched 10009 (unmapped: 10013)
+
+/// Two bytes of invalid UTF-8, a match, then a NUL at byte 9.
+///
+/// In the repaired text the NUL is at 13, because each `0xFF` widens to a
+/// three-byte U+FFFD.
+fn lossy_binary_file(dir: &TempDir) -> std::path::PathBuf {
+    let path = dir.path().join("lossy.txt");
+    let mut bytes = vec![0xFF, 0xFF];
+    bytes.extend_from_slice(b"needle\n");
+    bytes.push(0);
+    bytes.extend_from_slice(b"tail\n");
+    fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn binary_note_offset_is_the_byte_in_the_file() {
+    let dir = TempDir::new().unwrap();
+    let path = lossy_binary_file(&dir);
+
+    let out = stdout_of(tgrep().args(["needle", path.to_str().unwrap()]));
+
+    assert!(
+        out.contains("offset 9"),
+        "the NUL is at byte 9 on disk; 13 is where it sits after invalid UTF-8 \
+         was repaired: {out:?}"
+    );
+}
+
+#[test]
+fn json_binary_offset_and_bytes_searched_are_file_positions() {
+    let dir = TempDir::new().unwrap();
+    let path = lossy_binary_file(&dir);
+
+    let stdout = stdout_of(tgrep().args(["--json", "needle", path.to_str().unwrap()]));
+    let end = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|m| m["type"] == "end")
+        .expect("a binary file still reports an `end` message");
+
+    assert_eq!(
+        end["data"]["binary_offset"].as_u64(),
+        Some(9),
+        "binary_offset must be the byte on disk: {end}"
+    );
+    assert_eq!(
+        end["data"]["stats"]["bytes_searched"].as_u64(),
+        Some(9),
+        "ripgrep stops at the NUL and counts the bytes it read from the file, \
+         not from the repaired text: {end}"
+    );
+}
+
+#[test]
+fn json_bytes_searched_counts_the_file_when_there_is_no_nul() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("lossy_nonul.txt");
+    let mut bytes = vec![0xFF, 0xFF];
+    bytes.extend_from_slice(b"needle\ntail\n");
+    let on_disk = bytes.len() as u64;
+    fs::write(&path, bytes).unwrap();
+
+    let stdout = stdout_of(tgrep().args(["--json", "needle", path.to_str().unwrap()]));
+    let end = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|m| m["type"] == "end")
+        .expect("every searched file reports an `end` message");
+
+    assert_eq!(
+        end["data"]["stats"]["bytes_searched"].as_u64(),
+        Some(on_disk),
+        "a fully searched file reports its size on disk ({on_disk}), not the \
+         larger size it has once invalid UTF-8 is repaired: {end}"
+    );
+}

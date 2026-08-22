@@ -532,18 +532,20 @@ file selection.
 
 The kernel suite used to demonstrate this the hard way. Its queries were generic
 tokens — `read`, `write`, `^#define\s+[A-Z_]+` — that matched most of the tree:
-5,398,512 matches across 102 queries, with a single query returning 2,089,941. On
-that set tgrep took 60.2s on Linux against ripgrep's 45.4s, the only losing cell
-we ever measured. Index pruning was not the problem; measured directly on a local
-kernel checkout, the index still narrowed to **4–12% of the 95K files**.
+5,398,512 matches across 102 queries, with a single query returning 2,089,941.
+Kernel Linux is the only cell tgrep has ever lost, and on that query set it lost
+every run: 0.81x, 0.74x and 0.95x, the closest being 48.6s against ripgrep's
+46.4s. Index pruning was not the problem; measured directly on a local kernel
+checkout, the index still narrowed to **4–12% of the 95K files**.
 
 The suite now uses queries a kernel developer would actually run
 (`devm_platform_ioremap_resource`, `netif_napi_add`, `blk_mq_alloc_tag_set`):
-188,862 matches over the same 102 queries, none above 6,000. ripgrep's Linux total
-was unmoved by the change — across six runs spanning both query sets it has stayed
-between 28s and 46s, because it scans every file whichever pattern it gets — while
-tgrep's fell from 43–90s on the old set to 6.5–7.5s on the new one. That difference
-is the delivery cost, isolated.
+a different set of 102 queries returning 188,862 matches, none above 6,000.
+ripgrep's Linux total barely moved — 33–46s across the five most recent runs
+spanning both query sets, with a single 103s outlier in the earliest, because it
+scans every file whichever pattern it gets — while tgrep's fell from 49–128s on
+the old set to 6.5–7.5s on the new one. That difference is the delivery cost,
+isolated.
 
 A caution on reading the ratios: the ripgrep baselines themselves move between
 runner sessions, and macOS moves most. Three runs of the *identical* kernel suite

@@ -47,6 +47,14 @@ pub enum IndexStrategy {
 pub struct BuildOptions {
     pub include_hidden: bool,
     pub no_ignore: bool,
+    /// `--no-require-git`: respect `.gitignore` outside a git repository.
+    ///
+    /// The `ignore` crate gates gitignore rules on finding a `.git` directory,
+    /// matching ripgrep. Enlistments that are not git checkouts (Perforce and
+    /// Source Depot trees, exported source drops) therefore have their
+    /// `.gitignore` files silently ignored, and the index picks up build
+    /// output. This opts out of that gate.
+    pub no_require_git: bool,
     pub exclude_dirs: Vec<String>,
     /// Apply leading-dot ("hidden") filtering in the walk instead of the
     /// platform's native hidden check, and treat `.gitignore` files as
@@ -64,6 +72,12 @@ pub struct BuildOptions {
     /// Arena budget in bytes for [`IndexStrategy::External`]. Ignored by
     /// [`IndexStrategy::InMemory`].
     pub buffer_bytes: usize,
+    /// Skip files larger than this. `None` indexes files of any size.
+    ///
+    /// Indexing every byte of a huge repository is expensive, so the default
+    /// keeps a cap — but searching must be able to raise it, otherwise large
+    /// files are invisible to indexed queries.
+    pub max_file_size: Option<u64>,
 }
 
 impl Default for BuildOptions {
@@ -71,10 +85,12 @@ impl Default for BuildOptions {
         Self {
             include_hidden: false,
             no_ignore: false,
+            no_require_git: false,
             exclude_dirs: Vec::new(),
             collect_gitignore_files: false,
             strategy: IndexStrategy::default(),
             buffer_bytes: external::DEFAULT_BUFFER_BYTES,
+            max_file_size: Some(walker::DEFAULT_MAX_FILE_SIZE),
         }
     }
 }
@@ -158,6 +174,32 @@ pub fn build_index(
     .map(|_| ())
 }
 
+/// A warning to print when a `.gitignore` exists but the git gate silently
+/// disables it.
+///
+/// The `ignore` crate only applies `.gitignore` inside a git repository, which
+/// is exactly ripgrep's behaviour. On a non-git enlistment (Perforce, Source
+/// Depot, or a plain directory) that makes a repo-root `.gitignore` inert, and
+/// the only symptom is an index far larger than expected — with nothing in the
+/// log to explain why. Returns `None` when the rules are genuinely in effect,
+/// or when the user has already opted out of them.
+fn gitignore_gate_hint(root: &Path, opts: &BuildOptions) -> Option<String> {
+    if opts.no_ignore || opts.no_require_git {
+        return None;
+    }
+    if crate::gitignore::in_git_repo(root) {
+        return None;
+    }
+    if !root.join(".gitignore").is_file() {
+        return None;
+    }
+    Some(format!(
+        "warning: {} has a .gitignore but is not a git repository, so it is not \
+         applied (this matches ripgrep). Pass --no-require-git to apply it.",
+        root.display()
+    ))
+}
+
 /// Build a trigram index, choosing how postings are accumulated.
 pub fn build_index_with_options(
     root: &Path,
@@ -175,20 +217,26 @@ pub fn build_index_with_options(
     std::fs::create_dir_all(&index_dir)?;
 
     eprintln!("Walking {}...", root.display());
+    if let Some(hint) = gitignore_gate_hint(&root, opts) {
+        eprintln!("{hint}");
+    }
     let walk = walker::walk_dir(
         &root,
         &walker::WalkOptions {
             include_hidden,
             no_ignore,
+            no_require_git: opts.no_require_git,
             collect_gitignore_files: opts.collect_gitignore_files,
             exclude_dirs: exclude_dirs.to_vec(),
+            max_file_size: opts.max_file_size,
             ..Default::default()
         },
     );
     eprintln!(
-        "Found {} text files ({} binary skipped, {} errors)",
+        "Found {} text files ({} binary skipped, {} too large, {} errors)",
         walk.files.len(),
         walk.skipped_binary,
+        walk.skipped_too_large,
         walk.skipped_error
     );
     let gitignore_files = walk.gitignore_files;
@@ -216,7 +264,8 @@ pub fn build_index_with_options(
             .par_iter()
             .filter_map(|path| {
                 let data = std::fs::read(path).ok()?;
-                if trigram::is_binary(&data) {
+                let text = crate::encoding::decode_for_index(&data);
+                if trigram::is_binary(&text) {
                     binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return None;
                 }
@@ -225,7 +274,7 @@ pub fn build_index_with_options(
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                let per_tri = trigram::extract_merged_masks(&data);
+                let per_tri = trigram::extract_merged_masks(&text);
                 Some((rel, per_tri))
             })
             .collect();
@@ -1187,5 +1236,49 @@ mod tests {
         let mut paths: Vec<&str> = ids.iter().filter_map(|&id| merged.file_path(id)).collect();
         paths.sort_unstable();
         assert_eq!(paths, vec!["src/a.txt", "src/b.txt", "src/c.txt"]);
+    }
+
+    #[test]
+    fn gitignore_gate_hint_fires_only_when_rules_are_silently_inert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+
+        // Non-git enlistment with a .gitignore: the rules are silently dropped,
+        // which is the case that needs explaining.
+        let opts = BuildOptions::default();
+        assert!(gitignore_gate_hint(root, &opts).is_some());
+
+        // Already opted out either way, so nothing is a surprise.
+        assert!(
+            gitignore_gate_hint(
+                root,
+                &BuildOptions {
+                    no_require_git: true,
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            gitignore_gate_hint(
+                root,
+                &BuildOptions {
+                    no_ignore: true,
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+
+        // A real git repo applies the rules, so there is nothing to warn about.
+        std::fs::create_dir(root.join(".git")).unwrap();
+        assert!(gitignore_gate_hint(root, &opts).is_none());
+    }
+
+    #[test]
+    fn gitignore_gate_hint_is_silent_without_a_gitignore() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(gitignore_gate_hint(tmp.path(), &BuildOptions::default()).is_none());
     }
 }

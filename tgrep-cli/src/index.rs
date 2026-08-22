@@ -21,15 +21,35 @@ fn buffer_bytes_from_mb(mb: u64) -> Result<usize> {
         })
 }
 
-pub fn run(
-    root: &Path,
-    index_path: Option<&Path>,
-    include_hidden: bool,
-    no_ignore: bool,
-    exclude_dirs: &[String],
-    strategy: IndexStrategy,
-    index_buffer_mb: Option<u64>,
-) -> Result<()> {
+/// Everything `tgrep index` needs to build an index.
+///
+/// A struct rather than a long parameter list: the arguments are all plain
+/// scalars, so positional calls are easy to transpose without the compiler
+/// noticing.
+pub struct RunOptions<'a> {
+    pub root: &'a Path,
+    pub index_path: Option<&'a Path>,
+    pub include_hidden: bool,
+    pub no_ignore: bool,
+    pub no_require_git: bool,
+    pub exclude_dirs: &'a [String],
+    pub strategy: IndexStrategy,
+    pub index_buffer_mb: Option<u64>,
+    pub max_file_size: Option<u64>,
+}
+
+pub fn run(opts: RunOptions<'_>) -> Result<()> {
+    let RunOptions {
+        root,
+        index_path,
+        include_hidden,
+        no_ignore,
+        no_require_git,
+        exclude_dirs,
+        strategy,
+        index_buffer_mb,
+        max_file_size,
+    } = opts;
     let explicit_buffer = index_buffer_mb.is_some();
     let buffer_bytes = index_buffer_mb
         .map(buffer_bytes_from_mb)
@@ -52,9 +72,11 @@ pub fn run(
         &BuildOptions {
             include_hidden,
             no_ignore,
+            no_require_git,
             exclude_dirs: exclude_dirs.to_vec(),
             strategy,
             buffer_bytes,
+            max_file_size,
             ..Default::default()
         },
     )?;

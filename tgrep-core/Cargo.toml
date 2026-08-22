@@ -18,6 +18,8 @@ regex = "1"
 regex-syntax = "0.8"
 rayon = "1"
 ignore = "0.4"
+globset = "0.4.18"
+encoding_rs = "0.8"
 
 [dev-dependencies]
 criterion = "0.5"

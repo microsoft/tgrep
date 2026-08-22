@@ -7,29 +7,41 @@
 /// - If only exclusions exist, paths pass unless they match an exclusion
 /// - If inclusions exist, a path must match at least one inclusion AND
 ///   must not match any exclusion
+///
+/// Matching is case-sensitive by default, as in ripgrep. `--glob-case-insensitive`
+/// flips that for every `-g` pattern, and `--iglob` patterns are always
+/// case-insensitive regardless.
 use anyhow::Result;
 use globset::{GlobBuilder, GlobMatcher};
 
+#[derive(Default)]
 pub struct GlobFilter {
     includes: Vec<GlobMatcher>,
     excludes: Vec<GlobMatcher>,
 }
 
 impl GlobFilter {
-    /// Compile a list of glob patterns into a reusable filter.
+    /// Compile `-g/--glob` and `--iglob` patterns into a reusable filter.
+    ///
     /// Patterns prefixed with `!` become exclusions; others become inclusions.
-    /// Returns an error if any pattern fails to compile.
-    pub fn new(globs: &[String]) -> Result<Self> {
-        let mut includes = Vec::new();
-        let mut excludes = Vec::new();
+    /// `case_insensitive` applies to `globs` only — `iglobs` are always
+    /// case-insensitive. Returns an error if any pattern fails to compile.
+    pub fn new(globs: &[String], iglobs: &[String], case_insensitive: bool) -> Result<Self> {
+        let mut filter = GlobFilter::default();
+        filter.push_all(globs, case_insensitive)?;
+        filter.push_all(iglobs, true)?;
+        Ok(filter)
+    }
+
+    fn push_all(&mut self, globs: &[String], case_insensitive: bool) -> Result<()> {
         for g in globs {
             if let Some(neg) = g.strip_prefix('!') {
-                excludes.push(compile_glob(neg)?);
+                self.excludes.push(compile_glob(neg, case_insensitive)?);
             } else {
-                includes.push(compile_glob(g)?);
+                self.includes.push(compile_glob(g, case_insensitive)?);
             }
         }
-        Ok(GlobFilter { includes, excludes })
+        Ok(())
     }
 
     /// Returns true if the glob list is empty (no filtering needed).
@@ -63,7 +75,7 @@ impl GlobFilter {
 }
 
 /// Compile a single glob pattern into a `GlobMatcher`.
-fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
+fn compile_glob(pattern: &str, case_insensitive: bool) -> Result<GlobMatcher> {
     // Normalize backslashes so Windows-style globs work uniformly
     let pattern = pattern.replace('\\', "/");
     // Patterns without a path separator should match at any depth,
@@ -74,7 +86,7 @@ fn compile_glob(pattern: &str) -> Result<GlobMatcher> {
         pattern
     };
     let glob = GlobBuilder::new(&pattern)
-        .case_insensitive(true)
+        .case_insensitive(case_insensitive)
         .literal_separator(true)
         .build()?;
     Ok(glob.compile_matcher())
@@ -86,14 +98,14 @@ mod tests {
 
     #[test]
     fn empty_filter_passes_all() {
-        let f = GlobFilter::new(&[]).unwrap();
+        let f = GlobFilter::new(&[], &[], false).unwrap();
         assert!(f.matches("anything"));
         assert!(f.is_empty());
     }
 
     #[test]
     fn include_patterns() {
-        let f = GlobFilter::new(&["**/*.cs".to_string()]).unwrap();
+        let f = GlobFilter::new(&["**/*.cs".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
@@ -101,7 +113,7 @@ mod tests {
 
     #[test]
     fn exclude_patterns() {
-        let f = GlobFilter::new(&["!.git".to_string()]).unwrap();
+        let f = GlobFilter::new(&["!.git".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches(".git"));
         assert!(!f.matches("foo/.git"));
@@ -109,7 +121,12 @@ mod tests {
 
     #[test]
     fn include_and_exclude() {
-        let f = GlobFilter::new(&["**/*.cs".to_string(), "!**/test/**".to_string()]).unwrap();
+        let f = GlobFilter::new(
+            &["**/*.cs".to_string(), "!**/test/**".to_string()],
+            &[],
+            false,
+        )
+        .unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches("src/test/bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
@@ -117,28 +134,50 @@ mod tests {
 
     #[test]
     fn backslash_normalization() {
-        let f = GlobFilter::new(&[r"**\*.cs".to_string()]).unwrap();
+        let f = GlobFilter::new(&[r"**\*.cs".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
     }
 
     #[test]
-    fn case_insensitive() {
-        let f = GlobFilter::new(&["**/*.CS".to_string()]).unwrap();
+    fn globs_are_case_sensitive_by_default() {
+        // ripgrep matches `-g` patterns case-sensitively unless asked otherwise.
+        let f = GlobFilter::new(&["**/*.CS".to_string()], &[], false).unwrap();
+        assert!(!f.matches("src/foo/bar.cs"));
+        assert!(f.matches("src/foo/BAR.CS"));
+    }
+
+    #[test]
+    fn glob_case_insensitive_flag_applies_to_globs() {
+        let f = GlobFilter::new(&["**/*.CS".to_string()], &[], true).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("src/foo/BAR.CS"));
     }
 
     #[test]
+    fn iglob_patterns_are_always_case_insensitive() {
+        let f = GlobFilter::new(&[], &["**/*.CS".to_string()], false).unwrap();
+        assert!(f.matches("src/foo/bar.cs"));
+        assert!(f.matches("src/foo/BAR.CS"));
+    }
+
+    #[test]
+    fn iglob_negation_excludes_case_insensitively() {
+        let f = GlobFilter::new(&[], &["!**/*.CS".to_string()], false).unwrap();
+        assert!(!f.matches("src/foo/bar.cs"));
+        assert!(f.matches("src/foo/bar.rs"));
+    }
+
+    #[test]
     fn special_characters_are_literal() {
         // Characters like `+` and `(` should be treated as literal glob chars
-        let f = GlobFilter::new(&["**/(test)+.cs".to_string()]).unwrap();
+        let f = GlobFilter::new(&["**/(test)+.cs".to_string()], &[], false).unwrap();
         assert!(f.matches("src/(test)+.cs"));
         assert!(!f.matches("src/testtest.cs"));
     }
 
     #[test]
     fn glob_character_class() {
-        let f = GlobFilter::new(&["**/*.[ch]".to_string()]).unwrap();
+        let f = GlobFilter::new(&["**/*.[ch]".to_string()], &[], false).unwrap();
         assert!(f.matches("src/main.c"));
         assert!(f.matches("src/main.h"));
         assert!(!f.matches("src/main.rs"));
@@ -146,7 +185,7 @@ mod tests {
 
     #[test]
     fn question_mark_wildcard() {
-        let f = GlobFilter::new(&["**/*.?s".to_string()]).unwrap();
+        let f = GlobFilter::new(&["**/*.?s".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo.cs"));
         assert!(f.matches("src/foo.rs"));
         assert!(f.matches("src/foo.ts"));
@@ -155,7 +194,7 @@ mod tests {
 
     #[test]
     fn directory_prefix_pattern() {
-        let f = GlobFilter::new(&["src/**".to_string()]).unwrap();
+        let f = GlobFilter::new(&["src/**".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches("lib/foo/bar.cs"));
     }
@@ -163,7 +202,7 @@ mod tests {
     #[test]
     fn bare_extension_matches_at_any_depth() {
         // "*.cs" without path separator should match at any depth (like ripgrep --glob)
-        let f = GlobFilter::new(&["*.cs".to_string()]).unwrap();
+        let f = GlobFilter::new(&["*.cs".to_string()], &[], false).unwrap();
         assert!(f.matches("bar.cs"));
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));

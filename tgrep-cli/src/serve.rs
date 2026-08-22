@@ -112,9 +112,24 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
 /// for those flags so auto-save never observes both as false during handoff.
 /// Searches only acquire `index` (read) and `cache` (read then write);
 /// they never take `snapshot_gate` or `publish_lock`.
+/// A file's searchable text together with the map back to its on-disk byte
+/// offsets, so columns and `--byte-offset` mean the same thing over the server
+/// as they do locally even when lossy decoding widened invalid bytes.
+struct DecodedFile {
+    text: String,
+    fixups: tgrep_core::encoding::LossyFixups,
+}
+
+impl DecodedFile {
+    fn new(bytes: Vec<u8>, encoding: tgrep_core::encoding::EncodingMode) -> Self {
+        let (text, fixups) = tgrep_core::encoding::decode_owned_with_fixups(bytes, encoding);
+        Self { text, fixups }
+    }
+}
+
 struct ServerState {
     index: RwLock<HybridIndex>,
-    cache: RwLock<LruCache<String, Arc<String>>>,
+    cache: RwLock<LruCache<String, Arc<DecodedFile>>>,
     root: PathBuf,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
@@ -149,6 +164,15 @@ struct ServerState {
     exclude_dirs: Vec<String>,
     /// Disable all source-control ignore files for every server discovery path.
     no_ignore: bool,
+    /// Respect `.gitignore` outside a git repository, for every server
+    /// discovery path. Must be applied consistently to the index build, the
+    /// startup metadata walk and the watcher's rescan, or those disagree about
+    /// which files belong in the index.
+    no_require_git: bool,
+    /// Size cap for indexable files, shared by the index build and the startup
+    /// metadata walk. They must agree: a file the index holds but the metadata
+    /// walk skips looks *deleted* to the stale check and is evicted.
+    max_file_size: Option<u64>,
     /// On-disk index directory used by live ignore-rule reconciliation.
     index_dir: PathBuf,
     /// Serializes on-disk index publication across all publishers
@@ -206,6 +230,10 @@ struct ServerState {
     auto_save_mutations: u32,
 }
 
+/// `Default` exists only for tests, which need to vary one field at a time.
+/// Production builds construct every field from the request so a new one can
+/// never be silently left at its zero value.
+#[cfg_attr(test, derive(Default))]
 struct SearchOpts {
     files_only: bool,
     invert_match: bool,
@@ -213,6 +241,55 @@ struct SearchOpts {
     max_count: Option<usize>,
     before_context: usize,
     after_context: usize,
+    multiline: bool,
+    /// `-a/--text`: search binary files instead of reporting a note.
+    text: bool,
+    /// Send the matching lines of a binary file along with the marker, for
+    /// clients whose output format reports them (currently `--json`).
+    binary_lines: bool,
+    /// `--max-filesize`: skip candidates larger than this.
+    max_filesize: Option<u64>,
+    /// `--passthru`: emit every line, matching or not.
+    passthru: bool,
+    /// `-r/--replace`: template substituted for each match.
+    replace: Option<String>,
+    /// `--stop-on-nonmatch`: stop searching a file at its first non-match.
+    stop_on_nonmatch: bool,
+    /// `--vimgrep`: collapse a multiline match onto the line it starts on so
+    /// the client emits one row per match.
+    vimgrep: bool,
+    /// Whether the client will read per-match `spans` and `columns`.
+    ///
+    /// They dominate the size of a reply, so a client that only prints lines
+    /// asks for them to be left out.
+    detail: bool,
+    /// Whether the client will read per-row `offset` and `term`.
+    ///
+    /// Only `-b/--byte-offset` and `-M/--max-columns` look at them.
+    positions: bool,
+}
+
+impl SearchOpts {
+    /// The matching-relevant subset, shared with the local search path.
+    fn match_options(&self) -> crate::matching::MatchOptions {
+        crate::matching::MatchOptions {
+            invert_match: self.invert_match,
+            multiline: self.multiline,
+            only_matching: self.only_matching,
+            before_context: self.before_context,
+            after_context: self.after_context,
+            max_count: if self.files_only {
+                Some(1)
+            } else {
+                self.max_count
+            },
+            passthru: self.passthru,
+            replace: self.replace.clone(),
+            stop_on_nonmatch: self.stop_on_nonmatch,
+            vimgrep: self.vimgrep,
+            all_spans: self.detail,
+        }
+    }
 }
 
 pub struct ServeOptions<'a> {
@@ -221,6 +298,11 @@ pub struct ServeOptions<'a> {
     pub memory_cap_bytes: u64,
     pub index_threads: usize,
     pub no_ignore: bool,
+    /// `--no-require-git`: respect `.gitignore` outside a git repository.
+    pub no_require_git: bool,
+    /// `--max-filesize`: skip files larger than this when building and when
+    /// checking for stale files. `None` means no limit.
+    pub max_file_size: Option<u64>,
     pub auto_save_mutations: Option<u32>,
     /// Bound on the watcher's hand-off queue. `None` uses [`WATCHER_QUEUE_CAP`].
     pub watcher_queue_cap: Option<usize>,
@@ -233,6 +315,8 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         memory_cap_bytes,
         index_threads,
         no_ignore,
+        no_require_git,
+        max_file_size,
         auto_save_mutations,
         watcher_queue_cap,
     } = options;
@@ -307,6 +391,8 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         watch_enabled: !no_watch,
         exclude_dirs: exclude_dirs.to_vec(),
         no_ignore,
+        no_require_git,
+        max_file_size,
         index_dir: index_dir.clone(),
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
@@ -500,10 +586,11 @@ fn process_request(request: &str, state: &ServerState) -> String {
 struct SearchRequest {
     pattern: String,
     case_insensitive: bool,
-    matcher: crate::search::SearchMatcher,
+    matcher: crate::matching::SearchMatcher,
     plan: query::QueryPlan,
     glob_filter: crate::glob_filter::GlobFilter,
-    file_type: Option<String>,
+    type_filter: tgrep_core::filetypes::TypeFilter,
+    encoding: tgrep_core::encoding::EncodingMode,
     opts: SearchOpts,
 }
 
@@ -545,12 +632,43 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
                 .collect()
         })
         .unwrap_or_default();
+    let iglob_strs: Vec<String> = params
+        .get("iglob")
+        .and_then(|g| g.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let glob_case_insensitive = params
+        .get("glob_case_insensitive")
+        .and_then(|g| g.as_bool())
+        .unwrap_or(false);
     let glob_filter =
-        crate::glob_filter::GlobFilter::new(&glob_filter_strs).map_err(|e| format!("{e}"))?;
-    let file_type = params
-        .get("file_type")
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string());
+        crate::glob_filter::GlobFilter::new(&glob_filter_strs, &iglob_strs, glob_case_insensitive)
+            .map_err(|e| format!("{e}"))?;
+    let str_array = |key: &str| -> Vec<String> {
+        params
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The client sends the raw `-t`/`-T`/`--type-add`/`--type-clear` values and
+    // the server rebuilds the filter with the same shared helper, so both sides
+    // are guaranteed to derive an identical definition table.
+    let type_filter = crate::search::build_type_filter(
+        &str_array("type_add"),
+        &str_array("type_clear"),
+        &str_array("types"),
+        &str_array("types_not"),
+    )
+    .map_err(|e| format!("{e}"))?;
     let invert_match = params
         .get("invert_match")
         .and_then(|v| v.as_bool())
@@ -573,31 +691,116 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .get("multiline")
         .and_then(|m| m.as_bool())
         .unwrap_or(false);
+    let multiline_dotall = params
+        .get("multiline_dotall")
+        .and_then(|m| m.as_bool())
+        .unwrap_or(false);
     let files_only = params
         .get("files_only")
         .and_then(|f| f.as_bool())
         .unwrap_or(false);
+    let text = params
+        .get("text")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    // Clients rendering JSON want the matching lines of a binary file, not just
+    // the marker. Defaults to false so an older client keeps today's behaviour.
+    let binary_lines = params
+        .get("binary_lines")
+        .and_then(|t| t.as_bool())
+        .unwrap_or(false);
+    let max_filesize = params.get("max_filesize").and_then(|m| m.as_u64());
+    let line_regexp = params
+        .get("line_regexp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let no_unicode = params
+        .get("no_unicode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let engine = crate::matching::RegexEngine::from_str_opt(
+        params
+            .get("engine")
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto"),
+    )
+    .ok_or_else(|| "unrecognized regex engine".to_string())?;
+    // Saturate rather than truncate: these arrive from a client that already
+    // rejected values too large for its own `usize`, so this only guards
+    // against a malformed request applying a silently smaller limit.
+    let regex_size_limit = params
+        .get("regex_size_limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX));
+    let dfa_size_limit = params
+        .get("dfa_size_limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| usize::try_from(v).unwrap_or(usize::MAX));
+    let replace = params
+        .get("replace")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let passthru = params
+        .get("passthru")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let stop_on_nonmatch = params
+        .get("stop_on_nonmatch")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let vimgrep = params
+        .get("vimgrep")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // Older clients do not send this and do read the arrays, so absence has to
+    // mean "send them".
+    let detail = params
+        .get("detail")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let positions = params
+        .get("positions")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let encoding = tgrep_core::encoding::parse_encoding(
+        params
+            .get("encoding")
+            .and_then(|e| e.as_str())
+            .unwrap_or("auto"),
+    )
+    .map_err(|e| format!("{e}"))?;
 
     // Build combined regex from all patterns
     let mut all_patterns = vec![pattern.to_string()];
     all_patterns.extend(extra_patterns);
 
-    let matcher = crate::search::build_search_matcher(
+    let matcher = crate::matching::build_search_matcher(
         &all_patterns,
-        case_insensitive,
-        fixed_string,
-        word_boundary,
-        multiline,
+        &crate::matching::MatcherConfig {
+            case_insensitive,
+            fixed_string,
+            word_boundary,
+            line_regexp,
+            multiline,
+            dotall: multiline_dotall,
+            no_unicode,
+            engine,
+            regex_size_limit,
+            dfa_size_limit,
+        },
     )
     .map_err(|e| format!("{e}"))?;
 
-    // Build query plan from primary pattern for index filtering
-    let plan = if !matcher.is_standard() {
+    // Build query plan from every pattern for index filtering. `-v` inverts at
+    // the line level, so a file matches when some line does *not* match; the
+    // trigram plan would select exactly the wrong candidates. A non-default
+    // `--encoding` is unsound for the same reason: the index holds trigrams of
+    // the BOM-sniffed text, so a re-decoded file can match bytes that were
+    // never indexed.
+    let plan = if !matcher.is_standard() || invert_match || encoding.may_differ_from_index() {
         query::QueryPlan::MatchAll
-    } else if fixed_string {
-        query::build_literal_plan(pattern, case_insensitive)
     } else {
-        query::build_query_plan(pattern, case_insensitive)?
+        query::build_multi_pattern_plan(&all_patterns, fixed_string, case_insensitive)?
     };
 
     Ok(SearchRequest {
@@ -606,7 +809,8 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         matcher,
         plan,
         glob_filter,
-        file_type,
+        type_filter,
+        encoding,
         opts: SearchOpts {
             files_only,
             invert_match,
@@ -614,6 +818,16 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             max_count,
             before_context,
             after_context,
+            multiline,
+            text,
+            binary_lines,
+            max_filesize,
+            passthru,
+            replace,
+            stop_on_nonmatch,
+            vimgrep,
+            detail,
+            positions,
         },
     })
 }
@@ -633,7 +847,8 @@ fn handle_search(
     let matcher = req.matcher;
     let plan = req.plan;
     let glob_filter = req.glob_filter;
-    let file_type = req.file_type;
+    let type_filter = req.type_filter;
+    let encoding = req.encoding;
     let opts = req.opts;
     let pattern = req.pattern;
     let case_insensitive = req.case_insensitive;
@@ -667,9 +882,7 @@ fn handle_search(
                         return None;
                     }
                 };
-                if let Some(ref type_name) = file_type
-                    && !tgrep_core::filetypes::matches_type(&rel_path, type_name)
-                {
+                if !type_filter.matches(&rel_path) {
                     type_filtered_count += 1;
                     return None;
                 }
@@ -681,17 +894,23 @@ fn handle_search(
                     return None;
                 }
                 let full_path = index.resolve_full_path(fid, &reader_snapshot)?;
+                if let Some(limit) = opts.max_filesize
+                    && std::fs::metadata(&full_path).is_ok_and(|md| md.len() > limit)
+                {
+                    return None;
+                }
                 Some((rel_path, full_path))
             })
             .collect();
 
         // Log filter breakdown when raw candidates are dropped to zero
         let glob_active = !glob_filter.is_empty();
+        let type_active = !type_filter.is_empty();
         if raw_count > 0 && filtered.is_empty() {
             eprintln!(
                 "[trace] filter: raw={raw_count} no_path={no_path_count} \
                  type_filtered={type_filtered_count} glob_filtered={glob_filtered_count} \
-                 file_type={file_type:?} glob_active={glob_active} \
+                 type_active={type_active} glob_active={glob_active} \
                  sample_rejected={first_glob_rejected:?}",
             );
         }
@@ -704,10 +923,25 @@ fn handle_search(
     // Two-phase approach: read-lock for cache hits, then disk I/O outside the
     // lock, then a single write-lock to promote hits and insert misses.
     let t_resolve = Instant::now();
-    let candidate_contents: Vec<(String, Arc<String>)> = {
+    let candidate_contents: Vec<(String, Arc<DecodedFile>)> = if encoding.may_differ_from_index() {
+        // The cache holds text decoded with the default (BOM-sniffing) rules and
+        // is shared by every client. A request that asked for a different
+        // `--encoding` must neither read those entries nor write its own, or one
+        // client's `-E sjis` would silently change what the next client sees.
+        candidate_info
+            .iter()
+            .filter_map(|(rel_path, full_path)| {
+                let bytes = std::fs::read(full_path).ok()?;
+                Some((
+                    rel_path.clone(),
+                    Arc::new(DecodedFile::new(bytes, encoding)),
+                ))
+            })
+            .collect()
+    } else {
         // Phase 1: read-lock to find cache hits (peek avoids write-lock need)
         let mut hit_keys: Vec<String> = Vec::new();
-        let mut hits: Vec<(String, Arc<String>)> = Vec::with_capacity(candidate_info.len());
+        let mut hits: Vec<(String, Arc<DecodedFile>)> = Vec::with_capacity(candidate_info.len());
         let mut misses: Vec<(String, PathBuf)> = Vec::new();
         {
             let cache = state.cache.read().unwrap();
@@ -722,11 +956,15 @@ fn handle_search(
         } // read lock released
 
         // Phase 2: read cache misses from disk (no lock held)
-        let disk_results: Vec<(String, Arc<String>)> = misses
+        let disk_results: Vec<(String, Arc<DecodedFile>)> = misses
             .into_iter()
             .filter_map(|(rel_path, full_path)| {
-                let content = std::fs::read_to_string(&full_path).ok()?;
-                Some((rel_path, Arc::new(content)))
+                // Lossy, like the local path: refusing invalid UTF-8 would make
+                // UTF-16 and Latin-1 sources silently invisible over the server
+                // while the same query works with --no-index.
+                let bytes = std::fs::read(&full_path).ok()?;
+                let decoded = DecodedFile::new(bytes, tgrep_core::encoding::EncodingMode::Auto);
+                Some((rel_path, Arc::new(decoded)))
             })
             .collect();
 
@@ -746,7 +984,7 @@ fn handle_search(
         }
 
         // Combine hits and disk results, preserving candidate order
-        let mut result_map: std::collections::HashMap<&str, Arc<String>> =
+        let mut result_map: std::collections::HashMap<&str, Arc<DecodedFile>> =
             std::collections::HashMap::with_capacity(hits.len() + disk_results.len());
         for (rel_path, content) in &hits {
             result_map.insert(rel_path, Arc::clone(content));
@@ -797,6 +1035,10 @@ fn handle_search(
 
     let result = serde_json::json!({
         "matches": matches,
+        // The number of rows in `matches`, which is not a ripgrep-style match
+        // count: it spans the whole indexed tree (the client applies any
+        // subdirectory argument to the reply) and includes context rows. A
+        // client reporting `--stats` has to count the rows it actually prints.
         "num_matches": matches.len(),
         "elapsed_ms": elapsed_ms,
     });
@@ -806,80 +1048,154 @@ fn handle_search(
 
 fn search_file_matches(
     rel_path: &str,
-    content: &str,
-    matcher: &crate::search::SearchMatcher,
+    file: &DecodedFile,
+    matcher: &crate::matching::SearchMatcher,
     opts: &SearchOpts,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let effective_max = if opts.files_only {
-        Some(1)
+    use crate::matching::FileMatches;
+
+    let content = file.text.as_str();
+    let fixups = &file.fixups;
+    let match_opts = opts.match_options();
+
+    // The client applies ripgrep's "only explicitly named binary files are
+    // visible" rule, so the offset is reported here and filtered there.
+    //
+    // It is mapped back to the file's own bytes first: the NUL is found in the
+    // repaired text, where each byte of invalid UTF-8 ahead of it has grown to
+    // a three-byte U+FFFD. The client has no fixups for a server-side file, so
+    // this is the only place the mapping can happen.
+    let binary_offset = if opts.text {
+        None
     } else {
-        opts.max_count
+        content
+            .as_bytes()
+            .iter()
+            .position(|&b| b == 0)
+            .map(|off| fixups.to_source_offset(off))
     };
 
-    let lines: Vec<&str> = content.lines().collect();
-    let match_indices =
-        crate::search::find_match_indices(&lines, matcher, opts.invert_match, effective_max)?;
-
-    if match_indices.is_empty() {
+    let found = FileMatches::find(content, matcher, &match_opts)?;
+    if found.is_empty() {
         return Ok(Vec::new());
     }
 
-    let has_context = opts.before_context > 0 || opts.after_context > 0;
+    // Never stream raw binary back to the client; report a note instead, the
+    // same way the local path does. Emitted for `-l`/`-c` too so the client can
+    // apply ripgrep's "implicit binary files are invisible" rule uniformly.
+    if let Some(off) = binary_offset {
+        let marker = serde_json::json!({
+            "type": "binary",
+            "file": rel_path,
+            "offset": off,
+            // `-c` still reports a real count for binary files, so carry it
+            // here instead of streaming the file's raw contents back.
+            "lines": found.matched_lines(),
+        });
+        // `--json` reports binary matches as ordinary match events carrying a
+        // `binary_offset`, so those clients ask for the lines as well.
+        if !opts.binary_lines {
+            return Ok(vec![marker]);
+        }
+        let mut results = vec![marker];
+        results.extend(collect_match_rows(
+            &found,
+            &match_opts,
+            matcher,
+            rel_path,
+            fixups,
+            opts.detail,
+            opts.positions,
+        )?);
+        return Ok(results);
+    }
 
-    if has_context {
-        let printed = crate::matching::expand_context_window(
-            &match_indices,
-            lines.len(),
-            opts.before_context,
-            opts.after_context,
-        );
-        let is_match_line: std::collections::HashSet<usize> =
-            match_indices.iter().copied().collect();
+    collect_match_rows(
+        &found,
+        &match_opts,
+        matcher,
+        rel_path,
+        fixups,
+        opts.detail,
+        opts.positions,
+    )
+}
 
-        let mut results = Vec::new();
-        for &li in &printed {
-            if is_match_line.contains(&li) {
-                let mc = matcher.match_content(lines[li], opts.only_matching)?;
-                let col = matcher.find_start(lines[li])?.map(|start| start + 1);
+/// Turn a file's matches into the protocol's `match`/`context` rows.
+fn collect_match_rows(
+    found: &crate::matching::FileMatches,
+    match_opts: &crate::matching::MatchOptions,
+    matcher: &crate::matching::SearchMatcher,
+    rel_path: &str,
+    fixups: &tgrep_core::encoding::LossyFixups,
+    detail: bool,
+    positions: bool,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    use crate::matching::Emit;
+
+    let mut results = Vec::new();
+    found.for_each(match_opts, matcher, |emit| -> anyhow::Result<()> {
+        match emit {
+            Emit::Match {
+                line_number,
+                content,
+                columns,
+                spans,
+                absolute_offset,
+                line_offset,
+                column_shifts,
+                offset_shift,
+                terminator_len,
+            } => {
+                let (columns, offset) = crate::search::to_source_positions(
+                    &columns,
+                    &column_shifts,
+                    absolute_offset,
+                    offset_shift,
+                    line_offset,
+                    fixups,
+                );
                 let mut entry = serde_json::json!({
                     "type": "match",
                     "file": rel_path,
-                    "line": li + 1,
-                    "content": mc,
+                    "line": line_number,
+                    "content": content,
                 });
-                if let Some(c) = col {
-                    entry["column"] = serde_json::json!(c);
+                // The two arrays are what make a reply large; see `SearchOpts::detail`.
+                if detail {
+                    entry["spans"] =
+                        serde_json::json!(spans.iter().map(|&(s, e)| [s, e]).collect::<Vec<_>>());
+                    entry["columns"] = serde_json::json!(columns);
+                }
+                if positions {
+                    entry["offset"] = serde_json::json!(offset);
+                    entry["term"] = serde_json::json!(terminator_len);
                 }
                 results.push(entry);
-            } else {
-                results.push(serde_json::json!({
+            }
+            Emit::Context {
+                line_number,
+                content,
+                absolute_offset,
+                terminator_len,
+            } => {
+                let mut entry = serde_json::json!({
                     "type": "context",
                     "file": rel_path,
-                    "line": li + 1,
-                    "content": lines[li],
-                }));
+                    "line": line_number,
+                    "content": content,
+                });
+                if positions {
+                    entry["offset"] = serde_json::json!(fixups.to_source_offset(absolute_offset));
+                    entry["term"] = serde_json::json!(terminator_len);
+                }
+                results.push(entry);
             }
         }
-        Ok(results)
-    } else {
-        match_indices
-            .iter()
-            .map(|&mi| {
-                let mc = matcher.match_content(lines[mi], opts.only_matching)?;
-                let col = matcher.find_start(lines[mi])?.map(|start| start + 1);
-                let mut entry = serde_json::json!({
-                    "type": "match",
-                    "file": rel_path,
-                    "line": mi + 1,
-                    "content": mc,
-                });
-                if let Some(c) = col {
-                    entry["column"] = serde_json::json!(c);
-                }
-                Ok(entry)
-            })
-            .collect()
-    }
+        Ok(())
+    })?;
+
+    Ok(results)
 }
 
 fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
@@ -904,13 +1220,19 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
 fn handle_reload(id: Option<serde_json::Value>, state: &ServerState) -> String {
     let index_dir = state.index_dir.clone();
 
-    // Rebuild from disk
-    if let Err(e) = builder::build_index(
+    // Rebuild from disk. Uses the options form rather than `build_index` so the
+    // rebuild keeps the ignore semantics the server started with — a reload that
+    // silently changed them would rewrite the index against different rules.
+    if let Err(e) = builder::build_index_with_options(
         &state.root,
         Some(&index_dir),
-        false,
-        state.no_ignore,
-        &state.exclude_dirs,
+        &builder::BuildOptions {
+            no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
+            exclude_dirs: state.exclude_dirs.clone(),
+            ..Default::default()
+        },
     ) {
         return json_rpc_error(id, -32000, &format!("rebuild failed: {e}"));
     }
@@ -1277,11 +1599,12 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             Ok(d) => d,
             Err(_) => continue,
         };
-        let is_binary = tgrep_core::trigram::is_binary(&data);
+        let text = tgrep_core::encoding::decode_for_index(&data);
+        let is_binary = tgrep_core::trigram::is_binary(&text);
         let per_tri = if is_binary {
             None
         } else {
-            Some(tgrep_core::live::LiveIndex::compute_trigram_masks(&data))
+            Some(tgrep_core::live::LiveIndex::compute_trigram_masks(&text))
         };
 
         eprintln!("[trace] reindex: modified {rel_path}");
@@ -1525,7 +1848,15 @@ fn background_refresh_stale(
     // watcher's ignore matcher, and it must run before the early returns
     // below so the matcher is published — and `gitignore_pending` released —
     // even when the index turns out to be up to date or has no stamps yet.
-    let walk = walker::walk_file_metadata(root, &state.exclude_dirs, state.no_ignore);
+    let walk = walker::walk_file_metadata(
+        root,
+        &walker::MetaWalkOptions {
+            exclude_dirs: state.exclude_dirs.clone(),
+            no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
+        },
+    );
     let walk_ms = start.elapsed().as_millis();
     publish_watcher_matcher(state, root, &walk);
     let current_meta = &walk.files;
@@ -1687,6 +2018,8 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         &builder::BuildOptions {
             include_hidden: false,
             no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
             exclude_dirs: state.exclude_dirs.clone(),
             // Match the walk `background_index_build` would have run, and the
             // dot-prefix rule `should_skip_watcher_path` applies, so the
@@ -1833,6 +2166,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         &WalkOptions {
             include_hidden: false,
             no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
             collect_gitignore_files: state.watch_enabled && !state.no_ignore,
             exclude_dirs: state.exclude_dirs.clone(),
             ..Default::default()
@@ -1885,10 +2220,11 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         .index_progress
         .store(seeded_count, std::sync::atomic::Ordering::Relaxed);
     eprintln!(
-        "[trace] walk complete: {} new files to index ({} already indexed, {} binary skipped, {} errors) in {:.1}ms",
+        "[trace] walk complete: {} new files to index ({} already indexed, {} binary skipped, {} too large, {} errors) in {:.1}ms",
         new_count,
         seeded_count,
         walk.skipped_binary,
+        walk.skipped_too_large,
         walk.skipped_error,
         t_walk.elapsed().as_secs_f64() * 1000.0
     );
@@ -1920,6 +2256,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 .par_iter()
                 .filter_map(|path| {
                     let data = std::fs::read(path).ok()?;
+                    let data = tgrep_core::encoding::decode_for_index(&data);
                     if tgrep_core::trigram::is_binary(&data) {
                         return None;
                     }
@@ -1931,7 +2268,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
                     let mut trigrams = tgrep_core::trigram::extract(&data);
                     let lower = data.to_ascii_lowercase();
-                    if lower != data {
+                    if lower != *data {
                         trigrams.extend(tgrep_core::trigram::extract(&lower));
                     }
                     Some((rel_path, trigrams))
@@ -2008,8 +2345,15 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // the index looks fully published but `filestamps.json` is missing — a
     // server kill in that window disables incremental stale detection on
     // the next start.
-    let walk_meta =
-        tgrep_core::walker::walk_file_metadata(root, &state.exclude_dirs, state.no_ignore);
+    let walk_meta = tgrep_core::walker::walk_file_metadata(
+        root,
+        &tgrep_core::walker::MetaWalkOptions {
+            exclude_dirs: state.exclude_dirs.clone(),
+            no_ignore: state.no_ignore,
+            no_require_git: state.no_require_git,
+            max_file_size: state.max_file_size,
+        },
+    );
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = walk_meta
         .files
         .into_iter()
@@ -2577,6 +2921,52 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A binary marker's offset is a position in the file, not in the repaired
+    /// text.
+    ///
+    /// Lossy decoding widens every invalid byte to a three-byte U+FFFD, so a
+    /// NUL preceded by invalid UTF-8 sits further along the searched text than
+    /// it does on disk. `rg 15.2.0` reports the on-disk byte (verified: this
+    /// fixture gives `found "\0" byte around offset 9`).
+    ///
+    /// The mapping has to happen here because the client never reads a file the
+    /// server searched, so it has no fixups of its own to map with.
+    #[test]
+    fn binary_marker_offset_is_mapped_back_to_the_source_bytes() {
+        let mut bytes = vec![0xFF, 0xFF];
+        bytes.extend_from_slice(b"needle\n");
+        bytes.push(0);
+        bytes.extend_from_slice(b"tail\n");
+        let nul_on_disk = bytes.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(nul_on_disk, 9, "fixture changed");
+
+        let file = DecodedFile::new(bytes, tgrep_core::encoding::EncodingMode::Auto);
+        assert_eq!(
+            file.text.as_bytes().iter().position(|&b| b == 0),
+            Some(13),
+            "the fixture must actually shift the offset, or this proves nothing"
+        );
+
+        let matcher = crate::matching::build_search_matcher(
+            &["needle".to_string()],
+            &crate::matching::MatcherConfig::default(),
+        )
+        .unwrap();
+
+        let rows = search_file_matches("f.txt", &file, &matcher, &SearchOpts::default()).unwrap();
+
+        let marker = rows
+            .iter()
+            .find(|r| r["type"] == "binary")
+            .expect("a file containing a NUL is reported as binary");
+        assert_eq!(
+            marker["offset"].as_u64(),
+            Some(nul_on_disk as u64),
+            "offset must be the byte on disk (9), not the decoded position \
+             (13): {marker}"
+        );
+    }
+
     /// `reset_to_empty_index` runs after a failed build, when the index
     /// directory is least likely to be intact, so it must not assume the
     /// directory survived.
@@ -2794,11 +3184,11 @@ mod tests {
     #[test]
     fn glob_filter_unix_patterns() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["**/*.cs".to_string()]).unwrap();
+        let f = GlobFilter::new(&["**/*.cs".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
-        let f2 = GlobFilter::new(&["src/**".to_string()]).unwrap();
+        let f2 = GlobFilter::new(&["src/**".to_string()], &[], false).unwrap();
         assert!(f2.matches("src/foo/bar.cs"));
         assert!(!f2.matches("lib/foo/bar.cs"));
     }
@@ -2806,14 +3196,14 @@ mod tests {
     #[test]
     fn glob_filter_backslash_normalization() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&[r"**\*.cs".to_string()]).unwrap();
+        let f = GlobFilter::new(&[r"**\*.cs".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
-        let f2 = GlobFilter::new(&[r"src\**\*.cs".to_string()]).unwrap();
+        let f2 = GlobFilter::new(&[r"src\**\*.cs".to_string()], &[], false).unwrap();
         assert!(f2.matches("src/foo/bar.cs"));
-        let f3 = GlobFilter::new(&[r"src\**".to_string()]).unwrap();
+        let f3 = GlobFilter::new(&[r"src\**".to_string()], &[], false).unwrap();
         assert!(f3.matches("src/foo/bar.cs"));
         assert!(
-            !GlobFilter::new(&[r"lib\**".to_string()])
+            !GlobFilter::new(&[r"lib\**".to_string()], &[], false)
                 .unwrap()
                 .matches("src/foo/bar.cs")
         );
@@ -2822,15 +3212,21 @@ mod tests {
     #[test]
     fn glob_filter_case_insensitive() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["**/*.CS".to_string()]).unwrap();
-        assert!(f.matches("src/foo/bar.cs"));
-        assert!(f.matches("src/foo/BAR.CS"));
+        // Globs are case-sensitive by default, as in ripgrep.
+        let sensitive = GlobFilter::new(&["**/*.CS".to_string()], &[], false).unwrap();
+        assert!(!sensitive.matches("src/foo/bar.cs"));
+        assert!(sensitive.matches("src/foo/BAR.CS"));
+
+        // --iglob opts a pattern into case-insensitive matching.
+        let insensitive = GlobFilter::new(&[], &["**/*.CS".to_string()], false).unwrap();
+        assert!(insensitive.matches("src/foo/bar.cs"));
+        assert!(insensitive.matches("src/foo/BAR.CS"));
     }
 
     #[test]
     fn glob_filter_negation_only() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["!.git".to_string()]).unwrap();
+        let f = GlobFilter::new(&["!.git".to_string()], &[], false).unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(f.matches("README.md"));
         assert!(!f.matches(".git"));
@@ -2840,7 +3236,12 @@ mod tests {
     #[test]
     fn glob_filter_inclusion_and_exclusion() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&["**/*.cs".to_string(), "!**/test/**".to_string()]).unwrap();
+        let f = GlobFilter::new(
+            &["**/*.cs".to_string(), "!**/test/**".to_string()],
+            &[],
+            false,
+        )
+        .unwrap();
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches("src/test/bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
@@ -2849,7 +3250,7 @@ mod tests {
     #[test]
     fn glob_filter_empty_passes_all() {
         use crate::glob_filter::GlobFilter;
-        let f = GlobFilter::new(&[]).unwrap();
+        let f = GlobFilter::new(&[], &[], false).unwrap();
         assert!(f.matches("anything"));
     }
 

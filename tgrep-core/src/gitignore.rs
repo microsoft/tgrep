@@ -275,6 +275,15 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
 /// directory, because its patterns are written relative to that directory —
 /// see [`IgnoreMatcher::with_nested`].
 ///
+/// Whether `root` sits inside a git repository, detected by scanning `root` and
+/// its ancestors for a `.git` entry so a subdirectory of a repo still counts.
+///
+/// This mirrors the `ignore` crate's `require_git` gate, which is what decides
+/// whether `.gitignore` files are honoured at all.
+pub fn in_git_repo(root: &Path) -> bool {
+    root.ancestors().any(|dir| dir.join(".git").exists())
+}
+
 /// `.gitignore` and `.git/info/exclude` are **git-gated** to match the indexing
 /// walk (`WalkBuilder`'s `require_git` default): they apply only when `root` is
 /// inside a git repository, detected by scanning `root` and its ancestors for a
@@ -289,7 +298,7 @@ pub fn matcher_from_ignore_paths(
     use ignore::gitignore::GitignoreBuilder;
 
     // `root` is inside a git repo if it or any ancestor holds a `.git` entry.
-    let in_git_repo = root.ancestors().any(|dir| dir.join(".git").exists());
+    let in_git_repo = in_git_repo(root);
 
     let mut root_builder = GitignoreBuilder::new(root);
     if in_git_repo {

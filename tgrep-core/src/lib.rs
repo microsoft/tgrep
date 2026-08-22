@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod encoding;
 pub mod error;
 pub(crate) mod external;
 pub mod filetypes;

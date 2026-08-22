@@ -2167,12 +2167,15 @@ fn json_bytes_searched_counts_the_file_when_there_is_no_nul() {
 //      $ rg --json -o alpha a.txt
 //      ... two `match` events, {"matches":3,"matched_lines":2}
 //
-// c) `-c`, `--count-matches`, `-l` and `--files-without-match` are handled by
-//    a printer that predates `--json`, so those flags win outright and the
-//    invocation emits no JSON at all -- not even a `summary`:
+// c) `-c`, `--count-matches`, `-l`, `--files-without-match` and `--files` are
+//    handled by printers that predate `--json`, so those flags win outright
+//    and the invocation emits no JSON at all -- not even a `summary`:
 //
 //      $ rg --json -c alpha a.txt
 //      2
+//      $ rg --json --files
+//      b.txt
+//      a.txt
 // ---------------------------------------------------------------------------
 
 /// The two fixtures the `--json` stats cases were verified against.
@@ -2261,12 +2264,16 @@ fn json_ignores_only_matching() {
                 .args(["--no-index", "--json", "alpha", "a.txt"]),
         );
 
-    let strip_timings = |out: &str| {
+    // `elapsed` is wall clock, and `bytes_printed` counts the serialized JSON
+    // itself -- including the variable-width `nanos` of the event before it --
+    // so both move run to run. Every other field has to match exactly.
+    let strip_volatile = |out: &str| {
         json_events(out)
             .into_iter()
             .map(|mut e| {
                 if let Some(stats) = e["data"]["stats"].as_object_mut() {
                     stats.remove("elapsed");
+                    stats.remove("bytes_printed");
                 }
                 e["data"].as_object_mut().map(|d| d.remove("elapsed_total"));
                 e
@@ -2274,8 +2281,8 @@ fn json_ignores_only_matching() {
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        strip_timings(&with_o),
-        strip_timings(&without_o),
+        strip_volatile(&with_o),
+        strip_volatile(&without_o),
         "ripgrep's JSON printer has no -o mode, so the two streams are the \
          same: with -o {with_o}\nwithout -o {without_o}"
     );
@@ -2337,4 +2344,25 @@ fn json_is_ignored_when_listing_files() {
             "`--json {flag}` prints file names alone, with no stray summary: {out}"
         );
     }
+}
+
+#[test]
+fn json_is_ignored_when_listing_every_file() {
+    let dir = json_stats_fixture();
+    let out = stdout_of(
+        tgrep()
+            .current_dir(dir.path())
+            .args(["--no-index", "--json", "--files"]),
+    );
+    assert!(
+        !out.lines().any(|l| l.starts_with('{')),
+        "`--json --files` prints the bare file list, with no stray summary: {out}"
+    );
+    let mut listed: Vec<_> = out.lines().filter(|l| !l.is_empty()).collect();
+    listed.sort_unstable();
+    assert_eq!(
+        listed,
+        ["a.txt", "b.txt"],
+        "the listing itself is unchanged by --json: {out}"
+    );
 }

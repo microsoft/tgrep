@@ -1181,7 +1181,6 @@ fn run_search(
             report_missing_path(&target.path, opts.no_messages);
             continue;
         }
-        opts.path_display = target.display();
         writer.set_path_display(target.display());
         match search::run(&target.path, cli.index_path.as_deref(), &opts, &mut writer) {
             Ok(true) => {

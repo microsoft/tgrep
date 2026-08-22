@@ -9,11 +9,10 @@
 //! This test builds an index with an explicit cap, serves it with the same cap,
 //! and asserts the large file survives and is still searchable.
 //!
-//! The default cap is now 64 MiB, so the fixture below sits under it rather
-//! than over it. What this still catches is a walk that reverts to a hard-coded
-//! low cap instead of honouring the one it was given; reproducing the original
-//! above-the-default case would cost a >64 MiB fixture on every CI platform,
-//! which is not worth it when `walker`'s own unit tests cover that direction.
+//! The default is now no size cap, so this fixture is chosen to be well above
+//! the historical 1 MiB cap and comfortably under the explicit 10 MiB cap this
+//! test pins on both sides, keeping CI lightweight while still exercising the
+//! "honour the provided cap" path.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};

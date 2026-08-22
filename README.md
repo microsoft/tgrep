@@ -82,9 +82,9 @@ tgrep is designed to be significantly faster than ripgrep on large repos:
 - **Memory-efficient full builds** — index builds batch extraction and stream
   sorted postings, file entries, and lookup entries instead of retaining the full
   inverted index in memory
-- **Smart file walking** — extension-based binary rejection (50+ formats),
-  8KB content check, and a 64 MiB size cap when *indexing* (searching is
-  uncapped by default; see `--max-filesize`)
+- **Smart file walking** — extension-based binary rejection (50+ formats) and an
+  8KB content check, with no size cap on either indexing or searching (see
+  `--max-filesize` to opt into one)
 - **Lock-free reads** — `RwLock<HashMap>` cache allows concurrent reads
   without contention
 - **Hot serving** — queries work immediately during background index building;
@@ -128,7 +128,7 @@ tgrep says so rather than leaving you to guess:
 Walking /src/enlistment...
 warning: /src/enlistment has a .gitignore but is not a git repository, so it is
 not applied (this matches ripgrep). Pass --no-require-git to apply it.
-Found 289320 text files (2893 binary skipped, 698 too large, 0 errors)
+Found 290018 text files (2893 binary skipped, 0 too large, 0 errors)
 ```
 
 `--no-require-git` applies the rules anyway, and works on `index`, `serve`, and
@@ -146,13 +146,13 @@ Flags that decide *which files belong in the index* — `--no-require-git`,
 index` that built an index and the `tgrep serve` that serves it.
 
 The server compares the index against the filesystem at startup and treats an
-indexed file it cannot see as deleted. So serving an index built with
-`--max-filesize 128M` under the 64 MiB default drops every file above 64 MiB
-from that index, permanently. Pass the same flags to both:
+indexed file it cannot see as deleted. So serving an index built without a cap
+under a `--max-filesize 8M` server drops every file above 8 MiB from that index,
+permanently. Pass the same flags to both:
 
 ```bash
-tgrep index . --max-filesize 128M
-tgrep serve   --max-filesize 128M
+tgrep index . --max-filesize 8M
+tgrep serve   --max-filesize 8M
 ```
 
 #### Memory use on very large repos
@@ -187,15 +187,24 @@ reduction in peak memory, and no slower**:
 identical runs because `Vec` growth doubles and both buffers are briefly
 resident during the final reallocation, while `external` varied by 8 MiB.
 
-The indexing cap is now 64 MiB, which raises the peaks quoted in this section:
-the `external` build on the same repo peaks at roughly 198 MiB rather than 160.
-The arena bound is unchanged; the difference is that the builder reads each file
-whole, so a handful of 20 MB generated headers are resident at once. That is
-bounded on purpose — extraction no longer materialises a lowercased copy of each
-file, and batches are capped by cumulative bytes rather than file count, which
-holds the peak near 198 MiB (and within a 5 MiB spread across runs) instead of
-the ~291-400 MiB the unbounded path reached. Lower `--max-filesize` if a build
-has to fit a tighter budget.
+The indexing cap has since been removed entirely, which changes the peaks quoted
+in this section. Files past 1 MiB are memory-mapped rather than read onto the
+heap, so the `external` build on the same repo now settles at roughly **152 MiB
+of private memory in 27 s**, against 197-200 MiB and 41-42 s when a 64 MiB cap
+was still in force. The arena bound is unchanged; what changed is that a handful
+of 20 MB generated headers no longer cost their full size in heap in every
+worker that touches one.
+
+Two caveats on reading those numbers. The peak tgrep prints is *resident set*,
+which counts mapped file pages, so it now reads higher than the memory the
+process actually holds — the same build reports ~192 MiB resident against
+152 MiB private. Mapped pages are file-backed and reclaimable under pressure,
+which heap is not. And a very large file that is neither valid UTF-8 nor
+detectably binary still costs about its own size, because the index has to hold
+the same repaired bytes a search will match against; a 135 MB Latin-1 file
+indexes at roughly 205 MiB.
+
+Pass `--max-filesize` if a build has to fit a tighter budget.
 
 `--index-strategy=memory` remains available as an escape hatch for environments
 where spilling is undesirable or impossible, such as a read-only or full index
@@ -536,14 +545,16 @@ lines that are not valid UTF-8:
 
 ### File size limits
 
-Searching has **no size limit** by default — every text file is searched
-regardless of size. Pass `--max-filesize` to opt into one.
+Neither searching nor indexing has a size limit by default — every text file is
+read regardless of size, matching ripgrep. Pass `--max-filesize` to opt into one.
 
-`tgrep index` caps indexed files at 64 MiB by default; `--max-filesize`
-overrides that too. The cap is a guard against pathological inputs, not a cost
-control — large files are usually generated and repetitive, so they contribute
-far fewer distinct trigrams per byte than ordinary source, and a lower cap
-mainly bought silent misses on files ripgrep would have matched.
+`tgrep index` used to cap indexed files, which bought little and cost
+correctness: large files are usually generated and repetitive, so they
+contribute far fewer distinct trigrams per byte than ordinary source, while an
+oversized file was counted but never recorded — so an indexed search silently
+reported no match on a file ripgrep would have matched. Files past 1 MiB are
+memory-mapped during both indexing and searching, which is what makes indexing
+them affordable.
 
 ### Exit codes
 

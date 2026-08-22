@@ -107,7 +107,7 @@ impl Default for BuildOptions {
             collect_gitignore_files: false,
             strategy: IndexStrategy::default(),
             buffer_bytes: external::DEFAULT_BUFFER_BYTES,
-            max_file_size: Some(walker::DEFAULT_MAX_FILE_SIZE),
+            max_file_size: walker::DEFAULT_MAX_FILE_SIZE,
         }
     }
 }
@@ -361,10 +361,19 @@ pub fn build_index_with_options(
 
     // The walk already stats every entry but discards the size, so recover it
     // here rather than widening WalkResult into the search and serve paths.
+    //
+    // An unknown size counts as a whole batch rather than as zero. A file that
+    // failed to stat may still read, and calling it empty would both let it
+    // slip into an already-full batch and route it to the heap instead of a
+    // map — losing the bound precisely for the file whose size is unknown.
     let sizes: Vec<u64> = walk
         .files
         .par_iter()
-        .map(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        .map(|path| {
+            std::fs::metadata(path)
+                .map(|m| m.len())
+                .unwrap_or(INDEX_BUILD_BATCH_BYTES)
+        })
         .collect();
 
     for range in batch_ranges(&sizes, INDEX_BUILD_BATCH_BYTES) {
@@ -930,6 +939,15 @@ mod tests {
     fn a_file_larger_than_the_budget_gets_its_own_batch() {
         // The oversized file is never split, and never drags neighbours along.
         let sizes = vec![MB, 500 * MB, MB];
+        assert_eq!(batch_ranges(&sizes, 64 * MB), vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn a_file_whose_size_is_unknown_gets_its_own_batch() {
+        // A failed `metadata()` is recorded as a whole budget rather than as
+        // zero, so the unstattable file is isolated instead of being waved into
+        // a full batch as if it were empty.
+        let sizes = vec![MB, 64 * MB, MB];
         assert_eq!(batch_ranges(&sizes, 64 * MB), vec![0..1, 1..2, 2..3]);
     }
 

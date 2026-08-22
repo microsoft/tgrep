@@ -208,9 +208,11 @@ pub fn decode_for_index(bytes: &[u8]) -> Cow<'_, [u8]> {
             if crate::trigram::is_binary(body) {
                 return Cow::Borrowed(body);
             }
-            // `lossy_utf8` is what the search path uses, so this produces the
-            // exact bytes a later search will match against.
-            Cow::Owned(lossy_utf8(body).0.into_bytes())
+            // `lossy_utf8_into` is the same repair the search path uses, so
+            // this produces the exact bytes a later search will match against.
+            // The fixups it can record are for mapping match offsets back to
+            // the original file, which indexing has no use for.
+            Cow::Owned(lossy_utf8_into(body, None).into_bytes())
         }
     }
 }
@@ -227,13 +229,36 @@ fn transcode(enc: &'static Encoding, bytes: &[u8]) -> String {
 /// The loop mirrors the standard library's: one `U+FFFD` per maximal invalid
 /// subsequence, so the text produced here is identical.
 fn lossy_utf8(bytes: &[u8]) -> (String, LossyFixups) {
-    let mut rest = match std::str::from_utf8(bytes) {
-        Ok(s) => return (s.to_string(), LossyFixups::default()),
-        Err(_) => bytes,
-    };
-
-    let mut out = String::with_capacity(bytes.len());
     let mut shifts = Vec::new();
+    let out = lossy_utf8_into(bytes, Some(&mut shifts));
+    (out, LossyFixups { shifts })
+}
+
+/// The repair loop, shared so the two callers cannot drift apart.
+///
+/// `shifts` is `None` for indexing, which only needs the repaired bytes. That
+/// is not just a micro-optimisation: one entry is recorded per repair, so a
+/// large file of single-byte-invalid text (a 135 MB Latin-1 log, say) builds
+/// tens of megabytes of offset table that indexing then drops on the floor.
+///
+/// The output is measured before it is filled. A `String` that starts at
+/// `bytes.len()` is *almost* big enough, so the first repair to overflow it
+/// triggers a doubling reallocation — turning a 135 MB decode into a 270 MB
+/// buffer with both halves live during the copy. Sizing it exactly costs one
+/// extra validation pass, which is SIMD-fast and far cheaper than that copy.
+fn lossy_utf8_into(bytes: &[u8], shifts: Option<&mut Vec<(usize, usize)>>) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+
+    let (out_len, repairs) = lossy_utf8_shape(bytes);
+    let mut out = String::with_capacity(out_len);
+    let mut shifts = shifts;
+    if let Some(shifts) = shifts.as_deref_mut() {
+        shifts.reserve_exact(repairs);
+    }
+
+    let mut rest = bytes;
     let mut gained = 0usize;
     loop {
         let err = match std::str::from_utf8(rest) {
@@ -248,17 +273,46 @@ fn lossy_utf8(bytes: &[u8]) -> (String, LossyFixups) {
         // `None` means the input ended mid-sequence: everything left is one
         // replacement and there is nothing after it.
         let replaced = err.error_len().unwrap_or(rest.len() - valid);
-        shifts.push((out.len(), {
+        if let Some(shifts) = shifts.as_deref_mut() {
             gained += REPLACEMENT_LEN - replaced.min(REPLACEMENT_LEN);
-            gained
-        }));
+            shifts.push((out.len(), gained));
+        }
         out.push(char::REPLACEMENT_CHARACTER);
         match err.error_len() {
             Some(n) => rest = &rest[valid + n..],
             None => break,
         }
     }
-    (out, LossyFixups { shifts })
+    debug_assert_eq!(out.len(), out_len);
+    out
+}
+
+/// `(exact output length, number of replacements)` for [`lossy_utf8_into`].
+///
+/// Walks the input exactly as the repair loop does, so the two agree by
+/// construction; a `debug_assert` in the repair loop pins that agreement.
+fn lossy_utf8_shape(bytes: &[u8]) -> (usize, usize) {
+    let mut rest = bytes;
+    let mut len = 0usize;
+    let mut repairs = 0usize;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                len += s.len();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                len += valid + REPLACEMENT_LEN;
+                repairs += 1;
+                match e.error_len() {
+                    Some(n) => rest = &rest[valid + n..],
+                    None => break,
+                }
+            }
+        }
+    }
+    (len, repairs)
 }
 
 #[cfg(test)]
@@ -410,6 +464,44 @@ mod tests {
             indexed.windows(3).any(|w| w == "\u{FFFD}".as_bytes()),
             "the replacement character has to be indexable"
         );
+    }
+
+    #[test]
+    fn index_and_search_repairs_agree_on_every_invalid_shape() {
+        // The index repair skips the offset fixups the search repair records.
+        // Both walk the same loop so they cannot drift, but the exact-size
+        // pre-pass they now share has to agree with it for every shape of
+        // invalid input — including one truncated at EOF, where `error_len`
+        // is `None` and the walk stops early.
+        let cases: &[&[u8]] = &[
+            b"\xff",
+            b"\xffleading\n",
+            b"trailing\xff",
+            b"two \xff\xfe apart \xff\n",
+            b"adjacent \xff\xff\xff runs\n",
+            b"truncated 2-byte \xc3",
+            b"truncated 3-byte \xe2\x82",
+            b"truncated 4-byte \xf0\x9f\x92",
+            b"mixed \xc3\xa9 valid then \xff invalid\n",
+            "no repairs at all\n".as_bytes(),
+        ];
+        for raw in cases {
+            let indexed = decode_for_index(raw);
+            let searched = decode(raw, EncodingMode::Auto);
+            assert_eq!(
+                indexed.as_ref(),
+                searched.as_bytes(),
+                "index and search disagree on {raw:?}"
+            );
+            // Pins the pre-pass against the loop it sizes, which `debug_assert`
+            // only checks in debug builds.
+            let (predicted, repairs) = lossy_utf8_shape(raw);
+            let (repaired, fixups) = lossy_utf8(raw);
+            if std::str::from_utf8(raw).is_err() {
+                assert_eq!(predicted, repaired.len(), "bad length for {raw:?}");
+                assert_eq!(repairs, fixups.shifts.len(), "bad count for {raw:?}");
+            }
+        }
     }
 
     #[test]

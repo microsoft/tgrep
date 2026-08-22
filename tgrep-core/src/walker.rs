@@ -2,30 +2,30 @@
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
-/// Default maximum file size to index (64 MiB). Larger files are skipped.
+/// Whether a walk applies a size limit by default.
 ///
-/// This is a runaway guard, not a cost control. Size is a poor proxy for index
-/// cost, because the files that trip a cap are overwhelmingly generated and
-/// therefore repetitive: the kernel's 24 MB `dcn_3_2_0_sh_mask.h` contributes
-/// 7,263 distinct trigrams, *fewer* than the 10,936 of the 224 KB
-/// `fs/ext4/super.c`. Indexing all 489 MB of `drivers/gpu/drm/amd/include/
-/// asic_reg` rather than only its sub-1 MiB files grew the index by 5.9 MB —
-/// 1.3% of the added content, against 47% for the small files it already held.
+/// It does not. ripgrep has no default `--max-filesize`, and a cap costs
+/// correctness here in a way it does not cost ripgrep: oversized files are
+/// counted but their paths are never recorded, so an indexed search silently
+/// returned no match where both `--no-index` and ripgrep found one.
 ///
-/// The former 1 MiB cap bought little of that and cost correctness: because
-/// oversized files are counted but their paths are never recorded, an indexed
-/// search silently returned no match where both `--no-index` and ripgrep found
-/// one. What remains here only bounds the pathological case, such as a
-/// checked-in database dump that sniffs as text.
+/// A cap used to be the only thing bounding build memory, because the builder
+/// read every file whole and in parallel. It no longer does — files past
+/// [`crate::builder`]'s mapping threshold are memory-mapped, so their pages are
+/// file-backed and reclaimable rather than heap the process cannot give back.
+/// With memory no longer tied to the largest file, the cap was buying nothing
+/// but missing results.
 ///
-/// Raising it is not free — [`crate::builder`] reads each file whole, in
-/// parallel, so this also raises worst-case transient memory during a build.
-/// 64 MiB matches the default external-sort arena, keeping the two bounds in
-/// step.
+/// Size was always a poor proxy for index cost anyway, because the files that
+/// trip a cap are overwhelmingly generated and therefore repetitive: the
+/// kernel's 24 MB `dcn_3_2_0_sh_mask.h` contributes 7,263 distinct trigrams,
+/// *fewer* than the 10,936 of the 224 KB `fs/ext4/super.c`. Indexing all 489 MB
+/// of `drivers/gpu/drm/amd/include/asic_reg` rather than only its sub-1 MiB
+/// files grew the index by 5.9 MB — 1.3% of the added content, against 47% for
+/// the small files it already held.
 ///
-/// Search paths that scan the filesystem directly (`--no-index`, `--files`)
-/// have no such constraint and default to no limit, matching ripgrep.
-pub const DEFAULT_MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
+/// `--max-filesize` remains available for callers that want the bound.
+pub const DEFAULT_MAX_FILE_SIZE: Option<u64> = None;
 
 /// Binary extensions that can be rejected without reading file content.
 const BINARY_EXTENSIONS: &[&str] = &[
@@ -113,10 +113,9 @@ pub struct WalkOptions {
     pub threads: Option<usize>,
 }
 
-// Hand-written rather than derived: `Option::default()` is `None`, which would
-// silently turn the size limit off for every existing caller that builds this
-// struct with `..Default::default()` (the index builder and the server among
-// them). The default has to keep bounding the index.
+// Hand-written rather than derived so the size limit is a deliberate choice
+// rather than whatever `Option::default()` happens to be. It is `None` — no
+// limit — matching ripgrep; see [`DEFAULT_MAX_FILE_SIZE`].
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
@@ -124,7 +123,7 @@ impl Default for WalkOptions {
             no_ignore: false,
             search_binary: false,
             follow_links: false,
-            max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
             collect_gitignore_files: false,
             exclude_dirs: Vec::new(),
             max_depth: None,
@@ -388,15 +387,15 @@ pub struct MetaWalkOptions {
 }
 
 impl Default for MetaWalkOptions {
-    /// Hand-written rather than derived: `#[derive(Default)]` would make
-    /// `max_file_size` `None`, which means *no limit* and so would quietly
-    /// invert the default rather than matching [`WalkOptions::default`].
+    /// Hand-written rather than derived so the size limit stays an explicit
+    /// decision that matches [`WalkOptions::default`] rather than an accident
+    /// of `#[derive(Default)]`.
     fn default() -> Self {
         Self {
             exclude_dirs: Vec::new(),
             no_ignore: false,
             no_require_git: false,
-            max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
         }
     }
 }
@@ -1055,8 +1054,8 @@ mod tests {
             vec!["small.txt"]
         );
 
-        // The default is well above a couple of megabytes, so an ordinary
-        // large source file is indexed rather than silently dropped.
+        // The default applies no cap, so an ordinary large source file is
+        // indexed rather than silently dropped.
         assert_eq!(
             names(&MetaWalkOptions::default()),
             vec!["big.txt", "small.txt"]
@@ -1079,6 +1078,33 @@ mod tests {
                 ..Default::default()
             }),
             vec!["big.txt", "small.txt"]
+        );
+    }
+
+    #[test]
+    fn walks_default_to_no_size_cap() {
+        // Both option structs hand-write `Default` precisely so this cannot
+        // drift, and both are meant to agree with ripgrep: no limit.
+        assert_eq!(DEFAULT_MAX_FILE_SIZE, None);
+        assert_eq!(WalkOptions::default().max_file_size, None);
+        assert_eq!(MetaWalkOptions::default().max_file_size, None);
+
+        // Pinned against a file past the 64 MiB cap this used to carry, so the
+        // regression this guards against — an oversized file counted but never
+        // recorded, and so silently unsearchable — is what the test exercises.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let big = root.join("huge.txt");
+        // `set_len` rather than writing 65 MiB: the metadata walk only stats.
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(65 * 1024 * 1024)
+            .unwrap();
+
+        let files = walk_file_metadata(root, &MetaWalkOptions::default()).files;
+        assert_eq!(
+            files.iter().map(|f| &f.relative_path).collect::<Vec<_>>(),
+            vec!["huge.txt"]
         );
     }
 

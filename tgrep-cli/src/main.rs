@@ -976,8 +976,8 @@ fn run_cli() {
             exclude_dirs: &exclude,
             strategy: strategy.into(),
             index_buffer_mb,
-            // Indexing keeps a size cap by default; searching does not.
-            max_file_size: max_filesize.or(Some(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE)),
+            // Neither indexing nor searching caps file size by default.
+            max_file_size: max_filesize.or(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE),
         }),
         Some(Command::Serve {
             path,
@@ -1002,9 +1002,8 @@ fn run_cli() {
                     index_threads,
                     no_ignore,
                     no_require_git: cli.no_require_git,
-                    // Same default as `index`: serve builds and stale-checks
-                    // with a size cap unless the user raises it.
-                    max_file_size: max_filesize.or(Some(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE)),
+                    // Same default as `index`: no size cap unless asked for.
+                    max_file_size: max_filesize.or(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE),
                     auto_save_mutations,
                     // Clap's range bound guarantees this fits; saturating keeps
                     // the conversion total, and errs toward a large cap rather

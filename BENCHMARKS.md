@@ -140,19 +140,21 @@ Peak figures here are the OS process high-water mark (`PeakWorkingSetSize` on
 Windows, `VmHWM` on Linux), sampled externally. `tgrep index` now reports the
 same counter itself on completion, so these numbers are reproducible without
 external tooling; the self-reported and externally-sampled values agree exactly.
+Since large files became memory-mapped, resident set also counts mapped file
+pages, so it overstates what the process holds — where that matters below,
+private bytes are reported alongside it.
 
-**What the 64 MiB file-size cap costs.** The table above holds the arena fixed
-and varies the budget. Raising the *indexing* cap from 1 MiB to the current
-64 MiB default moves the floor under all of it, because the builder reads each
-file whole and in parallel, so several 20 MB generated headers are resident at
-once. Same host and repo, default arena:
+**What a file-size cap costs.** The table above holds the arena fixed and varies
+the budget. Raising the *indexing* cap from 1 MiB moved the floor under all of
+it, because the builder read each file whole and in parallel, so several 20 MB
+generated headers were resident at once. Same host and repo, default arena:
 
 | `--max-filesize` | Files indexed | Skipped as too large | Peak working set | Build |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 MiB (old default) | 94,637 | 110 | 151.2 MiB | 25.5 s |
+| 1 MiB (oldest default) | 94,637 | 110 | 151.2 MiB | 25.5 s |
 | 8 MiB | 94,736 | 11 | 304.1 MiB | 24.4 s |
 | 16 MiB | 94,745 | 2 | 341.2 MiB | 24.5 s |
-| 64 MiB (**default**) | 94,747 | 0 | 338.8 MiB | 25.5 s |
+| 64 MiB | 94,747 | 0 | 338.8 MiB | 25.5 s |
 
 The cost is a step, not a slope: almost all of it is paid on the first megabyte
 past the old cap, and 16 MiB and 64 MiB are within noise of each other. So a cap
@@ -164,7 +166,7 @@ is 24 MB and contributes 7,263 distinct trigrams, fewer than the 10,936 of the
 224 KB `fs/ext4/super.c`.
 
 **Bounding what the cap admits.** Those peaks are what the cap cost *before* the
-builder was taught to bound it. Two changes since: trigram extraction no longer
+builder was taught to bound it. Two changes: trigram extraction no longer
 materialises a lowercased copy of each file, and batches are bounded by
 cumulative bytes rather than file count, so the raw bytes in flight are capped
 however large the files are. Same host and repo, minimum of three runs:
@@ -183,6 +185,44 @@ was both slower *and* hungrier here (38.4 s, 254.0 MiB), because the kernel's
 large files are a rare minority and the extra headroom bought no parallelism.
 It only pays off on a tree that is nothing but oversized generated headers, where
 it recovers about half the throughput cost for double the memory.
+
+**Removing the cap.** Bounding the bytes in flight made the peak predictable but
+left it proportional to the largest files, which is why a cap still looked
+necessary. Mapping files past 1 MiB instead of reading them removes that link,
+and with it the reason for the cap. ripgrep has no default `--max-filesize`
+either, and this is the mechanism that lets it not need one.
+
+From here the two metrics diverge and have to be reported separately. Resident
+set counts mapped file pages, so it barely moves; *private* bytes — the memory
+the process actually holds and cannot hand back — is what the change targets.
+Interleaved A/B runs on the kernel, alternating binaries to keep the page cache
+from favouring whichever ran second:
+
+| | Private bytes | Resident set | Build |
+| --- | ---: | ---: | ---: |
+| 64 MiB cap, heap reads | 197.2 / 199.5 MiB | 202.8 / 205.1 MiB | 41.1 / 42.2 s |
+| No cap, mapped over 1 MiB | **152.4 / 152.4 MiB (−23%)** | 192.2 / 195.7 MiB | **27.0 / 27.0 s (−36%)** |
+
+Both produce the same index (447,080 trigrams over 94,744 files), because the
+kernel has nothing above 64 MiB — the time and memory come from the mapping, not
+from indexing more. The effect is far larger where the files are: on a single
+192 MB file, private bytes are 67.1 MiB, and searching one fell from 291.3 MiB
+to 58.2 MiB.
+
+The threshold is 1 MiB because that is where the measurement pointed. In the AMD
+register headers, the worst case in the tree, an 8 MiB threshold mapped only 11
+of 488 files and left 69% of the bytes on the heap, while 1 MiB maps 102 files
+covering 87%. It stays cheap on ordinary trees because only 110 of the kernel's
+94,747 files reach it at all.
+
+**What removing the cap still costs.** A file that is neither valid UTF-8 nor
+detectably binary cannot be mapped: the index must hold the same `U+FFFD`-repaired
+bytes a search will match against, so it is decoded onto the heap. Two fixes keep
+that proportional rather than multiplied — the repaired buffer is now sized
+exactly instead of doubling out of a `bytes.len()` guess, and indexing skips the
+per-repair offset table it never reads. On a 135 MB Latin-1 file that took
+private bytes from 504.2 MiB (3.7x the file) to 204.6 MiB (1.5x).
+
 
 **Why the merge shares one read budget.** The first implementation gave every
 open segment a fixed 256 KiB read-ahead buffer, which made merge memory

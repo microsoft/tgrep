@@ -242,6 +242,11 @@ pub struct OutputWriter {
     file_started: Instant,
     /// Stats for the file currently open in JSON mode.
     file_stats: Stats,
+    /// Line number of the last `match` event emitted for the current file.
+    ///
+    /// ripgrep's `matched_lines` counts distinct matching lines, so a line that
+    /// produces several events must only be counted once.
+    last_json_match_line: Option<usize>,
     total_stats: Stats,
     /// Size of the file currently being searched, for per-file JSON stats.
     pending_bytes_searched: u64,
@@ -281,6 +286,7 @@ impl OutputWriter {
             started: Instant::now(),
             file_started: Instant::now(),
             file_stats: Stats::default(),
+            last_json_match_line: None,
             total_stats: Stats::default(),
             pending_bytes_searched: 0,
             current_binary_offset: None,
@@ -291,6 +297,15 @@ impl OutputWriter {
 
     pub fn is_json(&self) -> bool {
         self.config.format == OutputFormat::Json
+    }
+
+    /// Switch to the path spelling of the next command-line argument.
+    ///
+    /// One writer spans the whole invocation so that stats accumulate and a
+    /// single JSON `summary` is emitted, but each path argument is echoed the
+    /// way the user typed it, so this part of the config is per argument.
+    pub fn set_path_display(&mut self, path_display: PathDisplay) {
+        self.config.path_display = path_display;
     }
 
     /// Record that a file of `bytes` length is about to be searched.
@@ -341,6 +356,7 @@ impl OutputWriter {
         self.current_file = Some(file.to_string());
         self.file_started = Instant::now();
         self.last_printed_line = None;
+        self.last_json_match_line = None;
         Ok(())
     }
 
@@ -371,6 +387,7 @@ impl OutputWriter {
         self.stdout.write_all(line.as_bytes())?;
         self.total_stats.add(&self.file_stats);
         self.file_stats = Stats::default();
+        self.last_json_match_line = None;
         Ok(())
     }
 
@@ -571,7 +588,13 @@ impl OutputWriter {
                         })
                     })
                     .collect();
-                self.file_stats.matched_lines += 1;
+                // ripgrep counts distinct matching *lines* here, not emitted
+                // events, so a line that produced more than one event (a
+                // multiline pattern re-reporting it, say) is only counted once.
+                if self.last_json_match_line != Some(m.line_number) {
+                    self.file_stats.matched_lines += 1;
+                    self.last_json_match_line = Some(m.line_number);
+                }
                 // Count submatch spans, not lines. An inverted match emits a
                 // line with no spans, and ripgrep counts those as zero matches
                 // while still reporting a non-zero `matched_lines`.
@@ -625,7 +648,22 @@ impl OutputWriter {
         Ok(())
     }
 
+    /// Flush buffered output, closing any file left open in JSON mode.
+    ///
+    /// Called once per searched path. The JSON `summary` covers the whole
+    /// invocation, so it is emitted by [`OutputWriter::finish`] instead.
     pub fn flush(&mut self) -> io::Result<()> {
+        if self.is_json() {
+            self.finish_json_file()?;
+        }
+        self.stdout.flush()
+    }
+
+    /// End the invocation, emitting ripgrep's single JSON `summary` event.
+    ///
+    /// ripgrep emits exactly one summary no matter how many paths were named,
+    /// so this runs after the last path rather than after each one.
+    pub fn finish(&mut self) -> io::Result<()> {
         if self.is_json() {
             self.finish_json_file()?;
             let elapsed = self.started.elapsed();

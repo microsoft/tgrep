@@ -2145,3 +2145,196 @@ fn json_bytes_searched_counts_the_file_when_there_is_no_nul() {
          larger size it has once invalid UTF-8 is repaired: {end}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 22. `--json` stats parity
+//
+// Confirmed against rg 15.2.0 with fixtures
+//   a.txt = "alpha\nbeta\ngamma\nalpha again alpha\n"
+//   b.txt = "beta\ndelta\n"
+//
+// a) One `summary` per *invocation*, not per named path. ripgrep aggregates
+//    every path it was given into a single event, so `searches` counts them
+//    all:
+//
+//      $ rg --json -v alpha a.txt b.txt
+//      ... {"stats":{"matched_lines":4,"searches":2,"searches_with_match":2}}
+//
+// b) `-o` is a flag of ripgrep's *standard* printer; the JSON printer has no
+//    equivalent and always emits whole lines with one submatch per hit, so
+//    `--json -o` is byte-identical to `--json`:
+//
+//      $ rg --json -o alpha a.txt
+//      ... two `match` events, {"matches":3,"matched_lines":2}
+//
+// c) `-c`, `--count-matches`, `-l` and `--files-without-match` are handled by
+//    a printer that predates `--json`, so those flags win outright and the
+//    invocation emits no JSON at all -- not even a `summary`:
+//
+//      $ rg --json -c alpha a.txt
+//      2
+// ---------------------------------------------------------------------------
+
+/// The two fixtures the `--json` stats cases were verified against.
+fn json_stats_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("a.txt"),
+        "alpha\nbeta\ngamma\nalpha again alpha\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("b.txt"), "beta\ndelta\n").unwrap();
+    dir
+}
+
+#[test]
+fn json_emits_one_summary_for_all_named_paths() {
+    let dir = json_stats_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "-v",
+        "alpha",
+        "a.txt",
+        "b.txt",
+    ]));
+    let summaries: Vec<_> = json_events(&out)
+        .into_iter()
+        .filter(|e| e["type"] == "summary")
+        .collect();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "ripgrep emits one summary for the whole invocation, not one per \
+         named path: {out}"
+    );
+    let stats = &summaries[0]["data"]["stats"];
+    assert_eq!(
+        stats["searches"], 2,
+        "both named paths count towards the one summary: {out}"
+    );
+    assert_eq!(
+        stats["searches_with_match"], 2,
+        "both produced output: {out}"
+    );
+    assert_eq!(
+        stats["matched_lines"], 4,
+        "two inverted lines in each file: {out}"
+    );
+}
+
+#[test]
+fn json_summary_comes_last_across_named_paths() {
+    let dir = json_stats_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "beta",
+        "a.txt",
+        "b.txt",
+    ]));
+    let kinds: Vec<_> = json_events(&out)
+        .iter()
+        .map(|e| e["type"].as_str().unwrap_or("?").to_string())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["begin", "match", "end", "begin", "match", "end", "summary"],
+        "every file's begin/end pair precedes the single trailing summary: {out}"
+    );
+}
+
+#[test]
+fn json_ignores_only_matching() {
+    let dir = json_stats_fixture();
+    let with_o = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--json",
+        "-o",
+        "alpha",
+        "a.txt",
+    ]));
+    let without_o =
+        stdout_of(
+            tgrep()
+                .current_dir(dir.path())
+                .args(["--no-index", "--json", "alpha", "a.txt"]),
+        );
+
+    let strip_timings = |out: &str| {
+        json_events(out)
+            .into_iter()
+            .map(|mut e| {
+                if let Some(stats) = e["data"]["stats"].as_object_mut() {
+                    stats.remove("elapsed");
+                }
+                e["data"].as_object_mut().map(|d| d.remove("elapsed_total"));
+                e
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        strip_timings(&with_o),
+        strip_timings(&without_o),
+        "ripgrep's JSON printer has no -o mode, so the two streams are the \
+         same: with -o {with_o}\nwithout -o {without_o}"
+    );
+
+    let events = json_events(&with_o);
+    let matches: Vec<_> = events.iter().filter(|e| e["type"] == "match").collect();
+    assert_eq!(
+        matches.len(),
+        2,
+        "one event per matching *line*, carrying every submatch: {with_o}"
+    );
+    let stats = &events
+        .iter()
+        .find(|e| e["type"] == "summary")
+        .unwrap_or_else(|| panic!("expected a summary: {with_o}"))["data"]["stats"];
+    assert_eq!(
+        stats["matched_lines"], 2,
+        "`alpha` is on two distinct lines: {with_o}"
+    );
+    assert_eq!(
+        stats["matches"], 3,
+        "three spans across those lines: {with_o}"
+    );
+}
+
+#[test]
+fn json_is_ignored_when_counting() {
+    let dir = json_stats_fixture();
+    for flag in ["-c", "--count-matches"] {
+        let out = stdout_of(tgrep().current_dir(dir.path()).args([
+            "--no-index",
+            "--json",
+            flag,
+            "alpha",
+            "a.txt",
+        ]));
+        assert!(
+            !out.lines().any(|l| l.starts_with('{')),
+            "`--json {flag}` prints the count alone, with no stray summary \
+             a consumer cannot tie to a begin/end pair: {out}"
+        );
+    }
+}
+
+#[test]
+fn json_is_ignored_when_listing_files() {
+    let dir = json_stats_fixture();
+    for flag in ["-l", "--files-without-match"] {
+        let out = stdout_of(tgrep().current_dir(dir.path()).args([
+            "--no-index",
+            "--json",
+            flag,
+            "alpha",
+            "a.txt",
+            "b.txt",
+        ]));
+        assert!(
+            !out.lines().any(|l| l.starts_with('{')),
+            "`--json {flag}` prints file names alone, with no stray summary: {out}"
+        );
+    }
+}

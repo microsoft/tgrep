@@ -250,11 +250,22 @@ impl SearchOptions {
         self.byte_offset || self.max_columns.is_some()
     }
 
+    /// `--only-matching` as the search should actually apply it.
+    ///
+    /// ripgrep implements `-o` in its standard printer only: the JSON printer
+    /// always reports whole lines with one `submatch` per hit, so `--json -o`
+    /// and `--json` produce byte-identical streams. Fanning a line out into one
+    /// event per match here would both reshape the stream and inflate
+    /// `matched_lines`, which counts distinct lines.
+    fn effective_only_matching(&self) -> bool {
+        self.only_matching && !self.json
+    }
+
     fn match_options(&self) -> crate::matching::MatchOptions {
         crate::matching::MatchOptions {
             invert_match: self.invert_match,
             multiline: self.multiline,
-            only_matching: self.only_matching,
+            only_matching: self.effective_only_matching(),
             before_context: self.before_ctx(),
             after_context: self.after_ctx(),
             // `-q` and `--files-without-match` only need to know whether the
@@ -381,6 +392,13 @@ impl SearchOptions {
     }
 }
 
+/// Build the [`OutputWriter`] that spans a whole invocation.
+///
+/// Kept here so `make_output_config` stays private to this module.
+pub fn new_writer(opts: &SearchOptions) -> OutputWriter {
+    OutputWriter::new(opts.make_output_config())
+}
+
 /// List files that would be searched (--files mode).
 pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
     let root = match std::fs::canonicalize(root) {
@@ -428,7 +446,18 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
     Ok(())
 }
 
-pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Result<bool> {
+/// Run one search path's worth of work, writing through the caller's `writer`.
+///
+/// The writer is owned by the caller and shared across every path argument:
+/// ripgrep emits one JSON `summary` for the whole invocation, so stats have to
+/// accumulate across paths and the summary is emitted by
+/// [`OutputWriter::finish`] once the last path is done.
+pub fn run(
+    root: &Path,
+    index_path: Option<&Path>,
+    opts: &SearchOptions,
+    writer: &mut OutputWriter,
+) -> Result<bool> {
     let root = match std::fs::canonicalize(root) {
         Ok(root) => root,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -475,7 +504,9 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
         && let Ok(info) = ServerInfo::load(&index_dir)
         && let Some((index_root, scope)) = resolve_scope(&index_dir, &root)
     {
-        if let Ok(had_matches) = search_via_server(&info, &root, &index_root, &scope, opts, ci) {
+        if let Ok(had_matches) =
+            search_via_server(&info, &root, &index_root, &scope, opts, ci, writer)
+        {
             return Ok(had_matches);
         }
         eprintln!("Server unreachable, falling back to local index");
@@ -483,14 +514,14 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
 
     // No server — use on-disk index directly (or brute force)
     if opts.no_index || bypass_index {
-        return brute_force_search(&root, opts, ci);
+        return brute_force_search(&root, opts, ci, writer);
     }
     if !index_dir.join("lookup.bin").exists() {
         warn_missing_index(&index_dir, index_path.is_some(), opts.quiet);
-        return brute_force_search(&root, opts, ci);
+        return brute_force_search(&root, opts, ci, writer);
     }
 
-    search_local_index(&root, &index_dir, opts, ci)
+    search_local_index(&root, &index_dir, opts, ci, writer)
 }
 
 /// Render a path the way the user typed it.
@@ -548,6 +579,7 @@ fn search_via_server(
     scope: &IndexScope,
     opts: &SearchOptions,
     ci: bool,
+    writer: &mut OutputWriter,
 ) -> Result<bool> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
@@ -592,7 +624,7 @@ fn search_via_server(
             "type_add": opts.type_add,
             "type_clear": opts.type_clear,
             "invert_match": opts.invert_match,
-            "only_matching": opts.only_matching,
+            "only_matching": opts.effective_only_matching(),
             "after_context": if wants_context { opts.after_ctx() } else { 0 },
             "before_context": if wants_context { opts.before_ctx() } else { 0 },
             "multiline": opts.multiline,
@@ -736,7 +768,6 @@ fn search_via_server(
         }
     };
 
-    let mut writer = OutputWriter::new(opts.make_output_config());
     let had_matches = !matches.is_empty();
 
     if opts.quiet {
@@ -888,6 +919,7 @@ fn search_local_index(
     index_dir: &Path,
     opts: &SearchOptions,
     ci: bool,
+    writer: &mut OutputWriter,
 ) -> Result<bool> {
     let start = Instant::now();
     let reader = IndexReader::open(index_dir)?;
@@ -898,7 +930,7 @@ fn search_local_index(
     // silently reports nothing.
     let Some((index_root, scope)) = resolve_scope(index_dir, root) else {
         // The index covers an unrelated tree, so it cannot answer this search.
-        return brute_force_search(root, opts, ci);
+        return brute_force_search(root, opts, ci, writer);
     };
 
     let glob_filter = opts.glob_filter()?;
@@ -977,7 +1009,6 @@ fn search_local_index(
         );
     }
 
-    let mut writer = OutputWriter::new(opts.make_output_config());
     let mut had_matches = false;
     // A single-file search root is a file the user named on the command line,
     // which is what makes binary files visible in ripgrep.
@@ -1003,7 +1034,7 @@ fn search_local_index(
             &matcher,
             rel_path,
             opts,
-            &mut writer,
+            &mut *writer,
             explicit,
         )?;
         match outcome {
@@ -1115,14 +1146,18 @@ fn within_max_depth(rel: &str, opts: &SearchOptions) -> bool {
     }
 }
 
-fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<bool> {
+fn brute_force_search(
+    root: &Path,
+    opts: &SearchOptions,
+    ci: bool,
+    writer: &mut OutputWriter,
+) -> Result<bool> {
     let start = Instant::now();
     let glob_filter = opts.glob_filter()?;
     let type_filter = opts.type_filter()?;
 
     let matcher = opts.matcher(ci)?;
 
-    let mut writer = OutputWriter::new(opts.make_output_config());
     let mut had_matches = false;
 
     if root.is_file() {
@@ -1137,7 +1172,7 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
                 &matcher,
                 &rel_path,
                 opts,
-                &mut writer,
+                &mut *writer,
                 true,
             )?;
             match outcome {
@@ -1195,7 +1230,7 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
             &matcher,
             &rel_path,
             opts,
-            &mut writer,
+            &mut *writer,
             false,
         )?;
         match outcome {

@@ -773,6 +773,19 @@ impl Cli {
         let binary = self.binary || self.unrestricted >= 3;
         let text = self.text;
 
+        // ripgrep implements `-c`, `--count-matches`, `-l`, `--files-without-match`
+        // and `--files` in a printer that predates `--json` and has no JSON form,
+        // so those flags win outright and the whole invocation produces no JSON —
+        // not even a `summary`. Dropping the flag here rather than only in
+        // `make_output_config` keeps every other `json`-conditional decision
+        // (binary handling, match detail) consistent with the printer in use.
+        let json = self.json
+            && !(self.count
+                || self.count_matches
+                || self.files_only
+                || self.files_without_match
+                || self.list_files);
+
         search::SearchOptions {
             pattern,
             extra_patterns: self.regexp.clone(),
@@ -786,7 +799,7 @@ impl Cli {
             count: self.count,
             word_boundary: self.word_regexp,
             max_count: self.max_count,
-            json: self.json,
+            json,
             vimgrep: self.vimgrep,
             stats: self.stats || self.debug || self.trace,
             no_index: self.no_index,
@@ -1157,16 +1170,26 @@ fn run_search(
     opts.no_filename = cli.no_filename
         || (!cli.with_filename && !cli.vimgrep && targets.len() == 1 && targets[0].path.is_file());
 
+    // One writer for the whole invocation: ripgrep emits a single JSON
+    // `summary` covering every path it was given, so per-path writers would
+    // report one summary each and a consumer reading "the" summary would see
+    // only the first path's numbers.
+    let mut writer = search::new_writer(&opts);
+
     for target in targets {
         if !target.path.exists() {
             report_missing_path(&target.path, opts.no_messages);
             continue;
         }
         opts.path_display = target.display();
-        match search::run(&target.path, cli.index_path.as_deref(), &opts) {
+        writer.set_path_display(target.display());
+        match search::run(&target.path, cli.index_path.as_deref(), &opts, &mut writer) {
             Ok(true) => {
                 had_matches = true;
                 if opts.quiet {
+                    // `process::exit` skips destructors, so the summary and any
+                    // buffered output have to be committed explicitly.
+                    let _ = writer.finish();
                     process::exit(0);
                 }
             }
@@ -1175,10 +1198,13 @@ fn run_search(
                 if !opts.no_messages {
                     eprintln!("tgrep: {e}");
                 }
+                let _ = writer.finish();
                 process::exit(2);
             }
         }
     }
+
+    writer.finish()?;
 
     // ripgrep's exit code: 0 on a match with no errors, 2 if anything was
     // reported to stderr, otherwise 1 for "no matches".

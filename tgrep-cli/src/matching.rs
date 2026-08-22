@@ -23,11 +23,15 @@ impl LineIndex {
     pub fn new(content: &str) -> Self {
         let mut starts = Vec::new();
         if !content.is_empty() {
+            // Size the index up front. It holds one `usize` per line, so
+            // growing it by doubling both overshoots — up to twice what is
+            // needed — and copies the whole thing on the way there. On a large
+            // file that transient is tens of megabytes, which is pure waste
+            // when the exact count is one SIMD scan away.
+            starts.reserve_exact(1 + memchr::memchr_iter(b'\n', content.as_bytes()).count());
             starts.push(0);
-            for (i, b) in content.bytes().enumerate() {
-                if b == b'\n' {
-                    starts.push(i + 1);
-                }
+            for i in memchr::memchr_iter(b'\n', content.as_bytes()) {
+                starts.push(i + 1);
             }
             // A trailing newline opens a final empty line that `str::lines`
             // does not yield. Drop it so line counts agree with the rest of

@@ -241,6 +241,63 @@ fn batch_ranges(sizes: &[u64], budget: u64) -> Vec<std::ops::Range<usize>> {
     ranges
 }
 
+/// Smallest file worth memory-mapping instead of reading.
+///
+/// The same tradeoff the search path makes: mapping costs a syscall pair and a
+/// page-table setup per file, which is a bad deal across the ~94k mostly-small
+/// files of a kernel tree, but above this size it is what stops a large
+/// generated header from costing its full size in heap in every worker that
+/// touches one. Mapped pages are file-backed, so the kernel can reclaim them
+/// under pressure instead of the process holding an allocation it cannot give
+/// back.
+///
+/// 1 MiB is where the measurement pointed rather than a round guess. In the AMD
+/// register headers — the worst case in the kernel tree — an 8 MiB threshold
+/// mapped only 11 of 488 files and left 69% of the bytes on the heap, while
+/// 1 MiB maps 102 files covering 87% of the bytes. It stays cheap on ordinary
+/// trees because it is far above the size of real source: only 110 of the
+/// kernel's 94,747 files reach it at all.
+const MMAP_MIN_BYTES: u64 = 1024 * 1024;
+
+/// The bytes of a file to index, either read onto the heap or borrowed from a
+/// memory map.
+enum FileBytes {
+    Read(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl std::ops::Deref for FileBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            FileBytes::Read(bytes) => bytes,
+            FileBytes::Mapped(map) => map,
+        }
+    }
+}
+
+/// Get a file's bytes for indexing, mapping it when it is large enough to be
+/// worth avoiding the copy.
+///
+/// Falls back to reading whenever mapping is unavailable, so a filesystem that
+/// cannot map still indexes correctly.
+fn read_for_index(path: &Path, size: u64) -> Option<FileBytes> {
+    if size >= MMAP_MIN_BYTES {
+        // SAFETY: the map is read-only and owned by the returned value, which
+        // is dropped once the file's trigrams have been extracted. A concurrent
+        // truncation would be undefined behaviour; that is inherent to mapping
+        // a file being indexed, and is the same exposure the search path
+        // accepts.
+        let mapped =
+            std::fs::File::open(path).and_then(|file| unsafe { memmap2::Mmap::map(&file) });
+        if let Ok(map) = mapped {
+            return Some(FileBytes::Mapped(map));
+        }
+    }
+    std::fs::read(path).ok().map(FileBytes::Read)
+}
+
 /// Build a trigram index, choosing how postings are accumulated.
 pub fn build_index_with_options(
     root: &Path,
@@ -311,11 +368,13 @@ pub fn build_index_with_options(
         .collect();
 
     for range in batch_ranges(&sizes, INDEX_BUILD_BATCH_BYTES) {
-        let batch = &walk.files[range];
+        let batch = &walk.files[range.clone()];
+        let batch_sizes = &sizes[range];
         let batch_data: Vec<(String, HashMap<u32, TrigramMasks>)> = batch
             .par_iter()
-            .filter_map(|path| {
-                let data = std::fs::read(path).ok()?;
+            .zip(batch_sizes.par_iter())
+            .filter_map(|(path, &size)| {
+                let data = read_for_index(path, size)?;
                 let text = crate::encoding::decode_for_index(&data);
                 if trigram::is_binary(&text) {
                     binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

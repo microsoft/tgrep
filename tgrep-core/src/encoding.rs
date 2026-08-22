@@ -123,7 +123,11 @@ pub fn decode_owned_with_fixups(bytes: Vec<u8>, mode: EncodingMode) -> (String, 
 /// That is the only case where the caller's buffer is exactly the bytes to be
 /// searched and can therefore be reused; a trimmed BOM or a transcode means the
 /// result is a different sequence of bytes.
-fn borrows_whole_input(bytes: &[u8], mode: EncodingMode) -> bool {
+///
+/// Public because it is also the precondition for searching a file straight out
+/// of a memory map: if decoding would rewrite the bytes, the mapped pages are
+/// not the bytes to search and the file has to be read and decoded instead.
+pub fn borrows_whole_input(bytes: &[u8], mode: EncodingMode) -> bool {
     match mode {
         EncodingMode::None => true,
         EncodingMode::Auto => Encoding::for_bom(bytes).is_none(),

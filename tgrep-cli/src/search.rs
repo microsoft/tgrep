@@ -1029,7 +1029,7 @@ fn search_local_index(
         };
 
         let outcome = search_decoded_file(
-            &content,
+            content.as_str(),
             &fixups,
             &matcher,
             rel_path,
@@ -1167,7 +1167,7 @@ fn brute_force_search(
         {
             let (content, fixups) = read_text_lossy(root, opts.encoding)?;
             let outcome = search_decoded_file(
-                &content,
+                content.as_str(),
                 &fixups,
                 &matcher,
                 &rel_path,
@@ -1225,7 +1225,7 @@ fn brute_force_search(
         };
 
         let outcome = search_decoded_file(
-            &content,
+            content.as_str(),
             &fixups,
             &matcher,
             &rel_path,
@@ -1268,6 +1268,69 @@ fn brute_force_search(
     Ok(had_matches)
 }
 
+/// Smallest file worth memory-mapping instead of reading.
+///
+/// Mapping costs a syscall pair and a page-table setup per file, which is a bad
+/// trade for the small files that dominate a repository walk — a kernel tree is
+/// ~94k files averaging well under 64 KB. Above this size the whole-file read is
+/// the dominant cost and mapping wins outright, so the threshold buys the
+/// large-file case without taxing the common one.
+///
+/// 1 MiB is far above the size of real source — only 110 of the kernel's 94,747
+/// files reach it — so ordinary searches never map, while the large generated
+/// files that actually cost memory always do.
+const MMAP_MIN_BYTES: u64 = 1024 * 1024;
+
+/// The text of a file to search, either owned on the heap or borrowed from a
+/// memory map.
+///
+/// Reading a file with `fs::read` costs its full size in heap, per file in
+/// flight. ripgrep searches a 192 MB file in under 10 MiB because its memory is
+/// decoupled from file size; mapping large files gives the same property here,
+/// since mapped pages are file-backed and the OS can evict them under pressure
+/// instead of the process holding an allocation it cannot give back.
+enum FileText {
+    Owned(String),
+    /// Mapped bytes verified as UTF-8 when the map was created.
+    Mapped(memmap2::Mmap),
+}
+
+impl FileText {
+    fn as_str(&self) -> &str {
+        match self {
+            FileText::Owned(text) => text,
+            // SAFETY: `Mapped` is only constructed by `try_map_text`, which
+            // validates the entire mapping with `str::from_utf8` first, so the
+            // bytes were UTF-8 when the map was taken. A concurrent writer
+            // could still invalidate them, which is the same exposure ripgrep
+            // accepts when it maps a file it is searching.
+            FileText::Mapped(map) => unsafe { std::str::from_utf8_unchecked(map) },
+        }
+    }
+}
+
+/// Map a file for searching, or `None` to fall back to reading it.
+///
+/// Declines whenever the mapped pages would not be exactly the bytes to search:
+/// a file below the threshold, an encoding that transcodes or strips a BOM, or
+/// content that is not already valid UTF-8 and so needs lossy repair.
+fn try_map_text(path: &Path, encoding: tgrep_core::encoding::EncodingMode) -> Option<FileText> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() < MMAP_MIN_BYTES {
+        return None;
+    }
+    // SAFETY: the map is read-only, owned by the returned `FileText`, and
+    // dropped before this function's caller finishes with the file. Mapping is
+    // undefined behaviour if another process truncates the file underneath us;
+    // that is inherent to searching by map and is the tradeoff ripgrep makes.
+    let map = unsafe { memmap2::Mmap::map(&file).ok()? };
+    if !tgrep_core::encoding::borrows_whole_input(&map, encoding) {
+        return None;
+    }
+    std::str::from_utf8(&map).ok()?;
+    Some(FileText::Mapped(map))
+}
+
 /// Read a file as text, applying `--encoding` and replacing invalid UTF-8
 /// rather than failing.
 ///
@@ -1276,11 +1339,14 @@ fn brute_force_search(
 fn read_text_lossy(
     path: &Path,
     encoding: tgrep_core::encoding::EncodingMode,
-) -> std::io::Result<(String, tgrep_core::encoding::LossyFixups)> {
+) -> std::io::Result<(FileText, tgrep_core::encoding::LossyFixups)> {
+    // A mapped file is always already-valid UTF-8, so it needs no fixups.
+    if let Some(mapped) = try_map_text(path, encoding) {
+        return Ok((mapped, tgrep_core::encoding::LossyFixups::default()));
+    }
     let bytes = std::fs::read(path)?;
-    Ok(tgrep_core::encoding::decode_owned_with_fixups(
-        bytes, encoding,
-    ))
+    let (text, fixups) = tgrep_core::encoding::decode_owned_with_fixups(bytes, encoding);
+    Ok((FileText::Owned(text), fixups))
 }
 
 /// Whether `--max-filesize` excludes this file.

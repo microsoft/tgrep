@@ -21,7 +21,7 @@ fn tgrep_bin() -> PathBuf {
     assert_cmd::cargo::cargo_bin("tgrep")
 }
 
-/// Comfortably above the 8 MiB mapping threshold in `search.rs`.
+/// Comfortably above the 1 MiB mapping threshold in `search.rs`.
 const LARGE_ENOUGH_TO_MAP: usize = 9 * 1024 * 1024;
 
 const FILLER: &str = "the quick brown fox jumps over the lazy dog\n";

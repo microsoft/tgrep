@@ -35,7 +35,7 @@ pub fn bloom_hash(byte: u8) -> u8 {
 }
 
 /// Per-trigram masks for a single file.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrigramMasks {
     /// Positional mask: bit i is set if the trigram occurs at offset where offset % 8 == i.
     pub loc_mask: u8,
@@ -133,12 +133,26 @@ pub fn extract_merged_masks(content: &[u8]) -> HashMap<TrigramHash, TrigramMasks
         return per_tri;
     }
 
-    let lower = content.to_ascii_lowercase();
-    let lower_tri_masks = extract_with_masks(&lower);
-    for &(tri, m) in lower_tri_masks.iter() {
-        let entry = per_tri.entry(tri).or_default();
-        entry.loc_mask |= m.loc_mask;
-        entry.next_mask |= m.next_mask;
+    // Second pass over the same bytes, lowercased. Folding the case conversion
+    // into the window rather than materialising a lowercased duplicate of the
+    // file keeps peak memory independent of file size, which matters because
+    // the builder holds several whole files in flight at once.
+    //
+    // This is equivalent to extracting from a lowercased copy: ASCII
+    // lowercasing is 1:1 on bytes, so every offset — and therefore every
+    // `loc_bit` — is unchanged, and `|=` is associative, so merging per window
+    // lands on the same masks as merging two completed sets.
+    for (i, window) in content.windows(3).enumerate() {
+        let h = hash(
+            window[0].to_ascii_lowercase(),
+            window[1].to_ascii_lowercase(),
+            window[2].to_ascii_lowercase(),
+        );
+        let entry = per_tri.entry(h).or_default();
+        entry.loc_mask |= loc_bit(i);
+        if i + 3 < content.len() {
+            entry.next_mask |= next_bit(content[i + 3].to_ascii_lowercase());
+        }
     }
 
     per_tri
@@ -192,6 +206,55 @@ mod tests {
     fn test_is_binary() {
         assert!(!is_binary(b"hello world"));
         assert!(is_binary(b"hello\0world"));
+    }
+
+    /// `extract_merged_masks` folds the lowercase pass into the window instead
+    /// of materialising a lowercased copy of the file. Pin it against the
+    /// formulation it replaced, which is the definition of what it must produce.
+    fn merged_masks_via_materialised_copy(content: &[u8]) -> HashMap<TrigramHash, TrigramMasks> {
+        let mut expected: HashMap<TrigramHash, TrigramMasks> = HashMap::new();
+        for (tri, m) in extract_with_masks(content) {
+            expected.insert(tri, m);
+        }
+        let lower = content.to_ascii_lowercase();
+        for (tri, m) in extract_with_masks(&lower) {
+            let entry = expected.entry(tri).or_default();
+            entry.loc_mask |= m.loc_mask;
+            entry.next_mask |= m.next_mask;
+        }
+        expected
+    }
+
+    #[test]
+    fn merged_masks_match_a_materialised_lowercase_pass() {
+        // Mixed case, repeats across the 8-byte `loc_mask` period, non-ASCII,
+        // and a trailing window whose next byte does not exist.
+        for content in [
+            b"Foo BAR foo Baz QUX quux Foo".as_slice(),
+            b"AAAAAAAAAAAAAAAAA".as_slice(),
+            b"MixedCase\nMIXEDCASE\nmixedcase\r\n".as_slice(),
+            b"\xc3\x9cber STRASSE \xc3\xbcber strasse".as_slice(),
+            b"ABC".as_slice(),
+            b"ab".as_slice(),
+            b"".as_slice(),
+            b"no uppercase here at all".as_slice(),
+        ] {
+            assert_eq!(
+                extract_merged_masks(content),
+                merged_masks_via_materialised_copy(content),
+                "mismatch for {:?}",
+                String::from_utf8_lossy(content)
+            );
+        }
+    }
+
+    #[test]
+    fn merged_masks_cover_both_cases_of_a_trigram() {
+        let merged = extract_merged_masks(b"Foo");
+        // The literal bytes and their lowercased form are both present, so a
+        // case-insensitive query planned on either spelling finds the file.
+        assert!(merged.contains_key(&hash(b'F', b'o', b'o')));
+        assert!(merged.contains_key(&hash(b'f', b'o', b'o')));
     }
 
     #[test]

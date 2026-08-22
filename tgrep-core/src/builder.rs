@@ -17,6 +17,23 @@ const INDEX_BUILD_BATCH_SIZE: usize = 1024;
 const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
 const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 
+/// Cumulative bytes allowed in one extraction batch.
+///
+/// Batching by file count alone bounds nothing in memory: every file in a batch
+/// can be read concurrently, so a run of large files puts an unbounded number of
+/// whole-file buffers in flight at once. Bounding the batch's total size bounds
+/// that directly, because each buffer is freed as soon as its trigrams have been
+/// extracted.
+///
+/// The budget also bounds parallelism — a batch holding three 20 MB headers can
+/// only occupy three workers — so it was measured rather than guessed. On the
+/// Linux kernel this value cut peak memory 32% for roughly 4% build time, and a
+/// larger budget that scales with the thread pool was tried and rejected: it was
+/// both slower *and* hungrier there, because the kernel's large files are a rare
+/// minority and the extra headroom bought no throughput. A budget this size only
+/// costs throughput on a tree that is nothing but oversized generated headers.
+const INDEX_BUILD_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Default arena budget for [`IndexStrategy::External`] before spilling.
 pub use crate::external::DEFAULT_BUFFER_BYTES as DEFAULT_INDEX_BUFFER_BYTES;
 
@@ -200,6 +217,30 @@ fn gitignore_gate_hint(root: &Path, opts: &BuildOptions) -> Option<String> {
     ))
 }
 
+/// Split a file list into batches bounded by both file count and cumulative
+/// bytes, given each file's size in walk order.
+///
+/// A file larger than the budget forms a batch of its own rather than being
+/// split, so the bound is "one budget, plus at most one oversized file".
+fn batch_ranges(sizes: &[u64], budget: u64) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0u64;
+    for (i, &size) in sizes.iter().enumerate() {
+        let full = i - start >= INDEX_BUILD_BATCH_SIZE || bytes.saturating_add(size) > budget;
+        if i > start && full {
+            ranges.push(start..i);
+            start = i;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(size);
+    }
+    if start < sizes.len() {
+        ranges.push(start..sizes.len());
+    }
+    ranges
+}
+
 /// Build a trigram index, choosing how postings are accumulated.
 pub fn build_index_with_options(
     root: &Path,
@@ -249,7 +290,9 @@ pub fn build_index_with_options(
     let binary_skipped = std::sync::atomic::AtomicUsize::new(0);
 
     // Assign file IDs and collect posting entries. Batching avoids
-    // retaining every file's per-trigram HashMap at once for large repos.
+    // retaining every file's per-trigram HashMap at once for large repos, and
+    // bounding each batch by cumulative bytes caps how much raw file content is
+    // resident at once, since the whole batch is read concurrently.
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
     let mut sink = match opts.strategy {
         IndexStrategy::InMemory => PostingSink::InMemory(Vec::new()),
@@ -259,7 +302,16 @@ pub fn build_index_with_options(
         }
     };
 
-    for batch in walk.files.chunks(INDEX_BUILD_BATCH_SIZE) {
+    // The walk already stats every entry but discards the size, so recover it
+    // here rather than widening WalkResult into the search and serve paths.
+    let sizes: Vec<u64> = walk
+        .files
+        .par_iter()
+        .map(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        .collect();
+
+    for range in batch_ranges(&sizes, INDEX_BUILD_BATCH_BYTES) {
+        let batch = &walk.files[range];
         let batch_data: Vec<(String, HashMap<u32, TrigramMasks>)> = batch
             .par_iter()
             .filter_map(|path| {
@@ -796,6 +848,49 @@ fn count_sorted_trigrams(postings: &[TrigramPosting]) -> usize {
 mod tests {
     use super::*;
     use crate::reader::IndexReader;
+
+    const MB: u64 = 1024 * 1024;
+
+    #[test]
+    fn batches_are_bounded_by_cumulative_bytes() {
+        // Five 20 MB files against a 64 MB budget: three fit, then the rest.
+        let sizes = vec![20 * MB; 5];
+        assert_eq!(batch_ranges(&sizes, 64 * MB), vec![0..3, 3..5]);
+    }
+
+    #[test]
+    fn batches_are_still_bounded_by_file_count() {
+        // Tiny files never reach the byte budget, so the count bound applies.
+        let sizes = vec![1u64; INDEX_BUILD_BATCH_SIZE * 2 + 5];
+        let ranges = batch_ranges(&sizes, 64 * MB);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0], 0..INDEX_BUILD_BATCH_SIZE);
+    }
+
+    #[test]
+    fn a_file_larger_than_the_budget_gets_its_own_batch() {
+        // The oversized file is never split, and never drags neighbours along.
+        let sizes = vec![MB, 500 * MB, MB];
+        assert_eq!(batch_ranges(&sizes, 64 * MB), vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn batches_cover_every_file_exactly_once() {
+        let sizes: Vec<u64> = (0..500).map(|i| (i as u64 % 7) * 9 * MB).collect();
+        let ranges = batch_ranges(&sizes, 64 * MB);
+        let mut next = 0usize;
+        for range in &ranges {
+            assert_eq!(range.start, next, "gap or overlap between batches");
+            assert!(range.start < range.end, "empty batch");
+            next = range.end;
+        }
+        assert_eq!(next, sizes.len(), "batches must cover the whole walk");
+    }
+
+    #[test]
+    fn an_empty_walk_produces_no_batches() {
+        assert!(batch_ranges(&[], 64 * MB).is_empty());
+    }
 
     /// Build a repo with enough varied content that a small arena spills.
     fn write_sample_repo(root: &Path, file_count: usize) {

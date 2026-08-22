@@ -187,18 +187,22 @@ reduction in peak memory, and no slower**:
 identical runs because `Vec` growth doubles and both buffers are briefly
 resident during the final reallocation, while `external` varied by 8 MiB.
 
-The indexing cap is now 64 MiB, which raises the peaks quoted in this section —
-the `external` build on the same repo now peaks at roughly 340 MiB. The arena
-bound is unchanged; the difference is that the builder reads each file whole and
-in parallel, so a handful of 20 MB generated headers are resident at once. The
-rise is a step, not a slope — an 8 MiB cap already costs ~304 MiB, and 16 MiB
-and 64 MiB are within noise of each other — so a lower cap gives up files
-without buying much back. Lower `--max-filesize` if a build has to fit a tighter
-budget.
+The indexing cap is now 64 MiB, which raises the peaks quoted in this section:
+the `external` build on the same repo peaks at roughly 198 MiB rather than 160.
+The arena bound is unchanged; the difference is that the builder reads each file
+whole, so a handful of 20 MB generated headers are resident at once. That is
+bounded on purpose — extraction no longer materialises a lowercased copy of each
+file, and batches are capped by cumulative bytes rather than file count, which
+holds the peak near 198 MiB (and within a 5 MiB spread across runs) instead of
+the ~291-400 MiB the unbounded path reached. Lower `--max-filesize` if a build
+has to fit a tighter budget.
 
 `--index-strategy=memory` remains available as an escape hatch for environments
 where spilling is undesirable or impossible, such as a read-only or full index
-volume. Both strategies produce byte-identical indexes. See
+volume. Both strategies produce byte-identical indexes from the same walk —
+note that file IDs follow walk order, which the parallel walker does not fix
+between runs, so two builds of the same tree need not be byte-identical to each
+other. See
 [BENCHMARKS.md](BENCHMARKS.md#index-build-strategies) for full numbers.
 
 `tgrep serve` uses the same bounded builder when it has to create an index from

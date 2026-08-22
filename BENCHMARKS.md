@@ -163,6 +163,27 @@ the files a size cap catches are generated and repetitive: `dcn_3_2_0_sh_mask.h`
 is 24 MB and contributes 7,263 distinct trigrams, fewer than the 10,936 of the
 224 KB `fs/ext4/super.c`.
 
+**Bounding what the cap admits.** Those peaks are what the cap cost *before* the
+builder was taught to bound it. Two changes since: trigram extraction no longer
+materialises a lowercased copy of each file, and batches are bounded by
+cumulative bytes rather than file count, so the raw bytes in flight are capped
+however large the files are. Same host and repo, minimum of three runs:
+
+| | Peak working set | Build |
+| --- | ---: | ---: |
+| Before | 291.5 MiB | 36.2 s |
+| After | 198.1 MiB (−32%) | 37.8 s (+4%) |
+
+The variance matters as much as the mean. Across those runs the old path ranged
+291.5–400.5 MiB while the new one ranged 198.1–203.5 MiB, so a 109 MiB spread
+became a 5 MiB one: bounding the bytes in flight makes peak memory repeatable,
+not just smaller. The budget is deliberately a flat 64 MiB rather than something
+that scales with the thread pool — a larger, pool-scaled budget was measured and
+was both slower *and* hungrier here (38.4 s, 254.0 MiB), because the kernel's
+large files are a rare minority and the extra headroom bought no parallelism.
+It only pays off on a tree that is nothing but oversized generated headers, where
+it recovers about half the throughput cost for double the memory.
+
 **Why the merge shares one read budget.** The first implementation gave every
 open segment a fixed 256 KiB read-ahead buffer, which made merge memory
 `segments * 256 KiB` — unbounded in fan-in. Since a smaller arena spills *more*

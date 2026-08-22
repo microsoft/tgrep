@@ -6,8 +6,14 @@
 //! raised `--max-filesize` lost every file above 1 MiB the first time it was
 //! served — silently, and permanently once the eviction was flushed to disk.
 //!
-//! This test builds an index with a raised cap, serves it with the same cap,
+//! This test builds an index with an explicit cap, serves it with the same cap,
 //! and asserts the large file survives and is still searchable.
+//!
+//! The default cap is now 64 MiB, so the fixture below sits under it rather
+//! than over it. What this still catches is a walk that reverts to a hard-coded
+//! low cap instead of honouring the one it was given; reproducing the original
+//! above-the-default case would cost a >64 MiB fixture on every CI platform,
+//! which is not worth it when `walker`'s own unit tests cover that direction.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -20,8 +26,8 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const MARKER: &str = "oversized_survivor_marker";
-/// Comfortably over the 1 MiB default cap, comfortably under the 10 MiB one
-/// the test raises it to.
+/// Comfortably under the 10 MiB cap this test pins on both sides, and large
+/// enough that a walk falling back to the historical 1 MiB cap would drop it.
 const BIG_FILE_BYTES: usize = 2 * 1024 * 1024;
 
 fn tgrep_bin() -> std::path::PathBuf {
@@ -39,8 +45,8 @@ impl Drop for ServerGuard {
     }
 }
 
-/// A repo holding the marker in one small file and one file above the default
-/// size cap.
+/// A repo holding the marker in one small file and one file well above the
+/// historical 1 MiB cap.
 fn setup_fixture() -> TempDir {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -149,13 +155,14 @@ fn wait_for_stale_check(log_path: &Path) {
 }
 
 #[test]
-fn serving_an_index_built_with_a_raised_max_filesize_keeps_large_files() {
+fn serving_an_index_built_with_an_explicit_max_filesize_keeps_large_files() {
     let fixture = setup_fixture();
     let root = fixture.path();
     let index_dir = root.join(".tgrep_test_index");
 
-    // Build a complete index with a raised cap so `serve` takes the warm-start
-    // path and runs the stale check against an index holding a 2 MiB file.
+    // Build a complete index with an explicit cap so `serve` takes the
+    // warm-start path and runs the stale check against an index holding a
+    // 2 MiB file.
     let output = Command::new(tgrep_bin())
         .args([
             "index",

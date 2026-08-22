@@ -2,12 +2,30 @@
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
-/// Default maximum file size to index (1 MB). Larger files are skipped.
+/// Default maximum file size to index (64 MiB). Larger files are skipped.
 ///
-/// This bounds the index, which is why it stays the default for index builds.
+/// This is a runaway guard, not a cost control. Size is a poor proxy for index
+/// cost, because the files that trip a cap are overwhelmingly generated and
+/// therefore repetitive: the kernel's 24 MB `dcn_3_2_0_sh_mask.h` contributes
+/// 7,263 distinct trigrams, *fewer* than the 10,936 of the 224 KB
+/// `fs/ext4/super.c`. Indexing all 489 MB of `drivers/gpu/drm/amd/include/
+/// asic_reg` rather than only its sub-1 MiB files grew the index by 5.9 MB —
+/// 1.3% of the added content, against 47% for the small files it already held.
+///
+/// The former 1 MiB cap bought little of that and cost correctness: because
+/// oversized files are counted but their paths are never recorded, an indexed
+/// search silently returned no match where both `--no-index` and ripgrep found
+/// one. What remains here only bounds the pathological case, such as a
+/// checked-in database dump that sniffs as text.
+///
+/// Raising it is not free — [`crate::builder`] reads each file whole, in
+/// parallel, so this also raises worst-case transient memory during a build.
+/// 64 MiB matches the default external-sort arena, keeping the two bounds in
+/// step.
+///
 /// Search paths that scan the filesystem directly (`--no-index`, `--files`)
 /// have no such constraint and default to no limit, matching ripgrep.
-pub const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Binary extensions that can be rejected without reading file content.
 const BINARY_EXTENSIONS: &[&str] = &[
@@ -1026,8 +1044,23 @@ mod tests {
             v
         };
 
-        // Default cap is 1 MiB, so the 2 MiB file is skipped.
-        assert_eq!(names(&MetaWalkOptions::default()), vec!["small.txt"]);
+        // A cap below the file size hides it. Pinned explicitly rather than
+        // taken from the default, so the test states the behaviour it checks
+        // instead of tracking whatever the default happens to be.
+        assert_eq!(
+            names(&MetaWalkOptions {
+                max_file_size: Some(1024 * 1024),
+                ..Default::default()
+            }),
+            vec!["small.txt"]
+        );
+
+        // The default is well above a couple of megabytes, so an ordinary
+        // large source file is indexed rather than silently dropped.
+        assert_eq!(
+            names(&MetaWalkOptions::default()),
+            vec!["big.txt", "small.txt"]
+        );
 
         // Raising the cap must reveal it. If it does not, the stale check reads
         // the file as deleted and evicts it from an index built with this cap.

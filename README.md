@@ -83,7 +83,7 @@ tgrep is designed to be significantly faster than ripgrep on large repos:
   sorted postings, file entries, and lookup entries instead of retaining the full
   inverted index in memory
 - **Smart file walking** — extension-based binary rejection (50+ formats),
-  8KB content check, and a 1 MB size cap when *indexing* (searching is
+  8KB content check, and a 64 MiB size cap when *indexing* (searching is
   uncapped by default; see `--max-filesize`)
 - **Lock-free reads** — `RwLock<HashMap>` cache allows concurrent reads
   without contention
@@ -147,12 +147,12 @@ index` that built an index and the `tgrep serve` that serves it.
 
 The server compares the index against the filesystem at startup and treats an
 indexed file it cannot see as deleted. So serving an index built with
-`--max-filesize 10M` under the 1 MB default drops every file above 1 MB from
-that index, permanently. Pass the same flags to both:
+`--max-filesize 128M` under the 64 MiB default drops every file above 64 MiB
+from that index, permanently. Pass the same flags to both:
 
 ```bash
-tgrep index . --max-filesize 10M
-tgrep serve   --max-filesize 10M
+tgrep index . --max-filesize 128M
+tgrep serve   --max-filesize 128M
 ```
 
 #### Memory use on very large repos
@@ -172,7 +172,8 @@ tgrep index . --index-buffer 16               # smaller arena, lower peak
 tgrep index . --index-strategy=memory         # opt out: sort entirely in RAM
 ```
 
-On the Linux kernel (94,634 files, 990 MiB index) the default is a **~17x
+On the Linux kernel (94,634 files, 990 MiB index), measured under the 1 MiB
+indexing cap that was the default at the time, the default strategy is a **~17x
 reduction in peak memory, and no slower**:
 
 | Strategy | Spill segments | Peak working set | Build |
@@ -185,6 +186,15 @@ reduction in peak memory, and no slower**:
 *predictable* memory — the `memory` row varied by over a gigabyte across
 identical runs because `Vec` growth doubles and both buffers are briefly
 resident during the final reallocation, while `external` varied by 8 MiB.
+
+The indexing cap is now 64 MiB, which raises the peaks quoted in this section —
+the `external` build on the same repo now peaks at roughly 340 MiB. The arena
+bound is unchanged; the difference is that the builder reads each file whole and
+in parallel, so a handful of 20 MB generated headers are resident at once. The
+rise is a step, not a slope — an 8 MiB cap already costs ~304 MiB, and 16 MiB
+and 64 MiB are within noise of each other — so a lower cap gives up files
+without buying much back. Lower `--max-filesize` if a build has to fit a tighter
+budget.
 
 `--index-strategy=memory` remains available as an escape hatch for environments
 where spilling is undesirable or impossible, such as a read-only or full index
@@ -525,8 +535,11 @@ lines that are not valid UTF-8:
 Searching has **no size limit** by default — every text file is searched
 regardless of size. Pass `--max-filesize` to opt into one.
 
-`tgrep index` still caps indexed files at 1 MiB by default (large files are
-mostly generated data and bloat the index); `--max-filesize` overrides that too.
+`tgrep index` caps indexed files at 64 MiB by default; `--max-filesize`
+overrides that too. The cap is a guard against pathological inputs, not a cost
+control — large files are usually generated and repetitive, so they contribute
+far fewer distinct trigrams per byte than ordinary source, and a lower cap
+mainly bought silent misses on files ripgrep would have matched.
 
 ### Exit codes
 

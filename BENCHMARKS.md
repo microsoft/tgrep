@@ -101,7 +101,8 @@ results, not postings.
 
 **Real-world scale: the Linux kernel.** 94,634 indexed files / 446,892 trigrams
 / 990 MiB index (`C:\repos\linux`, v7.2-rc7, warm page cache, peak working set
-sampled from the child process):
+sampled from the child process, under the 1 MiB indexing cap that was the
+default at the time):
 
 | Strategy | Spill segments | Peak working set | Build |
 | --- | ---: | ---: | ---: |
@@ -139,6 +140,28 @@ Peak figures here are the OS process high-water mark (`PeakWorkingSetSize` on
 Windows, `VmHWM` on Linux), sampled externally. `tgrep index` now reports the
 same counter itself on completion, so these numbers are reproducible without
 external tooling; the self-reported and externally-sampled values agree exactly.
+
+**What the 64 MiB file-size cap costs.** The table above holds the arena fixed
+and varies the budget. Raising the *indexing* cap from 1 MiB to the current
+64 MiB default moves the floor under all of it, because the builder reads each
+file whole and in parallel, so several 20 MB generated headers are resident at
+once. Same host and repo, default arena:
+
+| `--max-filesize` | Files indexed | Skipped as too large | Peak working set | Build |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 MiB (old default) | 94,637 | 110 | 151.2 MiB | 25.5 s |
+| 8 MiB | 94,736 | 11 | 304.1 MiB | 24.4 s |
+| 16 MiB | 94,745 | 2 | 341.2 MiB | 24.5 s |
+| 64 MiB (**default**) | 94,747 | 0 | 338.8 MiB | 25.5 s |
+
+The cost is a step, not a slope: almost all of it is paid on the first megabyte
+past the old cap, and 16 MiB and 64 MiB are within noise of each other. So a cap
+between the two gives up files without buying memory back — 8 MiB still drops 11
+kernel files for 89% of the peak. Build time is flat throughout, and the index
+grew 990.4 MB to 996.7 MB (+0.6%) for 110 more files totalling 437.9 MB, because
+the files a size cap catches are generated and repetitive: `dcn_3_2_0_sh_mask.h`
+is 24 MB and contributes 7,263 distinct trigrams, fewer than the 10,936 of the
+224 KB `fs/ext4/super.c`.
 
 **Why the merge shares one read budget.** The first implementation gave every
 open segment a fixed 256 KiB read-ahead buffer, which made merge memory

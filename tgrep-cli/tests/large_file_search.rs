@@ -22,7 +22,7 @@ fn tgrep_bin() -> PathBuf {
 }
 
 /// Comfortably above the 1 MiB mapping threshold in `search.rs`.
-const LARGE_ENOUGH_TO_MAP: usize = 9 * 1024 * 1024;
+const LARGE_ENOUGH_TO_MAP: usize = 2 * 1024 * 1024;
 
 const FILLER: &str = "the quick brown fox jumps over the lazy dog\n";
 const NEEDLE_LINE: &str = "NEEDLE_ALPHA marker\n";
@@ -71,7 +71,7 @@ fn a_mapped_file_reports_the_same_lines_as_a_read_one() {
     std::fs::write(&path, &text).unwrap();
 
     assert!(
-        std::fs::metadata(&path).unwrap().len() as usize > 8 * 1024 * 1024,
+        std::fs::metadata(&path).unwrap().len() as usize > 1024 * 1024,
         "fixture must exceed the mapping threshold or this tests nothing"
     );
 

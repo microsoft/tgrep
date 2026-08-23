@@ -453,8 +453,8 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
             // the index while the matcher is missing. That gate is armed when
             // `ServerState` is built — before this thread is spawned and
             // before `start_file_watcher` runs below — so it holds whichever
-            // of the two wins the race, and the stale check releases it
-            // before any of its early returns.
+            // of the two wins the race, and the stale check releases it as
+            // soon as its walk finishes, ahead of every one of its returns.
             //
             // The same stale check is also what recovers events dropped
             // during the gap: it compares the whole tree against the index,
@@ -1962,9 +1962,8 @@ fn background_refresh_stale(
     eprintln!("[trace] stale check: comparing index against filesystem...");
 
     // Walk first. This single traversal feeds both the stale diff and the
-    // watcher's ignore matcher, and it must run before the early returns
-    // below so the matcher is published — and `gitignore_pending` released —
-    // even when the index turns out to be up to date or has no stamps yet.
+    // watcher's ignore matcher, and it must run before the early returns below
+    // so the matcher can be published on every path out of this function.
     let walk = walker::walk_file_metadata(
         root,
         &walker::MetaWalkOptions {
@@ -1975,6 +1974,22 @@ fn background_refresh_stale(
         },
     );
     let walk_ms = start.elapsed().as_millis();
+
+    // Publish the matcher immediately, before any early return can skip it.
+    // Every exit below is a decision about the *index*; none of them is a
+    // reason to leave the watcher gated. `gitignore_pending` is what keeps the
+    // watcher off the index until a matcher exists, so leaking it past a return
+    // disables the watcher permanently — and the overflow-repair path skips
+    // reconciling while that flag is set, so nothing recovers it either. A
+    // single unreadable directory, or one file whose `metadata()` lost a race
+    // with a delete, would be enough.
+    //
+    // Committing here rather than at each exit is invisible to the watcher:
+    // this function holds `snapshot_gate` for write across its whole body, and
+    // the only reader of `state.gitignore` takes the read side first, so no
+    // event can observe the matcher before this function returns either way.
+    commit_stale_matcher(state, build_stale_matcher(state, root, &walk));
+
     if walk.skipped_error > 0 {
         eprintln!(
             "[trace] warning: stale check could not inspect {} filesystem entries \
@@ -1983,7 +1998,6 @@ fn background_refresh_stale(
         );
         return false;
     }
-    let matcher = build_stale_matcher(state, root, &walk);
     let current_meta = &walk.files;
 
     // Load stored per-file stamps from last index write
@@ -2014,7 +2028,6 @@ fn background_refresh_stale(
     };
     if old_stamps.is_empty() && indexed_paths.is_empty() && current_meta.is_empty() {
         eprintln!("[trace] stale check: no indexed files or filesystem files, skipping");
-        commit_stale_matcher(state, matcher);
         return true;
     }
 
@@ -2033,7 +2046,6 @@ fn background_refresh_stale(
             current_meta.len(),
             walk_ms
         );
-        commit_stale_matcher(state, matcher);
         return true;
     }
 
@@ -2077,7 +2089,6 @@ fn background_refresh_stale(
         return false;
     }
 
-    commit_stale_matcher(state, matcher);
     if let Ok(mut cache) = state.cache.write() {
         for path in changed.iter().chain(added.iter()).chain(deleted.iter()) {
             cache.pop(path);
@@ -2951,6 +2962,42 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A `ServerState` over an empty index, for exercising the stale path
+    /// directly. Mirrors the defaults `run` uses with a watcher and ignore
+    /// rules enabled, which is the configuration `gitignore_pending` gates.
+    #[cfg(unix)]
+    fn test_server_state(root: &Path, index_dir: &Path) -> Arc<ServerState> {
+        create_empty_index(index_dir).expect("create empty index");
+        let hybrid = HybridIndex::open(index_dir, root).expect("open empty index");
+        Arc::new(ServerState {
+            index: RwLock::new(hybrid),
+            cache: RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap())),
+            root: root.to_path_buf(),
+            watcher_active: std::sync::atomic::AtomicBool::new(false),
+            indexing: std::sync::atomic::AtomicBool::new(false),
+            flushing: std::sync::atomic::AtomicBool::new(false),
+            gitignore_pending: std::sync::atomic::AtomicBool::new(true),
+            ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
+            ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+            index_progress: std::sync::atomic::AtomicU64::new(0),
+            index_total: std::sync::atomic::AtomicU64::new(0),
+            watch_enabled: true,
+            exclude_dirs: Vec::new(),
+            no_ignore: false,
+            no_require_git: false,
+            max_file_size: None,
+            index_dir: index_dir.to_path_buf(),
+            publish_lock: Mutex::new(()),
+            file_stamps: RwLock::new(Default::default()),
+            snapshot_gate: RwLock::new(()),
+            stale_refresh_lock: Mutex::new(()),
+            gitignore: RwLock::new(None),
+            memory_cap_bytes: 16 * 1024 * 1024 * 1024,
+            index_threads: 1,
+            auto_save_mutations: 0,
+        })
+    }
+
     /// A binary marker's offset is a position in the file, not in the repaired
     /// text.
     ///
@@ -3229,6 +3276,66 @@ mod tests {
         assert_eq!(added, vec!["case.txt"]);
         deleted.sort();
         assert_eq!(deleted, vec!["Case.txt", "reader-only.txt"]);
+    }
+
+    /// A walk error must not leave the watcher gated forever.
+    ///
+    /// `gitignore_pending` is what keeps the watcher off the index until a
+    /// matcher exists, and the stale check owns clearing it. It also refuses to
+    /// touch the index when the walk could not inspect every entry, because
+    /// unseen files would be misclassified as deleted. Those two are separate
+    /// decisions: taking the second one used to skip the first, so one
+    /// unreadable directory — or one file whose `metadata()` lost a race with a
+    /// delete — silently disabled the watcher for the life of the process, and
+    /// the overflow-repair path would not reconcile either, since it defers to
+    /// the pending matcher.
+    ///
+    /// Unix-only because it needs a directory the process genuinely cannot
+    /// read, which has no portable equivalent on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_error_still_publishes_the_watcher_matcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        // `.gitignore` is git-gated, matching the indexing walk.
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.join("src.rs"), "fn main() {}\n").unwrap();
+
+        let unreadable = root.join("locked");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::write(unreadable.join("inner.rs"), "fn inner() {}\n").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&unreadable).is_ok() {
+            // Running as root, so permissions prove nothing. Restore and skip.
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let index_dir = root.join(".tgrep");
+        std::fs::create_dir(&index_dir).unwrap();
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(true, Ordering::SeqCst);
+
+        let ok = background_refresh_stale(&state, &root, &index_dir, false);
+
+        // Restore before any assertion so a failure still leaves a removable dir.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !ok,
+            "a walk that could not inspect every entry must keep the old index"
+        );
+        assert!(
+            !state.gitignore_pending.load(Ordering::SeqCst),
+            "the watcher gate must be released even when the index is left alone"
+        );
+        assert!(
+            state.gitignore.read().unwrap().is_some(),
+            "the matcher the walk did find must still be published"
+        );
     }
 
     #[test]

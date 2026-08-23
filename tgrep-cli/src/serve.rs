@@ -2139,6 +2139,10 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     let start = Instant::now();
     eprintln!("[trace] bootstrapping index with the external merge sort (memory-bounded)...");
 
+    // Dropped once the build is done so the sampled peak (on platforms without
+    // a kernel high-water mark) covers the whole of it. Unlike the incremental
+    // path below, nothing here polls memory on its own.
+    let sampler = crate::mem::PrivatePeakSampler::start();
     let outcome = match builder::build_index_with_options(
         root,
         Some(index_dir),
@@ -2231,11 +2235,11 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     drop(gate);
 
     let elapsed = start.elapsed().as_secs_f64();
-    match crate::mem::peak_rss_bytes() {
+    drop(sampler);
+    match crate::mem::format_peak_memory() {
         Some(peak) => eprintln!(
             "[trace] bootstrap complete: {indexed} files indexed in {elapsed:.1}s \
-             (peak memory {})",
-            crate::mem::format_bytes(peak)
+             (peak memory {peak})"
         ),
         None => eprintln!("[trace] bootstrap complete: {indexed} files indexed in {elapsed:.1}s"),
     }
@@ -2430,19 +2434,24 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             );
         }
 
-        // Memory-bounded build: if the in-heap overlay has pushed RSS past the
-        // budget, persist what we've indexed so far to disk and reclaim the
+        // Memory-bounded build: if the in-heap overlay has pushed memory past
+        // the budget, persist what we've indexed so far to disk and reclaim the
         // heap before continuing. This keeps peak memory bounded (the flush
         // copies existing on-disk postings verbatim from mmap rather than into
         // heap) while still converging to a *complete* index — unlike simply
         // stopping, which would leave a partial index.
-        if let Some(rss) = crate::mem::process_rss_bytes()
-            && rss > state.memory_cap_bytes
+        //
+        // Charged against private bytes, not the working set: the overlay is
+        // heap, and that is what a flush can give back. Mapped index pages sit
+        // in the working set too but are file-backed, so counting them would
+        // fire the cap on memory no flush can reclaim.
+        if let Some(used) = crate::mem::budgeted_memory_bytes()
+            && used > state.memory_cap_bytes
         {
             eprintln!(
-                "[trace] memory cap reached ({} MB RSS > {} MB cap) — flushing \
+                "[trace] memory cap reached ({} MB in use > {} MB cap) — flushing \
                  overlay to disk to reclaim memory and continuing",
-                rss / (1024 * 1024),
+                used / (1024 * 1024),
                 state.memory_cap_bytes / (1024 * 1024),
             );
             if flush_append_only_overlay(state, index_dir, false, None) {

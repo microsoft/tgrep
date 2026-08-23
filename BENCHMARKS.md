@@ -165,12 +165,11 @@ including at 1,946-segment fan-in; re-verified after `external` became the
 default with 7 queries over 100,130 matches.
 
 Peak figures here are the OS process high-water mark (`PeakWorkingSetSize` on
-Windows, `VmHWM` on Linux), sampled externally. `tgrep index` now reports the
-same counter itself on completion, so these numbers are reproducible without
-external tooling; the self-reported and externally-sampled values agree exactly.
-Since large files became memory-mapped, resident set also counts mapped file
-pages, so it overstates what the process holds — where that matters below,
-private bytes are reported alongside it.
+Windows, `VmHWM` on Linux), sampled externally. Since large files became
+memory-mapped, that counter also counts mapped file pages, so it overstates what
+the process holds — where that matters below, private bytes are reported
+alongside it. `tgrep index` and `tgrep serve` now lead with private bytes for
+that reason; see "What `peak memory` reports" below.
 
 **What a file-size cap costs.** The table above holds the arena fixed and varies
 the budget. Raising the *indexing* cap from 1 MiB moved the floor under all of
@@ -290,6 +289,53 @@ Memory moves the way mapping implies. On the mixed-case corpus, private bytes
 went 71.4 MiB to 78.1 MiB while resident set went 59.3 MiB to 228.1 MiB: the
 increase is entirely file-backed pages the kernel can reclaim, held by the
 256 MiB mapped budget, and the heap the process actually owns barely moved.
+
+**What `peak memory` reports.** Mapping large files made the number tgrep printed
+wrong. It was `PeakWorkingSetSize` / `VmHWM`, which counts resident mapped file
+pages, so once indexing mapped files it tracked the size of the files rather than
+the memory tgrep held. A `tgrep serve` bootstrap over a 290k-file internal
+monorepo reported `peak memory 13.49 GiB`, which prompted this investigation.
+
+Reproducing at that scale showed the build itself was never the problem. On a
+generated 290,700-file / 4.2 GB corpus:
+
+| | Reported peak | Private bytes | Wall |
+| --- | ---: | ---: | ---: |
+| `tgrep index` | 305.1 MiB | 318.0 MiB | 816 s |
+| `tgrep serve` bootstrap | 382.3 MiB | 386.8 MiB | 609 s |
+
+The builder is bounded by construction — batches cap at 1,024 files and 64 MiB of
+heap, the sort arena is 64 MiB, and the merge reads through buffers sized from
+that same budget — so scale alone cannot produce gigabytes. Isolating a single
+oversized file does, because `batch_ranges` gives a file larger than a budget a
+batch of its own and the whole file is then mapped and scanned:
+
+| Corpus | Reported peak (old) | Private bytes | Overstatement |
+| --- | ---: | ---: | ---: |
+| 1 x 2 GiB file | 1.99 GiB | **77.8 MiB** | 26x |
+| 200 x 8 MiB files | 470.2 MiB | **365.4 MiB** | 1.3x |
+| 290,700 files, 4.2 GB | 305.1 MiB | 318.0 MiB | none |
+
+So the metric, not the build, is what scales with file size. Two consequences
+were fixed:
+
+*Reporting.* Both commands now lead with private bytes — `PagefileUsage` on
+Windows, `RssAnon` on Linux — and name the working set separately only when it is
+both 25% and 64 MiB larger, so the mapped-page component is visible instead of
+being folded into a figure that reads as tgrep's own use. The 2 GiB case now
+prints `77.8 MiB private, 1.99 GiB working set incl. memory-mapped files`.
+Linux has no kernel high-water mark for anonymous memory alone, so the peak is
+sampled on a background thread for the duration of a build; without it the
+reported peak would be whatever survived the build, which is a small fraction of
+the true high point once the sorter drops its arena. macOS exposes the split only
+through Mach `TASK_VM_INFO`, which `libc` does not surface, so it still reports
+resident set.
+
+*The memory cap.* It was enforced against the working set too. Mapped pages are
+file-backed and reclaimable, so charging them against a heap budget fires the cap
+on memory no flush can return — the build pays for a full overlay flush and is
+still over budget on the next check, which is exactly the "flush did not reclaim
+memory" path the code warns about. The cap now charges private bytes.
 
 
 **Why the merge shares one read budget.** The first implementation gave every

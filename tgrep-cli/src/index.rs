@@ -66,6 +66,9 @@ pub fn run(opts: RunOptions<'_>) -> Result<()> {
     }
 
     let started = Instant::now();
+    // Dropped after the build so the sampled peak (on platforms without a
+    // kernel high-water mark) covers the whole of it.
+    let sampler = mem::PrivatePeakSampler::start();
     builder::build_index_with_options(
         root,
         index_path,
@@ -81,6 +84,7 @@ pub fn run(opts: RunOptions<'_>) -> Result<()> {
         },
     )?;
     let elapsed = started.elapsed();
+    drop(sampler);
 
     let strategy_label = match strategy {
         IndexStrategy::InMemory => "memory",
@@ -88,12 +92,12 @@ pub fn run(opts: RunOptions<'_>) -> Result<()> {
     };
     // Peak is an OS high-water mark for the whole process. `tgrep index` does
     // nothing substantial before the build, so it reads as the build's peak.
-    match mem::peak_rss_bytes() {
+    match mem::format_peak_memory() {
         Some(peak) => eprintln!(
             "Indexed in {:.1}s using {} strategy (peak memory {})",
             elapsed.as_secs_f64(),
             strategy_label,
-            mem::format_bytes(peak)
+            peak
         ),
         None => eprintln!(
             "Indexed in {:.1}s using {} strategy",

@@ -113,8 +113,16 @@ Index built successfully at /tmp/idx
 Indexed in 22.6s using external strategy (peak memory 160.1 MiB)
 ```
 
-The peak is the operating system's own high-water mark for the process, so it
-reflects the true maximum rather than a sampled snapshot.
+The peak is the memory the process itself holds — private/committed bytes, not
+resident set. The two differ once large files are memory-mapped: mapped pages are
+file-backed and reclaimable, so counting them would report the size of the files
+being indexed rather than tgrep's own use. Indexing a single 2 GiB file holds
+77.8 MiB while its working set reaches 1.99 GiB. When the working set is
+substantially larger it is named alongside, so nothing is hidden:
+
+```
+Indexed in 46.1s using external strategy (peak memory 77.8 MiB private, 1.99 GiB working set incl. memory-mapped files)
+```
 
 #### Repositories without a `.git` directory
 

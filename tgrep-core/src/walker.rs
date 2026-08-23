@@ -338,8 +338,14 @@ pub fn build_gitignore_matcher_from_files(
     root: &Path,
     gitignore_files: &[PathBuf],
     ignore_files: &[PathBuf],
+    no_require_git: bool,
 ) -> Option<crate::gitignore::IgnoreMatcher> {
-    crate::gitignore::matcher_from_ignore_paths(root, gitignore_files, ignore_files)
+    crate::gitignore::matcher_from_ignore_paths_with_options(
+        root,
+        gitignore_files,
+        ignore_files,
+        no_require_git,
+    )
 }
 
 /// Filesystem metadata for a single file (no content read).
@@ -357,6 +363,8 @@ pub struct MetaWalkResult {
     pub files: Vec<FileMeta>,
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
+    /// Entries or metadata reads the walk could not inspect.
+    pub skipped_error: usize,
 }
 
 /// Options for [`walk_file_metadata`].
@@ -414,6 +422,7 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
     let results = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
+    let skipped_error = std::sync::atomic::AtomicUsize::new(0);
     let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(opts.exclude_dirs.clone());
     let p4ignore = (!no_ignore)
         .then(|| crate::gitignore::build_p4ignore_matcher(root))
@@ -449,10 +458,14 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
         let results = &results;
         let gitignore_files = &gitignore_files;
         let ignore_files = &ignore_files;
+        let skipped_error = &skipped_error;
         Box::new(move |entry| {
             let entry = match entry {
                 Ok(e) => e,
-                Err(_) => return ignore::WalkState::Continue,
+                Err(_) => {
+                    skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
+                }
             };
 
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
@@ -487,22 +500,27 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
                 Err(_) => return ignore::WalkState::Continue,
             };
 
-            if let Ok(meta) = entry.metadata() {
-                if max_file_size.is_some_and(|limit| meta.len() > limit) {
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(_) => {
+                    skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return ignore::WalkState::Continue;
                 }
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                results.lock().unwrap().push(FileMeta {
-                    relative_path: rel_path,
-                    mtime,
-                    size: meta.len(),
-                });
+            };
+            if max_file_size.is_some_and(|limit| meta.len() > limit) {
+                return ignore::WalkState::Continue;
             }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            results.lock().unwrap().push(FileMeta {
+                relative_path: rel_path,
+                mtime,
+                size: meta.len(),
+            });
 
             ignore::WalkState::Continue
         })
@@ -512,6 +530,7 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
         files: results.into_inner().unwrap(),
         gitignore_files: gitignore_files.into_inner().unwrap(),
         ignore_files: ignore_files.into_inner().unwrap(),
+        skipped_error: skipped_error.into_inner(),
     }
 }
 
@@ -731,9 +750,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let gi =
-            build_gitignore_matcher_from_files(&root, &walk.gitignore_files, &walk.ignore_files)
-                .expect("matcher should build from discovered .gitignore files");
+        let gi = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            false,
+        )
+        .expect("matcher should build from discovered .gitignore files");
 
         assert!(gi.is_ignored(Path::new("build/output.log"), false));
         assert!(gi.is_ignored(Path::new("src/cache.tmp"), false));
@@ -792,9 +815,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let gi =
-            build_gitignore_matcher_from_files(&root, &walk.gitignore_files, &walk.ignore_files)
-                .expect("matcher should build from discovered .ignore files");
+        let gi = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            false,
+        )
+        .expect("matcher should build from discovered .ignore files");
 
         assert!(gi.is_ignored(Path::new("server/output.log"), false));
         assert!(gi.is_ignored(Path::new("build/artifact.bin"), false));
@@ -808,9 +835,26 @@ mod tests {
         // serving a subdirectory of a repository.
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::create_dir(tmp.path().join(".git").join("info")).unwrap();
+        fs::write(
+            tmp.path().join(".gitignore"),
+            "/sub/parent.txt\n/sub/git-precedence.txt\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".ignore"),
+            "/sub/parent.tmp\n/sub/precedence.txt\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".git").join("info").join("exclude"),
+            "/sub/info.bin\n",
+        )
+        .unwrap();
         let root = tmp.path().join("sub");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n!precedence.txt\n").unwrap();
+        fs::write(root.join(".ignore"), "!git-precedence.txt\n").unwrap();
 
         let walk = walk_dir(
             &root,
@@ -819,10 +863,60 @@ mod tests {
                 ..Default::default()
             },
         );
-        let gi =
-            build_gitignore_matcher_from_files(&root, &walk.gitignore_files, &walk.ignore_files)
-                .expect("`.gitignore` should apply in a subdirectory of a git repo");
+        let gi = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            false,
+        )
+        .expect("`.gitignore` should apply in a subdirectory of a git repo");
         assert!(gi.is_ignored(Path::new("build/out.log"), false));
+        assert!(gi.is_ignored(Path::new("parent.txt"), false));
+        assert!(gi.is_ignored(Path::new("parent.tmp"), false));
+        assert!(gi.is_ignored(Path::new("info.bin"), false));
+        assert!(gi.is_ignored(Path::new("precedence.txt"), false));
+        assert!(!gi.is_ignored(Path::new("git-precedence.txt"), false));
+    }
+
+    #[test]
+    fn parent_ignore_crosses_repository_boundary_but_gitignore_does_not() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "/repo/from-parent-git.txt\n").unwrap();
+        fs::write(tmp.path().join(".ignore"), "/repo/from-parent-dot.txt\n").unwrap();
+
+        let root = tmp.path().join("repo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("from-parent-git.txt"), "kept\n").unwrap();
+        fs::write(root.join("from-parent-dot.txt"), "ignored\n").unwrap();
+
+        let options = MetaWalkOptions::default();
+        let walk = walk_file_metadata(&root, &options);
+        let paths = walk
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"from-parent-git.txt"));
+        assert!(!paths.contains(&"from-parent-dot.txt"));
+
+        let matcher = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            false,
+        )
+        .unwrap();
+        assert!(!matcher.is_ignored(Path::new("from-parent-git.txt"), false));
+        assert!(matcher.is_ignored(Path::new("from-parent-dot.txt"), false));
+
+        let lifted = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            true,
+        )
+        .unwrap();
+        assert!(lifted.is_ignored(Path::new("from-parent-git.txt"), false));
     }
 
     #[test]
@@ -987,6 +1081,23 @@ mod tests {
             vec!["src/main.rs".to_string()],
             "`.gitignore` must apply once the git gate is lifted"
         );
+
+        let metadata = walk_file_metadata(
+            root,
+            &MetaWalkOptions {
+                no_require_git: true,
+                ..Default::default()
+            },
+        );
+        let matcher = build_gitignore_matcher_from_files(
+            root,
+            &metadata.gitignore_files,
+            &metadata.ignore_files,
+            true,
+        )
+        .expect("the lifted matcher should load .gitignore outside a repository");
+        assert!(matcher.is_ignored(Path::new("build/out.rs"), false));
+        assert!(matcher.is_ignored(Path::new("noisy.log"), false));
     }
 
     /// The metadata walk feeds startup stale-file detection. If it stayed

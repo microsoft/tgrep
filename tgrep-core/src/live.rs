@@ -211,6 +211,11 @@ impl LiveIndex {
         self.dirty_count
     }
 
+    /// Whether the overlay contains an active file or a reader tombstone.
+    pub fn has_pending_changes(&self) -> bool {
+        !self.path_to_id.is_empty() || !self.deleted_paths.is_empty()
+    }
+
     /// Reset the dirty counter (e.g., after saving).
     pub fn reset_dirty_count(&mut self) {
         self.dirty_count = 0;
@@ -375,6 +380,16 @@ impl LiveIndex {
         self.masks.retain(|&(_, fid), _| !ids.contains(&fid));
     }
 
+    /// Clear live entries and tombstones that a serialized reconciliation has
+    /// incorporated. The caller must prevent newer mutations to these paths
+    /// until this returns.
+    pub fn clear_reconciled_paths(&mut self, paths: &[String]) {
+        self.batch_remove_overlay_entries(paths);
+        for path in paths {
+            self.deleted_paths.remove(path);
+        }
+    }
+
     /// Fast post-flush prune: if every overlay entry is reflected in
     /// `reader_paths`, swap all overlay maps out for empty ones and drop
     /// the old contents on a background thread. Returns `true` if the
@@ -454,6 +469,11 @@ impl LiveIndex {
         self.path_to_id.keys().cloned().collect()
     }
 
+    /// Return every reader path currently hidden by a deletion tombstone.
+    pub fn tombstone_paths(&self) -> Vec<String> {
+        self.deleted_paths.iter().cloned().collect()
+    }
+
     fn remove_file_by_id(&mut self, file_id: u32) {
         // Remove from inverted index and masks
         let mut trigrams_to_clean = Vec::new();
@@ -472,5 +492,32 @@ impl LiveIndex {
         if let Some(path) = self.file_paths.remove(&file_id) {
             self.path_to_id.remove(&path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_reconciled_paths_removes_entries_and_tombstones_only_for_them() {
+        let mut live = LiveIndex::new();
+        live.upsert_file("omitted.txt", b"abc");
+        live.upsert_file("newer.txt", b"def");
+        live.delete_file("deleted.txt");
+
+        live.clear_reconciled_paths(&["omitted.txt".to_string(), "deleted.txt".to_string()]);
+
+        assert_eq!(live.overlay_paths(), vec!["newer.txt"]);
+        assert!(live.tombstone_paths().is_empty());
+        assert!(
+            live.lookup_trigram(crate::trigram::hash(b'a', b'b', b'c'))
+                .is_empty()
+        );
+        assert_eq!(
+            live.lookup_trigram(crate::trigram::hash(b'd', b'e', b'f'))
+                .len(),
+            1
+        );
     }
 }

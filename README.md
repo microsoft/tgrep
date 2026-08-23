@@ -557,6 +557,12 @@ reported no match on a file ripgrep would have matched. Files past 1 MiB are
 memory-mapped during both indexing and searching, which is what makes indexing
 them affordable.
 
+Mapped files are also batched by what they actually put on the heap rather than
+by their length, so a build over large files fills its worker pool instead of
+running two files at a time. Combined with a faster trigram extractor, that made
+indexing a tree of 32 MiB source files about 14x faster; ordinary small-file
+trees are unchanged. See [BENCHMARKS.md](BENCHMARKS.md).
+
 ### Exit codes
 
 Same as ripgrep:

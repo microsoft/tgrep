@@ -211,8 +211,6 @@ not just smaller. The budget is deliberately a flat 64 MiB rather than something
 that scales with the thread pool — a larger, pool-scaled budget was measured and
 was both slower *and* hungrier here (38.4 s, 254.0 MiB), because the kernel's
 large files are a rare minority and the extra headroom bought no parallelism.
-It only pays off on a tree that is nothing but oversized generated headers, where
-it recovers about half the throughput cost for double the memory.
 
 **Removing the cap.** Bounding the bytes in flight made the peak predictable but
 left it proportional to the largest files, which is why a cap still looked
@@ -250,6 +248,48 @@ that proportional rather than multiplied — the repaired buffer is now sized
 exactly instead of doubling out of a `bytes.len()` guess, and indexing skips the
 per-repair offset table it never reads. On a 135 MB Latin-1 file that took
 private bytes from 504.2 MiB (3.7x the file) to 204.6 MiB (1.5x).
+
+**Indexing large files at speed.** Admitting large files exposed a throughput
+problem the cap had been hiding. Two causes, both only visible once a tree is
+mostly large files:
+
+*The byte budget charged mapped bytes it never allocated.* A mapped file costs no
+heap, but it was charged its full length against the 64 MiB budget, so a batch of
+32 MiB files held two — and a batch is a barrier, so a 16-core pool ran two files
+at a time. Mapped files are now charged a saturating stand-in for the one thing
+they *do* put on the heap, their extracted trigram map, against a second budget
+that caps mapped bytes in flight at 256 MiB.
+
+*Extraction hashed every byte twice with SipHash.* A trigram key is its own
+24-bit hash, so the collision resistance was paying for nothing, and the
+lowercase pass re-walked the whole file even though most windows in real source
+lower to the same key. Extraction now uses a multiply-xorshift hasher and folds
+both cases into one pass, doing real work only for windows that actually contain
+an uppercase byte.
+
+Interleaved A/B runs, 512 MiB per corpus, minimum of alternating runs:
+
+| Corpus | Before | After | |
+| --- | ---: | ---: | ---: |
+| 16 x 32 MiB, mixed case | 24.1 s | **1.7 s** | 14.2x |
+| 16 x 32 MiB, lowercase | 9.4 s | **1.0 s** | 9.4x |
+| 512 x 1 MiB, lowercase | 2.7 s | **1.9 s** | 1.4x |
+| 20,000 x 8 KiB, mixed case | 12.5 s | 12.6 s | — |
+
+The last row is the point: ordinary source trees are bound by file I/O and the
+external sort, not by extraction, so they neither gain nor lose. The gain is
+concentrated exactly where the old cap used to hide the cost.
+
+This is what the reported case was made of. A `tgrep serve` opening an index
+built under the old cap sees every formerly-oversized file as new and absorbs
+them in one stale merge; on a 40,300-file index absorbing 16 x 32 MiB of new
+mixed-case files, that merge went from 26.3 s to 3.4 s (7.7x), producing the same
+79,078 trigrams over 40,316 files.
+
+Memory moves the way mapping implies. On the mixed-case corpus, private bytes
+went 71.4 MiB to 78.1 MiB while resident set went 59.3 MiB to 228.1 MiB: the
+increase is entirely file-backed pages the kernel can reclaim, held by the
+256 MiB mapped budget, and the heap the process actually owns barely moved.
 
 
 **Why the merge shares one read budget.** The first implementation gave every
@@ -357,15 +397,22 @@ already-normalized posting lists.
 
 ### Trigram extraction
 
+Interleaved A/B on one machine, before and after replacing SipHash with a
+multiply-xorshift hasher over the 24-bit trigram key and fusing the case-folding
+pass into the main window loop:
+
 | Case | 1 KiB | 16 KiB | 256 KiB |
 | --- | ---: | ---: | ---: |
-| Extract masks, lowercase ASCII | 14.253us | 206.39us | 2.9378ms |
-| Extract merged masks, lowercase ASCII | 30.271us | 399.31us | 6.0330ms |
-| Extract merged masks, mixed case | 29.960us | 374.22us | 6.1909ms |
+| Extract masks, lowercase ASCII | 18.860us → **6.7010us** | 240.73us → **73.384us** | 3.7818ms → **1.1429ms** |
+| Extract merged masks, lowercase ASCII | 37.896us → **9.2151us** | 530.06us → **124.74us** | 8.4003ms → **2.0132ms** |
+| Extract merged masks, mixed case | 38.483us → **9.9965us** | 536.00us → **139.44us** | 8.4413ms → **2.2813ms** |
 
-For lowercase-only content, merged-mask extraction skips the lowercase copy and
-second extraction pass. In the 256 KiB case, that improved the local Criterion
-baseline by about 51%.
+A trigram packs three bytes into 24 bits, so the key is already collision-free
+and SipHash's collision resistance bought nothing while running once per input
+byte. Merged extraction previously walked the file a second time whenever it held
+any uppercase byte; folding that into one pass means a window costs extra work
+only if it actually lowers to a different trigram, which closes most of the gap
+between the mixed-case and lowercase rows.
 
 ---
 

@@ -14,44 +14,64 @@ use regex::RegexBuilder;
 /// Search results are produced as byte ranges over the whole file so a single
 /// match can span lines (`--multiline`). This maps those ranges back to line
 /// numbers and columns.
-pub struct LineIndex {
-    starts: Vec<usize>,
-    len: usize,
+///
+/// The table is built on first use rather than up front, because most searches
+/// never need it. It costs one `usize` per line — 670 MB on a 13.4 GiB file
+/// with 83.8M lines — plus two `memchr` passes over the whole buffer, and a
+/// file with no match asks it nothing at all: the whole-buffer prescan finds no
+/// match, so no offset is ever mapped to a line. Building it eagerly was 4.7 s
+/// of the 30.7 s that file took to search, spent entirely on an answer nobody
+/// wanted.
+pub struct LineIndex<'a> {
+    content: &'a str,
+    starts: std::cell::OnceCell<Vec<usize>>,
 }
 
-impl LineIndex {
-    pub fn new(content: &str) -> Self {
-        let mut starts = Vec::new();
-        if !content.is_empty() {
-            starts.push(0);
-            for (i, b) in content.bytes().enumerate() {
-                if b == b'\n' {
-                    starts.push(i + 1);
-                }
-            }
-            // A trailing newline opens a final empty line that `str::lines`
-            // does not yield. Drop it so line counts agree with the rest of
-            // the pipeline, which is still line-oriented.
-            if starts.len() > 1 && starts[starts.len() - 1] == content.len() {
-                starts.pop();
-            }
-        }
+impl<'a> LineIndex<'a> {
+    pub fn new(content: &'a str) -> Self {
         Self {
-            starts,
-            len: content.len(),
+            content,
+            starts: std::cell::OnceCell::new(),
         }
     }
 
+    fn starts(&self) -> &[usize] {
+        self.starts.get_or_init(|| {
+            let content = self.content;
+            let mut starts = Vec::new();
+            if !content.is_empty() {
+                // Size the index up front. It holds one `usize` per line, so
+                // growing it by doubling both overshoots — up to twice what is
+                // needed — and copies the whole thing on the way there. On a
+                // large file that transient is tens of megabytes, which is pure
+                // waste when the exact count is one SIMD scan away.
+                starts.reserve_exact(1 + memchr::memchr_iter(b'\n', content.as_bytes()).count());
+                starts.push(0);
+                for i in memchr::memchr_iter(b'\n', content.as_bytes()) {
+                    starts.push(i + 1);
+                }
+                // A trailing newline opens a final empty line that `str::lines`
+                // does not yield. Drop it so line counts agree with the rest of
+                // the pipeline, which is still line-oriented.
+                if starts.len() > 1 && starts[starts.len() - 1] == content.len() {
+                    starts.pop();
+                }
+            }
+            starts
+        })
+    }
+
     pub fn line_count(&self) -> usize {
-        self.starts.len()
+        self.starts().len()
     }
 
     /// 0-based index of the line containing `offset`.
     pub fn line_of(&self, offset: usize) -> usize {
-        if self.starts.is_empty() {
+        let starts = self.starts();
+        if starts.is_empty() {
             return 0;
         }
-        match self.starts.binary_search(&offset) {
+        match starts.binary_search(&offset) {
             Ok(i) => i,
             // `starts[0]` is always 0, so a miss can never land at index 0.
             Err(i) => i - 1,
@@ -59,14 +79,21 @@ impl LineIndex {
     }
 
     pub fn line_start(&self, idx: usize) -> usize {
-        self.starts.get(idx).copied().unwrap_or(self.len)
+        self.starts()
+            .get(idx)
+            .copied()
+            .unwrap_or(self.content.len())
     }
 
     /// End offset of line `idx`, excluding its `\n` or `\r\n` terminator.
-    pub fn line_end(&self, content: &str, idx: usize) -> usize {
+    pub fn line_end(&self, idx: usize) -> usize {
         let start = self.line_start(idx);
-        let mut end = self.starts.get(idx + 1).copied().unwrap_or(self.len);
-        let bytes = content.as_bytes();
+        let mut end = self
+            .starts()
+            .get(idx + 1)
+            .copied()
+            .unwrap_or(self.content.len());
+        let bytes = self.content.as_bytes();
         if end > start && bytes[end - 1] == b'\n' {
             end -= 1;
         }
@@ -76,18 +103,22 @@ impl LineIndex {
         end
     }
 
-    /// Byte length of line `idx`'s terminator in `content`: 2 for `\r\n`, 1 for
-    /// a bare `\n`, 0 for a final line that the file does not terminate.
+    /// Byte length of line `idx`'s terminator in the buffer: 2 for `\r\n`, 1
+    /// for a bare `\n`, 0 for a final line that the file does not terminate.
     ///
     /// `-M/--max-columns` measures the line *including* its terminator, so this
     /// is needed to decide whether a line is over the limit.
-    pub fn line_terminator_len(&self, content: &str, idx: usize) -> usize {
-        let end = self.starts.get(idx + 1).copied().unwrap_or(self.len);
-        end - self.line_end(content, idx)
+    pub fn line_terminator_len(&self, idx: usize) -> usize {
+        let end = self
+            .starts()
+            .get(idx + 1)
+            .copied()
+            .unwrap_or(self.content.len());
+        end - self.line_end(idx)
     }
 
-    pub fn line_text<'a>(&self, content: &'a str, idx: usize) -> &'a str {
-        &content[self.line_start(idx)..self.line_end(content, idx)]
+    pub fn line_text(&self, idx: usize) -> &'a str {
+        &self.content[self.line_start(idx)..self.line_end(idx)]
     }
 }
 
@@ -108,7 +139,7 @@ pub struct LineHit {
 /// for `--max-count`, so several matches sharing a line spend one unit between
 /// them, and a match straddling two lines also spends just one.
 fn limit_to_line_blocks(
-    index: &LineIndex,
+    index: &LineIndex<'_>,
     spans: &[(usize, usize)],
     max: Option<usize>,
 ) -> Vec<(usize, usize)> {
@@ -143,14 +174,13 @@ fn limit_to_line_blocks(
 /// single line. ripgrep keeps the line the match *starts* on, which is the
 /// position an editor should jump to.
 fn clip_spans_to_start_line(
-    content: &str,
-    index: &LineIndex,
+    index: &LineIndex<'_>,
     spans: &[(usize, usize)],
 ) -> Vec<(usize, usize)> {
     spans
         .iter()
         .map(|&(s, e)| {
-            let line_end = index.line_end(content, index.line_of(s));
+            let line_end = index.line_end(index.line_of(s));
             (s, e.min(line_end))
         })
         .collect()
@@ -161,11 +191,7 @@ fn clip_spans_to_start_line(
 /// Under `--multiline` a single match can cover several lines, and every line
 /// it touches has to be printed. Overlapping ranges on the same line are
 /// merged so highlighting never emits nested escape sequences.
-pub fn group_spans_by_line(
-    content: &str,
-    index: &LineIndex,
-    spans: &[(usize, usize)],
-) -> Vec<LineHit> {
+pub fn group_spans_by_line(index: &LineIndex<'_>, spans: &[(usize, usize)]) -> Vec<LineHit> {
     let mut by_line: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
 
     for &(s, e) in spans {
@@ -174,7 +200,7 @@ pub fn group_spans_by_line(
         let last = if e > s { index.line_of(e - 1) } else { first };
         for li in first..=last.min(index.line_count().saturating_sub(1)) {
             let ls = index.line_start(li);
-            let le = index.line_end(content, li);
+            let le = index.line_end(li);
             let cs = s.clamp(ls, le) - ls;
             let ce = e.clamp(ls, le) - ls;
             by_line.entry(li).or_default().push((cs, ce));
@@ -220,7 +246,23 @@ pub fn expand_context_window(
 /// `fancy_regex` is the fallback for backreferences and lookaround.
 pub enum SearchMatcher {
     Standard(regex::Regex),
-    Fancy(fancy_regex::Regex),
+    /// A backtracking match, optionally gated by a linear-time prefilter.
+    ///
+    /// `fancy_regex` already delegates to `regex` when a pattern needs nothing
+    /// fancy, so this variant only really costs anything when a construct like
+    /// lookaround forces the backtracking VM. That VM has no literal prefilter,
+    /// so it tries to match at *every* byte offset - on a multi-gigabyte file
+    /// that is the difference between seconds and never finishing.
+    ///
+    /// `prefilter` is the pattern relaxed into a form the linear-time engine can
+    /// compile (see `tgrep_core::query::relax_for_indexing`). Relaxation only
+    /// widens the language, so a haystack the prefilter rejects cannot possibly
+    /// match the real pattern - which makes it sound to use for negative
+    /// answers, and only for negative answers.
+    Fancy {
+        re: fancy_regex::Regex,
+        prefilter: Option<regex::Regex>,
+    },
 }
 
 impl SearchMatcher {
@@ -228,12 +270,24 @@ impl SearchMatcher {
         matches!(self, SearchMatcher::Standard(_))
     }
 
+    /// Whether the prefilter has already ruled this haystack out.
+    ///
+    /// A `false` from the prefilter is conclusive; a `true` means nothing, and
+    /// the real matcher still has to run.
+    fn ruled_out(prefilter: &Option<regex::Regex>, hay: &str) -> bool {
+        prefilter.as_ref().is_some_and(|re| !re.is_match(hay))
+    }
+
     pub fn is_match(&self, hay: &str) -> Result<bool> {
         match self {
             SearchMatcher::Standard(re) => Ok(re.is_match(hay)),
-            SearchMatcher::Fancy(re) => re
-                .is_match(hay)
-                .map_err(|e| anyhow::anyhow!("regex match error: {e}")),
+            SearchMatcher::Fancy { re, prefilter } => {
+                if Self::ruled_out(prefilter, hay) {
+                    return Ok(false);
+                }
+                re.is_match(hay)
+                    .map_err(|e| anyhow::anyhow!("regex match error: {e}"))
+            }
         }
     }
 
@@ -246,7 +300,10 @@ impl SearchMatcher {
                     spans.push((m.start(), m.end()));
                 }
             }
-            SearchMatcher::Fancy(re) => {
+            SearchMatcher::Fancy { re, prefilter } => {
+                if Self::ruled_out(prefilter, hay) {
+                    return Ok(spans);
+                }
                 for m in re.find_iter(hay) {
                     let m = m.map_err(|e| anyhow::anyhow!("regex match error: {e}"))?;
                     spans.push((m.start(), m.end()));
@@ -263,10 +320,14 @@ impl SearchMatcher {
     pub fn find_first_span(&self, hay: &str) -> Result<Option<(usize, usize)>> {
         match self {
             SearchMatcher::Standard(re) => Ok(re.find(hay).map(|m| (m.start(), m.end()))),
-            SearchMatcher::Fancy(re) => re
-                .find(hay)
-                .map(|m| m.map(|m| (m.start(), m.end())))
-                .map_err(|e| anyhow::anyhow!("regex match error: {e}")),
+            SearchMatcher::Fancy { re, prefilter } => {
+                if Self::ruled_out(prefilter, hay) {
+                    return Ok(None);
+                }
+                re.find(hay)
+                    .map(|m| m.map(|m| (m.start(), m.end())))
+                    .map_err(|e| anyhow::anyhow!("regex match error: {e}"))
+            }
         }
     }
 
@@ -306,7 +367,10 @@ impl SearchMatcher {
                     out.push((m.start(), m.end(), dst));
                 }
             }
-            SearchMatcher::Fancy(re) => {
+            SearchMatcher::Fancy { re, prefilter } => {
+                if Self::ruled_out(prefilter, hay) {
+                    return Ok(out);
+                }
                 for caps in re.captures_iter(hay) {
                     let caps = caps.map_err(|e| anyhow::anyhow!("regex match error: {e}"))?;
                     let m = caps.get(0).expect("group 0 always participates");
@@ -415,14 +479,34 @@ fn build_fancy(combined: &str, cfg: &MatcherConfig) -> Result<SearchMatcher> {
     if cfg.dotall {
         flags.push('s');
     }
-    let pattern = if flags.is_empty() {
-        combined.to_string()
-    } else {
-        format!("(?{flags}:{combined})")
+    let wrap = |body: &str| {
+        if flags.is_empty() {
+            body.to_string()
+        } else {
+            format!("(?{flags}:{body})")
+        }
     };
-    fancy_regex::Regex::new(&pattern)
-        .map(SearchMatcher::Fancy)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    let pattern = wrap(combined);
+    let re = fancy_regex::Regex::new(&pattern).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(SearchMatcher::Fancy {
+        re,
+        prefilter: build_fancy_prefilter(combined, &wrap),
+    })
+}
+
+/// Compile a linear-time approximation of `combined` to use as a prefilter.
+///
+/// Only worth building when relaxation actually removed something: if the
+/// relaxed pattern is identical, `fancy_regex` is already delegating to `regex`
+/// internally and a second engine would be pure overhead. Anything that fails to
+/// relax or fails to compile simply yields no prefilter, which costs performance
+/// and never correctness.
+fn build_fancy_prefilter(combined: &str, wrap: &dyn Fn(&str) -> String) -> Option<regex::Regex> {
+    let relaxed = tgrep_core::query::relax_for_indexing(combined)?;
+    if relaxed == combined {
+        return None;
+    }
+    regex::Regex::new(&wrap(&relaxed)).ok()
 }
 
 fn combine_patterns(
@@ -540,8 +624,7 @@ pub enum Emit<'a> {
 
 /// Result of matching one file: the line index plus every matching line.
 pub struct FileMatches<'a> {
-    content: &'a str,
-    index: LineIndex,
+    index: LineIndex<'a>,
     hits: Vec<LineHit>,
 }
 
@@ -553,11 +636,7 @@ impl<'a> FileMatches<'a> {
         } else {
             collect_hits(content, &index, matcher, opts)?
         };
-        Ok(Self {
-            content,
-            index,
-            hits,
-        })
+        Ok(Self { index, hits })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -592,7 +671,7 @@ impl<'a> FileMatches<'a> {
         let emit_hit = |hit: &LineHit,
                         on_emit: &mut dyn FnMut(Emit<'a>) -> std::result::Result<(), E>|
          -> std::result::Result<(), E> {
-            let line = self.index.line_text(self.content, hit.idx);
+            let line = self.index.line_text(hit.idx);
             let offset = self.index.line_start(hit.idx);
 
             if opts.only_matching && !hit.spans.is_empty() {
@@ -672,7 +751,7 @@ impl<'a> FileMatches<'a> {
                 line_offset: offset,
                 column_shifts,
                 offset_shift: 0,
-                terminator_len: self.index.line_terminator_len(self.content, hit.idx),
+                terminator_len: self.index.line_terminator_len(hit.idx),
             })
         };
 
@@ -686,9 +765,9 @@ impl<'a> FileMatches<'a> {
                     Some(hit) => emit_hit(hit, &mut on_emit)?,
                     None => on_emit(Emit::Context {
                         line_number: li + 1,
-                        content: self.index.line_text(self.content, li),
+                        content: self.index.line_text(li),
                         absolute_offset: self.index.line_start(li),
-                        terminator_len: self.index.line_terminator_len(self.content, li),
+                        terminator_len: self.index.line_terminator_len(li),
                     })?,
                 }
             }
@@ -717,9 +796,9 @@ impl<'a> FileMatches<'a> {
                 Some(hit) => emit_hit(hit, &mut on_emit)?,
                 None => on_emit(Emit::Context {
                     line_number: li + 1,
-                    content: self.index.line_text(self.content, li),
+                    content: self.index.line_text(li),
                     absolute_offset: self.index.line_start(li),
-                    terminator_len: self.index.line_terminator_len(self.content, li),
+                    terminator_len: self.index.line_terminator_len(li),
                 })?,
             }
         }
@@ -727,10 +806,104 @@ impl<'a> FileMatches<'a> {
     }
 }
 
+/// Whether `pattern` is free of anchors whose meaning depends on where the
+/// haystack starts and ends.
+///
+/// Line-oriented matching runs the pattern against one line at a time, so `^`,
+/// `$`, `\A`, `\z` and `\Z` all bind to the line. Running the identical regex
+/// over the whole buffer instead would bind them to the buffer, which *narrows*
+/// what matches - the one direction a prescan must never take. Without them the
+/// two haystacks agree, because nothing else in the pattern can observe where
+/// the haystack was cut.
+///
+/// Character classes are not tracked: a `^` or `$` inside one is a literal and
+/// would be safe, but treating it as an anchor only costs the optimisation, not
+/// correctness. Erring toward "not anchor-free" is always sound.
+fn pattern_is_anchor_free(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                // `\A`, `\z` and `\Z` stay bound to the haystack ends even under
+                // `(?m)`, so they can never be made line-relative.
+                match bytes.get(i + 1) {
+                    Some(b'A') | Some(b'z') | Some(b'Z') => return false,
+                    Some(_) => i += 2,
+                    None => return false,
+                }
+            }
+            b'^' | b'$' => return false,
+            _ => i += 1,
+        }
+    }
+    true
+}
+
+/// The lines that could possibly contain a match, or `None` for "check them
+/// all".
+///
+/// The line-oriented loop asks the regex engine once per line. On a
+/// multi-gigabyte file that is billions of calls, and the engine's SIMD
+/// prefilter never gets a run long enough to pay for itself - which is most of
+/// why a whole-file scan costs several times what ripgrep charges. Scanning the
+/// buffer once and verifying only the lines a match touches collapses that to a
+/// single pass.
+///
+/// Soundness rests on two things. The pattern must be anchor-free, so that a
+/// line and the buffer are interchangeable haystacks. And every line a returned
+/// match *spans* is a candidate, not just the line it starts on: `find_iter`
+/// yields leftmost non-overlapping matches, so a match beginning on an earlier
+/// line can be the one that covers this line's match, and a pattern that can
+/// cross `\n` (via `\s`, a negated class, or `-s`) can span several. Under those
+/// rules every line that really matches is covered, and the per-line matcher
+/// still has the final say, so extra candidates cost time and never accuracy.
+fn candidate_lines<'a>(
+    content: &'a str,
+    index: &'a LineIndex<'a>,
+    matcher: &'a SearchMatcher,
+    opts: &MatchOptions,
+) -> Option<impl Iterator<Item = usize> + 'a> {
+    // `--stop-on-nonmatch` has to see the first line that *fails*, which a
+    // candidate list by construction skips over.
+    if opts.stop_on_nonmatch {
+        return None;
+    }
+    let SearchMatcher::Standard(re) = matcher else {
+        return None;
+    };
+    if !pattern_is_anchor_free(re.as_str()) {
+        return None;
+    }
+    // A pattern that matches the empty string matches at every offset, so the
+    // prescan would yield every line and the real loop is cheaper.
+    if re.is_match("") {
+        return None;
+    }
+
+    let mut last: Option<usize> = None;
+    Some(
+        re.find_iter(content)
+            .flat_map(move |m| {
+                let first = index.line_of(m.start());
+                // Matches are non-empty here, so `end - 1` is inside the match.
+                let last_line = index.line_of(m.end() - 1);
+                first..=last_line
+            })
+            .filter(move |&li| {
+                let fresh = last != Some(li);
+                if fresh {
+                    last = Some(li);
+                }
+                fresh
+            }),
+    )
+}
+
 /// Find every matching line together with the match ranges inside it.
 fn collect_hits(
     content: &str,
-    index: &LineIndex,
+    index: &LineIndex<'_>,
     matcher: &SearchMatcher,
     opts: &MatchOptions,
 ) -> Result<Vec<LineHit>> {
@@ -739,7 +912,7 @@ fn collect_hits(
     if opts.invert_match {
         let mut out = Vec::new();
         for i in 0..index.line_count() {
-            if !matcher.is_match(index.line_text(content, i))? {
+            if !matcher.is_match(index.line_text(i))? {
                 out.push(LineHit {
                     idx: i,
                     spans: Vec::new(),
@@ -775,32 +948,49 @@ fn collect_hits(
             // past the end of its line is reported only on the line it starts
             // on rather than once per line it touches.
             return Ok(group_spans_by_line(
-                content,
                 index,
-                &clip_spans_to_start_line(content, index, &spans),
+                &clip_spans_to_start_line(index, &spans),
             ));
         }
-        return Ok(group_spans_by_line(content, index, &spans));
+        return Ok(group_spans_by_line(index, &spans));
     }
 
     // Line-oriented mode: match each line separately so `^` and `$` anchor
     // per line, as ripgrep does.
     let mut out = Vec::new();
-    for i in 0..index.line_count() {
+    let visit = |i: usize, out: &mut Vec<LineHit>| -> Result<bool> {
         let spans = if opts.all_spans {
-            matcher.find_spans(index.line_text(content, i))?
+            matcher.find_spans(index.line_text(i))?
         } else {
             matcher
-                .find_first_span(index.line_text(content, i))?
+                .find_first_span(index.line_text(i))?
                 .into_iter()
                 .collect()
         };
         if !spans.is_empty() {
             out.push(LineHit { idx: i, spans });
             if max.is_some_and(|m| out.len() >= m) {
-                break;
+                return Ok(false);
             }
         } else if opts.stop_on_nonmatch && !out.is_empty() {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+
+    // The prescan is lazy, so `--max-count` still stops early instead of
+    // scanning the rest of the file for candidates it will never look at.
+    if let Some(candidates) = candidate_lines(content, index, matcher, opts) {
+        for i in candidates {
+            if !visit(i, &mut out)? {
+                break;
+            }
+        }
+        return Ok(out);
+    }
+
+    for i in 0..index.line_count() {
+        if !visit(i, &mut out)? {
             break;
         }
     }
@@ -810,6 +1000,415 @@ fn collect_hits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // The whole-buffer line prescan
+    //
+    // Asking the regex engine once per line is billions of calls on a large
+    // file. Scanning the buffer once and verifying only the lines a match
+    // touches is equivalent *only* when the pattern cannot tell where the
+    // haystack was cut, so these pin down both the gate and the equivalence.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn anchors_disable_the_prescan() {
+        assert!(pattern_is_anchor_free("needle"));
+        assert!(pattern_is_anchor_free(r"\bneedle\b"));
+        assert!(pattern_is_anchor_free(r"a\\b"));
+        assert!(pattern_is_anchor_free(r"\^literal"));
+        assert!(pattern_is_anchor_free(r"\$literal"));
+
+        assert!(!pattern_is_anchor_free("^needle"));
+        assert!(!pattern_is_anchor_free("needle$"));
+        assert!(!pattern_is_anchor_free(r"\Aneedle"));
+        assert!(!pattern_is_anchor_free(r"needle\z"));
+        assert!(!pattern_is_anchor_free(r"needle\Z"));
+        // A class member is a literal, but rejecting it only loses speed.
+        assert!(!pattern_is_anchor_free("[$]"));
+        // A trailing backslash is malformed; refuse rather than index past it.
+        assert!(!pattern_is_anchor_free("needle\\"));
+    }
+
+    // The property that makes the prescan safe: for every pattern it accepts,
+    // the lines it proposes are a superset of the lines that actually match.
+    // Brute-forced against the per-line loop the prescan replaces.
+    #[test]
+    fn prescan_never_drops_a_matching_line() {
+        let patterns = [
+            "a",
+            "ab",
+            "a.c",
+            "a+b",
+            "[abc]+",
+            "a|bc",
+            r"\bword\b",
+            r"\s+x",
+            "a\nb",
+            r"[^q]z",
+            "(?i)ABC",
+            r"\d+",
+            "xyz",
+        ];
+        let haystacks = [
+            "",
+            "a",
+            "abc\n",
+            "abc\ndef\n",
+            "a\nb\nc\n",
+            "aaa\nbbb\nccc",
+            "word here\nno match\nanother word\n",
+            "x\r\ny\r\n",
+            " x\n  x\nq\n",
+            "az\nqz\nbz\n",
+            "ABC\nabc\nAbC\n",
+            "12\n34a\n\n56\n",
+            "no matches at all\nnothing here\n",
+            "a\n\n\na\n",
+        ];
+
+        for pat in patterns {
+            let re = regex::Regex::new(pat).expect("test pattern compiles");
+            let matcher = SearchMatcher::Standard(re);
+            for hay in haystacks {
+                let index = LineIndex::new(hay);
+                let opts = MatchOptions::default();
+
+                // Lines that genuinely match, computed the slow, obvious way.
+                let mut expected = Vec::new();
+                for i in 0..index.line_count() {
+                    if matcher
+                        .is_match(index.line_text(i))
+                        .expect("standard matcher cannot error")
+                    {
+                        expected.push(i);
+                    }
+                }
+
+                // Declining is always allowed; it just means the full loop.
+                if let Some(iter) = candidate_lines(hay, &index, &matcher, &opts) {
+                    let proposed: Vec<usize> = iter.collect();
+                    // Ascending and deduplicated, so `--max-count` can stop
+                    // early and still return the first N matching lines.
+                    assert!(
+                        proposed.windows(2).all(|w| w[0] < w[1]),
+                        "pattern {pat:?} on {hay:?}: candidates {proposed:?} not ascending"
+                    );
+                    for want in &expected {
+                        assert!(
+                            proposed.contains(want),
+                            "pattern {pat:?} on {hay:?}: line {want} matches but was not proposed \
+                             (candidates {proposed:?})"
+                        );
+                    }
+                }
+
+                // Whichever path it took, the answer must be the same.
+                let hits = collect_hits(hay, &index, &matcher, &opts)
+                    .expect("standard matcher cannot error");
+                let got: Vec<usize> = hits.iter().map(|h| h.idx).collect();
+                assert_eq!(got, expected, "pattern {pat:?} on {hay:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn prescan_respects_max_count_and_stop_on_nonmatch() {
+        let hay = "hit\nhit\nmiss\nhit\n";
+        let matcher = SearchMatcher::Standard(regex::Regex::new("hit").unwrap());
+        let index = LineIndex::new(hay);
+
+        let opts = MatchOptions {
+            max_count: Some(2),
+            ..MatchOptions::default()
+        };
+        let hits = collect_hits(hay, &index, &matcher, &opts).unwrap();
+        assert_eq!(hits.iter().map(|h| h.idx).collect::<Vec<_>>(), vec![0, 1]);
+
+        // `--stop-on-nonmatch` must see line 2 fail, which a candidate list
+        // skips, so the prescan has to decline outright.
+        let opts = MatchOptions {
+            stop_on_nonmatch: true,
+            ..MatchOptions::default()
+        };
+        assert!(candidate_lines(hay, &index, &matcher, &opts).is_none());
+        let hits = collect_hits(hay, &index, &matcher, &opts).unwrap();
+        assert_eq!(hits.iter().map(|h| h.idx).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn prescan_declines_when_every_line_matches_anyway() {
+        // An empty-matching pattern matches at every offset, so a prescan would
+        // propose every line at the cost of an extra pass.
+        let hay = "a\nb\n";
+        let index = LineIndex::new(hay);
+        let matcher = SearchMatcher::Standard(regex::Regex::new("x*").unwrap());
+        let opts = MatchOptions::default();
+        assert!(candidate_lines(hay, &index, &matcher, &opts).is_none());
+    }
+
+    #[test]
+    fn prescan_proposes_every_line_a_match_spans() {
+        // `\s+` matches across the newline, so one match covers both lines and
+        // both have to be offered.
+        let hay = "a \n b\nzzz\n";
+        let index = LineIndex::new(hay);
+        let matcher = SearchMatcher::Standard(regex::Regex::new(r"\s+").unwrap());
+        let opts = MatchOptions::default();
+        let proposed: Vec<usize> = candidate_lines(hay, &index, &matcher, &opts)
+            .expect("anchor-free and non-empty")
+            .collect();
+        assert!(proposed.contains(&0));
+        assert!(proposed.contains(&1));
+    }
+
+    //
+    // `fancy_regex`'s VM has no literal prefilter, so a pattern like
+    // `(?<!//)Needle` is tried at every byte offset. Gating it on a relaxed,
+    // linear-time approximation makes the common "this haystack has nothing"
+    // case cheap. The prefilter is only ever allowed to answer *no*, so these
+    // tests care about one thing above all: the answers must not change.
+    // -----------------------------------------------------------------------
+
+    fn pcre(pattern: &str) -> SearchMatcher {
+        build_search_matcher(
+            &[pattern.to_string()],
+            &MatcherConfig {
+                engine: RegexEngine::Pcre2,
+                ..Default::default()
+            },
+        )
+        .expect("pattern compiles")
+    }
+
+    #[test]
+    fn a_lookaround_pattern_gets_a_prefilter() {
+        match pcre(r"(?<!//)Needle") {
+            SearchMatcher::Fancy { prefilter, .. } => {
+                let re = prefilter.expect("lookaround is relaxable, so it is worth prefiltering");
+                assert!(re.is_match("x Needle"), "the prefilter admits real matches");
+                assert!(
+                    re.is_match("//Needle"),
+                    "and admits near-misses too - it only rules things out"
+                );
+                assert!(!re.is_match("nothing here"));
+            }
+            _ => panic!("expected a fancy matcher"),
+        }
+    }
+
+    #[test]
+    fn a_pattern_with_nothing_to_relax_gets_no_prefilter() {
+        // `fancy_regex` already delegates these to `regex`; a second engine
+        // would be pure overhead.
+        for pattern in ["Needle", r"Needle\d+"] {
+            match pcre(pattern) {
+                SearchMatcher::Fancy { prefilter, .. } => {
+                    assert!(prefilter.is_none(), "{pattern} needs no prefilter")
+                }
+                _ => panic!("expected a fancy matcher"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrelaxable_pattern_gets_no_prefilter() {
+        match pcre(r"(Needle)\1") {
+            SearchMatcher::Fancy { prefilter, .. } => assert!(prefilter.is_none()),
+            _ => panic!("expected a fancy matcher"),
+        }
+    }
+
+    #[test]
+    fn the_prefilter_does_not_change_any_answer() {
+        // Each case pairs a haystack with whether the real pattern matches it.
+        // A prefilter that ever turned a `true` into a `false` would be silently
+        // losing results, which is the failure mode worth guarding.
+        let cases: [(&str, &[(&str, bool)]); 5] = [
+            (
+                r"(?<!//)Needle",
+                &[
+                    ("let x = Needle;", true),
+                    ("//Needle", false),
+                    ("nothing at all", false),
+                    ("//Needle and Needle", true),
+                ],
+            ),
+            (
+                r"Needle(?=::)",
+                &[("Needle::new", true), ("Needle.new", false)],
+            ),
+            (
+                r"Needle(?!::)",
+                &[("Needle::new", false), ("Needle.new", true)],
+            ),
+            (
+                r"(?>Nee)dle",
+                &[("Needle", true), ("Needle", true), ("nope", false)],
+            ),
+            (
+                r"(?=.*Haystack)Needle",
+                &[
+                    ("Needle in a Haystack", true),
+                    ("Needle alone", false),
+                    ("Haystack alone", false),
+                ],
+            ),
+        ];
+
+        for (pattern, haystacks) in cases {
+            let gated = pcre(pattern);
+            // The same pattern with the prefilter removed, as the control.
+            let ungated = match pcre(pattern) {
+                SearchMatcher::Fancy { re, .. } => SearchMatcher::Fancy {
+                    re,
+                    prefilter: None,
+                },
+                other => other,
+            };
+            for (hay, expected) in haystacks {
+                assert_eq!(
+                    gated.is_match(hay).unwrap(),
+                    *expected,
+                    "{pattern:?} against {hay:?}"
+                );
+                assert_eq!(
+                    gated.is_match(hay).unwrap(),
+                    ungated.is_match(hay).unwrap(),
+                    "prefilter changed is_match for {pattern:?} against {hay:?}"
+                );
+                assert_eq!(
+                    gated.find_spans(hay).unwrap(),
+                    ungated.find_spans(hay).unwrap(),
+                    "prefilter changed find_spans for {pattern:?} against {hay:?}"
+                );
+                assert_eq!(
+                    gated.find_first_span(hay).unwrap(),
+                    ungated.find_first_span(hay).unwrap(),
+                    "prefilter changed find_first_span for {pattern:?} against {hay:?}"
+                );
+            }
+        }
+    }
+
+    /// The subset property, checked by brute force over a broad pattern corpus.
+    ///
+    /// This is the assumption the whole optimisation rests on, in both places it
+    /// is used - candidate planning and the prefilter - so it is worth checking
+    /// against the real backtracking engine rather than by inspection. For every
+    /// pattern and every haystack: if `fancy_regex` matches, the relaxed pattern
+    /// compiled with `regex` must match too. The converse is allowed and
+    /// expected; that is what makes it a *relaxation*.
+    #[test]
+    fn relaxation_is_a_superset_of_every_pattern_it_accepts() {
+        let patterns = [
+            r"(?<!//)Needle",
+            r"(?<=//)Needle",
+            r"Needle(?=::)",
+            r"Needle(?!::)",
+            r"(?=.*Hay)Needle",
+            r"(?!.*Hay)Needle",
+            r"^(?=.*a)(?=.*b).*$",
+            r"(?>Nee)dle",
+            r"a(?>b|bc)d",
+            r"(?:Nee(?=d))+dle",
+            r"\bNeedle\b(?!s)",
+            r"(?i)(?<!x)needle",
+            r"[Nn](?<!x)eedle",
+            r"(?<!\w)Needle",
+            r"Needle(?=\s*[;,])",
+            r"(?<name>Nee)(?=dle)dle",
+            r"(a(?=b)|c)d",
+            r"^(?!#)\s*Needle",
+            r"Needle(?![)])",
+            r"(?=[(])\(Needle",
+            // Character-class forms: `(?=` and friends are ordinary members here.
+            r"[](?=a)]n",
+            r"[^](?<!a)]n",
+            r"[[:digit:](?=a)]n",
+            r"[]a]n",
+            r"[[:alpha:]]eedle(?!s)",
+            r"\p{L}+(?=dle)",
+        ];
+        let haystacks = [
+            "",
+            "Needle",
+            "//Needle",
+            " Needle ",
+            "Needle::new()",
+            "Needle.new()",
+            "Needle in a Hay stack",
+            "ab",
+            "ba",
+            "abd",
+            "abcd",
+            "cd",
+            "needle",
+            "xneedle",
+            "Needles",
+            "Needle;",
+            "Needle , x",
+            "# Needle",
+            "  Needle",
+            "Needle)",
+            "(Needle",
+            "NeeNeedle",
+            "no match at all",
+            "]Needle[",
+            "]n",
+            "an",
+            "(n",
+            "?n",
+            "=n",
+            "3n",
+            "Needle(?=a)",
+            "\u{3b1}\u{3b2}dle",
+        ];
+
+        for pattern in patterns {
+            let fancy = fancy_regex::Regex::new(pattern).expect("pattern compiles as PCRE");
+            let Some(relaxed_src) = tgrep_core::query::relax_for_indexing(pattern) else {
+                continue; // bailing out is always safe
+            };
+            let Ok(relaxed) = regex::Regex::new(&relaxed_src) else {
+                continue; // failing to compile degrades to a full scan
+            };
+            for hay in haystacks {
+                if fancy.is_match(hay).unwrap() {
+                    assert!(
+                        relaxed.is_match(hay),
+                        "relaxation NARROWED {pattern:?} to {relaxed_src:?}: it drops {hay:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_prefilter_inherits_the_case_insensitive_flag() {
+        // A prefilter compiled without `-i` would reject `NEEDLE` outright and
+        // hide a match the real pattern would have found.
+        let matcher = build_search_matcher(
+            &[r"(?<!//)Needle".to_string()],
+            &MatcherConfig {
+                engine: RegexEngine::Pcre2,
+                case_insensitive: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matcher.is_match("let x = NEEDLE;").unwrap());
+        assert!(!matcher.is_match("//NEEDLE").unwrap());
+    }
+
+    #[test]
+    fn the_prefilter_survives_replacement() {
+        let matcher = pcre(r"(?<!//)Needle");
+        let (out, _) = matcher.replace_all("a Needle here", "Pin").unwrap();
+        assert_eq!(out, "a Pin here");
+        let (out, spans) = matcher.replace_all("no match here", "Pin").unwrap();
+        assert_eq!(out, "no match here");
+        assert!(spans.is_empty());
+    }
 
     #[test]
     fn line_blocks_merge_matches_that_share_a_line() {
@@ -859,11 +1458,7 @@ mod tests {
             let expected: Vec<&str> = content.lines().collect();
             assert_eq!(index.line_count(), expected.len(), "count for {content:?}");
             for (i, want) in expected.iter().enumerate() {
-                assert_eq!(
-                    &index.line_text(content, i),
-                    want,
-                    "line {i} of {content:?}"
-                );
+                assert_eq!(&index.line_text(i), want, "line {i} of {content:?}");
             }
         }
     }
@@ -883,7 +1478,7 @@ mod tests {
         let content = "start\nmiddle\nend\n";
         let index = LineIndex::new(content);
         // "start\nmiddle\nend" as one match spanning three lines.
-        let hits = group_spans_by_line(content, &index, &[(0, 16)]);
+        let hits = group_spans_by_line(&index, &[(0, 16)]);
         assert_eq!(
             hits,
             vec![
@@ -907,7 +1502,7 @@ mod tests {
     fn group_spans_merges_overlapping_ranges_on_one_line() {
         let content = "aaaa";
         let index = LineIndex::new(content);
-        let hits = group_spans_by_line(content, &index, &[(0, 2), (1, 3)]);
+        let hits = group_spans_by_line(&index, &[(0, 2), (1, 3)]);
         assert_eq!(
             hits,
             vec![LineHit {
@@ -921,7 +1516,7 @@ mod tests {
     fn group_spans_keeps_separate_ranges_apart() {
         let content = "foo bar foo";
         let index = LineIndex::new(content);
-        let hits = group_spans_by_line(content, &index, &[(0, 3), (8, 11)]);
+        let hits = group_spans_by_line(&index, &[(0, 3), (8, 11)]);
         assert_eq!(
             hits,
             vec![LineHit {

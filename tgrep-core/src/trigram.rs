@@ -7,6 +7,50 @@ use std::collections::{HashMap, HashSet};
 
 pub type TrigramHash = u32;
 
+/// Hasher for trigram-keyed maps.
+///
+/// A trigram key *is* its own hash: packing three bytes into 24 bits is
+/// injective, so there is nothing for a cryptographic hash to protect against.
+/// The default SipHash is not free, though, and extraction hashes once per
+/// input byte — twice for a file containing any uppercase — which put it
+/// directly on the critical path of every index build.
+///
+/// One multiply-xorshift replaces it. The xorshift is not optional: hashbrown
+/// takes the bucket index from the *low* bits of the hash, and the low `k` bits
+/// of `value * K` depend only on the low `k` bits of `value`, which for a
+/// trigram is its last byte alone. Folding the high half down mixes all 24 bits
+/// into both the bucket index and the top-7-bit control byte.
+#[derive(Default, Clone, Copy)]
+pub struct TrigramHasher(u64);
+
+impl std::hash::Hasher for TrigramHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    /// Only reachable if a key type other than `u32` is ever used with this
+    /// hasher; kept correct rather than fast.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        let mixed = u64::from(value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mixed ^ (mixed >> 32);
+    }
+}
+
+/// [`std::hash::BuildHasher`] for [`TrigramHasher`].
+pub type BuildTrigramHasher = std::hash::BuildHasherDefault<TrigramHasher>;
+
+/// A file's trigrams with their merged masks.
+pub type TrigramMaskMap = HashMap<TrigramHash, TrigramMasks, BuildTrigramHasher>;
+
 /// Pack three bytes into a single u32 trigram hash.
 #[inline]
 pub fn hash(a: u8, b: u8, c: u8) -> TrigramHash {
@@ -35,7 +79,7 @@ pub fn bloom_hash(byte: u8) -> u8 {
 }
 
 /// Per-trigram masks for a single file.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrigramMasks {
     /// Positional mask: bit i is set if the trigram occurs at offset where offset % 8 == i.
     pub loc_mask: u8,
@@ -71,7 +115,7 @@ pub fn extract_with_masks(data: &[u8]) -> Vec<(TrigramHash, TrigramMasks)> {
 
     // Use HashMap instead of 16M arrays — much less allocation pressure
     // since typical files have far fewer than 16M unique trigrams.
-    let mut masks: HashMap<TrigramHash, TrigramMasks> = HashMap::new();
+    let mut masks = TrigramMaskMap::default();
     let mut order: Vec<TrigramHash> = Vec::new();
 
     for (i, window) in data.windows(3).enumerate() {
@@ -86,10 +130,7 @@ pub fn extract_with_masks(data: &[u8]) -> Vec<(TrigramHash, TrigramMasks)> {
         }
     }
 
-    order
-        .into_iter()
-        .map(|h| (h, masks.remove(&h).unwrap()))
-        .collect()
+    order.into_iter().map(|h| (h, masks[&h])).collect()
 }
 
 /// Check whether consecutive trigrams from a literal can be adjacent based on masks.
@@ -121,24 +162,74 @@ pub fn check_next_byte(masks: &TrigramMasks, next_byte: u8) -> bool {
 /// Extract trigrams with masks from both original and lowercased content,
 /// merging masks per trigram. This is the standard extraction used by both
 /// the on-disk builder and the live index overlay.
-pub fn extract_merged_masks(content: &[u8]) -> HashMap<TrigramHash, TrigramMasks> {
-    let tri_masks = extract_with_masks(content);
-
-    let mut per_tri: HashMap<TrigramHash, TrigramMasks> = HashMap::with_capacity(tri_masks.len());
-    for (tri, m) in tri_masks {
-        per_tri.insert(tri, m);
-    }
-
-    if !content.iter().any(|&b| b.is_ascii_uppercase()) {
+pub fn extract_merged_masks(content: &[u8]) -> TrigramMaskMap {
+    let mut per_tri = TrigramMaskMap::default();
+    if content.len() < 3 {
         return per_tri;
     }
 
-    let lower = content.to_ascii_lowercase();
-    let lower_tri_masks = extract_with_masks(&lower);
-    for &(tri, m) in lower_tri_masks.iter() {
-        let entry = per_tri.entry(tri).or_default();
-        entry.loc_mask |= m.loc_mask;
-        entry.next_mask |= m.next_mask;
+    // Folding the case conversion into the window rather than materialising a
+    // lowercased duplicate of the file keeps peak memory independent of file
+    // size, which matters because the builder holds several whole files in
+    // flight at once.
+    //
+    // This is equivalent to extracting from a lowercased copy: ASCII
+    // lowercasing is 1:1 on bytes, so every offset — and therefore every
+    // `loc_bit` — is unchanged, and `|=` is associative, so merging per window
+    // lands on the same masks as merging two completed sets.
+    //
+    // Both cases are folded into the *same* pass rather than run as two passes
+    // over the file. Most windows in real source are already lowercase, so
+    // their lowered trigram is the same key; recognising that collapses the
+    // second pass's hash and probe into a single extra `|=` on an entry that is
+    // already in hand, and leaves genuine work only for windows that actually
+    // contain an uppercase byte.
+    let has_upper = content.iter().any(|byte| byte.is_ascii_uppercase());
+    let len = content.len();
+
+    for (i, window) in content.windows(3).enumerate() {
+        let trigram = hash(window[0], window[1], window[2]);
+        let loc = loc_bit(i);
+        let next = if i + 3 < len {
+            next_bit(content[i + 3])
+        } else {
+            0
+        };
+
+        if !has_upper {
+            // No uppercase anywhere means the lowercased pass would recompute
+            // this identical entry for every window.
+            let entry = per_tri.entry(trigram).or_default();
+            entry.loc_mask |= loc;
+            entry.next_mask |= next;
+            continue;
+        }
+
+        let lowered = hash(
+            window[0].to_ascii_lowercase(),
+            window[1].to_ascii_lowercase(),
+            window[2].to_ascii_lowercase(),
+        );
+        // The lowercased pass also lowercases the *following* byte, so an
+        // otherwise-lowercase window followed by an uppercase byte still
+        // contributes a second next_mask bit to the same entry.
+        let next_lowered = if i + 3 < len {
+            next_bit(content[i + 3].to_ascii_lowercase())
+        } else {
+            0
+        };
+
+        let entry = per_tri.entry(trigram).or_default();
+        entry.loc_mask |= loc;
+        if lowered == trigram {
+            entry.next_mask |= next | next_lowered;
+            continue;
+        }
+        entry.next_mask |= next;
+
+        let lowered_entry = per_tri.entry(lowered).or_default();
+        lowered_entry.loc_mask |= loc;
+        lowered_entry.next_mask |= next_lowered;
     }
 
     per_tri
@@ -192,6 +283,60 @@ mod tests {
     fn test_is_binary() {
         assert!(!is_binary(b"hello world"));
         assert!(is_binary(b"hello\0world"));
+    }
+
+    /// `extract_merged_masks` folds the lowercase pass into the window instead
+    /// of materialising a lowercased copy of the file. Pin it against the
+    /// formulation it replaced, which is the definition of what it must produce.
+    fn merged_masks_via_materialised_copy(content: &[u8]) -> TrigramMaskMap {
+        let mut expected = TrigramMaskMap::default();
+        for (tri, m) in extract_with_masks(content) {
+            expected.insert(tri, m);
+        }
+        let lower = content.to_ascii_lowercase();
+        for (tri, m) in extract_with_masks(&lower) {
+            let entry = expected.entry(tri).or_default();
+            entry.loc_mask |= m.loc_mask;
+            entry.next_mask |= m.next_mask;
+        }
+        expected
+    }
+
+    #[test]
+    fn merged_masks_match_a_materialised_lowercase_pass() {
+        // Mixed case, repeats across the 8-byte `loc_mask` period, non-ASCII,
+        // and a trailing window whose next byte does not exist.
+        for content in [
+            b"Foo BAR foo Baz QUX quux Foo".as_slice(),
+            b"AAAAAAAAAAAAAAAAA".as_slice(),
+            b"MixedCase\nMIXEDCASE\nmixedcase\r\n".as_slice(),
+            b"\xc3\x9cber STRASSE \xc3\xbcber strasse".as_slice(),
+            b"ABC".as_slice(),
+            b"ab".as_slice(),
+            b"".as_slice(),
+            b"no uppercase here at all".as_slice(),
+            // An all-lowercase window whose *next* byte is uppercase. The
+            // lowercased pass folds onto the same key, so its next_mask bit has
+            // to reach the entry the original pass already created.
+            b"abcD abcd".as_slice(),
+            b"zzzZzzz".as_slice(),
+        ] {
+            assert_eq!(
+                extract_merged_masks(content),
+                merged_masks_via_materialised_copy(content),
+                "mismatch for {:?}",
+                String::from_utf8_lossy(content)
+            );
+        }
+    }
+
+    #[test]
+    fn merged_masks_cover_both_cases_of_a_trigram() {
+        let merged = extract_merged_masks(b"Foo");
+        // The literal bytes and their lowercased form are both present, so a
+        // case-insensitive query planned on either spelling finds the file.
+        assert!(merged.contains_key(&hash(b'F', b'o', b'o')));
+        assert!(merged.contains_key(&hash(b'f', b'o', b'o')));
     }
 
     #[test]

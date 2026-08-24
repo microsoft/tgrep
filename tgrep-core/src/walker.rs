@@ -2,12 +2,45 @@
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
-/// Default maximum file size to index (1 MB). Larger files are skipped.
+/// The size limit a walk applies when the caller does not name one.
 ///
-/// This bounds the index, which is why it stays the default for index builds.
-/// Search paths that scan the filesystem directly (`--no-index`, `--files`)
-/// have no such constraint and default to no limit, matching ripgrep.
-pub const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+/// 64 MiB, which is a deliberate divergence from ripgrep's "no limit". The
+/// divergence is affordable because tgrep is not a one-shot scanner: a file
+/// that a walk picks up is also a file the index carries and re-reads on every
+/// query that its trigrams make a candidate for, so an outlier's cost is paid
+/// repeatedly rather than once.
+///
+/// Measured on a 292,911-file Microsoft Substrate enlistment, where a single
+/// 13.41 GiB generated build artifact is **71% of all searchable bytes**:
+///
+/// | | uncapped | 64 MiB cap |
+/// |---|---|---|
+/// | cold index build | 214.5 s | 64.2 s |
+/// | warm query, same pattern | 21.30 s | 0.55 s |
+/// | files the query matched | 2,990 | 2,989 |
+///
+/// A 39x query win and a 3.3x build win for one lost match in one generated
+/// file. The cap excluded 2 files of 292,911.
+///
+/// Note what this is *not* buying. The cap is no longer what bounds memory —
+/// files past [`crate::builder`]'s mapping threshold are memory-mapped, so
+/// their pages are file-backed and reclaimable. And size remains a poor proxy
+/// for *index* cost, because oversized files are overwhelmingly generated and
+/// therefore repetitive: the kernel's 24 MB `dcn_3_2_0_sh_mask.h` contributes
+/// 7,263 distinct trigrams, *fewer* than the 10,936 of the 224 KB
+/// `fs/ext4/super.c`. What the cap buys is bounded *scan* time, and it buys it
+/// where the distribution is worst.
+///
+/// The cost is real and is the reason this constant is documented at length:
+/// an oversized file is counted but its path is never recorded, so a match
+/// inside one is reported as no match, with exit status 0. Two things keep
+/// that from being silent:
+///
+/// - `--no-max-filesize` restores the uncapped, ripgrep-identical behaviour.
+/// - A file named directly on the command line is never dropped by the
+///   *default* cap, only by one the user asked for. Pointing at a file is an
+///   unambiguous request to search it.
+pub const DEFAULT_MAX_FILE_SIZE: Option<u64> = Some(64 * 1024 * 1024);
 
 /// Binary extensions that can be rejected without reading file content.
 const BINARY_EXTENSIONS: &[&str] = &[
@@ -95,10 +128,9 @@ pub struct WalkOptions {
     pub threads: Option<usize>,
 }
 
-// Hand-written rather than derived: `Option::default()` is `None`, which would
-// silently turn the size limit off for every existing caller that builds this
-// struct with `..Default::default()` (the index builder and the server among
-// them). The default has to keep bounding the index.
+// Hand-written rather than derived so the size limit is a deliberate choice
+// rather than whatever `Option::default()` happens to be. See
+// [`DEFAULT_MAX_FILE_SIZE`], which diverges from ripgrep.
 impl Default for WalkOptions {
     fn default() -> Self {
         Self {
@@ -106,7 +138,7 @@ impl Default for WalkOptions {
             no_ignore: false,
             search_binary: false,
             follow_links: false,
-            max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
             collect_gitignore_files: false,
             exclude_dirs: Vec::new(),
             max_depth: None,
@@ -160,6 +192,39 @@ fn display_ignore_error(err: &ignore::Error, root: &Path) -> String {
     format!("{shown}: {inner}")
 }
 
+/// Git's own case-insensitive ignore matching, when the repository asks for it.
+///
+/// Both walks build this the same way on purpose. They must agree on what the
+/// tree contains: the indexing walk decides what goes in, and the stale check
+/// decides what is missing and should be evicted. A file one includes and the
+/// other does not is indexed and then immediately deleted, every single time —
+/// the failure mode pinned by `tgrep-cli/tests/serve_max_filesize.rs`.
+///
+/// The flags must be the *same* ones handed to `WalkBuilder`, because this is
+/// only ever sound as a narrowing of the case-sensitive pass. A source that
+/// pass was told to skip must be skipped here too, or a `--no-ignore-*` flag
+/// would be silently undone.
+///
+/// See [`crate::gitignore::CaseInsensitiveIgnore`] for what it matches and why.
+fn git_ignorecase_filter(
+    root: &Path,
+    no_ignore: bool,
+    no_ignore_vcs: bool,
+    no_ignore_exclude: bool,
+    no_ignore_parent: bool,
+) -> Option<crate::gitignore::CaseInsensitiveIgnore> {
+    (!no_ignore)
+        .then(|| {
+            crate::gitignore::CaseInsensitiveIgnore::new(
+                root,
+                !no_ignore_vcs,
+                !no_ignore_exclude,
+                !no_ignore_parent,
+            )
+        })
+        .flatten()
+}
+
 /// Walk a directory tree, respecting .gitignore rules (unless disabled).
 /// Returns paths of text files suitable for indexing/searching.
 ///
@@ -185,6 +250,13 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         .flatten()
         .map(std::sync::Arc::new);
     let p4ignore_root = root.clone();
+    let ignorecase = git_ignorecase_filter(
+        &root,
+        opts.no_ignore,
+        opts.no_ignore_vcs,
+        opts.no_ignore_exclude,
+        opts.no_ignore_parent,
+    );
 
     let mut builder = WalkBuilder::new(&root);
     builder
@@ -203,16 +275,19 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
             if entry.file_name() == ".gitignore" {
                 return true;
             }
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if let Some(ignorecase) = &ignorecase
+                && ignorecase.excludes(entry.path(), is_dir)
+            {
+                return false;
+            }
             let Some(matcher) = &p4ignore else {
                 return true;
             };
             let Ok(relative) = entry.path().strip_prefix(&p4ignore_root) else {
                 return true;
             };
-            !matcher.is_ignored(
-                relative,
-                entry.file_type().is_some_and(|kind| kind.is_dir()),
-            )
+            !matcher.is_ignored(relative, is_dir)
         })
         .threads(opts.threads.unwrap_or_else(walker_thread_count).max(1));
     // `--ignore-file` is applied even under `--no-ignore`: the user asked for
@@ -321,8 +396,14 @@ pub fn build_gitignore_matcher_from_files(
     root: &Path,
     gitignore_files: &[PathBuf],
     ignore_files: &[PathBuf],
+    no_require_git: bool,
 ) -> Option<crate::gitignore::IgnoreMatcher> {
-    crate::gitignore::matcher_from_ignore_paths(root, gitignore_files, ignore_files)
+    crate::gitignore::matcher_from_ignore_paths_with_options(
+        root,
+        gitignore_files,
+        ignore_files,
+        no_require_git,
+    )
 }
 
 /// Filesystem metadata for a single file (no content read).
@@ -340,6 +421,8 @@ pub struct MetaWalkResult {
     pub files: Vec<FileMeta>,
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
+    /// Entries or metadata reads the walk could not inspect.
+    pub skipped_error: usize,
 }
 
 /// Options for [`walk_file_metadata`].
@@ -370,15 +453,15 @@ pub struct MetaWalkOptions {
 }
 
 impl Default for MetaWalkOptions {
-    /// Hand-written rather than derived: `#[derive(Default)]` would make
-    /// `max_file_size` `None`, which means *no limit* and so would quietly
-    /// invert the default rather than matching [`WalkOptions::default`].
+    /// Hand-written rather than derived so the size limit stays an explicit
+    /// decision that matches [`WalkOptions::default`] rather than an accident
+    /// of `#[derive(Default)]`.
     fn default() -> Self {
         Self {
             exclude_dirs: Vec::new(),
             no_ignore: false,
             no_require_git: false,
-            max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
         }
     }
 }
@@ -397,12 +480,18 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
     let results = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
+    let skipped_error = std::sync::atomic::AtomicUsize::new(0);
     let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(opts.exclude_dirs.clone());
     let p4ignore = (!no_ignore)
         .then(|| crate::gitignore::build_p4ignore_matcher(root))
         .flatten()
         .map(std::sync::Arc::new);
     let match_root = root.to_path_buf();
+    // `MetaWalkOptions` carries no finer ignore flags, and the builder below
+    // enables gitignore and exclude together on `!no_ignore`. Passing `false`
+    // for both mirrors that exactly, which is what keeps this walk and
+    // `walk_dir` agreeing about the tree under `serve`.
+    let ignorecase = git_ignorecase_filter(root, no_ignore, false, false, false);
     let root = root.to_path_buf();
 
     let walker = WalkBuilder::new(&root)
@@ -412,16 +501,19 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
         .git_global(!no_ignore)
         .git_exclude(!no_ignore)
         .filter_entry(move |entry| {
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if let Some(ignorecase) = &ignorecase
+                && ignorecase.excludes(entry.path(), is_dir)
+            {
+                return false;
+            }
             let Some(matcher) = &p4ignore else {
                 return true;
             };
             let Ok(relative) = entry.path().strip_prefix(&match_root) else {
                 return true;
             };
-            !matcher.is_ignored(
-                relative,
-                entry.file_type().is_some_and(|kind| kind.is_dir()),
-            )
+            !matcher.is_ignored(relative, is_dir)
         })
         .threads(walker_thread_count())
         .build_parallel();
@@ -432,10 +524,14 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
         let results = &results;
         let gitignore_files = &gitignore_files;
         let ignore_files = &ignore_files;
+        let skipped_error = &skipped_error;
         Box::new(move |entry| {
             let entry = match entry {
                 Ok(e) => e,
-                Err(_) => return ignore::WalkState::Continue,
+                Err(_) => {
+                    skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return ignore::WalkState::Continue;
+                }
             };
 
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
@@ -470,22 +566,27 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
                 Err(_) => return ignore::WalkState::Continue,
             };
 
-            if let Ok(meta) = entry.metadata() {
-                if max_file_size.is_some_and(|limit| meta.len() > limit) {
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(_) => {
+                    skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return ignore::WalkState::Continue;
                 }
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                results.lock().unwrap().push(FileMeta {
-                    relative_path: rel_path,
-                    mtime,
-                    size: meta.len(),
-                });
+            };
+            if max_file_size.is_some_and(|limit| meta.len() > limit) {
+                return ignore::WalkState::Continue;
             }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            results.lock().unwrap().push(FileMeta {
+                relative_path: rel_path,
+                mtime,
+                size: meta.len(),
+            });
 
             ignore::WalkState::Continue
         })
@@ -495,6 +596,7 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
         files: results.into_inner().unwrap(),
         gitignore_files: gitignore_files.into_inner().unwrap(),
         ignore_files: ignore_files.into_inner().unwrap(),
+        skipped_error: skipped_error.into_inner(),
     }
 }
 
@@ -714,9 +816,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let gi =
-            build_gitignore_matcher_from_files(&root, &walk.gitignore_files, &walk.ignore_files)
-                .expect("matcher should build from discovered .gitignore files");
+        let gi = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            false,
+        )
+        .expect("matcher should build from discovered .gitignore files");
 
         assert!(gi.is_ignored(Path::new("build/output.log"), false));
         assert!(gi.is_ignored(Path::new("src/cache.tmp"), false));
@@ -775,9 +881,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let gi =
-            build_gitignore_matcher_from_files(&root, &walk.gitignore_files, &walk.ignore_files)
-                .expect("matcher should build from discovered .ignore files");
+        let gi = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            false,
+        )
+        .expect("matcher should build from discovered .ignore files");
 
         assert!(gi.is_ignored(Path::new("server/output.log"), false));
         assert!(gi.is_ignored(Path::new("build/artifact.bin"), false));
@@ -791,9 +901,26 @@ mod tests {
         // serving a subdirectory of a repository.
         let tmp = TempDir::new().unwrap();
         fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::create_dir(tmp.path().join(".git").join("info")).unwrap();
+        fs::write(
+            tmp.path().join(".gitignore"),
+            "/sub/parent.txt\n/sub/git-precedence.txt\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".ignore"),
+            "/sub/parent.tmp\n/sub/precedence.txt\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".git").join("info").join("exclude"),
+            "/sub/info.bin\n",
+        )
+        .unwrap();
         let root = tmp.path().join("sub");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n!precedence.txt\n").unwrap();
+        fs::write(root.join(".ignore"), "!git-precedence.txt\n").unwrap();
 
         let walk = walk_dir(
             &root,
@@ -802,10 +929,60 @@ mod tests {
                 ..Default::default()
             },
         );
-        let gi =
-            build_gitignore_matcher_from_files(&root, &walk.gitignore_files, &walk.ignore_files)
-                .expect("`.gitignore` should apply in a subdirectory of a git repo");
+        let gi = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            false,
+        )
+        .expect("`.gitignore` should apply in a subdirectory of a git repo");
         assert!(gi.is_ignored(Path::new("build/out.log"), false));
+        assert!(gi.is_ignored(Path::new("parent.txt"), false));
+        assert!(gi.is_ignored(Path::new("parent.tmp"), false));
+        assert!(gi.is_ignored(Path::new("info.bin"), false));
+        assert!(gi.is_ignored(Path::new("precedence.txt"), false));
+        assert!(!gi.is_ignored(Path::new("git-precedence.txt"), false));
+    }
+
+    #[test]
+    fn parent_ignore_crosses_repository_boundary_but_gitignore_does_not() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "/repo/from-parent-git.txt\n").unwrap();
+        fs::write(tmp.path().join(".ignore"), "/repo/from-parent-dot.txt\n").unwrap();
+
+        let root = tmp.path().join("repo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("from-parent-git.txt"), "kept\n").unwrap();
+        fs::write(root.join("from-parent-dot.txt"), "ignored\n").unwrap();
+
+        let options = MetaWalkOptions::default();
+        let walk = walk_file_metadata(&root, &options);
+        let paths = walk
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"from-parent-git.txt"));
+        assert!(!paths.contains(&"from-parent-dot.txt"));
+
+        let matcher = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            false,
+        )
+        .unwrap();
+        assert!(!matcher.is_ignored(Path::new("from-parent-git.txt"), false));
+        assert!(matcher.is_ignored(Path::new("from-parent-dot.txt"), false));
+
+        let lifted = build_gitignore_matcher_from_files(
+            &root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            true,
+        )
+        .unwrap();
+        assert!(lifted.is_ignored(Path::new("from-parent-git.txt"), false));
     }
 
     #[test]
@@ -970,6 +1147,23 @@ mod tests {
             vec!["src/main.rs".to_string()],
             "`.gitignore` must apply once the git gate is lifted"
         );
+
+        let metadata = walk_file_metadata(
+            root,
+            &MetaWalkOptions {
+                no_require_git: true,
+                ..Default::default()
+            },
+        );
+        let matcher = build_gitignore_matcher_from_files(
+            root,
+            &metadata.gitignore_files,
+            &metadata.ignore_files,
+            true,
+        )
+        .expect("the lifted matcher should load .gitignore outside a repository");
+        assert!(matcher.is_ignored(Path::new("build/out.rs"), false));
+        assert!(matcher.is_ignored(Path::new("noisy.log"), false));
     }
 
     /// The metadata walk feeds startup stale-file detection. If it stayed
@@ -1026,8 +1220,23 @@ mod tests {
             v
         };
 
-        // Default cap is 1 MiB, so the 2 MiB file is skipped.
-        assert_eq!(names(&MetaWalkOptions::default()), vec!["small.txt"]);
+        // A cap below the file size hides it. Pinned explicitly rather than
+        // taken from the default, so the test states the behaviour it checks
+        // instead of tracking whatever the default happens to be.
+        assert_eq!(
+            names(&MetaWalkOptions {
+                max_file_size: Some(1024 * 1024),
+                ..Default::default()
+            }),
+            vec!["small.txt"]
+        );
+
+        // The default cap is well above this file, so an ordinary large source
+        // file is indexed rather than silently dropped.
+        assert_eq!(
+            names(&MetaWalkOptions::default()),
+            vec!["big.txt", "small.txt"]
+        );
 
         // Raising the cap must reveal it. If it does not, the stale check reads
         // the file as deleted and evicts it from an index built with this cap.
@@ -1050,6 +1259,40 @@ mod tests {
     }
 
     #[test]
+    fn walks_default_to_a_64_mib_size_cap() {
+        // Both option structs hand-write `Default` precisely so this cannot
+        // drift, and both must agree: a metadata walk that disagreed with the
+        // indexing walk classified everything between the two caps as deleted
+        // and evicted it (see `tests/serve_max_filesize.rs`).
+        assert_eq!(DEFAULT_MAX_FILE_SIZE, Some(64 * 1024 * 1024));
+        assert_eq!(WalkOptions::default().max_file_size, DEFAULT_MAX_FILE_SIZE);
+        assert_eq!(
+            MetaWalkOptions::default().max_file_size,
+            DEFAULT_MAX_FILE_SIZE
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // `set_len` rather than writing the bytes: the metadata walk only stats.
+        std::fs::File::create(root.join("huge.txt"))
+            .unwrap()
+            .set_len(65 * 1024 * 1024)
+            .unwrap();
+        std::fs::File::create(root.join("large.txt"))
+            .unwrap()
+            .set_len(63 * 1024 * 1024)
+            .unwrap();
+
+        // Straddling the cap, so this pins the boundary rather than merely
+        // observing that some file survived.
+        let files = walk_file_metadata(root, &MetaWalkOptions::default()).files;
+        assert_eq!(
+            files.iter().map(|f| &f.relative_path).collect::<Vec<_>>(),
+            vec!["large.txt"]
+        );
+    }
+
+    #[test]
     fn meta_walk_options_default_matches_the_indexing_walk() {
         // A derived `Default` would give `None` here, which means *no limit* —
         // the opposite of the indexing walk's default.
@@ -1057,5 +1300,245 @@ mod tests {
             MetaWalkOptions::default().max_file_size,
             WalkOptions::default().max_file_size
         );
+    }
+
+    // --- git's case-insensitive ignore matching ------------------------------
+    //
+    // On a case-insensitive filesystem git sets `core.ignorecase` and stops
+    // distinguishing case when matching ignore rules. The `ignore` crate does
+    // not, so a rule spelled `QLogs` left a `qlogs/` directory fully walked and
+    // indexed even though `git status` never mentions it. Matching the way git
+    // does starts catching *tracked* files too, which git would never hide, so
+    // the tracked-file exemption has to come with it.
+
+    /// A `.git` directory real enough for the walker: a config and an index.
+    fn fake_git_repo(root: &Path, ignorecase: bool, tracked: &[&str]) {
+        let git = root.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(
+            git.join("config"),
+            format!("[core]\n\tignorecase = {ignorecase}\n"),
+        )
+        .unwrap();
+
+        let mut index = Vec::new();
+        index.extend_from_slice(b"DIRC");
+        index.extend_from_slice(&2u32.to_be_bytes());
+        index.extend_from_slice(&(tracked.len() as u32).to_be_bytes());
+        for path in tracked {
+            let start = index.len();
+            index.extend_from_slice(&[0u8; 60]);
+            index.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            index.extend_from_slice(path.as_bytes());
+            index.push(0);
+            while (index.len() - start) % 8 != 0 {
+                index.push(0);
+            }
+        }
+        fs::write(git.join("index"), index).unwrap();
+    }
+
+    /// The shape of the problem: a rule in one case, a directory in another,
+    /// and an untracked artifact inside it.
+    ///
+    /// Extensions are all ones the walker treats as text. A `.JPG` would be a
+    /// truer retelling of the enlistment this came from, but the binary
+    /// extension filter drops it before any of this runs, so it would prove
+    /// nothing.
+    fn ignorecase_fixture(ignorecase: bool, tracked: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fake_git_repo(root, ignorecase, tracked);
+        fs::write(root.join(".gitignore"), "QLogs\n*.txt\n").unwrap();
+        fs::create_dir_all(root.join("qlogs")).unwrap();
+        fs::write(root.join("qlogs/artifact.rs"), "junk").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        // Matched by `*.txt` only when case is ignored.
+        fs::write(root.join("src/Kept.TXT"), "tracked").unwrap();
+        fs::write(root.join("src/Gone.TXT"), "untracked").unwrap();
+        dir
+    }
+
+    #[test]
+    fn ignorecase_hides_what_git_hides_and_keeps_what_git_tracks() {
+        // `src/Kept.TXT` is tracked, so `*.txt` must not hide it even though
+        // the rule now matches. `src/Gone.TXT` is identical but untracked, and
+        // the whole `qlogs/` directory goes — which is the point.
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(
+            names.contains(&"src/Kept.TXT".to_string()),
+            "dropped a tracked file: {names:?}"
+        );
+        assert!(names.contains(&"src/main.rs".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"src/Gone.TXT".to_string()),
+            "kept an untracked file the rule matches: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("qlogs/")),
+            "kept an untracked file inside an ignored directory: {names:?}"
+        );
+    }
+
+    #[test]
+    fn without_ignorecase_the_walk_is_unchanged() {
+        // The gate: a repository that distinguishes case gets git's ordinary
+        // case-sensitive behaviour, and pays nothing for this.
+        let dir = ignorecase_fixture(false, &["src/main.rs", "src/Kept.TXT"]);
+        let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
+        assert!(names.contains(&"src/Kept.TXT".to_string()), "{names:?}");
+        assert!(names.contains(&"src/Gone.TXT".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_tracked_file_keeps_its_ignored_directory_walkable() {
+        // A directory cannot be pruned just because a rule matches it: git
+        // still reports the tracked files inside.
+        let dir = ignorecase_fixture(true, &["qlogs/kept.rs"]);
+        fs::write(dir.path().join("qlogs/kept.rs"), "tracked").unwrap();
+        let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(
+            names.contains(&"qlogs/kept.rs".to_string()),
+            "pruned a directory holding a tracked file: {names:?}"
+        );
+        assert!(
+            !names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn no_ignore_turns_the_whole_thing_off() {
+        let dir = ignorecase_fixture(true, &["src/main.rs"]);
+        let names = sorted_filenames(
+            &walk_dir(
+                dir.path(),
+                &WalkOptions {
+                    no_ignore: true,
+                    ..Default::default()
+                },
+            ),
+            dir.path(),
+        );
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn no_ignore_vcs_turns_the_whole_thing_off_too() {
+        // The rules only live in `.gitignore` here, and `--no-ignore-vcs` tells
+        // the case-sensitive pass to skip that file. If the case-insensitive
+        // pass kept reading it, it would become the *only* thing excluding and
+        // the flag would exclude more than not passing it at all.
+        let dir = ignorecase_fixture(true, &["src/main.rs"]);
+        let names = sorted_filenames(
+            &walk_dir(
+                dir.path(),
+                &WalkOptions {
+                    no_ignore_vcs: true,
+                    ..Default::default()
+                },
+            ),
+            dir.path(),
+        );
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
+        assert!(names.contains(&"src/Gone.TXT".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn no_ignore_exclude_leaves_the_repository_exclude_file_unread() {
+        // Same argument as above, for the other source this matcher reads. The
+        // rules live only in `.git/info/exclude`, so honouring the flag must
+        // leave nothing behind to match with.
+        let dir = ignorecase_fixture(true, &["src/main.rs"]);
+        fs::remove_file(dir.path().join(".gitignore")).unwrap();
+        fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        fs::write(dir.path().join(".git/info/exclude"), "QLogs\n").unwrap();
+
+        let with_exclude =
+            sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(
+            !with_exclude.contains(&"qlogs/artifact.rs".to_string()),
+            "the exclude file should have hidden this: {with_exclude:?}"
+        );
+
+        let names = sorted_filenames(
+            &walk_dir(
+                dir.path(),
+                &WalkOptions {
+                    no_ignore_exclude: true,
+                    ..Default::default()
+                },
+            ),
+            dir.path(),
+        );
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn no_ignore_parent_leaves_a_subdirectory_walk_alone() {
+        // Walking `src/` reaches the repository-wide rules only as parent rules,
+        // which is exactly what `--no-ignore-parent` switches off.
+        let dir = ignorecase_fixture(true, &["src/main.rs"]);
+        let src = dir.path().join("src");
+        let names = sorted_filenames(
+            &walk_dir(
+                &src,
+                &WalkOptions {
+                    no_ignore_parent: true,
+                    ..Default::default()
+                },
+            ),
+            &src,
+        );
+        assert!(
+            names.contains(&"Gone.TXT".to_string()),
+            "applied a parent rule the flag disabled: {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_index_excludes_nothing() {
+        // Without the index there is no way to tell tracked from untracked,
+        // and guessing wrong would hide real source. Decline instead.
+        let dir = ignorecase_fixture(true, &[]);
+        fs::write(dir.path().join(".git/index"), b"not an index").unwrap();
+        let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
+        assert!(names.contains(&"src/Kept.TXT".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn both_walks_agree_on_what_the_tree_contains() {
+        // The indexing walk decides what goes into the index and the metadata
+        // walk decides what is missing from it. If they disagree, every build
+        // indexes a file the next stale check evicts.
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let indexed = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        let mut seen: Vec<String> = walk_file_metadata(dir.path(), &MetaWalkOptions::default())
+            .files
+            .iter()
+            .map(|f| f.relative_path.replace('\\', "/"))
+            .filter(|p| !p.starts_with(".git/"))
+            .collect();
+        seen.sort();
+        assert_eq!(indexed, seen);
     }
 }

@@ -17,28 +17,29 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
-See [full benchmark results](BENCHMARKS.md) — up to **58x faster** than ripgrep on large repos.
+See [full benchmark results](BENCHMARKS.md) — up to **52x faster** than ripgrep on large repos.
 
 ### Benchmark highlights (avg latency per query, index pre-built)
 
 | Repo | Files | Platform | ripgrep | tgrep | Speedup |
 | --- | ---: | --- | ---: | ---: | ---: |
-| gecko-dev | 388K | macOS arm64 | 31,364ms | 544ms | **58x** |
-| gecko-dev | 388K | Windows | 17,447ms | 376ms | **46x** |
-| gecko-dev | 388K | Linux | 1,760ms | 207ms | **8.5x** |
-| chromium | 504K | macOS arm64 | 45,728ms | 2,226ms | **21x** |
-| chromium | 504K | Windows | 25,262ms | 1,690ms | **15x** |
-| chromium | 504K | Linux | 2,377ms | 762ms | **3.1x** |
-| go | 16K | Windows | 480ms | 93ms | **5.2x** |
-| rust | 62K | Windows | 1,897ms | 229ms | **8.3x** |
-| kubernetes | 31K | Windows | 1,378ms | 202ms | **6.8x** |
-| linux | 96K | macOS arm64 | 3,804ms | 154ms | **25x** |
-| linux | 96K | Windows | 2,599ms | 132ms | **20x** |
-| linux | 96K | Linux | 328ms | 64ms | **5.2x** |
+| gecko-dev | 388K | macOS arm64 | 33,402ms | 643ms | **51.9x** |
+| gecko-dev | 388K | Windows | 17,841ms | 463ms | **38.6x** |
+| gecko-dev | 388K | Linux | 1,195ms | 162ms | **7.36x** |
+| chromium | 504K | macOS arm64 | 41,806ms | 2,643ms | **15.8x** |
+| chromium | 504K | Windows | 24,576ms | 1,396ms | **17.6x** |
+| chromium | 504K | Linux | 2,404ms | 631ms | **3.81x** |
+| go | 16K | Windows | 592ms | 79ms | **7.53x** |
+| rust | 62K | Windows | 1,489ms | 194ms | **7.69x** |
+| kubernetes | 31K | Windows | 1,342ms | 190ms | **7.08x** |
+| linux | 96K | macOS arm64 | 5,390ms | 256ms | **21.0x** |
+| linux | 96K | Windows | 3,280ms | 94ms | **34.8x** |
+| linux | 96K | Linux | 427ms | 46ms | **9.38x** |
 
-tgrep is faster in all 18 measured cells. The margin depends on repo size and on how
-many matches a query returns — a search that returns tens of thousands of matches
-spends more on delivering them than the index saves on finding them. See
+tgrep wins 17 of the 18 measured cells; the exception is Kubernetes on Linux, a
+near-tie at 0.93x. The margin depends on repo size and on how many matches a query
+returns — a search that returns tens of thousands of matches spends more on
+delivering them than the index saves on finding them. See
 [What decides the margin](BENCHMARKS.md#what-decides-the-margin).
 
 ## Architecture
@@ -82,9 +83,9 @@ tgrep is designed to be significantly faster than ripgrep on large repos:
 - **Memory-efficient full builds** — index builds batch extraction and stream
   sorted postings, file entries, and lookup entries instead of retaining the full
   inverted index in memory
-- **Smart file walking** — extension-based binary rejection (50+ formats),
-  8KB content check, and a 1 MB size cap when *indexing* (searching is
-  uncapped by default; see `--max-filesize`)
+- **Smart file walking** — extension-based binary rejection (50+ formats) and an
+  8KB content check, with a 64 MiB size cap on both indexing and searching
+  (`--no-max-filesize` removes it)
 - **Lock-free reads** — `RwLock<HashMap>` cache allows concurrent reads
   without contention
 - **Hot serving** — queries work immediately during background index building;
@@ -112,8 +113,16 @@ Index built successfully at /tmp/idx
 Indexed in 22.6s using external strategy (peak memory 160.1 MiB)
 ```
 
-The peak is the operating system's own high-water mark for the process, so it
-reflects the true maximum rather than a sampled snapshot.
+The peak is the memory the process itself holds — private/committed bytes, not
+resident set. The two differ once large files are memory-mapped: mapped pages are
+file-backed and reclaimable, so counting them would report the size of the files
+being indexed rather than tgrep's own use. Indexing a single 2 GiB file holds
+77.8 MiB while its working set reaches 1.99 GiB. When the working set is
+substantially larger it is named alongside, so nothing is hidden:
+
+```
+Indexed in 46.1s using external strategy (peak memory 77.8 MiB private, 1.99 GiB working set incl. memory-mapped files)
+```
 
 #### Repositories without a `.git` directory
 
@@ -128,7 +137,7 @@ tgrep says so rather than leaving you to guess:
 Walking /src/enlistment...
 warning: /src/enlistment has a .gitignore but is not a git repository, so it is
 not applied (this matches ripgrep). Pass --no-require-git to apply it.
-Found 289320 text files (2893 binary skipped, 698 too large, 0 errors)
+Found 290018 text files (2893 binary skipped, 0 too large, 0 errors)
 ```
 
 `--no-require-git` applies the rules anyway, and works on `index`, `serve`, and
@@ -139,6 +148,35 @@ tgrep index . --no-require-git
 tgrep serve --no-require-git
 ```
 
+#### Case-insensitive repositories
+
+When git clones onto a filesystem that does not distinguish case — which on
+Windows is every clone — it sets `core.ignorecase` and stops distinguishing case
+when it matches ignore rules. A rule spelled `QLogs` then hides a directory
+named `qlogs`.
+
+Most tools, ripgrep included, always match ignore rules case-sensitively, so
+that directory is walked, read and indexed even though `git status` never
+mentions it. On one Windows enlistment that was a single 13.4 GiB build
+artifact, 71% of the corpus, adding about 16 seconds to *every* query.
+
+tgrep reads `core.ignorecase` and matches the way the repository itself does.
+Files git **tracks** are exempt, which is git's own rule — ignore rules only
+decide the fate of files git does not already know about. Without that
+exemption the same change would have hidden 273 tracked `.JPG`, `.PNG` and
+`.RLL` files caught by rules written in lower case.
+
+On that enlistment the walk went from listing one file more than
+`git ls-files --cached --others --exclude-standard` to matching it exactly, at a
+cost of roughly 0.4 s on a 293k-file walk. `--no-ignore` turns it off along with
+every other ignore source, and repositories that distinguish case are unaffected
+and pay nothing.
+
+Only the repository's own root `.gitignore` and `.git/info/exclude` are matched
+this way. Rules in nested `.gitignore` files are not, because the walk does not
+know they exist until it reaches their directory. Missing one only leaves a file
+visible that git would hide, which is what every other tool does anyway.
+
 #### Keep `index` and `serve` flags in step
 
 Flags that decide *which files belong in the index* — `--no-require-git`,
@@ -146,13 +184,14 @@ Flags that decide *which files belong in the index* — `--no-require-git`,
 index` that built an index and the `tgrep serve` that serves it.
 
 The server compares the index against the filesystem at startup and treats an
-indexed file it cannot see as deleted. So serving an index built with
-`--max-filesize 10M` under the 1 MB default drops every file above 1 MB from
-that index, permanently. Pass the same flags to both:
+indexed file it cannot see as deleted. So serving an index built without a cap
+under a `--max-filesize 8M` server drops every file above 8 MiB from that index,
+permanently. Both sides default to 64 MiB, so this only bites when one side
+names a limit; pass the same flags to both:
 
 ```bash
-tgrep index . --max-filesize 10M
-tgrep serve   --max-filesize 10M
+tgrep index . --max-filesize 8M
+tgrep serve   --max-filesize 8M
 ```
 
 #### Memory use on very large repos
@@ -172,7 +211,8 @@ tgrep index . --index-buffer 16               # smaller arena, lower peak
 tgrep index . --index-strategy=memory         # opt out: sort entirely in RAM
 ```
 
-On the Linux kernel (94,634 files, 990 MiB index) the default is a **~17x
+On the Linux kernel (94,634 files, 990 MiB index), measured under the 1 MiB
+indexing cap that was the default at the time, the default strategy is a **~17x
 reduction in peak memory, and no slower**:
 
 | Strategy | Spill segments | Peak working set | Build |
@@ -186,9 +226,37 @@ reduction in peak memory, and no slower**:
 identical runs because `Vec` growth doubles and both buffers are briefly
 resident during the final reallocation, while `external` varied by 8 MiB.
 
+The 1 MiB indexing cap those rows were measured under is now 64 MiB, and files
+past 1 MiB are memory-mapped rather than read onto the heap. On the same repo the
+`external` build now settles at roughly **152 MiB of private memory in 27 s**,
+against 197-200 MiB and 41-42 s when every admitted file was read onto the heap.
+The arena bound is unchanged; what changed is that a handful of 20 MB generated
+headers no longer cost their full size in heap in every worker that touches one.
+The 152 MiB figure was taken with no cap at all, and the 64 MiB default excludes
+only files *above* 64 MiB, so it leaves these numbers alone here: the largest file
+in the kernel tree is a 22.9 MiB generated AMD register header, and nothing in its
+95,862 files reaches the cap.
+
+Two caveats on reading those numbers. The peak tgrep prints is *private bytes*,
+which excludes mapped file pages, so it reports what the process actually holds
+rather than the size of the files it is reading — the same build is 152 MiB
+private against ~192 MiB resident, and the working set is named alongside only
+when it is substantially larger, as in [Build the index](#build-the-index).
+macOS is the exception: `libc` does not surface the Mach counter that separates
+the two, so it still reports resident set there. And a very large file that is
+neither valid UTF-8 nor detectably binary still costs about its own size, because
+the index has to hold the same repaired bytes a search will match against; a
+135 MB Latin-1 file indexes at roughly 205 MiB.
+
+Pass `--max-filesize` if a build has to fit a tighter budget, or
+`--no-max-filesize` to lift the 64 MiB default entirely.
+
 `--index-strategy=memory` remains available as an escape hatch for environments
 where spilling is undesirable or impossible, such as a read-only or full index
-volume. Both strategies produce byte-identical indexes. See
+volume. Both strategies produce byte-identical indexes from the same walk —
+note that file IDs follow walk order, which the parallel walker does not fix
+between runs, so two builds of the same tree need not be byte-identical to each
+other. See
 [BENCHMARKS.md](BENCHMARKS.md#index-build-strategies) for full numbers.
 
 `tgrep serve` uses the same bounded builder when it has to create an index from
@@ -220,6 +288,23 @@ Resource use during that initial build can be tuned. These apply to both
 | `--max-cpu <PERCENT>` | `50` | Confine parallel reading and trigram extraction to this share of logical cores |
 | `--auto-save-mutations <N>` | `5000` | Accumulated index changes that trigger a background save; higher means fewer pauses but more to redo if killed |
 | `--watcher-queue-cap <N>` | `16384` | Filesystem events buffered between the OS watcher and the indexing worker; raise it if bulk changes log watcher queue overflows, since each overflow forces a full stale check |
+
+#### Staying in step with the filesystem
+
+Once the index is built, everything that changes it arrives as an OS
+notification, and a notification can go missing — a queue overflow, a network
+or virtualised filesystem that declines to report a change, a tree replaced
+wholesale by a branch switch or a build. Overflow is detected and repaired at
+once; the rest is silent, and nothing else in the server revisits a file it
+believes it already knows. A missed change would otherwise last until that
+file happened to change again, which for a deleted file is never.
+
+So a watching server also reconciles on a timer: about once an hour it walks
+the tree and compares it against the index, which finds any drift regardless
+of what the watcher heard. It waits for a two-minute gap in queries first, and
+gives up waiting after four hours so a continuously busy server still
+reconciles. On an unchanged tree it finds nothing and leaves the index alone.
+`--no-watch` turns it off along with the watcher.
 
 ### Search
 
@@ -337,7 +422,8 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-a, --text` | Search binary files as if they were text |
 | `--binary` | Search binary files, reporting a note instead of their contents |
 | `-u, --unrestricted` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden, `-uuu` = +binary |
-| `--max-filesize <SIZE>` | Skip files larger than `SIZE` (`K`/`M`/`G` suffixes) |
+| `--max-filesize <SIZE>` | Skip files larger than `SIZE` (`K`/`M`/`G` suffixes); default 64M |
+| `--no-max-filesize` | Apply no size limit, as ripgrep does |
 | `-L, --follow` | Follow symbolic links |
 | `--no-messages` | Suppress error messages about unreadable/missing paths |
 | `--no-index` | Skip index, grep all files |
@@ -522,11 +608,43 @@ lines that are not valid UTF-8:
 
 ### File size limits
 
-Searching has **no size limit** by default — every text file is searched
-regardless of size. Pass `--max-filesize` to opt into one.
+Searching and indexing both skip files larger than **64 MiB** by default. This
+is a deliberate divergence from ripgrep, which has no default limit.
 
-`tgrep index` still caps indexed files at 1 MiB by default (large files are
-mostly generated data and bloat the index); `--max-filesize` overrides that too.
+The divergence is affordable because tgrep is not a one-shot scanner. A file a
+walk picks up is also a file the index carries and re-reads on every query whose
+trigrams make it a candidate, so an outlier's cost is paid repeatedly rather
+than once. On a 292,911-file enlistment where one 13.41 GiB generated build
+artifact was 71% of all searchable bytes, the cap cut a cold index build from
+214.5 s to 64.2 s and a warm query from 21.30 s to 0.55 s — a 39x difference —
+at the cost of one match in one generated file, and it excluded 2 files out of
+292,911.
+
+The cost is real: an oversized file is counted but its path is never recorded,
+so a match inside one is reported as no match. Two rules keep that from being
+silent:
+
+- `--no-max-filesize` restores the uncapped, ripgrep-identical behaviour, and
+  `--max-filesize` sets a different bound.
+- A file named directly on the command line is never dropped by the *inherited*
+  default, only by a limit you passed. `tgrep pattern ./huge.log` searches
+  `huge.log`.
+
+The limit is resolved once, before the walk and the search diverge, so an index
+and the queries against it always agree on which files exist. A walk that capped
+where the search did not would be indistinguishable from "this file contains no
+match".
+
+The cap is not what bounds memory. Files past 1 MiB are memory-mapped during
+both indexing and searching, so their pages are file-backed and reclaimable, and
+mapped files are batched by what they actually put on the heap rather than by
+their length — so a build over large files fills its worker pool instead of
+running two files at a time. Combined with a faster trigram extractor, that made
+indexing a tree of 32 MiB source files about 14x faster. Nor is size a good
+proxy for *index* cost: oversized files are overwhelmingly generated and
+therefore repetitive, contributing far fewer distinct trigrams per byte than
+ordinary source. What the cap buys is bounded *scan* time. See
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ### Exit codes
 

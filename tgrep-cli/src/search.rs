@@ -69,6 +69,10 @@ pub struct SearchOptions {
     /// path argument, since each argument is echoed back exactly as typed.
     pub path_display: crate::output::PathDisplay,
     pub max_filesize: Option<u64>,
+    /// Whether `--max-filesize` was passed, as opposed to inheriting
+    /// [`tgrep_core::walker::DEFAULT_MAX_FILE_SIZE`]. See
+    /// [`exceeds_max_filesize`].
+    pub max_filesize_requested: bool,
     pub encoding: tgrep_core::encoding::EncodingMode,
     pub follow: bool,
     pub no_messages: bool,
@@ -250,11 +254,22 @@ impl SearchOptions {
         self.byte_offset || self.max_columns.is_some()
     }
 
+    /// `--only-matching` as the search should actually apply it.
+    ///
+    /// ripgrep implements `-o` in its standard printer only: the JSON printer
+    /// always reports whole lines with one `submatch` per hit, so `--json -o`
+    /// and `--json` produce byte-identical streams. Fanning a line out into one
+    /// event per match here would both reshape the stream and inflate
+    /// `matched_lines`, which counts distinct lines.
+    fn effective_only_matching(&self) -> bool {
+        self.only_matching && !self.json
+    }
+
     fn match_options(&self) -> crate::matching::MatchOptions {
         crate::matching::MatchOptions {
             invert_match: self.invert_match,
             multiline: self.multiline,
-            only_matching: self.only_matching,
+            only_matching: self.effective_only_matching(),
             before_context: self.before_ctx(),
             after_context: self.after_ctx(),
             // `-q` and `--files-without-match` only need to know whether the
@@ -381,6 +396,13 @@ impl SearchOptions {
     }
 }
 
+/// Build the [`OutputWriter`] that spans a whole invocation.
+///
+/// Kept here so `make_output_config` stays private to this module.
+pub fn new_writer(opts: &SearchOptions) -> OutputWriter {
+    OutputWriter::new(opts.make_output_config())
+}
+
 /// List files that would be searched (--files mode).
 pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
     let root = match std::fs::canonicalize(root) {
@@ -428,7 +450,18 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
     Ok(())
 }
 
-pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Result<bool> {
+/// Run one search path's worth of work, writing through the caller's `writer`.
+///
+/// The writer is owned by the caller and shared across every path argument:
+/// ripgrep emits one JSON `summary` for the whole invocation, so stats have to
+/// accumulate across paths and the summary is emitted by
+/// [`OutputWriter::finish`] once the last path is done.
+pub fn run(
+    root: &Path,
+    index_path: Option<&Path>,
+    opts: &SearchOptions,
+    writer: &mut OutputWriter,
+) -> Result<bool> {
     let root = match std::fs::canonicalize(root) {
         Ok(root) => root,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -475,7 +508,9 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
         && let Ok(info) = ServerInfo::load(&index_dir)
         && let Some((index_root, scope)) = resolve_scope(&index_dir, &root)
     {
-        if let Ok(had_matches) = search_via_server(&info, &root, &index_root, &scope, opts, ci) {
+        if let Ok(had_matches) =
+            search_via_server(&info, &root, &index_root, &scope, opts, ci, writer)
+        {
             return Ok(had_matches);
         }
         eprintln!("Server unreachable, falling back to local index");
@@ -483,14 +518,14 @@ pub fn run(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Resu
 
     // No server — use on-disk index directly (or brute force)
     if opts.no_index || bypass_index {
-        return brute_force_search(&root, opts, ci);
+        return brute_force_search(&root, opts, ci, writer);
     }
     if !index_dir.join("lookup.bin").exists() {
         warn_missing_index(&index_dir, index_path.is_some(), opts.quiet);
-        return brute_force_search(&root, opts, ci);
+        return brute_force_search(&root, opts, ci, writer);
     }
 
-    search_local_index(&root, &index_dir, opts, ci)
+    search_local_index(&root, &index_dir, opts, ci, writer)
 }
 
 /// Render a path the way the user typed it.
@@ -548,6 +583,7 @@ fn search_via_server(
     scope: &IndexScope,
     opts: &SearchOptions,
     ci: bool,
+    writer: &mut OutputWriter,
 ) -> Result<bool> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
@@ -592,7 +628,7 @@ fn search_via_server(
             "type_add": opts.type_add,
             "type_clear": opts.type_clear,
             "invert_match": opts.invert_match,
-            "only_matching": opts.only_matching,
+            "only_matching": opts.effective_only_matching(),
             "after_context": if wants_context { opts.after_ctx() } else { 0 },
             "before_context": if wants_context { opts.before_ctx() } else { 0 },
             "multiline": opts.multiline,
@@ -736,7 +772,6 @@ fn search_via_server(
         }
     };
 
-    let mut writer = OutputWriter::new(opts.make_output_config());
     let had_matches = !matches.is_empty();
 
     if opts.quiet {
@@ -888,6 +923,7 @@ fn search_local_index(
     index_dir: &Path,
     opts: &SearchOptions,
     ci: bool,
+    writer: &mut OutputWriter,
 ) -> Result<bool> {
     let start = Instant::now();
     let reader = IndexReader::open(index_dir)?;
@@ -898,7 +934,7 @@ fn search_local_index(
     // silently reports nothing.
     let Some((index_root, scope)) = resolve_scope(index_dir, root) else {
         // The index covers an unrelated tree, so it cannot answer this search.
-        return brute_force_search(root, opts, ci);
+        return brute_force_search(root, opts, ci, writer);
     };
 
     let glob_filter = opts.glob_filter()?;
@@ -909,11 +945,17 @@ fn search_local_index(
     // Narrow candidates using every pattern, not just the primary one. A
     // non-default `--encoding` re-decodes files into text the index never saw,
     // so the trigram plan cannot be trusted to find them.
-    let plan = if !matcher.is_standard() || opts.encoding.may_differ_from_index() {
+    //
+    // A PCRE-style pattern is not parseable by `regex-syntax`, but relaxing it
+    // (dropping lookarounds and the like) yields one that is, and that matches a
+    // superset — so its trigrams remain mandatory for the original.
+    let plan = if opts.encoding.may_differ_from_index() {
         QueryPlan::MatchAll
-    } else {
+    } else if matcher.is_standard() || opts.fixed_string {
         query::build_multi_pattern_plan(&opts.all_patterns()?, opts.fixed_string, ci)
             .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        query::build_relaxed_multi_pattern_plan(&opts.all_patterns()?, ci)
     };
 
     let is_match_all = plan.is_match_all();
@@ -977,7 +1019,6 @@ fn search_local_index(
         );
     }
 
-    let mut writer = OutputWriter::new(opts.make_output_config());
     let mut had_matches = false;
     // A single-file search root is a file the user named on the command line,
     // which is what makes binary files visible in ripgrep.
@@ -989,23 +1030,15 @@ fn search_local_index(
         }
 
         let full_path = scope.full_path(&index_root, rel_path);
-        if exceeds_max_filesize(&full_path, opts) {
+        if exceeds_max_filesize(&full_path, opts, explicit) {
             continue;
         }
-        let (content, fixups) = match read_text_lossy(&full_path, opts.encoding) {
+        let read = match read_text_lossy(&full_path, opts.encoding) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
-        let outcome = search_decoded_file(
-            &content,
-            &fixups,
-            &matcher,
-            rel_path,
-            opts,
-            &mut writer,
-            explicit,
-        )?;
+        let outcome = search_decoded_file(&read, &matcher, rel_path, opts, &mut *writer, explicit)?;
         match outcome {
             FileOutcome::Matched => {
                 if !opts.files_without_match {
@@ -1115,31 +1148,28 @@ fn within_max_depth(rel: &str, opts: &SearchOptions) -> bool {
     }
 }
 
-fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<bool> {
+fn brute_force_search(
+    root: &Path,
+    opts: &SearchOptions,
+    ci: bool,
+    writer: &mut OutputWriter,
+) -> Result<bool> {
     let start = Instant::now();
     let glob_filter = opts.glob_filter()?;
     let type_filter = opts.type_filter()?;
 
     let matcher = opts.matcher(ci)?;
 
-    let mut writer = OutputWriter::new(opts.make_output_config());
     let mut had_matches = false;
 
     if root.is_file() {
         let rel_path = explicit_file_display_path(root);
         if passes_filters(&rel_path, &glob_filter, &type_filter)
-            && !exceeds_max_filesize(root, opts)
+            && !exceeds_max_filesize(root, opts, true)
         {
-            let (content, fixups) = read_text_lossy(root, opts.encoding)?;
-            let outcome = search_decoded_file(
-                &content,
-                &fixups,
-                &matcher,
-                &rel_path,
-                opts,
-                &mut writer,
-                true,
-            )?;
+            let read = read_text_lossy(root, opts.encoding)?;
+            let outcome =
+                search_decoded_file(&read, &matcher, &rel_path, opts, &mut *writer, true)?;
             match outcome {
                 FileOutcome::Matched => {
                     if !opts.files_without_match {
@@ -1184,20 +1214,12 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
             continue;
         }
 
-        let (content, fixups) = match read_text_lossy(path, opts.encoding) {
+        let read = match read_text_lossy(path, opts.encoding) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
-        let outcome = search_decoded_file(
-            &content,
-            &fixups,
-            &matcher,
-            &rel_path,
-            opts,
-            &mut writer,
-            false,
-        )?;
+        let outcome = search_decoded_file(&read, &matcher, &rel_path, opts, &mut *writer, false)?;
         match outcome {
             FileOutcome::Matched => {
                 if !opts.files_without_match {
@@ -1233,6 +1255,132 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
     Ok(had_matches)
 }
 
+/// Smallest file worth memory-mapping instead of reading.
+///
+/// Mapping costs a syscall pair and a page-table setup per file, which is a bad
+/// trade for the small files that dominate a repository walk — a kernel tree is
+/// ~94k files averaging well under 64 KB. Above this size the whole-file read is
+/// the dominant cost and mapping wins outright, so the threshold buys the
+/// large-file case without taxing the common one.
+///
+/// 1 MiB is far above the size of real source — only 110 of the kernel's 94,747
+/// files reach it — so ordinary searches never map, while the large generated
+/// files that actually cost memory always do.
+const MMAP_MIN_BYTES: u64 = 1024 * 1024;
+
+/// The text of a file to search, either owned on the heap or borrowed from a
+/// memory map.
+///
+/// Reading a file with `fs::read` costs its full size in heap, per file in
+/// flight. ripgrep searches a 192 MB file in under 10 MiB because its memory is
+/// decoupled from file size; mapping large files gives the same property here,
+/// since mapped pages are file-backed and the OS can evict them under pressure
+/// instead of the process holding an allocation it cannot give back.
+enum FileText {
+    Owned(String),
+    /// Mapped bytes verified as UTF-8 when the map was created.
+    Mapped(memmap2::Mmap),
+}
+
+impl FileText {
+    fn as_str(&self) -> &str {
+        match self {
+            FileText::Owned(text) => text,
+            // SAFETY: `Mapped` is only constructed by `try_map_text`, which
+            // validates the entire mapping with `str::from_utf8` first, so the
+            // bytes were UTF-8 when the map was taken. A concurrent writer
+            // could still invalidate them, which is the same exposure ripgrep
+            // accepts when it maps a file it is searching.
+            FileText::Mapped(map) => unsafe { std::str::from_utf8_unchecked(map) },
+        }
+    }
+}
+
+/// A file's text together with what the read already learned about it.
+struct FileRead {
+    text: FileText,
+    fixups: tgrep_core::encoding::LossyFixups,
+    /// Offset of the first NUL byte in `text`, which is what makes the file
+    /// binary. Found during the pass that decoded or validated the bytes, not
+    /// in a pass of its own — see [`validate_utf8_and_find_nul`].
+    first_nul: Option<usize>,
+}
+
+/// Validate `bytes` as UTF-8 and locate the first NUL byte in one traversal.
+///
+/// Returns `None` if the bytes are not valid UTF-8, which is the caller's
+/// signal to fall back to reading and repairing them.
+///
+/// Both questions need every byte, and asking them separately means walking the
+/// file twice. That is nearly free while it stays in the page cache and is
+/// anything but on a file larger than the cache, where the second walk is
+/// another trip to disk: on a 13.4 GiB file, validating cost 8.7 s and a
+/// separate `memchr` for the NUL cost another 6.2 s. Interleaving them at
+/// chunk granularity keeps each page hot for both.
+///
+/// The chunking is what makes that possible, and it is why this cannot simply
+/// call `str::from_utf8` per chunk: a multi-byte sequence can straddle a chunk
+/// boundary, where `from_utf8` reports an incomplete sequence. That is not an
+/// error mid-file — it means "resume here" — so the scan restarts at
+/// `valid_up_to` and lets the next chunk carry the sequence. At the *last*
+/// chunk the same report is a real truncation and does fail.
+fn validate_utf8_and_find_nul(bytes: &[u8]) -> Option<Option<usize>> {
+    /// Large enough that the ≤3 carried-over bytes are noise, small enough to
+    /// stay in cache between the two scans of it.
+    const CHUNK: usize = 1 << 20;
+
+    let mut pos = 0;
+    let mut first_nul = None;
+    while pos < bytes.len() {
+        let end = (pos + CHUNK).min(bytes.len());
+        let chunk = &bytes[pos..end];
+        let valid_len = match std::str::from_utf8(chunk) {
+            Ok(_) => chunk.len(),
+            Err(e) if e.error_len().is_none() && end < bytes.len() => e.valid_up_to(),
+            Err(_) => return None,
+        };
+        // A chunk starts on a character boundary and a UTF-8 sequence is at
+        // most 4 bytes, so a chunk this size always validates at least part of
+        // itself unless it opens with a genuinely invalid byte. Bailing keeps
+        // the loop from spinning if that reasoning ever stops holding.
+        if valid_len == 0 {
+            return None;
+        }
+        if first_nul.is_none()
+            && let Some(i) = memchr::memchr(0, &chunk[..valid_len])
+        {
+            first_nul = Some(pos + i);
+        }
+        pos += valid_len;
+    }
+    Some(first_nul)
+}
+
+/// Map a file for searching, or `None` to fall back to reading it.
+///
+/// Declines whenever the mapped pages would not be exactly the bytes to search:
+/// a file below the threshold, an encoding that transcodes or strips a BOM, or
+/// content that is not already valid UTF-8 and so needs lossy repair.
+fn try_map_text(
+    path: &Path,
+    encoding: tgrep_core::encoding::EncodingMode,
+) -> Option<(FileText, Option<usize>)> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() < MMAP_MIN_BYTES {
+        return None;
+    }
+    // SAFETY: the map is read-only, owned by the returned `FileText`, and
+    // dropped before this function's caller finishes with the file. Mapping is
+    // undefined behaviour if another process truncates the file underneath us;
+    // that is inherent to searching by map and is the tradeoff ripgrep makes.
+    let map = unsafe { memmap2::Mmap::map(&file).ok()? };
+    if !tgrep_core::encoding::borrows_whole_input(&map, encoding) {
+        return None;
+    }
+    let first_nul = validate_utf8_and_find_nul(&map)?;
+    Some((FileText::Mapped(map), first_nul))
+}
+
 /// Read a file as text, applying `--encoding` and replacing invalid UTF-8
 /// rather than failing.
 ///
@@ -1241,11 +1389,27 @@ fn brute_force_search(root: &Path, opts: &SearchOptions, ci: bool) -> Result<boo
 fn read_text_lossy(
     path: &Path,
     encoding: tgrep_core::encoding::EncodingMode,
-) -> std::io::Result<(String, tgrep_core::encoding::LossyFixups)> {
+) -> std::io::Result<FileRead> {
+    // A mapped file is always already-valid UTF-8, so it needs no fixups.
+    if let Some((text, first_nul)) = try_map_text(path, encoding) {
+        return Ok(FileRead {
+            text,
+            fixups: tgrep_core::encoding::LossyFixups::default(),
+            first_nul,
+        });
+    }
     let bytes = std::fs::read(path)?;
-    Ok(tgrep_core::encoding::decode_owned_with_fixups(
-        bytes, encoding,
-    ))
+    let (text, fixups) = tgrep_core::encoding::decode_owned_with_fixups(bytes, encoding);
+    // The read path already walks these bytes at least once and they are under
+    // the mapping threshold or repaired, so a separate scan here is cheap. It
+    // has to run over the *repaired* text, since that is what offsets are
+    // reported against.
+    let first_nul = memchr::memchr(0, text.as_bytes());
+    Ok(FileRead {
+        text: FileText::Owned(text),
+        fixups,
+        first_nul,
+    })
 }
 
 /// Whether `--max-filesize` excludes this file.
@@ -1254,7 +1418,16 @@ fn read_text_lossy(
 /// takes candidates straight from the index and the explicit-file path skips
 /// the walk entirely. Both check here so the flag means the same thing on every
 /// path instead of silently doing nothing on the default (indexed) one.
-fn exceeds_max_filesize(path: &Path, opts: &SearchOptions) -> bool {
+///
+/// `explicit` marks a file the user named on the command line. Those are exempt
+/// from the *inherited* [`tgrep_core::walker::DEFAULT_MAX_FILE_SIZE`], because
+/// naming a file is an unambiguous request to search it and answering "no
+/// match" would be a lie. A limit the user actually passed still applies, since
+/// then the limit is itself the request.
+fn exceeds_max_filesize(path: &Path, opts: &SearchOptions, explicit: bool) -> bool {
+    if explicit && !opts.max_filesize_requested {
+        return false;
+    }
     let Some(limit) = opts.max_filesize else {
         return false;
     };
@@ -1331,29 +1504,32 @@ enum FileOutcome {
 /// skipped silently, so they appear in neither `-l`, `-c`, `-L`, nor the plain
 /// output.
 fn search_decoded_file(
-    content: &str,
-    fixups: &tgrep_core::encoding::LossyFixups,
+    read: &FileRead,
     matcher: &SearchMatcher,
     rel_path: &str,
     opts: &SearchOptions,
     writer: &mut OutputWriter,
     explicit: bool,
 ) -> Result<FileOutcome> {
+    let FileRead {
+        text,
+        fixups,
+        first_nul,
+    } = read;
+    let content = text.as_str();
+
     // ripgrep only surfaces a binary file when the user named it explicitly (or
     // passed `--binary`).
     //
-    // The NUL is located in the repaired text but reported in terms of the file
-    // on disk, so it goes back through `fixups`: repairing invalid UTF-8 ahead
-    // of the NUL widens every bad byte to three, which would otherwise push the
-    // reported offset past where the byte actually is.
+    // `first_nul` was found by the pass that read the file, so this costs
+    // nothing here. The NUL is located in the repaired text but reported in
+    // terms of the file on disk, so it goes back through `fixups`: repairing
+    // invalid UTF-8 ahead of the NUL widens every bad byte to three, which
+    // would otherwise push the reported offset past where the byte actually is.
     let binary_offset = if opts.text {
         None
     } else {
-        content
-            .as_bytes()
-            .iter()
-            .position(|&b| b == 0)
-            .map(|off| fixups.to_source_offset(off))
+        first_nul.map(|off| fixups.to_source_offset(off))
     };
     if binary_offset.is_some() && !explicit && !opts.binary {
         return Ok(FileOutcome::Skipped);
@@ -1566,6 +1742,102 @@ fn plan_summary(plan: &QueryPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- fused UTF-8 validation and NUL scan --------------------------------
+    //
+    // `validate_utf8_and_find_nul` walks the file in chunks so that validating
+    // it and finding the NUL that marks it binary share one traversal. The
+    // chunking is the delicate part: a multi-byte sequence that straddles a
+    // chunk boundary must be carried into the next chunk rather than reported
+    // as invalid. These pin that against the whole-buffer answer it replaces.
+
+    /// What the two separate passes used to produce, for differential testing.
+    fn reference(bytes: &[u8]) -> Option<Option<usize>> {
+        std::str::from_utf8(bytes).ok()?;
+        Some(memchr::memchr(0, bytes))
+    }
+
+    fn check(bytes: &[u8]) {
+        assert_eq!(
+            validate_utf8_and_find_nul(bytes),
+            reference(bytes),
+            "disagreed with a whole-buffer scan on {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn fused_scan_handles_empty_and_ascii() {
+        check(b"");
+        check(b"hello world");
+        check(b"hello\0world");
+        check(b"\0");
+    }
+
+    #[test]
+    fn fused_scan_rejects_invalid_utf8() {
+        check(&[0xFF]);
+        check(b"ok\xFFbad");
+        // A truncated sequence at the very end is a real error, not a chunk
+        // boundary to resume across.
+        check(&[0xE2, 0x82]);
+    }
+
+    #[test]
+    fn fused_scan_carries_a_sequence_across_a_chunk_boundary() {
+        // Place every multi-byte width so that it straddles the boundary at
+        // each possible split, which is exactly the case a per-chunk
+        // `from_utf8` would reject.
+        const CHUNK: usize = 1 << 20;
+        for seq in ["\u{00E9}", "\u{20AC}", "\u{1F600}"] {
+            for offset in 1..seq.len() {
+                let mut bytes = vec![b'a'; CHUNK - offset];
+                bytes.extend_from_slice(seq.as_bytes());
+                bytes.extend_from_slice(b"tail");
+                check(&bytes);
+                // The same, with a NUL on the far side of the boundary, so the
+                // reported offset has to survive the carry.
+                let mut with_nul = bytes.clone();
+                with_nul.push(0);
+                with_nul.extend_from_slice(b"more");
+                check(&with_nul);
+            }
+        }
+    }
+
+    #[test]
+    fn fused_scan_reports_the_first_nul_not_a_later_one() {
+        const CHUNK: usize = 1 << 20;
+        // One NUL in the first chunk and one in the third: the scan must stop
+        // updating after the first, even though later chunks also match.
+        let mut bytes = vec![b'a'; CHUNK * 3];
+        bytes[7] = 0;
+        bytes[CHUNK * 2 + 11] = 0;
+        check(&bytes);
+        assert_eq!(validate_utf8_and_find_nul(&bytes), Some(Some(7)));
+    }
+
+    #[test]
+    fn fused_scan_finds_a_nul_exactly_on_a_chunk_boundary() {
+        const CHUNK: usize = 1 << 20;
+        for at in [CHUNK - 1, CHUNK, CHUNK + 1] {
+            let mut bytes = vec![b'a'; CHUNK * 2];
+            bytes[at] = 0;
+            check(&bytes);
+            assert_eq!(validate_utf8_and_find_nul(&bytes), Some(Some(at)));
+        }
+    }
+
+    #[test]
+    fn fused_scan_spans_many_chunks_without_a_nul() {
+        const CHUNK: usize = 1 << 20;
+        // Multi-byte content throughout, so every chunk ends mid-sequence at
+        // some point and the loop has to keep making progress.
+        let unit = "héllo wörld €";
+        let bytes = unit.repeat((CHUNK * 3) / unit.len()).into_bytes();
+        check(&bytes);
+        assert_eq!(validate_utf8_and_find_nul(&bytes), Some(None));
+    }
 
     // --- `--stats` counting -------------------------------------------------
     //

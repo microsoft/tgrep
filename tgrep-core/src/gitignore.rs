@@ -72,13 +72,27 @@ struct NestedIgnore {
     matcher: Gitignore,
 }
 
+/// An ignore file above the served root. `prefix` is the served root relative
+/// to the directory that owns the matcher, so a root-relative event path can be
+/// queried with the same anchoring the filesystem walk used.
+struct AncestorIgnore {
+    prefix: String,
+    kind: IgnoreKind,
+    matcher: Gitignore,
+}
+
 pub struct IgnoreMatcher {
-    /// Root-scoped rules: the root `.gitignore`, `.git/info/exclude`,
-    /// `p4ignore.ini`, and the root `.ignore` (added last so it wins).
+    /// Root-scoped custom rules such as `p4ignore.ini`.
     local: Gitignore,
-    /// Nested ignore files, deepest first and `.ignore` before `.gitignore`
-    /// within a directory.
+    /// `p4ignore.ini` is a separate walker filter: its ignores are additive,
+    /// while its whitelists do not override the standard ignore sources.
+    local_is_filter: bool,
+    /// Ignore files inside (or at) the served root, deepest first.
     nested: Vec<NestedIgnore>,
+    /// Parent `.ignore` / `.gitignore` files, closest directory first.
+    ancestors: Vec<AncestorIgnore>,
+    /// Repository-local `.git/info/exclude`, below global rules in precedence.
+    repo_exclude: Option<(String, Gitignore)>,
     global: Gitignore,
 }
 
@@ -103,6 +117,17 @@ impl IgnoreMatcher {
         nested: Vec<(String, IgnoreKind, Gitignore)>,
         global: Gitignore,
     ) -> Option<Self> {
+        Self::with_all_sources(local, false, nested, Vec::new(), None, global)
+    }
+
+    fn with_all_sources(
+        local: Gitignore,
+        local_is_filter: bool,
+        nested: Vec<(String, IgnoreKind, Gitignore)>,
+        ancestors: Vec<(String, IgnoreKind, Gitignore)>,
+        repo_exclude: Option<(String, Gitignore)>,
+        global: Gitignore,
+    ) -> Option<Self> {
         let mut nested: Vec<NestedIgnore> = nested
             .into_iter()
             .filter(|(_, _, matcher)| !matcher.is_empty())
@@ -124,9 +149,28 @@ impl IgnoreMatcher {
                 .then_with(|| a.kind.cmp(&b.kind))
         });
 
-        (!local.is_empty() || !nested.is_empty() || !global.is_empty()).then_some(Self {
+        let ancestors = ancestors
+            .into_iter()
+            .filter(|(_, _, matcher)| !matcher.is_empty())
+            .map(|(prefix, kind, matcher)| AncestorIgnore {
+                prefix,
+                kind,
+                matcher,
+            })
+            .collect::<Vec<_>>();
+        let repo_exclude = repo_exclude.filter(|(_, matcher)| !matcher.is_empty());
+
+        (!local.is_empty()
+            || !nested.is_empty()
+            || !ancestors.is_empty()
+            || repo_exclude.is_some()
+            || !global.is_empty())
+        .then_some(Self {
             local,
+            local_is_filter,
             nested,
+            ancestors,
+            repo_exclude,
             global,
         })
     }
@@ -135,31 +179,103 @@ impl IgnoreMatcher {
         let rel = path.to_string_lossy().replace('\\', "/");
         let rel = rel.trim_start_matches("./").trim_start_matches('/');
 
-        for entry in &self.nested {
-            // Only consult a nested file for paths beneath its directory, and
-            // match against the path *relative to that directory*, which is
-            // the scope its patterns were written for.
-            let Some(under) = strip_dir_prefix(rel, &entry.dir) else {
-                continue;
+        // The ignore crate resolves each source independently, then gives
+        // `.ignore` files precedence over every `.gitignore`, regardless of
+        // directory depth.
+        let mut standard_decision = None;
+        for kind in [IgnoreKind::DotIgnore, IgnoreKind::GitIgnore] {
+            for entry in self.nested.iter().filter(|entry| entry.kind == kind) {
+                // Only consult a nested file for paths beneath its directory,
+                // relative to the directory where its patterns were written.
+                let Some(under) = strip_dir_prefix(rel, &entry.dir) else {
+                    continue;
+                };
+                match entry
+                    .matcher
+                    .matched_path_or_any_parents(Path::new(under), is_dir)
+                {
+                    Match::Ignore(_) => {
+                        standard_decision = Some(true);
+                        break;
+                    }
+                    Match::Whitelist(_) => {
+                        standard_decision = Some(false);
+                        break;
+                    }
+                    Match::None => {}
+                }
+            }
+            if standard_decision.is_some() {
+                break;
+            }
+
+            for entry in self.ancestors.iter().filter(|entry| entry.kind == kind) {
+                let path = if entry.prefix.is_empty() {
+                    rel.to_string()
+                } else {
+                    format!("{}/{rel}", entry.prefix)
+                };
+                match entry
+                    .matcher
+                    .matched_path_or_any_parents(Path::new(&path), is_dir)
+                {
+                    Match::Ignore(_) => {
+                        standard_decision = Some(true);
+                        break;
+                    }
+                    Match::Whitelist(_) => {
+                        standard_decision = Some(false);
+                        break;
+                    }
+                    Match::None => {}
+                }
+            }
+            if standard_decision.is_some() {
+                break;
+            }
+        }
+
+        // `with_nested` historically takes an already-combined root matcher;
+        // nested files must retain their deeper-path precedence over it.
+        if standard_decision.is_none() && !self.local_is_filter {
+            standard_decision = match self.local.matched_path_or_any_parents(path, is_dir) {
+                Match::Ignore(_) => Some(true),
+                Match::Whitelist(_) => Some(false),
+                Match::None => None,
             };
-            match entry
-                .matcher
-                .matched_path_or_any_parents(Path::new(under), is_dir)
-            {
-                Match::Ignore(_) => return true,
-                Match::Whitelist(_) => return false,
+        }
+
+        if standard_decision.is_none()
+            && let Some((prefix, matcher)) = &self.repo_exclude
+        {
+            let path = if prefix.is_empty() {
+                rel.to_string()
+            } else {
+                format!("{prefix}/{rel}")
+            };
+            match matcher.matched_path_or_any_parents(Path::new(&path), is_dir) {
+                Match::Ignore(_) => standard_decision = Some(true),
+                Match::Whitelist(_) => standard_decision = Some(false),
                 Match::None => {}
             }
         }
 
-        match self.local.matched_path_or_any_parents(path, is_dir) {
-            Match::Ignore(_) => true,
-            Match::Whitelist(_) => false,
-            Match::None => self
-                .global
-                .matched_path_or_any_parents(path, is_dir)
-                .is_ignore(),
+        if standard_decision.is_none() {
+            standard_decision = match self.global.matched_path_or_any_parents(path, is_dir) {
+                Match::Ignore(_) => Some(true),
+                Match::Whitelist(_) => Some(false),
+                Match::None => None,
+            };
         }
+
+        if standard_decision == Some(true) {
+            return true;
+        }
+        self.local_is_filter
+            && self
+                .local
+                .matched_path_or_any_parents(path, is_dir)
+                .is_ignore()
     }
 }
 
@@ -237,7 +353,6 @@ impl P4IgnoreMatcher {
 /// Build a matcher containing only root-level `p4ignore.ini` rules.
 pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
     use ignore::gitignore::GitignoreBuilder;
-
     let (_, lines) = p4ignore_lines(root)?;
     let mut builder = GitignoreBuilder::new(root);
     if !add_p4ignore_rules(&mut builder, root) {
@@ -261,6 +376,136 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
     })
 }
 
+/// Git's repository-wide ignore rules, matched the way git matches them on a
+/// case-insensitive filesystem, with git's tracked-file exemption applied.
+///
+/// # Why this exists
+///
+/// git sets `core.ignorecase` when it clones onto a filesystem that does not
+/// distinguish case, and from then on it matches ignore rules without regard to
+/// case. The `ignore` crate always matches case-sensitively, so on such a
+/// repository a rule written `QLogs` does not hide a directory named `qlogs` —
+/// and everything inside it gets walked, read and indexed even though `git
+/// status` never mentions it. On one Windows enlistment that was a single 13.4
+/// GiB build artifact making up 71% of the corpus.
+///
+/// This only ever *adds* exclusions, and only for paths the case-sensitive pass
+/// already let through, so it cannot resurrect a file the normal rules hid.
+///
+/// # The tracked-file exemption
+///
+/// Matching without regard to case starts catching files that are already
+/// tracked, which git would never hide — on that same enlistment, 273 `.JPG`,
+/// `.PNG` and `.RLL` files caught by rules written in lower case. git's rule is
+/// that ignore rules only decide the fate of files it does not already track,
+/// so tracked paths are exempt here too. With the exemption, exactly one file
+/// is excluded: the untracked artifact.
+///
+/// # Limits
+///
+/// Only the repository's own rules are matched this way — the root
+/// `.gitignore` and `.git/info/exclude`. Rules in nested `.gitignore` files are
+/// not, because the walk does not know they exist until it reaches their
+/// directory, by which point the parent may already have been pruned; nor is
+/// the user's global ignore file, whose rules are not repository state. Missing
+/// one only leaves a file visible that git would hide, which is the behaviour
+/// without any of this.
+pub struct CaseInsensitiveIgnore {
+    matcher: Gitignore,
+    repo_root: std::path::PathBuf,
+    /// Loaded on the first path this matcher actually claims, which for most
+    /// repositories is never. Reading it costs 163 ms and ~30 MB on a
+    /// 299k-file repository, and nothing at all if no rule ever matches.
+    tracked: std::sync::OnceLock<Option<crate::git_index::TrackedFiles>>,
+}
+
+impl CaseInsensitiveIgnore {
+    /// Returns `None` unless `root` is in a git repository that sets
+    /// `core.ignorecase` and has repository-wide rules to apply.
+    ///
+    /// `use_gitignore`, `use_exclude` and `use_parents` mirror the flags the
+    /// case-sensitive pass was built with. They are not a convenience: this
+    /// matcher is only sound as a *narrowing* of that pass, so it must never
+    /// consult a source the case-sensitive pass was told to ignore. With
+    /// `--no-ignore-vcs` the case-sensitive pass lets everything through, which
+    /// would leave this the only thing excluding — the exact opposite of what
+    /// the flag asks for.
+    pub fn new(
+        root: &Path,
+        use_gitignore: bool,
+        use_exclude: bool,
+        use_parents: bool,
+    ) -> Option<Self> {
+        use ignore::gitignore::GitignoreBuilder;
+
+        if !use_gitignore && !use_exclude {
+            return None;
+        }
+
+        let repo_root = git_repo_root(root)?.to_path_buf();
+        if !crate::git_index::ignores_case(&repo_root) {
+            return None;
+        }
+
+        // Everything below is repository-wide, so when the walk starts inside a
+        // subdirectory these rules reach it only as parent rules. `--no-ignore-parent`
+        // switches those off in the case-sensitive pass, and we must follow.
+        // `git_repo_root` returns an ancestor of `root`, so this compares exactly.
+        if !use_parents && root != repo_root {
+            return None;
+        }
+
+        let mut builder = GitignoreBuilder::new(&repo_root);
+        builder.case_insensitive(true).ok()?;
+        if use_gitignore {
+            let _ = builder.add(repo_root.join(GITIGNORE_FILENAME));
+        }
+        if use_exclude {
+            let _ = builder.add(repo_root.join(".git").join("info").join("exclude"));
+        }
+        let matcher = builder.build().ok()?;
+        if matcher.is_empty() {
+            return None;
+        }
+        Some(Self {
+            matcher,
+            repo_root,
+            tracked: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Whether git would hide `path`, which must be absolute.
+    pub fn excludes(&self, path: &Path, is_dir: bool) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.repo_root) else {
+            return false;
+        };
+        if !self
+            .matcher
+            .matched_path_or_any_parents(relative, is_dir)
+            .is_ignore()
+        {
+            return false;
+        }
+        // Only now is the index worth reading.
+        let Some(tracked) = self
+            .tracked
+            .get_or_init(|| crate::git_index::load_tracked(&self.repo_root))
+        else {
+            // No readable index means no way to tell tracked from untracked.
+            // Excluding could hide real source, so decline instead.
+            return false;
+        };
+        let relative = relative.to_string_lossy();
+        if is_dir {
+            // A rule matching a directory does not hide tracked files inside
+            // it, so the walk still has to descend.
+            !tracked.contains_any_under(&relative)
+        } else {
+            !tracked.contains(&relative)
+        }
+    }
+}
+
 /// Build an [`IgnoreMatcher`] from already-discovered `.gitignore` paths.
 ///
 /// `gitignore_files` / `ignore_files` must be **absolute** paths under `root` —
@@ -268,12 +513,10 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
 /// stripping `root` from its parent directory, so repo-relative paths would
 /// leave every nested rule out of the matcher.
 ///
-/// Root-level rules (`.git/info/exclude`, `p4ignore.ini`, a `.gitignore`
-/// directly in `root`, and finally the root `.ignore`) share the root matcher,
-/// added in that order so the last match wins and `.ignore` outranks
-/// `.gitignore`. Every deeper ignore file gets its own matcher anchored at its
-/// directory, because its patterns are written relative to that directory —
-/// see [`IgnoreMatcher::with_nested`].
+/// Every `.ignore` and `.gitignore`, including files directly in `root`, keeps
+/// its own directory anchoring. Source classes are resolved separately so
+/// `.ignore` outranks `.gitignore` across directory levels, matching
+/// `WalkBuilder`. `p4ignore.ini` remains a root-scoped custom source.
 ///
 /// Whether `root` sits inside a git repository, detected by scanning `root` and
 /// its ancestors for a `.git` entry so a subdirectory of a repo still counts.
@@ -282,6 +525,10 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
 /// whether `.gitignore` files are honoured at all.
 pub fn in_git_repo(root: &Path) -> bool {
     root.ancestors().any(|dir| dir.join(".git").exists())
+}
+
+fn git_repo_root(root: &Path) -> Option<&Path> {
+    root.ancestors().find(|dir| dir.join(".git").exists())
 }
 
 /// `.gitignore` and `.git/info/exclude` are **git-gated** to match the indexing
@@ -295,32 +542,30 @@ pub fn matcher_from_ignore_paths(
     gitignore_files: &[std::path::PathBuf],
     ignore_files: &[std::path::PathBuf],
 ) -> Option<IgnoreMatcher> {
+    matcher_from_ignore_paths_with_options(root, gitignore_files, ignore_files, false)
+}
+
+/// Build a matcher from already-discovered ignore files with the same git gate
+/// used by a file walk.
+pub fn matcher_from_ignore_paths_with_options(
+    root: &Path,
+    gitignore_files: &[std::path::PathBuf],
+    ignore_files: &[std::path::PathBuf],
+    no_require_git: bool,
+) -> Option<IgnoreMatcher> {
     use ignore::gitignore::GitignoreBuilder;
 
     // `root` is inside a git repo if it or any ancestor holds a `.git` entry.
-    let in_git_repo = in_git_repo(root);
+    let repo_root = git_repo_root(root);
+    let git_rules_enabled = repo_root.is_some() || no_require_git;
 
     let mut root_builder = GitignoreBuilder::new(root);
-    if in_git_repo {
-        // `.git/info/exclude` is anchored at the repo root, but this matcher is
-        // queried with paths relative to `root`. Only apply it when `root` is
-        // itself the repo root — a `.git` *directory*, not a worktree's `.git`
-        // file — so its anchoring matches.
-        if root.join(".git").is_dir() {
-            let info_exclude = root.join(".git").join("info").join("exclude");
-            if info_exclude.is_file() {
-                let _ = root_builder.add(&info_exclude);
-            }
-        }
-    }
     add_p4ignore_rules(&mut root_builder, root);
 
     let mut nested: Vec<(String, IgnoreKind, Gitignore)> = Vec::new();
 
-    // `.gitignore` first, then `.ignore`, so that within the root matcher the
-    // later-added `.ignore` patterns win.
     let sources = [
-        (IgnoreKind::GitIgnore, gitignore_files, in_git_repo),
+        (IgnoreKind::GitIgnore, gitignore_files, git_rules_enabled),
         (IgnoreKind::DotIgnore, ignore_files, true),
     ];
     for (kind, paths, enabled) in sources {
@@ -349,23 +594,67 @@ pub fn matcher_from_ignore_paths(
             let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
             let rel_dir = rel_dir.trim_matches('/');
 
-            if rel_dir.is_empty() {
-                let _ = root_builder.add(path);
-                continue;
-            }
-
             let mut builder = GitignoreBuilder::new(dir);
-            if builder.add(path).is_some() {
-                continue;
-            }
+            let _ = builder.add(path);
             if let Ok(matcher) = builder.build() {
                 nested.push((rel_dir.to_string(), kind, matcher));
             }
         }
     }
 
+    // WalkBuilder applies `.ignore` files from every ancestor. Its git boundary
+    // is independent: with the default `require_git`, ancestor `.gitignore`
+    // files stop after the nearest repository root; with `--no-require-git`
+    // they continue to the filesystem root.
+    let mut ancestors = Vec::new();
+    for dir in root.ancestors().skip(1) {
+        let prefix = root
+            .strip_prefix(dir)
+            .unwrap_or(root)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (kind, path, enabled) in [
+            (IgnoreKind::DotIgnore, dir.join(DOT_IGNORE_FILENAME), true),
+            (
+                IgnoreKind::GitIgnore,
+                dir.join(GITIGNORE_FILENAME),
+                no_require_git || repo_root.is_some_and(|repo| dir.starts_with(repo)),
+            ),
+        ] {
+            if !enabled || !path.is_file() {
+                continue;
+            }
+            let mut builder = GitignoreBuilder::new(dir);
+            let _ = builder.add(&path);
+            if let Ok(matcher) = builder.build() {
+                ancestors.push((prefix.clone(), kind, matcher));
+            }
+        }
+    }
+
+    let repo_exclude = repo_root.and_then(|repo| {
+        let path = repo.join(".git").join("info").join("exclude");
+        if !path.is_file() {
+            return None;
+        }
+        let mut builder = GitignoreBuilder::new(repo);
+        let _ = builder.add(&path);
+        let matcher = builder.build().ok()?;
+        let prefix = root
+            .strip_prefix(repo)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/");
+        Some((prefix, matcher))
+    });
+
     let local = root_builder.build().ok()?;
-    IgnoreMatcher::with_nested(local, nested, build_global_matcher(root))
+    let global = if git_rules_enabled {
+        build_global_matcher(root)
+    } else {
+        GitignoreBuilder::new(root).build().ok()?
+    };
+    IgnoreMatcher::with_all_sources(local, true, nested, ancestors, repo_exclude, global)
 }
 
 /// Convenience wrapper for callers that only have `.gitignore` paths.
@@ -525,6 +814,17 @@ mod tests {
     }
 
     #[test]
+    fn malformed_ignore_line_does_not_discard_valid_rules() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "*.tmp\n[\n*.log\n").unwrap();
+
+        let matcher = build_matcher(tmp.path()).expect("valid rules should still build");
+        assert!(matcher.is_ignored(Path::new("cache.tmp"), false));
+        assert!(matcher.is_ignored(Path::new("trace.log"), false));
+    }
+
+    #[test]
     fn builds_matcher_from_dot_ignore_without_a_git_repo() {
         // `.ignore` is not git-gated: it applies with no `.git` present.
         let tmp = TempDir::new().unwrap();
@@ -599,6 +899,31 @@ mod tests {
 
         assert!(!matcher.is_ignored(Path::new("keep.log"), false));
         assert!(matcher.is_ignored(Path::new("drop.log"), false));
+    }
+
+    #[test]
+    fn with_nested_keeps_deeper_rules_ahead_of_local_rules() {
+        use ignore::gitignore::GitignoreBuilder;
+
+        let tmp = TempDir::new().unwrap();
+        let mut local = GitignoreBuilder::new(tmp.path());
+        local.add_line(None, "*.log").unwrap();
+        let mut nested = GitignoreBuilder::new(tmp.path().join("pkg"));
+        nested.add_line(None, "!keep.log").unwrap();
+        let global = GitignoreBuilder::new(tmp.path()).build().unwrap();
+        let matcher = IgnoreMatcher::with_nested(
+            local.build().unwrap(),
+            vec![(
+                "pkg".to_string(),
+                IgnoreKind::GitIgnore,
+                nested.build().unwrap(),
+            )],
+            global,
+        )
+        .unwrap();
+
+        assert!(!matcher.is_ignored(Path::new("pkg/keep.log"), false));
+        assert!(matcher.is_ignored(Path::new("pkg/drop.log"), false));
     }
 
     #[test]

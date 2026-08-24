@@ -17,6 +17,28 @@ const INDEX_BUILD_BATCH_SIZE: usize = 1024;
 const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
 const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 
+/// Cumulative bytes allowed in one extraction batch.
+///
+/// Batching by file count alone bounds nothing in memory: every file in a batch
+/// can be read concurrently, so a run of large files puts an unbounded number of
+/// whole-file buffers in flight at once. Bounding the batch's total size bounds
+/// that directly, because each buffer is freed as soon as its trigrams have been
+/// extracted.
+///
+/// The budget also bounds parallelism — a batch holding three 20 MB headers can
+/// only occupy three workers — so it was measured rather than guessed. On the
+/// Linux kernel this value cut peak memory 32% for roughly 4% build time, and a
+/// larger budget that scales with the thread pool was tried and rejected: it was
+/// both slower *and* hungrier there, because the kernel's large files are a rare
+/// minority and the extra headroom bought no throughput.
+///
+/// Files large enough to be mapped are charged [`MAPPED_BATCH_CHARGE`] instead
+/// of their length, so a tree that is mostly oversized files still fills the
+/// pool. Raising this budget would trade memory on *every* tree for that;
+/// charging mapped bytes honestly costs nothing on trees like the kernel, where
+/// only 110 of 94,747 files are mapped at all.
+const INDEX_BUILD_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Default arena budget for [`IndexStrategy::External`] before spilling.
 pub use crate::external::DEFAULT_BUFFER_BYTES as DEFAULT_INDEX_BUFFER_BYTES;
 
@@ -73,10 +95,6 @@ pub struct BuildOptions {
     /// [`IndexStrategy::InMemory`].
     pub buffer_bytes: usize,
     /// Skip files larger than this. `None` indexes files of any size.
-    ///
-    /// Indexing every byte of a huge repository is expensive, so the default
-    /// keeps a cap — but searching must be able to raise it, otherwise large
-    /// files are invisible to indexed queries.
     pub max_file_size: Option<u64>,
 }
 
@@ -90,7 +108,7 @@ impl Default for BuildOptions {
             collect_gitignore_files: false,
             strategy: IndexStrategy::default(),
             buffer_bytes: external::DEFAULT_BUFFER_BYTES,
-            max_file_size: Some(walker::DEFAULT_MAX_FILE_SIZE),
+            max_file_size: walker::DEFAULT_MAX_FILE_SIZE,
         }
     }
 }
@@ -200,6 +218,163 @@ fn gitignore_gate_hint(root: &Path, opts: &BuildOptions) -> Option<String> {
     ))
 }
 
+/// Nominal heap charge for a file large enough to be memory-mapped.
+///
+/// A mapped file's bytes never reach the heap, so charging it its own length
+/// against the heap budget is charging for memory the build does not allocate.
+/// What it does cost is its extracted trigram map, and that is bounded by the
+/// number of *distinct* trigrams — at most 16.7M, and in practice saturating
+/// long before file size does. Saturating the charge keeps that real cost
+/// bounded while letting a batch hold enough large files to fill the pool.
+const MAPPED_BATCH_CHARGE: u64 = 2 * 1024 * 1024;
+
+/// Ceiling on mapped bytes one batch may put in flight.
+///
+/// Mapped pages are file-backed and reclaimable, so they are not the same
+/// liability as heap, but they are still resident: a batch of large files maps
+/// all of them at once, and the process working set follows. This is the second
+/// half of the bound — the heap budget alone would let a batch of 32 MiB files
+/// map 64 MiB *per worker*.
+const MAPPED_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What one file costs a batch, split by where the bytes live.
+#[derive(Clone, Copy, Default)]
+struct BatchCharge {
+    /// Charge against the heap budget: the read buffer for a small file, or the
+    /// saturating stand-in for a mapped file's extracted trigram map.
+    heap: u64,
+    /// Charge against the mapped budget; zero for a file that is read.
+    mapped: u64,
+}
+
+fn batch_charge(size: u64) -> BatchCharge {
+    if size >= MMAP_MIN_BYTES {
+        BatchCharge {
+            heap: size.min(MAPPED_BATCH_CHARGE),
+            mapped: size,
+        }
+    } else {
+        BatchCharge {
+            heap: size,
+            mapped: 0,
+        }
+    }
+}
+
+/// Charge for a file whose size could not be read.
+///
+/// An unknown size counts as a whole batch rather than as zero. A file that
+/// failed to stat may still read, and calling it empty would both let it slip
+/// into an already-full batch and route it to the heap instead of a map —
+/// losing the bound precisely for the file whose size is unknown.
+const UNKNOWN_SIZE_CHARGE: BatchCharge = BatchCharge {
+    heap: INDEX_BUILD_BATCH_BYTES,
+    mapped: MAPPED_BATCH_BYTES,
+};
+
+/// Split a file list into batches bounded by file count, heap bytes and mapped
+/// bytes, given each file's charge in walk order.
+///
+/// A file whose charge alone exceeds a budget forms a batch of its own rather
+/// than being split, so the bound is "one budget, plus at most one oversized
+/// file".
+fn batch_ranges(charges: &[BatchCharge], budget: u64) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut heap = 0u64;
+    let mut mapped = 0u64;
+    for (i, charge) in charges.iter().enumerate() {
+        let full = i - start >= INDEX_BUILD_BATCH_SIZE
+            || heap.saturating_add(charge.heap) > budget
+            || mapped.saturating_add(charge.mapped) > MAPPED_BATCH_BYTES;
+        if i > start && full {
+            ranges.push(start..i);
+            start = i;
+            heap = 0;
+            mapped = 0;
+        }
+        heap = heap.saturating_add(charge.heap);
+        mapped = mapped.saturating_add(charge.mapped);
+    }
+    if start < charges.len() {
+        ranges.push(start..charges.len());
+    }
+    ranges
+}
+
+/// Per-file sizes for reading, paired with their charges against the batch
+/// budgets.
+fn batch_sizes_and_charges(files: &[std::path::PathBuf]) -> (Vec<u64>, Vec<BatchCharge>) {
+    files
+        .par_iter()
+        .map(
+            |path| match std::fs::metadata(path).map(|meta| meta.len()) {
+                Ok(size) => (size, batch_charge(size)),
+                Err(_) => (INDEX_BUILD_BATCH_BYTES, UNKNOWN_SIZE_CHARGE),
+            },
+        )
+        .unzip()
+}
+
+/// Smallest file worth memory-mapping instead of reading.
+///
+/// The same tradeoff the search path makes: mapping costs a syscall pair and a
+/// page-table setup per file, which is a bad deal across the ~94k mostly-small
+/// files of a kernel tree, but above this size it is what stops a large
+/// generated header from costing its full size in heap in every worker that
+/// touches one. Mapped pages are file-backed, so the kernel can reclaim them
+/// under pressure instead of the process holding an allocation it cannot give
+/// back.
+///
+/// 1 MiB is where the measurement pointed rather than a round guess. In the AMD
+/// register headers — the worst case in the kernel tree — an 8 MiB threshold
+/// mapped only 11 of 488 files and left 69% of the bytes on the heap, while
+/// 1 MiB maps 102 files covering 87% of the bytes. It stays cheap on ordinary
+/// trees because it is far above the size of real source: only 110 of the
+/// kernel's 94,747 files reach it at all.
+const MMAP_MIN_BYTES: u64 = 1024 * 1024;
+
+/// The bytes of a file to index, either read onto the heap or borrowed from a
+/// memory map.
+enum FileBytes {
+    Read(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+type ExtractedFile = (String, trigram::TrigramMaskMap);
+
+impl std::ops::Deref for FileBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            FileBytes::Read(bytes) => bytes,
+            FileBytes::Mapped(map) => map,
+        }
+    }
+}
+
+/// Get a file's bytes for indexing, mapping it when it is large enough to be
+/// worth avoiding the copy.
+///
+/// Falls back to reading whenever mapping is unavailable, so a filesystem that
+/// cannot map still indexes correctly.
+fn read_for_index(path: &Path, size: u64) -> std::io::Result<FileBytes> {
+    if size >= MMAP_MIN_BYTES {
+        // SAFETY: the map is read-only and owned by the returned value, which
+        // is dropped once the file's trigrams have been extracted. A concurrent
+        // truncation would be undefined behaviour; that is inherent to mapping
+        // a file being indexed, and is the same exposure the search path
+        // accepts.
+        let mapped =
+            std::fs::File::open(path).and_then(|file| unsafe { memmap2::Mmap::map(&file) });
+        if let Ok(map) = mapped {
+            return Ok(FileBytes::Mapped(map));
+        }
+    }
+    std::fs::read(path).map(FileBytes::Read)
+}
+
 /// Build a trigram index, choosing how postings are accumulated.
 pub fn build_index_with_options(
     root: &Path,
@@ -249,7 +424,9 @@ pub fn build_index_with_options(
     let binary_skipped = std::sync::atomic::AtomicUsize::new(0);
 
     // Assign file IDs and collect posting entries. Batching avoids
-    // retaining every file's per-trigram HashMap at once for large repos.
+    // retaining every file's per-trigram HashMap at once for large repos, and
+    // bounding each batch by cumulative bytes caps how much raw file content is
+    // resident at once, since the whole batch is read concurrently.
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
     let mut sink = match opts.strategy {
         IndexStrategy::InMemory => PostingSink::InMemory(Vec::new()),
@@ -259,11 +436,18 @@ pub fn build_index_with_options(
         }
     };
 
-    for batch in walk.files.chunks(INDEX_BUILD_BATCH_SIZE) {
-        let batch_data: Vec<(String, HashMap<u32, TrigramMasks>)> = batch
+    // The walk already stats every entry but discards the size, so recover it
+    // here rather than widening WalkResult into the search and serve paths.
+    let (sizes, charges) = batch_sizes_and_charges(&walk.files);
+
+    for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
+        let batch = &walk.files[range.clone()];
+        let batch_sizes = &sizes[range];
+        let batch_data: Vec<ExtractedFile> = batch
             .par_iter()
-            .filter_map(|path| {
-                let data = std::fs::read(path).ok()?;
+            .zip(batch_sizes.par_iter())
+            .filter_map(|(path, &size)| {
+                let data = read_for_index(path, size).ok()?;
                 let text = crate::encoding::decode_for_index(&data);
                 if trigram::is_binary(&text) {
                     binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -334,6 +518,113 @@ pub fn build_index_with_options(
         num_files: file_id_map.len(),
         gitignore_files,
         ignore_files,
+    })
+}
+
+/// Outcome of [`build_index_for_files`].
+#[derive(Debug, Default)]
+pub struct FileDeltaOutcome {
+    /// Number of text files written into the delta index.
+    pub indexed: usize,
+    /// Paths that could not be read, and are therefore absent from the delta.
+    ///
+    /// The caller must drop these from the filestamp set it publishes. A stamp
+    /// asserts "this file is indexed at this version"; publishing one for a
+    /// file that was skipped makes the miss permanent, because every later
+    /// reconcile sees a current stamp and never revisits the file. Withholding
+    /// the stamp instead leaves the file looking new, so the next pass retries
+    /// it — which is what should happen for a transient lock or permission
+    /// error.
+    ///
+    /// Binary files are *not* listed here. They are skipped deliberately and
+    /// permanently, so their stamps should be published as normal.
+    pub unreadable: Vec<std::path::PathBuf>,
+}
+
+/// Build an external-sort index for an exact list of absolute file paths.
+///
+/// This is used by `tgrep serve` to build a bounded delta for files that are
+/// absent from an otherwise-complete index. It deliberately skips the directory
+/// walk and filestamp write: the caller already has both from its stale-state
+/// scan and publishes the complete stamp set with the merged index.
+///
+/// Files that become unreadable or binary after the stale scan are omitted
+/// rather than fatal, matching a normal index build. Aborting instead would be
+/// far worse than it looks: for `tgrep serve` this delta is how the index is
+/// persisted, so a single locked or deleted file would fail every save attempt
+/// for the life of the process and no work would ever reach disk. See
+/// [`FileDeltaOutcome::unreadable`] for the caller's obligation.
+pub fn build_index_for_files(
+    root: &Path,
+    index_dir: &Path,
+    files: &[std::path::PathBuf],
+    buffer_bytes: usize,
+) -> Result<FileDeltaOutcome> {
+    let input_root = root;
+    let root = std::fs::canonicalize(root)?;
+    std::fs::create_dir_all(index_dir)?;
+
+    let (sizes, charges) = batch_sizes_and_charges(files);
+    let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(files.len());
+    let mut sorter = ExternalSorter::new(index_dir, buffer_bytes);
+    let mut unreadable: Vec<std::path::PathBuf> = Vec::new();
+
+    for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
+        let batch = &files[range.clone()];
+        let batch_sizes = &sizes[range];
+        let batch_data: Vec<std::result::Result<ExtractedFile, std::path::PathBuf>> = batch
+            .par_iter()
+            .zip(batch_sizes.par_iter())
+            .filter_map(|(path, &size)| {
+                let data = match read_for_index(path, size) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        eprintln!("tgrep: skipping {}: {error}", path.display());
+                        return Some(Err(path.clone()));
+                    }
+                };
+                let text = crate::encoding::decode_for_index(&data);
+                if trigram::is_binary(&text) {
+                    return None;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .or_else(|_| path.strip_prefix(input_root))
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                Some(Ok((rel, trigram::extract_merged_masks(&text))))
+            })
+            .collect();
+
+        for entry in batch_data {
+            let (path, per_tri) = match entry {
+                Ok(extracted) => extracted,
+                Err(skipped) => {
+                    unreadable.push(skipped);
+                    continue;
+                }
+            };
+            let file_id = u32::try_from(file_id_map.len()).map_err(|_| {
+                Error::IndexCorrupted("file count exceeds the u32 file-id limit".into())
+            })?;
+            file_id_map.push((file_id, path));
+            sorter.push_file(file_id, per_tri)?;
+        }
+    }
+
+    let (trigram_count, _) = sorter.write_postings(index_dir)?;
+    write_files_and_meta(
+        index_dir,
+        &root,
+        file_id_map.len(),
+        file_id_map.iter().map(|(_, path)| path.as_str()),
+        trigram_count,
+        Some(true),
+    )?;
+    Ok(FileDeltaOutcome {
+        indexed: file_id_map.len(),
+        unreadable,
     })
 }
 
@@ -751,6 +1042,208 @@ pub fn append_overlay_to_index(
     )
 }
 
+/// Stream-merge replacements and deletions into an existing index.
+///
+/// `delta` contains every new or replacement file. `removed_paths` identifies
+/// reader files to omit; replacement paths therefore appear in both
+/// `removed_paths` and `delta`. Reader file IDs are compacted through a dense
+/// `u32` remap while each posting list is streamed, so heap use is O(files)
+/// rather than O(all postings).
+pub fn merge_index_with_delta(
+    root: &Path,
+    out_dir: &Path,
+    reader: &IndexReader,
+    delta: &IndexReader,
+    removed_paths: &std::collections::HashSet<String>,
+    complete: bool,
+) -> Result<()> {
+    let append_only = removed_paths.is_empty();
+    std::fs::create_dir_all(out_dir)?;
+
+    const DROPPED: u32 = u32::MAX;
+    let mut next_id = 0u32;
+    let mut reader_id_map = Vec::with_capacity(reader.num_files());
+    for path in reader.all_paths() {
+        if removed_paths.contains(path) {
+            reader_id_map.push(DROPPED);
+        } else {
+            reader_id_map.push(next_id);
+            next_id = next_id.checked_add(1).ok_or_else(|| {
+                Error::IndexCorrupted("file count exceeds the u32 file-id limit".into())
+            })?;
+        }
+    }
+    let delta_base = next_id;
+    let total_files = (delta_base as usize)
+        .checked_add(delta.num_files())
+        .ok_or_else(|| Error::IndexCorrupted("file count overflow".into()))?;
+    u32::try_from(total_files)
+        .map_err(|_| Error::IndexCorrupted("file count exceeds the u32 file-id limit".into()))?;
+
+    let mut postings_file =
+        std::io::BufWriter::new(std::fs::File::create(out_dir.join("index.bin"))?);
+    let mut lookup_file =
+        std::io::BufWriter::new(std::fs::File::create(out_dir.join("lookup.bin"))?);
+    let mut lookup_scratch =
+        Vec::with_capacity(LOOKUP_WRITE_CHUNK_ENTRIES * ondisk::LOOKUP_ENTRY_SIZE);
+    let mut posting_scratch =
+        Vec::with_capacity(POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE);
+
+    let reader_trigram_count = reader.num_trigrams();
+    let delta_trigram_count = delta.num_trigrams();
+    let mut ri = 0usize;
+    let mut di = 0usize;
+    let mut offset = 0u64;
+    let mut trigram_count = 0usize;
+
+    while ri < reader_trigram_count || di < delta_trigram_count {
+        let reader_next = (ri < reader_trigram_count)
+            .then(|| reader.nth_trigram_raw(ri))
+            .flatten();
+        if ri < reader_trigram_count && reader_next.is_none() {
+            return Err(Error::IndexCorrupted(format!(
+                "reader trigram entry {ri} of {reader_trigram_count} has unreadable postings"
+            )));
+        }
+        let delta_next = (di < delta_trigram_count)
+            .then(|| delta.nth_trigram_raw(di))
+            .flatten();
+        if di < delta_trigram_count && delta_next.is_none() {
+            return Err(Error::IndexCorrupted(format!(
+                "delta trigram entry {di} of {delta_trigram_count} has unreadable postings"
+            )));
+        }
+
+        let (trigram, reader_bytes, delta_bytes) = match (reader_next, delta_next) {
+            (Some((rt, rbytes)), Some((dt, dbytes))) => match rt.cmp(&dt) {
+                std::cmp::Ordering::Less => {
+                    ri += 1;
+                    (rt, Some(rbytes), None)
+                }
+                std::cmp::Ordering::Greater => {
+                    di += 1;
+                    (dt, None, Some(dbytes))
+                }
+                std::cmp::Ordering::Equal => {
+                    ri += 1;
+                    di += 1;
+                    (rt, Some(rbytes), Some(dbytes))
+                }
+            },
+            (Some((rt, rbytes)), None) => {
+                ri += 1;
+                (rt, Some(rbytes), None)
+            }
+            (None, Some((dt, dbytes))) => {
+                di += 1;
+                (dt, None, Some(dbytes))
+            }
+            (None, None) => break,
+        };
+
+        let mut reader_len = reader_bytes.map_or(0, |bytes| {
+            usize::from(append_only) * (bytes.len() / ondisk::POSTING_ENTRY_SIZE)
+        });
+        if !append_only && let Some(bytes) = reader_bytes {
+            for raw in bytes.as_chunks::<{ ondisk::POSTING_ENTRY_SIZE }>().0.iter() {
+                let old_id = u32::from_le_bytes(raw[0..4].try_into().expect("four-byte file id"));
+                let new_id = *reader_id_map.get(old_id as usize).ok_or_else(|| {
+                    Error::IndexCorrupted(format!(
+                        "posting for trigram {trigram} references missing file id {old_id}"
+                    ))
+                })?;
+                reader_len += usize::from(new_id != DROPPED);
+            }
+        }
+        let delta_len = delta_bytes.map_or(0, |bytes| bytes.len() / ondisk::POSTING_ENTRY_SIZE);
+        let length = u32::try_from(
+            reader_len
+                .checked_add(delta_len)
+                .ok_or_else(|| Error::IndexCorrupted("posting list length overflow".into()))?,
+        )
+        .map_err(|_| {
+            Error::IndexCorrupted(format!(
+                "posting list for trigram {trigram} exceeds the u32 length limit"
+            ))
+        })?;
+        if length == 0 {
+            continue;
+        }
+
+        write_lookup_entry(
+            &mut lookup_file,
+            LookupEntry {
+                trigram,
+                offset,
+                length,
+            },
+            &mut lookup_scratch,
+        )?;
+        if let Some(bytes) = reader_bytes {
+            if append_only {
+                postings_file.write_all(bytes)?;
+            } else {
+                for chunk in bytes.chunks(POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE)
+                {
+                    posting_scratch.clear();
+                    for raw in chunk.as_chunks::<{ ondisk::POSTING_ENTRY_SIZE }>().0.iter() {
+                        let old_id =
+                            u32::from_le_bytes(raw[0..4].try_into().expect("four-byte file id"));
+                        let new_id = reader_id_map[old_id as usize];
+                        if new_id != DROPPED {
+                            posting_scratch.extend_from_slice(&new_id.to_le_bytes());
+                            posting_scratch.extend_from_slice(&raw[4..]);
+                        }
+                    }
+                    postings_file.write_all(&posting_scratch)?;
+                }
+            }
+        }
+        if let Some(bytes) = delta_bytes {
+            for chunk in bytes.chunks(POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE) {
+                posting_scratch.clear();
+                for raw in chunk.as_chunks::<{ ondisk::POSTING_ENTRY_SIZE }>().0.iter() {
+                    let file_id =
+                        u32::from_le_bytes(raw[0..4].try_into().expect("four-byte file id"));
+                    if file_id as usize >= delta.num_files() {
+                        return Err(Error::IndexCorrupted(format!(
+                            "delta posting references missing file id {file_id}"
+                        )));
+                    }
+                    let file_id = delta_base.checked_add(file_id).ok_or_else(|| {
+                        Error::IndexCorrupted("delta file id overflow beyond u32".into())
+                    })?;
+                    posting_scratch.extend_from_slice(&file_id.to_le_bytes());
+                    posting_scratch.extend_from_slice(&raw[4..]);
+                }
+                postings_file.write_all(&posting_scratch)?;
+            }
+        }
+
+        offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;
+        trigram_count += 1;
+    }
+
+    flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
+    postings_file.flush()?;
+    lookup_file.flush()?;
+
+    let paths = reader
+        .all_paths()
+        .iter()
+        .filter(|path| !removed_paths.contains(path.as_str()))
+        .map(String::as_str)
+        .chain(delta.all_paths().iter().map(String::as_str));
+    write_files_and_meta(
+        out_dir,
+        root,
+        total_files,
+        paths,
+        trigram_count,
+        Some(complete),
+    )
+}
+
 fn write_index_v2_from_postings(
     index_dir: &Path,
     root: &Path,
@@ -796,6 +1289,104 @@ fn count_sorted_trigrams(postings: &[TrigramPosting]) -> usize {
 mod tests {
     use super::*;
     use crate::reader::IndexReader;
+
+    const MB: u64 = 1024 * 1024;
+
+    fn charges(sizes: &[u64]) -> Vec<BatchCharge> {
+        sizes.iter().copied().map(batch_charge).collect()
+    }
+
+    #[test]
+    fn batches_are_bounded_by_cumulative_heap_bytes() {
+        // Files below the mapping threshold are read, so their whole length is
+        // heap: five 900 KiB reads against a 2 MiB budget fit two at a time.
+        let charges = charges(&[900 * 1024; 5]);
+        assert_eq!(batch_ranges(&charges, 2 * MB), vec![0..2, 2..4, 4..5]);
+    }
+
+    #[test]
+    fn large_mapped_files_still_fill_a_batch() {
+        // Regression: charging a mapped file its own length against the heap
+        // budget made a batch of large files degenerate to one or two, leaving
+        // every worker but one idle. Mapped bytes never reach the heap, so only
+        // the mapped budget bounds these: 256 MiB / 32 MiB is eight per batch.
+        let charges = charges(&[32 * MB; 16]);
+        assert_eq!(
+            batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES),
+            vec![0..8, 8..16]
+        );
+    }
+
+    #[test]
+    fn mapped_bytes_in_flight_stay_bounded() {
+        // The other half of the bound: a batch may not map more than the mapped
+        // budget, whatever mix of sizes it is handed.
+        let sizes: Vec<u64> = (0..200).map(|i| (i % 9 + 1) * 8 * MB).collect();
+        let charges = charges(&sizes);
+        for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
+            let single = range.end - range.start == 1;
+            let mapped: u64 = charges[range.clone()].iter().map(|c| c.mapped).sum();
+            let heap: u64 = charges[range.clone()].iter().map(|c| c.heap).sum();
+            assert!(
+                single || mapped <= MAPPED_BATCH_BYTES,
+                "batch {range:?} maps {mapped} bytes"
+            );
+            assert!(
+                single || heap <= INDEX_BUILD_BATCH_BYTES,
+                "batch {range:?} reads {heap} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn batches_are_still_bounded_by_file_count() {
+        // Tiny files never reach either byte budget, so the count bound applies.
+        let charges = charges(&[1u64; INDEX_BUILD_BATCH_SIZE * 2 + 5]);
+        let ranges = batch_ranges(&charges, 64 * MB);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0], 0..INDEX_BUILD_BATCH_SIZE);
+    }
+
+    #[test]
+    fn a_file_larger_than_the_budget_gets_its_own_batch() {
+        // The oversized file is never split, and never drags neighbours along.
+        let charges = charges(&[MB, 500 * MB, MB]);
+        assert_eq!(
+            batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES),
+            vec![0..1, 1..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn a_file_whose_size_is_unknown_gets_its_own_batch() {
+        // A failed `metadata()` is recorded as a whole budget rather than as
+        // zero, so the unstattable file is isolated instead of being waved into
+        // a full batch as if it were empty.
+        let charges = vec![batch_charge(MB), UNKNOWN_SIZE_CHARGE, batch_charge(MB)];
+        assert_eq!(
+            batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES),
+            vec![0..1, 1..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn batches_cover_every_file_exactly_once() {
+        let sizes: Vec<u64> = (0..500).map(|i| (i as u64 % 7) * 9 * MB).collect();
+        let charges = charges(&sizes);
+        let ranges = batch_ranges(&charges, 64 * MB);
+        let mut next = 0usize;
+        for range in &ranges {
+            assert_eq!(range.start, next, "gap or overlap between batches");
+            assert!(range.start < range.end, "empty batch");
+            next = range.end;
+        }
+        assert_eq!(next, sizes.len(), "batches must cover the whole walk");
+    }
+
+    #[test]
+    fn an_empty_walk_produces_no_batches() {
+        assert!(batch_ranges(&[], 64 * MB).is_empty());
+    }
 
     /// Build a repo with enough varied content that a small arena spills.
     fn write_sample_repo(root: &Path, file_count: usize) {
@@ -1236,6 +1827,238 @@ mod tests {
         let mut paths: Vec<&str> = ids.iter().filter_map(|&id| merged.file_path(id)).collect();
         paths.sort_unstable();
         assert_eq!(paths, vec!["src/a.txt", "src/b.txt", "src/c.txt"]);
+    }
+
+    /// An unreadable input must not sink the whole delta. For `tgrep serve`
+    /// this build *is* index persistence, so aborting on one locked or
+    /// vanished file would stop anything from ever reaching disk. The file is
+    /// skipped and reported so the caller can withhold its stamp and retry.
+    #[test]
+    fn exact_file_delta_skips_and_reports_an_unreadable_input() {
+        let repo = tempfile::tempdir().unwrap();
+        let readable = repo.path().join("present.txt");
+        std::fs::write(&readable, "needle one\n").unwrap();
+        let missing = repo.path().join("vanished.txt");
+        let delta = tempfile::tempdir().unwrap();
+
+        let outcome = build_index_for_files(
+            repo.path(),
+            delta.path(),
+            &[readable, missing.clone()],
+            DEFAULT_INDEX_BUFFER_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.indexed, 1,
+            "the readable file must still be indexed"
+        );
+        assert_eq!(outcome.unreadable, vec![missing]);
+
+        // The delta is usable, not a half-written casualty of the failure.
+        let reader = IndexReader::open(delta.path()).unwrap();
+        assert_eq!(reader.num_files(), 1);
+        assert_eq!(reader.file_path(0), Some("present.txt"));
+    }
+
+    /// A binary file is skipped deliberately and permanently, so it must *not*
+    /// be reported as unreadable - doing so would make the caller re-read it
+    /// on every reconcile forever.
+    #[test]
+    fn exact_file_delta_does_not_report_binary_files_as_unreadable() {
+        let repo = tempfile::tempdir().unwrap();
+        let binary = repo.path().join("blob.bin");
+        std::fs::write(&binary, [0u8, 1, 2, 0, 3, 0]).unwrap();
+        let delta = tempfile::tempdir().unwrap();
+
+        let outcome = build_index_for_files(
+            repo.path(),
+            delta.path(),
+            &[binary],
+            DEFAULT_INDEX_BUFFER_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.indexed, 0);
+        assert!(outcome.unreadable.is_empty());
+    }
+
+    #[test]
+    fn exact_file_delta_streams_onto_an_existing_index() {
+        let repo = tempfile::tempdir().unwrap();
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "hello world\nneedle one\n").unwrap();
+        std::fs::write(src.join("b.txt"), "needle two\nother content\n").unwrap();
+
+        let base_dir = tempfile::tempdir().unwrap();
+        build_index(repo.path(), Some(base_dir.path()), false, false, &[]).unwrap();
+        let base_reader = IndexReader::open(base_dir.path()).unwrap();
+
+        let c = src.join("c.txt");
+        let d = src.join("d.txt");
+        let binary = src.join("binary.dat");
+        std::fs::write(&c, "Needle three\n").unwrap();
+        std::fs::write(&d, "zzz unique\n").unwrap();
+        std::fs::write(&binary, b"text prefix\0binary tail").unwrap();
+
+        let delta_dir = tempfile::tempdir().unwrap();
+        let delta_count = build_index_for_files(repo.path(), delta_dir.path(), &[c, d, binary], 1)
+            .unwrap()
+            .indexed;
+        assert_eq!(delta_count, 2, "binary files must stay out of the delta");
+        let delta_reader = IndexReader::open(delta_dir.path()).unwrap();
+
+        let merged_dir = tempfile::tempdir().unwrap();
+        merge_index_with_delta(
+            repo.path(),
+            merged_dir.path(),
+            &base_reader,
+            &delta_reader,
+            &std::collections::HashSet::new(),
+            true,
+        )
+        .unwrap();
+
+        let merged = IndexReader::open(merged_dir.path()).unwrap();
+        merged.validate_lookup().unwrap();
+        assert_eq!(merged.num_files(), 4);
+        assert_eq!(merged.file_path(0), base_reader.file_path(0));
+        assert_eq!(merged.file_path(1), base_reader.file_path(1));
+        assert_eq!(merged.file_path(2), Some("src/c.txt"));
+        assert_eq!(merged.file_path(3), Some("src/d.txt"));
+
+        let needle = crate::trigram::hash(b'n', b'e', b'e');
+        let entries = merged.lookup_trigram_with_masks(needle);
+        let mut paths: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| merged.file_path(entry.file_id))
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            vec!["src/a.txt", "src/b.txt", "src/c.txt"],
+            "delta postings must be offset and merged with base postings"
+        );
+        let c_entry = entries
+            .iter()
+            .find(|entry| merged.file_path(entry.file_id) == Some("src/c.txt"))
+            .unwrap();
+        assert_ne!(
+            (c_entry.loc_mask, c_entry.next_mask),
+            (u8::MAX, u8::MAX),
+            "the external delta must preserve real masks"
+        );
+    }
+
+    #[test]
+    fn streamed_delta_can_replace_and_delete_reader_files() {
+        let repo = tempfile::tempdir().unwrap();
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "keep alpha needle\n").unwrap();
+        std::fs::write(src.join("b.txt"), "old beta needle\n").unwrap();
+        std::fs::write(src.join("c.txt"), "delete gamma needle\n").unwrap();
+
+        let base_dir = tempfile::tempdir().unwrap();
+        build_index(repo.path(), Some(base_dir.path()), false, false, &[]).unwrap();
+        let base_reader = IndexReader::open(base_dir.path()).unwrap();
+
+        let b = src.join("b.txt");
+        let d = src.join("d.txt");
+        std::fs::write(&b, "replacement beta unique\n").unwrap();
+        std::fs::remove_file(src.join("c.txt")).unwrap();
+        std::fs::write(&d, "new delta unique\n").unwrap();
+
+        let delta_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            build_index_for_files(repo.path(), delta_dir.path(), &[b, d], 1)
+                .unwrap()
+                .indexed,
+            2
+        );
+        let delta_reader = IndexReader::open(delta_dir.path()).unwrap();
+        let removed =
+            std::collections::HashSet::from(["src/b.txt".to_string(), "src/c.txt".to_string()]);
+
+        let merged_dir = tempfile::tempdir().unwrap();
+        merge_index_with_delta(
+            repo.path(),
+            merged_dir.path(),
+            &base_reader,
+            &delta_reader,
+            &removed,
+            true,
+        )
+        .unwrap();
+
+        let merged = IndexReader::open(merged_dir.path()).unwrap();
+        merged.validate_lookup().unwrap();
+        assert_eq!(merged.num_files(), 3);
+        assert_eq!(merged.file_path(0), Some("src/a.txt"));
+        assert_eq!(merged.file_path(1), Some("src/b.txt"));
+        assert_eq!(merged.file_path(2), Some("src/d.txt"));
+        assert!(
+            merged.all_paths().iter().all(|path| path != "src/c.txt"),
+            "deleted reader paths must not survive the merge"
+        );
+
+        let needle = crate::trigram::hash(b'n', b'e', b'e');
+        let needle_paths: Vec<&str> = merged
+            .lookup_trigram(needle)
+            .iter()
+            .filter_map(|&id| merged.file_path(id))
+            .collect();
+        assert_eq!(
+            needle_paths,
+            vec!["src/a.txt"],
+            "the replacement must not retain the old reader posting"
+        );
+        let unique = crate::trigram::hash(b'u', b'n', b'i');
+        let mut unique_paths: Vec<&str> = merged
+            .lookup_trigram(unique)
+            .iter()
+            .filter_map(|&id| merged.file_path(id))
+            .collect();
+        unique_paths.sort_unstable();
+        assert_eq!(unique_paths, vec!["src/b.txt", "src/d.txt"]);
+    }
+
+    #[test]
+    fn streamed_delta_supports_deletion_without_new_files() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("keep.txt"), "keep needle\n").unwrap();
+        std::fs::write(repo.path().join("delete.txt"), "delete needle\n").unwrap();
+
+        let base_dir = tempfile::tempdir().unwrap();
+        build_index(repo.path(), Some(base_dir.path()), false, false, &[]).unwrap();
+        let base_reader = IndexReader::open(base_dir.path()).unwrap();
+
+        let delta_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            build_index_for_files(repo.path(), delta_dir.path(), &[], 1)
+                .unwrap()
+                .indexed,
+            0
+        );
+        let delta_reader = IndexReader::open(delta_dir.path()).unwrap();
+        let removed = std::collections::HashSet::from(["delete.txt".to_string()]);
+
+        let merged_dir = tempfile::tempdir().unwrap();
+        merge_index_with_delta(
+            repo.path(),
+            merged_dir.path(),
+            &base_reader,
+            &delta_reader,
+            &removed,
+            true,
+        )
+        .unwrap();
+
+        let merged = IndexReader::open(merged_dir.path()).unwrap();
+        merged.validate_lookup().unwrap();
+        assert_eq!(merged.num_files(), 1);
+        assert_eq!(merged.file_path(0), Some("keep.txt"));
     }
 
     #[test]

@@ -5227,3 +5227,169 @@ fn indexed_search_excludes_ignored_files_under_no_require_git() {
         "ignored build output must not be searchable: {stdout:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `-P` patterns still use the index
+//
+// A PCRE pattern cannot be parsed by regex-syntax, so the planner used to give up
+// and hand back MatchAll - every file in the index, read and decoded and matched
+// one by one. On a large tree that turned a query with an obvious mandatory
+// literal into a full-corpus scan. The planner now relaxes the pattern first
+// (dropping the zero-width assertions) and plans from the result, which matches a
+// superset and therefore cannot exclude a real hit. These tests pin that the
+// answers are unchanged.
+// ---------------------------------------------------------------------------
+
+/// Index and direct scans can print paths differently; compare the set of lines
+/// with separators and ordering normalised away.
+fn normalize(out: &str) -> Vec<String> {
+    let mut lines: Vec<String> = out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.replace('\\', "/"))
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// Two files hold the literal - one commented out, one not - plus decoys that do
+/// not hold it at all, so a plan that works can be told apart from one that does
+/// not.
+fn setup_lookaround_fixture() -> (TempDir, String) {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+
+    fs::write(sub.join("live.rs"), "let p = ExchangePrincipal::new();\n").unwrap();
+    fs::write(sub.join("commented.rs"), "//ExchangePrincipal is gone\n").unwrap();
+    fs::write(sub.join("unrelated.rs"), "let q = SomethingElse::new();\n").unwrap();
+    fs::write(sub.join("notes.txt"), "no mention of the type here\n").unwrap();
+
+    let index_dir = dir.path().join("idx");
+    tgrep()
+        .args([
+            "index",
+            sub.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    (dir, index_dir.to_str().unwrap().to_string())
+}
+
+#[test]
+fn indexed_lookaround_finds_the_same_lines_as_a_direct_scan() {
+    let (dir, idx) = setup_lookaround_fixture();
+    let root = indexed_fixture_path(&dir);
+
+    let indexed = String::from_utf8(
+        tgrep()
+            .args([
+                "--no-heading",
+                "-P",
+                "--index-path",
+                &idx,
+                r"(?<!//)ExchangePrincipal",
+                &root,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    let direct = String::from_utf8(
+        tgrep()
+            .args([
+                "--no-heading",
+                "-P",
+                "--no-index",
+                r"(?<!//)ExchangePrincipal",
+                &root,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        normalize(&indexed),
+        normalize(&direct),
+        "using the index must not change the answer"
+    );
+    assert!(
+        indexed.contains("live.rs"),
+        "the uncommented hit survives the relaxed plan: {indexed}"
+    );
+    assert!(
+        !indexed.contains("commented.rs"),
+        "the lookbehind is still applied by the real matcher: {indexed}"
+    );
+}
+
+#[test]
+fn indexed_lookahead_finds_the_same_lines_as_a_direct_scan() {
+    let (dir, idx) = setup_lookaround_fixture();
+    let root = indexed_fixture_path(&dir);
+
+    for pattern in [
+        r"ExchangePrincipal(?=::)",
+        r"ExchangePrincipal(?!::)",
+        r"(?=.*Exchange)ExchangePrincipal",
+    ] {
+        let indexed = tgrep()
+            .args(["--no-heading", "-P", "--index-path", &idx, pattern, &root])
+            .assert()
+            .get_output()
+            .stdout
+            .clone();
+        let direct = tgrep()
+            .args(["--no-heading", "-P", "--no-index", pattern, &root])
+            .assert()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(
+            normalize(&String::from_utf8(indexed).unwrap()),
+            normalize(&String::from_utf8(direct).unwrap()),
+            "index and direct scan disagree for {pattern}"
+        );
+    }
+}
+
+#[test]
+fn indexed_backreference_still_returns_every_match() {
+    // Backreferences cannot be relaxed, so the planner falls back to scanning
+    // everything. That is slow, not wrong - the results must still be complete.
+    let (dir, idx) = setup_lookaround_fixture();
+    let root = indexed_fixture_path(&dir);
+
+    let out = String::from_utf8(
+        tgrep()
+            .args([
+                "--no-heading",
+                "-P",
+                "--index-path",
+                &idx,
+                r"(Exchange)\1?Principal",
+                &root,
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        out.contains("live.rs") && out.contains("commented.rs"),
+        "an unrelaxable pattern still sees every file: {out}"
+    );
+}

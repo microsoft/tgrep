@@ -151,8 +151,22 @@ struct Cli {
     type_list: bool,
 
     /// Ignore files larger than NUM bytes (suffixes K, M, G allowed).
-    #[arg(long = "max-filesize", global = true, value_name = "NUM")]
+    /// Defaults to 64M; use --no-max-filesize for no limit.
+    #[arg(
+        long = "max-filesize",
+        global = true,
+        value_name = "NUM",
+        overrides_with = "no_max_filesize"
+    )]
     max_filesize: Option<String>,
+
+    /// Apply no file size limit, as ripgrep does.
+    #[arg(
+        long = "no-max-filesize",
+        global = true,
+        overrides_with = "max_filesize"
+    )]
+    no_max_filesize: bool,
 
     /// Text encoding to use: `auto` (BOM sniffing), `none`, or a label like `utf-16le`.
     #[arg(
@@ -489,6 +503,11 @@ struct Cli {
 /// Every argument that needs parsing and can fail, resolved once up front.
 struct ResolvedArgs {
     max_filesize: Option<u64>,
+    /// Whether the size limit was asked for rather than inherited from
+    /// [`tgrep_core::walker::DEFAULT_MAX_FILE_SIZE`]. A file named directly on
+    /// the command line ignores the inherited limit — pointing at a file is an
+    /// unambiguous request to search it — but honours one the user set.
+    max_filesize_requested: bool,
     encoding: tgrep_core::encoding::EncodingMode,
     engine: matching::RegexEngine,
     regex_size_limit: Option<usize>,
@@ -676,11 +695,19 @@ enum Command {
 impl Cli {
     /// Resolve `--max-filesize` once, so a malformed value is reported instead
     /// of silently falling back to a different limit than the user asked for.
+    ///
+    /// Absent both flags this is [`walker::DEFAULT_MAX_FILE_SIZE`], not `None`.
+    /// Resolving the default *here* rather than at each use is what keeps the
+    /// index and the search agreeing: a walk that capped at 64 MiB while the
+    /// search did not would look exactly like "this file contains no match".
     fn max_filesize_bytes(&self) -> Result<Option<u64>> {
-        self.max_filesize
-            .as_deref()
-            .map(|s| parse_byte_size("--max-filesize", s))
-            .transpose()
+        if self.no_max_filesize {
+            return Ok(None);
+        }
+        match self.max_filesize.as_deref() {
+            Some(s) => Ok(Some(parse_byte_size("--max-filesize", s)?)),
+            None => Ok(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE),
+        }
     }
 
     /// Resolve `-E/--encoding`. `--no-encoding` means `auto`, and clap's
@@ -715,6 +742,7 @@ impl Cli {
 
         Ok(ResolvedArgs {
             max_filesize: self.max_filesize_bytes()?,
+            max_filesize_requested: self.max_filesize.is_some(),
             encoding: self.encoding_mode()?,
             engine,
             regex_size_limit: self
@@ -773,6 +801,19 @@ impl Cli {
         let binary = self.binary || self.unrestricted >= 3;
         let text = self.text;
 
+        // ripgrep implements `-c`, `--count-matches`, `-l`, `--files-without-match`
+        // and `--files` in a printer that predates `--json` and has no JSON form,
+        // so those flags win outright and the whole invocation produces no JSON —
+        // not even a `summary`. Dropping the flag here rather than only in
+        // `make_output_config` keeps every other `json`-conditional decision
+        // (binary handling, match detail) consistent with the printer in use.
+        let json = self.json
+            && !(self.count
+                || self.count_matches
+                || self.files_only
+                || self.files_without_match
+                || self.list_files);
+
         search::SearchOptions {
             pattern,
             extra_patterns: self.regexp.clone(),
@@ -786,7 +827,7 @@ impl Cli {
             count: self.count,
             word_boundary: self.word_regexp,
             max_count: self.max_count,
-            json: self.json,
+            json,
             vimgrep: self.vimgrep,
             stats: self.stats || self.debug || self.trace,
             no_index: self.no_index,
@@ -827,6 +868,7 @@ impl Cli {
             // Replaced per path argument in `run_search`.
             path_display: crate::output::PathDisplay::Bare,
             max_filesize: resolved.max_filesize,
+            max_filesize_requested: resolved.max_filesize_requested,
             encoding: resolved.encoding,
             follow: self.follow,
             no_messages: self.no_messages,
@@ -882,6 +924,75 @@ impl Cli {
             line_buffered: self.line_buffered,
         }
     }
+
+    /// File-discovery flags that are declared globally (so every subcommand
+    /// accepts them) but that `index` and `serve` do not plumb into their
+    /// walks.
+    ///
+    /// These change *which files exist* as far as the tool is concerned, so
+    /// accepting one and ignoring it produces an index that silently disagrees
+    /// with what was asked for — and, for `serve`, one that then disagrees with
+    /// `tgrep search` over the same tree. That is indistinguishable from a
+    /// corpus with no matches, so the only safe answer is to refuse.
+    ///
+    /// `--hidden` is honoured by `index` but not by `serve`, hence the
+    /// parameter. `--threads` is excluded deliberately: it is documented as
+    /// accepted-for-compatibility and ignored everywhere, not just here.
+    fn unsupported_discovery_flags(&self, hidden_supported: bool) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.hidden && !hidden_supported {
+            out.push("--hidden");
+        }
+        if self.follow {
+            out.push("--follow");
+        }
+        if self.max_depth.is_some() {
+            out.push("--max-depth");
+        }
+        if self.one_file_system {
+            out.push("--one-file-system");
+        }
+        if !self.ignore_file.is_empty() {
+            out.push("--ignore-file");
+        }
+        if self.ignore_file_case_insensitive {
+            out.push("--ignore-file-case-insensitive");
+        }
+        if self.no_ignore_dot {
+            out.push("--no-ignore-dot");
+        }
+        if self.no_ignore_exclude {
+            out.push("--no-ignore-exclude");
+        }
+        if self.no_ignore_files {
+            out.push("--no-ignore-files");
+        }
+        if self.no_ignore_global {
+            out.push("--no-ignore-global");
+        }
+        if self.no_ignore_parent {
+            out.push("--no-ignore-parent");
+        }
+        if self.no_ignore_vcs {
+            out.push("--no-ignore-vcs");
+        }
+        out
+    }
+}
+
+/// Exit with a clear error rather than building an index under settings the
+/// caller did not ask for. See [`Cli::unsupported_discovery_flags`].
+fn reject_unsupported_discovery_flags(cli: &Cli, subcommand: &str, hidden_supported: bool) {
+    let unsupported = cli.unsupported_discovery_flags(hidden_supported);
+    if unsupported.is_empty() {
+        return;
+    }
+    eprintln!(
+        "tgrep: `{subcommand}` does not support {}; \
+         it would be ignored and the index would not match what you asked for",
+        unsupported.join(", ")
+    );
+    process::exit(2);
 }
 
 fn main() {
@@ -947,6 +1058,14 @@ fn run_cli() {
     };
     let max_filesize = resolved.max_filesize;
 
+    // Refuse discovery flags the index-building subcommands can't honour. Done
+    // before the match so the arms keep consuming `cli.command` by value.
+    match &cli.command {
+        Some(Command::Index { .. }) => reject_unsupported_discovery_flags(&cli, "index", true),
+        Some(Command::Serve { .. }) => reject_unsupported_discovery_flags(&cli, "serve", false),
+        _ => {}
+    }
+
     let result = match cli.command {
         Some(Command::Index {
             path,
@@ -954,18 +1073,21 @@ fn run_cli() {
             strategy,
             index_buffer_mb,
             ..
-        }) => index::run(index::RunOptions {
-            root: &path,
-            index_path: cli.index_path.as_deref(),
-            include_hidden: cli.hidden,
-            no_ignore,
-            no_require_git: cli.no_require_git,
-            exclude_dirs: &exclude,
-            strategy: strategy.into(),
-            index_buffer_mb,
-            // Indexing keeps a size cap by default; searching does not.
-            max_file_size: max_filesize.or(Some(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE)),
-        }),
+        }) => {
+            index::run(index::RunOptions {
+                root: &path,
+                index_path: cli.index_path.as_deref(),
+                include_hidden: cli.hidden,
+                no_ignore,
+                no_require_git: cli.no_require_git,
+                exclude_dirs: &exclude,
+                strategy: strategy.into(),
+                index_buffer_mb,
+                // Already carries `walker::DEFAULT_MAX_FILE_SIZE` when the user
+                // named no limit, so indexing and searching cap identically.
+                max_file_size: max_filesize,
+            })
+        }
         Some(Command::Serve {
             path,
             no_watch,
@@ -989,9 +1111,9 @@ fn run_cli() {
                     index_threads,
                     no_ignore,
                     no_require_git: cli.no_require_git,
-                    // Same default as `index`: serve builds and stale-checks
-                    // with a size cap unless the user raises it.
-                    max_file_size: max_filesize.or(Some(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE)),
+                    // Same resolved value the search path uses, so the index
+                    // and the queries against it agree on what exists.
+                    max_file_size: max_filesize,
                     auto_save_mutations,
                     // Clap's range bound guarantees this fits; saturating keeps
                     // the conversion total, and errs toward a large cap rather
@@ -1157,16 +1279,25 @@ fn run_search(
     opts.no_filename = cli.no_filename
         || (!cli.with_filename && !cli.vimgrep && targets.len() == 1 && targets[0].path.is_file());
 
+    // One writer for the whole invocation: ripgrep emits a single JSON
+    // `summary` covering every path it was given, so per-path writers would
+    // report one summary each and a consumer reading "the" summary would see
+    // only the first path's numbers.
+    let mut writer = search::new_writer(&opts);
+
     for target in targets {
         if !target.path.exists() {
             report_missing_path(&target.path, opts.no_messages);
             continue;
         }
-        opts.path_display = target.display();
-        match search::run(&target.path, cli.index_path.as_deref(), &opts) {
+        writer.set_path_display(target.display());
+        match search::run(&target.path, cli.index_path.as_deref(), &opts, &mut writer) {
             Ok(true) => {
                 had_matches = true;
                 if opts.quiet {
+                    // `process::exit` skips destructors, so the summary and any
+                    // buffered output have to be committed explicitly.
+                    let _ = writer.finish();
                     process::exit(0);
                 }
             }
@@ -1175,10 +1306,13 @@ fn run_search(
                 if !opts.no_messages {
                     eprintln!("tgrep: {e}");
                 }
+                let _ = writer.finish();
                 process::exit(2);
             }
         }
     }
+
+    writer.finish()?;
 
     // ripgrep's exit code: 0 on a match with no errors, 2 if anything was
     // reported to stderr, otherwise 1 for "no matches".

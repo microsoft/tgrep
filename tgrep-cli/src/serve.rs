@@ -25,6 +25,14 @@ use tgrep_core::hybrid::HybridIndex;
 use tgrep_core::query;
 
 const CACHE_CAPACITY: usize = 50_000;
+/// Total decoded bytes the content cache may hold. The entry-count limit above
+/// says nothing about memory; without this a handful of large files can pin
+/// tens of gigabytes for the life of the process.
+const CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// Largest single entry the cache will admit. A file bigger than this would
+/// evict most of the cache to store itself, so it is read straight through
+/// instead. It is still searched - only the caching is skipped.
+const CACHE_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 /// Default mutation count that triggers a background save (override with
 /// `--auto-save-mutations`).
 const AUTO_SAVE_MUTATIONS: u32 = 5000;
@@ -43,6 +51,37 @@ const WATCHER_QUEUE_CAP: usize = 16_384;
 /// overflow to repair. Doubles as the quiet period that must elapse before a
 /// reconciling stale check runs.
 const WATCHER_IDLE_POLL: Duration = Duration::from_secs(1);
+
+/// How long a file the watcher never heard about can stay wrong in the index.
+///
+/// Every mutation the index takes after the initial build arrives as an OS
+/// notification, and a notification can go missing: the queue between the
+/// callback and the worker can overflow, a network or virtualised filesystem
+/// can decline to report a change at all, and a `serve` that is running while
+/// the tree is replaced wholesale (a branch switch, a build) can be handed
+/// more events than the platform is willing to buffer. Overflow is detected
+/// and repaired immediately; the rest is silent. Nothing else in the server
+/// ever revisits a file it believes it already knows, so a miss lasts until
+/// the file happens to change again — which for a deleted file is never.
+///
+/// A full stale check finds all of it, because it compares the whole tree
+/// against the index rather than trusting any event. Running one on a timer
+/// turns "until something else happens to fix it" into a bound.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How often the reconcile loop wakes to see whether it is due.
+const RECONCILE_POLL: Duration = Duration::from_secs(60);
+
+/// How long the server must have gone without a search before a scheduled
+/// reconcile runs. A reconcile walks the entire tree and holds the snapshot
+/// gate while it does, so on a repository being actively queried it waits for
+/// a gap rather than competing.
+const RECONCILE_QUIET_PERIOD: Duration = Duration::from_secs(120);
+
+/// The point at which a reconcile stops waiting for a quiet gap. A server
+/// queried steadily every minute would otherwise never see one, and would
+/// never reconcile at all — which is the failure this exists to prevent.
+const RECONCILE_DEADLINE: Duration = Duration::from_secs(4 * 3600);
 
 /// Server discovery info, written to `serve.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -125,11 +164,108 @@ impl DecodedFile {
         let (text, fixups) = tgrep_core::encoding::decode_owned_with_fixups(bytes, encoding);
         Self { text, fixups }
     }
+
+    /// Heap cost of this entry, used to bound the cache by memory rather than
+    /// by entry count.
+    fn heap_bytes(&self) -> u64 {
+        self.text.capacity() as u64 + self.fixups.heap_bytes()
+    }
+}
+
+/// An LRU of decoded file contents bounded by *bytes* as well as by entry count.
+///
+/// Bounding only by entry count makes memory unbounded in practice: 50,000
+/// entries of arbitrary size. Serving a repository that contains one 13.7 GiB
+/// build artifact took the server to 14.4 GiB of private memory after a single
+/// query, and it stayed there for the life of the process, because nothing ever
+/// evicted that one entry.
+///
+/// Two limits are applied:
+///   * `max_bytes` - total cached bytes; the least-recently-used entries are
+///     evicted until the total fits.
+///   * `max_entry_bytes` - entries larger than this are never admitted. A file
+///     that alone exceeds the whole budget would evict every useful entry to
+///     cache itself, and would then be evicted by the next insert anyway.
+struct ContentCache {
+    lru: LruCache<String, Arc<DecodedFile>>,
+    bytes: u64,
+    max_bytes: u64,
+    max_entry_bytes: u64,
+}
+
+impl ContentCache {
+    fn new(capacity: usize, max_bytes: u64, max_entry_bytes: u64) -> Self {
+        Self {
+            lru: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+            bytes: 0,
+            max_bytes,
+            max_entry_bytes,
+        }
+    }
+
+    fn peek(&self, key: &str) -> Option<&Arc<DecodedFile>> {
+        self.lru.peek(key)
+    }
+
+    /// Promote an entry to most-recently-used.
+    fn touch(&mut self, key: &str) {
+        self.lru.get(key);
+    }
+
+    fn put(&mut self, key: String, value: Arc<DecodedFile>) {
+        let size = value.heap_bytes();
+        if size > self.max_entry_bytes {
+            return;
+        }
+        // `push`, not `put`: `put` returns the old value only when the *key*
+        // already existed, and stays silent when the entry-count limit evicts
+        // some other entry to make room. That eviction still frees bytes, so
+        // using `put` would leak the running total upward until the byte budget
+        // looked full and the cache evicted everything.
+        if let Some((_, old)) = self.lru.push(key, value) {
+            self.bytes = self.bytes.saturating_sub(old.heap_bytes());
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.evict_to_fit();
+    }
+
+    fn evict_to_fit(&mut self) {
+        while self.bytes > self.max_bytes {
+            match self.lru.pop_lru() {
+                Some((_, evicted)) => {
+                    self.bytes = self.bytes.saturating_sub(evicted.heap_bytes());
+                }
+                None => {
+                    self.bytes = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn pop(&mut self, key: &str) {
+        if let Some(old) = self.lru.pop(key) {
+            self.bytes = self.bytes.saturating_sub(old.heap_bytes());
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lru.clear();
+        self.bytes = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.lru.len()
+    }
+
+    fn byte_len(&self) -> u64 {
+        self.bytes
+    }
 }
 
 struct ServerState {
     index: RwLock<HybridIndex>,
-    cache: RwLock<LruCache<String, Arc<DecodedFile>>>,
+    cache: RwLock<ContentCache>,
     root: PathBuf,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
@@ -209,6 +345,10 @@ struct ServerState {
     /// Searches do **not** take this lock; they keep using the
     /// current reader + overlay throughout.
     snapshot_gate: RwLock<()>,
+    /// Serializes the complete stale walk → matcher → merge cycle. Serializing
+    /// only publication would let an older walk publish after a newer
+    /// ignore-rule refresh and roll the index back to stale ignore semantics.
+    stale_refresh_lock: Mutex<()>,
     /// Gitignore matcher used by the file watcher to drop events for
     /// paths the initial walk would have skipped via the `ignore` crate
     /// (`.gitignore`, `.git/info/exclude`, global gitignore, etc.).
@@ -228,6 +368,43 @@ struct ServerState {
     /// save. Higher values reduce save frequency (and the pauses they cause)
     /// at the cost of more unsaved work if the process is killed.
     auto_save_mutations: u32,
+    /// Files a delta build could not read, and the metadata they had when it
+    /// tried.
+    ///
+    /// A file that fails to read has its stamp withheld so the next reconcile
+    /// retries it rather than recording it as indexed. That is right for a
+    /// transient failure and wrong for a permanent one: a file locked by
+    /// another process, or unreadable by permission, fails identically every
+    /// time, and with a reconcile on a timer it would rewrite the whole index
+    /// once an hour forever to re-attempt a file that will fail again.
+    ///
+    /// Remembering the metadata of the attempt separates the two. A file whose
+    /// mtime and size have not moved since it failed is not worth another
+    /// read; one that has changed gets a fresh look. The record lives in
+    /// memory, so restarting the server retries everything — which is the
+    /// escape hatch for a file made readable without being modified.
+    unreadable: RwLock<std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+    /// Reference point for [`ServerState::quiet_for`], because an `Instant`
+    /// cannot live in an atomic.
+    started: Instant,
+    /// Milliseconds since `started` at the last search request, used by the
+    /// periodic reconcile to stay out of the way of a server in active use.
+    last_search_ms: std::sync::atomic::AtomicU64,
+}
+
+impl ServerState {
+    fn note_search(&self) {
+        self.last_search_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long the server has gone without a search.
+    fn quiet_for(&self) -> Duration {
+        let last = self.last_search_ms.load(Ordering::Relaxed);
+        self.started
+            .elapsed()
+            .saturating_sub(Duration::from_millis(last))
+    }
 }
 
 /// `Default` exists only for tests, which need to vary one field at a time.
@@ -376,7 +553,11 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
 
     let state = Arc::new(ServerState {
         index: RwLock::new(hybrid),
-        cache: RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap())),
+        cache: RwLock::new(ContentCache::new(
+            CACHE_CAPACITY,
+            CACHE_MAX_BYTES,
+            CACHE_MAX_ENTRY_BYTES,
+        )),
         root: root.clone(),
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
@@ -397,10 +578,14 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         publish_lock: Mutex::new(()),
         file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
         snapshot_gate: RwLock::new(()),
+        stale_refresh_lock: Mutex::new(()),
         gitignore: RwLock::new(None),
         memory_cap_bytes,
         index_threads,
         auto_save_mutations,
+        unreadable: RwLock::new(std::collections::HashMap::new()),
+        started: serve_start,
+        last_search_ms: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Bind TCP listener on a random port
@@ -415,11 +600,14 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     info.save(&index_dir)?;
 
     eprintln!(
-        "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries. \
+        "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries / {} MiB \
+         (entries over {} MiB not cached). \
          Memory cap: {} MB. Index threads: {}. Watcher queue cap: {}.",
         serve_start.elapsed().as_secs_f64() * 1000.0,
         port,
         CACHE_CAPACITY,
+        CACHE_MAX_BYTES / (1024 * 1024),
+        CACHE_MAX_ENTRY_BYTES / (1024 * 1024),
         memory_cap_bytes / (1024 * 1024),
         index_threads,
         watcher_queue_cap,
@@ -448,14 +636,22 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
             // the index while the matcher is missing. That gate is armed when
             // `ServerState` is built — before this thread is spawned and
             // before `start_file_watcher` runs below — so it holds whichever
-            // of the two wins the race, and the stale check releases it
-            // before any of its early returns.
+            // of the two wins the race, and the stale check releases it as
+            // soon as its walk finishes, ahead of every one of its returns.
             //
             // The same stale check is also what recovers events dropped
             // during the gap: it compares the whole tree against the index,
             // so any edit that landed while the matcher was still building is
             // picked up here.
-            background_refresh_stale(&stale_state, &stale_root, &stale_index_dir, None);
+            let mut retry_delay = Duration::from_secs(1);
+            while !background_refresh_stale(&stale_state, &stale_root, &stale_index_dir, false) {
+                eprintln!(
+                    "[trace] stale check: retrying in {:.0}s",
+                    retry_delay.as_secs_f64()
+                );
+                thread::sleep(retry_delay);
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+            }
         });
     }
 
@@ -479,8 +675,20 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
 
     // Start auto-save thread
     let save_state = Arc::clone(&state);
-    let save_index_dir = index_dir.clone();
-    thread::spawn(move || auto_save_loop(save_state, &save_index_dir));
+    thread::spawn(move || auto_save_loop(save_state));
+
+    // Bound how long a change the watcher never heard about can stay wrong.
+    // Pointless without a watcher: `--no-watch` means the index is only ever
+    // refreshed on request, and silently rewriting it on a timer would be a
+    // surprise rather than a repair.
+    if !no_watch {
+        let reconcile_state = Arc::clone(&state);
+        let reconcile_root = root.clone();
+        let reconcile_index_dir = index_dir.clone();
+        thread::spawn(move || {
+            periodic_reconcile_loop(reconcile_state, reconcile_root, reconcile_index_dir)
+        });
+    }
 
     // Accept connections
     for stream in listener.incoming() {
@@ -500,29 +708,21 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     Ok(())
 }
 
-/// Publish the watcher's ignore matcher from ignore files discovered by a walk
-/// that already happened, and release the `gitignore_pending` gate.
+/// Build the ignore matcher used by the watcher from files discovered by a walk
+/// that already happened. The stale path needs it even with `--no-watch`.
 ///
 /// Reusing the caller's walk is the whole point: `gitignore::build_matcher`
 /// would traverse the entire tree a second time purely to find the same ignore
 /// files. On a 289k-file repo on a network drive that second walk cost 205s,
 /// against 1.6s for the stale-check walk over the same tree.
 ///
-/// Every exit path clears the gate. A repo with no ignore rules at all yields
-/// `None`, which is a legitimate final answer rather than a missing matcher, so
-/// it clears the gate too — otherwise the watcher would stay muted forever.
-fn publish_watcher_matcher(
+fn build_stale_matcher(
     state: &ServerState,
     root: &Path,
     walk: &tgrep_core::walker::MetaWalkResult,
-) {
-    if !state.watch_enabled {
-        return;
-    }
+) -> Option<tgrep_core::gitignore::IgnoreMatcher> {
     if state.no_ignore {
-        *state.gitignore.write().unwrap() = None;
-        state.gitignore_pending.store(false, Ordering::SeqCst);
-        return;
+        return None;
     }
 
     let start = Instant::now();
@@ -530,10 +730,9 @@ fn publish_watcher_matcher(
         root,
         &walk.gitignore_files,
         &walk.ignore_files,
+        state.no_require_git,
     );
     let has_matcher = matcher.is_some();
-    *state.gitignore.write().unwrap() = matcher;
-    state.gitignore_pending.store(false, Ordering::SeqCst);
     eprintln!(
         "[trace] gitignore matcher built from stale walk in {:.1}ms \
          ({} .gitignore + {} .ignore files{})",
@@ -542,6 +741,17 @@ fn publish_watcher_matcher(
         walk.ignore_files.len(),
         if has_matcher { "" } else { ", no rules found" }
     );
+    matcher
+}
+
+/// Commit matcher and index semantics together while the stale refresh holds
+/// `snapshot_gate`. `None` is a legitimate matcher when no rules exist.
+fn commit_stale_matcher(
+    state: &ServerState,
+    matcher: Option<tgrep_core::gitignore::IgnoreMatcher>,
+) {
+    *state.gitignore.write().unwrap() = matcher;
+    state.gitignore_pending.store(false, Ordering::SeqCst);
 }
 
 fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
@@ -797,10 +1007,17 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
     // `--encoding` is unsound for the same reason: the index holds trigrams of
     // the BOM-sniffed text, so a re-decoded file can match bytes that were
     // never indexed.
-    let plan = if !matcher.is_standard() || invert_match || encoding.may_differ_from_index() {
+    //
+    // A PCRE-style pattern cannot be parsed by `regex-syntax` at all, but it can
+    // usually be *relaxed* into one that can (dropping lookarounds and the like).
+    // The relaxed pattern matches a superset, so its trigrams are still mandatory
+    // for the original and the candidate set stays sound.
+    let plan = if invert_match || encoding.may_differ_from_index() {
         query::QueryPlan::MatchAll
-    } else {
+    } else if matcher.is_standard() || fixed_string {
         query::build_multi_pattern_plan(&all_patterns, fixed_string, case_insensitive)?
+    } else {
+        query::build_relaxed_multi_pattern_plan(&all_patterns, case_insensitive)
     };
 
     Ok(SearchRequest {
@@ -838,6 +1055,9 @@ fn handle_search(
     state: &ServerState,
 ) -> String {
     let start = Instant::now();
+    // Marks the server as in use, so the periodic reconcile waits for a gap
+    // rather than walking the tree underneath a client that is mid-session.
+    state.note_search();
 
     let req = match parse_search_params(params) {
         Ok(r) => r,
@@ -852,6 +1072,16 @@ fn handle_search(
     let opts = req.opts;
     let pattern = req.pattern;
     let case_insensitive = req.case_insensitive;
+
+    // The index build already dropped everything above the server's own cap, so
+    // re-checking a query cap that is no stricter can never reject a candidate
+    // the index did not already reject — it would only buy a `metadata` call
+    // per candidate on every query. Now that a cap is the default rather than
+    // opt-in, that is the common case, so recognise it and skip the stat.
+    let query_size_limit = match (opts.max_filesize, state.max_file_size) {
+        (Some(query), Some(built)) if built <= query => None,
+        (query, _) => query,
+    };
 
     // Collect candidates and their paths/full_paths while holding the index lock briefly
     let t_index = Instant::now();
@@ -894,7 +1124,7 @@ fn handle_search(
                     return None;
                 }
                 let full_path = index.resolve_full_path(fid, &reader_snapshot)?;
-                if let Some(limit) = opts.max_filesize
+                if let Some(limit) = query_size_limit
                     && std::fs::metadata(&full_path).is_ok_and(|md| md.len() > limit)
                 {
                     return None;
@@ -973,7 +1203,7 @@ fn handle_search(
             let mut cache = state.cache.write().unwrap();
             // Promote hit entries so LRU recency stays accurate
             for key in &hit_keys {
-                cache.get(key);
+                cache.touch(key);
             }
             // Insert disk results, re-checking for races with other threads
             for (rel_path, content) in &disk_results {
@@ -1208,6 +1438,8 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
         "num_trigrams": index.num_trigrams(),
         "cache_size": cache.len(),
         "cache_capacity": CACHE_CAPACITY,
+        "cache_bytes": cache.byte_len(),
+        "cache_max_bytes": CACHE_MAX_BYTES,
         "watcher_active": state.watcher_active.load(std::sync::atomic::Ordering::Relaxed),
         "indexing": indexing,
         "index_progress": state.index_progress.load(std::sync::atomic::Ordering::Relaxed),
@@ -1332,12 +1564,15 @@ fn start_file_watcher(
                             "[trace] watcher queue overflowed (cap {queue_cap}); \
                              reconciling with a stale check"
                         );
-                        background_refresh_stale(
+                        if !background_refresh_stale(
                             &worker_state,
                             &worker_root,
                             &worker_index_dir,
-                            None,
-                        );
+                            false,
+                        ) {
+                            overflowed.store(true, Ordering::SeqCst);
+                            thread::sleep(Duration::from_secs(1));
+                        }
                     }
                     // The watcher was dropped, so the server is shutting down.
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -1441,13 +1676,10 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
                 // The stale refresh walks the tree anyway and republishes the
                 // matcher from that walk, so the reload costs one traversal
                 // rather than a rebuild plus a re-scan.
-                let indexed_paths = {
-                    let index = state.index.read().unwrap();
-                    let mut paths = index.reader_paths();
-                    paths.extend(index.live.overlay_paths());
-                    paths
-                };
-                background_refresh_stale(&state, &root, &state.index_dir, Some(&indexed_paths));
+                if !background_refresh_stale(&state, &root, &state.index_dir, true) {
+                    state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+                    thread::sleep(Duration::from_secs(1));
+                }
             }
 
             state
@@ -1496,17 +1728,6 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         return;
     }
 
-    // Likewise, stay off the index until the gitignore matcher exists. On a
-    // warm start (complete index on disk) `indexing` is false from the very
-    // first event, so without this the watcher would run with a `None`
-    // matcher and index exactly the build output the walk skipped — the
-    // divergence `should_skip_watcher_path` exists to prevent. Events dropped
-    // here are recovered by the stale check that runs right after the
-    // matcher is published.
-    if state.gitignore_pending.load(Ordering::SeqCst) {
-        return;
-    }
-
     // Acquire the snapshot gate up-front for the whole event. While a
     // flush/auto-save is publishing (writer holds it), no reindex
     // *work* — file I/O, trigram extraction, even the [trace] line —
@@ -1515,6 +1736,14 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     // would just block the watcher thread anyway. We hold it for read
     // so multiple events can proceed concurrently outside any flush.
     let _gate = state.snapshot_gate.read().unwrap();
+
+    // Stay off the index until the initial ignore matcher exists. This check
+    // must happen *under* the gate: during startup the stale walk holds the
+    // write side, so an event waits and is applied after publication instead
+    // of being dropped after the walk may already have visited its path.
+    if state.gitignore_pending.load(Ordering::SeqCst) {
+        return;
+    }
 
     for path in &event.paths {
         // Skip the index directory itself
@@ -1628,7 +1857,62 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     }
 }
 
-fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
+/// Whether a scheduled reconcile should run now.
+///
+/// Split out from the loop so the schedule can be exercised without waiting
+/// hours for it.
+fn reconcile_due(since_last: Duration, quiet_for: Duration, busy: bool) -> bool {
+    // Indexing and flushing are already rewriting the index, and a reconcile
+    // takes the snapshot gate for its whole walk-and-merge. Let them finish;
+    // the next tick is a minute away.
+    if busy {
+        return false;
+    }
+    if since_last >= RECONCILE_DEADLINE {
+        return true;
+    }
+    since_last >= RECONCILE_INTERVAL && quiet_for >= RECONCILE_QUIET_PERIOD
+}
+
+/// Periodically compare the whole tree against the index, so a change the
+/// watcher never heard about cannot stay wrong indefinitely.
+///
+/// See [`RECONCILE_INTERVAL`] for why this is needed at all. It is deliberately
+/// unhurried: it defers to indexing, to flushing, and to a server that is
+/// being queried, and it does nothing at all on a tree that has not drifted —
+/// the walk finds no differences and returns without touching the index.
+fn periodic_reconcile_loop(state: Arc<ServerState>, root: PathBuf, index_dir: PathBuf) {
+    let mut last = Instant::now();
+    loop {
+        thread::sleep(RECONCILE_POLL);
+
+        let busy = state.indexing.load(Ordering::SeqCst) || state.flushing.load(Ordering::SeqCst);
+        if !reconcile_due(last.elapsed(), state.quiet_for(), busy) {
+            continue;
+        }
+
+        // Restart the interval before the walk rather than after it. On a large
+        // repository the reconcile itself takes a while, and timing from its
+        // completion would push each one further out than the last.
+        last = Instant::now();
+        eprintln!("[trace] periodic reconcile: looking for changes the watcher missed");
+        // Same comparison the startup check makes, and for the same reason: a
+        // lost event is a stamp that disagrees with the filesystem, a file with
+        // no stamp, or a stamp with no file, and all three fall out of that.
+        // Comparing index *membership* as well would additionally re-add any
+        // file whose stamp says indexed but which the reader does not hold —
+        // a publication bug rather than a lost event, and one that on an hourly
+        // timer would rebuild the whole index every hour if it ever misfired.
+        if !background_refresh_stale(&state, &root, &index_dir, false) {
+            // It declined — an unreadable directory, or a walk that raced a
+            // delete. The index is untouched and correct as far as it goes,
+            // and the next interval tries again.
+            eprintln!("[trace] periodic reconcile: declined, keeping the current index");
+        }
+    }
+}
+
+fn auto_save_loop(state: Arc<ServerState>) {
     let mut last_save = Instant::now();
 
     loop {
@@ -1652,91 +1936,22 @@ fn auto_save_loop(state: Arc<ServerState>, index_dir: &Path) {
             let save_start = Instant::now();
             eprintln!("[trace] auto-save: {dirty} mutations, saving...");
 
-            // Hold the snapshot gate in write mode for the entire
-            // snapshot → publish → prune cycle so watcher mutations
-            // can't race the prune (see flush_index_to_disk for the
-            // same pattern + rationale).
+            // Hold the gate through delta build → publish → prune so watcher
+            // mutations cannot race publication. Recheck after acquiring it:
+            // another publisher may have drained the overlay while we waited.
             let _gate = state.snapshot_gate.write().unwrap();
-
-            // Snapshot reader + overlay under brief read lock
-            let (paths, inverted) = {
-                let index = state.index.read().unwrap();
-                index.full_snapshot()
-            };
-            let staging_dir = index_dir.with_file_name(".tgrep_save_staging");
-            // Clear any stale files from a previously crashed auto-save —
-            // otherwise leftover artifacts (e.g. an old filestamps.json)
-            // would be picked up by move_staged_files and published.
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            if let Err(e) = builder::write_index_from_snapshot(
-                &state.root,
-                &staging_dir,
-                &paths,
-                &inverted,
-                true,
-            ) {
-                eprintln!("[trace] auto-save failed: {e}");
-                let _ = std::fs::remove_dir_all(&staging_dir);
+            if !state.index.read().unwrap().live.has_pending_changes() {
                 continue;
             }
 
-            // Lock-free publish: rename staging files into place, build a
-            // new IndexReader, then swap it in via a brief read lock. Search
-            // queries are NOT blocked: they continue to be served by the
-            // previous reader (whose mmap stays valid until the last
-            // in-flight Arc<IndexReader> is dropped) and by the live overlay
-            // throughout the entire publish.
-            //
-            // Held across move + open + swap so concurrent publishers
-            // (checkpoint / flush) cannot interleave renames or swap
-            // readers out of order. Searches do not take this lock.
-            let _publish = state.publish_lock.lock().unwrap();
-            let num_files = paths.len();
-            if let Err(e) = move_staged_files(&staging_dir, index_dir) {
-                eprintln!("[trace] auto-save move failed: {e}");
-                let _ = std::fs::remove_dir_all(&staging_dir);
-                continue;
+            let stamps = state.file_stamps.read().unwrap().clone();
+            if stream_merge_stale_changes(&state, &[], &[], &[], &stamps, "auto-save", false) {
+                last_save = Instant::now();
+                eprintln!(
+                    "[trace] auto-save complete in {:.1}s",
+                    save_start.elapsed().as_secs_f64()
+                );
             }
-            match tgrep_core::reader::IndexReader::open(index_dir) {
-                Ok(new_reader) => {
-                    let reader_files = new_reader.num_files();
-                    let reader_trigrams = new_reader.num_trigrams();
-
-                    if new_reader.is_degenerate() {
-                        eprintln!(
-                            "[trace] auto-save: degenerate reader ({reader_files} files, \
-                             0 trigrams), keeping live overlay"
-                        );
-                    } else if let Err(msg) = new_reader.validate_lookup() {
-                        eprintln!(
-                            "[trace] auto-save: validation failed: {msg}, keeping live overlay"
-                        );
-                    } else if reader_files >= num_files {
-                        // Swap the reader without blocking concurrent searches.
-                        state.index.read().unwrap().swap_reader(new_reader);
-                        // Brief write lock for in-memory overlay prune + dirty reset.
-                        {
-                            let mut index = state.index.write().unwrap();
-                            index.prune_persisted_entries();
-                            index.live.reset_dirty_count();
-                        }
-                        last_save = Instant::now();
-                        eprintln!(
-                            "[trace] auto-save complete in {:.1}s ({reader_files} files, \
-                             {reader_trigrams} trigrams on disk)",
-                            save_start.elapsed().as_secs_f64(),
-                        );
-                    } else {
-                        eprintln!(
-                            "[trace] auto-save reopen incomplete: expected {num_files} files, found {reader_files}; live overlay retained"
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[trace] auto-save reopen failed: {e}, live overlay retained");
-                }
-            }
-            let _ = std::fs::remove_dir_all(&staging_dir);
         }
     }
 }
@@ -1795,7 +2010,8 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
 fn classify_file_changes(
     current_meta: &[tgrep_core::walker::FileMeta],
     old_stamps: &std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
-    indexed_paths: Option<&std::collections::HashSet<String>>,
+    indexed_paths: &std::collections::HashSet<String>,
+    compare_index_membership: bool,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     use tgrep_core::meta::FileStamp;
 
@@ -1809,7 +2025,7 @@ fn classify_file_changes(
             mtime: fm.mtime,
             size: fm.size,
         };
-        if indexed_paths.is_some_and(|paths| !paths.contains(&fm.relative_path)) {
+        if compare_index_membership && !indexed_paths.contains(&fm.relative_path) {
             added.push(fm.relative_path.clone());
             continue;
         }
@@ -1820,11 +2036,11 @@ fn classify_file_changes(
         }
     }
 
-    let indexed_or_stamped_paths: Box<dyn Iterator<Item = &String>> = match indexed_paths {
-        Some(paths) => Box::new(paths.iter()),
-        None => Box::new(old_stamps.keys()),
-    };
-    let deleted = indexed_or_stamped_paths
+    let mut seen = std::collections::HashSet::new();
+    let deleted = old_stamps
+        .keys()
+        .chain(indexed_paths)
+        .filter(|path| seen.insert(path.as_str()))
         .filter(|path| !current_set.contains(path.as_str()))
         .cloned()
         .collect();
@@ -1832,22 +2048,288 @@ fn classify_file_changes(
     (changed, added, deleted)
 }
 
+/// Apply a stale diff without materializing the existing index in heap.
+///
+/// The ordinary incremental flush uses `HybridIndex::full_snapshot`, whose
+/// memory is proportional to every posting already on disk. That is especially
+/// harmful when a newer tgrep first opens an index built with an older file-size
+/// cap: every formerly-oversized file appears as new at once. Build new and
+/// replacement files into a bounded external-sort delta, then stream it together
+/// with the old index while filtering replaced and deleted reader entries.
+///
+/// The caller holds `snapshot_gate` across the metadata walk and this merge, so
+/// the walk's exact path set is newer than every live entry captured here.
+fn stream_merge_stale_changes(
+    state: &Arc<ServerState>,
+    changed: &[String],
+    added: &[String],
+    deleted: &[String],
+    stamps: &std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    operation: &str,
+    authoritative_membership: bool,
+) -> bool {
+    let root = &state.root;
+    let index_dir = &state.index_dir;
+    let (reader, overlay_paths, tombstone_paths) = {
+        let index = state.index.read().unwrap();
+        (
+            index.reader_arc(),
+            index.live.overlay_paths(),
+            index.live.tombstone_paths(),
+        )
+    };
+
+    state.flushing.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    eprintln!(
+        "[trace] {operation}: building a memory-bounded delta \
+         ({} changed, {} new, {} deleted)...",
+        changed.len(),
+        added.len(),
+        deleted.len()
+    );
+
+    // Keep work directories inside the locked index directory. Sibling names
+    // collide when two independent indexes share a parent directory.
+    let delta_dir = index_dir.join(".stale-delta");
+    let staging_dir = index_dir.join(".stale-merge");
+    let _ = std::fs::remove_dir_all(&delta_dir);
+    let _ = std::fs::remove_dir_all(&staging_dir);
+
+    // Fold in every live mutation. A stale walk also treats its exact path set
+    // as authoritative, removing reader entries missing from the walk; an
+    // auto-save cannot do that because its filestamps may be incomplete.
+    let mut seen = std::collections::HashSet::new();
+    let mut candidates: Vec<String> = changed
+        .iter()
+        .chain(added)
+        .chain(deleted)
+        .chain(overlay_paths.iter())
+        .chain(tombstone_paths.iter())
+        .filter(|path| seen.insert((*path).clone()))
+        .cloned()
+        .collect();
+    if authoritative_membership {
+        candidates.extend(
+            reader
+                .all_paths()
+                .iter()
+                .filter(|path| !stamps.contains_key(path.as_str()))
+                .filter(|path| seen.insert((*path).clone()))
+                .cloned(),
+        );
+    }
+    let desired_paths: Vec<String> = candidates
+        .iter()
+        .filter(|path| stamps.contains_key(path.as_str()))
+        .cloned()
+        .collect();
+    let files: Vec<PathBuf> = desired_paths.iter().map(|path| root.join(path)).collect();
+    // Every candidate is either removed or replaced by the delta. Including a
+    // genuinely new path is harmless because it has no reader entry to filter.
+    let removed: std::collections::HashSet<String> = candidates.iter().cloned().collect();
+
+    let mut published_stamps = stamps.clone();
+
+    let result = (|| -> Result<bool> {
+        let build = || {
+            builder::build_index_for_files(
+                root,
+                &delta_dir,
+                &files,
+                builder::DEFAULT_INDEX_BUFFER_BYTES,
+            )
+        };
+        let outcome = match rayon::ThreadPoolBuilder::new()
+            .num_threads(state.index_threads)
+            .thread_name(|i| format!("tgrep-stale-index-{i}"))
+            .build()
+        {
+            Ok(pool) => pool.install(build)?,
+            Err(_) => build()?,
+        };
+        let delta_count = outcome.indexed;
+
+        // Withhold stamps for files the delta could not read. A published stamp
+        // means "indexed at this version", so keeping one for a skipped file
+        // would hide it from every later reconcile and make the miss permanent.
+        // Dropping the stamp leaves it looking new, so the next pass retries it.
+        //
+        // Record what the file looked like when it failed, so a permanent
+        // failure is retried when the file changes rather than on every pass.
+        // See `ServerState::unreadable`.
+        {
+            let mut memo = state.unreadable.write().unwrap();
+            // Anything this delta was asked to build is settled: either it was
+            // read, or it is in `outcome.unreadable` and re-recorded below.
+            for path in changed.iter().chain(added).chain(deleted) {
+                memo.remove(path);
+            }
+            for path in &outcome.unreadable {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if let Some(stamp) = published_stamps.remove(&rel) {
+                    memo.insert(rel, stamp);
+                }
+            }
+        }
+        if !outcome.unreadable.is_empty() {
+            eprintln!(
+                "[trace] {} file(s) were unreadable during the delta build; \
+                 their stamps are withheld so a later reconcile retries them",
+                outcome.unreadable.len()
+            );
+        }
+
+        let delta = tgrep_core::reader::IndexReader::open(&delta_dir)?;
+        if delta.num_files() != delta_count {
+            anyhow::bail!(
+                "delta reopened with {} files after writing {delta_count}",
+                delta.num_files()
+            );
+        }
+
+        builder::merge_index_with_delta(root, &staging_dir, &reader, &delta, &removed, true)?;
+        tgrep_core::meta::write_filestamps(&published_stamps, &staging_dir)?;
+        let removed_reader_files = reader
+            .all_paths()
+            .iter()
+            .filter(|path| removed.contains(path.as_str()))
+            .count();
+        let expected_files = reader.num_files() - removed_reader_files + delta.num_files();
+        let published = publish_staged_index(state, index_dir, &staging_dir, expected_files);
+        if published {
+            // `publish_staged_index` prunes overlay entries represented by the
+            // new reader. Also clear reconciled entries intentionally omitted
+            // (newly ignored/binary/deleted) and old tombstones for files the
+            // delta restored. The gate guarantees none is newer than this merge.
+            state
+                .index
+                .write()
+                .unwrap()
+                .live
+                .clear_reconciled_paths(&candidates);
+            state
+                .index_progress
+                .store(expected_files as u64, Ordering::Relaxed);
+            state
+                .index_total
+                .store(expected_files as u64, Ordering::Relaxed);
+        }
+        Ok(published)
+    })();
+
+    let _ = std::fs::remove_dir_all(&delta_dir);
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    state.flushing.store(false, Ordering::SeqCst);
+    if matches!(&result, Ok(true)) {
+        *state.file_stamps.write().unwrap() = published_stamps;
+    }
+    match result {
+        Ok(true) => {
+            eprintln!(
+                "[trace] {operation}: streamed {} changes into the index in {:.1}s",
+                candidates.len(),
+                start.elapsed().as_secs_f64()
+            );
+            true
+        }
+        Ok(false) => {
+            eprintln!(
+                "[trace] warning: {operation} delta could not be published; \
+                 keeping the old index"
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!(
+                "[trace] warning: memory-bounded {operation} failed ({error}); \
+                 keeping the old index"
+            );
+            false
+        }
+    }
+}
+
+/// Drop the candidates that failed to read last time and have not changed since.
+///
+/// Returns the paths removed, which the caller must also keep out of the
+/// published stamps — see [`stamps_for_indexed`].
+fn drop_memoized_failures(
+    memo: &std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    current_meta: &[tgrep_core::walker::FileMeta],
+    changed: &mut Vec<String>,
+    added: &mut Vec<String>,
+) -> std::collections::HashSet<String> {
+    if memo.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    // One pass over the walk to pick out the memoized paths, rather than a scan
+    // per candidate.
+    let still_failing: std::collections::HashSet<String> = current_meta
+        .iter()
+        .filter(|fm| {
+            memo.get(&fm.relative_path)
+                .is_some_and(|a| a.mtime == fm.mtime && a.size == fm.size)
+        })
+        .map(|fm| fm.relative_path.clone())
+        .collect();
+    changed.retain(|path| !still_failing.contains(path));
+    added.retain(|path| !still_failing.contains(path));
+    still_failing
+}
+
+/// The stamps to publish for a walk, minus the files that were never built.
+///
+/// A published stamp means "indexed at this version". Stamping a file the delta
+/// deliberately skipped would make every later reconcile see it as unchanged,
+/// so it would never be indexed again — and because the stamp lands in
+/// `filestamps.json`, not even a restart would recover it: every automatic
+/// caller of the stale check passes `compare_index_membership = false`, which
+/// is precisely the check that would have noticed the file is missing. Leaving
+/// it unstamped keeps it looking new, which is what makes the retry-on-change
+/// behaviour in [`drop_memoized_failures`] work at all.
+fn stamps_for_indexed(
+    current_meta: &[tgrep_core::walker::FileMeta],
+    skipped: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, tgrep_core::meta::FileStamp> {
+    current_meta
+        .iter()
+        .filter(|fm| !skipped.contains(&fm.relative_path))
+        .map(|fm| {
+            (
+                fm.relative_path.clone(),
+                tgrep_core::meta::FileStamp {
+                    mtime: fm.mtime,
+                    size: fm.size,
+                },
+            )
+        })
+        .collect()
+}
+
 fn background_refresh_stale(
     state: &Arc<ServerState>,
     root: &Path,
     index_dir: &Path,
-    indexed_paths: Option<&std::collections::HashSet<String>>,
-) {
-    use tgrep_core::meta::{self, FileStamp};
+    compare_index_membership: bool,
+) -> bool {
+    use tgrep_core::meta;
     use tgrep_core::walker;
 
+    let _refresh = state.stale_refresh_lock.lock().unwrap();
+    // Keep watcher/auto-save mutations out for the complete walk → matcher →
+    // merge cycle. Search queries do not take this gate and remain available.
+    let _gate = state.snapshot_gate.write().unwrap();
     let start = Instant::now();
     eprintln!("[trace] stale check: comparing index against filesystem...");
 
     // Walk first. This single traversal feeds both the stale diff and the
-    // watcher's ignore matcher, and it must run before the early returns
-    // below so the matcher is published — and `gitignore_pending` released —
-    // even when the index turns out to be up to date or has no stamps yet.
+    // watcher's ignore matcher, and it must run before the early returns below
+    // so the matcher can be published on every path out of this function.
     let walk = walker::walk_file_metadata(
         root,
         &walker::MetaWalkOptions {
@@ -1858,15 +2340,38 @@ fn background_refresh_stale(
         },
     );
     let walk_ms = start.elapsed().as_millis();
-    publish_watcher_matcher(state, root, &walk);
+
+    // Publish the matcher immediately, before any early return can skip it.
+    // Every exit below is a decision about the *index*; none of them is a
+    // reason to leave the watcher gated. `gitignore_pending` is what keeps the
+    // watcher off the index until a matcher exists, so leaking it past a return
+    // disables the watcher permanently — and the overflow-repair path skips
+    // reconciling while that flag is set, so nothing recovers it either. A
+    // single unreadable directory, or one file whose `metadata()` lost a race
+    // with a delete, would be enough.
+    //
+    // Committing here rather than at each exit is invisible to the watcher:
+    // this function holds `snapshot_gate` for write across its whole body, and
+    // the only reader of `state.gitignore` takes the read side first, so no
+    // event can observe the matcher before this function returns either way.
+    commit_stale_matcher(state, build_stale_matcher(state, root, &walk));
+
+    if walk.skipped_error > 0 {
+        eprintln!(
+            "[trace] warning: stale check could not inspect {} filesystem entries \
+             (walk: {walk_ms}ms); keeping the old index",
+            walk.skipped_error
+        );
+        return false;
+    }
     let current_meta = &walk.files;
 
     // Load stored per-file stamps from last index write
     let mut old_stamps = match meta::read_filestamps(index_dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[trace] stale check: no filestamps found ({e}), skipping");
-            return;
+            eprintln!("[trace] stale check: no filestamps found ({e}), comparing against reader");
+            std::collections::HashMap::new()
         }
     };
 
@@ -1881,93 +2386,86 @@ fn background_refresh_stale(
     for (path, stamp) in state.file_stamps.read().unwrap().iter() {
         old_stamps.insert(path.clone(), stamp.clone());
     }
-    if old_stamps.is_empty() && indexed_paths.is_none() {
-        eprintln!("[trace] stale check: no filestamps found, skipping");
-        return;
+    let indexed_paths = {
+        let index = state.index.read().unwrap();
+        let mut paths = index.reader_paths();
+        paths.extend(index.live.overlay_paths());
+        paths
+    };
+    if old_stamps.is_empty() && indexed_paths.is_empty() && current_meta.is_empty() {
+        eprintln!("[trace] stale check: no indexed files or filesystem files, skipping");
+        return true;
     }
 
-    let (changed, added, deleted) = classify_file_changes(current_meta, &old_stamps, indexed_paths);
+    let (mut changed, mut added, deleted) = classify_file_changes(
+        current_meta,
+        &old_stamps,
+        &indexed_paths,
+        compare_index_membership,
+    );
+
+    // Files that failed to read last time and have not changed since are not
+    // worth another attempt; without this a single permanently locked file
+    // makes every scheduled reconcile rebuild the index. `deleted` is exempt —
+    // a file that is gone needs no read to evict.
+    let skipped_unreadable = {
+        let memo = state.unreadable.read().unwrap();
+        drop_memoized_failures(&memo, current_meta, &mut changed, &mut added)
+    };
+    if !skipped_unreadable.is_empty() {
+        eprintln!(
+            "[trace] stale check: {} file(s) unchanged since they last failed to \
+             read; not retrying them",
+            skipped_unreadable.len()
+        );
+    }
 
     let total_changes = changed.len() + added.len() + deleted.len();
-    if total_changes == 0 {
+    let live_pending = state.index.read().unwrap().live.has_pending_changes();
+    if total_changes == 0 && !live_pending {
         eprintln!(
             "[trace] stale check: index is up-to-date ({} files checked in {}ms)",
             current_meta.len(),
             walk_ms
         );
-        return;
+        return true;
     }
 
-    eprintln!(
-        "[trace] stale check: {} changed, {} new, {} deleted (walk: {}ms)",
-        changed.len(),
-        added.len(),
-        deleted.len(),
-        walk_ms
-    );
-
-    // Apply changes to the LiveIndex. Hold snapshot_gate.read() across the
-    // mutation block so a concurrent flush/auto-save cannot snapshot the
-    // overlay and then prune away these updates after publishing. The
-    // subsequent flush_index_to_disk call below takes the gate exclusively
-    // itself.
-    let update_start = Instant::now();
-    let files_to_update: Vec<String> = changed.into_iter().chain(added).collect();
-
-    {
-        let _gate = state.snapshot_gate.read().unwrap();
-        let mut index = state.index.write().unwrap();
-
-        // Remove deleted files
-        for rel_path in &deleted {
-            index.live.delete_file(rel_path);
-        }
-
-        // Upsert changed/new files (reads content, extracts trigrams)
-        for rel_path in &files_to_update {
-            index.live.update_from_disk(root, rel_path);
-        }
+    if total_changes == 0 {
+        eprintln!(
+            "[trace] stale check: metadata is unchanged, reconciling live mutations \
+             (walk: {walk_ms}ms)"
+        );
+    } else {
+        eprintln!(
+            "[trace] stale check: {} changed, {} new, {} deleted (walk: {}ms)",
+            changed.len(),
+            added.len(),
+            deleted.len(),
+            walk_ms
+        );
     }
 
-    // Invalidate cache entries for all affected files
-    {
-        if let Ok(mut cache) = state.cache.write() {
-            for rel_path in deleted.iter().chain(files_to_update.iter()) {
-                cache.pop(rel_path);
-            }
-        }
+    let new_stamps = stamps_for_indexed(current_meta, &skipped_unreadable);
+
+    if !stream_merge_stale_changes(
+        state,
+        &changed,
+        &added,
+        &deleted,
+        &new_stamps,
+        "stale check",
+        true,
+    ) {
+        return false;
     }
 
-    eprintln!(
-        "[trace] stale check: updated {} files in {:.1}ms (total: {:.1}ms)",
-        total_changes,
-        update_start.elapsed().as_secs_f64() * 1000.0,
-        start.elapsed().as_secs_f64() * 1000.0
-    );
-
-    // Persist the updated index immediately so changes survive a crash.
-    // Pass the freshly-walked stamps so they publish atomically with the
-    // index files.
-    eprintln!("[trace] stale check: flushing updated index to disk...");
-    let new_stamps: std::collections::HashMap<String, FileStamp> = current_meta
-        .iter()
-        .map(|fm| {
-            (
-                fm.relative_path.clone(),
-                FileStamp {
-                    mtime: fm.mtime,
-                    size: fm.size,
-                },
-            )
-        })
-        .collect();
-    state.flushing.store(true, Ordering::SeqCst);
-    flush_index_to_disk(state, root, index_dir, Some(&new_stamps));
-    state.flushing.store(false, Ordering::SeqCst);
-
-    // Refresh in-memory stamps so the watcher can dedupe spurious notify
-    // events for files that already match what we just published.
-    *state.file_stamps.write().unwrap() = new_stamps;
+    if let Ok(mut cache) = state.cache.write() {
+        for path in changed.iter().chain(added.iter()).chain(deleted.iter()) {
+            cache.pop(path);
+        }
+    }
+    true
 }
 
 /// Restore a known-empty on-disk index after a failed bootstrap.
@@ -2012,6 +2510,10 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     let start = Instant::now();
     eprintln!("[trace] bootstrapping index with the external merge sort (memory-bounded)...");
 
+    // Dropped once the build is done so the sampled peak (on platforms without
+    // a kernel high-water mark) covers the whole of it. Unlike the incremental
+    // path below, nothing here polls memory on its own.
+    let sampler = crate::mem::PrivatePeakSampler::start();
     let outcome = match builder::build_index_with_options(
         root,
         Some(index_dir),
@@ -2087,6 +2589,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             root,
             &outcome.gitignore_files,
             &outcome.ignore_files,
+            state.no_require_git,
         );
         let found = matcher.is_some();
         *state.gitignore.write().unwrap() = matcher;
@@ -2103,11 +2606,11 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     drop(gate);
 
     let elapsed = start.elapsed().as_secs_f64();
-    match crate::mem::peak_rss_bytes() {
+    drop(sampler);
+    match crate::mem::format_peak_memory() {
         Some(peak) => eprintln!(
             "[trace] bootstrap complete: {indexed} files indexed in {elapsed:.1}s \
-             (peak memory {})",
-            crate::mem::format_bytes(peak)
+             (peak memory {peak})"
         ),
         None => eprintln!("[trace] bootstrap complete: {indexed} files indexed in {elapsed:.1}s"),
     }
@@ -2180,6 +2683,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             root,
             &walk.gitignore_files,
             &walk.ignore_files,
+            state.no_require_git,
         );
         let has_matcher = matcher.is_some();
         *state.gitignore.write().unwrap() = matcher;
@@ -2301,19 +2805,24 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             );
         }
 
-        // Memory-bounded build: if the in-heap overlay has pushed RSS past the
-        // budget, persist what we've indexed so far to disk and reclaim the
+        // Memory-bounded build: if the in-heap overlay has pushed memory past
+        // the budget, persist what we've indexed so far to disk and reclaim the
         // heap before continuing. This keeps peak memory bounded (the flush
         // copies existing on-disk postings verbatim from mmap rather than into
         // heap) while still converging to a *complete* index — unlike simply
         // stopping, which would leave a partial index.
-        if let Some(rss) = crate::mem::process_rss_bytes()
-            && rss > state.memory_cap_bytes
+        //
+        // Charged against private bytes, not the working set: the overlay is
+        // heap, and that is what a flush can give back. Mapped index pages sit
+        // in the working set too but are file-backed, so counting them would
+        // fire the cap on memory no flush can reclaim.
+        if let Some(used) = crate::mem::budgeted_memory_bytes()
+            && used > state.memory_cap_bytes
         {
             eprintln!(
-                "[trace] memory cap reached ({} MB RSS > {} MB cap) — flushing \
+                "[trace] memory cap reached ({} MB in use > {} MB cap) — flushing \
                  overlay to disk to reclaim memory and continuing",
-                rss / (1024 * 1024),
+                used / (1024 * 1024),
                 state.memory_cap_bytes / (1024 * 1024),
             );
             if flush_append_only_overlay(state, index_dir, false, None) {
@@ -2419,97 +2928,10 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     }
 }
 
-/// Flush the current LiveIndex to disk and reopen the reader.
-/// Uses fast clone + background remap so queries stay responsive.
-///
-/// If `stamps` is `Some`, the function attempts to write per-file stamps
-/// into the staging directory so they are renamed into the index dir
-/// alongside the index files. Stamp persistence is best-effort: if writing
-/// `filestamps.json` fails we log and still publish the index, since
-/// losing the incremental stale-check on next start is preferable to
-/// dropping the freshly-built index. Callers must therefore not rely on
-/// `filestamps.json` always being published alongside a newly-flushed
-/// index.
-///
-/// Returns `true` if the new reader was opened and `prune_persisted_entries`
-/// ran on the live overlay; `false` on any earlier failure (write/move/open
-/// error or partial reader). Callers can use this to decide whether
-/// follow-up work that depends on the prune (e.g. shrinking the overlay)
-/// is worth doing.
-fn flush_index_to_disk(
-    state: &ServerState,
-    _root: &Path,
-    index_dir: &Path,
-    stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
-) -> bool {
-    let flush_start = Instant::now();
-
-    // Hold the snapshot gate in write mode for the entire snapshot →
-    // publish → prune cycle. Watcher mutations block on this for the
-    // duration; without it, an event that fires after the snapshot but
-    // before the prune would be silently dropped (snapshot doesn't see
-    // it, reader is reopened with the old version, then the prune
-    // removes the overlay entry by path because it now matches a reader
-    // entry). Searches do not take this lock and remain unaffected.
-    let _gate = state.snapshot_gate.write().unwrap();
-
-    // Snapshot under brief read lock — use full_snapshot to merge reader + overlay
-    let (paths, inverted, num_files) = {
-        let index = state.index.read().unwrap();
-        let (paths, inverted) = index.full_snapshot();
-        let num = paths.len();
-        eprintln!(
-            "[trace] flush: snapshotted {num} files in {:.1}ms",
-            flush_start.elapsed().as_secs_f64() * 1000.0
-        );
-        (paths, inverted, num)
-    };
-
-    // Always start from a clean staging dir. A previous crash (or a partial
-    // earlier flush whose error path missed the cleanup) could have left
-    // stale files behind — including a stale `filestamps.json`. If the
-    // current flush is invoked with `stamps == None` and we left an old
-    // filestamps.json there, `move_staged_files` would publish it next to
-    // a freshly-built index, silently corrupting the stale-check baseline.
-    let staging_dir = index_dir.with_file_name(".tgrep_flush_staging");
-    let _ = std::fs::remove_dir_all(&staging_dir);
-
-    // Expensive write — no lock held, queries served normally
-    if let Err(e) =
-        builder::write_index_from_snapshot(&state.root, &staging_dir, &paths, &inverted, true)
-    {
-        eprintln!("[trace] warning: flush to disk failed: {e}");
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        return false;
-    }
-
-    // Stage filestamps alongside the index files so the subsequent move
-    // publishes them atomically. If this fails we still try to publish the
-    // index — losing only the incremental stale-check benefit on next start,
-    // not the index itself.
-    if let Some(stamps) = stamps
-        && let Err(e) = tgrep_core::meta::write_filestamps(stamps, &staging_dir)
-    {
-        eprintln!("[trace] warning: failed to write staging filestamps: {e}");
-    }
-
-    // Lock-free publish: rename staging files into place, build the new
-    // reader, swap it in, and prune the now-persisted overlay. Search queries
-    // continue to be served by the previous reader throughout.
-    let pruned = publish_staged_index(state, index_dir, &staging_dir, num_files);
-
-    eprintln!(
-        "[trace] index flushed: {num_files} files on disk in {:.1}s",
-        flush_start.elapsed().as_secs_f64()
-    );
-    pruned
-}
-
 /// Memory-bounded append-only flush used during the initial bulk build.
 ///
-/// Unlike [`flush_index_to_disk`] (which builds a full reader+overlay snapshot
-/// in heap via `full_snapshot`, costing O(total index size) memory), this
-/// streams the live overlay onto the existing on-disk index via
+/// Unlike building a full reader+overlay snapshot in heap (which costs
+/// O(total index size) memory), this streams the live overlay onto disk via
 /// [`builder::append_overlay_to_index`]: the existing postings are copied
 /// verbatim from the reader's mmap and never enter the heap. Peak heap stays
 /// bounded to the overlay snapshot, so repeated checkpoint flushes and the
@@ -2531,10 +2953,9 @@ fn flush_append_only_overlay(
     complete: bool,
     stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
 ) -> bool {
-    // Hold the snapshot gate for the whole snapshot → publish → prune cycle,
-    // mirroring flush_index_to_disk. (During the bulk build the watcher is
-    // already suppressed, but auto-save coordination and future-proofing make
-    // the gate the right call.)
+    // Hold the snapshot gate for the whole snapshot → publish → prune cycle.
+    // During the bulk build the watcher is already suppressed, but auto-save
+    // coordination and future-proofing make the gate the right call.
     let _gate = state.snapshot_gate.write().unwrap();
     flush_append_only_overlay_locked(state, index_dir, complete, stamps)
 }
@@ -2605,10 +3026,10 @@ fn flush_append_only_overlay_locked(
 /// validate + warm it, swap it in without blocking searches, and prune the
 /// now-persisted overlay entries.
 ///
-/// Shared by [`flush_index_to_disk`] and [`flush_append_only_overlay`]. The
-/// `publish_lock` is held across move + open + swap so concurrent publishers
-/// cannot interleave renames or swap readers out of order. `num_files` is the
-/// expected on-disk file count used to reject a partially-published reader.
+/// Shared by stale refresh and [`flush_append_only_overlay`]. The `publish_lock`
+/// is held across move + open + swap so concurrent publishers cannot interleave
+/// renames or swap readers out of order. `num_files` is the expected on-disk
+/// file count used to reject a partially-published reader.
 ///
 /// Returns `true` when the swap + prune succeeded, `false` on any failure (the
 /// previous reader and the live overlay are retained as the fallback).
@@ -2921,6 +3342,123 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn cached(len: usize) -> Arc<DecodedFile> {
+        // `String::from_utf8` preserves the Vec's capacity, so `heap_bytes`
+        // is exactly `len` and the assertions below can use round numbers.
+        let mut bytes = Vec::with_capacity(len);
+        bytes.resize(len, b'a');
+        Arc::new(DecodedFile {
+            text: String::from_utf8(bytes).unwrap(),
+            fixups: Default::default(),
+        })
+    }
+
+    #[test]
+    fn content_cache_evicts_to_stay_under_byte_budget() {
+        let mut cache = ContentCache::new(CACHE_CAPACITY, 1000, 1000);
+        for i in 0..10 {
+            cache.put(format!("f{i}"), cached(200));
+        }
+        assert!(cache.byte_len() <= 1000, "bytes = {}", cache.byte_len());
+        assert_eq!(cache.len(), 5);
+        // Oldest entries went first; the newest survive.
+        assert!(cache.peek("f0").is_none());
+        assert!(cache.peek("f9").is_some());
+    }
+
+    #[test]
+    fn content_cache_refuses_oversized_entries() {
+        let mut cache = ContentCache::new(CACHE_CAPACITY, 1000, 100);
+        cache.put("small".into(), cached(50));
+        cache.put("huge".into(), cached(500));
+        assert!(cache.peek("huge").is_none(), "oversized entry was admitted");
+        // Admitting it would also have evicted the useful entry.
+        assert!(cache.peek("small").is_some());
+        assert_eq!(cache.byte_len(), 50);
+    }
+
+    /// The byte total must stay exact across every path that removes an entry,
+    /// including the entry-count eviction that `LruCache` performs internally.
+    #[test]
+    fn content_cache_byte_accounting_stays_exact() {
+        let mut cache = ContentCache::new(2, u64::MAX, u64::MAX);
+        cache.put("a".into(), cached(100));
+        cache.put("b".into(), cached(100));
+        assert_eq!(cache.byte_len(), 200);
+
+        // Capacity is 2, so this evicts "a" inside the LRU.
+        cache.put("c".into(), cached(100));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.byte_len(), 200, "count-eviction leaked bytes");
+
+        // Replacing an existing key must not double-count.
+        cache.put("c".into(), cached(300));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.byte_len(), 400);
+
+        cache.pop("c");
+        assert_eq!(cache.byte_len(), 100);
+        cache.clear();
+        assert_eq!(cache.byte_len(), 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn content_cache_touch_promotes_recency() {
+        let mut cache = ContentCache::new(CACHE_CAPACITY, 300, 300);
+        cache.put("a".into(), cached(100));
+        cache.put("b".into(), cached(100));
+        cache.touch("a");
+        // "b" is now least-recently-used, so it is the one that goes.
+        cache.put("c".into(), cached(100));
+        cache.put("d".into(), cached(100));
+        assert!(cache.peek("a").is_some(), "touched entry was evicted first");
+        assert!(cache.peek("b").is_none());
+    }
+
+    /// A `ServerState` over an empty index, for exercising the stale path
+    /// directly. Mirrors the defaults `run` uses with a watcher and ignore
+    /// rules enabled, which is the configuration `gitignore_pending` gates.
+    #[cfg(unix)]
+    fn test_server_state(root: &Path, index_dir: &Path) -> Arc<ServerState> {
+        create_empty_index(index_dir).expect("create empty index");
+        let hybrid = HybridIndex::open(index_dir, root).expect("open empty index");
+        Arc::new(ServerState {
+            index: RwLock::new(hybrid),
+            cache: RwLock::new(ContentCache::new(
+                CACHE_CAPACITY,
+                CACHE_MAX_BYTES,
+                CACHE_MAX_ENTRY_BYTES,
+            )),
+            root: root.to_path_buf(),
+            watcher_active: std::sync::atomic::AtomicBool::new(false),
+            indexing: std::sync::atomic::AtomicBool::new(false),
+            flushing: std::sync::atomic::AtomicBool::new(false),
+            gitignore_pending: std::sync::atomic::AtomicBool::new(true),
+            ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
+            ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+            index_progress: std::sync::atomic::AtomicU64::new(0),
+            index_total: std::sync::atomic::AtomicU64::new(0),
+            watch_enabled: true,
+            exclude_dirs: Vec::new(),
+            no_ignore: false,
+            no_require_git: false,
+            max_file_size: None,
+            index_dir: index_dir.to_path_buf(),
+            publish_lock: Mutex::new(()),
+            file_stamps: RwLock::new(Default::default()),
+            snapshot_gate: RwLock::new(()),
+            stale_refresh_lock: Mutex::new(()),
+            gitignore: RwLock::new(None),
+            memory_cap_bytes: 16 * 1024 * 1024 * 1024,
+            index_threads: 1,
+            auto_save_mutations: 0,
+            unreadable: RwLock::new(std::collections::HashMap::new()),
+            started: Instant::now(),
+            last_search_ms: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
     /// A binary marker's offset is a position in the file, not in the repaired
     /// text.
     ///
@@ -3175,10 +3713,217 @@ mod tests {
         ]);
         let indexed = HashSet::from(["kept.txt".to_string(), "newly-ignored.txt".to_string()]);
 
-        let (changed, added, deleted) = classify_file_changes(&current, &stamps, Some(&indexed));
+        let (changed, added, deleted) = classify_file_changes(&current, &stamps, &indexed, true);
         assert!(changed.is_empty());
         assert_eq!(added, vec!["newly-unignored.txt"]);
         assert_eq!(deleted, vec!["newly-ignored.txt"]);
+    }
+
+    #[test]
+    fn stale_classification_uses_reader_paths_for_deletions_and_case_renames() {
+        use std::collections::{HashMap, HashSet};
+        use tgrep_core::walker::FileMeta;
+
+        let current = vec![FileMeta {
+            relative_path: "case.txt".to_string(),
+            mtime: 1,
+            size: 10,
+        }];
+        let indexed = HashSet::from(["Case.txt".to_string(), "reader-only.txt".to_string()]);
+
+        let (changed, added, mut deleted) =
+            classify_file_changes(&current, &HashMap::new(), &indexed, false);
+        assert!(changed.is_empty());
+        assert_eq!(added, vec!["case.txt"]);
+        deleted.sort();
+        assert_eq!(deleted, vec!["Case.txt", "reader-only.txt"]);
+    }
+
+    /// The reconcile waits for the server to go quiet, but not forever.
+    #[test]
+    fn a_scheduled_reconcile_defers_to_a_busy_server_but_not_indefinitely() {
+        let long_quiet = RECONCILE_QUIET_PERIOD + Duration::from_secs(1);
+        let just_queried = Duration::from_secs(1);
+
+        // Before the interval, nothing runs however idle the server is.
+        assert!(!reconcile_due(
+            RECONCILE_INTERVAL - Duration::from_secs(1),
+            long_quiet,
+            false
+        ));
+        // After it, an idle server reconciles.
+        assert!(reconcile_due(RECONCILE_INTERVAL, long_quiet, false));
+        // A server mid-query waits for a gap...
+        assert!(!reconcile_due(RECONCILE_INTERVAL, just_queried, false));
+        // ...but a server that is *always* mid-query would otherwise never
+        // reconcile at all, which is the failure this exists to prevent.
+        assert!(reconcile_due(RECONCILE_DEADLINE, just_queried, false));
+        // Indexing and flushing outrank even the deadline: they are rewriting
+        // the index already, and the next tick is a minute away.
+        assert!(!reconcile_due(RECONCILE_DEADLINE, long_quiet, true));
+    }
+
+    /// A file that cannot be read must not make every reconcile rebuild.
+    ///
+    /// Its stamp is deliberately withheld so it looks new and gets retried.
+    /// Left at that, a file locked by another process would be "new" on every
+    /// pass, and a reconcile on a timer would rewrite the whole index once an
+    /// hour, forever, to re-attempt a read that fails the same way each time.
+    #[test]
+    fn a_file_that_stays_unreadable_is_not_retried_until_it_changes() {
+        use tgrep_core::meta::FileStamp;
+        use tgrep_core::walker::FileMeta;
+
+        let memo = std::collections::HashMap::from([(
+            "locked.bin".to_string(),
+            FileStamp {
+                mtime: 100,
+                size: 5,
+            },
+        )]);
+
+        let retried = |mtime: u64, size: u64| {
+            let current = vec![FileMeta {
+                relative_path: "locked.bin".to_string(),
+                mtime,
+                size,
+            }];
+            let (mut changed, mut added, _) = classify_file_changes(
+                &current,
+                &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
+                false,
+            );
+            let skipped = drop_memoized_failures(&memo, &current, &mut changed, &mut added);
+            (changed.len() + added.len(), skipped)
+        };
+
+        // Unchanged since the failed read: leave it alone.
+        assert_eq!(retried(100, 5).0, 0);
+        // Touched: worth another look.
+        assert_eq!(retried(200, 5).0, 1);
+        // Resized: likewise.
+        assert_eq!(retried(100, 6).0, 1);
+    }
+
+    /// Skipping a file must not also mark it indexed.
+    ///
+    /// The two halves have to agree. `drop_memoized_failures` keeps a file out
+    /// of the delta, so nothing reads it and nothing writes postings for it; if
+    /// the stamps published alongside that delta still claimed it was indexed at
+    /// its current mtime and size, the next reconcile would classify it as
+    /// unchanged and skip it for a completely different reason — one that never
+    /// clears, because the memo is not involved and the stamp outlives the
+    /// process in `filestamps.json`. A file that failed to read once would be
+    /// invisible to search forever, with no error and no way back short of
+    /// deleting the index.
+    #[test]
+    fn a_skipped_file_is_left_unstamped_so_the_next_pass_still_sees_it() {
+        use tgrep_core::meta::FileStamp;
+        use tgrep_core::walker::FileMeta;
+
+        let current = vec![
+            FileMeta {
+                relative_path: "locked.bin".to_string(),
+                mtime: 100,
+                size: 5,
+            },
+            FileMeta {
+                relative_path: "src/main.rs".to_string(),
+                mtime: 100,
+                size: 9,
+            },
+        ];
+        let memo = std::collections::HashMap::from([(
+            "locked.bin".to_string(),
+            FileStamp {
+                mtime: 100,
+                size: 5,
+            },
+        )]);
+
+        let (mut changed, mut added, _) = classify_file_changes(
+            &current,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            false,
+        );
+        let skipped = drop_memoized_failures(&memo, &current, &mut changed, &mut added);
+        assert!(skipped.contains("locked.bin"));
+
+        let stamps = stamps_for_indexed(&current, &skipped);
+        assert!(
+            !stamps.contains_key("locked.bin"),
+            "published a stamp for a file that was never read: {stamps:?}"
+        );
+        assert!(stamps.contains_key("src/main.rs"), "{stamps:?}");
+
+        // And with that stamp withheld, a later pass over an unchanged tree
+        // still offers the file up rather than treating it as up-to-date.
+        let (changed, added, _) =
+            classify_file_changes(&current, &stamps, &std::collections::HashSet::new(), false);
+        assert_eq!(changed.len() + added.len(), 1);
+        assert!(added.contains(&"locked.bin".to_string()));
+    }
+
+    /// A walk error must not leave the watcher gated forever.
+    ///
+    /// `gitignore_pending` is what keeps the watcher off the index until a
+    /// matcher exists, and the stale check owns clearing it. It also refuses to
+    /// touch the index when the walk could not inspect every entry, because
+    /// unseen files would be misclassified as deleted. Those two are separate
+    /// decisions: taking the second one used to skip the first, so one
+    /// unreadable directory — or one file whose `metadata()` lost a race with a
+    /// delete — silently disabled the watcher for the life of the process, and
+    /// the overflow-repair path would not reconcile either, since it defers to
+    /// the pending matcher.
+    ///
+    /// Unix-only because it needs a directory the process genuinely cannot
+    /// read, which has no portable equivalent on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_error_still_publishes_the_watcher_matcher() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        // `.gitignore` is git-gated, matching the indexing walk.
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(root.join("src.rs"), "fn main() {}\n").unwrap();
+
+        let unreadable = root.join("locked");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::write(unreadable.join("inner.rs"), "fn inner() {}\n").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&unreadable).is_ok() {
+            // Running as root, so permissions prove nothing. Restore and skip.
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let index_dir = root.join(".tgrep");
+        std::fs::create_dir(&index_dir).unwrap();
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(true, Ordering::SeqCst);
+
+        let ok = background_refresh_stale(&state, &root, &index_dir, false);
+
+        // Restore before any assertion so a failure still leaves a removable dir.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            !ok,
+            "a walk that could not inspect every entry must keep the old index"
+        );
+        assert!(
+            !state.gitignore_pending.load(Ordering::SeqCst),
+            "the watcher gate must be released even when the index is left alone"
+        );
+        assert!(
+            state.gitignore.read().unwrap().is_some(),
+            "the matcher the walk did find must still be published"
+        );
     }
 
     #[test]

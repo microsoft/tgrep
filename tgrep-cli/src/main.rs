@@ -895,6 +895,75 @@ impl Cli {
             line_buffered: self.line_buffered,
         }
     }
+
+    /// File-discovery flags that are declared globally (so every subcommand
+    /// accepts them) but that `index` and `serve` do not plumb into their
+    /// walks.
+    ///
+    /// These change *which files exist* as far as the tool is concerned, so
+    /// accepting one and ignoring it produces an index that silently disagrees
+    /// with what was asked for — and, for `serve`, one that then disagrees with
+    /// `tgrep search` over the same tree. That is indistinguishable from a
+    /// corpus with no matches, so the only safe answer is to refuse.
+    ///
+    /// `--hidden` is honoured by `index` but not by `serve`, hence the
+    /// parameter. `--threads` is excluded deliberately: it is documented as
+    /// accepted-for-compatibility and ignored everywhere, not just here.
+    fn unsupported_discovery_flags(&self, hidden_supported: bool) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.hidden && !hidden_supported {
+            out.push("--hidden");
+        }
+        if self.follow {
+            out.push("--follow");
+        }
+        if self.max_depth.is_some() {
+            out.push("--max-depth");
+        }
+        if self.one_file_system {
+            out.push("--one-file-system");
+        }
+        if !self.ignore_file.is_empty() {
+            out.push("--ignore-file");
+        }
+        if self.ignore_file_case_insensitive {
+            out.push("--ignore-file-case-insensitive");
+        }
+        if self.no_ignore_dot {
+            out.push("--no-ignore-dot");
+        }
+        if self.no_ignore_exclude {
+            out.push("--no-ignore-exclude");
+        }
+        if self.no_ignore_files {
+            out.push("--no-ignore-files");
+        }
+        if self.no_ignore_global {
+            out.push("--no-ignore-global");
+        }
+        if self.no_ignore_parent {
+            out.push("--no-ignore-parent");
+        }
+        if self.no_ignore_vcs {
+            out.push("--no-ignore-vcs");
+        }
+        out
+    }
+}
+
+/// Exit with a clear error rather than building an index under settings the
+/// caller did not ask for. See [`Cli::unsupported_discovery_flags`].
+fn reject_unsupported_discovery_flags(cli: &Cli, subcommand: &str, hidden_supported: bool) {
+    let unsupported = cli.unsupported_discovery_flags(hidden_supported);
+    if unsupported.is_empty() {
+        return;
+    }
+    eprintln!(
+        "tgrep: `{subcommand}` does not support {}; \
+         it would be ignored and the index would not match what you asked for",
+        unsupported.join(", ")
+    );
+    process::exit(2);
 }
 
 fn main() {
@@ -960,6 +1029,14 @@ fn run_cli() {
     };
     let max_filesize = resolved.max_filesize;
 
+    // Refuse discovery flags the index-building subcommands can't honour. Done
+    // before the match so the arms keep consuming `cli.command` by value.
+    match &cli.command {
+        Some(Command::Index { .. }) => reject_unsupported_discovery_flags(&cli, "index", true),
+        Some(Command::Serve { .. }) => reject_unsupported_discovery_flags(&cli, "serve", false),
+        _ => {}
+    }
+
     let result = match cli.command {
         Some(Command::Index {
             path,
@@ -967,18 +1044,20 @@ fn run_cli() {
             strategy,
             index_buffer_mb,
             ..
-        }) => index::run(index::RunOptions {
-            root: &path,
-            index_path: cli.index_path.as_deref(),
-            include_hidden: cli.hidden,
-            no_ignore,
-            no_require_git: cli.no_require_git,
-            exclude_dirs: &exclude,
-            strategy: strategy.into(),
-            index_buffer_mb,
-            // Neither indexing nor searching caps file size by default.
-            max_file_size: max_filesize.or(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE),
-        }),
+        }) => {
+            index::run(index::RunOptions {
+                root: &path,
+                index_path: cli.index_path.as_deref(),
+                include_hidden: cli.hidden,
+                no_ignore,
+                no_require_git: cli.no_require_git,
+                exclude_dirs: &exclude,
+                strategy: strategy.into(),
+                index_buffer_mb,
+                // Neither indexing nor searching caps file size by default.
+                max_file_size: max_filesize.or(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE),
+            })
+        }
         Some(Command::Serve {
             path,
             no_watch,

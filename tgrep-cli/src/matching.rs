@@ -789,6 +789,100 @@ impl<'a> FileMatches<'a> {
     }
 }
 
+/// Whether `pattern` is free of anchors whose meaning depends on where the
+/// haystack starts and ends.
+///
+/// Line-oriented matching runs the pattern against one line at a time, so `^`,
+/// `$`, `\A`, `\z` and `\Z` all bind to the line. Running the identical regex
+/// over the whole buffer instead would bind them to the buffer, which *narrows*
+/// what matches - the one direction a prescan must never take. Without them the
+/// two haystacks agree, because nothing else in the pattern can observe where
+/// the haystack was cut.
+///
+/// Character classes are not tracked: a `^` or `$` inside one is a literal and
+/// would be safe, but treating it as an anchor only costs the optimisation, not
+/// correctness. Erring toward "not anchor-free" is always sound.
+fn pattern_is_anchor_free(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                // `\A`, `\z` and `\Z` stay bound to the haystack ends even under
+                // `(?m)`, so they can never be made line-relative.
+                match bytes.get(i + 1) {
+                    Some(b'A') | Some(b'z') | Some(b'Z') => return false,
+                    Some(_) => i += 2,
+                    None => return false,
+                }
+            }
+            b'^' | b'$' => return false,
+            _ => i += 1,
+        }
+    }
+    true
+}
+
+/// The lines that could possibly contain a match, or `None` for "check them
+/// all".
+///
+/// The line-oriented loop asks the regex engine once per line. On a
+/// multi-gigabyte file that is billions of calls, and the engine's SIMD
+/// prefilter never gets a run long enough to pay for itself - which is most of
+/// why a whole-file scan costs several times what ripgrep charges. Scanning the
+/// buffer once and verifying only the lines a match touches collapses that to a
+/// single pass.
+///
+/// Soundness rests on two things. The pattern must be anchor-free, so that a
+/// line and the buffer are interchangeable haystacks. And every line a returned
+/// match *spans* is a candidate, not just the line it starts on: `find_iter`
+/// yields leftmost non-overlapping matches, so a match beginning on an earlier
+/// line can be the one that covers this line's match, and a pattern that can
+/// cross `\n` (via `\s`, a negated class, or `-s`) can span several. Under those
+/// rules every line that really matches is covered, and the per-line matcher
+/// still has the final say, so extra candidates cost time and never accuracy.
+fn candidate_lines<'a>(
+    content: &'a str,
+    index: &'a LineIndex,
+    matcher: &'a SearchMatcher,
+    opts: &MatchOptions,
+) -> Option<impl Iterator<Item = usize> + 'a> {
+    // `--stop-on-nonmatch` has to see the first line that *fails*, which a
+    // candidate list by construction skips over.
+    if opts.stop_on_nonmatch {
+        return None;
+    }
+    let SearchMatcher::Standard(re) = matcher else {
+        return None;
+    };
+    if !pattern_is_anchor_free(re.as_str()) {
+        return None;
+    }
+    // A pattern that matches the empty string matches at every offset, so the
+    // prescan would yield every line and the real loop is cheaper.
+    if re.is_match("") {
+        return None;
+    }
+
+    let mut last: Option<usize> = None;
+    Some(
+        re.find_iter(content)
+            .flat_map(move |m| {
+                let first = index.line_of(m.start());
+                // Matches are non-empty here, so `end - 1` is inside the match.
+                let last_line = index.line_of(m.end() - 1);
+                first..=last_line
+            })
+            .filter(move |&li| {
+                let fresh = last != Some(li);
+                if fresh {
+                    last = Some(li);
+                }
+                fresh
+            }),
+    )
+}
+
 /// Find every matching line together with the match ranges inside it.
 fn collect_hits(
     content: &str,
@@ -848,7 +942,7 @@ fn collect_hits(
     // Line-oriented mode: match each line separately so `^` and `$` anchor
     // per line, as ripgrep does.
     let mut out = Vec::new();
-    for i in 0..index.line_count() {
+    let visit = |i: usize, out: &mut Vec<LineHit>| -> Result<bool> {
         let spans = if opts.all_spans {
             matcher.find_spans(index.line_text(content, i))?
         } else {
@@ -860,9 +954,27 @@ fn collect_hits(
         if !spans.is_empty() {
             out.push(LineHit { idx: i, spans });
             if max.is_some_and(|m| out.len() >= m) {
-                break;
+                return Ok(false);
             }
         } else if opts.stop_on_nonmatch && !out.is_empty() {
+            return Ok(false);
+        }
+        Ok(true)
+    };
+
+    // The prescan is lazy, so `--max-count` still stops early instead of
+    // scanning the rest of the file for candidates it will never look at.
+    if let Some(candidates) = candidate_lines(content, index, matcher, opts) {
+        for i in candidates {
+            if !visit(i, &mut out)? {
+                break;
+            }
+        }
+        return Ok(out);
+    }
+
+    for i in 0..index.line_count() {
+        if !visit(i, &mut out)? {
             break;
         }
     }
@@ -874,7 +986,165 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // The backtracking-engine prefilter
+    // The whole-buffer line prescan
+    //
+    // Asking the regex engine once per line is billions of calls on a large
+    // file. Scanning the buffer once and verifying only the lines a match
+    // touches is equivalent *only* when the pattern cannot tell where the
+    // haystack was cut, so these pin down both the gate and the equivalence.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn anchors_disable_the_prescan() {
+        assert!(pattern_is_anchor_free("needle"));
+        assert!(pattern_is_anchor_free(r"\bneedle\b"));
+        assert!(pattern_is_anchor_free(r"a\\b"));
+        assert!(pattern_is_anchor_free(r"\^literal"));
+        assert!(pattern_is_anchor_free(r"\$literal"));
+
+        assert!(!pattern_is_anchor_free("^needle"));
+        assert!(!pattern_is_anchor_free("needle$"));
+        assert!(!pattern_is_anchor_free(r"\Aneedle"));
+        assert!(!pattern_is_anchor_free(r"needle\z"));
+        assert!(!pattern_is_anchor_free(r"needle\Z"));
+        // A class member is a literal, but rejecting it only loses speed.
+        assert!(!pattern_is_anchor_free("[$]"));
+        // A trailing backslash is malformed; refuse rather than index past it.
+        assert!(!pattern_is_anchor_free("needle\\"));
+    }
+
+    // The property that makes the prescan safe: for every pattern it accepts,
+    // the lines it proposes are a superset of the lines that actually match.
+    // Brute-forced against the per-line loop the prescan replaces.
+    #[test]
+    fn prescan_never_drops_a_matching_line() {
+        let patterns = [
+            "a",
+            "ab",
+            "a.c",
+            "a+b",
+            "[abc]+",
+            "a|bc",
+            r"\bword\b",
+            r"\s+x",
+            "a\nb",
+            r"[^q]z",
+            "(?i)ABC",
+            r"\d+",
+            "xyz",
+        ];
+        let haystacks = [
+            "",
+            "a",
+            "abc\n",
+            "abc\ndef\n",
+            "a\nb\nc\n",
+            "aaa\nbbb\nccc",
+            "word here\nno match\nanother word\n",
+            "x\r\ny\r\n",
+            " x\n  x\nq\n",
+            "az\nqz\nbz\n",
+            "ABC\nabc\nAbC\n",
+            "12\n34a\n\n56\n",
+            "no matches at all\nnothing here\n",
+            "a\n\n\na\n",
+        ];
+
+        for pat in patterns {
+            let re = regex::Regex::new(pat).expect("test pattern compiles");
+            let matcher = SearchMatcher::Standard(re);
+            for hay in haystacks {
+                let index = LineIndex::new(hay);
+                let opts = MatchOptions::default();
+
+                // Lines that genuinely match, computed the slow, obvious way.
+                let mut expected = Vec::new();
+                for i in 0..index.line_count() {
+                    if matcher
+                        .is_match(index.line_text(hay, i))
+                        .expect("standard matcher cannot error")
+                    {
+                        expected.push(i);
+                    }
+                }
+
+                // Declining is always allowed; it just means the full loop.
+                if let Some(iter) = candidate_lines(hay, &index, &matcher, &opts) {
+                    let proposed: Vec<usize> = iter.collect();
+                    // Ascending and deduplicated, so `--max-count` can stop
+                    // early and still return the first N matching lines.
+                    assert!(
+                        proposed.windows(2).all(|w| w[0] < w[1]),
+                        "pattern {pat:?} on {hay:?}: candidates {proposed:?} not ascending"
+                    );
+                    for want in &expected {
+                        assert!(
+                            proposed.contains(want),
+                            "pattern {pat:?} on {hay:?}: line {want} matches but was not proposed \
+                             (candidates {proposed:?})"
+                        );
+                    }
+                }
+
+                // Whichever path it took, the answer must be the same.
+                let hits = collect_hits(hay, &index, &matcher, &opts)
+                    .expect("standard matcher cannot error");
+                let got: Vec<usize> = hits.iter().map(|h| h.idx).collect();
+                assert_eq!(got, expected, "pattern {pat:?} on {hay:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn prescan_respects_max_count_and_stop_on_nonmatch() {
+        let hay = "hit\nhit\nmiss\nhit\n";
+        let matcher = SearchMatcher::Standard(regex::Regex::new("hit").unwrap());
+        let index = LineIndex::new(hay);
+
+        let opts = MatchOptions {
+            max_count: Some(2),
+            ..MatchOptions::default()
+        };
+        let hits = collect_hits(hay, &index, &matcher, &opts).unwrap();
+        assert_eq!(hits.iter().map(|h| h.idx).collect::<Vec<_>>(), vec![0, 1]);
+
+        // `--stop-on-nonmatch` must see line 2 fail, which a candidate list
+        // skips, so the prescan has to decline outright.
+        let opts = MatchOptions {
+            stop_on_nonmatch: true,
+            ..MatchOptions::default()
+        };
+        assert!(candidate_lines(hay, &index, &matcher, &opts).is_none());
+        let hits = collect_hits(hay, &index, &matcher, &opts).unwrap();
+        assert_eq!(hits.iter().map(|h| h.idx).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn prescan_declines_when_every_line_matches_anyway() {
+        // An empty-matching pattern matches at every offset, so a prescan would
+        // propose every line at the cost of an extra pass.
+        let hay = "a\nb\n";
+        let index = LineIndex::new(hay);
+        let matcher = SearchMatcher::Standard(regex::Regex::new("x*").unwrap());
+        let opts = MatchOptions::default();
+        assert!(candidate_lines(hay, &index, &matcher, &opts).is_none());
+    }
+
+    #[test]
+    fn prescan_proposes_every_line_a_match_spans() {
+        // `\s+` matches across the newline, so one match covers both lines and
+        // both have to be offered.
+        let hay = "a \n b\nzzz\n";
+        let index = LineIndex::new(hay);
+        let matcher = SearchMatcher::Standard(regex::Regex::new(r"\s+").unwrap());
+        let opts = MatchOptions::default();
+        let proposed: Vec<usize> = candidate_lines(hay, &index, &matcher, &opts)
+            .expect("anchor-free and non-empty")
+            .collect();
+        assert!(proposed.contains(&0));
+        assert!(proposed.contains(&1));
+    }
+
     //
     // `fancy_regex`'s VM has no literal prefilter, so a pattern like
     // `(?<!//)Needle` is tried at every byte offset. Gating it on a relaxed,

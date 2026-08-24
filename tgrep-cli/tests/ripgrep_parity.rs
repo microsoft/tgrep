@@ -2366,3 +2366,92 @@ fn json_is_ignored_when_listing_every_file() {
         "the listing itself is unchanged by --json: {out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Context separators across file boundaries
+//
+// ripgrep marks every gap in the printed stream with `--`, and the jump from one
+// file's context block to the next is a gap. tgrep only marked gaps *within* a
+// file, so piped `-C` output was short one separator per file boundary - 808 of
+// them across a large tree. In heading mode there is no `--`, because the blank
+// line before the next heading already separates the files.
+// ---------------------------------------------------------------------------
+
+/// Two files, each with a match, so the only separator in play is the boundary.
+fn context_fixture() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.txt"), "a1\nneedle\na3\n").unwrap();
+    fs::write(dir.path().join("b.txt"), "b1\nneedle\nb3\n").unwrap();
+    dir
+}
+
+#[test]
+fn context_separator_marks_the_boundary_between_files() {
+    let dir = context_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--no-heading",
+        "-n",
+        "-C",
+        "1",
+        "needle",
+    ]));
+    assert_eq!(
+        out.lines().filter(|l| *l == "--").count(),
+        1,
+        "one `--` separates the two files' context blocks: {out}"
+    );
+}
+
+#[test]
+fn context_separator_is_absent_in_heading_mode() {
+    let dir = context_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--heading",
+        "-n",
+        "-C",
+        "1",
+        "needle",
+    ]));
+    assert_eq!(
+        out.lines().filter(|l| *l == "--").count(),
+        0,
+        "heading mode separates files with a blank line, not `--`: {out}"
+    );
+}
+
+#[test]
+fn context_separator_is_absent_without_context_flags() {
+    let dir = context_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--no-heading",
+        "-n",
+        "needle",
+    ]));
+    assert_eq!(
+        out.lines().filter(|l| *l == "--").count(),
+        0,
+        "without -A/-B/-C a file change is not a context gap: {out}"
+    );
+}
+
+#[test]
+fn no_context_separator_suppresses_the_boundary_marker() {
+    let dir = context_fixture();
+    let out = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--no-heading",
+        "--no-context-separator",
+        "-n",
+        "-C",
+        "1",
+        "needle",
+    ]));
+    assert_eq!(
+        out.lines().filter(|l| *l == "--").count(),
+        0,
+        "--no-context-separator suppresses the boundary marker too: {out}"
+    );
+}

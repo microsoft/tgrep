@@ -397,6 +397,13 @@ impl OutputWriter {
     /// non-adjacent matching lines are the normal case and ripgrep prints
     /// nothing between them; emitting `--` there would also corrupt
     /// `--vimgrep` quickfix parsing and `-o` pipelines.
+    ///
+    /// A gap arises two ways, and ripgrep marks both: a jump between line
+    /// numbers *within* a file, and the transition from one file's context
+    /// block to the next. Only the first was handled here, so piped context
+    /// output was missing one `--` per file boundary - 808 of them across a
+    /// Substrate-sized tree. In heading mode there is no separator, because the
+    /// blank line before the next heading already does that job.
     pub fn write_context_separator(&mut self, file: &str, line_num: usize) -> io::Result<()> {
         if self.is_json() || !self.config.context {
             return Ok(());
@@ -404,11 +411,12 @@ impl OutputWriter {
         let Some(sep) = self.config.context_separator.clone() else {
             return Ok(());
         };
-        if let Some((ref last_file, last_line)) = self.last_printed_line
-            && last_file == file
-            && line_num > last_line + 1
-        {
-            writeln!(self.stdout, "{sep}")?;
+        if let Some((ref last_file, last_line)) = self.last_printed_line {
+            let gap_within_file = last_file == file && line_num > last_line + 1;
+            let new_file = last_file != file && !self.use_heading;
+            if gap_within_file || new_file {
+                writeln!(self.stdout, "{sep}")?;
+            }
         }
         Ok(())
     }

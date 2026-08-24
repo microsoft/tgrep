@@ -17,27 +17,27 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
-See [full benchmark results](BENCHMARKS.md) — up to **43x faster** than ripgrep on large repos.
+See [full benchmark results](BENCHMARKS.md) — up to **52x faster** than ripgrep on large repos.
 
 ### Benchmark highlights (avg latency per query, index pre-built)
 
 | Repo | Files | Platform | ripgrep | tgrep | Speedup |
 | --- | ---: | --- | ---: | ---: | ---: |
-| gecko-dev | 388K | macOS arm64 | 34,289ms | 798ms | **42.9x** |
-| gecko-dev | 388K | Windows | 18,005ms | 517ms | **34.8x** |
-| gecko-dev | 388K | Linux | 1,768ms | 235ms | **7.5x** |
-| chromium | 504K | macOS arm64 | 34,887ms | 3,240ms | **10.8x** |
-| chromium | 504K | Windows | 25,652ms | 1,906ms | **13.5x** |
-| chromium | 504K | Linux | 1,543ms | 655ms | **2.36x** |
-| go | 16K | Windows | 599ms | 97ms | **6.2x** |
-| rust | 62K | Windows | 1,995ms | 247ms | **8.1x** |
-| kubernetes | 31K | Windows | 1,393ms | 236ms | **5.9x** |
-| linux | 96K | macOS arm64 | 3,770ms | 168ms | **22.4x** |
-| linux | 96K | Windows | 3,270ms | 130ms | **25.1x** |
-| linux | 96K | Linux | 435ms | 79ms | **5.5x** |
+| gecko-dev | 388K | macOS arm64 | 33,402ms | 643ms | **51.9x** |
+| gecko-dev | 388K | Windows | 17,841ms | 463ms | **38.6x** |
+| gecko-dev | 388K | Linux | 1,195ms | 162ms | **7.36x** |
+| chromium | 504K | macOS arm64 | 41,806ms | 2,643ms | **15.8x** |
+| chromium | 504K | Windows | 24,576ms | 1,396ms | **17.6x** |
+| chromium | 504K | Linux | 2,404ms | 631ms | **3.81x** |
+| go | 16K | Windows | 592ms | 79ms | **7.53x** |
+| rust | 62K | Windows | 1,489ms | 194ms | **7.69x** |
+| kubernetes | 31K | Windows | 1,342ms | 190ms | **7.08x** |
+| linux | 96K | macOS arm64 | 5,390ms | 256ms | **21.0x** |
+| linux | 96K | Windows | 3,280ms | 94ms | **34.8x** |
+| linux | 96K | Linux | 427ms | 46ms | **9.38x** |
 
-tgrep does not lose any of the 18 measured cells; Kubernetes/Linux is effectively
-tied at 1.004x. The margin depends on repo size and on how many matches a query
+tgrep wins 17 of the 18 measured cells; the exception is Kubernetes on Linux, a
+near-tie at 0.93x. The margin depends on repo size and on how many matches a query
 returns — a search that returns tens of thousands of matches spends more on
 delivering them than the index saves on finding them. See
 [What decides the margin](BENCHMARKS.md#what-decides-the-margin).

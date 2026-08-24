@@ -521,6 +521,26 @@ pub fn build_index_with_options(
     })
 }
 
+/// Outcome of [`build_index_for_files`].
+#[derive(Debug, Default)]
+pub struct FileDeltaOutcome {
+    /// Number of text files written into the delta index.
+    pub indexed: usize,
+    /// Paths that could not be read, and are therefore absent from the delta.
+    ///
+    /// The caller must drop these from the filestamp set it publishes. A stamp
+    /// asserts "this file is indexed at this version"; publishing one for a
+    /// file that was skipped makes the miss permanent, because every later
+    /// reconcile sees a current stamp and never revisits the file. Withholding
+    /// the stamp instead leaves the file looking new, so the next pass retries
+    /// it — which is what should happen for a transient lock or permission
+    /// error.
+    ///
+    /// Binary files are *not* listed here. They are skipped deliberately and
+    /// permanently, so their stamps should be published as normal.
+    pub unreadable: Vec<std::path::PathBuf>,
+}
+
 /// Build an external-sort index for an exact list of absolute file paths.
 ///
 /// This is used by `tgrep serve` to build a bounded delta for files that are
@@ -528,14 +548,18 @@ pub fn build_index_with_options(
 /// walk and filestamp write: the caller already has both from its stale-state
 /// scan and publishes the complete stamp set with the merged index.
 ///
-/// Returns the number of text files written. Files that become unreadable or
-/// binary after the stale scan are omitted, matching a normal index build.
+/// Files that become unreadable or binary after the stale scan are omitted
+/// rather than fatal, matching a normal index build. Aborting instead would be
+/// far worse than it looks: for `tgrep serve` this delta is how the index is
+/// persisted, so a single locked or deleted file would fail every save attempt
+/// for the life of the process and no work would ever reach disk. See
+/// [`FileDeltaOutcome::unreadable`] for the caller's obligation.
 pub fn build_index_for_files(
     root: &Path,
     index_dir: &Path,
     files: &[std::path::PathBuf],
     buffer_bytes: usize,
-) -> Result<usize> {
+) -> Result<FileDeltaOutcome> {
     let input_root = root;
     let root = std::fs::canonicalize(root)?;
     std::fs::create_dir_all(index_dir)?;
@@ -543,23 +567,25 @@ pub fn build_index_for_files(
     let (sizes, charges) = batch_sizes_and_charges(files);
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(files.len());
     let mut sorter = ExternalSorter::new(index_dir, buffer_bytes);
+    let mut unreadable: Vec<std::path::PathBuf> = Vec::new();
 
     for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
         let batch = &files[range.clone()];
         let batch_sizes = &sizes[range];
-        let batch_data: Result<Vec<Option<ExtractedFile>>> = batch
+        let batch_data: Vec<std::result::Result<ExtractedFile, std::path::PathBuf>> = batch
             .par_iter()
             .zip(batch_sizes.par_iter())
-            .map(|(path, &size)| {
-                let data = read_for_index(path, size).map_err(|error| {
-                    Error::Io(std::io::Error::new(
-                        error.kind(),
-                        format!("{}: {error}", path.display()),
-                    ))
-                })?;
+            .filter_map(|(path, &size)| {
+                let data = match read_for_index(path, size) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        eprintln!("tgrep: skipping {}: {error}", path.display());
+                        return Some(Err(path.clone()));
+                    }
+                };
                 let text = crate::encoding::decode_for_index(&data);
                 if trigram::is_binary(&text) {
-                    return Ok(None);
+                    return None;
                 }
                 let rel = path
                     .strip_prefix(&root)
@@ -567,11 +593,18 @@ pub fn build_index_for_files(
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                Ok(Some((rel, trigram::extract_merged_masks(&text))))
+                Some(Ok((rel, trigram::extract_merged_masks(&text))))
             })
             .collect();
 
-        for (path, per_tri) in batch_data?.into_iter().flatten() {
+        for entry in batch_data {
+            let (path, per_tri) = match entry {
+                Ok(extracted) => extracted,
+                Err(skipped) => {
+                    unreadable.push(skipped);
+                    continue;
+                }
+            };
             let file_id = u32::try_from(file_id_map.len()).map_err(|_| {
                 Error::IndexCorrupted("file count exceeds the u32 file-id limit".into())
             })?;
@@ -589,7 +622,10 @@ pub fn build_index_for_files(
         trigram_count,
         Some(true),
     )?;
-    Ok(file_id_map.len())
+    Ok(FileDeltaOutcome {
+        indexed: file_id_map.len(),
+        unreadable,
+    })
 }
 
 /// Return the default index directory for a given repo root.
@@ -1793,20 +1829,58 @@ mod tests {
         assert_eq!(paths, vec!["src/a.txt", "src/b.txt", "src/c.txt"]);
     }
 
+    /// An unreadable input must not sink the whole delta. For `tgrep serve`
+    /// this build *is* index persistence, so aborting on one locked or
+    /// vanished file would stop anything from ever reaching disk. The file is
+    /// skipped and reported so the caller can withhold its stamp and retry.
     #[test]
-    fn exact_file_delta_fails_if_an_input_cannot_be_read() {
+    fn exact_file_delta_skips_and_reports_an_unreadable_input() {
         let repo = tempfile::tempdir().unwrap();
-        let delta = tempfile::tempdir().unwrap();
+        let readable = repo.path().join("present.txt");
+        std::fs::write(&readable, "needle one\n").unwrap();
         let missing = repo.path().join("vanished.txt");
+        let delta = tempfile::tempdir().unwrap();
 
-        let error = build_index_for_files(
+        let outcome = build_index_for_files(
             repo.path(),
             delta.path(),
-            &[missing],
+            &[readable, missing.clone()],
             DEFAULT_INDEX_BUFFER_BYTES,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("vanished.txt"));
+        .unwrap();
+
+        assert_eq!(
+            outcome.indexed, 1,
+            "the readable file must still be indexed"
+        );
+        assert_eq!(outcome.unreadable, vec![missing]);
+
+        // The delta is usable, not a half-written casualty of the failure.
+        let reader = IndexReader::open(delta.path()).unwrap();
+        assert_eq!(reader.num_files(), 1);
+        assert_eq!(reader.file_path(0), Some("present.txt"));
+    }
+
+    /// A binary file is skipped deliberately and permanently, so it must *not*
+    /// be reported as unreadable - doing so would make the caller re-read it
+    /// on every reconcile forever.
+    #[test]
+    fn exact_file_delta_does_not_report_binary_files_as_unreadable() {
+        let repo = tempfile::tempdir().unwrap();
+        let binary = repo.path().join("blob.bin");
+        std::fs::write(&binary, [0u8, 1, 2, 0, 3, 0]).unwrap();
+        let delta = tempfile::tempdir().unwrap();
+
+        let outcome = build_index_for_files(
+            repo.path(),
+            delta.path(),
+            &[binary],
+            DEFAULT_INDEX_BUFFER_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.indexed, 0);
+        assert!(outcome.unreadable.is_empty());
     }
 
     #[test]
@@ -1829,8 +1903,9 @@ mod tests {
         std::fs::write(&binary, b"text prefix\0binary tail").unwrap();
 
         let delta_dir = tempfile::tempdir().unwrap();
-        let delta_count =
-            build_index_for_files(repo.path(), delta_dir.path(), &[c, d, binary], 1).unwrap();
+        let delta_count = build_index_for_files(repo.path(), delta_dir.path(), &[c, d, binary], 1)
+            .unwrap()
+            .indexed;
         assert_eq!(delta_count, 2, "binary files must stay out of the delta");
         let delta_reader = IndexReader::open(delta_dir.path()).unwrap();
 
@@ -1897,7 +1972,9 @@ mod tests {
 
         let delta_dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            build_index_for_files(repo.path(), delta_dir.path(), &[b, d], 1).unwrap(),
+            build_index_for_files(repo.path(), delta_dir.path(), &[b, d], 1)
+                .unwrap()
+                .indexed,
             2
         );
         let delta_reader = IndexReader::open(delta_dir.path()).unwrap();
@@ -1959,7 +2036,9 @@ mod tests {
 
         let delta_dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            build_index_for_files(repo.path(), delta_dir.path(), &[], 1).unwrap(),
+            build_index_for_files(repo.path(), delta_dir.path(), &[], 1)
+                .unwrap()
+                .indexed,
             0
         );
         let delta_reader = IndexReader::open(delta_dir.path()).unwrap();

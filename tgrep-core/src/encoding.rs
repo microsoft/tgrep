@@ -154,6 +154,15 @@ impl LossyFixups {
         self.shifts.is_empty()
     }
 
+    /// Heap bytes held by this fixup table.
+    ///
+    /// A file of mostly-invalid bytes produces one shift per replacement, so
+    /// this can rival the decoded text itself. Callers that budget memory (the
+    /// `serve` content cache) must count it.
+    pub fn heap_bytes(&self) -> u64 {
+        (self.shifts.capacity() * std::mem::size_of::<(usize, usize)>()) as u64
+    }
+
     /// Map an offset in the decoded text to the corresponding offset in the
     /// source bytes.
     ///

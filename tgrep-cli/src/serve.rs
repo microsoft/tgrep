@@ -25,6 +25,14 @@ use tgrep_core::hybrid::HybridIndex;
 use tgrep_core::query;
 
 const CACHE_CAPACITY: usize = 50_000;
+/// Total decoded bytes the content cache may hold. The entry-count limit above
+/// says nothing about memory; without this a handful of large files can pin
+/// tens of gigabytes for the life of the process.
+const CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// Largest single entry the cache will admit. A file bigger than this would
+/// evict most of the cache to store itself, so it is read straight through
+/// instead. It is still searched - only the caching is skipped.
+const CACHE_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 /// Default mutation count that triggers a background save (override with
 /// `--auto-save-mutations`).
 const AUTO_SAVE_MUTATIONS: u32 = 5000;
@@ -125,11 +133,108 @@ impl DecodedFile {
         let (text, fixups) = tgrep_core::encoding::decode_owned_with_fixups(bytes, encoding);
         Self { text, fixups }
     }
+
+    /// Heap cost of this entry, used to bound the cache by memory rather than
+    /// by entry count.
+    fn heap_bytes(&self) -> u64 {
+        self.text.capacity() as u64 + self.fixups.heap_bytes()
+    }
+}
+
+/// An LRU of decoded file contents bounded by *bytes* as well as by entry count.
+///
+/// Bounding only by entry count makes memory unbounded in practice: 50,000
+/// entries of arbitrary size. Serving a repository that contains one 13.7 GiB
+/// build artifact took the server to 14.4 GiB of private memory after a single
+/// query, and it stayed there for the life of the process, because nothing ever
+/// evicted that one entry.
+///
+/// Two limits are applied:
+///   * `max_bytes` - total cached bytes; the least-recently-used entries are
+///     evicted until the total fits.
+///   * `max_entry_bytes` - entries larger than this are never admitted. A file
+///     that alone exceeds the whole budget would evict every useful entry to
+///     cache itself, and would then be evicted by the next insert anyway.
+struct ContentCache {
+    lru: LruCache<String, Arc<DecodedFile>>,
+    bytes: u64,
+    max_bytes: u64,
+    max_entry_bytes: u64,
+}
+
+impl ContentCache {
+    fn new(capacity: usize, max_bytes: u64, max_entry_bytes: u64) -> Self {
+        Self {
+            lru: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+            bytes: 0,
+            max_bytes,
+            max_entry_bytes,
+        }
+    }
+
+    fn peek(&self, key: &str) -> Option<&Arc<DecodedFile>> {
+        self.lru.peek(key)
+    }
+
+    /// Promote an entry to most-recently-used.
+    fn touch(&mut self, key: &str) {
+        self.lru.get(key);
+    }
+
+    fn put(&mut self, key: String, value: Arc<DecodedFile>) {
+        let size = value.heap_bytes();
+        if size > self.max_entry_bytes {
+            return;
+        }
+        // `push`, not `put`: `put` returns the old value only when the *key*
+        // already existed, and stays silent when the entry-count limit evicts
+        // some other entry to make room. That eviction still frees bytes, so
+        // using `put` would leak the running total upward until the byte budget
+        // looked full and the cache evicted everything.
+        if let Some((_, old)) = self.lru.push(key, value) {
+            self.bytes = self.bytes.saturating_sub(old.heap_bytes());
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.evict_to_fit();
+    }
+
+    fn evict_to_fit(&mut self) {
+        while self.bytes > self.max_bytes {
+            match self.lru.pop_lru() {
+                Some((_, evicted)) => {
+                    self.bytes = self.bytes.saturating_sub(evicted.heap_bytes());
+                }
+                None => {
+                    self.bytes = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn pop(&mut self, key: &str) {
+        if let Some(old) = self.lru.pop(key) {
+            self.bytes = self.bytes.saturating_sub(old.heap_bytes());
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lru.clear();
+        self.bytes = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.lru.len()
+    }
+
+    fn byte_len(&self) -> u64 {
+        self.bytes
+    }
 }
 
 struct ServerState {
     index: RwLock<HybridIndex>,
-    cache: RwLock<LruCache<String, Arc<DecodedFile>>>,
+    cache: RwLock<ContentCache>,
     root: PathBuf,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
@@ -380,7 +485,11 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
 
     let state = Arc::new(ServerState {
         index: RwLock::new(hybrid),
-        cache: RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap())),
+        cache: RwLock::new(ContentCache::new(
+            CACHE_CAPACITY,
+            CACHE_MAX_BYTES,
+            CACHE_MAX_ENTRY_BYTES,
+        )),
         root: root.clone(),
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
@@ -420,11 +529,14 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     info.save(&index_dir)?;
 
     eprintln!(
-        "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries. \
+        "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries / {} MiB \
+         (entries over {} MiB not cached). \
          Memory cap: {} MB. Index threads: {}. Watcher queue cap: {}.",
         serve_start.elapsed().as_secs_f64() * 1000.0,
         port,
         CACHE_CAPACITY,
+        CACHE_MAX_BYTES / (1024 * 1024),
+        CACHE_MAX_ENTRY_BYTES / (1024 * 1024),
         memory_cap_bytes / (1024 * 1024),
         index_threads,
         watcher_queue_cap,
@@ -811,10 +923,17 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
     // `--encoding` is unsound for the same reason: the index holds trigrams of
     // the BOM-sniffed text, so a re-decoded file can match bytes that were
     // never indexed.
-    let plan = if !matcher.is_standard() || invert_match || encoding.may_differ_from_index() {
+    //
+    // A PCRE-style pattern cannot be parsed by `regex-syntax` at all, but it can
+    // usually be *relaxed* into one that can (dropping lookarounds and the like).
+    // The relaxed pattern matches a superset, so its trigrams are still mandatory
+    // for the original and the candidate set stays sound.
+    let plan = if invert_match || encoding.may_differ_from_index() {
         query::QueryPlan::MatchAll
-    } else {
+    } else if matcher.is_standard() || fixed_string {
         query::build_multi_pattern_plan(&all_patterns, fixed_string, case_insensitive)?
+    } else {
+        query::build_relaxed_multi_pattern_plan(&all_patterns, case_insensitive)
     };
 
     Ok(SearchRequest {
@@ -987,7 +1106,7 @@ fn handle_search(
             let mut cache = state.cache.write().unwrap();
             // Promote hit entries so LRU recency stays accurate
             for key in &hit_keys {
-                cache.get(key);
+                cache.touch(key);
             }
             // Insert disk results, re-checking for races with other threads
             for (rel_path, content) in &disk_results {
@@ -1222,6 +1341,8 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
         "num_trigrams": index.num_trigrams(),
         "cache_size": cache.len(),
         "cache_capacity": CACHE_CAPACITY,
+        "cache_bytes": cache.byte_len(),
+        "cache_max_bytes": CACHE_MAX_BYTES,
         "watcher_active": state.watcher_active.load(std::sync::atomic::Ordering::Relaxed),
         "indexing": indexing,
         "index_progress": state.index_progress.load(std::sync::atomic::Ordering::Relaxed),
@@ -1856,7 +1977,7 @@ fn stream_merge_stale_changes(
     // genuinely new path is harmless because it has no reader entry to filter.
     let removed: std::collections::HashSet<String> = candidates.iter().cloned().collect();
 
-    let published_stamps = stamps.clone();
+    let mut published_stamps = stamps.clone();
 
     let result = (|| -> Result<bool> {
         let build = || {
@@ -1867,7 +1988,7 @@ fn stream_merge_stale_changes(
                 builder::DEFAULT_INDEX_BUFFER_BYTES,
             )
         };
-        let delta_count = match rayon::ThreadPoolBuilder::new()
+        let outcome = match rayon::ThreadPoolBuilder::new()
             .num_threads(state.index_threads)
             .thread_name(|i| format!("tgrep-stale-index-{i}"))
             .build()
@@ -1875,6 +1996,28 @@ fn stream_merge_stale_changes(
             Ok(pool) => pool.install(build)?,
             Err(_) => build()?,
         };
+        let delta_count = outcome.indexed;
+
+        // Withhold stamps for files the delta could not read. A published stamp
+        // means "indexed at this version", so keeping one for a skipped file
+        // would hide it from every later reconcile and make the miss permanent.
+        // Dropping the stamp leaves it looking new, so the next pass retries it.
+        if !outcome.unreadable.is_empty() {
+            eprintln!(
+                "[trace] {} file(s) were unreadable during the delta build; \
+                 their stamps are withheld so the next reconcile retries them",
+                outcome.unreadable.len()
+            );
+            for path in &outcome.unreadable {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                published_stamps.remove(&rel);
+            }
+        }
+
         let delta = tgrep_core::reader::IndexReader::open(&delta_dir)?;
         if delta.num_files() != delta_count {
             anyhow::bail!(
@@ -2971,6 +3114,80 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn cached(len: usize) -> Arc<DecodedFile> {
+        // `String::from_utf8` preserves the Vec's capacity, so `heap_bytes`
+        // is exactly `len` and the assertions below can use round numbers.
+        let mut bytes = Vec::with_capacity(len);
+        bytes.resize(len, b'a');
+        Arc::new(DecodedFile {
+            text: String::from_utf8(bytes).unwrap(),
+            fixups: Default::default(),
+        })
+    }
+
+    #[test]
+    fn content_cache_evicts_to_stay_under_byte_budget() {
+        let mut cache = ContentCache::new(CACHE_CAPACITY, 1000, 1000);
+        for i in 0..10 {
+            cache.put(format!("f{i}"), cached(200));
+        }
+        assert!(cache.byte_len() <= 1000, "bytes = {}", cache.byte_len());
+        assert_eq!(cache.len(), 5);
+        // Oldest entries went first; the newest survive.
+        assert!(cache.peek("f0").is_none());
+        assert!(cache.peek("f9").is_some());
+    }
+
+    #[test]
+    fn content_cache_refuses_oversized_entries() {
+        let mut cache = ContentCache::new(CACHE_CAPACITY, 1000, 100);
+        cache.put("small".into(), cached(50));
+        cache.put("huge".into(), cached(500));
+        assert!(cache.peek("huge").is_none(), "oversized entry was admitted");
+        // Admitting it would also have evicted the useful entry.
+        assert!(cache.peek("small").is_some());
+        assert_eq!(cache.byte_len(), 50);
+    }
+
+    /// The byte total must stay exact across every path that removes an entry,
+    /// including the entry-count eviction that `LruCache` performs internally.
+    #[test]
+    fn content_cache_byte_accounting_stays_exact() {
+        let mut cache = ContentCache::new(2, u64::MAX, u64::MAX);
+        cache.put("a".into(), cached(100));
+        cache.put("b".into(), cached(100));
+        assert_eq!(cache.byte_len(), 200);
+
+        // Capacity is 2, so this evicts "a" inside the LRU.
+        cache.put("c".into(), cached(100));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.byte_len(), 200, "count-eviction leaked bytes");
+
+        // Replacing an existing key must not double-count.
+        cache.put("c".into(), cached(300));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.byte_len(), 400);
+
+        cache.pop("c");
+        assert_eq!(cache.byte_len(), 100);
+        cache.clear();
+        assert_eq!(cache.byte_len(), 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn content_cache_touch_promotes_recency() {
+        let mut cache = ContentCache::new(CACHE_CAPACITY, 300, 300);
+        cache.put("a".into(), cached(100));
+        cache.put("b".into(), cached(100));
+        cache.touch("a");
+        // "b" is now least-recently-used, so it is the one that goes.
+        cache.put("c".into(), cached(100));
+        cache.put("d".into(), cached(100));
+        assert!(cache.peek("a").is_some(), "touched entry was evicted first");
+        assert!(cache.peek("b").is_none());
+    }
+
     /// A `ServerState` over an empty index, for exercising the stale path
     /// directly. Mirrors the defaults `run` uses with a watcher and ignore
     /// rules enabled, which is the configuration `gitignore_pending` gates.
@@ -2980,7 +3197,11 @@ mod tests {
         let hybrid = HybridIndex::open(index_dir, root).expect("open empty index");
         Arc::new(ServerState {
             index: RwLock::new(hybrid),
-            cache: RwLock::new(LruCache::new(NonZeroUsize::new(CACHE_CAPACITY).unwrap())),
+            cache: RwLock::new(ContentCache::new(
+                CACHE_CAPACITY,
+                CACHE_MAX_BYTES,
+                CACHE_MAX_ENTRY_BYTES,
+            )),
             root: root.to_path_buf(),
             watcher_active: std::sync::atomic::AtomicBool::new(false),
             indexing: std::sync::atomic::AtomicBool::new(false),

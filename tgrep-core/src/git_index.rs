@@ -169,7 +169,12 @@ fn parse_index(bytes: &[u8]) -> Option<TrackedFiles> {
     }
     let count = u32::from_be_bytes(bytes[8..12].try_into().ok()?) as usize;
 
-    let mut paths = HashSet::with_capacity(count);
+    // The header is attacker-controlled — reserving `count` outright lets a
+    // 12-byte file claim 4 billion entries and abort the process in the
+    // allocator, which is not catchable. No entry can be shorter than its
+    // 62-byte header plus a NUL and padding, so the file length is a hard
+    // ceiling on how many there really are.
+    let mut paths = HashSet::with_capacity(count.min((bytes.len() - 12) / (ENTRY_HEADER + 1)));
     let mut pos = 12;
     let mut previous: Vec<u8> = Vec::new();
     for _ in 0..count {
@@ -359,6 +364,19 @@ mod tests {
     fn a_count_larger_than_the_data_is_refused() {
         let mut index = v2_index(&["a.txt"]);
         index[11] = 40;
+        assert!(parse_index(&index).is_none());
+    }
+
+    #[test]
+    fn a_header_claiming_four_billion_entries_does_not_reserve_for_them() {
+        // A bare header claiming u32::MAX entries. Reserving that many would ask
+        // the allocator for roughly 146GB and abort the process before any of the
+        // per-entry length checks below ever run, so the clamp has to happen at
+        // the reservation itself. Reaching the `None` at all proves it did.
+        let mut index = Vec::from(*b"DIRC");
+        index.extend_from_slice(&2u32.to_be_bytes());
+        index.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(index.len(), 12);
         assert!(parse_index(&index).is_none());
     }
 

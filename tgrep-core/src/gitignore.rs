@@ -422,18 +422,47 @@ pub struct CaseInsensitiveIgnore {
 impl CaseInsensitiveIgnore {
     /// Returns `None` unless `root` is in a git repository that sets
     /// `core.ignorecase` and has repository-wide rules to apply.
-    pub fn new(root: &Path) -> Option<Self> {
+    ///
+    /// `use_gitignore`, `use_exclude` and `use_parents` mirror the flags the
+    /// case-sensitive pass was built with. They are not a convenience: this
+    /// matcher is only sound as a *narrowing* of that pass, so it must never
+    /// consult a source the case-sensitive pass was told to ignore. With
+    /// `--no-ignore-vcs` the case-sensitive pass lets everything through, which
+    /// would leave this the only thing excluding — the exact opposite of what
+    /// the flag asks for.
+    pub fn new(
+        root: &Path,
+        use_gitignore: bool,
+        use_exclude: bool,
+        use_parents: bool,
+    ) -> Option<Self> {
         use ignore::gitignore::GitignoreBuilder;
+
+        if !use_gitignore && !use_exclude {
+            return None;
+        }
 
         let repo_root = git_repo_root(root)?.to_path_buf();
         if !crate::git_index::ignores_case(&repo_root) {
             return None;
         }
 
+        // Everything below is repository-wide, so when the walk starts inside a
+        // subdirectory these rules reach it only as parent rules. `--no-ignore-parent`
+        // switches those off in the case-sensitive pass, and we must follow.
+        // `git_repo_root` returns an ancestor of `root`, so this compares exactly.
+        if !use_parents && root != repo_root {
+            return None;
+        }
+
         let mut builder = GitignoreBuilder::new(&repo_root);
         builder.case_insensitive(true).ok()?;
-        let _ = builder.add(repo_root.join(GITIGNORE_FILENAME));
-        let _ = builder.add(repo_root.join(".git").join("info").join("exclude"));
+        if use_gitignore {
+            let _ = builder.add(repo_root.join(GITIGNORE_FILENAME));
+        }
+        if use_exclude {
+            let _ = builder.add(repo_root.join(".git").join("info").join("exclude"));
+        }
         let matcher = builder.build().ok()?;
         if matcher.is_empty() {
             return None;

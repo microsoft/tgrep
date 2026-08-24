@@ -200,13 +200,28 @@ fn display_ignore_error(err: &ignore::Error, root: &Path) -> String {
 /// other does not is indexed and then immediately deleted, every single time —
 /// the failure mode pinned by `tgrep-cli/tests/serve_max_filesize.rs`.
 ///
+/// The flags must be the *same* ones handed to `WalkBuilder`, because this is
+/// only ever sound as a narrowing of the case-sensitive pass. A source that
+/// pass was told to skip must be skipped here too, or a `--no-ignore-*` flag
+/// would be silently undone.
+///
 /// See [`crate::gitignore::CaseInsensitiveIgnore`] for what it matches and why.
 fn git_ignorecase_filter(
     root: &Path,
     no_ignore: bool,
+    no_ignore_vcs: bool,
+    no_ignore_exclude: bool,
+    no_ignore_parent: bool,
 ) -> Option<crate::gitignore::CaseInsensitiveIgnore> {
     (!no_ignore)
-        .then(|| crate::gitignore::CaseInsensitiveIgnore::new(root))
+        .then(|| {
+            crate::gitignore::CaseInsensitiveIgnore::new(
+                root,
+                !no_ignore_vcs,
+                !no_ignore_exclude,
+                !no_ignore_parent,
+            )
+        })
         .flatten()
 }
 
@@ -235,7 +250,13 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         .flatten()
         .map(std::sync::Arc::new);
     let p4ignore_root = root.clone();
-    let ignorecase = git_ignorecase_filter(&root, opts.no_ignore);
+    let ignorecase = git_ignorecase_filter(
+        &root,
+        opts.no_ignore,
+        opts.no_ignore_vcs,
+        opts.no_ignore_exclude,
+        opts.no_ignore_parent,
+    );
 
     let mut builder = WalkBuilder::new(&root);
     builder
@@ -466,7 +487,11 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
         .flatten()
         .map(std::sync::Arc::new);
     let match_root = root.to_path_buf();
-    let ignorecase = git_ignorecase_filter(root, no_ignore);
+    // `MetaWalkOptions` carries no finer ignore flags, and the builder below
+    // enables gitignore and exclude together on `!no_ignore`. Passing `false`
+    // for both mirrors that exactly, which is what keeps this walk and
+    // `walk_dir` agreeing about the tree under `serve`.
+    let ignorecase = git_ignorecase_filter(root, no_ignore, false, false, false);
     let root = root.to_path_buf();
 
     let walker = WalkBuilder::new(&root)
@@ -1401,6 +1426,79 @@ mod tests {
             dir.path(),
         );
         assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn no_ignore_vcs_turns_the_whole_thing_off_too() {
+        // The rules only live in `.gitignore` here, and `--no-ignore-vcs` tells
+        // the case-sensitive pass to skip that file. If the case-insensitive
+        // pass kept reading it, it would become the *only* thing excluding and
+        // the flag would exclude more than not passing it at all.
+        let dir = ignorecase_fixture(true, &["src/main.rs"]);
+        let names = sorted_filenames(
+            &walk_dir(
+                dir.path(),
+                &WalkOptions {
+                    no_ignore_vcs: true,
+                    ..Default::default()
+                },
+            ),
+            dir.path(),
+        );
+        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+        assert!(names.contains(&"src/Gone.TXT".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn no_ignore_exclude_leaves_the_repository_exclude_file_unread() {
+        // Same argument as above, for the other source this matcher reads. The
+        // rules live only in `.git/info/exclude`, so honouring the flag must
+        // leave nothing behind to match with.
+        let dir = ignorecase_fixture(true, &["src/main.rs"]);
+        fs::remove_file(dir.path().join(".gitignore")).unwrap();
+        fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        fs::write(dir.path().join(".git/info/exclude"), "QLogs\n").unwrap();
+
+        let with_exclude =
+            sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(
+            !with_exclude.contains(&"qlogs/artifact.rs".to_string()),
+            "the exclude file should have hidden this: {with_exclude:?}"
+        );
+
+        let names = sorted_filenames(
+            &walk_dir(
+                dir.path(),
+                &WalkOptions {
+                    no_ignore_exclude: true,
+                    ..Default::default()
+                },
+            ),
+            dir.path(),
+        );
+        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn no_ignore_parent_leaves_a_subdirectory_walk_alone() {
+        // Walking `src/` reaches the repository-wide rules only as parent rules,
+        // which is exactly what `--no-ignore-parent` switches off.
+        let dir = ignorecase_fixture(true, &["src/main.rs"]);
+        let src = dir.path().join("src");
+        let names = sorted_filenames(
+            &walk_dir(
+                &src,
+                &WalkOptions {
+                    no_ignore_parent: true,
+                    ..Default::default()
+                },
+            ),
+            &src,
+        );
+        assert!(
+            names.contains(&"Gone.TXT".to_string()),
+            "applied a parent rule the flag disabled: {names:?}"
+        );
     }
 
     #[test]

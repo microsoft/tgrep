@@ -2255,13 +2255,70 @@ fn stream_merge_stale_changes(
     }
 }
 
+/// Drop the candidates that failed to read last time and have not changed since.
+///
+/// Returns the paths removed, which the caller must also keep out of the
+/// published stamps — see [`stamps_for_indexed`].
+fn drop_memoized_failures(
+    memo: &std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    current_meta: &[tgrep_core::walker::FileMeta],
+    changed: &mut Vec<String>,
+    added: &mut Vec<String>,
+) -> std::collections::HashSet<String> {
+    if memo.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    // One pass over the walk to pick out the memoized paths, rather than a scan
+    // per candidate.
+    let still_failing: std::collections::HashSet<String> = current_meta
+        .iter()
+        .filter(|fm| {
+            memo.get(&fm.relative_path)
+                .is_some_and(|a| a.mtime == fm.mtime && a.size == fm.size)
+        })
+        .map(|fm| fm.relative_path.clone())
+        .collect();
+    changed.retain(|path| !still_failing.contains(path));
+    added.retain(|path| !still_failing.contains(path));
+    still_failing
+}
+
+/// The stamps to publish for a walk, minus the files that were never built.
+///
+/// A published stamp means "indexed at this version". Stamping a file the delta
+/// deliberately skipped would make every later reconcile see it as unchanged,
+/// so it would never be indexed again — and because the stamp lands in
+/// `filestamps.json`, not even a restart would recover it: every automatic
+/// caller of the stale check passes `compare_index_membership = false`, which
+/// is precisely the check that would have noticed the file is missing. Leaving
+/// it unstamped keeps it looking new, which is what makes the retry-on-change
+/// behaviour in [`drop_memoized_failures`] work at all.
+fn stamps_for_indexed(
+    current_meta: &[tgrep_core::walker::FileMeta],
+    skipped: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, tgrep_core::meta::FileStamp> {
+    current_meta
+        .iter()
+        .filter(|fm| !skipped.contains(&fm.relative_path))
+        .map(|fm| {
+            (
+                fm.relative_path.clone(),
+                tgrep_core::meta::FileStamp {
+                    mtime: fm.mtime,
+                    size: fm.size,
+                },
+            )
+        })
+        .collect()
+}
+
 fn background_refresh_stale(
     state: &Arc<ServerState>,
     root: &Path,
     index_dir: &Path,
     compare_index_membership: bool,
 ) -> bool {
-    use tgrep_core::meta::{self, FileStamp};
+    use tgrep_core::meta;
     use tgrep_core::walker;
 
     let _refresh = state.stale_refresh_lock.lock().unwrap();
@@ -2354,29 +2411,13 @@ fn background_refresh_stale(
     // a file that is gone needs no read to evict.
     let skipped_unreadable = {
         let memo = state.unreadable.read().unwrap();
-        if memo.is_empty() {
-            0
-        } else {
-            // One pass over the walk to pick out the memoized paths, rather
-            // than a scan per candidate.
-            let still_failing: std::collections::HashSet<&str> = current_meta
-                .iter()
-                .filter(|fm| {
-                    memo.get(&fm.relative_path)
-                        .is_some_and(|a| a.mtime == fm.mtime && a.size == fm.size)
-                })
-                .map(|fm| fm.relative_path.as_str())
-                .collect();
-            let before = changed.len() + added.len();
-            changed.retain(|path| !still_failing.contains(path.as_str()));
-            added.retain(|path| !still_failing.contains(path.as_str()));
-            before - (changed.len() + added.len())
-        }
+        drop_memoized_failures(&memo, current_meta, &mut changed, &mut added)
     };
-    if skipped_unreadable > 0 {
+    if !skipped_unreadable.is_empty() {
         eprintln!(
-            "[trace] stale check: {skipped_unreadable} file(s) unchanged since they \
-             last failed to read; not retrying them"
+            "[trace] stale check: {} file(s) unchanged since they last failed to \
+             read; not retrying them",
+            skipped_unreadable.len()
         );
     }
 
@@ -2406,18 +2447,7 @@ fn background_refresh_stale(
         );
     }
 
-    let new_stamps: std::collections::HashMap<String, FileStamp> = current_meta
-        .iter()
-        .map(|fm| {
-            (
-                fm.relative_path.clone(),
-                FileStamp {
-                    mtime: fm.mtime,
-                    size: fm.size,
-                },
-            )
-        })
-        .collect();
+    let new_stamps = stamps_for_indexed(current_meta, &skipped_unreadable);
 
     if !stream_merge_stale_changes(
         state,
@@ -3765,26 +3795,80 @@ mod tests {
                 &std::collections::HashSet::new(),
                 false,
             );
-            // Mirrors the filter `background_refresh_stale` applies.
-            let still_failing: std::collections::HashSet<&str> = current
-                .iter()
-                .filter(|fm| {
-                    memo.get(&fm.relative_path)
-                        .is_some_and(|a| a.mtime == fm.mtime && a.size == fm.size)
-                })
-                .map(|fm| fm.relative_path.as_str())
-                .collect();
-            changed.retain(|path| !still_failing.contains(path.as_str()));
-            added.retain(|path| !still_failing.contains(path.as_str()));
-            changed.len() + added.len()
+            let skipped = drop_memoized_failures(&memo, &current, &mut changed, &mut added);
+            (changed.len() + added.len(), skipped)
         };
 
         // Unchanged since the failed read: leave it alone.
-        assert_eq!(retried(100, 5), 0);
+        assert_eq!(retried(100, 5).0, 0);
         // Touched: worth another look.
-        assert_eq!(retried(200, 5), 1);
+        assert_eq!(retried(200, 5).0, 1);
         // Resized: likewise.
-        assert_eq!(retried(100, 6), 1);
+        assert_eq!(retried(100, 6).0, 1);
+    }
+
+    /// Skipping a file must not also mark it indexed.
+    ///
+    /// The two halves have to agree. `drop_memoized_failures` keeps a file out
+    /// of the delta, so nothing reads it and nothing writes postings for it; if
+    /// the stamps published alongside that delta still claimed it was indexed at
+    /// its current mtime and size, the next reconcile would classify it as
+    /// unchanged and skip it for a completely different reason — one that never
+    /// clears, because the memo is not involved and the stamp outlives the
+    /// process in `filestamps.json`. A file that failed to read once would be
+    /// invisible to search forever, with no error and no way back short of
+    /// deleting the index.
+    #[test]
+    fn a_skipped_file_is_left_unstamped_so_the_next_pass_still_sees_it() {
+        use tgrep_core::meta::FileStamp;
+        use tgrep_core::walker::FileMeta;
+
+        let current = vec![
+            FileMeta {
+                relative_path: "locked.bin".to_string(),
+                mtime: 100,
+                size: 5,
+            },
+            FileMeta {
+                relative_path: "src/main.rs".to_string(),
+                mtime: 100,
+                size: 9,
+            },
+        ];
+        let memo = std::collections::HashMap::from([(
+            "locked.bin".to_string(),
+            FileStamp {
+                mtime: 100,
+                size: 5,
+            },
+        )]);
+
+        let (mut changed, mut added, _) = classify_file_changes(
+            &current,
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+            false,
+        );
+        let skipped = drop_memoized_failures(&memo, &current, &mut changed, &mut added);
+        assert!(skipped.contains("locked.bin"));
+
+        let stamps = stamps_for_indexed(&current, &skipped);
+        assert!(
+            !stamps.contains_key("locked.bin"),
+            "published a stamp for a file that was never read: {stamps:?}"
+        );
+        assert!(stamps.contains_key("src/main.rs"), "{stamps:?}");
+
+        // And with that stamp withheld, a later pass over an unchanged tree
+        // still offers the file up rather than treating it as up-to-date.
+        let (changed, added, _) = classify_file_changes(
+            &current,
+            &stamps,
+            &std::collections::HashSet::new(),
+            false,
+        );
+        assert_eq!(changed.len() + added.len(), 1);
+        assert!(added.contains(&"locked.bin".to_string()));
     }
 
     /// A walk error must not leave the watcher gated forever.

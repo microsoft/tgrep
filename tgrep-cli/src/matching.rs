@@ -224,7 +224,23 @@ pub fn expand_context_window(
 /// `fancy_regex` is the fallback for backreferences and lookaround.
 pub enum SearchMatcher {
     Standard(regex::Regex),
-    Fancy(fancy_regex::Regex),
+    /// A backtracking match, optionally gated by a linear-time prefilter.
+    ///
+    /// `fancy_regex` already delegates to `regex` when a pattern needs nothing
+    /// fancy, so this variant only really costs anything when a construct like
+    /// lookaround forces the backtracking VM. That VM has no literal prefilter,
+    /// so it tries to match at *every* byte offset - on a multi-gigabyte file
+    /// that is the difference between seconds and never finishing.
+    ///
+    /// `prefilter` is the pattern relaxed into a form the linear-time engine can
+    /// compile (see `tgrep_core::query::relax_for_indexing`). Relaxation only
+    /// widens the language, so a haystack the prefilter rejects cannot possibly
+    /// match the real pattern - which makes it sound to use for negative
+    /// answers, and only for negative answers.
+    Fancy {
+        re: fancy_regex::Regex,
+        prefilter: Option<regex::Regex>,
+    },
 }
 
 impl SearchMatcher {
@@ -232,12 +248,24 @@ impl SearchMatcher {
         matches!(self, SearchMatcher::Standard(_))
     }
 
+    /// Whether the prefilter has already ruled this haystack out.
+    ///
+    /// A `false` from the prefilter is conclusive; a `true` means nothing, and
+    /// the real matcher still has to run.
+    fn ruled_out(prefilter: &Option<regex::Regex>, hay: &str) -> bool {
+        prefilter.as_ref().is_some_and(|re| !re.is_match(hay))
+    }
+
     pub fn is_match(&self, hay: &str) -> Result<bool> {
         match self {
             SearchMatcher::Standard(re) => Ok(re.is_match(hay)),
-            SearchMatcher::Fancy(re) => re
-                .is_match(hay)
-                .map_err(|e| anyhow::anyhow!("regex match error: {e}")),
+            SearchMatcher::Fancy { re, prefilter } => {
+                if Self::ruled_out(prefilter, hay) {
+                    return Ok(false);
+                }
+                re.is_match(hay)
+                    .map_err(|e| anyhow::anyhow!("regex match error: {e}"))
+            }
         }
     }
 
@@ -250,7 +278,10 @@ impl SearchMatcher {
                     spans.push((m.start(), m.end()));
                 }
             }
-            SearchMatcher::Fancy(re) => {
+            SearchMatcher::Fancy { re, prefilter } => {
+                if Self::ruled_out(prefilter, hay) {
+                    return Ok(spans);
+                }
                 for m in re.find_iter(hay) {
                     let m = m.map_err(|e| anyhow::anyhow!("regex match error: {e}"))?;
                     spans.push((m.start(), m.end()));
@@ -267,10 +298,14 @@ impl SearchMatcher {
     pub fn find_first_span(&self, hay: &str) -> Result<Option<(usize, usize)>> {
         match self {
             SearchMatcher::Standard(re) => Ok(re.find(hay).map(|m| (m.start(), m.end()))),
-            SearchMatcher::Fancy(re) => re
-                .find(hay)
-                .map(|m| m.map(|m| (m.start(), m.end())))
-                .map_err(|e| anyhow::anyhow!("regex match error: {e}")),
+            SearchMatcher::Fancy { re, prefilter } => {
+                if Self::ruled_out(prefilter, hay) {
+                    return Ok(None);
+                }
+                re.find(hay)
+                    .map(|m| m.map(|m| (m.start(), m.end())))
+                    .map_err(|e| anyhow::anyhow!("regex match error: {e}"))
+            }
         }
     }
 
@@ -310,7 +345,10 @@ impl SearchMatcher {
                     out.push((m.start(), m.end(), dst));
                 }
             }
-            SearchMatcher::Fancy(re) => {
+            SearchMatcher::Fancy { re, prefilter } => {
+                if Self::ruled_out(prefilter, hay) {
+                    return Ok(out);
+                }
                 for caps in re.captures_iter(hay) {
                     let caps = caps.map_err(|e| anyhow::anyhow!("regex match error: {e}"))?;
                     let m = caps.get(0).expect("group 0 always participates");
@@ -419,14 +457,34 @@ fn build_fancy(combined: &str, cfg: &MatcherConfig) -> Result<SearchMatcher> {
     if cfg.dotall {
         flags.push('s');
     }
-    let pattern = if flags.is_empty() {
-        combined.to_string()
-    } else {
-        format!("(?{flags}:{combined})")
+    let wrap = |body: &str| {
+        if flags.is_empty() {
+            body.to_string()
+        } else {
+            format!("(?{flags}:{body})")
+        }
     };
-    fancy_regex::Regex::new(&pattern)
-        .map(SearchMatcher::Fancy)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    let pattern = wrap(combined);
+    let re = fancy_regex::Regex::new(&pattern).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(SearchMatcher::Fancy {
+        re,
+        prefilter: build_fancy_prefilter(combined, &wrap),
+    })
+}
+
+/// Compile a linear-time approximation of `combined` to use as a prefilter.
+///
+/// Only worth building when relaxation actually removed something: if the
+/// relaxed pattern is identical, `fancy_regex` is already delegating to `regex`
+/// internally and a second engine would be pure overhead. Anything that fails to
+/// relax or fails to compile simply yields no prefilter, which costs performance
+/// and never correctness.
+fn build_fancy_prefilter(combined: &str, wrap: &dyn Fn(&str) -> String) -> Option<regex::Regex> {
+    let relaxed = tgrep_core::query::relax_for_indexing(combined)?;
+    if relaxed == combined {
+        return None;
+    }
+    regex::Regex::new(&wrap(&relaxed)).ok()
 }
 
 fn combine_patterns(
@@ -814,6 +872,257 @@ fn collect_hits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // The backtracking-engine prefilter
+    //
+    // `fancy_regex`'s VM has no literal prefilter, so a pattern like
+    // `(?<!//)Needle` is tried at every byte offset. Gating it on a relaxed,
+    // linear-time approximation makes the common "this haystack has nothing"
+    // case cheap. The prefilter is only ever allowed to answer *no*, so these
+    // tests care about one thing above all: the answers must not change.
+    // -----------------------------------------------------------------------
+
+    fn pcre(pattern: &str) -> SearchMatcher {
+        build_search_matcher(
+            &[pattern.to_string()],
+            &MatcherConfig {
+                engine: RegexEngine::Pcre2,
+                ..Default::default()
+            },
+        )
+        .expect("pattern compiles")
+    }
+
+    #[test]
+    fn a_lookaround_pattern_gets_a_prefilter() {
+        match pcre(r"(?<!//)Needle") {
+            SearchMatcher::Fancy { prefilter, .. } => {
+                let re = prefilter.expect("lookaround is relaxable, so it is worth prefiltering");
+                assert!(re.is_match("x Needle"), "the prefilter admits real matches");
+                assert!(
+                    re.is_match("//Needle"),
+                    "and admits near-misses too - it only rules things out"
+                );
+                assert!(!re.is_match("nothing here"));
+            }
+            _ => panic!("expected a fancy matcher"),
+        }
+    }
+
+    #[test]
+    fn a_pattern_with_nothing_to_relax_gets_no_prefilter() {
+        // `fancy_regex` already delegates these to `regex`; a second engine
+        // would be pure overhead.
+        for pattern in ["Needle", r"Needle\d+"] {
+            match pcre(pattern) {
+                SearchMatcher::Fancy { prefilter, .. } => {
+                    assert!(prefilter.is_none(), "{pattern} needs no prefilter")
+                }
+                _ => panic!("expected a fancy matcher"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrelaxable_pattern_gets_no_prefilter() {
+        match pcre(r"(Needle)\1") {
+            SearchMatcher::Fancy { prefilter, .. } => assert!(prefilter.is_none()),
+            _ => panic!("expected a fancy matcher"),
+        }
+    }
+
+    #[test]
+    fn the_prefilter_does_not_change_any_answer() {
+        // Each case pairs a haystack with whether the real pattern matches it.
+        // A prefilter that ever turned a `true` into a `false` would be silently
+        // losing results, which is the failure mode worth guarding.
+        let cases: [(&str, &[(&str, bool)]); 5] = [
+            (
+                r"(?<!//)Needle",
+                &[
+                    ("let x = Needle;", true),
+                    ("//Needle", false),
+                    ("nothing at all", false),
+                    ("//Needle and Needle", true),
+                ],
+            ),
+            (
+                r"Needle(?=::)",
+                &[("Needle::new", true), ("Needle.new", false)],
+            ),
+            (
+                r"Needle(?!::)",
+                &[("Needle::new", false), ("Needle.new", true)],
+            ),
+            (
+                r"(?>Nee)dle",
+                &[("Needle", true), ("Needle", true), ("nope", false)],
+            ),
+            (
+                r"(?=.*Haystack)Needle",
+                &[
+                    ("Needle in a Haystack", true),
+                    ("Needle alone", false),
+                    ("Haystack alone", false),
+                ],
+            ),
+        ];
+
+        for (pattern, haystacks) in cases {
+            let gated = pcre(pattern);
+            // The same pattern with the prefilter removed, as the control.
+            let ungated = match pcre(pattern) {
+                SearchMatcher::Fancy { re, .. } => SearchMatcher::Fancy {
+                    re,
+                    prefilter: None,
+                },
+                other => other,
+            };
+            for (hay, expected) in haystacks {
+                assert_eq!(
+                    gated.is_match(hay).unwrap(),
+                    *expected,
+                    "{pattern:?} against {hay:?}"
+                );
+                assert_eq!(
+                    gated.is_match(hay).unwrap(),
+                    ungated.is_match(hay).unwrap(),
+                    "prefilter changed is_match for {pattern:?} against {hay:?}"
+                );
+                assert_eq!(
+                    gated.find_spans(hay).unwrap(),
+                    ungated.find_spans(hay).unwrap(),
+                    "prefilter changed find_spans for {pattern:?} against {hay:?}"
+                );
+                assert_eq!(
+                    gated.find_first_span(hay).unwrap(),
+                    ungated.find_first_span(hay).unwrap(),
+                    "prefilter changed find_first_span for {pattern:?} against {hay:?}"
+                );
+            }
+        }
+    }
+
+    /// The subset property, checked by brute force over a broad pattern corpus.
+    ///
+    /// This is the assumption the whole optimisation rests on, in both places it
+    /// is used - candidate planning and the prefilter - so it is worth checking
+    /// against the real backtracking engine rather than by inspection. For every
+    /// pattern and every haystack: if `fancy_regex` matches, the relaxed pattern
+    /// compiled with `regex` must match too. The converse is allowed and
+    /// expected; that is what makes it a *relaxation*.
+    #[test]
+    fn relaxation_is_a_superset_of_every_pattern_it_accepts() {
+        let patterns = [
+            r"(?<!//)Needle",
+            r"(?<=//)Needle",
+            r"Needle(?=::)",
+            r"Needle(?!::)",
+            r"(?=.*Hay)Needle",
+            r"(?!.*Hay)Needle",
+            r"^(?=.*a)(?=.*b).*$",
+            r"(?>Nee)dle",
+            r"a(?>b|bc)d",
+            r"(?:Nee(?=d))+dle",
+            r"\bNeedle\b(?!s)",
+            r"(?i)(?<!x)needle",
+            r"[Nn](?<!x)eedle",
+            r"(?<!\w)Needle",
+            r"Needle(?=\s*[;,])",
+            r"(?<name>Nee)(?=dle)dle",
+            r"(a(?=b)|c)d",
+            r"^(?!#)\s*Needle",
+            r"Needle(?![)])",
+            r"(?=[(])\(Needle",
+            // Character-class forms: `(?=` and friends are ordinary members here.
+            r"[](?=a)]n",
+            r"[^](?<!a)]n",
+            r"[[:digit:](?=a)]n",
+            r"[]a]n",
+            r"[[:alpha:]]eedle(?!s)",
+            r"\p{L}+(?=dle)",
+        ];
+        let haystacks = [
+            "",
+            "Needle",
+            "//Needle",
+            " Needle ",
+            "Needle::new()",
+            "Needle.new()",
+            "Needle in a Hay stack",
+            "ab",
+            "ba",
+            "abd",
+            "abcd",
+            "cd",
+            "needle",
+            "xneedle",
+            "Needles",
+            "Needle;",
+            "Needle , x",
+            "# Needle",
+            "  Needle",
+            "Needle)",
+            "(Needle",
+            "NeeNeedle",
+            "no match at all",
+            "]Needle[",
+            "]n",
+            "an",
+            "(n",
+            "?n",
+            "=n",
+            "3n",
+            "Needle(?=a)",
+            "\u{3b1}\u{3b2}dle",
+        ];
+
+        for pattern in patterns {
+            let fancy = fancy_regex::Regex::new(pattern).expect("pattern compiles as PCRE");
+            let Some(relaxed_src) = tgrep_core::query::relax_for_indexing(pattern) else {
+                continue; // bailing out is always safe
+            };
+            let Ok(relaxed) = regex::Regex::new(&relaxed_src) else {
+                continue; // failing to compile degrades to a full scan
+            };
+            for hay in haystacks {
+                if fancy.is_match(hay).unwrap() {
+                    assert!(
+                        relaxed.is_match(hay),
+                        "relaxation NARROWED {pattern:?} to {relaxed_src:?}: it drops {hay:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_prefilter_inherits_the_case_insensitive_flag() {
+        // A prefilter compiled without `-i` would reject `NEEDLE` outright and
+        // hide a match the real pattern would have found.
+        let matcher = build_search_matcher(
+            &[r"(?<!//)Needle".to_string()],
+            &MatcherConfig {
+                engine: RegexEngine::Pcre2,
+                case_insensitive: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matcher.is_match("let x = NEEDLE;").unwrap());
+        assert!(!matcher.is_match("//NEEDLE").unwrap());
+    }
+
+    #[test]
+    fn the_prefilter_survives_replacement() {
+        let matcher = pcre(r"(?<!//)Needle");
+        let (out, _) = matcher.replace_all("a Needle here", "Pin").unwrap();
+        assert_eq!(out, "a Pin here");
+        let (out, spans) = matcher.replace_all("no match here", "Pin").unwrap();
+        assert_eq!(out, "no match here");
+        assert!(spans.is_empty());
+    }
 
     #[test]
     fn line_blocks_merge_matches_that_share_a_line() {

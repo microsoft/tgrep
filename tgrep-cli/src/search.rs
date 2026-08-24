@@ -941,11 +941,17 @@ fn search_local_index(
     // Narrow candidates using every pattern, not just the primary one. A
     // non-default `--encoding` re-decodes files into text the index never saw,
     // so the trigram plan cannot be trusted to find them.
-    let plan = if !matcher.is_standard() || opts.encoding.may_differ_from_index() {
+    //
+    // A PCRE-style pattern is not parseable by `regex-syntax`, but relaxing it
+    // (dropping lookarounds and the like) yields one that is, and that matches a
+    // superset — so its trigrams remain mandatory for the original.
+    let plan = if opts.encoding.may_differ_from_index() {
         QueryPlan::MatchAll
-    } else {
+    } else if matcher.is_standard() || opts.fixed_string {
         query::build_multi_pattern_plan(&opts.all_patterns()?, opts.fixed_string, ci)
             .map_err(|e| anyhow::anyhow!("{e}"))?
+    } else {
+        query::build_relaxed_multi_pattern_plan(&opts.all_patterns()?, ci)
     };
 
     let is_match_all = plan.is_match_all();

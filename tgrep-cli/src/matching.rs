@@ -14,48 +14,64 @@ use regex::RegexBuilder;
 /// Search results are produced as byte ranges over the whole file so a single
 /// match can span lines (`--multiline`). This maps those ranges back to line
 /// numbers and columns.
-pub struct LineIndex {
-    starts: Vec<usize>,
-    len: usize,
+///
+/// The table is built on first use rather than up front, because most searches
+/// never need it. It costs one `usize` per line — 670 MB on a 13.4 GiB file
+/// with 83.8M lines — plus two `memchr` passes over the whole buffer, and a
+/// file with no match asks it nothing at all: the whole-buffer prescan finds no
+/// match, so no offset is ever mapped to a line. Building it eagerly was 4.7 s
+/// of the 30.7 s that file took to search, spent entirely on an answer nobody
+/// wanted.
+pub struct LineIndex<'a> {
+    content: &'a str,
+    starts: std::cell::OnceCell<Vec<usize>>,
 }
 
-impl LineIndex {
-    pub fn new(content: &str) -> Self {
-        let mut starts = Vec::new();
-        if !content.is_empty() {
-            // Size the index up front. It holds one `usize` per line, so
-            // growing it by doubling both overshoots — up to twice what is
-            // needed — and copies the whole thing on the way there. On a large
-            // file that transient is tens of megabytes, which is pure waste
-            // when the exact count is one SIMD scan away.
-            starts.reserve_exact(1 + memchr::memchr_iter(b'\n', content.as_bytes()).count());
-            starts.push(0);
-            for i in memchr::memchr_iter(b'\n', content.as_bytes()) {
-                starts.push(i + 1);
-            }
-            // A trailing newline opens a final empty line that `str::lines`
-            // does not yield. Drop it so line counts agree with the rest of
-            // the pipeline, which is still line-oriented.
-            if starts.len() > 1 && starts[starts.len() - 1] == content.len() {
-                starts.pop();
-            }
-        }
+impl<'a> LineIndex<'a> {
+    pub fn new(content: &'a str) -> Self {
         Self {
-            starts,
-            len: content.len(),
+            content,
+            starts: std::cell::OnceCell::new(),
         }
     }
 
+    fn starts(&self) -> &[usize] {
+        self.starts.get_or_init(|| {
+            let content = self.content;
+            let mut starts = Vec::new();
+            if !content.is_empty() {
+                // Size the index up front. It holds one `usize` per line, so
+                // growing it by doubling both overshoots — up to twice what is
+                // needed — and copies the whole thing on the way there. On a
+                // large file that transient is tens of megabytes, which is pure
+                // waste when the exact count is one SIMD scan away.
+                starts.reserve_exact(1 + memchr::memchr_iter(b'\n', content.as_bytes()).count());
+                starts.push(0);
+                for i in memchr::memchr_iter(b'\n', content.as_bytes()) {
+                    starts.push(i + 1);
+                }
+                // A trailing newline opens a final empty line that `str::lines`
+                // does not yield. Drop it so line counts agree with the rest of
+                // the pipeline, which is still line-oriented.
+                if starts.len() > 1 && starts[starts.len() - 1] == content.len() {
+                    starts.pop();
+                }
+            }
+            starts
+        })
+    }
+
     pub fn line_count(&self) -> usize {
-        self.starts.len()
+        self.starts().len()
     }
 
     /// 0-based index of the line containing `offset`.
     pub fn line_of(&self, offset: usize) -> usize {
-        if self.starts.is_empty() {
+        let starts = self.starts();
+        if starts.is_empty() {
             return 0;
         }
-        match self.starts.binary_search(&offset) {
+        match starts.binary_search(&offset) {
             Ok(i) => i,
             // `starts[0]` is always 0, so a miss can never land at index 0.
             Err(i) => i - 1,
@@ -63,14 +79,18 @@ impl LineIndex {
     }
 
     pub fn line_start(&self, idx: usize) -> usize {
-        self.starts.get(idx).copied().unwrap_or(self.len)
+        self.starts().get(idx).copied().unwrap_or(self.content.len())
     }
 
     /// End offset of line `idx`, excluding its `\n` or `\r\n` terminator.
-    pub fn line_end(&self, content: &str, idx: usize) -> usize {
+    pub fn line_end(&self, idx: usize) -> usize {
         let start = self.line_start(idx);
-        let mut end = self.starts.get(idx + 1).copied().unwrap_or(self.len);
-        let bytes = content.as_bytes();
+        let mut end = self
+            .starts()
+            .get(idx + 1)
+            .copied()
+            .unwrap_or(self.content.len());
+        let bytes = self.content.as_bytes();
         if end > start && bytes[end - 1] == b'\n' {
             end -= 1;
         }
@@ -80,18 +100,22 @@ impl LineIndex {
         end
     }
 
-    /// Byte length of line `idx`'s terminator in `content`: 2 for `\r\n`, 1 for
-    /// a bare `\n`, 0 for a final line that the file does not terminate.
+    /// Byte length of line `idx`'s terminator in the buffer: 2 for `\r\n`, 1
+    /// for a bare `\n`, 0 for a final line that the file does not terminate.
     ///
     /// `-M/--max-columns` measures the line *including* its terminator, so this
     /// is needed to decide whether a line is over the limit.
-    pub fn line_terminator_len(&self, content: &str, idx: usize) -> usize {
-        let end = self.starts.get(idx + 1).copied().unwrap_or(self.len);
-        end - self.line_end(content, idx)
+    pub fn line_terminator_len(&self, idx: usize) -> usize {
+        let end = self
+            .starts()
+            .get(idx + 1)
+            .copied()
+            .unwrap_or(self.content.len());
+        end - self.line_end(idx)
     }
 
-    pub fn line_text<'a>(&self, content: &'a str, idx: usize) -> &'a str {
-        &content[self.line_start(idx)..self.line_end(content, idx)]
+    pub fn line_text(&self, idx: usize) -> &'a str {
+        &self.content[self.line_start(idx)..self.line_end(idx)]
     }
 }
 
@@ -112,7 +136,7 @@ pub struct LineHit {
 /// for `--max-count`, so several matches sharing a line spend one unit between
 /// them, and a match straddling two lines also spends just one.
 fn limit_to_line_blocks(
-    index: &LineIndex,
+    index: &LineIndex<'_>,
     spans: &[(usize, usize)],
     max: Option<usize>,
 ) -> Vec<(usize, usize)> {
@@ -147,14 +171,13 @@ fn limit_to_line_blocks(
 /// single line. ripgrep keeps the line the match *starts* on, which is the
 /// position an editor should jump to.
 fn clip_spans_to_start_line(
-    content: &str,
-    index: &LineIndex,
+    index: &LineIndex<'_>,
     spans: &[(usize, usize)],
 ) -> Vec<(usize, usize)> {
     spans
         .iter()
         .map(|&(s, e)| {
-            let line_end = index.line_end(content, index.line_of(s));
+            let line_end = index.line_end(index.line_of(s));
             (s, e.min(line_end))
         })
         .collect()
@@ -166,8 +189,7 @@ fn clip_spans_to_start_line(
 /// it touches has to be printed. Overlapping ranges on the same line are
 /// merged so highlighting never emits nested escape sequences.
 pub fn group_spans_by_line(
-    content: &str,
-    index: &LineIndex,
+    index: &LineIndex<'_>,
     spans: &[(usize, usize)],
 ) -> Vec<LineHit> {
     let mut by_line: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
@@ -178,7 +200,7 @@ pub fn group_spans_by_line(
         let last = if e > s { index.line_of(e - 1) } else { first };
         for li in first..=last.min(index.line_count().saturating_sub(1)) {
             let ls = index.line_start(li);
-            let le = index.line_end(content, li);
+            let le = index.line_end(li);
             let cs = s.clamp(ls, le) - ls;
             let ce = e.clamp(ls, le) - ls;
             by_line.entry(li).or_default().push((cs, ce));
@@ -602,8 +624,7 @@ pub enum Emit<'a> {
 
 /// Result of matching one file: the line index plus every matching line.
 pub struct FileMatches<'a> {
-    content: &'a str,
-    index: LineIndex,
+    index: LineIndex<'a>,
     hits: Vec<LineHit>,
 }
 
@@ -615,11 +636,7 @@ impl<'a> FileMatches<'a> {
         } else {
             collect_hits(content, &index, matcher, opts)?
         };
-        Ok(Self {
-            content,
-            index,
-            hits,
-        })
+        Ok(Self { index, hits })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -654,7 +671,7 @@ impl<'a> FileMatches<'a> {
         let emit_hit = |hit: &LineHit,
                         on_emit: &mut dyn FnMut(Emit<'a>) -> std::result::Result<(), E>|
          -> std::result::Result<(), E> {
-            let line = self.index.line_text(self.content, hit.idx);
+            let line = self.index.line_text(hit.idx);
             let offset = self.index.line_start(hit.idx);
 
             if opts.only_matching && !hit.spans.is_empty() {
@@ -734,7 +751,7 @@ impl<'a> FileMatches<'a> {
                 line_offset: offset,
                 column_shifts,
                 offset_shift: 0,
-                terminator_len: self.index.line_terminator_len(self.content, hit.idx),
+                terminator_len: self.index.line_terminator_len(hit.idx),
             })
         };
 
@@ -748,9 +765,9 @@ impl<'a> FileMatches<'a> {
                     Some(hit) => emit_hit(hit, &mut on_emit)?,
                     None => on_emit(Emit::Context {
                         line_number: li + 1,
-                        content: self.index.line_text(self.content, li),
+                        content: self.index.line_text(li),
                         absolute_offset: self.index.line_start(li),
-                        terminator_len: self.index.line_terminator_len(self.content, li),
+                        terminator_len: self.index.line_terminator_len(li),
                     })?,
                 }
             }
@@ -779,9 +796,9 @@ impl<'a> FileMatches<'a> {
                 Some(hit) => emit_hit(hit, &mut on_emit)?,
                 None => on_emit(Emit::Context {
                     line_number: li + 1,
-                    content: self.index.line_text(self.content, li),
+                    content: self.index.line_text(li),
                     absolute_offset: self.index.line_start(li),
-                    terminator_len: self.index.line_terminator_len(self.content, li),
+                    terminator_len: self.index.line_terminator_len(li),
                 })?,
             }
         }
@@ -843,7 +860,7 @@ fn pattern_is_anchor_free(pattern: &str) -> bool {
 /// still has the final say, so extra candidates cost time and never accuracy.
 fn candidate_lines<'a>(
     content: &'a str,
-    index: &'a LineIndex,
+    index: &'a LineIndex<'a>,
     matcher: &'a SearchMatcher,
     opts: &MatchOptions,
 ) -> Option<impl Iterator<Item = usize> + 'a> {
@@ -886,7 +903,7 @@ fn candidate_lines<'a>(
 /// Find every matching line together with the match ranges inside it.
 fn collect_hits(
     content: &str,
-    index: &LineIndex,
+    index: &LineIndex<'_>,
     matcher: &SearchMatcher,
     opts: &MatchOptions,
 ) -> Result<Vec<LineHit>> {
@@ -895,7 +912,7 @@ fn collect_hits(
     if opts.invert_match {
         let mut out = Vec::new();
         for i in 0..index.line_count() {
-            if !matcher.is_match(index.line_text(content, i))? {
+            if !matcher.is_match(index.line_text(i))? {
                 out.push(LineHit {
                     idx: i,
                     spans: Vec::new(),
@@ -931,12 +948,11 @@ fn collect_hits(
             // past the end of its line is reported only on the line it starts
             // on rather than once per line it touches.
             return Ok(group_spans_by_line(
-                content,
                 index,
-                &clip_spans_to_start_line(content, index, &spans),
+                &clip_spans_to_start_line(index, &spans),
             ));
         }
-        return Ok(group_spans_by_line(content, index, &spans));
+        return Ok(group_spans_by_line(index, &spans));
     }
 
     // Line-oriented mode: match each line separately so `^` and `$` anchor
@@ -944,10 +960,10 @@ fn collect_hits(
     let mut out = Vec::new();
     let visit = |i: usize, out: &mut Vec<LineHit>| -> Result<bool> {
         let spans = if opts.all_spans {
-            matcher.find_spans(index.line_text(content, i))?
+            matcher.find_spans(index.line_text(i))?
         } else {
             matcher
-                .find_first_span(index.line_text(content, i))?
+                .find_first_span(index.line_text(i))?
                 .into_iter()
                 .collect()
         };
@@ -1061,7 +1077,7 @@ mod tests {
                 let mut expected = Vec::new();
                 for i in 0..index.line_count() {
                     if matcher
-                        .is_match(index.line_text(hay, i))
+                        .is_match(index.line_text(i))
                         .expect("standard matcher cannot error")
                     {
                         expected.push(i);
@@ -1443,7 +1459,7 @@ mod tests {
             assert_eq!(index.line_count(), expected.len(), "count for {content:?}");
             for (i, want) in expected.iter().enumerate() {
                 assert_eq!(
-                    &index.line_text(content, i),
+                    &index.line_text(i),
                     want,
                     "line {i} of {content:?}"
                 );
@@ -1466,7 +1482,7 @@ mod tests {
         let content = "start\nmiddle\nend\n";
         let index = LineIndex::new(content);
         // "start\nmiddle\nend" as one match spanning three lines.
-        let hits = group_spans_by_line(content, &index, &[(0, 16)]);
+        let hits = group_spans_by_line(&index, &[(0, 16)]);
         assert_eq!(
             hits,
             vec![
@@ -1490,7 +1506,7 @@ mod tests {
     fn group_spans_merges_overlapping_ranges_on_one_line() {
         let content = "aaaa";
         let index = LineIndex::new(content);
-        let hits = group_spans_by_line(content, &index, &[(0, 2), (1, 3)]);
+        let hits = group_spans_by_line(&index, &[(0, 2), (1, 3)]);
         assert_eq!(
             hits,
             vec![LineHit {
@@ -1504,7 +1520,7 @@ mod tests {
     fn group_spans_keeps_separate_ranges_apart() {
         let content = "foo bar foo";
         let index = LineIndex::new(content);
-        let hits = group_spans_by_line(content, &index, &[(0, 3), (8, 11)]);
+        let hits = group_spans_by_line(&index, &[(0, 3), (8, 11)]);
         assert_eq!(
             hits,
             vec![LineHit {

@@ -1033,14 +1033,13 @@ fn search_local_index(
         if exceeds_max_filesize(&full_path, opts, explicit) {
             continue;
         }
-        let (content, fixups) = match read_text_lossy(&full_path, opts.encoding) {
+        let read = match read_text_lossy(&full_path, opts.encoding) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
         let outcome = search_decoded_file(
-            content.as_str(),
-            &fixups,
+            &read,
             &matcher,
             rel_path,
             opts,
@@ -1175,10 +1174,9 @@ fn brute_force_search(
         if passes_filters(&rel_path, &glob_filter, &type_filter)
             && !exceeds_max_filesize(root, opts, true)
         {
-            let (content, fixups) = read_text_lossy(root, opts.encoding)?;
+            let read = read_text_lossy(root, opts.encoding)?;
             let outcome = search_decoded_file(
-                content.as_str(),
-                &fixups,
+                &read,
                 &matcher,
                 &rel_path,
                 opts,
@@ -1229,14 +1227,13 @@ fn brute_force_search(
             continue;
         }
 
-        let (content, fixups) = match read_text_lossy(path, opts.encoding) {
+        let read = match read_text_lossy(path, opts.encoding) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
         let outcome = search_decoded_file(
-            content.as_str(),
-            &fixups,
+            &read,
             &matcher,
             &rel_path,
             opts,
@@ -1319,12 +1316,75 @@ impl FileText {
     }
 }
 
+/// A file's text together with what the read already learned about it.
+struct FileRead {
+    text: FileText,
+    fixups: tgrep_core::encoding::LossyFixups,
+    /// Offset of the first NUL byte in `text`, which is what makes the file
+    /// binary. Found during the pass that decoded or validated the bytes, not
+    /// in a pass of its own — see [`validate_utf8_and_find_nul`].
+    first_nul: Option<usize>,
+}
+
+/// Validate `bytes` as UTF-8 and locate the first NUL byte in one traversal.
+///
+/// Returns `None` if the bytes are not valid UTF-8, which is the caller's
+/// signal to fall back to reading and repairing them.
+///
+/// Both questions need every byte, and asking them separately means walking the
+/// file twice. That is nearly free while it stays in the page cache and is
+/// anything but on a file larger than the cache, where the second walk is
+/// another trip to disk: on a 13.4 GiB file, validating cost 8.7 s and a
+/// separate `memchr` for the NUL cost another 6.2 s. Interleaving them at
+/// chunk granularity keeps each page hot for both.
+///
+/// The chunking is what makes that possible, and it is why this cannot simply
+/// call `str::from_utf8` per chunk: a multi-byte sequence can straddle a chunk
+/// boundary, where `from_utf8` reports an incomplete sequence. That is not an
+/// error mid-file — it means "resume here" — so the scan restarts at
+/// `valid_up_to` and lets the next chunk carry the sequence. At the *last*
+/// chunk the same report is a real truncation and does fail.
+fn validate_utf8_and_find_nul(bytes: &[u8]) -> Option<Option<usize>> {
+    /// Large enough that the ≤3 carried-over bytes are noise, small enough to
+    /// stay in cache between the two scans of it.
+    const CHUNK: usize = 1 << 20;
+
+    let mut pos = 0;
+    let mut first_nul = None;
+    while pos < bytes.len() {
+        let end = (pos + CHUNK).min(bytes.len());
+        let chunk = &bytes[pos..end];
+        let valid_len = match std::str::from_utf8(chunk) {
+            Ok(_) => chunk.len(),
+            Err(e) if e.error_len().is_none() && end < bytes.len() => e.valid_up_to(),
+            Err(_) => return None,
+        };
+        // A chunk starts on a character boundary and a UTF-8 sequence is at
+        // most 4 bytes, so a chunk this size always validates at least part of
+        // itself unless it opens with a genuinely invalid byte. Bailing keeps
+        // the loop from spinning if that reasoning ever stops holding.
+        if valid_len == 0 {
+            return None;
+        }
+        if first_nul.is_none()
+            && let Some(i) = memchr::memchr(0, &chunk[..valid_len])
+        {
+            first_nul = Some(pos + i);
+        }
+        pos += valid_len;
+    }
+    Some(first_nul)
+}
+
 /// Map a file for searching, or `None` to fall back to reading it.
 ///
 /// Declines whenever the mapped pages would not be exactly the bytes to search:
 /// a file below the threshold, an encoding that transcodes or strips a BOM, or
 /// content that is not already valid UTF-8 and so needs lossy repair.
-fn try_map_text(path: &Path, encoding: tgrep_core::encoding::EncodingMode) -> Option<FileText> {
+fn try_map_text(
+    path: &Path,
+    encoding: tgrep_core::encoding::EncodingMode,
+) -> Option<(FileText, Option<usize>)> {
     let file = std::fs::File::open(path).ok()?;
     if file.metadata().ok()?.len() < MMAP_MIN_BYTES {
         return None;
@@ -1337,8 +1397,8 @@ fn try_map_text(path: &Path, encoding: tgrep_core::encoding::EncodingMode) -> Op
     if !tgrep_core::encoding::borrows_whole_input(&map, encoding) {
         return None;
     }
-    std::str::from_utf8(&map).ok()?;
-    Some(FileText::Mapped(map))
+    let first_nul = validate_utf8_and_find_nul(&map)?;
+    Some((FileText::Mapped(map), first_nul))
 }
 
 /// Read a file as text, applying `--encoding` and replacing invalid UTF-8
@@ -1349,14 +1409,27 @@ fn try_map_text(path: &Path, encoding: tgrep_core::encoding::EncodingMode) -> Op
 fn read_text_lossy(
     path: &Path,
     encoding: tgrep_core::encoding::EncodingMode,
-) -> std::io::Result<(FileText, tgrep_core::encoding::LossyFixups)> {
+) -> std::io::Result<FileRead> {
     // A mapped file is always already-valid UTF-8, so it needs no fixups.
-    if let Some(mapped) = try_map_text(path, encoding) {
-        return Ok((mapped, tgrep_core::encoding::LossyFixups::default()));
+    if let Some((text, first_nul)) = try_map_text(path, encoding) {
+        return Ok(FileRead {
+            text,
+            fixups: tgrep_core::encoding::LossyFixups::default(),
+            first_nul,
+        });
     }
     let bytes = std::fs::read(path)?;
     let (text, fixups) = tgrep_core::encoding::decode_owned_with_fixups(bytes, encoding);
-    Ok((FileText::Owned(text), fixups))
+    // The read path already walks these bytes at least once and they are under
+    // the mapping threshold or repaired, so a separate scan here is cheap. It
+    // has to run over the *repaired* text, since that is what offsets are
+    // reported against.
+    let first_nul = memchr::memchr(0, text.as_bytes());
+    Ok(FileRead {
+        text: FileText::Owned(text),
+        fixups,
+        first_nul,
+    })
 }
 
 /// Whether `--max-filesize` excludes this file.
@@ -1451,29 +1524,32 @@ enum FileOutcome {
 /// skipped silently, so they appear in neither `-l`, `-c`, `-L`, nor the plain
 /// output.
 fn search_decoded_file(
-    content: &str,
-    fixups: &tgrep_core::encoding::LossyFixups,
+    read: &FileRead,
     matcher: &SearchMatcher,
     rel_path: &str,
     opts: &SearchOptions,
     writer: &mut OutputWriter,
     explicit: bool,
 ) -> Result<FileOutcome> {
+    let FileRead {
+        text,
+        fixups,
+        first_nul,
+    } = read;
+    let content = text.as_str();
+
     // ripgrep only surfaces a binary file when the user named it explicitly (or
     // passed `--binary`).
     //
-    // The NUL is located in the repaired text but reported in terms of the file
-    // on disk, so it goes back through `fixups`: repairing invalid UTF-8 ahead
-    // of the NUL widens every bad byte to three, which would otherwise push the
-    // reported offset past where the byte actually is.
+    // `first_nul` was found by the pass that read the file, so this costs
+    // nothing here. The NUL is located in the repaired text but reported in
+    // terms of the file on disk, so it goes back through `fixups`: repairing
+    // invalid UTF-8 ahead of the NUL widens every bad byte to three, which
+    // would otherwise push the reported offset past where the byte actually is.
     let binary_offset = if opts.text {
         None
     } else {
-        content
-            .as_bytes()
-            .iter()
-            .position(|&b| b == 0)
-            .map(|off| fixups.to_source_offset(off))
+        first_nul.map(|off| fixups.to_source_offset(off))
     };
     if binary_offset.is_some() && !explicit && !opts.binary {
         return Ok(FileOutcome::Skipped);
@@ -1686,6 +1762,102 @@ fn plan_summary(plan: &QueryPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- fused UTF-8 validation and NUL scan --------------------------------
+    //
+    // `validate_utf8_and_find_nul` walks the file in chunks so that validating
+    // it and finding the NUL that marks it binary share one traversal. The
+    // chunking is the delicate part: a multi-byte sequence that straddles a
+    // chunk boundary must be carried into the next chunk rather than reported
+    // as invalid. These pin that against the whole-buffer answer it replaces.
+
+    /// What the two separate passes used to produce, for differential testing.
+    fn reference(bytes: &[u8]) -> Option<Option<usize>> {
+        std::str::from_utf8(bytes).ok()?;
+        Some(memchr::memchr(0, bytes))
+    }
+
+    fn check(bytes: &[u8]) {
+        assert_eq!(
+            validate_utf8_and_find_nul(bytes),
+            reference(bytes),
+            "disagreed with a whole-buffer scan on {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn fused_scan_handles_empty_and_ascii() {
+        check(b"");
+        check(b"hello world");
+        check(b"hello\0world");
+        check(b"\0");
+    }
+
+    #[test]
+    fn fused_scan_rejects_invalid_utf8() {
+        check(&[0xFF]);
+        check(b"ok\xFFbad");
+        // A truncated sequence at the very end is a real error, not a chunk
+        // boundary to resume across.
+        check(&[0xE2, 0x82]);
+    }
+
+    #[test]
+    fn fused_scan_carries_a_sequence_across_a_chunk_boundary() {
+        // Place every multi-byte width so that it straddles the boundary at
+        // each possible split, which is exactly the case a per-chunk
+        // `from_utf8` would reject.
+        const CHUNK: usize = 1 << 20;
+        for seq in ["\u{00E9}", "\u{20AC}", "\u{1F600}"] {
+            for offset in 1..seq.len() {
+                let mut bytes = vec![b'a'; CHUNK - offset];
+                bytes.extend_from_slice(seq.as_bytes());
+                bytes.extend_from_slice(b"tail");
+                check(&bytes);
+                // The same, with a NUL on the far side of the boundary, so the
+                // reported offset has to survive the carry.
+                let mut with_nul = bytes.clone();
+                with_nul.push(0);
+                with_nul.extend_from_slice(b"more");
+                check(&with_nul);
+            }
+        }
+    }
+
+    #[test]
+    fn fused_scan_reports_the_first_nul_not_a_later_one() {
+        const CHUNK: usize = 1 << 20;
+        // One NUL in the first chunk and one in the third: the scan must stop
+        // updating after the first, even though later chunks also match.
+        let mut bytes = vec![b'a'; CHUNK * 3];
+        bytes[7] = 0;
+        bytes[CHUNK * 2 + 11] = 0;
+        check(&bytes);
+        assert_eq!(validate_utf8_and_find_nul(&bytes), Some(Some(7)));
+    }
+
+    #[test]
+    fn fused_scan_finds_a_nul_exactly_on_a_chunk_boundary() {
+        const CHUNK: usize = 1 << 20;
+        for at in [CHUNK - 1, CHUNK, CHUNK + 1] {
+            let mut bytes = vec![b'a'; CHUNK * 2];
+            bytes[at] = 0;
+            check(&bytes);
+            assert_eq!(validate_utf8_and_find_nul(&bytes), Some(Some(at)));
+        }
+    }
+
+    #[test]
+    fn fused_scan_spans_many_chunks_without_a_nul() {
+        const CHUNK: usize = 1 << 20;
+        // Multi-byte content throughout, so every chunk ends mid-sequence at
+        // some point and the loop has to keep making progress.
+        let unit = "héllo wörld €";
+        let bytes = unit.repeat((CHUNK * 3) / unit.len()).into_bytes();
+        check(&bytes);
+        assert_eq!(validate_utf8_and_find_nul(&bytes), Some(None));
+    }
 
     // --- `--stats` counting -------------------------------------------------
     //

@@ -52,6 +52,38 @@ const WATCHER_QUEUE_CAP: usize = 16_384;
 /// reconciling stale check runs.
 const WATCHER_IDLE_POLL: Duration = Duration::from_secs(1);
 
+/// How long a file the watcher never heard about can stay wrong in the index.
+///
+/// Every mutation the index takes after the initial build arrives as an OS
+/// notification, and a notification can go missing: the queue between the
+/// callback and the worker can overflow, a network or virtualised filesystem
+/// can decline to report a change at all, and a `serve` that is running while
+/// the tree is replaced wholesale (a branch switch, a build) can be handed
+/// more events than the platform is willing to buffer. Overflow is detected
+/// and repaired immediately; the rest is silent. Nothing else in the server
+/// ever revisits a file it believes it already knows, so a miss lasts until
+/// the file happens to change again — which for a deleted file is never.
+///
+/// A full stale check finds all of it, because it compares the whole tree
+/// against the index rather than trusting any event. Running one on a timer
+/// turns "until something else happens to fix it" into a bound.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How often the reconcile loop wakes to see whether it is due.
+const RECONCILE_POLL: Duration = Duration::from_secs(60);
+
+/// How long the server must have gone without a search before a scheduled
+/// reconcile runs. A reconcile walks the entire tree and holds the snapshot
+/// gate while it does, so on a repository being actively queried it waits for
+/// a gap rather than competing.
+const RECONCILE_QUIET_PERIOD: Duration = Duration::from_secs(120);
+
+/// The point at which a reconcile stops waiting for a quiet gap. A server
+/// queried steadily every minute would otherwise never see one, and would
+/// never reconcile at all — which is the failure this exists to prevent.
+const RECONCILE_DEADLINE: Duration = Duration::from_secs(4 * 3600);
+
+
 /// Server discovery info, written to `serve.json`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerInfo {
@@ -337,6 +369,43 @@ struct ServerState {
     /// save. Higher values reduce save frequency (and the pauses they cause)
     /// at the cost of more unsaved work if the process is killed.
     auto_save_mutations: u32,
+    /// Files a delta build could not read, and the metadata they had when it
+    /// tried.
+    ///
+    /// A file that fails to read has its stamp withheld so the next reconcile
+    /// retries it rather than recording it as indexed. That is right for a
+    /// transient failure and wrong for a permanent one: a file locked by
+    /// another process, or unreadable by permission, fails identically every
+    /// time, and with a reconcile on a timer it would rewrite the whole index
+    /// once an hour forever to re-attempt a file that will fail again.
+    ///
+    /// Remembering the metadata of the attempt separates the two. A file whose
+    /// mtime and size have not moved since it failed is not worth another
+    /// read; one that has changed gets a fresh look. The record lives in
+    /// memory, so restarting the server retries everything — which is the
+    /// escape hatch for a file made readable without being modified.
+    unreadable: RwLock<std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+    /// Reference point for [`ServerState::quiet_for`], because an `Instant`
+    /// cannot live in an atomic.
+    started: Instant,
+    /// Milliseconds since `started` at the last search request, used by the
+    /// periodic reconcile to stay out of the way of a server in active use.
+    last_search_ms: std::sync::atomic::AtomicU64,
+}
+
+impl ServerState {
+    fn note_search(&self) {
+        self.last_search_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long the server has gone without a search.
+    fn quiet_for(&self) -> Duration {
+        let last = self.last_search_ms.load(Ordering::Relaxed);
+        self.started
+            .elapsed()
+            .saturating_sub(Duration::from_millis(last))
+    }
 }
 
 /// `Default` exists only for tests, which need to vary one field at a time.
@@ -515,6 +584,9 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         memory_cap_bytes,
         index_threads,
         auto_save_mutations,
+        unreadable: RwLock::new(std::collections::HashMap::new()),
+        started: serve_start,
+        last_search_ms: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Bind TCP listener on a random port
@@ -605,6 +677,19 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     // Start auto-save thread
     let save_state = Arc::clone(&state);
     thread::spawn(move || auto_save_loop(save_state));
+
+    // Bound how long a change the watcher never heard about can stay wrong.
+    // Pointless without a watcher: `--no-watch` means the index is only ever
+    // refreshed on request, and silently rewriting it on a timer would be a
+    // surprise rather than a repair.
+    if !no_watch {
+        let reconcile_state = Arc::clone(&state);
+        let reconcile_root = root.clone();
+        let reconcile_index_dir = index_dir.clone();
+        thread::spawn(move || {
+            periodic_reconcile_loop(reconcile_state, reconcile_root, reconcile_index_dir)
+        });
+    }
 
     // Accept connections
     for stream in listener.incoming() {
@@ -971,6 +1056,9 @@ fn handle_search(
     state: &ServerState,
 ) -> String {
     let start = Instant::now();
+    // Marks the server as in use, so the periodic reconcile waits for a gap
+    // rather than walking the tree underneath a client that is mid-session.
+    state.note_search();
 
     let req = match parse_search_params(params) {
         Ok(r) => r,
@@ -1770,6 +1858,61 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     }
 }
 
+/// Whether a scheduled reconcile should run now.
+///
+/// Split out from the loop so the schedule can be exercised without waiting
+/// hours for it.
+fn reconcile_due(since_last: Duration, quiet_for: Duration, busy: bool) -> bool {
+    // Indexing and flushing are already rewriting the index, and a reconcile
+    // takes the snapshot gate for its whole walk-and-merge. Let them finish;
+    // the next tick is a minute away.
+    if busy {
+        return false;
+    }
+    if since_last >= RECONCILE_DEADLINE {
+        return true;
+    }
+    since_last >= RECONCILE_INTERVAL && quiet_for >= RECONCILE_QUIET_PERIOD
+}
+
+/// Periodically compare the whole tree against the index, so a change the
+/// watcher never heard about cannot stay wrong indefinitely.
+///
+/// See [`RECONCILE_INTERVAL`] for why this is needed at all. It is deliberately
+/// unhurried: it defers to indexing, to flushing, and to a server that is
+/// being queried, and it does nothing at all on a tree that has not drifted —
+/// the walk finds no differences and returns without touching the index.
+fn periodic_reconcile_loop(state: Arc<ServerState>, root: PathBuf, index_dir: PathBuf) {
+    let mut last = Instant::now();
+    loop {
+        thread::sleep(RECONCILE_POLL);
+
+        let busy = state.indexing.load(Ordering::SeqCst) || state.flushing.load(Ordering::SeqCst);
+        if !reconcile_due(last.elapsed(), state.quiet_for(), busy) {
+            continue;
+        }
+
+        // Restart the interval before the walk rather than after it. On a large
+        // repository the reconcile itself takes a while, and timing from its
+        // completion would push each one further out than the last.
+        last = Instant::now();
+        eprintln!("[trace] periodic reconcile: looking for changes the watcher missed");
+        // Same comparison the startup check makes, and for the same reason: a
+        // lost event is a stamp that disagrees with the filesystem, a file with
+        // no stamp, or a stamp with no file, and all three fall out of that.
+        // Comparing index *membership* as well would additionally re-add any
+        // file whose stamp says indexed but which the reader does not hold —
+        // a publication bug rather than a lost event, and one that on an hourly
+        // timer would rebuild the whole index every hour if it ever misfired.
+        if !background_refresh_stale(&state, &root, &index_dir, false) {
+            // It declined — an unreadable directory, or a walk that raced a
+            // delete. The index is untouched and correct as far as it goes,
+            // and the next interval tries again.
+            eprintln!("[trace] periodic reconcile: declined, keeping the current index");
+        }
+    }
+}
+
 fn auto_save_loop(state: Arc<ServerState>) {
     let mut last_save = Instant::now();
 
@@ -2012,20 +2155,34 @@ fn stream_merge_stale_changes(
         // means "indexed at this version", so keeping one for a skipped file
         // would hide it from every later reconcile and make the miss permanent.
         // Dropping the stamp leaves it looking new, so the next pass retries it.
-        if !outcome.unreadable.is_empty() {
-            eprintln!(
-                "[trace] {} file(s) were unreadable during the delta build; \
-                 their stamps are withheld so the next reconcile retries them",
-                outcome.unreadable.len()
-            );
+        //
+        // Record what the file looked like when it failed, so a permanent
+        // failure is retried when the file changes rather than on every pass.
+        // See `ServerState::unreadable`.
+        {
+            let mut memo = state.unreadable.write().unwrap();
+            // Anything this delta was asked to build is settled: either it was
+            // read, or it is in `outcome.unreadable` and re-recorded below.
+            for path in changed.iter().chain(added).chain(deleted) {
+                memo.remove(path);
+            }
             for path in &outcome.unreadable {
                 let rel = path
                     .strip_prefix(root)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                published_stamps.remove(&rel);
+                if let Some(stamp) = published_stamps.remove(&rel) {
+                    memo.insert(rel, stamp);
+                }
             }
+        }
+        if !outcome.unreadable.is_empty() {
+            eprintln!(
+                "[trace] {} file(s) were unreadable during the delta build; \
+                 their stamps are withheld so a later reconcile retries them",
+                outcome.unreadable.len()
+            );
         }
 
         let delta = tgrep_core::reader::IndexReader::open(&delta_dir)?;
@@ -2184,12 +2341,44 @@ fn background_refresh_stale(
         return true;
     }
 
-    let (changed, added, deleted) = classify_file_changes(
+    let (mut changed, mut added, deleted) = classify_file_changes(
         current_meta,
         &old_stamps,
         &indexed_paths,
         compare_index_membership,
     );
+
+    // Files that failed to read last time and have not changed since are not
+    // worth another attempt; without this a single permanently locked file
+    // makes every scheduled reconcile rebuild the index. `deleted` is exempt —
+    // a file that is gone needs no read to evict.
+    let skipped_unreadable = {
+        let memo = state.unreadable.read().unwrap();
+        if memo.is_empty() {
+            0
+        } else {
+            // One pass over the walk to pick out the memoized paths, rather
+            // than a scan per candidate.
+            let still_failing: std::collections::HashSet<&str> = current_meta
+                .iter()
+                .filter(|fm| {
+                    memo.get(&fm.relative_path)
+                        .is_some_and(|a| a.mtime == fm.mtime && a.size == fm.size)
+                })
+                .map(|fm| fm.relative_path.as_str())
+                .collect();
+            let before = changed.len() + added.len();
+            changed.retain(|path| !still_failing.contains(path.as_str()));
+            added.retain(|path| !still_failing.contains(path.as_str()));
+            before - (changed.len() + added.len())
+        }
+    };
+    if skipped_unreadable > 0 {
+        eprintln!(
+            "[trace] stale check: {skipped_unreadable} file(s) unchanged since they \
+             last failed to read; not retrying them"
+        );
+    }
 
     let total_changes = changed.len() + added.len() + deleted.len();
     let live_pending = state.index.read().unwrap().live.has_pending_changes();
@@ -3235,6 +3424,9 @@ mod tests {
             memory_cap_bytes: 16 * 1024 * 1024 * 1024,
             index_threads: 1,
             auto_save_mutations: 0,
+            unreadable: RwLock::new(std::collections::HashMap::new()),
+            started: Instant::now(),
+            last_search_ms: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -3516,6 +3708,83 @@ mod tests {
         assert_eq!(added, vec!["case.txt"]);
         deleted.sort();
         assert_eq!(deleted, vec!["Case.txt", "reader-only.txt"]);
+    }
+
+    /// The reconcile waits for the server to go quiet, but not forever.
+    #[test]
+    fn a_scheduled_reconcile_defers_to_a_busy_server_but_not_indefinitely() {
+        let long_quiet = RECONCILE_QUIET_PERIOD + Duration::from_secs(1);
+        let just_queried = Duration::from_secs(1);
+
+        // Before the interval, nothing runs however idle the server is.
+        assert!(!reconcile_due(
+            RECONCILE_INTERVAL - Duration::from_secs(1),
+            long_quiet,
+            false
+        ));
+        // After it, an idle server reconciles.
+        assert!(reconcile_due(RECONCILE_INTERVAL, long_quiet, false));
+        // A server mid-query waits for a gap...
+        assert!(!reconcile_due(RECONCILE_INTERVAL, just_queried, false));
+        // ...but a server that is *always* mid-query would otherwise never
+        // reconcile at all, which is the failure this exists to prevent.
+        assert!(reconcile_due(RECONCILE_DEADLINE, just_queried, false));
+        // Indexing and flushing outrank even the deadline: they are rewriting
+        // the index already, and the next tick is a minute away.
+        assert!(!reconcile_due(RECONCILE_DEADLINE, long_quiet, true));
+    }
+
+    /// A file that cannot be read must not make every reconcile rebuild.
+    ///
+    /// Its stamp is deliberately withheld so it looks new and gets retried.
+    /// Left at that, a file locked by another process would be "new" on every
+    /// pass, and a reconcile on a timer would rewrite the whole index once an
+    /// hour, forever, to re-attempt a read that fails the same way each time.
+    #[test]
+    fn a_file_that_stays_unreadable_is_not_retried_until_it_changes() {
+        use tgrep_core::meta::FileStamp;
+        use tgrep_core::walker::FileMeta;
+
+        let memo = std::collections::HashMap::from([(
+            "locked.bin".to_string(),
+            FileStamp {
+                mtime: 100,
+                size: 5,
+            },
+        )]);
+
+        let retried = |mtime: u64, size: u64| {
+            let current = vec![FileMeta {
+                relative_path: "locked.bin".to_string(),
+                mtime,
+                size,
+            }];
+            let (mut changed, mut added, _) = classify_file_changes(
+                &current,
+                &std::collections::HashMap::new(),
+                &std::collections::HashSet::new(),
+                false,
+            );
+            // Mirrors the filter `background_refresh_stale` applies.
+            let still_failing: std::collections::HashSet<&str> = current
+                .iter()
+                .filter(|fm| {
+                    memo.get(&fm.relative_path)
+                        .is_some_and(|a| a.mtime == fm.mtime && a.size == fm.size)
+                })
+                .map(|fm| fm.relative_path.as_str())
+                .collect();
+            changed.retain(|path| !still_failing.contains(path.as_str()));
+            added.retain(|path| !still_failing.contains(path.as_str()));
+            changed.len() + added.len()
+        };
+
+        // Unchanged since the failed read: leave it alone.
+        assert_eq!(retried(100, 5), 0);
+        // Touched: worth another look.
+        assert_eq!(retried(200, 5), 1);
+        // Resized: likewise.
+        assert_eq!(retried(100, 6), 1);
     }
 
     /// A walk error must not leave the watcher gated forever.

@@ -283,6 +283,23 @@ Resource use during that initial build can be tuned. These apply to both
 | `--auto-save-mutations <N>` | `5000` | Accumulated index changes that trigger a background save; higher means fewer pauses but more to redo if killed |
 | `--watcher-queue-cap <N>` | `16384` | Filesystem events buffered between the OS watcher and the indexing worker; raise it if bulk changes log watcher queue overflows, since each overflow forces a full stale check |
 
+#### Staying in step with the filesystem
+
+Once the index is built, everything that changes it arrives as an OS
+notification, and a notification can go missing — a queue overflow, a network
+or virtualised filesystem that declines to report a change, a tree replaced
+wholesale by a branch switch or a build. Overflow is detected and repaired at
+once; the rest is silent, and nothing else in the server revisits a file it
+believes it already knows. A missed change would otherwise last until that
+file happened to change again, which for a deleted file is never.
+
+So a watching server also reconciles on a timer: about once an hour it walks
+the tree and compares it against the index, which finds any drift regardless
+of what the watcher heard. It waits for a two-minute gap in queries first, and
+gives up waiting after four hours so a continuously busy server still
+reconciles. On an unchanged tree it finds nothing and leaves the index alone.
+`--no-watch` turns it off along with the watcher.
+
 ### Search
 
 ```bash

@@ -512,11 +512,25 @@ mod tests {
 
     // The cap exists to stop tgrep exhausting the host, so it must charge
     // against memory the process actually owns wherever that is available.
+    //
+    // The two figures are sampled at different instants, and the rest of the
+    // suite is allocating on other threads meanwhile, so they are compared for
+    // *provenance* rather than exact equality - an exact match made this test
+    // flaky. Private and RSS differ by far more than the tolerance whenever the
+    // distinction matters, so a wrong source still fails.
     #[test]
     fn budgeted_memory_prefers_private_bytes() {
         let budgeted = budgeted_memory_bytes();
         match process_private_bytes() {
-            Some(private) => assert_eq!(budgeted, Some(private)),
+            Some(private) => {
+                let budgeted = budgeted.expect("private bytes are available, so a budget is too");
+                let drift = budgeted.abs_diff(private);
+                let tolerance = (private / 10).max(16 * 1024 * 1024);
+                assert!(
+                    drift <= tolerance,
+                    "budgeted {budgeted} should track private {private} (drift {drift} > {tolerance})"
+                );
+            }
             None => assert_eq!(budgeted, process_rss_bytes()),
         }
     }

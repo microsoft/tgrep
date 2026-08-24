@@ -9,10 +9,13 @@
 //! This test builds an index with an explicit cap, serves it with the same cap,
 //! and asserts the large file survives and is still searchable.
 //!
-//! The default is now no size cap, so this fixture is chosen to be well above
-//! the historical 1 MiB cap and comfortably under the explicit 10 MiB cap this
-//! test pins on both sides, keeping CI lightweight while still exercising the
-//! "honour the provided cap" path.
+//! The default cap is now [`tgrep_core::walker::DEFAULT_MAX_FILE_SIZE`], 64 MiB,
+//! so this fixture is chosen to be well above the historical 1 MiB cap and
+//! comfortably under the explicit 10 MiB cap this test pins on both sides,
+//! keeping CI lightweight while still exercising the "honour the provided cap"
+//! path. Pinning an explicit cap rather than relying on the default is
+//! deliberate: it keeps the test measuring cap propagation rather than whatever
+//! the default happens to be.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};

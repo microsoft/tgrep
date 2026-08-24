@@ -226,24 +226,30 @@ reduction in peak memory, and no slower**:
 identical runs because `Vec` growth doubles and both buffers are briefly
 resident during the final reallocation, while `external` varied by 8 MiB.
 
-The indexing cap has since been removed entirely, which changes the peaks quoted
-in this section. Files past 1 MiB are memory-mapped rather than read onto the
-heap, so the `external` build on the same repo now settles at roughly **152 MiB
-of private memory in 27 s**, against 197-200 MiB and 41-42 s when a 64 MiB cap
-was still in force. The arena bound is unchanged; what changed is that a handful
-of 20 MB generated headers no longer cost their full size in heap in every
-worker that touches one.
+The 1 MiB indexing cap those rows were measured under is now 64 MiB, and files
+past 1 MiB are memory-mapped rather than read onto the heap. On the same repo the
+`external` build now settles at roughly **152 MiB of private memory in 27 s**,
+against 197-200 MiB and 41-42 s when every admitted file was read onto the heap.
+The arena bound is unchanged; what changed is that a handful of 20 MB generated
+headers no longer cost their full size in heap in every worker that touches one.
+The 152 MiB figure was taken with no cap at all, and the 64 MiB default excludes
+only files *above* 64 MiB, so it leaves these numbers alone here: the largest file
+in the kernel tree is a 22.9 MiB generated AMD register header, and nothing in its
+95,862 files reaches the cap.
 
-Two caveats on reading those numbers. The peak tgrep prints is *resident set*,
-which counts mapped file pages, so it now reads higher than the memory the
-process actually holds — the same build reports ~192 MiB resident against
-152 MiB private. Mapped pages are file-backed and reclaimable under pressure,
-which heap is not. And a very large file that is neither valid UTF-8 nor
-detectably binary still costs about its own size, because the index has to hold
-the same repaired bytes a search will match against; a 135 MB Latin-1 file
-indexes at roughly 205 MiB.
+Two caveats on reading those numbers. The peak tgrep prints is *private bytes*,
+which excludes mapped file pages, so it reports what the process actually holds
+rather than the size of the files it is reading — the same build is 152 MiB
+private against ~192 MiB resident, and the working set is named alongside only
+when it is substantially larger, as in [Build the index](#build-the-index).
+macOS is the exception: `libc` does not surface the Mach counter that separates
+the two, so it still reports resident set there. And a very large file that is
+neither valid UTF-8 nor detectably binary still costs about its own size, because
+the index has to hold the same repaired bytes a search will match against; a
+135 MB Latin-1 file indexes at roughly 205 MiB.
 
-Pass `--max-filesize` if a build has to fit a tighter budget.
+Pass `--max-filesize` if a build has to fit a tighter budget, or
+`--no-max-filesize` to lift the 64 MiB default entirely.
 
 `--index-strategy=memory` remains available as an escape hatch for environments
 where spilling is undesirable or impossible, such as a read-only or full index

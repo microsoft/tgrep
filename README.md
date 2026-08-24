@@ -148,6 +148,35 @@ tgrep index . --no-require-git
 tgrep serve --no-require-git
 ```
 
+#### Case-insensitive repositories
+
+When git clones onto a filesystem that does not distinguish case — which on
+Windows is every clone — it sets `core.ignorecase` and stops distinguishing case
+when it matches ignore rules. A rule spelled `QLogs` then hides a directory
+named `qlogs`.
+
+Most tools, ripgrep included, always match ignore rules case-sensitively, so
+that directory is walked, read and indexed even though `git status` never
+mentions it. On one Windows enlistment that was a single 13.4 GiB build
+artifact, 71% of the corpus, adding about 16 seconds to *every* query.
+
+tgrep reads `core.ignorecase` and matches the way the repository itself does.
+Files git **tracks** are exempt, which is git's own rule — ignore rules only
+decide the fate of files git does not already know about. Without that
+exemption the same change would have hidden 273 tracked `.JPG`, `.PNG` and
+`.RLL` files caught by rules written in lower case.
+
+On that enlistment the walk went from listing one file more than
+`git ls-files --cached --others --exclude-standard` to matching it exactly, at a
+cost of roughly 0.4 s on a 293k-file walk. `--no-ignore` turns it off along with
+every other ignore source, and repositories that distinguish case are unaffected
+and pay nothing.
+
+Only the repository's own root `.gitignore` and `.git/info/exclude` are matched
+this way. Rules in nested `.gitignore` files are not, because the walk does not
+know they exist until it reaches their directory. Missing one only leaves a file
+visible that git would hide, which is what every other tool does anyway.
+
 #### Keep `index` and `serve` flags in step
 
 Flags that decide *which files belong in the index* — `--no-require-git`,

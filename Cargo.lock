@@ -1079,6 +1079,7 @@ dependencies = [
  "encoding_rs",
  "globset",
  "ignore",
+ "memchr",
  "memmap2",
  "rayon",
  "regex",

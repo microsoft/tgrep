@@ -192,6 +192,24 @@ fn display_ignore_error(err: &ignore::Error, root: &Path) -> String {
     format!("{shown}: {inner}")
 }
 
+/// Git's own case-insensitive ignore matching, when the repository asks for it.
+///
+/// Both walks build this the same way on purpose. They must agree on what the
+/// tree contains: the indexing walk decides what goes in, and the stale check
+/// decides what is missing and should be evicted. A file one includes and the
+/// other does not is indexed and then immediately deleted, every single time —
+/// the failure mode pinned by `tgrep-cli/tests/serve_max_filesize.rs`.
+///
+/// See [`crate::gitignore::CaseInsensitiveIgnore`] for what it matches and why.
+fn git_ignorecase_filter(
+    root: &Path,
+    no_ignore: bool,
+) -> Option<crate::gitignore::CaseInsensitiveIgnore> {
+    (!no_ignore)
+        .then(|| crate::gitignore::CaseInsensitiveIgnore::new(root))
+        .flatten()
+}
+
 /// Walk a directory tree, respecting .gitignore rules (unless disabled).
 /// Returns paths of text files suitable for indexing/searching.
 ///
@@ -217,6 +235,7 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         .flatten()
         .map(std::sync::Arc::new);
     let p4ignore_root = root.clone();
+    let ignorecase = git_ignorecase_filter(&root, opts.no_ignore);
 
     let mut builder = WalkBuilder::new(&root);
     builder
@@ -235,16 +254,19 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
             if entry.file_name() == ".gitignore" {
                 return true;
             }
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if let Some(ignorecase) = &ignorecase
+                && ignorecase.excludes(entry.path(), is_dir)
+            {
+                return false;
+            }
             let Some(matcher) = &p4ignore else {
                 return true;
             };
             let Ok(relative) = entry.path().strip_prefix(&p4ignore_root) else {
                 return true;
             };
-            !matcher.is_ignored(
-                relative,
-                entry.file_type().is_some_and(|kind| kind.is_dir()),
-            )
+            !matcher.is_ignored(relative, is_dir)
         })
         .threads(opts.threads.unwrap_or_else(walker_thread_count).max(1));
     // `--ignore-file` is applied even under `--no-ignore`: the user asked for
@@ -444,6 +466,7 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
         .flatten()
         .map(std::sync::Arc::new);
     let match_root = root.to_path_buf();
+    let ignorecase = git_ignorecase_filter(root, no_ignore);
     let root = root.to_path_buf();
 
     let walker = WalkBuilder::new(&root)
@@ -453,16 +476,19 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
         .git_global(!no_ignore)
         .git_exclude(!no_ignore)
         .filter_entry(move |entry| {
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if let Some(ignorecase) = &ignorecase
+                && ignorecase.excludes(entry.path(), is_dir)
+            {
+                return false;
+            }
             let Some(matcher) = &p4ignore else {
                 return true;
             };
             let Ok(relative) = entry.path().strip_prefix(&match_root) else {
                 return true;
             };
-            !matcher.is_ignored(
-                relative,
-                entry.file_type().is_some_and(|kind| kind.is_dir()),
-            )
+            !matcher.is_ignored(relative, is_dir)
         })
         .threads(walker_thread_count())
         .build_parallel();
@@ -577,8 +603,7 @@ mod tests {
         dir
     }
 
-    fn sorted_filenames(result: &WalkResult, root: &Path) -> Vec<String> {
-        let mut names: Vec<String> = result
+    fn sorted_filenames(result: &WalkResult, root: &Path) -> Vec<String> {        let mut names: Vec<String> = result
             .files
             .iter()
             .map(|p| {
@@ -1252,5 +1277,157 @@ mod tests {
             MetaWalkOptions::default().max_file_size,
             WalkOptions::default().max_file_size
         );
+    }
+
+    // --- git's case-insensitive ignore matching ------------------------------
+    //
+    // On a case-insensitive filesystem git sets `core.ignorecase` and stops
+    // distinguishing case when matching ignore rules. The `ignore` crate does
+    // not, so a rule spelled `QLogs` left a `qlogs/` directory fully walked and
+    // indexed even though `git status` never mentions it. Matching the way git
+    // does starts catching *tracked* files too, which git would never hide, so
+    // the tracked-file exemption has to come with it.
+
+    /// A `.git` directory real enough for the walker: a config and an index.
+    fn fake_git_repo(root: &Path, ignorecase: bool, tracked: &[&str]) {
+        let git = root.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(
+            git.join("config"),
+            format!("[core]\n\tignorecase = {ignorecase}\n"),
+        )
+        .unwrap();
+
+        let mut index = Vec::new();
+        index.extend_from_slice(b"DIRC");
+        index.extend_from_slice(&2u32.to_be_bytes());
+        index.extend_from_slice(&(tracked.len() as u32).to_be_bytes());
+        for path in tracked {
+            let start = index.len();
+            index.extend_from_slice(&[0u8; 60]);
+            index.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            index.extend_from_slice(path.as_bytes());
+            index.push(0);
+            while (index.len() - start) % 8 != 0 {
+                index.push(0);
+            }
+        }
+        fs::write(git.join("index"), index).unwrap();
+    }
+
+    /// The shape of the problem: a rule in one case, a directory in another,
+    /// and an untracked artifact inside it.
+    ///
+    /// Extensions are all ones the walker treats as text. A `.JPG` would be a
+    /// truer retelling of the enlistment this came from, but the binary
+    /// extension filter drops it before any of this runs, so it would prove
+    /// nothing.
+    fn ignorecase_fixture(ignorecase: bool, tracked: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fake_git_repo(root, ignorecase, tracked);
+        fs::write(root.join(".gitignore"), "QLogs\n*.txt\n").unwrap();
+        fs::create_dir_all(root.join("qlogs")).unwrap();
+        fs::write(root.join("qlogs/artifact.rs"), "junk").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        // Matched by `*.txt` only when case is ignored.
+        fs::write(root.join("src/Kept.TXT"), "tracked").unwrap();
+        fs::write(root.join("src/Gone.TXT"), "untracked").unwrap();
+        dir
+    }
+
+    #[test]
+    fn ignorecase_hides_what_git_hides_and_keeps_what_git_tracks() {
+        // `src/Kept.TXT` is tracked, so `*.txt` must not hide it even though
+        // the rule now matches. `src/Gone.TXT` is identical but untracked, and
+        // the whole `qlogs/` directory goes — which is the point.
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(
+            names.contains(&"src/Kept.TXT".to_string()),
+            "dropped a tracked file: {names:?}"
+        );
+        assert!(names.contains(&"src/main.rs".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"src/Gone.TXT".to_string()),
+            "kept an untracked file the rule matches: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("qlogs/")),
+            "kept an untracked file inside an ignored directory: {names:?}"
+        );
+    }
+
+    #[test]
+    fn without_ignorecase_the_walk_is_unchanged() {
+        // The gate: a repository that distinguishes case gets git's ordinary
+        // case-sensitive behaviour, and pays nothing for this.
+        let dir = ignorecase_fixture(false, &["src/main.rs", "src/Kept.TXT"]);
+        let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+        assert!(names.contains(&"src/Kept.TXT".to_string()), "{names:?}");
+        assert!(names.contains(&"src/Gone.TXT".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_tracked_file_keeps_its_ignored_directory_walkable() {
+        // A directory cannot be pruned just because a rule matches it: git
+        // still reports the tracked files inside.
+        let dir = ignorecase_fixture(true, &["qlogs/kept.rs"]);
+        fs::write(dir.path().join("qlogs/kept.rs"), "tracked").unwrap();
+        let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(
+            names.contains(&"qlogs/kept.rs".to_string()),
+            "pruned a directory holding a tracked file: {names:?}"
+        );
+        assert!(
+            !names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn no_ignore_turns_the_whole_thing_off() {
+        let dir = ignorecase_fixture(true, &["src/main.rs"]);
+        let names = sorted_filenames(
+            &walk_dir(
+                dir.path(),
+                &WalkOptions {
+                    no_ignore: true,
+                    ..Default::default()
+                },
+            ),
+            dir.path(),
+        );
+        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn an_unreadable_index_excludes_nothing() {
+        // Without the index there is no way to tell tracked from untracked,
+        // and guessing wrong would hide real source. Decline instead.
+        let dir = ignorecase_fixture(true, &[]);
+        fs::write(dir.path().join(".git/index"), b"not an index").unwrap();
+        let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+        assert!(names.contains(&"src/Kept.TXT".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn both_walks_agree_on_what_the_tree_contains() {
+        // The indexing walk decides what goes into the index and the metadata
+        // walk decides what is missing from it. If they disagree, every build
+        // indexes a file the next stale check evicts.
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let indexed = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        let mut seen: Vec<String> = walk_file_metadata(dir.path(), &MetaWalkOptions::default())
+            .files
+            .iter()
+            .map(|f| f.relative_path.replace('\\', "/"))
+            .filter(|p| !p.starts_with(".git/"))
+            .collect();
+        seen.sort();
+        assert_eq!(indexed, seen);
     }
 }

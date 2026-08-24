@@ -353,7 +353,6 @@ impl P4IgnoreMatcher {
 /// Build a matcher containing only root-level `p4ignore.ini` rules.
 pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
     use ignore::gitignore::GitignoreBuilder;
-
     let (_, lines) = p4ignore_lines(root)?;
     let mut builder = GitignoreBuilder::new(root);
     if !add_p4ignore_rules(&mut builder, root) {
@@ -375,6 +374,107 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
         matcher,
         reinclude_prefixes,
     })
+}
+
+/// Git's repository-wide ignore rules, matched the way git matches them on a
+/// case-insensitive filesystem, with git's tracked-file exemption applied.
+///
+/// # Why this exists
+///
+/// git sets `core.ignorecase` when it clones onto a filesystem that does not
+/// distinguish case, and from then on it matches ignore rules without regard to
+/// case. The `ignore` crate always matches case-sensitively, so on such a
+/// repository a rule written `QLogs` does not hide a directory named `qlogs` —
+/// and everything inside it gets walked, read and indexed even though `git
+/// status` never mentions it. On one Windows enlistment that was a single 13.4
+/// GiB build artifact making up 71% of the corpus.
+///
+/// This only ever *adds* exclusions, and only for paths the case-sensitive pass
+/// already let through, so it cannot resurrect a file the normal rules hid.
+///
+/// # The tracked-file exemption
+///
+/// Matching without regard to case starts catching files that are already
+/// tracked, which git would never hide — on that same enlistment, 273 `.JPG`,
+/// `.PNG` and `.RLL` files caught by rules written in lower case. git's rule is
+/// that ignore rules only decide the fate of files it does not already track,
+/// so tracked paths are exempt here too. With the exemption, exactly one file
+/// is excluded: the untracked artifact.
+///
+/// # Limits
+///
+/// Only the repository's own rules are matched this way — the root
+/// `.gitignore` and `.git/info/exclude`. Rules in nested `.gitignore` files are
+/// not, because the walk does not know they exist until it reaches their
+/// directory, by which point the parent may already have been pruned; nor is
+/// the user's global ignore file, whose rules are not repository state. Missing
+/// one only leaves a file visible that git would hide, which is the behaviour
+/// without any of this.
+pub struct CaseInsensitiveIgnore {
+    matcher: Gitignore,
+    repo_root: std::path::PathBuf,
+    /// Loaded on the first path this matcher actually claims, which for most
+    /// repositories is never. Reading it costs 163 ms and ~30 MB on a
+    /// 299k-file repository, and nothing at all if no rule ever matches.
+    tracked: std::sync::OnceLock<Option<crate::git_index::TrackedFiles>>,
+}
+
+impl CaseInsensitiveIgnore {
+    /// Returns `None` unless `root` is in a git repository that sets
+    /// `core.ignorecase` and has repository-wide rules to apply.
+    pub fn new(root: &Path) -> Option<Self> {
+        use ignore::gitignore::GitignoreBuilder;
+
+        let repo_root = git_repo_root(root)?.to_path_buf();
+        if !crate::git_index::ignores_case(&repo_root) {
+            return None;
+        }
+
+        let mut builder = GitignoreBuilder::new(&repo_root);
+        builder.case_insensitive(true).ok()?;
+        let _ = builder.add(repo_root.join(GITIGNORE_FILENAME));
+        let _ = builder.add(repo_root.join(".git").join("info").join("exclude"));
+        let matcher = builder.build().ok()?;
+        if matcher.is_empty() {
+            return None;
+        }
+        Some(Self {
+            matcher,
+            repo_root,
+            tracked: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Whether git would hide `path`, which must be absolute.
+    pub fn excludes(&self, path: &Path, is_dir: bool) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.repo_root) else {
+            return false;
+        };
+        if !self
+            .matcher
+            .matched_path_or_any_parents(relative, is_dir)
+            .is_ignore()
+        {
+            return false;
+        }
+        // Only now is the index worth reading.
+        let Some(tracked) = self
+            .tracked
+            .get_or_init(|| crate::git_index::load_tracked(&self.repo_root))
+        else {
+            // No readable index means no way to tell tracked from untracked.
+            // Excluding could hide real source, so decline instead.
+            return false;
+        };
+        let relative = relative.to_string_lossy();
+        if is_dir {
+            // A rule matching a directory does not hide tracked files inside
+            // it, so the walk still has to descend.
+            !tracked.contains_any_under(&relative)
+        } else {
+            !tracked.contains(&relative)
+        }
+    }
 }
 
 /// Build an [`IgnoreMatcher`] from already-discovered `.gitignore` paths.

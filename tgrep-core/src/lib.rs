@@ -3,6 +3,7 @@ pub mod encoding;
 pub mod error;
 pub(crate) mod external;
 pub mod filetypes;
+pub mod git_index;
 pub mod gitignore;
 pub mod hybrid;
 pub mod live;

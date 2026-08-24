@@ -84,8 +84,8 @@ tgrep is designed to be significantly faster than ripgrep on large repos:
   sorted postings, file entries, and lookup entries instead of retaining the full
   inverted index in memory
 - **Smart file walking** — extension-based binary rejection (50+ formats) and an
-  8KB content check, with no size cap on either indexing or searching (see
-  `--max-filesize` to opt into one)
+  8KB content check, with a 64 MiB size cap on both indexing and searching
+  (`--no-max-filesize` removes it)
 - **Lock-free reads** — `RwLock<HashMap>` cache allows concurrent reads
   without contention
 - **Hot serving** — queries work immediately during background index building;
@@ -157,7 +157,8 @@ index` that built an index and the `tgrep serve` that serves it.
 The server compares the index against the filesystem at startup and treats an
 indexed file it cannot see as deleted. So serving an index built without a cap
 under a `--max-filesize 8M` server drops every file above 8 MiB from that index,
-permanently. Pass the same flags to both:
+permanently. Both sides default to 64 MiB, so this only bites when one side
+names a limit; pass the same flags to both:
 
 ```bash
 tgrep index . --max-filesize 8M
@@ -369,7 +370,8 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-a, --text` | Search binary files as if they were text |
 | `--binary` | Search binary files, reporting a note instead of their contents |
 | `-u, --unrestricted` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden, `-uuu` = +binary |
-| `--max-filesize <SIZE>` | Skip files larger than `SIZE` (`K`/`M`/`G` suffixes) |
+| `--max-filesize <SIZE>` | Skip files larger than `SIZE` (`K`/`M`/`G` suffixes); default 64M |
+| `--no-max-filesize` | Apply no size limit, as ripgrep does |
 | `-L, --follow` | Follow symbolic links |
 | `--no-messages` | Suppress error messages about unreadable/missing paths |
 | `--no-index` | Skip index, grep all files |
@@ -554,22 +556,43 @@ lines that are not valid UTF-8:
 
 ### File size limits
 
-Neither searching nor indexing has a size limit by default — every text file is
-read regardless of size, matching ripgrep. Pass `--max-filesize` to opt into one.
+Searching and indexing both skip files larger than **64 MiB** by default. This
+is a deliberate divergence from ripgrep, which has no default limit.
 
-`tgrep index` used to cap indexed files, which bought little and cost
-correctness: large files are usually generated and repetitive, so they
-contribute far fewer distinct trigrams per byte than ordinary source, while an
-oversized file was counted but never recorded — so an indexed search silently
-reported no match on a file ripgrep would have matched. Files past 1 MiB are
-memory-mapped during both indexing and searching, which is what makes indexing
-them affordable.
+The divergence is affordable because tgrep is not a one-shot scanner. A file a
+walk picks up is also a file the index carries and re-reads on every query whose
+trigrams make it a candidate, so an outlier's cost is paid repeatedly rather
+than once. On a 292,911-file enlistment where one 13.41 GiB generated build
+artifact was 71% of all searchable bytes, the cap cut a cold index build from
+214.5 s to 64.2 s and a warm query from 21.30 s to 0.55 s — a 39x difference —
+at the cost of one match in one generated file, and it excluded 2 files out of
+292,911.
 
-Mapped files are also batched by what they actually put on the heap rather than
-by their length, so a build over large files fills its worker pool instead of
+The cost is real: an oversized file is counted but its path is never recorded,
+so a match inside one is reported as no match. Two rules keep that from being
+silent:
+
+- `--no-max-filesize` restores the uncapped, ripgrep-identical behaviour, and
+  `--max-filesize` sets a different bound.
+- A file named directly on the command line is never dropped by the *inherited*
+  default, only by a limit you passed. `tgrep pattern ./huge.log` searches
+  `huge.log`.
+
+The limit is resolved once, before the walk and the search diverge, so an index
+and the queries against it always agree on which files exist. A walk that capped
+where the search did not would be indistinguishable from "this file contains no
+match".
+
+The cap is not what bounds memory. Files past 1 MiB are memory-mapped during
+both indexing and searching, so their pages are file-backed and reclaimable, and
+mapped files are batched by what they actually put on the heap rather than by
+their length — so a build over large files fills its worker pool instead of
 running two files at a time. Combined with a faster trigram extractor, that made
-indexing a tree of 32 MiB source files about 14x faster; ordinary small-file
-trees are unchanged. See [BENCHMARKS.md](BENCHMARKS.md).
+indexing a tree of 32 MiB source files about 14x faster. Nor is size a good
+proxy for *index* cost: oversized files are overwhelmingly generated and
+therefore repetitive, contributing far fewer distinct trigrams per byte than
+ordinary source. What the cap buys is bounded *scan* time. See
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ### Exit codes
 

@@ -214,8 +214,12 @@ large files are a rare minority and the extra headroom bought no parallelism.
 **Removing the cap.** Bounding the bytes in flight made the peak predictable but
 left it proportional to the largest files, which is why a cap still looked
 necessary. Mapping files past 1 MiB instead of reading them removes that link,
-and with it the reason for the cap. ripgrep has no default `--max-filesize`
-either, and this is the mechanism that lets it not need one.
+and with it the memory argument for a cap. ripgrep has no default
+`--max-filesize` either, and this is the mechanism that lets it not need one.
+
+(A 64 MiB default was later reinstated for a different reason: not build memory,
+which mapping had solved, but repeated *scan* time on the pathological tail. See
+"File size limits" in the README.)
 
 From here the two metrics diverge and have to be reported separately. Resident
 set counts mapped file pages, so it barely moves; *private* bytes — the memory

@@ -69,6 +69,10 @@ pub struct SearchOptions {
     /// path argument, since each argument is echoed back exactly as typed.
     pub path_display: crate::output::PathDisplay,
     pub max_filesize: Option<u64>,
+    /// Whether `--max-filesize` was passed, as opposed to inheriting
+    /// [`tgrep_core::walker::DEFAULT_MAX_FILE_SIZE`]. See
+    /// [`exceeds_max_filesize`].
+    pub max_filesize_requested: bool,
     pub encoding: tgrep_core::encoding::EncodingMode,
     pub follow: bool,
     pub no_messages: bool,
@@ -1026,7 +1030,7 @@ fn search_local_index(
         }
 
         let full_path = scope.full_path(&index_root, rel_path);
-        if exceeds_max_filesize(&full_path, opts) {
+        if exceeds_max_filesize(&full_path, opts, explicit) {
             continue;
         }
         let (content, fixups) = match read_text_lossy(&full_path, opts.encoding) {
@@ -1169,7 +1173,7 @@ fn brute_force_search(
     if root.is_file() {
         let rel_path = explicit_file_display_path(root);
         if passes_filters(&rel_path, &glob_filter, &type_filter)
-            && !exceeds_max_filesize(root, opts)
+            && !exceeds_max_filesize(root, opts, true)
         {
             let (content, fixups) = read_text_lossy(root, opts.encoding)?;
             let outcome = search_decoded_file(
@@ -1361,7 +1365,16 @@ fn read_text_lossy(
 /// takes candidates straight from the index and the explicit-file path skips
 /// the walk entirely. Both check here so the flag means the same thing on every
 /// path instead of silently doing nothing on the default (indexed) one.
-fn exceeds_max_filesize(path: &Path, opts: &SearchOptions) -> bool {
+///
+/// `explicit` marks a file the user named on the command line. Those are exempt
+/// from the *inherited* [`tgrep_core::walker::DEFAULT_MAX_FILE_SIZE`], because
+/// naming a file is an unambiguous request to search it and answering "no
+/// match" would be a lie. A limit the user actually passed still applies, since
+/// then the limit is itself the request.
+fn exceeds_max_filesize(path: &Path, opts: &SearchOptions, explicit: bool) -> bool {
+    if explicit && !opts.max_filesize_requested {
+        return false;
+    }
     let Some(limit) = opts.max_filesize else {
         return false;
     };

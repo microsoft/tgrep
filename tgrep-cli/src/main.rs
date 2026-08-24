@@ -151,8 +151,18 @@ struct Cli {
     type_list: bool,
 
     /// Ignore files larger than NUM bytes (suffixes K, M, G allowed).
-    #[arg(long = "max-filesize", global = true, value_name = "NUM")]
+    /// Defaults to 64M; use --no-max-filesize for no limit.
+    #[arg(
+        long = "max-filesize",
+        global = true,
+        value_name = "NUM",
+        overrides_with = "no_max_filesize"
+    )]
     max_filesize: Option<String>,
+
+    /// Apply no file size limit, as ripgrep does.
+    #[arg(long = "no-max-filesize", global = true, overrides_with = "max_filesize")]
+    no_max_filesize: bool,
 
     /// Text encoding to use: `auto` (BOM sniffing), `none`, or a label like `utf-16le`.
     #[arg(
@@ -489,6 +499,11 @@ struct Cli {
 /// Every argument that needs parsing and can fail, resolved once up front.
 struct ResolvedArgs {
     max_filesize: Option<u64>,
+    /// Whether the size limit was asked for rather than inherited from
+    /// [`tgrep_core::walker::DEFAULT_MAX_FILE_SIZE`]. A file named directly on
+    /// the command line ignores the inherited limit — pointing at a file is an
+    /// unambiguous request to search it — but honours one the user set.
+    max_filesize_requested: bool,
     encoding: tgrep_core::encoding::EncodingMode,
     engine: matching::RegexEngine,
     regex_size_limit: Option<usize>,
@@ -676,11 +691,19 @@ enum Command {
 impl Cli {
     /// Resolve `--max-filesize` once, so a malformed value is reported instead
     /// of silently falling back to a different limit than the user asked for.
+    ///
+    /// Absent both flags this is [`walker::DEFAULT_MAX_FILE_SIZE`], not `None`.
+    /// Resolving the default *here* rather than at each use is what keeps the
+    /// index and the search agreeing: a walk that capped at 64 MiB while the
+    /// search did not would look exactly like "this file contains no match".
     fn max_filesize_bytes(&self) -> Result<Option<u64>> {
-        self.max_filesize
-            .as_deref()
-            .map(|s| parse_byte_size("--max-filesize", s))
-            .transpose()
+        if self.no_max_filesize {
+            return Ok(None);
+        }
+        match self.max_filesize.as_deref() {
+            Some(s) => Ok(Some(parse_byte_size("--max-filesize", s)?)),
+            None => Ok(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE),
+        }
     }
 
     /// Resolve `-E/--encoding`. `--no-encoding` means `auto`, and clap's
@@ -715,6 +738,7 @@ impl Cli {
 
         Ok(ResolvedArgs {
             max_filesize: self.max_filesize_bytes()?,
+            max_filesize_requested: self.max_filesize.is_some(),
             encoding: self.encoding_mode()?,
             engine,
             regex_size_limit: self
@@ -840,6 +864,7 @@ impl Cli {
             // Replaced per path argument in `run_search`.
             path_display: crate::output::PathDisplay::Bare,
             max_filesize: resolved.max_filesize,
+            max_filesize_requested: resolved.max_filesize_requested,
             encoding: resolved.encoding,
             follow: self.follow,
             no_messages: self.no_messages,
@@ -1054,8 +1079,9 @@ fn run_cli() {
                 exclude_dirs: &exclude,
                 strategy: strategy.into(),
                 index_buffer_mb,
-                // Neither indexing nor searching caps file size by default.
-                max_file_size: max_filesize.or(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE),
+                // Already carries `walker::DEFAULT_MAX_FILE_SIZE` when the user
+                // named no limit, so indexing and searching cap identically.
+                max_file_size: max_filesize,
             })
         }
         Some(Command::Serve {
@@ -1081,8 +1107,9 @@ fn run_cli() {
                     index_threads,
                     no_ignore,
                     no_require_git: cli.no_require_git,
-                    // Same default as `index`: no size cap unless asked for.
-                    max_file_size: max_filesize.or(tgrep_core::walker::DEFAULT_MAX_FILE_SIZE),
+                    // Same resolved value the search path uses, so the index
+                    // and the queries against it agree on what exists.
+                    max_file_size: max_filesize,
                     auto_save_mutations,
                     // Clap's range bound guarantees this fits; saturating keeps
                     // the conversion total, and errs toward a large cap rather

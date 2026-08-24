@@ -986,6 +986,16 @@ fn handle_search(
     let pattern = req.pattern;
     let case_insensitive = req.case_insensitive;
 
+    // The index build already dropped everything above the server's own cap, so
+    // re-checking a query cap that is no stricter can never reject a candidate
+    // the index did not already reject — it would only buy a `metadata` call
+    // per candidate on every query. Now that a cap is the default rather than
+    // opt-in, that is the common case, so recognise it and skip the stat.
+    let query_size_limit = match (opts.max_filesize, state.max_file_size) {
+        (Some(query), Some(built)) if built <= query => None,
+        (query, _) => query,
+    };
+
     // Collect candidates and their paths/full_paths while holding the index lock briefly
     let t_index = Instant::now();
     let (candidate_info, raw_candidate_count): (Vec<(String, PathBuf)>, usize) = {
@@ -1027,7 +1037,7 @@ fn handle_search(
                     return None;
                 }
                 let full_path = index.resolve_full_path(fid, &reader_snapshot)?;
-                if let Some(limit) = opts.max_filesize
+                if let Some(limit) = query_size_limit
                     && std::fs::metadata(&full_path).is_ok_and(|md| md.len() > limit)
                 {
                     return None;

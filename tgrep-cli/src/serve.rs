@@ -83,7 +83,6 @@ const RECONCILE_QUIET_PERIOD: Duration = Duration::from_secs(120);
 /// never reconcile at all — which is the failure this exists to prevent.
 const RECONCILE_DEADLINE: Duration = Duration::from_secs(4 * 3600);
 
-
 /// Server discovery info, written to `serve.json`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerInfo {
@@ -3861,12 +3860,8 @@ mod tests {
 
         // And with that stamp withheld, a later pass over an unchanged tree
         // still offers the file up rather than treating it as up-to-date.
-        let (changed, added, _) = classify_file_changes(
-            &current,
-            &stamps,
-            &std::collections::HashSet::new(),
-            false,
-        );
+        let (changed, added, _) =
+            classify_file_changes(&current, &stamps, &std::collections::HashSet::new(), false);
         assert_eq!(changed.len() + added.len(), 1);
         assert!(added.contains(&"locked.bin".to_string()));
     }

@@ -637,7 +637,9 @@ mod tests {
     fn trigram_ids(index_dir: &Path) -> Vec<u32> {
         std::fs::read(index_dir.join("lookup.bin"))
             .unwrap()
-            .chunks_exact(ondisk::LOOKUP_ENTRY_SIZE)
+            .as_chunks::<{ ondisk::LOOKUP_ENTRY_SIZE }>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }

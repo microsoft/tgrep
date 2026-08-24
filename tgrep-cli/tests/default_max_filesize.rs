@@ -38,7 +38,11 @@ fn fixture() -> (TempDir, PathBuf) {
     let root = dir.path().join("testdata");
     std::fs::create_dir_all(&root).unwrap();
 
-    std::fs::write(root.join("small.txt"), format!("{NEEDLE} in a small file\n")).unwrap();
+    std::fs::write(
+        root.join("small.txt"),
+        format!("{NEEDLE} in a small file\n"),
+    )
+    .unwrap();
 
     let big_path = root.join("big.txt");
     let mut big = std::io::BufWriter::new(std::fs::File::create(&big_path).unwrap());

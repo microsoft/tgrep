@@ -415,7 +415,10 @@ mod tests {
             ("[core]\n\tignorecase = True\n", true),
             ("[CORE]\n\tIgnoreCase = yes\n", true),
             // Set, but in another section: not ours to read.
-            ("[core]\n\tbare = false\n[other]\n\tignorecase = true\n", false),
+            (
+                "[core]\n\tbare = false\n[other]\n\tignorecase = true\n",
+                false,
+            ),
             ("[core]\n\tbare = false\n", false),
             ("", false),
         ];

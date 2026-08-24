@@ -628,7 +628,8 @@ mod tests {
         dir
     }
 
-    fn sorted_filenames(result: &WalkResult, root: &Path) -> Vec<String> {        let mut names: Vec<String> = result
+    fn sorted_filenames(result: &WalkResult, root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = result
             .files
             .iter()
             .map(|p| {
@@ -1264,10 +1265,7 @@ mod tests {
         // indexing walk classified everything between the two caps as deleted
         // and evicted it (see `tests/serve_max_filesize.rs`).
         assert_eq!(DEFAULT_MAX_FILE_SIZE, Some(64 * 1024 * 1024));
-        assert_eq!(
-            WalkOptions::default().max_file_size,
-            DEFAULT_MAX_FILE_SIZE
-        );
+        assert_eq!(WalkOptions::default().max_file_size, DEFAULT_MAX_FILE_SIZE);
         assert_eq!(
             MetaWalkOptions::default().max_file_size,
             DEFAULT_MAX_FILE_SIZE
@@ -1390,7 +1388,10 @@ mod tests {
         // case-sensitive behaviour, and pays nothing for this.
         let dir = ignorecase_fixture(false, &["src/main.rs", "src/Kept.TXT"]);
         let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
-        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
         assert!(names.contains(&"src/Kept.TXT".to_string()), "{names:?}");
         assert!(names.contains(&"src/Gone.TXT".to_string()), "{names:?}");
     }
@@ -1425,7 +1426,10 @@ mod tests {
             ),
             dir.path(),
         );
-        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -1445,7 +1449,10 @@ mod tests {
             ),
             dir.path(),
         );
-        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
         assert!(names.contains(&"src/Gone.TXT".to_string()), "{names:?}");
     }
 
@@ -1476,7 +1483,10 @@ mod tests {
             ),
             dir.path(),
         );
-        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -1508,7 +1518,10 @@ mod tests {
         let dir = ignorecase_fixture(true, &[]);
         fs::write(dir.path().join(".git/index"), b"not an index").unwrap();
         let names = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
-        assert!(names.contains(&"qlogs/artifact.rs".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"qlogs/artifact.rs".to_string()),
+            "{names:?}"
+        );
         assert!(names.contains(&"src/Kept.TXT".to_string()), "{names:?}");
     }
 

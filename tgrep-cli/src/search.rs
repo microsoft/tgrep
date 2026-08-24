@@ -1038,14 +1038,7 @@ fn search_local_index(
             Err(_) => continue,
         };
 
-        let outcome = search_decoded_file(
-            &read,
-            &matcher,
-            rel_path,
-            opts,
-            &mut *writer,
-            explicit,
-        )?;
+        let outcome = search_decoded_file(&read, &matcher, rel_path, opts, &mut *writer, explicit)?;
         match outcome {
             FileOutcome::Matched => {
                 if !opts.files_without_match {
@@ -1175,14 +1168,8 @@ fn brute_force_search(
             && !exceeds_max_filesize(root, opts, true)
         {
             let read = read_text_lossy(root, opts.encoding)?;
-            let outcome = search_decoded_file(
-                &read,
-                &matcher,
-                &rel_path,
-                opts,
-                &mut *writer,
-                true,
-            )?;
+            let outcome =
+                search_decoded_file(&read, &matcher, &rel_path, opts, &mut *writer, true)?;
             match outcome {
                 FileOutcome::Matched => {
                     if !opts.files_without_match {
@@ -1232,14 +1219,7 @@ fn brute_force_search(
             Err(_) => continue,
         };
 
-        let outcome = search_decoded_file(
-            &read,
-            &matcher,
-            &rel_path,
-            opts,
-            &mut *writer,
-            false,
-        )?;
+        let outcome = search_decoded_file(&read, &matcher, &rel_path, opts, &mut *writer, false)?;
         match outcome {
             FileOutcome::Matched => {
                 if !opts.files_without_match {

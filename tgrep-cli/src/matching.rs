@@ -79,7 +79,10 @@ impl<'a> LineIndex<'a> {
     }
 
     pub fn line_start(&self, idx: usize) -> usize {
-        self.starts().get(idx).copied().unwrap_or(self.content.len())
+        self.starts()
+            .get(idx)
+            .copied()
+            .unwrap_or(self.content.len())
     }
 
     /// End offset of line `idx`, excluding its `\n` or `\r\n` terminator.
@@ -188,10 +191,7 @@ fn clip_spans_to_start_line(
 /// Under `--multiline` a single match can cover several lines, and every line
 /// it touches has to be printed. Overlapping ranges on the same line are
 /// merged so highlighting never emits nested escape sequences.
-pub fn group_spans_by_line(
-    index: &LineIndex<'_>,
-    spans: &[(usize, usize)],
-) -> Vec<LineHit> {
+pub fn group_spans_by_line(index: &LineIndex<'_>, spans: &[(usize, usize)]) -> Vec<LineHit> {
     let mut by_line: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
 
     for &(s, e) in spans {
@@ -1458,11 +1458,7 @@ mod tests {
             let expected: Vec<&str> = content.lines().collect();
             assert_eq!(index.line_count(), expected.len(), "count for {content:?}");
             for (i, want) in expected.iter().enumerate() {
-                assert_eq!(
-                    &index.line_text(i),
-                    want,
-                    "line {i} of {content:?}"
-                );
+                assert_eq!(&index.line_text(i), want, "line {i} of {content:?}");
             }
         }
     }

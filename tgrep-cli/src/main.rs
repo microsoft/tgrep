@@ -161,7 +161,11 @@ struct Cli {
     max_filesize: Option<String>,
 
     /// Apply no file size limit, as ripgrep does.
-    #[arg(long = "no-max-filesize", global = true, overrides_with = "max_filesize")]
+    #[arg(
+        long = "no-max-filesize",
+        global = true,
+        overrides_with = "max_filesize"
+    )]
     no_max_filesize: bool,
 
     /// Text encoding to use: `auto` (BOM sniffing), `none`, or a label like `utf-16le`.

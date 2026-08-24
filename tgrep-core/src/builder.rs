@@ -1145,7 +1145,7 @@ pub fn merge_index_with_delta(
             usize::from(append_only) * (bytes.len() / ondisk::POSTING_ENTRY_SIZE)
         });
         if !append_only && let Some(bytes) = reader_bytes {
-            for raw in bytes.chunks_exact(ondisk::POSTING_ENTRY_SIZE) {
+            for raw in bytes.as_chunks::<{ ondisk::POSTING_ENTRY_SIZE }>().0.iter() {
                 let old_id = u32::from_le_bytes(raw[0..4].try_into().expect("four-byte file id"));
                 let new_id = *reader_id_map.get(old_id as usize).ok_or_else(|| {
                     Error::IndexCorrupted(format!(
@@ -1186,7 +1186,7 @@ pub fn merge_index_with_delta(
                 for chunk in bytes.chunks(POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE)
                 {
                     posting_scratch.clear();
-                    for raw in chunk.chunks_exact(ondisk::POSTING_ENTRY_SIZE) {
+                    for raw in chunk.as_chunks::<{ ondisk::POSTING_ENTRY_SIZE }>().0.iter() {
                         let old_id =
                             u32::from_le_bytes(raw[0..4].try_into().expect("four-byte file id"));
                         let new_id = reader_id_map[old_id as usize];
@@ -1202,7 +1202,7 @@ pub fn merge_index_with_delta(
         if let Some(bytes) = delta_bytes {
             for chunk in bytes.chunks(POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE) {
                 posting_scratch.clear();
-                for raw in chunk.chunks_exact(ondisk::POSTING_ENTRY_SIZE) {
+                for raw in chunk.as_chunks::<{ ondisk::POSTING_ENTRY_SIZE }>().0.iter() {
                     let file_id =
                         u32::from_le_bytes(raw[0..4].try_into().expect("four-byte file id"));
                     if file_id as usize >= delta.num_files() {

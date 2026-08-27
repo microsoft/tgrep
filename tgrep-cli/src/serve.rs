@@ -1784,7 +1784,7 @@ const PER_DIRECTORY_WATCHES: bool = cfg!(any(target_os = "linux", target_os = "a
 /// one as a directory would subscribe to and index its target — possibly a tree
 /// outside `root` entirely, and possibly a cycle.
 fn is_real_dir(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+    std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
 }
 
 /// The watcher plus the set of directories it is currently subscribed to.
@@ -2627,7 +2627,7 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // `symlink_metadata` describes the link itself; `metadata` would describe
     // its target. See the eligibility check below for why that distinction
     // matters here.
-    let meta = match std::fs::symlink_metadata(path) {
+    let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(_) => return,
     };
@@ -2655,8 +2655,7 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // target need not be under `root` at all, so a link committed to a branch
     // (or dropped in by a build) is enough to pull `~/.ssh/id_rsa` into an
     // index whose whole contract is that it covers the served tree.
-    let eligible = meta.is_file()
-        && !tgrep_core::walker::is_binary_extension(path)
+    let eligible = !tgrep_core::walker::is_binary_extension(path)
         && !state
             .max_file_size
             .is_some_and(|limit| current.size > limit);

@@ -756,17 +756,24 @@ fn build_stale_matcher(
 /// Callers on the stale path hold `snapshot_gate` for write, which is what
 /// makes the matcher swap and the index decisions around it atomic from the
 /// watcher's point of view.
+///
+/// Returns the directories that were newly subscribed to as a result. Those
+/// were unwatched while the caller's walk ran, so anything written to them in
+/// that window produced no event and appears in no walk result. Callers pass
+/// the list to [`reindex_files_in`] once `state.file_stamps` describes the
+/// index they just published.
+#[must_use = "newly watched directories need a recovery scan or writes race the subscription"]
 fn publish_ignore_matcher(
     state: &ServerState,
     root: &Path,
     matcher: Option<tgrep_core::gitignore::IgnoreMatcher>,
-) {
+) -> Vec<PathBuf> {
     *state.gitignore.write().unwrap() = matcher;
     state.gitignore_pending.store(false, Ordering::SeqCst);
     // New rules mean a different set of directories worth hearing about:
     // a tightened rule releases the subscriptions under it, and a relaxed
     // one takes subscriptions for the tree it used to hide.
-    sync_watch_registrations(state, root);
+    sync_watch_registrations(state, root)
 }
 
 fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
@@ -1569,7 +1576,13 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
     if state.gitignore_pending.load(Ordering::SeqCst) {
         eprintln!("[trace] watcher subscriptions deferred until the ignore matcher is ready");
     } else {
-        sync_watch_registrations(&state, root);
+        // The newly watched directories are deliberately not rechecked here.
+        // This is every directory in the repository, the index was built or
+        // opened moments ago, and the stale check that follows startup
+        // reconciles the same drift while holding `snapshot_gate` — which this
+        // path does not hold and must not take, since the watcher has to be
+        // receiving events before that check runs.
+        let _ = sync_watch_registrations(&state, root);
     }
 
     let worker_state = Arc::clone(&state);
@@ -1761,6 +1774,17 @@ fn is_ignore_rules_file(root: &Path, path: &Path) -> bool {
 /// `PollWatcher` are per-path too, but nothing here builds or tests them.
 const PER_DIRECTORY_WATCHES: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
+/// Whether `path` is a directory in its own right rather than a symlink to one.
+///
+/// [`Path::is_dir`] follows links, so it answers "does this lead to a
+/// directory", which is the wrong question here: the walker does not follow
+/// symlinks, so a symlinked directory is not part of the indexed tree. Treating
+/// one as a directory would subscribe to and index its target — possibly a tree
+/// outside `root` entirely, and possibly a cycle.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
 /// The watcher plus the set of directories it is currently subscribed to.
 ///
 /// Only meaningful when [`PER_DIRECTORY_WATCHES`] is true; elsewhere `watched`
@@ -1774,12 +1798,13 @@ impl WatchRegistry {
     /// Subscribe to every directory in `desired` that is not already
     /// subscribed, leaving existing subscriptions alone.
     ///
-    /// Returns the number added. A single directory that cannot be subscribed
-    /// is reported and skipped rather than failing the whole call: the watcher
-    /// is still useful for everything else, and giving up on the entire tree is
-    /// exactly the failure mode this registration exists to avoid.
-    fn add_all(&mut self, desired: &std::collections::HashSet<PathBuf>) -> usize {
-        let mut added = 0;
+    /// Returns the directories that were newly subscribed to. A single
+    /// directory that cannot be subscribed is reported and skipped rather than
+    /// failing the whole call: the watcher is still useful for everything
+    /// else, and giving up on the entire tree is exactly the failure mode this
+    /// registration exists to avoid.
+    fn add_all<'a>(&mut self, desired: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+        let mut added = Vec::new();
         let mut failures = 0;
         // Iterating `desired` and testing membership is deliberate: a
         // `difference` would be proportional to the whole watched set, and
@@ -1792,7 +1817,7 @@ impl WatchRegistry {
             match self.watcher.watch(dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
                     self.watched.insert(dir.clone());
-                    added += 1;
+                    added.push(dir.clone());
                 }
                 Err(e) => {
                     // One line per call, not per directory: exhausting the
@@ -1820,7 +1845,7 @@ impl WatchRegistry {
     /// Returns `(added, removed)`. Only for a set that describes the whole
     /// tree — anything absent from `desired` is unsubscribed. To subscribe to
     /// a subtree without disturbing the rest, use [`Self::add_all`].
-    fn sync(&mut self, desired: &std::collections::HashSet<PathBuf>) -> (usize, usize) {
+    fn sync(&mut self, desired: &std::collections::HashSet<PathBuf>) -> (Vec<PathBuf>, usize) {
         let stale: Vec<PathBuf> = self.watched.difference(desired).cloned().collect();
         let mut removed = 0;
         for dir in stale {
@@ -1896,15 +1921,21 @@ fn watchable_dirs(
 /// Called when the watcher starts and every time the ignore matcher is
 /// published, so relaxing a rule subscribes to the tree it used to hide and
 /// tightening one drops it.
-fn sync_watch_registrations(state: &ServerState, root: &Path) {
+///
+/// Returns the directories that were newly subscribed to. Until a directory is
+/// subscribed it cannot report anything, so a file written to one of these
+/// between the caller's walk and this call is in neither the walk's results nor
+/// any event. The caller is expected to hand the list to
+/// [`reindex_files_in`] once its own bookkeeping is settled.
+fn sync_watch_registrations(state: &ServerState, root: &Path) -> Vec<PathBuf> {
     if !PER_DIRECTORY_WATCHES {
-        return;
+        return Vec::new();
     }
     let mut registry = state.watch_registry.lock().unwrap();
     let Some(registry) = registry.as_mut() else {
         // The watcher has not started yet. It syncs once as it comes up, so
         // there is nothing to do and nothing to remember.
-        return;
+        return Vec::new();
     };
 
     let start = Instant::now();
@@ -1914,60 +1945,34 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) {
     };
     let total = desired.len();
     let (added, removed) = registry.sync(&desired);
-    if added > 0 || removed > 0 {
+    if !added.is_empty() || removed > 0 {
         eprintln!(
             "[trace] watcher subscriptions: {total} directories \
-             (+{added}, -{removed}) in {:.1}ms",
+             (+{}, -{removed}) in {:.1}ms",
+            added.len(),
             start.elapsed().as_secs_f64() * 1000.0
         );
     }
+    added
 }
 
-/// Subscribe to a directory that has just appeared, and to anything already
-/// inside it.
+/// Re-check the files directly inside `dirs`, indexing the ones that changed.
 ///
-/// Non-recursive subscriptions are not extended by notify — it only auto-adds
-/// watches beneath a watch that was registered as recursive — so a new
-/// directory has to be picked up here or its contents are invisible.
+/// Used to close the gap between a walk and the subscriptions that follow it:
+/// [`reindex_file`] compares stamps first, so for a tree that did not change
+/// under us this costs one `metadata` call per file and indexes nothing.
 ///
-/// Files that landed between the directory's creation and its subscription
-/// would be missed by definition, so the same pass indexes what it finds.
-/// The caller must already hold `snapshot_gate`.
-fn watch_new_subtree(state: &ServerState, root: &Path, dir: &Path) {
-    let Ok(rel_dir) = dir.strip_prefix(root) else {
+/// Callers must already hold `snapshot_gate`, and `state.file_stamps` must
+/// already describe the index as published — a merge that replaces the stamps
+/// afterwards would both discard what this records and make every file here
+/// look changed.
+fn reindex_files_in(state: &ServerState, root: &Path, dirs: &[PathBuf]) {
+    if dirs.is_empty() {
         return;
-    };
-    let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
-
-    let desired = {
-        let gitignore = state.gitignore.read().unwrap();
-        // The event that brought us here was filtered with file semantics, so
-        // a `build/`-style rule that only ever matches directories has not
-        // been applied to this path yet. Re-check before subscribing to it.
-        if !rel_dir.is_empty()
-            && should_skip_watcher_dir(&rel_dir, &state.exclude_dirs, gitignore.as_ref())
-        {
-            return;
-        }
-        watchable_dirs(root, dir, &state.exclude_dirs, gitignore.as_ref())
-    };
-
-    {
-        let mut registry = state.watch_registry.lock().unwrap();
-        let Some(registry) = registry.as_mut() else {
-            return;
-        };
-        // Additive, not a sync: `desired` covers only this subtree, and `sync`
-        // would read everything outside it as stale and unsubscribe from the
-        // entire rest of the repository. Doing this without materialising a
-        // union also matters at scale — a monorepo can hold tens of thousands
-        // of watched directories, and copying that set for every newly created
-        // directory would be quadratic over a checkout or a build.
-        registry.add_all(&desired);
     }
-
-    for subdir in &desired {
-        let Ok(entries) = std::fs::read_dir(subdir) else {
+    let start = Instant::now();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -1987,6 +1992,136 @@ fn watch_new_subtree(state: &ServerState, root: &Path, dir: &Path) {
                 reindex_file(state, &path, &rel);
             }
         }
+    }
+    eprintln!(
+        "[trace] watcher: rechecked {} newly watched directories in {:.1}ms",
+        dirs.len(),
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+}
+
+/// Subscribe to a directory that has just appeared, and to anything already
+/// inside it.
+///
+/// Non-recursive subscriptions are not extended by notify — it only auto-adds
+/// watches beneath a watch that was registered as recursive — so a new
+/// directory has to be picked up here or its contents are invisible.
+///
+/// Files that landed between the directory's creation and its subscription
+/// would be missed by definition, so the same pass indexes what it finds.
+/// The caller must already hold `snapshot_gate`.
+///
+/// The descent subscribes to each level *before* reading it. Reading first
+/// leaves a window in which a child created in between is in neither place:
+/// not in what this pass enumerates, and not yet able to report itself. That
+/// window is small but it is exactly the one a checkout or a build fills, and
+/// anything lost in it stays invisible until the hourly reconcile.
+fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
+    // `is_dir` follows symlinks; the walker does not. Refuse a symlinked
+    // directory here so we never subscribe to, or index, a tree the indexer
+    // would not have walked into.
+    if !is_real_dir(dir) {
+        return;
+    }
+    let Ok(rel_dir) = dir.strip_prefix(root) else {
+        return;
+    };
+    let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
+    // The event that brought us here was filtered with file semantics, so a
+    // `build/`-style rule that only ever matches directories has not been
+    // applied to this path yet. Re-check before subscribing to it.
+    if !rel_dir.is_empty() {
+        let gitignore = state.gitignore.read().unwrap();
+        if should_skip_watcher_dir(&rel_dir, &state.exclude_dirs, gitignore.as_ref()) {
+            return;
+        }
+    }
+
+    let mut level = vec![dir.to_path_buf()];
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    let mut found_ignore_rules = false;
+
+    while !level.is_empty() {
+        {
+            let mut registry = state.watch_registry.lock().unwrap();
+            let Some(registry) = registry.as_mut() else {
+                return;
+            };
+            // Additive, not a sync: this covers only the new subtree, and
+            // `sync` would read everything outside it as stale and unsubscribe
+            // from the entire rest of the repository. Staying additive also
+            // matters at scale — a monorepo can hold tens of thousands of
+            // watched directories, and materialising a union for every newly
+            // created directory would be quadratic over a checkout.
+            registry.add_all(level.iter());
+        }
+
+        // The registry lock is released before any `read_dir`, so a large
+        // subtree does not hold it across the I/O for a whole level.
+        let mut next = Vec::new();
+        for subdir in level.drain(..) {
+            if !seen.insert(subdir.clone()) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&subdir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                let Ok(rel) = path.strip_prefix(root) else {
+                    continue;
+                };
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                // `DirEntry::file_type` does not follow symlinks, so a
+                // symlinked directory is neither descended into nor indexed.
+                if file_type.is_dir() {
+                    let skip = {
+                        let gitignore = state.gitignore.read().unwrap();
+                        should_skip_watcher_dir(&rel, &state.exclude_dirs, gitignore.as_ref())
+                    };
+                    if !skip {
+                        next.push(path);
+                    }
+                } else if file_type.is_file() {
+                    // A subtree that arrives whole — a clone, a `mv`, a branch
+                    // switch — can carry its own ignore rules. Those files are
+                    // dot-prefixed, so the scan below would silently drop them
+                    // and index the rest of the subtree against rules that do
+                    // not know about them.
+                    if !state.no_ignore && is_ignore_rules_file(root, &path) {
+                        found_ignore_rules = true;
+                        continue;
+                    }
+                    let skip = {
+                        let gitignore = state.gitignore.read().unwrap();
+                        should_skip_watcher_path(&rel, &state.exclude_dirs, gitignore.as_ref())
+                    };
+                    if !skip {
+                        files.push((path, rel));
+                    }
+                }
+            }
+        }
+        level = next;
+    }
+
+    if found_ignore_rules {
+        // Indexing now would apply the wrong rules to the whole subtree, and
+        // anything wrongly indexed would stay until something touched it
+        // again. The refresh rewalks and republishes, which covers these files
+        // correctly; it runs on its own thread and takes `snapshot_gate`
+        // there, so scheduling it while we hold the gate is safe.
+        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+        schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+        return;
+    }
+
+    for (path, rel) in &files {
+        reindex_file(state, path, rel);
     }
 }
 
@@ -2122,7 +2257,11 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         }
 
         if !path.is_file() {
-            if PER_DIRECTORY_WATCHES && path.is_dir() {
+            // `is_real_dir` rather than `is_dir`: the latter follows symlinks,
+            // and a link to a directory is not something the walker descends
+            // into, so subscribing to and indexing its target would pull in a
+            // tree the index never contained — possibly outside `root`.
+            if PER_DIRECTORY_WATCHES && is_real_dir(path) {
                 // With non-recursive subscriptions notify will not extend the
                 // watch set for us, so a directory that just appeared — and
                 // anything already inside it — has to be picked up here.
@@ -2655,19 +2794,57 @@ fn stamps_for_indexed(
         .collect()
 }
 
+/// Rebuild the ignore matcher and reconcile the index against the filesystem.
+///
+/// Returns whether the index can be trusted afterwards. A `false` means the
+/// walk or the merge failed and the stamps are not describing the index.
 fn background_refresh_stale(
     state: &Arc<ServerState>,
     root: &Path,
     index_dir: &Path,
     compare_index_membership: bool,
 ) -> bool {
+    let _refresh = state.stale_refresh_lock.lock().unwrap();
+    // Keep watcher/auto-save mutations out for the complete walk → matcher →
+    // merge → recovery cycle. Search queries do not take this gate and remain
+    // available. Held here rather than inside so the recovery scan below is
+    // still covered by it.
+    let _gate = state.snapshot_gate.write().unwrap();
+
+    let mut newly_watched = Vec::new();
+    let ok = refresh_stale_locked(
+        state,
+        root,
+        index_dir,
+        compare_index_membership,
+        &mut newly_watched,
+    );
+
+    // Directories that were not subscribed while the walk ran could not report
+    // a write, and the walk may have passed them before it happened, so a file
+    // created in that window is in neither place. Recheck them now that the
+    // subscriptions exist.
+    //
+    // Only on success, and only here at the end: a failed walk or merge leaves
+    // `file_stamps` describing something other than the published index, and
+    // `stream_merge_stale_changes` replaces the stamps wholesale, so scanning
+    // any earlier would both be discarded and re-read every changed file.
+    if ok {
+        reindex_files_in(state, root, &newly_watched);
+    }
+    ok
+}
+
+fn refresh_stale_locked(
+    state: &Arc<ServerState>,
+    root: &Path,
+    index_dir: &Path,
+    compare_index_membership: bool,
+    newly_watched: &mut Vec<PathBuf>,
+) -> bool {
     use tgrep_core::meta;
     use tgrep_core::walker;
 
-    let _refresh = state.stale_refresh_lock.lock().unwrap();
-    // Keep watcher/auto-save mutations out for the complete walk → matcher →
-    // merge cycle. Search queries do not take this gate and remain available.
-    let _gate = state.snapshot_gate.write().unwrap();
     let start = Instant::now();
     eprintln!("[trace] stale check: comparing index against filesystem...");
 
@@ -2695,10 +2872,10 @@ fn background_refresh_stale(
     // with a delete, would be enough.
     //
     // Committing here rather than at each exit is invisible to the watcher:
-    // this function holds `snapshot_gate` for write across its whole body, and
+    // the caller holds `snapshot_gate` for write across this whole body, and
     // the only reader of `state.gitignore` takes the read side first, so no
     // event can observe the matcher before this function returns either way.
-    publish_ignore_matcher(state, root, build_stale_matcher(state, root, &walk));
+    *newly_watched = publish_ignore_matcher(state, root, build_stale_matcher(state, root, &walk));
 
     if walk.skipped_error > 0 {
         eprintln!(
@@ -2936,7 +3113,13 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             state.no_require_git,
         );
         let found = matcher.is_some();
-        publish_ignore_matcher(state, root, matcher);
+        // These subscriptions are the repository's first, so "newly watched"
+        // is every directory in it. No recovery scan: the startup stale check
+        // runs right after this and does a full walk-versus-index diff, which
+        // is a strict superset of what a recovery scan would find — and doing
+        // it here would stat the entire tree while holding the gate, on the
+        // path a warm start exists to keep fast.
+        let _ = publish_ignore_matcher(state, root, matcher);
         eprintln!(
             "[trace] gitignore matcher built from {} file(s) in {:.1}ms{}",
             outcome.gitignore_files.len(),
@@ -3029,7 +3212,11 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             state.no_require_git,
         );
         let has_matcher = matcher.is_some();
-        publish_ignore_matcher(state, root, matcher);
+        // Same reasoning as the bootstrap publish: this is the cold-start
+        // build, so "newly watched" is the whole tree, `indexing` keeps the
+        // watcher off the index for the rest of the build, and the stale check
+        // that follows reconciles anything written during it.
+        let _ = publish_ignore_matcher(state, root, matcher);
         eprintln!(
             "[trace] gitignore matcher built from index walk in {:.1}ms \
              ({} .gitignore + {} .ignore files{})",
@@ -4025,13 +4212,17 @@ mod tests {
             watched: std::collections::HashSet::new(),
         };
 
-        let added = registry.add_all(&[a.clone(), b.clone()].into_iter().collect());
-        assert_eq!(added, 2);
+        let added = registry.add_all(&[a.clone(), b.clone()]);
+        assert_eq!(added.len(), 2);
 
         // Adding a subtree leaves existing subscriptions untouched, and
         // re-adding one already present is a no-op rather than a duplicate.
-        let added = registry.add_all(&[b.clone(), c.clone()].into_iter().collect());
-        assert_eq!(added, 1, "b was already watched and must not be re-added");
+        let added = registry.add_all(&[b.clone(), c.clone()]);
+        assert_eq!(
+            added,
+            vec![c.clone()],
+            "b was already watched and must not be re-added"
+        );
         assert_eq!(
             registry.watched,
             [a.clone(), b.clone(), c.clone()].into_iter().collect(),
@@ -4040,8 +4231,33 @@ mod tests {
 
         // `sync`, by contrast, is authoritative over the whole tree.
         let (added, removed) = registry.sync(&[c.clone()].into_iter().collect());
-        assert_eq!((added, removed), (0, 2));
+        assert_eq!((added.len(), removed), (0, 2));
         assert_eq!(registry.watched, [c].into_iter().collect());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_real_dir_rejects_a_symlink_to_a_directory() {
+        // `Path::is_dir` follows links, so it would report a symlinked
+        // directory as a directory and the watcher would subscribe to and
+        // index the link's target — a tree the walker never descends into, and
+        // one that can sit entirely outside the repository root.
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(is_real_dir(&real));
+        assert!(
+            link.is_dir(),
+            "precondition: is_dir follows the link, which is the trap"
+        );
+        assert!(!is_real_dir(&link));
+        assert!(!is_real_dir(&tmp.path().join("missing")));
+        let file = tmp.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(!is_real_dir(&file));
     }
 
     #[test]

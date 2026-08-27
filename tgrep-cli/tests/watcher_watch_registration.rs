@@ -306,3 +306,84 @@ fn watcher_indexes_files_in_directories_created_after_startup() {
         "watcher indexed a file in a directory created under a gitignored path"
     );
 }
+
+/// A subtree that arrives already populated can carry its own ignore rules.
+///
+/// A clone, a `git mv`, a branch switch or an unpacked archive all land this
+/// way: the directory and everything under it appear in one step, so there is
+/// no moment at which the `.gitignore` inside it is seen on its own. The
+/// recovery pass skips dot-prefixed files, so without explicitly looking for
+/// ignore rules it would index the subtree against rules that never mentioned
+/// it — and the wrongly indexed files would stay until something touched them
+/// again or the hourly reconcile came round.
+#[test]
+fn watcher_honors_ignore_rules_inside_a_subtree_that_arrives_whole() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let index_dir = root.join(".tgrep_test_index");
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        "fn seeded() { let normal_source_marker = 1; }\n",
+    )
+    .unwrap();
+
+    let status = Command::new(tgrep_bin())
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run tgrep index");
+    assert!(status.success(), "initial index build failed");
+
+    let child = Command::new(tgrep_bin())
+        .args([
+            "serve",
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start tgrep serve");
+    let _server = ServerGuard { child };
+
+    let (_pid, port) = wait_for_server(&index_dir);
+    assert!(
+        wait_for_match(port, "normal_source_marker", Duration::from_secs(30)),
+        "expected the seeded source file to be searchable"
+    );
+    thread::sleep(Duration::from_secs(2));
+
+    // Staged under a dot-prefixed name so the watcher ignores it while it is
+    // being built, and on the same filesystem so the move below is atomic.
+    let staging = root.join(".staging");
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join(".gitignore"), "secret.txt\n").unwrap();
+    fs::write(staging.join("secret.txt"), "moved_subtree_secret_marker\n").unwrap();
+    fs::write(
+        staging.join("keep.rs"),
+        "fn keep() { let moved_subtree_keep_marker = 3; }\n",
+    )
+    .unwrap();
+
+    fs::rename(&staging, root.join("vendor")).unwrap();
+
+    assert!(
+        wait_for_match(port, "moved_subtree_keep_marker", Duration::from_secs(60)),
+        "watcher never indexed the non-ignored file in a subtree that arrived whole"
+    );
+    assert_eq!(
+        search_matches(port, "moved_subtree_secret_marker"),
+        0,
+        "watcher indexed a file excluded by a .gitignore that arrived inside \
+         the same subtree, so the subtree was indexed against stale rules"
+    );
+}

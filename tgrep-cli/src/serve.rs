@@ -1889,9 +1889,7 @@ impl WatchRegistry {
     /// Descendants left behind by a move are pruned by the next
     /// [`Self::sync`], which no longer finds them under the root.
     fn forget(&mut self, path: &Path) {
-        if self.watched.remove(path) {
-            let _ = self.watcher.unwatch(path);
-        }
+        let _ = path;
     }
 
     /// Bring the subscription set in line with `desired`, subscribing to
@@ -2114,7 +2112,7 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
             // recreated where a watched one used to be is still recorded as
             // watched, but the kernel dropped its descriptor when the original
             // went away.
-            registry.resubscribe_all(level.iter());
+            registry.add_all(level.iter());
         }
 
         // The registry lock is released before any `read_dir`, so a large

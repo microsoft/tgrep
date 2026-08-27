@@ -1771,36 +1771,31 @@ struct WatchRegistry {
 }
 
 impl WatchRegistry {
-    /// Bring the subscription set in line with `desired`, subscribing to
-    /// directories that are newly relevant and dropping ones that are not.
+    /// Subscribe to every directory in `desired` that is not already
+    /// subscribed, leaving existing subscriptions alone.
     ///
-    /// Returns `(added, removed)`. A single directory that cannot be
-    /// subscribed is reported and skipped rather than failing the sync: the
-    /// watcher is still useful for everything else, and giving up on the whole
-    /// tree is exactly the failure mode this registration exists to avoid.
-    fn sync(&mut self, desired: &std::collections::HashSet<PathBuf>) -> (usize, usize) {
-        let stale: Vec<PathBuf> = self.watched.difference(desired).cloned().collect();
-        let mut removed = 0;
-        for dir in stale {
-            // Best effort. inotify drops a descriptor by itself when the
-            // directory is deleted, so "not found" is an expected outcome
-            // here, not an error worth reporting.
-            let _ = self.watcher.unwatch(&dir);
-            self.watched.remove(&dir);
-            removed += 1;
-        }
-
-        let missing: Vec<PathBuf> = desired.difference(&self.watched).cloned().collect();
+    /// Returns the number added. A single directory that cannot be subscribed
+    /// is reported and skipped rather than failing the whole call: the watcher
+    /// is still useful for everything else, and giving up on the entire tree is
+    /// exactly the failure mode this registration exists to avoid.
+    fn add_all(&mut self, desired: &std::collections::HashSet<PathBuf>) -> usize {
         let mut added = 0;
         let mut failures = 0;
-        for dir in missing {
-            match self.watcher.watch(&dir, RecursiveMode::NonRecursive) {
+        // Iterating `desired` and testing membership is deliberate: a
+        // `difference` would be proportional to the whole watched set, and
+        // this runs per newly created directory on repositories where that set
+        // is tens of thousands of entries.
+        for dir in desired {
+            if self.watched.contains(dir) {
+                continue;
+            }
+            match self.watcher.watch(dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
-                    self.watched.insert(dir);
+                    self.watched.insert(dir.clone());
                     added += 1;
                 }
                 Err(e) => {
-                    // One line per sync, not per directory: exhausting the
+                    // One line per call, not per directory: exhausting the
                     // inotify budget fails thousands of these at once.
                     if failures == 0 {
                         eprintln!(
@@ -1816,7 +1811,28 @@ impl WatchRegistry {
         if failures > 1 {
             eprintln!("[trace] warning: {failures} directories could not be watched");
         }
-        (added, removed)
+        added
+    }
+
+    /// Bring the subscription set in line with `desired`, subscribing to
+    /// directories that are newly relevant and dropping ones that are not.
+    ///
+    /// Returns `(added, removed)`. Only for a set that describes the whole
+    /// tree — anything absent from `desired` is unsubscribed. To subscribe to
+    /// a subtree without disturbing the rest, use [`Self::add_all`].
+    fn sync(&mut self, desired: &std::collections::HashSet<PathBuf>) -> (usize, usize) {
+        let stale: Vec<PathBuf> = self.watched.difference(desired).cloned().collect();
+        let mut removed = 0;
+        for dir in stale {
+            // Best effort. inotify drops a descriptor by itself when the
+            // directory is deleted, so "not found" is an expected outcome
+            // here, not an error worth reporting.
+            let _ = self.watcher.unwatch(&dir);
+            self.watched.remove(&dir);
+            removed += 1;
+        }
+
+        (self.add_all(desired), removed)
     }
 }
 
@@ -1941,12 +1957,13 @@ fn watch_new_subtree(state: &ServerState, root: &Path, dir: &Path) {
         let Some(registry) = registry.as_mut() else {
             return;
         };
-        // A union, not a replacement: `desired` covers only this subtree, and
-        // `sync` would read anything outside it as newly stale and unsubscribe
-        // from the entire rest of the repository.
-        let union: std::collections::HashSet<PathBuf> =
-            registry.watched.union(&desired).cloned().collect();
-        registry.sync(&union);
+        // Additive, not a sync: `desired` covers only this subtree, and `sync`
+        // would read everything outside it as stale and unsubscribe from the
+        // entire rest of the repository. Doing this without materialising a
+        // union also matters at scale — a monorepo can hold tens of thousands
+        // of watched directories, and copying that set for every newly created
+        // directory would be quadratic over a checkout or a build.
+        registry.add_all(&desired);
     }
 
     for subdir in &desired {
@@ -3985,6 +4002,46 @@ mod tests {
             &no_exclude,
             Some(&gi)
         ));
+    }
+
+    #[test]
+    fn watch_registry_add_all_is_additive_but_sync_prunes() {
+        // These two must not be confused. `watch_new_subtree` learns only
+        // about the subtree that just appeared, so if it went through `sync`
+        // every directory outside that subtree would look stale and the server
+        // would unsubscribe from the entire rest of the repository — turning a
+        // new folder into a silent, total loss of file watching.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let c = tmp.path().join("c");
+        for dir in [&a, &b, &c] {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+        let mut registry = WatchRegistry {
+            watcher,
+            watched: std::collections::HashSet::new(),
+        };
+
+        let added = registry.add_all(&[a.clone(), b.clone()].into_iter().collect());
+        assert_eq!(added, 2);
+
+        // Adding a subtree leaves existing subscriptions untouched, and
+        // re-adding one already present is a no-op rather than a duplicate.
+        let added = registry.add_all(&[b.clone(), c.clone()].into_iter().collect());
+        assert_eq!(added, 1, "b was already watched and must not be re-added");
+        assert_eq!(
+            registry.watched,
+            [a.clone(), b.clone(), c.clone()].into_iter().collect(),
+            "add_all dropped a subscription outside the set it was given"
+        );
+
+        // `sync`, by contrast, is authoritative over the whole tree.
+        let (added, removed) = registry.sync(&[c.clone()].into_iter().collect());
+        assert_eq!((added, removed), (0, 2));
+        assert_eq!(registry.watched, [c].into_iter().collect());
     }
 
     #[test]

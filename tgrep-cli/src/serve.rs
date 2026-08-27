@@ -1656,9 +1656,24 @@ fn should_skip_watcher_path(
     false
 }
 
+/// Whether a changed path is an ignore-rules source, i.e. one whose contents
+/// feed the matcher published in `ServerState::gitignore`.
+///
+/// `.gitignore` and `.ignore` are matched by file name at any depth, because
+/// [`tgrep_core::gitignore::matcher_from_ignore_paths`] anchors nested files of
+/// both kinds. `.ignore` must be included even though it is git-agnostic —
+/// leaving it out meant a `.ignore` written while the server was live never
+/// refreshed the matcher, so the watcher kept indexing files the rule excluded.
+///
+/// `p4ignore.ini` stays root-scoped, mirroring the walker, which only reads the
+/// root-level file.
 fn is_ignore_rules_file(root: &Path, path: &Path) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some(".gitignore")
-        || path == root.join(tgrep_core::gitignore::P4IGNORE_FILENAME)
+    let name = path.file_name().and_then(|name| name.to_str());
+    matches!(
+        name,
+        Some(tgrep_core::gitignore::GITIGNORE_FILENAME)
+            | Some(tgrep_core::gitignore::DOT_IGNORE_FILENAME)
+    ) || path == root.join(tgrep_core::gitignore::P4IGNORE_FILENAME)
 }
 
 fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
@@ -3671,6 +3686,14 @@ mod tests {
         assert!(is_ignore_rules_file(
             root,
             Path::new("workspace/p4ignore.ini")
+        ));
+        // `.ignore` is a first-class ignore source (and, unlike `.gitignore`,
+        // applies outside a git repo), so live edits to it must refresh the
+        // matcher too — at the root and nested.
+        assert!(is_ignore_rules_file(root, Path::new("workspace/.ignore")));
+        assert!(is_ignore_rules_file(
+            root,
+            Path::new("workspace/nested/.ignore")
         ));
         assert!(!is_ignore_rules_file(
             root,

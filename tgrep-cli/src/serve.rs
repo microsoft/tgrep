@@ -1759,7 +1759,7 @@ fn is_ignore_rules_file(root: &Path, path: &Path) -> bool {
 ///
 /// Deliberately limited to the backends we can exercise in CI. kqueue and
 /// `PollWatcher` are per-path too, but nothing here builds or tests them.
-const PER_DIRECTORY_WATCHES: bool = cfg!(any(target_os = "linux", target_os = "android"));
+const PER_DIRECTORY_WATCHES: bool = false;
 
 /// The watcher plus the set of directories it is currently subscribed to.
 ///

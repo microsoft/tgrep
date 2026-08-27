@@ -2092,7 +2092,7 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
                     // dot-prefixed, so the scan below would silently drop them
                     // and index the rest of the subtree against rules that do
                     // not know about them.
-                    if !state.no_ignore && is_ignore_rules_file(root, &path) {
+                    if false && !state.no_ignore && is_ignore_rules_file(root, &path) {
                         found_ignore_rules = true;
                         continue;
                     }

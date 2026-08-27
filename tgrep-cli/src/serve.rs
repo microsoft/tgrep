@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use fs2::FileExt;
 use lru::LruCache;
@@ -757,17 +757,18 @@ fn build_stale_matcher(
 /// makes the matcher swap and the index decisions around it atomic from the
 /// watcher's point of view.
 ///
-/// Returns the directories that were newly subscribed to as a result. Those
-/// were unwatched while the caller's walk ran, so anything written to them in
-/// that window produced no event and appears in no walk result. Callers pass
-/// the list to [`reindex_files_in`] once `state.file_stamps` describes the
-/// index they just published.
+/// Returns the directories that were newly subscribed to as a result, and the
+/// moment the walk behind that decision began. Those were unwatched while the
+/// caller's walk ran, so anything written to them in that window produced no
+/// event and appears in no walk result. Callers pass both to
+/// [`reindex_files_in`] once `state.file_stamps` describes the index they just
+/// published.
 #[must_use = "newly watched directories need a recovery scan or writes race the subscription"]
 fn publish_ignore_matcher(
     state: &ServerState,
     root: &Path,
     matcher: Option<tgrep_core::gitignore::IgnoreMatcher>,
-) -> Vec<PathBuf> {
+) -> (Vec<PathBuf>, SystemTime) {
     *state.gitignore.write().unwrap() = matcher;
     state.gitignore_pending.store(false, Ordering::SeqCst);
     // New rules mean a different set of directories worth hearing about:
@@ -1582,8 +1583,8 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
         // subscriptions at all. Its walk is then already over by the time we
         // subscribe here, and nothing else revisits the tree until the hourly
         // reconcile — so the recovery scan is not optional on this path.
-        let newly_watched = sync_watch_registrations(&state, root);
-        spawn_recovery_scan(&state, root, newly_watched);
+        let (newly_watched, since) = sync_watch_registrations(&state, root);
+        spawn_recovery_scan(&state, root, newly_watched, since);
     }
 
     let worker_state = Arc::clone(&state);
@@ -1876,6 +1877,16 @@ impl WatchRegistry {
         added
     }
 
+    /// Whether `path` is already subscribed.
+    ///
+    /// For deciding whether a directory found during a recovery scan is one the
+    /// sync already knew about or one that appeared after it — the latter has
+    /// to be picked up explicitly, since a non-recursive subscription on its
+    /// parent says nothing about it.
+    fn is_watched(&self, path: &Path) -> bool {
+        self.watched.contains(path)
+    }
+
     /// Drop a path that no longer exists from the subscription set.
     ///
     /// The kernel has already released the descriptor if the directory was
@@ -1978,20 +1989,26 @@ fn watchable_dirs(
 /// published, so relaxing a rule subscribes to the tree it used to hide and
 /// tightening one drops it.
 ///
-/// Returns the directories that were newly subscribed to. Until a directory is
-/// subscribed it cannot report anything, so a file written to one of these
-/// between the caller's walk and this call is in neither the walk's results nor
-/// any event. The caller is expected to hand the list to
-/// [`reindex_files_in`] once its own bookkeeping is settled.
-fn sync_watch_registrations(state: &ServerState, root: &Path) -> Vec<PathBuf> {
+/// Returns the directories that were newly subscribed to, and the moment the
+/// walk behind that decision began. Until a directory is subscribed it cannot
+/// report anything, so a file written to one of these between the walk and the
+/// subscription is in neither the walk's results nor any event. The caller is
+/// expected to hand both to [`reindex_files_in`] once its own bookkeeping is
+/// settled; the timestamp bounds that window, which is what lets the scan tell
+/// an ignore-rules file that landed inside it from the thousands that were
+/// already there and are already reflected in the matcher.
+fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, SystemTime) {
+    // Before the early returns as well as the walk: a caller that gets no
+    // directories back still gets a usable bound.
+    let since = SystemTime::now();
     if !PER_DIRECTORY_WATCHES {
-        return Vec::new();
+        return (Vec::new(), since);
     }
     let mut registry = state.watch_registry.lock().unwrap();
     let Some(registry) = registry.as_mut() else {
         // The watcher has not started yet. It syncs once as it comes up, so
         // there is nothing to do and nothing to remember.
-        return Vec::new();
+        return (Vec::new(), since);
     };
 
     let start = Instant::now();
@@ -2009,37 +2026,113 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> Vec<PathBuf> {
             start.elapsed().as_secs_f64() * 1000.0
         );
     }
-    added
+    (added, since)
 }
 
-/// Re-check the files directly inside `dirs`, indexing the ones that changed.
+/// Re-check the files directly inside `dirs`, indexing the ones that changed,
+/// dropping the ones that are gone, and subscribing to subdirectories that
+/// appeared while the subscriptions were being established.
 ///
 /// Used to close the gap between a walk and the subscriptions that follow it:
 /// [`reindex_file`] compares stamps first, so for a tree that did not change
 /// under us this costs one `metadata` call per file and indexes nothing.
 ///
+/// `since` is when the walk behind `dirs` began — the start of the window this
+/// is closing. It is only consulted for ignore-rules files, where "did this
+/// arrive after the matcher was decided" cannot be answered from the stamps:
+/// the dot-prefixed ones are hidden, so they are never indexed and never have
+/// one.
+///
 /// Callers must already hold `snapshot_gate`, and `state.file_stamps` must
 /// already describe the index as published — a merge that replaces the stamps
 /// afterwards would both discard what this records and make every file here
 /// look changed.
-fn reindex_files_in(state: &ServerState, root: &Path, dirs: &[PathBuf]) {
+fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], since: SystemTime) {
     if dirs.is_empty() {
         return;
     }
     let start = Instant::now();
+    // Directories whose listing succeeded, and the files those listings
+    // contained, for the removal sweep at the end. Only files are recorded:
+    // stamps describe files, so directory names would just be dead weight on a
+    // set that at startup spans the whole repository.
+    let mut swept: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let Ok(rel_dir) = dir.strip_prefix(root) else {
             continue;
         };
+        let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            // No listing means no evidence, and the sweep below must not treat
+            // silence as absence.
+            continue;
+        };
+        let mut subdirs: Vec<PathBuf> = Vec::new();
         for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|t| t.is_file()) {
-                continue;
-            }
             let path = entry.path();
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
+            let Ok(file_type) = entry.file_type() else {
+                // Unclassifiable, so nothing can be concluded about it —
+                // least of all that it is gone.
+                present.insert(rel);
+                continue;
+            };
+            // `DirEntry::file_type` does not follow symlinks, so a symlinked
+            // file or directory is neither indexed nor descended into, which
+            // is what the walker does with `follow_links(false)`.
+            if file_type.is_dir() {
+                subdirs.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            present.insert(rel.clone());
+
+            // An ignore-rules file that landed in this window was not seen by
+            // the walk that built the matcher in force, so every other file in
+            // this scan is being judged by rules that do not know about it.
+            // Indexing them now would apply the wrong rules and leave whatever
+            // was wrongly indexed until something touched it again.
+            //
+            // The mtime test is what keeps this quiet: a repository has an
+            // ignore file in every other directory and the startup scan walks
+            // past all of them, but they predate the walk and are already
+            // accounted for. Only one written inside the window can have been
+            // missed — and a spurious match (a `touch` in the same
+            // millisecond) costs an idempotent refresh, not correctness.
+            //
+            // Bounded at both ends, not just the near one. On a network mount
+            // whose server clock runs ahead of ours, every recently touched
+            // file carries a future mtime and would pass a one-sided test — on
+            // every scan, including the one at the end of the refresh this
+            // schedules, which walks the whole repository and then arms the
+            // next. Treating a future mtime as skew rather than as an arrival
+            // gives up the fix on such a mount and keeps the loop closed.
+            if !state.no_ignore
+                && is_ignore_rules_file(root, &path)
+                && entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|m| m >= since && m <= SystemTime::now())
+            {
+                // Abandon the scan: the refresh rewalks and republishes, which
+                // covers these directories properly, and anything indexed
+                // between here and there would be judged by the stale rules.
+                state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+                schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+                eprintln!(
+                    "[trace] watcher: ignore rules changed during recovery ({rel}); \
+                     deferring to a refresh"
+                );
+                return;
+            }
+
             let skip = {
                 let gitignore = state.gitignore.read().unwrap();
                 should_skip_watcher_path(&rel, &state.exclude_dirs, gitignore.as_ref())
@@ -2048,12 +2141,108 @@ fn reindex_files_in(state: &ServerState, root: &Path, dirs: &[PathBuf]) {
                 reindex_file(state, &path, &rel);
             }
         }
+        swept.insert(rel_dir);
+
+        // A directory created in the same window is in neither `dirs` (the
+        // walk did not see it) nor any event (its parent's subscription is
+        // non-recursive, so notify does not extend to it), and would stay
+        // invisible until the hourly reconcile.
+        //
+        // Only the ones not already subscribed: at startup `dirs` is every
+        // directory in the repository and each one is a subdirectory of
+        // another, so descending into all of them would re-walk the tree once
+        // per level. The membership test reduces that to a hash lookup apiece.
+        if !subdirs.is_empty() {
+            let unwatched: Vec<PathBuf> = {
+                let mut registry = state.watch_registry.lock().unwrap();
+                match registry.as_mut() {
+                    // Filtered under the lock but subscribed outside it:
+                    // `watch_new_subtree` takes the same lock, and it is not
+                    // reentrant.
+                    Some(registry) => subdirs
+                        .into_iter()
+                        .filter(|p| !registry.is_watched(p))
+                        .collect(),
+                    None => Vec::new(),
+                }
+            };
+            for subdir in &unwatched {
+                watch_new_subtree(state, root, subdir);
+            }
+        }
     }
+
+    sweep_removed_files(state, &swept, &present);
+
     eprintln!(
         "[trace] watcher: rechecked {} newly watched directories in {:.1}ms",
         dirs.len(),
         start.elapsed().as_secs_f64() * 1000.0
     );
+}
+
+/// Drop index entries for files that were deleted while subscriptions were
+/// being established.
+///
+/// The counterpart to the indexing pass in [`reindex_files_in`]: a file removed
+/// in that window produced no event either, and unlike a modified one nothing
+/// later brings it back to the watcher's attention, so it keeps answering
+/// searches until the hourly reconcile.
+///
+/// `swept` holds the relative directories whose listing succeeded — a failed
+/// `read_dir` proves nothing and must not be read as an empty directory — and
+/// `present` every file those listings contained, regardless of ignore rules or
+/// eligibility. Filtering `present` would delete entries for files that are
+/// still on disk and were indexed under a laxer configuration.
+///
+/// The caller must already hold `snapshot_gate`.
+fn sweep_removed_files(
+    state: &ServerState,
+    swept: &std::collections::HashSet<String>,
+    present: &std::collections::HashSet<String>,
+) {
+    if swept.is_empty() {
+        return;
+    }
+    // One pass over the stamps rather than a lookup per swept directory: at
+    // startup both sides of this span the whole repository, and anything
+    // proportional to their product would not finish.
+    let gone: Vec<String> = {
+        let stamps = state.file_stamps.read().unwrap();
+        stamps
+            .keys()
+            .filter(|rel| {
+                let parent = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+                swept.contains(parent) && !present.contains(rel.as_str())
+            })
+            .cloned()
+            .collect()
+    };
+    if gone.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[trace] watcher: dropped {} file(s) removed while subscriptions were \
+         being established",
+        gone.len()
+    );
+    {
+        let mut index = state.index.write().unwrap();
+        for rel in &gone {
+            index.live.delete_file(rel);
+        }
+    }
+    {
+        let mut stamps = state.file_stamps.write().unwrap();
+        for rel in &gone {
+            stamps.remove(rel);
+        }
+    }
+    if let Ok(mut cache) = state.cache.write() {
+        for rel in &gone {
+            cache.pop(rel);
+        }
+    }
 }
 
 /// Subscribe to a directory that has just appeared, and to anything already
@@ -2098,7 +2287,7 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
     let mut files: Vec<(PathBuf, String)> = Vec::new();
     let mut found_ignore_rules = false;
 
-    while !level.is_empty() {
+    'descend: while !level.is_empty() {
         {
             let mut registry = state.watch_registry.lock().unwrap();
             let Some(registry) = registry.as_mut() else {
@@ -2153,9 +2342,20 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
                     // dot-prefixed, so the scan below would silently drop them
                     // and index the rest of the subtree against rules that do
                     // not know about them.
+                    //
+                    // Abandon the descent immediately rather than finishing it.
+                    // Everything gathered from here on is discarded by the
+                    // refresh anyway, and the rules that are about to be
+                    // published are the ones that decide whether these
+                    // directories should be watched at all — continuing would
+                    // subscribe to every level of, say, a `node_modules/` that
+                    // was just moved into place, which on Linux is a watch
+                    // descriptor apiece and the exhaustion this pass exists to
+                    // avoid. The refresh's `sync` would prune them, but only
+                    // after they had already been taken.
                     if !state.no_ignore && is_ignore_rules_file(root, &path) {
                         found_ignore_rules = true;
-                        continue;
+                        break 'descend;
                     }
                     let skip = {
                         let gitignore = state.gitignore.read().unwrap();
@@ -2237,7 +2437,12 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
 /// Waits out `indexing` first. During a build the stamps do not describe the
 /// index yet, so every file would look changed and the scan would re-read the
 /// whole repository alongside the build that is already doing it.
-fn spawn_recovery_scan(state: &Arc<ServerState>, root: &Path, dirs: Vec<PathBuf>) {
+fn spawn_recovery_scan(
+    state: &Arc<ServerState>,
+    root: &Path,
+    dirs: Vec<PathBuf>,
+    since: SystemTime,
+) {
     if dirs.is_empty() || !PER_DIRECTORY_WATCHES {
         return;
     }
@@ -2254,7 +2459,7 @@ fn spawn_recovery_scan(state: &Arc<ServerState>, root: &Path, dirs: Vec<PathBuf>
             // keeps the stamp check and the index update from interleaving
             // with a flush.
             let _gate = state.snapshot_gate.read().unwrap();
-            reindex_files_in(&state, &root, &dirs);
+            reindex_files_in(&state, &root, &dirs, since);
         });
     if spawned.is_err() {
         eprintln!(
@@ -2372,6 +2577,10 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             continue;
         }
 
+        // `is_file` follows symlinks, so a link to a file lands in
+        // `reindex_file` below rather than here — deliberately: that is where
+        // it is recognised as ineligible and any content indexed under that
+        // path before it became a link is dropped.
         if !path.is_file() {
             // Only for events that can actually introduce a directory. Any
             // `Modify` would include `Modify(Metadata)`, which a recursive
@@ -2414,40 +2623,72 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // for atime/attribute updates, opens, etc. — re-indexing on those
     // would re-read large files, churn the live overlay, and produce a
     // misleading "modified" trace for files that didn't actually change.
-    let current = match std::fs::metadata(path) {
-        Ok(m) => FileStamp {
-            mtime: m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            size: m.len(),
-        },
+    //
+    // `symlink_metadata` describes the link itself; `metadata` would describe
+    // its target. See the eligibility check below for why that distinction
+    // matters here.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
         Err(_) => return,
     };
+    let current = FileStamp {
+        mtime: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        size: meta.len(),
+    };
 
-    // The same two rules `walk_file_metadata` applies, and for the same
-    // reason: the walk is authoritative about what belongs in the index, so
-    // anything it rejects must not be added here. Without this a file that
-    // grew past the cap — or an ineligible extension in a directory a relaxed
-    // ignore rule just exposed — would be read whole and indexed, and the next
-    // reconcile would silently delete it again.
-    let eligible = !tgrep_core::walker::is_binary_extension(path)
+    // The rules `walk_file_metadata` applies, and for the same reason: the walk
+    // is authoritative about what belongs in the index, so anything it rejects
+    // must not be added here. Without this a file that grew past the cap — or
+    // an ineligible extension in a directory a relaxed ignore rule just exposed
+    // — would be read whole and indexed, and the next reconcile would silently
+    // delete it again.
+    //
+    // `is_file` on the link's own metadata is the third rule, and the one with
+    // teeth: the walker runs with `follow_links(false)`, where a symlink is
+    // neither file nor dir and is skipped outright. Following one here would
+    // read the target and index its bytes under the link's path — and the
+    // target need not be under `root` at all, so a link committed to a branch
+    // (or dropped in by a build) is enough to pull `~/.ssh/id_rsa` into an
+    // index whose whole contract is that it covers the served tree.
+    let eligible = meta.is_file()
+        && !tgrep_core::walker::is_binary_extension(path)
         && !state
             .max_file_size
             .is_some_and(|limit| current.size > limit);
     if !eligible {
         // It may have been eligible when it was last indexed — a file can grow
-        // past the cap. Drop what we hold so the index matches the walk rather
-        // than keeping a stale copy of the smaller version until the reconcile.
-        if state
+        // past the cap, and a real file can be replaced by a link to one. Drop
+        // what we hold so the index matches the walk rather than keeping a
+        // stale copy of the smaller version until the reconcile.
+        //
+        // The stamp is not the only evidence that something is indexed. A file
+        // the watcher added since the last flush lives in the live overlay,
+        // and a stamp map that was replaced wholesale — by a stale merge, or
+        // by a load that failed and left it empty — no longer mentions it, so
+        // testing the stamp alone would skip the drop and keep serving content
+        // the walk rejects. `has_path` covers the overlay; an entry that is
+        // only in the persisted reader with no stamp to match is beyond what
+        // can be checked cheaply here (the reader has no path index) and is
+        // left to the reconcile's membership diff.
+        //
+        // Both are checked before deleting rather than deleting unconditionally
+        // the way the removal branch does: removals are rare, but this runs for
+        // every ineligible file a recovery scan walks past, and `delete_file`
+        // records a tombstone and dirties the overlay even when the path was
+        // never indexed.
+        let had_stamp = state
             .file_stamps
             .write()
             .unwrap()
             .remove(rel_path)
-            .is_some()
-        {
+            .is_some();
+        let in_overlay = state.index.read().unwrap().live.has_path(rel_path);
+        if had_stamp || in_overlay {
             eprintln!("[trace] reindex: dropped {rel_path} (no longer eligible)");
             state.index.write().unwrap().live.delete_file(rel_path);
             if let Ok(mut cache) = state.cache.write() {
@@ -2970,6 +3211,10 @@ fn background_refresh_stale(
     let _gate = state.snapshot_gate.write().unwrap();
 
     let mut newly_watched = Vec::new();
+    // Before the walk, not after the subscriptions: this bounds the window the
+    // recovery scan is closing, and the window opens the moment the traversal
+    // that decided what to subscribe to begins.
+    let since = SystemTime::now();
     let ok = refresh_stale_locked(
         state,
         root,
@@ -2988,7 +3233,7 @@ fn background_refresh_stale(
     // `stream_merge_stale_changes` replaces the stamps wholesale, so scanning
     // any earlier would both be discarded and re-read every changed file.
     if ok {
-        reindex_files_in(state, root, &newly_watched);
+        reindex_files_in(state, root, &newly_watched, since);
     }
     ok
 }
@@ -3033,7 +3278,10 @@ fn refresh_stale_locked(
     // the caller holds `snapshot_gate` for write across this whole body, and
     // the only reader of `state.gitignore` takes the read side first, so no
     // event can observe the matcher before this function returns either way.
-    *newly_watched = publish_ignore_matcher(state, root, build_stale_matcher(state, root, &walk));
+    // The caller anchored the recovery window at its own walk, which starts
+    // earlier than the subscription sync inside this call, so the timestamp
+    // that comes back here is the looser of the two and is dropped.
+    *newly_watched = publish_ignore_matcher(state, root, build_stale_matcher(state, root, &walk)).0;
 
     if walk.skipped_error > 0 {
         eprintln!(
@@ -3276,8 +3524,8 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         // than skipped: the scan waits out `indexing` and then costs one
         // `metadata` call per file, since the stamps this build just wrote
         // describe the index exactly.
-        let newly_watched = publish_ignore_matcher(state, root, matcher);
-        spawn_recovery_scan(state, root, newly_watched);
+        let (newly_watched, since) = publish_ignore_matcher(state, root, matcher);
+        spawn_recovery_scan(state, root, newly_watched, since);
         eprintln!(
             "[trace] gitignore matcher built from {} file(s) in {:.1}ms{}",
             outcome.gitignore_files.len(),
@@ -3375,8 +3623,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         // the build's results nor any event. The scan waits for the build to
         // finish before looking, because until then the stamps describe
         // nothing and every file would read as changed.
-        let newly_watched = publish_ignore_matcher(state, root, matcher);
-        spawn_recovery_scan(state, root, newly_watched);
+        let (newly_watched, since) = publish_ignore_matcher(state, root, matcher);
+        spawn_recovery_scan(state, root, newly_watched, since);
         eprintln!(
             "[trace] gitignore matcher built from index walk in {:.1}ms \
              ({} .gitignore + {} .ignore files{})",
@@ -3583,6 +3831,19 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // the newly published reader; no event is lost.
     let gate = state.snapshot_gate.write().unwrap();
     state.flushing.store(true, Ordering::SeqCst);
+
+    // Publish the stamps *before* clearing `indexing`, not after the flush.
+    // The recovery scan started at publish time waits for `indexing` to clear
+    // and then blocks on this gate, so it runs the instant the gate drops. If
+    // the stamps were still unpublished at that point every file it walked
+    // would compare as changed and it would re-read the entire repository —
+    // the exact work the wait exists to avoid — and the assignment would then
+    // overwrite the stamps it had just recorded for anything that really did
+    // change during the build, losing them until the next reconcile.
+    //
+    // Done even if the flush below fails: the live overlay already reflects
+    // what was just indexed, and the stamps describe that.
+    *state.file_stamps.write().unwrap() = stamps;
     state.indexing.store(false, Ordering::SeqCst);
 
     // Final flush to disk for the bulk build. Use the same streaming
@@ -3592,16 +3853,16 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // intermediate incremental flushes published `complete = false` so a
     // mid-build kill would resume rather than be treated as finished.
     eprintln!("[trace] persisting final index to disk...");
-    let pruned = flush_append_only_overlay_locked(state, index_dir, true, Some(&stamps));
+    let pruned = {
+        // A read guard rather than a clone: these maps hold an entry per file
+        // in the repo. Nothing reachable from the flush takes this lock, and
+        // every other writer is behind the publish gate we hold.
+        let stamps = state.file_stamps.read().unwrap();
+        flush_append_only_overlay_locked(state, index_dir, true, Some(&stamps))
+    };
     drop(gate);
 
     state.flushing.store(false, Ordering::SeqCst);
-
-    // Refresh the in-memory file_stamps so the file watcher can recognize
-    // unchanged files and skip spurious notify events (e.g. atime/attribute
-    // updates on Windows). Done even if the flush failed — the live overlay
-    // already reflects what we just indexed, and the stamps describe that.
-    *state.file_stamps.write().unwrap() = stamps;
 
     // Reclaim memory held by the indexing-time live overlay — but only when
     // the flush actually completed and `prune_persisted_entries` ran. If the

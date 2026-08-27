@@ -92,6 +92,25 @@ fn wait_for_match(port: u16, pattern: &str, timeout: Duration) -> bool {
     }
 }
 
+/// Wait until `pattern` stops matching.
+///
+/// For content that has to be *dropped* from the index. The barrier the other
+/// assertions use — a second file appearing — only proves that some later event
+/// was processed, which on a backend that coalesces or reorders events (macOS)
+/// says nothing about the drop.
+fn wait_for_no_match(port: u16, pattern: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if search_matches(port, pattern) == 0 {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Read `(pid, port)` once the server is accepting connections.
 fn wait_for_server(index_dir: &Path) -> (u32, u16) {
     let serve_json = index_dir.join("serve.json");
@@ -497,6 +516,12 @@ fn watcher_applies_the_same_file_eligibility_rules_as_the_walker() {
         "fn seeded() { let seeded_source_marker = 1; }\n",
     )
     .unwrap();
+    // Small enough to be indexed now, and grown past the cap below.
+    fs::write(
+        root.join("src").join("grows.rs"),
+        "fn grows() { let outgrew_the_cap_marker = 5; }\n",
+    )
+    .unwrap();
 
     let status = Command::new(tgrep_bin())
         .args([
@@ -543,6 +568,11 @@ fn watcher_applies_the_same_file_eligibility_rules_as_the_walker() {
     let mut oversized = String::from("fn big() { let oversized_file_marker = 3; }\n");
     oversized.push_str(&"// padding\n".repeat(400));
     fs::write(src.join("huge.rs"), oversized).unwrap();
+    // Already in the index, and now over the cap: what was indexed has to go,
+    // not just stop being updated.
+    let mut grown = String::from("fn grows() { let outgrew_the_cap_marker = 5; }\n");
+    grown.push_str(&"// padding\n".repeat(400));
+    fs::write(src.join("grows.rs"), grown).unwrap();
     fs::write(
         src.join("extra.rs"),
         "fn extra() { let eligible_file_marker = 4; }\n",
@@ -564,5 +594,98 @@ fn watcher_applies_the_same_file_eligibility_rules_as_the_walker() {
         search_matches(port, "oversized_file_marker"),
         0,
         "the watcher indexed a file larger than --max-filesize"
+    );
+    assert!(
+        wait_for_no_match(port, "outgrew_the_cap_marker", Duration::from_secs(30)),
+        "a file that grew past --max-filesize kept its indexed content"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn watcher_does_not_index_through_symlinks() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let index_dir = root.join(".tgrep_test_index");
+
+    // Deliberately outside the served root: this stands in for anything a
+    // symlink committed to a branch could point at.
+    let outside = TempDir::new().unwrap();
+    let secret = outside.path().join("secret.txt");
+    fs::write(&secret, "fn leak() { let outside_root_marker = 1; }\n").unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        "fn seeded() { let seeded_source_marker = 1; }\n",
+    )
+    .unwrap();
+    // Indexed as a real file first, then replaced by a link below.
+    fs::write(
+        root.join("src").join("swapped.rs"),
+        "fn swapped() { let replaced_by_symlink_marker = 2; }\n",
+    )
+    .unwrap();
+
+    let status = Command::new(tgrep_bin())
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run tgrep index");
+    assert!(status.success(), "initial index build failed");
+
+    let child = Command::new(tgrep_bin())
+        .args([
+            "serve",
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start tgrep serve");
+    let _server = ServerGuard { child };
+
+    let (_pid, port) = wait_for_server(&index_dir);
+    assert!(
+        wait_for_match(port, "seeded_source_marker", Duration::from_secs(30)),
+        "expected the seeded file to be searchable"
+    );
+    assert_eq!(
+        search_matches(port, "replaced_by_symlink_marker"),
+        1,
+        "expected the file that is about to be replaced to start out indexed"
+    );
+
+    let src = root.join("src");
+    std::os::unix::fs::symlink(&secret, src.join("link.rs")).unwrap();
+    fs::remove_file(src.join("swapped.rs")).unwrap();
+    std::os::unix::fs::symlink(&secret, src.join("swapped.rs")).unwrap();
+    fs::write(
+        src.join("extra.rs"),
+        "fn extra() { let eligible_file_marker = 3; }\n",
+    )
+    .unwrap();
+
+    assert!(
+        wait_for_match(port, "eligible_file_marker", Duration::from_secs(30)),
+        "the eligible file written alongside the symlinks was never indexed, \
+         so this test cannot say anything about the symlinks"
+    );
+
+    assert!(
+        wait_for_no_match(port, "replaced_by_symlink_marker", Duration::from_secs(30)),
+        "a real file replaced by a symlink kept its old content in the index"
+    );
+    assert_eq!(
+        search_matches(port, "outside_root_marker"),
+        0,
+        "the watcher followed a symlink and indexed content from outside the served root"
     );
 }

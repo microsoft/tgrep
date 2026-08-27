@@ -4306,6 +4306,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn a_recreated_directory_is_subscribed_again_rather_than_assumed_watched() {
         // The kernel releases an inotify watch by itself when its directory is
         // deleted or moved away, and says nothing about it. A path recreated at

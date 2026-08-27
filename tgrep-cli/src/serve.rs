@@ -1576,13 +1576,14 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
     if state.gitignore_pending.load(Ordering::SeqCst) {
         eprintln!("[trace] watcher subscriptions deferred until the ignore matcher is ready");
     } else {
-        // The newly watched directories are deliberately not rechecked here.
-        // This is every directory in the repository, the index was built or
-        // opened moments ago, and the stale check that follows startup
-        // reconciles the same drift while holding `snapshot_gate` — which this
-        // path does not hold and must not take, since the watcher has to be
-        // receiving events before that check runs.
-        let _ = sync_watch_registrations(&state, root);
+        // This can be the first subscription pass the repository ever gets:
+        // the stale check runs on a thread spawned before this function, so it
+        // can publish while `watch_registry` is still `None` and take no
+        // subscriptions at all. Its walk is then already over by the time we
+        // subscribe here, and nothing else revisits the tree until the hourly
+        // reconcile — so the recovery scan is not optional on this path.
+        let newly_watched = sync_watch_registrations(&state, root);
+        spawn_recovery_scan(&state, root, newly_watched);
     }
 
     let worker_state = Arc::clone(&state);
@@ -2221,6 +2222,49 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
     });
 }
 
+/// Recheck newly watched directories on a background thread.
+///
+/// For the publish sites that cannot scan inline. Until a directory is
+/// subscribed it cannot report a write, and the walk that decided to subscribe
+/// to it may have passed it before that write happened, so a file landing in
+/// that window is in neither place and would wait for the hourly reconcile.
+///
+/// Spawned because at startup this is every directory in the repository and
+/// the callers are on paths that must not block: `start_file_watcher` has to
+/// get its worker running, and an index build must not stop to stat the tree
+/// it is already reading.
+///
+/// Waits out `indexing` first. During a build the stamps do not describe the
+/// index yet, so every file would look changed and the scan would re-read the
+/// whole repository alongside the build that is already doing it.
+fn spawn_recovery_scan(state: &Arc<ServerState>, root: &Path, dirs: Vec<PathBuf>) {
+    if dirs.is_empty() || !PER_DIRECTORY_WATCHES {
+        return;
+    }
+    let state = Arc::clone(state);
+    let root = root.to_path_buf();
+    let spawned = thread::Builder::new()
+        .name("tgrep-watch-recovery".into())
+        .spawn(move || {
+            while state.indexing.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(200));
+            }
+            // Read, not write: this does exactly what `handle_fs_event` does,
+            // and that runs under the read side. Taking it at all is what
+            // keeps the stamp check and the index update from interleaving
+            // with a flush.
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_files_in(&state, &root, &dirs);
+        });
+    if spawned.is_err() {
+        eprintln!(
+            "[trace] warning: could not start the watcher recovery scan; \
+             files written while subscriptions were being established will \
+             wait for the next reconcile"
+        );
+    }
+}
+
 fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     let dominated_kinds = matches!(
         event.kind,
@@ -2329,11 +2373,22 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         }
 
         if !path.is_file() {
+            // Only for events that can actually introduce a directory. Any
+            // `Modify` would include `Modify(Metadata)`, which a recursive
+            // chmod or a checkout fires once per directory — and each one
+            // would re-walk and re-subscribe that directory's whole subtree
+            // on the single watcher worker, turning a linear operation into
+            // quadratic work. inotify announces a new directory as `Create`
+            // and one moved in as `Modify(Name)`; nothing else can.
+            let introduces_dir = matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+            );
             // `is_real_dir` rather than `is_dir`: the latter follows symlinks,
             // and a link to a directory is not something the walker descends
             // into, so subscribing to and indexing its target would pull in a
             // tree the index never contained — possibly outside `root`.
-            if PER_DIRECTORY_WATCHES && is_real_dir(path) {
+            if PER_DIRECTORY_WATCHES && introduces_dir && is_real_dir(path) {
                 // With non-recursive subscriptions notify will not extend the
                 // watch set for us, so a directory that just appeared — and
                 // anything already inside it — has to be picked up here.
@@ -2371,6 +2426,37 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
         },
         Err(_) => return,
     };
+
+    // The same two rules `walk_file_metadata` applies, and for the same
+    // reason: the walk is authoritative about what belongs in the index, so
+    // anything it rejects must not be added here. Without this a file that
+    // grew past the cap — or an ineligible extension in a directory a relaxed
+    // ignore rule just exposed — would be read whole and indexed, and the next
+    // reconcile would silently delete it again.
+    let eligible = !tgrep_core::walker::is_binary_extension(path)
+        && !state
+            .max_file_size
+            .is_some_and(|limit| current.size > limit);
+    if !eligible {
+        // It may have been eligible when it was last indexed — a file can grow
+        // past the cap. Drop what we hold so the index matches the walk rather
+        // than keeping a stale copy of the smaller version until the reconcile.
+        if state
+            .file_stamps
+            .write()
+            .unwrap()
+            .remove(rel_path)
+            .is_some()
+        {
+            eprintln!("[trace] reindex: dropped {rel_path} (no longer eligible)");
+            state.index.write().unwrap().live.delete_file(rel_path);
+            if let Ok(mut cache) = state.cache.write() {
+                cache.pop(rel_path);
+            }
+        }
+        return;
+    }
+
     if state.file_stamps.read().unwrap().get(rel_path) == Some(&current) {
         return;
     }
@@ -3185,13 +3271,13 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             state.no_require_git,
         );
         let found = matcher.is_some();
-        // These subscriptions are the repository's first, so "newly watched"
-        // is every directory in it. No recovery scan: the startup stale check
-        // runs right after this and does a full walk-versus-index diff, which
-        // is a strict superset of what a recovery scan would find — and doing
-        // it here would stat the entire tree while holding the gate, on the
-        // path a warm start exists to keep fast.
-        let _ = publish_ignore_matcher(state, root, matcher);
+        // "Newly watched" here is every directory in the repository, and the
+        // build's walk ran before any of them were subscribed. Deferred rather
+        // than skipped: the scan waits out `indexing` and then costs one
+        // `metadata` call per file, since the stamps this build just wrote
+        // describe the index exactly.
+        let newly_watched = publish_ignore_matcher(state, root, matcher);
+        spawn_recovery_scan(state, root, newly_watched);
         eprintln!(
             "[trace] gitignore matcher built from {} file(s) in {:.1}ms{}",
             outcome.gitignore_files.len(),
@@ -3284,11 +3370,13 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             state.no_require_git,
         );
         let has_matcher = matcher.is_some();
-        // Same reasoning as the bootstrap publish: this is the cold-start
-        // build, so "newly watched" is the whole tree, `indexing` keeps the
-        // watcher off the index for the rest of the build, and the stale check
-        // that follows reconciles anything written during it.
-        let _ = publish_ignore_matcher(state, root, matcher);
+        // Subscriptions are taken here, partway through the build, so files
+        // written to a directory the walk has already passed are in neither
+        // the build's results nor any event. The scan waits for the build to
+        // finish before looking, because until then the stamps describe
+        // nothing and every file would read as changed.
+        let newly_watched = publish_ignore_matcher(state, root, matcher);
+        spawn_recovery_scan(state, root, newly_watched);
         eprintln!(
             "[trace] gitignore matcher built from index walk in {:.1}ms \
              ({} .gitignore + {} .ignore files{})",

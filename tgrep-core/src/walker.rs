@@ -158,7 +158,11 @@ impl Default for WalkOptions {
 }
 
 /// Check if a file extension indicates a binary format.
-fn is_binary_extension(path: &Path) -> bool {
+///
+/// Public so the watcher can apply the same rule the walk does. A file the
+/// walk rejected here must not be inserted into the index by an incremental
+/// update, or the two disagree about what the index contains.
+pub fn is_binary_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| {

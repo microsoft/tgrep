@@ -470,3 +470,99 @@ fn watcher_rewatches_a_directory_that_is_removed_and_recreated() {
          recreated, so its subscription was not re-established"
     );
 }
+
+/// The walk decides what belongs in the index; the watcher must agree with it.
+///
+/// `should_skip_watcher_path` only filters by location — excludes, ignore
+/// rules, hidden paths. It says nothing about the two rules the walker applies
+/// per file: binary extensions are skipped, and so is anything over
+/// `--max-filesize`. A file arriving through the watcher therefore used to be
+/// indexed even when a walk of the very same tree would have rejected it, so
+/// the index disagreed with itself depending on whether a file was present at
+/// startup or written afterwards — and the next reconcile silently deleted it.
+///
+/// Both rejections are asserted alongside an eligible file written at the same
+/// moment. Without that control the test would pass just as happily against a
+/// watcher that had stopped indexing anything at all.
+#[test]
+fn watcher_applies_the_same_file_eligibility_rules_as_the_walker() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let index_dir = root.join(".tgrep_test_index");
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        "fn seeded() { let seeded_source_marker = 1; }\n",
+    )
+    .unwrap();
+
+    let status = Command::new(tgrep_bin())
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--max-filesize",
+            "2K",
+        ])
+        .status()
+        .expect("failed to run tgrep index");
+    assert!(status.success(), "initial index build failed");
+
+    let child = Command::new(tgrep_bin())
+        .args([
+            "serve",
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--max-filesize",
+            "2K",
+            root.to_str().unwrap(),
+        ])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start tgrep serve");
+    let _server = ServerGuard { child };
+
+    let (_pid, port) = wait_for_server(&index_dir);
+    assert!(
+        wait_for_match(port, "seeded_source_marker", Duration::from_secs(30)),
+        "expected the seeded file to be searchable"
+    );
+
+    let src = root.join("src");
+    // Text content, so nothing but the extension can keep it out.
+    fs::write(
+        src.join("asset.png"),
+        "fn decoy() { let binary_extension_marker = 2; }\n",
+    )
+    .unwrap();
+    // Same marker, pushed past the 2K cap by padding.
+    let mut oversized = String::from("fn big() { let oversized_file_marker = 3; }\n");
+    oversized.push_str(&"// padding\n".repeat(400));
+    fs::write(src.join("huge.rs"), oversized).unwrap();
+    fs::write(
+        src.join("extra.rs"),
+        "fn extra() { let eligible_file_marker = 4; }\n",
+    )
+    .unwrap();
+
+    assert!(
+        wait_for_match(port, "eligible_file_marker", Duration::from_secs(30)),
+        "the eligible file written next to the rejected ones was never indexed, \
+         so this test cannot say anything about the rejections"
+    );
+
+    assert_eq!(
+        search_matches(port, "binary_extension_marker"),
+        0,
+        "the watcher indexed a file whose extension the walker rejects"
+    );
+    assert_eq!(
+        search_matches(port, "oversized_file_marker"),
+        0,
+        "the watcher indexed a file larger than --max-filesize"
+    );
+}

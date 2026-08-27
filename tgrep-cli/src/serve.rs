@@ -1804,6 +1804,33 @@ impl WatchRegistry {
     /// else, and giving up on the entire tree is exactly the failure mode this
     /// registration exists to avoid.
     fn add_all<'a>(&mut self, desired: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+        self.subscribe(desired, false)
+    }
+
+    /// Subscribe to every directory in `dirs`, re-issuing the subscription even
+    /// for ones already recorded as watched.
+    ///
+    /// For directories that have just appeared, where membership in `watched`
+    /// proves nothing. The kernel drops an inotify watch by itself when its
+    /// directory is deleted or moved away, and nothing tells us the descriptor
+    /// is gone — so a path recreated at the same location would look
+    /// subscribed while receiving no events at all. [`Self::add_all`] would
+    /// skip it, and so would every later [`Self::sync`], since the path is in
+    /// `desired` *and* in `watched`: the entry stays poisoned until the server
+    /// restarts. Re-adding is cheap and idempotent (`inotify_add_watch`
+    /// returns the existing descriptor), so the doubt is worth paying for.
+    ///
+    /// Returns only the directories that were not previously recorded, so a
+    /// caller's notion of "newly watched" keeps its meaning.
+    fn resubscribe_all<'a>(&mut self, dirs: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
+        self.subscribe(dirs, true)
+    }
+
+    fn subscribe<'a>(
+        &mut self,
+        desired: impl IntoIterator<Item = &'a PathBuf>,
+        force: bool,
+    ) -> Vec<PathBuf> {
         let mut added = Vec::new();
         let mut failures = 0;
         // Iterating `desired` and testing membership is deliberate: a
@@ -1811,15 +1838,24 @@ impl WatchRegistry {
         // this runs per newly created directory on repositories where that set
         // is tens of thousands of entries.
         for dir in desired {
-            if self.watched.contains(dir) {
+            let known = self.watched.contains(dir);
+            if known && !force {
                 continue;
             }
             match self.watcher.watch(dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
-                    self.watched.insert(dir.clone());
-                    added.push(dir.clone());
+                    if !known {
+                        self.watched.insert(dir.clone());
+                        added.push(dir.clone());
+                    }
                 }
                 Err(e) => {
+                    // A forced re-add that fails means the directory is gone
+                    // again; drop the entry so a later attempt can retry it
+                    // rather than trusting a descriptor that does not exist.
+                    if known {
+                        self.watched.remove(dir);
+                    }
                     // One line per call, not per directory: exhausting the
                     // inotify budget fails thousands of these at once.
                     if failures == 0 {
@@ -1837,6 +1873,25 @@ impl WatchRegistry {
             eprintln!("[trace] warning: {failures} directories could not be watched");
         }
         added
+    }
+
+    /// Drop a path that no longer exists from the subscription set.
+    ///
+    /// The kernel has already released the descriptor if the directory was
+    /// deleted; the `unwatch` is for the moved-away case, where it is still
+    /// live and now pointing outside the tree. What matters either way is
+    /// clearing `watched`, so that if the path comes back, it is treated as
+    /// the new directory it is instead of an already-subscribed one.
+    ///
+    /// Cheap by design: one hash lookup per removal event, because deleting a
+    /// tree delivers one event per directory in it and anything proportional
+    /// to the whole watched set would turn that into quadratic work.
+    /// Descendants left behind by a move are pruned by the next
+    /// [`Self::sync`], which no longer finds them under the root.
+    fn forget(&mut self, path: &Path) {
+        if self.watched.remove(path) {
+            let _ = self.watcher.unwatch(path);
+        }
     }
 
     /// Bring the subscription set in line with `desired`, subscribing to
@@ -2054,7 +2109,12 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
             // matters at scale — a monorepo can hold tens of thousands of
             // watched directories, and materialising a union for every newly
             // created directory would be quadratic over a checkout.
-            registry.add_all(level.iter());
+            //
+            // Forced, because these directories have just appeared: a path
+            // recreated where a watched one used to be is still recorded as
+            // watched, but the kernel dropped its descriptor when the original
+            // went away.
+            registry.resubscribe_all(level.iter());
         }
 
         // The registry lock is released before any `read_dir`, so a large
@@ -2236,6 +2296,18 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         let is_remove = matches!(event.kind, EventKind::Remove(_)) || !path.exists();
 
         if is_remove {
+            // A watched directory that disappears takes its descriptor with
+            // it, but not its entry in the registry. Clearing that entry is
+            // what lets the path be subscribed again if it comes back — and
+            // keeps `watched` from accumulating dead paths between syncs.
+            // Done for every removed path rather than only known directories,
+            // since by now there is nothing left to ask what it was; a path
+            // that was never watched is a single failed hash lookup.
+            if PER_DIRECTORY_WATCHES
+                && let Some(registry) = state.watch_registry.lock().unwrap().as_mut()
+            {
+                registry.forget(path);
+            }
             // notify can deliver Remove events for transient/unknown paths
             // (e.g. a build tool's temp file). Suppress the noisy log line
             // for those, but still apply the delete unconditionally — if
@@ -4233,6 +4305,52 @@ mod tests {
         let (added, removed) = registry.sync(&[c.clone()].into_iter().collect());
         assert_eq!((added.len(), removed), (0, 2));
         assert_eq!(registry.watched, [c].into_iter().collect());
+    }
+
+    #[test]
+    fn a_recreated_directory_is_subscribed_again_rather_than_assumed_watched() {
+        // The kernel releases an inotify watch by itself when its directory is
+        // deleted or moved away, and says nothing about it. A path recreated at
+        // the same location therefore *looks* subscribed while receiving no
+        // events — and because it is in `desired` as well as in `watched`, no
+        // later `sync` can tell the difference either. The entry stays poisoned
+        // for the life of the process, so the directory silently stops being
+        // watched forever.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        std::fs::create_dir(&a).unwrap();
+
+        let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+        let mut registry = WatchRegistry {
+            watcher,
+            watched: std::collections::HashSet::new(),
+        };
+        assert_eq!(registry.add_all(std::slice::from_ref(&a)).len(), 1);
+
+        // What the removal event does. Without it the entry below survives.
+        registry.forget(&a);
+        assert!(
+            !registry.watched.contains(&a),
+            "a removed directory must not be left recorded as watched"
+        );
+        assert_eq!(
+            registry.add_all(std::slice::from_ref(&a)).len(),
+            1,
+            "a directory recreated after removal must be subscribed again"
+        );
+
+        // And the belt-and-braces half: even with the entry still present —
+        // a move away delivers no event for the descendants it takes with it —
+        // a directory that has just appeared gets its subscription re-issued.
+        // Already-known paths are not reported as new, so the recovery scan
+        // does not treat the whole subtree as freshly watched.
+        assert!(
+            registry
+                .resubscribe_all(std::slice::from_ref(&a))
+                .is_empty(),
+            "re-issuing a subscription must not report an existing path as new"
+        );
+        assert!(registry.watched.contains(&a));
     }
 
     #[cfg(unix)]

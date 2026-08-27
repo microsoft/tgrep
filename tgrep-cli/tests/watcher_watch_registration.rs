@@ -387,3 +387,86 @@ fn watcher_honors_ignore_rules_inside_a_subtree_that_arrives_whole() {
          the same subtree, so the subtree was indexed against stale rules"
     );
 }
+
+/// A directory removed and recreated at the same path must still be watched.
+///
+/// The kernel drops an inotify watch when its directory goes away and does not
+/// say so, leaving the path recorded as watched with no descriptor behind it.
+/// Nothing later can tell that entry from a live one — it is in the desired set
+/// *and* in the watched set — so without explicitly clearing it on removal the
+/// directory stops being watched for the life of the process.
+///
+/// `rm -rf build && mkdir build`, a branch switch, and a `git clean` all do
+/// exactly this.
+#[test]
+fn watcher_rewatches_a_directory_that_is_removed_and_recreated() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let index_dir = root.join(".tgrep_test_index");
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    fs::create_dir_all(root.join("src").join("gen")).unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        "fn seeded() { let normal_source_marker = 1; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("gen").join("old.rs"),
+        "fn old() { let pre_delete_marker = 2; }\n",
+    )
+    .unwrap();
+
+    let status = Command::new(tgrep_bin())
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run tgrep index");
+    assert!(status.success(), "initial index build failed");
+
+    let child = Command::new(tgrep_bin())
+        .args([
+            "serve",
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start tgrep serve");
+    let _server = ServerGuard { child };
+
+    let (_pid, port) = wait_for_server(&index_dir);
+    assert!(
+        wait_for_match(port, "pre_delete_marker", Duration::from_secs(30)),
+        "expected the seeded file in src/gen to be searchable"
+    );
+    thread::sleep(Duration::from_secs(2));
+
+    let gen_dir = root.join("src").join("gen");
+    fs::remove_dir_all(&gen_dir).unwrap();
+    thread::sleep(Duration::from_secs(2));
+    fs::create_dir_all(&gen_dir).unwrap();
+
+    // Deliberately after the recreation has been processed. A file written in
+    // the same breath would be picked up by the subscription pass's own scan
+    // and would say nothing about whether the watch itself was re-established.
+    thread::sleep(Duration::from_secs(3));
+    fs::write(
+        gen_dir.join("new.rs"),
+        "fn regenerated() { let post_recreate_marker = 3; }\n",
+    )
+    .unwrap();
+
+    assert!(
+        wait_for_match(port, "post_recreate_marker", Duration::from_secs(30)),
+        "watcher never saw a file written to a directory that was removed and \
+         recreated, so its subscription was not re-established"
+    );
+}

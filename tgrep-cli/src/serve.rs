@@ -2139,10 +2139,75 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
     (added, since)
 }
 
+/// The first ignore-rules file in `dirs` that the published matcher did not
+/// read, or that has been edited since `since`.
+///
+/// Probing by name rather than inspecting listings, for three reasons. It is
+/// how the walker itself discovers these files, so the two agree by
+/// construction. `Path::is_file` follows symlinks, so a symlinked `.gitignore`
+/// — which carries rules exactly like a real one — is seen, where
+/// `DirEntry::file_type` does not resolve it and the entry gets dropped as "not
+/// a regular file". And it is ordering-independent: `read_dir` offers no
+/// ordering, and on macOS `.gitignore` routinely comes back *after* its
+/// siblings, so a per-entry check indexes part of a directory under the stale
+/// rules before it ever reaches the file that changes them. Answering for the
+/// whole scan up front closes that window across directories as well.
+///
+/// Two tests, because neither alone is enough. Absence from the published
+/// sources is the exact question — this file did not feed the matcher in force
+/// — and it catches an arrival however old the file says it is, which matters
+/// because `git checkout`, `tar -x` and `rsync -a` all restore mtimes from what
+/// they unpack and would sail past a recency test. The mtime window then covers
+/// what the source list cannot: a file that was already a source and has just
+/// been edited.
+///
+/// That window is bounded at both ends, not just the near one. On a network
+/// mount whose server clock runs ahead of ours, every recently touched file
+/// carries a future mtime and would pass a one-sided test — on every scan,
+/// including the one at the end of the refresh this schedules, which walks the
+/// whole repository and then arms the next. Treating a future mtime as skew
+/// rather than as an edit keeps that loop closed.
+fn changed_ignore_rules_in(
+    root: &Path,
+    dirs: &[PathBuf],
+    known_sources: &std::collections::HashSet<String>,
+    since: SystemTime,
+) -> Option<(String, &'static str)> {
+    let mut probed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for dir in dirs {
+        let mut candidates = vec![
+            dir.join(tgrep_core::gitignore::GITIGNORE_FILENAME),
+            dir.join(tgrep_core::gitignore::DOT_IGNORE_FILENAME),
+        ];
+        // Root-scoped, mirroring the walker, which only reads the root file.
+        if dir == root {
+            candidates.push(root.join(tgrep_core::gitignore::P4IGNORE_FILENAME));
+        }
+        for candidate in candidates {
+            if !probed.insert(candidate.clone()) || !candidate.is_file() {
+                continue;
+            }
+            let Ok(rel) = candidate.strip_prefix(root) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if !known_sources.contains(&rel) {
+                return Some((rel, "not a known source"));
+            }
+            if std::fs::metadata(&candidate)
+                .and_then(|m| m.modified())
+                .is_ok_and(|m| m >= since && m <= SystemTime::now())
+            {
+                return Some((rel, "modified"));
+            }
+        }
+    }
+    None
+}
+
 /// Re-check the files directly inside `dirs`, indexing the ones that changed,
 /// dropping the ones that are gone, and subscribing to subdirectories that
 /// appeared while the subscriptions were being established.
-///
 /// Used to close the gap between a walk and the subscriptions that follow it:
 /// [`reindex_file`] compares stamps first, so for a tree that did not change
 /// under us this costs one `metadata` call per file and indexes nothing.
@@ -2204,6 +2269,24 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
         known
     };
 
+    // Before a single file is indexed: an ignore-rules file that landed in this
+    // window was not seen by the walk that built the matcher in force, so every
+    // file in this scan would be judged by rules that do not know about it, and
+    // whatever was wrongly indexed would stay until something touched it again.
+    if !state.no_ignore
+        && let Some((rel, why)) = changed_ignore_rules_in(root, dirs, &known_sources, since)
+    {
+        // Abandon the scan: the refresh rewalks and republishes, which covers
+        // these directories properly.
+        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+        schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+        eprintln!(
+            "[trace] watcher: ignore rules changed during recovery ({rel}, {why}); \
+             deferring to a refresh"
+        );
+        return;
+    }
+
     // Directories whose listing succeeded, and the files those listings
     // contained, for the removal sweep at the end. Only files are recorded:
     // stamps describe files, so directory names would just be dead weight on a
@@ -2251,69 +2334,6 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
                 subdirs.push(path);
                 continue;
             }
-
-            // Ahead of the regular-file test, and following links to decide.
-            // The walker collects rule files with `Path::is_file`, which
-            // resolves symlinks, so a symlinked `.gitignore` contributes rules
-            // exactly like a real one — while `DirEntry::file_type` above does
-            // not resolve them, which left those files falling through the
-            // `!is_file` bail and never triggering a refresh. They are still
-            // never indexed; they are only allowed to announce themselves.
-            //
-            // An ignore-rules file that landed in this window was not seen by
-            // the walk that built the matcher in force, so every other file in
-            // this scan is being judged by rules that do not know about it.
-            // Indexing them now would apply the wrong rules and leave whatever
-            // was wrongly indexed until something touched it again.
-            //
-            // Two tests, because neither alone is enough. Absence from the
-            // published sources is the exact question — this file did not feed
-            // the matcher — and it catches the arrival however old the file
-            // says it is, which matters because `git checkout`, `tar -x` and
-            // `rsync -a` all restore mtimes from the archive and would sail
-            // past a recency test. The mtime window then covers the case the
-            // source list cannot: a file that was already a source and has just
-            // been *edited*.
-            //
-            // The mtime test is what keeps the second one quiet: a repository
-            // has an ignore file in every other directory and the startup scan
-            // walks past all of them, but they predate the walk and are already
-            // accounted for. Only one written inside the window can have been
-            // missed — and a spurious match (a `touch` in the same millisecond)
-            // costs an idempotent refresh, not correctness.
-            //
-            // Bounded at both ends, not just the near one. On a network mount
-            // whose server clock runs ahead of ours, every recently touched
-            // file carries a future mtime and would pass a one-sided test — on
-            // every scan, including the one at the end of the refresh this
-            // schedules, which walks the whole repository and then arms the
-            // next. Treating a future mtime as skew rather than as an arrival
-            // gives up the fix on such a mount and keeps the loop closed.
-            if !state.no_ignore && is_ignore_rules_file(root, &path) && path.is_file() {
-                let unknown = !known_sources.contains(&rel);
-                let touched = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|m| m >= since && m <= SystemTime::now());
-                if unknown || touched {
-                    // Abandon the scan: the refresh rewalks and republishes,
-                    // which covers these directories properly, and anything
-                    // indexed between here and there would be judged by the
-                    // stale rules.
-                    state.ignore_rules_dirty.store(true, Ordering::SeqCst);
-                    schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
-                    let why = if unknown {
-                        "not a known source"
-                    } else {
-                        "modified"
-                    };
-                    eprintln!(
-                        "[trace] watcher: ignore rules changed during recovery ({rel}, {why}); \
-                         deferring to a refresh"
-                    );
-                    return;
-                }
-            }
-
             if !file_type.is_file() {
                 continue;
             }
@@ -6486,6 +6506,41 @@ mod tests {
         assert!(
             !state.index.read().unwrap().live.has_path("sub/kept.rs"),
             "the scan must abandon rather than index under rules it knows are stale"
+        );
+    }
+
+    /// `read_dir` promises no ordering, and the rules a scan must respect can
+    /// live in a directory it has not reached yet — so every directory in the
+    /// scan is asked before any file in it is indexed.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_checks_every_directory_for_rules_before_indexing_any_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        *state.ignore_sources.write().unwrap() = Vec::new();
+
+        // The rules are in `b`, the file is in `a`, and `a` is scanned first.
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("keep.rs"), "fn keep() {}\n").unwrap();
+        std::fs::write(b.join(".gitignore"), "keep.rs\n").unwrap();
+
+        state.ignore_refresh_scheduled.store(true, Ordering::SeqCst);
+        let since = SystemTime::now() - std::time::Duration::from_secs(60);
+        reindex_files_in(&state, &root, &[a, b], since);
+
+        assert!(
+            state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "the scan must notice rules that live later in its own list"
+        );
+        assert!(
+            !state.index.read().unwrap().live.has_path("a/keep.rs"),
+            "nothing may be indexed before every directory has been asked for rules"
         );
     }
 

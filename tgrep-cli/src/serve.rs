@@ -290,6 +290,15 @@ struct ServerState {
     ignore_rules_dirty: std::sync::atomic::AtomicBool,
     /// Ensures a burst of ignore-file events uses at most one refresh worker.
     ignore_refresh_scheduled: std::sync::atomic::AtomicBool,
+    /// The ignore files the published matcher was built from.
+    ///
+    /// A recovery scan can spot an ignore file that *arrived* during its window
+    /// by its mtime, but a deleted one leaves nothing behind to notice. That is
+    /// the more damaging direction: the matcher keeps enforcing rules whose
+    /// source is gone, so an entire subtree stays unsubscribed and unindexed
+    /// until something else forces a rebuild. Keeping the source list lets the
+    /// scan test for it directly, at one stat per ignore file per scan.
+    ignore_sources: RwLock<Vec<PathBuf>>,
     /// Serializes the whole check-read-commit cycle in [`reindex_file`].
     ///
     /// `snapshot_gate` is held for *read* by everything that indexes a file, so
@@ -304,7 +313,8 @@ struct ServerState {
     /// anything but one file's read, and searches do not take it at all.
     reindex_lock: Mutex<()>,
     /// Paths the watcher saw while `indexing` was set, kept so they can be
-    /// replayed once the build publishes.
+    /// replayed once the build publishes, each with whether its original event
+    /// could have introduced a directory.
     ///
     /// Events that arrive during a build cannot be applied — the stamps do not
     /// describe the index yet, so every path would read as changed — but they
@@ -314,12 +324,19 @@ struct ServerState {
     /// back on, so discarding them leaves the change invisible until the hourly
     /// reconcile.
     ///
+    /// The flag has to be carried rather than reconstructed. Replaying
+    /// everything as a create would put every recorded path through
+    /// `watch_new_subtree`, and a recursive `chmod` or a checkout fires a
+    /// metadata-only modify per directory — so a tree that produced no new
+    /// directories at all would be walked and force-resubscribed once per
+    /// recorded path, which is quadratic over a deep checkout.
+    ///
     /// `None` means the buffer overflowed and the paths were dropped; the
     /// replay then falls back to a full stale refresh, which is slower but
     /// complete. Bounded because a build can run for minutes on a large
     /// repository and a checkout or a build tree churning underneath it is
     /// unbounded.
-    deferred_events: Mutex<Option<std::collections::HashSet<PathBuf>>>,
+    deferred_events: Mutex<Option<std::collections::HashMap<PathBuf, bool>>>,
     /// Progress: number of files indexed so far.
     index_progress: std::sync::atomic::AtomicU64,
     /// Total files discovered for indexing.
@@ -603,8 +620,9 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         gitignore_pending: std::sync::atomic::AtomicBool::new(!no_watch && !no_ignore),
         ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
         ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+        ignore_sources: RwLock::new(Vec::new()),
         reindex_lock: Mutex::new(()),
-        deferred_events: Mutex::new(Some(std::collections::HashSet::new())),
+        deferred_events: Mutex::new(Some(std::collections::HashMap::new())),
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
         watch_enabled: !no_watch,
@@ -782,6 +800,27 @@ fn build_stale_matcher(
     matcher
 }
 
+/// The ignore files a matcher was built from, as one list.
+///
+/// Root-level `p4ignore.ini` is a separate source from the walker's point of
+/// view — it is applied as its own filter rather than collected with the
+/// gitignore files — but deleting it invalidates the published rules exactly
+/// the same way, so it belongs in the list.
+fn ignore_sources_of(
+    root: &Path,
+    gitignore_files: &[PathBuf],
+    ignore_files: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut sources = Vec::with_capacity(gitignore_files.len() + ignore_files.len() + 1);
+    sources.extend_from_slice(gitignore_files);
+    sources.extend_from_slice(ignore_files);
+    let p4 = root.join(tgrep_core::gitignore::P4IGNORE_FILENAME);
+    if p4.is_file() {
+        sources.push(p4);
+    }
+    sources
+}
+
 /// Publish a new ignore matcher and bring everything that depends on it up to
 /// date. `None` is a legitimate matcher when no rules exist.
 ///
@@ -800,12 +839,18 @@ fn build_stale_matcher(
 /// subscription walk inside this function starts later, and an ignore file
 /// written between the two would predate a timestamp taken here and be read as
 /// already accounted for by rules that never saw it.
+///
+/// `sources` are the ignore files `matcher` was built from, recorded so a
+/// recovery scan can notice one of them being deleted — an event the mtime
+/// heuristic cannot see, since a deleted file leaves nothing to stat.
 #[must_use = "newly watched directories need a recovery scan or writes race the subscription"]
 fn publish_ignore_matcher(
     state: &ServerState,
     root: &Path,
     matcher: Option<tgrep_core::gitignore::IgnoreMatcher>,
+    sources: Vec<PathBuf>,
 ) -> Vec<PathBuf> {
+    *state.ignore_sources.write().unwrap() = sources;
     *state.gitignore.write().unwrap() = matcher;
     state.gitignore_pending.store(false, Ordering::SeqCst);
     // New rules mean a different set of directories worth hearing about:
@@ -2078,7 +2123,9 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
 /// is closing. It is only consulted for ignore-rules files, where "did this
 /// arrive after the matcher was decided" cannot be answered from the stamps:
 /// the dot-prefixed ones are hidden, so they are never indexed and never have
-/// one.
+/// one. The opposite case — one that was *deleted* in the window — is handled
+/// separately, from `state.ignore_sources`, since a deleted file leaves nothing
+/// to stat.
 ///
 /// Callers must already hold `snapshot_gate`, and `state.file_stamps` must
 /// already describe the index as published — a merge that replaces the stamps
@@ -2089,6 +2136,30 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
         return;
     }
     let start = Instant::now();
+
+    // An ignore file that was deleted during the window is invisible to the
+    // per-entry mtime test below — there is no entry left to stat. It is also
+    // the more damaging direction: rules that no longer have a source keep
+    // being enforced, so the subtree they hide stays unsubscribed and
+    // unindexed until an unrelated rebuild happens along. Checking the sources
+    // the published matcher was built from catches it at one stat apiece, once
+    // per scan rather than once per file.
+    if !state.no_ignore {
+        let vanished = {
+            let sources = state.ignore_sources.read().unwrap();
+            sources.iter().find(|p| !p.exists()).cloned()
+        };
+        if let Some(gone) = vanished {
+            state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+            schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+            eprintln!(
+                "[trace] watcher: ignore rules source {} disappeared; deferring to a refresh",
+                gone.display()
+            );
+            return;
+        }
+    }
+
     // Directories whose listing succeeded, and the files those listings
     // contained, for the removal sweep at the end. Only files are recorded:
     // stamps describe files, so directory names would just be dead weight on a
@@ -2459,30 +2530,41 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
     });
 }
 
-/// Recheck newly watched directories on a background thread.
-///
 /// Remember the paths in an event that arrived mid-build, for replay once the
-/// build publishes.
+/// build publishes. Returns whether it did — a `false` means the build finished
+/// underneath us and the caller should handle the event normally.
 ///
 /// The event cannot be applied now: until `indexing` clears, `file_stamps` does
 /// not describe the index, so every path would compare as changed and the
 /// watcher would re-read the repository alongside the build already reading it.
 /// It cannot simply be dropped either — see [`ServerState::deferred_events`].
 ///
+/// `indexing` is re-read *under the buffer lock*, and that is what makes the
+/// handoff safe. The caller's own check is only a hint: between it and this
+/// call the build can finish and [`replay_deferred_events`] can swap the buffer
+/// out, and an insert landing after that swap is in a set nothing will ever
+/// look at again. Because the replay cannot swap until `indexing` is false, and
+/// cannot swap without this lock, seeing `indexing` set while holding it proves
+/// the swap has not happened yet.
+///
 /// Capped, and the cap discards the whole set rather than truncating it: a
 /// partial set is indistinguishable from a complete one at replay time, and
 /// silently recovering nine tenths of a checkout is worse than knowing to fall
 /// back on a full refresh.
-fn defer_events_during_build(state: &ServerState, event: &Event) {
+fn defer_events_during_build(state: &ServerState, event: &Event) -> bool {
     /// A checkout of the Linux kernel is ~90k files. Above this the fallback
     /// refresh is cheaper than the replay would be anyway.
     const MAX_DEFERRED: usize = 100_000;
 
     let Ok(mut deferred) = state.deferred_events.lock() else {
-        return;
+        return false;
     };
+    if !state.indexing.load(Ordering::SeqCst) {
+        return false;
+    }
     let Some(paths) = deferred.as_mut() else {
-        return;
+        // Already overflowed, so the fallback refresh will cover this path too.
+        return true;
     };
     if paths.len().saturating_add(event.paths.len()) > MAX_DEFERRED {
         *deferred = None;
@@ -2490,26 +2572,43 @@ fn defer_events_during_build(state: &ServerState, event: &Event) {
             "[trace] warning: too many file changes during the initial index build to replay \
              individually; a full reconcile will run instead"
         );
-        return;
+        return true;
     }
-    paths.extend(event.paths.iter().cloned());
+    // Only these kinds can put a directory somewhere, and only they should
+    // trigger a subtree walk on replay. See `ServerState::deferred_events`.
+    let introduces_dir = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    );
+    for path in &event.paths {
+        // A path seen both ways keeps the stronger claim: a directory that was
+        // created and then chmod'd still needs its subtree picked up.
+        let entry = paths.entry(path.clone()).or_insert(false);
+        *entry |= introduces_dir;
+    }
+    true
 }
 
 /// Apply the events that arrived during the build, now that it has published.
 ///
-/// Replayed as synthetic create events rather than handled directly so they go
-/// through exactly the filtering an ordinary event gets — ignore rules, the
-/// exclude list, the index directory, new-subtree subscription. `Create(Any)`
-/// is the right kind for all of them: `handle_fs_event` decides removal from
-/// whether the path still exists, and modifications and creations take the same
-/// route, so one kind covers arrivals, edits and deletions alike.
+/// Replayed as synthetic events rather than handled directly so they go through
+/// exactly the filtering an ordinary event gets — ignore rules, the exclude
+/// list, the index directory, new-subtree subscription. The kind is
+/// reconstructed from the flag recorded with each path so the directory gate
+/// still holds; beyond that gate, creations and modifications take the same
+/// route, and `handle_fs_event` decides removal from whether the path still
+/// exists, so one kind of each class covers arrivals, edits and deletions
+/// alike.
 ///
 /// The caller must *not* hold `snapshot_gate`; `handle_fs_event` takes it.
 fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
     let deferred = match state.deferred_events.lock() {
-        // Leaves `Some(empty)` behind, so anything deferred by a later build
-        // (a reconcile sets `indexing` again) is collected from scratch.
-        Ok(mut guard) => guard.replace(std::collections::HashSet::new()),
+        // Leaves an empty map behind, so anything deferred by a later build
+        // (a reconcile sets `indexing` again) is collected from scratch. The
+        // caller has already waited out `indexing`, and `defer_events_during_
+        // build` re-reads it under this same lock, so nothing can be inserted
+        // into the old map after this point.
+        Ok(mut guard) => guard.replace(std::collections::HashMap::new()),
         Err(_) => return,
     };
     let Some(paths) = deferred else {
@@ -2541,12 +2640,19 @@ fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
 
     let start = Instant::now();
     let count = paths.len();
-    for path in paths {
+    for (path, introduces_dir) in paths {
+        let kind = if introduces_dir {
+            EventKind::Create(notify::event::CreateKind::Any)
+        } else {
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            ))
+        };
         handle_fs_event(
             state,
             root,
             &Event {
-                kind: EventKind::Create(notify::event::CreateKind::Any),
+                kind,
                 paths: vec![path],
                 attrs: Default::default(),
             },
@@ -2664,8 +2770,11 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     // progress. The indexer will pick up those files itself — but only for the
     // parts of the tree it has not reached yet, so remember these and replay
     // them once it publishes.
-    if state.indexing.load(Ordering::SeqCst) {
-        defer_events_during_build(state, event);
+    //
+    // The load is a fast path that keeps the mutex out of the common case; the
+    // decision is made under the lock, since the build can finish between the
+    // two and an event deferred after that is never replayed.
+    if state.indexing.load(Ordering::SeqCst) && defer_events_during_build(state, event) {
         return;
     }
 
@@ -2822,6 +2931,37 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
     }
 }
 
+/// Whether a failure to open a path establishes that it does not belong in the
+/// index, as opposed to merely being unreadable right now.
+///
+/// The distinction decides whether the watcher drops what it has indexed. A
+/// path that is gone, or that cannot be reached without traversing a symlink,
+/// is genuinely ineligible and the entry has to go. A path that is locked,
+/// unreadable, or lost to a descriptor limit is none of those things — dropping
+/// on that would evict live content because a build held the file open for a
+/// moment, and the stale path deliberately keeps unreadable files and retries
+/// them later.
+fn proves_ineligible(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+
+    // `InvalidInput` and `NotADirectory` are what `open_within_root` itself
+    // returns for a path that escapes the root, has a non-literal component, or
+    // runs through something that is not a directory.
+    if matches!(
+        error.kind(),
+        ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::InvalidInput
+    ) {
+        return true;
+    }
+    // A symlink met under `O_NOFOLLOW`, at any level. Not yet a stable
+    // `ErrorKind`, so it has to be read from the raw code.
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    false
+}
+
 /// Open a file without following a final symlink, so the handle is the path
 /// itself rather than wherever it points.
 ///
@@ -2898,13 +3038,80 @@ fn open_within_root(root: &Path, path: &Path) -> std::io::Result<std::fs::File> 
     Ok(std::fs::File::from(dir))
 }
 
-/// As above. Windows has no `openat`, so the ancestors are checked by path
-/// instead of by handle: this rejects a symlink or junction that is actually
-/// there, but not one substituted between the check and the open. Closing that
-/// window needs handle-relative opens (`NtCreateFile` with a `RootDirectory`),
-/// which is a great deal of unsafe code for a platform where creating a symlink
-/// needs a privilege the machine does not grant by default.
-#[cfg(not(unix))]
+/// As above. Windows has no `openat`, so containment is established after the
+/// fact instead of during resolution: the file is opened without following a
+/// final reparse point, and the *handle* is then asked where it actually ended
+/// up. Anything that is not under the root's own resolved path is refused.
+///
+/// This is race-free in the way that matters. Checking each ancestor by path
+/// first would only reject a junction that happened to be there at the time of
+/// the check — one substituted between the check and the open would still be
+/// followed. Asking the handle removes the second lookup entirely: whatever the
+/// open resolved through, the answer describes the object we are actually
+/// holding.
+#[cfg(windows)]
+fn open_within_root(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
+    use std::io::{Error, ErrorKind};
+
+    // Rejects escapes and non-literal components before anything is opened.
+    relative_components(root, path)?;
+    let file = open_no_follow(path)?;
+
+    // The root's own resolved path, since it may itself sit under a junction or
+    // a substituted drive — comparing against the path as given would then
+    // reject every file in the tree. `canonicalize` is the same
+    // `GetFinalPathNameByHandleW` query underneath, so the two agree on
+    // verbatim prefix and casing.
+    let anchor = std::fs::canonicalize(root)?;
+    let opened = final_path_of(&file)?;
+    if !opened.starts_with(&anchor) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "path resolves outside the served root",
+        ));
+    }
+    Ok(file)
+}
+
+/// Where an open handle actually is, with every reparse point on the way
+/// resolved.
+#[cfg(windows)]
+fn final_path_of(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    let handle = file.as_raw_handle() as isize;
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: `handle` is a live file handle borrowed from `file`, and the
+        // buffer's length is passed as its capacity in `u16`s.
+        let needed = unsafe {
+            GetFinalPathNameByHandleW(
+                handle as _,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if needed == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // The return value excludes the NUL when it fits and includes it when
+        // it does not, so a value at or past the capacity means "too small".
+        if (needed as usize) < buf.len() {
+            buf.truncate(needed as usize);
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+        }
+        buf.resize(needed as usize + 1, 0);
+    }
+}
+
+/// A fallback for platforms that are neither unix nor Windows, where there is
+/// no way to do better than refusing a link that is actually there.
+#[cfg(not(any(unix, windows)))]
 fn open_within_root(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
     use std::io::{Error, ErrorKind};
 
@@ -2913,8 +3120,6 @@ fn open_within_root(root: &Path, path: &Path) -> std::io::Result<std::fs::File> 
     for component in &components[..components.len() - 1] {
         walked.push(component);
         let meta = std::fs::symlink_metadata(&walked)?;
-        // `is_symlink` covers junctions too: both are reparse points tagged as
-        // name surrogates, which is what std tests for.
         if meta.file_type().is_symlink() {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
@@ -2982,11 +3187,20 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // metadata we judged it by, or put it outside the tree we serve.
     let file = match open_within_root(&state.root, path) {
         Ok(f) => f,
-        Err(_) => {
-            // Includes the ELOOP that a symlink gets on unix. It may still be
-            // a path we indexed before it became one, so fall through to the
-            // drop rather than returning.
+        Err(e) if proves_ineligible(&e) => {
+            // Gone, or not a regular file reachable without traversing a link.
+            // It may still be a path we indexed before it became one, so fall
+            // through to the drop rather than returning.
             drop_indexed_file(state, rel_path, "no longer eligible");
+            return;
+        }
+        Err(_) => {
+            // A permission error, a Windows sharing violation, a descriptor
+            // limit — none of which say anything about whether the file
+            // belongs in the index. Dropping on those would evict live content
+            // because a build held the file open for a moment. The stale path
+            // already treats unreadable files this way, keeping what it has and
+            // retrying later, and the watcher should not disagree with it.
             return;
         }
     };
@@ -3619,7 +3833,12 @@ fn refresh_stale_locked(
     // event can observe the matcher before this function returns either way.
     // The caller's walk started before this publish; its timestamp is what the
     // recovery scan needs, so the one the subscription sync derives is dropped.
-    *newly_watched = publish_ignore_matcher(state, root, build_stale_matcher(state, root, &walk));
+    *newly_watched = publish_ignore_matcher(
+        state,
+        root,
+        build_stale_matcher(state, root, &walk),
+        ignore_sources_of(root, &walk.gitignore_files, &walk.ignore_files),
+    );
 
     if walk.skipped_error > 0 {
         eprintln!(
@@ -3870,7 +4089,12 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         // than skipped: the scan waits out `indexing` and then costs one
         // `metadata` call per file, since the stamps this build just wrote
         // describe the index exactly.
-        newly_watched = publish_ignore_matcher(state, root, matcher);
+        newly_watched = publish_ignore_matcher(
+            state,
+            root,
+            matcher,
+            ignore_sources_of(root, &outcome.gitignore_files, &outcome.ignore_files),
+        );
         eprintln!(
             "[trace] gitignore matcher built from {} file(s) in {:.1}ms{}",
             outcome.gitignore_files.len(),
@@ -3980,7 +4204,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         // the build's results nor any event. The scan waits for the build to
         // finish before looking, because until then the stamps describe
         // nothing and every file would read as changed.
-        newly_watched = publish_ignore_matcher(state, root, matcher);
+        newly_watched = publish_ignore_matcher(
+            state,
+            root,
+            matcher,
+            ignore_sources_of(root, &walk.gitignore_files, &walk.ignore_files),
+        );
         eprintln!(
             "[trace] gitignore matcher built from index walk in {:.1}ms \
              ({} .gitignore + {} .ignore files{})",
@@ -4748,8 +4977,9 @@ mod tests {
             gitignore_pending: std::sync::atomic::AtomicBool::new(true),
             ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
             ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+            ignore_sources: RwLock::new(Vec::new()),
             reindex_lock: Mutex::new(()),
-            deferred_events: Mutex::new(Some(std::collections::HashSet::new())),
+            deferred_events: Mutex::new(Some(std::collections::HashMap::new())),
             index_progress: std::sync::atomic::AtomicU64::new(0),
             index_total: std::sync::atomic::AtomicU64::new(0),
             watch_enabled: true,
@@ -5611,13 +5841,16 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let index_dir = root.join(".tgrep");
         let state = test_server_state(&root, &index_dir);
+        // The function only defers while a build is running; it now reports
+        // back so the caller can handle an event that arrived after one ended.
+        state.indexing.store(true, Ordering::SeqCst);
 
         let small = Event {
             kind: EventKind::Create(notify::event::CreateKind::Any),
             paths: vec![root.join("a.rs")],
             attrs: Default::default(),
         };
-        defer_events_during_build(&state, &small);
+        assert!(defer_events_during_build(&state, &small));
         assert_eq!(
             state
                 .deferred_events
@@ -5636,14 +5869,14 @@ mod tests {
                 .collect(),
             attrs: Default::default(),
         };
-        defer_events_during_build(&state, &flood);
+        assert!(defer_events_during_build(&state, &flood));
         assert!(
             state.deferred_events.lock().unwrap().is_none(),
             "an overflowing burst must mark the buffer unusable, not truncate it"
         );
 
         // And stays given up on, rather than resuming a partial record.
-        defer_events_during_build(&state, &small);
+        assert!(defer_events_during_build(&state, &small));
         assert!(state.deferred_events.lock().unwrap().is_none());
     }
 
@@ -5694,6 +5927,125 @@ mod tests {
                 .as_ref()
                 .is_some_and(|p| p.is_empty()),
             "the buffer must be drained, and left usable for the next build"
+        );
+    }
+
+    /// A metadata-only change to a directory is not a claim that anything new
+    /// is under it. Replaying every deferred path as a creation would turn a
+    /// recursive `chmod` during a build into one subtree walk per directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_deferred_metadata_change_does_not_replay_as_a_subtree_arrival() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let dir = root.join("vendor");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("deep.rs"), "fn deep() {}\n").unwrap();
+
+        state.indexing.store(true, Ordering::SeqCst);
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Metadata(
+                    notify::event::MetadataKind::Permissions,
+                )),
+                paths: vec![dir.clone()],
+                attrs: Default::default(),
+            },
+        );
+        assert_eq!(
+            state
+                .deferred_events
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get(&dir),
+            Some(&false),
+            "a metadata modify must not be recorded as introducing a directory"
+        );
+
+        state.indexing.store(false, Ordering::SeqCst);
+        replay_deferred_events(&state, &root);
+
+        // The replay reconstructs a modify, which stops at the directory gate.
+        // Had it reconstructed a create, `watch_new_subtree` would have walked
+        // in and indexed the file below.
+        assert!(
+            !state.index.read().unwrap().live.has_path("vendor/deep.rs"),
+            "a metadata modify must not trigger a subtree walk on replay"
+        );
+    }
+
+    /// A file that cannot be opened right now is not a file that stopped
+    /// belonging in the index. Evicting on a transient error would drop live
+    /// content because something else held the file open for a moment.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_keeps_its_indexed_content() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let path = root.join("locked.rs");
+        std::fs::write(&path, "fn readable() {}\n").unwrap();
+        reindex_file(&state, &path, "locked.rs");
+        assert!(state.index.read().unwrap().live.has_path("locked.rs"));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            // Running as root, where the mode is advisory. Nothing to test.
+            return;
+        }
+        reindex_file(&state, &path, "locked.rs");
+
+        assert!(
+            !state.index.read().unwrap().live.is_deleted("locked.rs"),
+            "an unreadable file must keep what was already indexed for it"
+        );
+    }
+
+    /// Deleting an ignore file is invisible to a scan that looks for *arrivals*
+    /// by mtime, and leaves rules in force whose source is gone — so the
+    /// published sources are checked directly.
+    #[cfg(unix)]
+    #[test]
+    fn a_recovery_scan_notices_an_ignore_file_that_was_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        // Published as a source, then removed behind the matcher's back.
+        let rules = root.join(".gitignore");
+        std::fs::write(&rules, "build/\n").unwrap();
+        *state.ignore_sources.write().unwrap() = vec![rules.clone()];
+        std::fs::remove_file(&rules).unwrap();
+
+        std::fs::write(root.join("kept.rs"), "fn kept() {}\n").unwrap();
+        // Pretend a refresh worker is already running, so the scan's request
+        // for one is coalesced into it instead of spawning a real rewalk that
+        // would race the assertions below.
+        state.ignore_refresh_scheduled.store(true, Ordering::SeqCst);
+        reindex_files_in(&state, &root, &[root.clone()], SystemTime::UNIX_EPOCH);
+
+        assert!(
+            state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "a vanished ignore source must schedule a refresh"
+        );
+        assert!(
+            !state.index.read().unwrap().live.has_path("kept.rs"),
+            "the scan must abandon rather than index under rules it knows are stale"
         );
     }
 

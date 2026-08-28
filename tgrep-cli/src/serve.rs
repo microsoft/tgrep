@@ -6316,11 +6316,14 @@ mod tests {
         );
     }
 
-    /// The whole point of the bound: a file past the cap loses what the index
-    /// held for it rather than keeping a stale, smaller copy.
+    /// The size gate is checked against a fresh stat on every visit, so a file
+    /// that outgrew the cap since it was indexed loses what the index holds
+    /// rather than keeping the smaller version until the reconcile. (The
+    /// growth this pins is between visits — growth *during* a read is what
+    /// `read_within_limit` above covers.)
     #[cfg(unix)]
     #[test]
-    fn a_file_that_outgrows_the_cap_loses_its_indexed_content() {
+    fn a_file_that_outgrew_the_cap_between_visits_loses_its_indexed_content() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let index_dir = root.join(".tgrep");

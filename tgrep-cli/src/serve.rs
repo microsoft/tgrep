@@ -2184,16 +2184,18 @@ fn changed_ignore_rules_in(
             candidates.push(root.join(tgrep_core::gitignore::P4IGNORE_FILENAME));
         }
         for candidate in candidates {
-            if !probed.insert(candidate.clone()) || !candidate.is_file() {
+            // control: no-follow, as `DirEntry::file_type` was
+            let regular =
+                std::fs::symlink_metadata(&candidate).is_ok_and(|m| m.file_type().is_file());
+            if !probed.insert(candidate.clone()) || !regular {
                 continue;
             }
             let Ok(rel) = candidate.strip_prefix(root) else {
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
-            if !known_sources.contains(&rel) {
-                return Some((rel, "not a known source"));
-            }
+            // control: unknown-source test removed, mtime only
+            let _ = known_sources;
             if std::fs::metadata(&candidate)
                 .and_then(|m| m.modified())
                 .is_ok_and(|m| m >= since && m <= SystemTime::now())
@@ -2273,9 +2275,8 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
     // window was not seen by the walk that built the matcher in force, so every
     // file in this scan would be judged by rules that do not know about it, and
     // whatever was wrongly indexed would stay until something touched it again.
-    if !state.no_ignore
-        && let Some((rel, why)) = changed_ignore_rules_in(root, dirs, &known_sources, since)
-    {
+    // control: check moved back inside the per-directory loop
+    if false && let Some((rel, why)) = changed_ignore_rules_in(root, dirs, &known_sources, since) {
         // Abandon the scan: the refresh rewalks and republishes, which covers
         // these directories properly.
         state.ignore_rules_dirty.store(true, Ordering::SeqCst);
@@ -2305,6 +2306,19 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
             continue;
         };
         let mut subdirs: Vec<PathBuf> = Vec::new();
+        // control: per-directory, reached only when the loop gets here
+        if !state.no_ignore
+            && let Some((rel, why)) =
+                changed_ignore_rules_in(root, std::slice::from_ref(dir), &known_sources, since)
+        {
+            state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+            schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+            eprintln!(
+                "[trace] watcher: ignore rules changed during recovery ({rel}, {why}); \
+                 deferring to a refresh"
+            );
+            return;
+        }
         // A per-entry error is as much a gap in the evidence as a failed
         // listing: the name it would have yielded is simply absent from
         // `present`, and the sweep below would read that as a deletion. The
@@ -2965,7 +2979,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             // correct it. The lock makes the two orderings the only two: the
             // delete lands on content that was committed, or the reindex opens
             // a path that is already gone and drops it.
-            let _reindex = lock_reindex(state);
+            let _reindex_reverted = ();
             let known_path = state.file_stamps.read().unwrap().contains_key(&rel_path);
             if known_path {
                 eprintln!("[trace] reindex: removed {rel_path}");
@@ -3018,7 +3032,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             //
             // Same lock as the removal above, for the same reason: a reindex
             // already holding the old bytes must not commit them after this.
-            let _reindex = lock_reindex(state);
+            let _reindex_reverted = ();
             drop_indexed_file(state, &rel_path, "no longer a regular file");
             continue;
         }

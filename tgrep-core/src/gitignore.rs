@@ -447,7 +447,36 @@ pub struct CaseInsensitiveIgnore {
     /// Loaded on the first path this matcher actually claims, which for most
     /// repositories is never. Reading it costs 163 ms and ~30 MB on a
     /// 299k-file repository, and nothing at all if no rule ever matches.
-    tracked: std::sync::OnceLock<Option<crate::git_index::TrackedFiles>>,
+    ///
+    /// Reloaded when the index it was read from changes. A walk builds this
+    /// matcher, uses it and drops it, so a snapshot would do; the file watcher
+    /// holds one for the life of the server, and there a `git add -f` or a
+    /// `git rm --cached` rewrites only `.git/index` — which is hidden, so no
+    /// ignore source changes and nothing republishes the matcher. Frozen, the
+    /// exemption would keep answering from the tracked set as it stood at
+    /// startup, and the watcher would disagree with a fresh walk about which
+    /// files exist until the hourly reconcile.
+    tracked: std::sync::RwLock<TrackedCache>,
+}
+
+/// The tracked-file set, together with the identity of the index it came from.
+#[derive(Default)]
+struct TrackedCache {
+    /// `None` until something is loaded; `Some` even when the load failed, so
+    /// an unreadable index is not retried on every path.
+    loaded_from: Option<Option<(std::time::SystemTime, u64)>>,
+    tracked: Option<crate::git_index::TrackedFiles>,
+}
+
+/// Modification time and length of the index, which is what identifies it.
+///
+/// git replaces the index by renaming `index.lock` over it, so any rewrite
+/// lands as a new mtime — the same pair git's own racy-index handling relies
+/// on. Two rewrites inside one filesystem mtime tick that leave the length
+/// unchanged are the gap, and the periodic reconcile is what closes it.
+fn index_identity(repo_root: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(crate::git_index::index_path(repo_root)?).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 impl CaseInsensitiveIgnore {
@@ -501,7 +530,7 @@ impl CaseInsensitiveIgnore {
         Some(Self {
             matcher,
             repo_root,
-            tracked: std::sync::OnceLock::new(),
+            tracked: std::sync::RwLock::new(TrackedCache::default()),
         })
     }
 
@@ -518,21 +547,45 @@ impl CaseInsensitiveIgnore {
             return false;
         }
         // Only now is the index worth reading.
-        let Some(tracked) = self
-            .tracked
-            .get_or_init(|| crate::git_index::load_tracked(&self.repo_root))
-        else {
-            // No readable index means no way to tell tracked from untracked.
-            // Excluding could hide real source, so decline instead.
+        let relative = relative.to_string_lossy();
+        self.tracked_hides(&relative, is_dir)
+    }
+
+    /// Whether the tracked-file set leaves `relative` hidden.
+    ///
+    /// `false` when the index cannot be read: with no way to tell tracked from
+    /// untracked, excluding could hide real source, so it declines instead.
+    fn tracked_hides(&self, relative: &str, is_dir: bool) -> bool {
+        let identity = index_identity(&self.repo_root);
+        {
+            let cache = self.tracked.read().unwrap();
+            if cache.loaded_from.as_ref() == Some(&identity) {
+                return Self::hides(cache.tracked.as_ref(), relative, is_dir);
+            }
+        }
+        let mut cache = self.tracked.write().unwrap();
+        // Another thread may have reloaded it while this one waited.
+        if cache.loaded_from.as_ref() != Some(&identity) {
+            cache.tracked = crate::git_index::load_tracked(&self.repo_root);
+            cache.loaded_from = Some(identity);
+        }
+        Self::hides(cache.tracked.as_ref(), relative, is_dir)
+    }
+
+    fn hides(
+        tracked: Option<&crate::git_index::TrackedFiles>,
+        relative: &str,
+        is_dir: bool,
+    ) -> bool {
+        let Some(tracked) = tracked else {
             return false;
         };
-        let relative = relative.to_string_lossy();
         if is_dir {
             // A rule matching a directory does not hide tracked files inside
             // it, so the walk still has to descend.
-            !tracked.contains_any_under(&relative)
+            !tracked.contains_any_under(relative)
         } else {
-            !tracked.contains(&relative)
+            !tracked.contains(relative)
         }
     }
 }

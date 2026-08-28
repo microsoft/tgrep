@@ -2378,6 +2378,51 @@ fn watchable_dirs(
     found
 }
 
+/// The directories that must be subscribed to for the ignore sources
+/// themselves to be observable, beyond the ones the rules allow.
+///
+/// A `.gitignore` symlinked to `build/shared-rules` contributes the *target's*
+/// contents, and [`handle_fs_event`] already recognises an event naming that
+/// target rather than a name rules usually go by. But only if one arrives: on a
+/// per-directory backend nothing subscribes to `build/` when the rules hide it,
+/// so the edit that changes what the matcher enforces produces no event at all,
+/// and the matcher stays stale until the hourly reconcile — the one case where
+/// the source of the rules is invisible to the rules' own watcher.
+///
+/// One watch on the target's own directory, not its subtree: this is about
+/// seeing a single file that the matcher was built from, not about indexing
+/// anything under it. `should_skip_watcher_path` still discards everything else
+/// delivered from there, and the target itself is matched by path against the
+/// recorded stamps before any of that filtering runs.
+///
+/// Targets outside `root` are deliberately not covered. Watching them would
+/// mean subscribing outside the tree the server was asked to serve, and the
+/// periodic reconcile remains the backstop there.
+fn ignore_target_dirs(root: &Path, sources: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
+    let mut dirs = std::collections::HashSet::new();
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+        return dirs;
+    };
+    for source in sources {
+        if !std::fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        let Ok(target) = std::fs::canonicalize(source) else {
+            continue;
+        };
+        let Ok(rel) = target.strip_prefix(&canonical_root) else {
+            continue;
+        };
+        // Re-anchored on `root` as given rather than kept canonical: the
+        // registry compares paths literally, and a `\\?\` or `/private` prefix
+        // would register a second subscription for a directory already watched.
+        if let Some(parent) = root.join(rel).parent() {
+            dirs.insert(parent.to_path_buf());
+        }
+    }
+    dirs
+}
+
 /// Recompute the watcher's subscriptions against the ignore rules in force.
 ///
 /// Called when the watcher starts and every time the ignore matcher is
@@ -2407,10 +2452,14 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
     };
 
     let start = Instant::now();
-    let desired = {
+    let mut desired = {
         let gitignore = state.gitignore.read().unwrap();
         watchable_dirs(root, root, &state.exclude_dirs, gitignore.as_ref())
     };
+    if !state.no_ignore {
+        let sources = state.ignore_sources.read().unwrap();
+        desired.extend(ignore_target_dirs(root, &sources));
+    }
     let total = desired.len();
     // Consumed here, so one overflow buys one forced pass rather than making
     // every later reconcile re-register the whole tree.
@@ -3305,9 +3354,11 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     // nothing whose name does. Recognising the paths that were read, and not
     // just the names rules usually go by, is what closes that.
     //
-    // Only targets inside `root` can appear here, because only those are
-    // watched; for one outside, no event arrives at all and the periodic
-    // reconcile remains the backstop.
+    // Only targets inside `root` can appear here, and [`ignore_target_dirs`] is
+    // what makes them observable: their directory is subscribed to even when the
+    // rules hide it, precisely so this lookup has an event to run against. For a
+    // target outside the root none arrives and the periodic reconcile remains
+    // the backstop.
     let ignore_rules_changed = !state.no_ignore && {
         let stamps = state.ignore_source_stamps.read().unwrap();
         event.paths.iter().any(|path| {
@@ -3381,7 +3432,22 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             continue;
         }
 
-        let is_remove = matches!(event.kind, EventKind::Remove(_)) || !path.exists();
+        // Classified through the same contract the sweep uses, from one stat.
+        // `Path::exists` and `Path::is_file` map every metadata error to
+        // `false`, so a file held open by a build, a Windows sharing violation,
+        // or a momentary `EACCES` used to read as "gone" and "not a regular
+        // file" respectively — and both branches below then evicted content
+        // that was still perfectly valid. `reindex_file` deliberately preserves
+        // entries through exactly those failures, but it never got the chance:
+        // the drop happens here, before it is ever called.
+        let target = classify_event_target(&std::fs::metadata(path));
+        if target == EventTarget::Unknown {
+            // Unreadable right now is not proof of anything. Leave what is
+            // indexed alone; the stale path keeps such files and retries them.
+            continue;
+        }
+
+        let is_remove = matches!(event.kind, EventKind::Remove(_)) || target == EventTarget::Gone;
 
         if is_remove {
             // A watched directory that disappears takes its descriptor with
@@ -3429,7 +3495,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         // `reindex_file` below rather than here — deliberately: that is where
         // it is recognised as ineligible and any content indexed under that
         // path before it became a link is dropped.
-        if !path.is_file() {
+        if target != EventTarget::Regular {
             // `is_real_dir` rather than `is_dir`: the latter follows symlinks,
             // and a link to a directory is not something the walker descends
             // into, so subscribing to and indexing its target would pull in a
@@ -3536,6 +3602,44 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
     state.index.write().unwrap().live.delete_file(rel_path);
     if let Ok(mut cache) = state.cache.write() {
         cache.pop(rel_path);
+    }
+}
+
+/// What an event's stat result says about the path it named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventTarget {
+    /// A regular file: index it.
+    Regular,
+    /// Something that exists but is not a regular file — a directory, a fifo, a
+    /// socket, a device. Whatever was indexed under this path has to go.
+    NotRegular,
+    /// Proven not to be there: absent, unreachable except through a symlink, or
+    /// behind a component that is not a directory.
+    Gone,
+    /// Exists or not, this stat cannot say. Nothing may be concluded from it.
+    Unknown,
+}
+
+/// Classify the target of an event from a stat of its path.
+///
+/// The `Unknown` case is the point of this. `Path::exists` and `Path::is_file`
+/// fold every error into `false`, which turns "a build has this file open" and
+/// "the directory was briefly unreadable" into "it is gone" — and the watcher
+/// then evicts live content on the strength of it. [`proves_ineligible`] is the
+/// contract that separates the two, and it is the same one the recovery sweep
+/// and [`reindex_file`] answer to, so all three agree about what an I/O failure
+/// is allowed to mean.
+///
+/// The stat follows symlinks, which is deliberate: a link to a regular file is
+/// classified `Regular` here and refused by `open_within_root` in
+/// [`reindex_file`], which is where content indexed under a path that has since
+/// become a link is dropped.
+fn classify_event_target(meta: &std::io::Result<std::fs::Metadata>) -> EventTarget {
+    match meta {
+        Ok(meta) if meta.is_file() => EventTarget::Regular,
+        Ok(_) => EventTarget::NotRegular,
+        Err(error) if proves_ineligible(error) => EventTarget::Gone,
+        Err(_) => EventTarget::Unknown,
     }
 }
 
@@ -6216,6 +6320,113 @@ mod tests {
         assert!(
             rel.contains("src/fresh/keep"),
             "a root-anchored rule was applied at the wrong depth: {rel:?}"
+        );
+    }
+
+    /// A transient stat failure is not a deletion. `Path::exists` said it was,
+    /// which meant one `EACCES` — or a Windows sharing violation from a build
+    /// holding the file open — tombstoned content that was still valid, and
+    /// bypassed the preservation policy `reindex_file` applies to exactly those
+    /// errors.
+    #[test]
+    fn an_unreadable_path_is_not_treated_as_a_deletion() {
+        use std::io::{Error, ErrorKind};
+
+        let unreadable: std::io::Result<std::fs::Metadata> =
+            Err(Error::from(ErrorKind::PermissionDenied));
+        assert_eq!(
+            classify_event_target(&unreadable),
+            EventTarget::Unknown,
+            "a locked or unreadable file must leave the index alone"
+        );
+
+        // Windows reports a file opened without FILE_SHARE_* this way, and it
+        // is the single most common way a stat fails on a live repository.
+        let sharing: std::io::Result<std::fs::Metadata> = Err(Error::from_raw_os_error(32));
+        assert_eq!(classify_event_target(&sharing), EventTarget::Unknown);
+
+        // The other direction still has to work, or a real deletion is never
+        // applied.
+        let absent: std::io::Result<std::fs::Metadata> = Err(Error::from(ErrorKind::NotFound));
+        assert_eq!(classify_event_target(&absent), EventTarget::Gone);
+
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("real.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        assert_eq!(
+            classify_event_target(&std::fs::metadata(&file)),
+            EventTarget::Regular
+        );
+        assert_eq!(
+            classify_event_target(&std::fs::metadata(tmp.path())),
+            EventTarget::NotRegular
+        );
+    }
+
+    /// Create a symlink, or return `false` where the platform will not allow
+    /// one — an unprivileged Windows runner without Developer Mode.
+    fn try_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    /// The matcher reads a symlinked source through the link, so an edit to the
+    /// target changes the rules in force. `handle_fs_event` recognises an event
+    /// naming that target — but on a per-directory backend no event ever
+    /// arrived, because the directory holding it is one the rules hide and
+    /// nothing subscribed to it.
+    #[test]
+    fn a_rule_file_symlinked_into_a_hidden_directory_is_still_watched() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("build")).unwrap();
+        std::fs::write(root.join("build").join("shared-rules"), "target/\n").unwrap();
+        if !try_symlink(
+            &root.join("build").join("shared-rules"),
+            &root.join(".gitignore"),
+        ) {
+            return;
+        }
+
+        let sources = vec![root.join(".gitignore")];
+        let dirs = ignore_target_dirs(root, &sources);
+
+        assert!(
+            dirs.contains(&root.join("build")),
+            "the directory holding a rule file the matcher read must be watched \
+             even when the rules hide it: {dirs:?}"
+        );
+    }
+
+    /// A source that is a plain file needs nothing extra, and one whose target
+    /// is outside the root must not pull a subscription outside the tree the
+    /// server was asked to serve.
+    #[test]
+    fn ordinary_and_outside_rule_files_add_no_subscriptions() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        assert!(ignore_target_dirs(root, &[root.join(".gitignore")]).is_empty());
+
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("rules"), "target/\n").unwrap();
+        if !try_symlink(&outside.path().join("rules"), &root.join(".ignore")) {
+            return;
+        }
+        assert!(
+            ignore_target_dirs(root, &[root.join(".ignore")]).is_empty(),
+            "a target outside the root must not be subscribed to"
         );
     }
 

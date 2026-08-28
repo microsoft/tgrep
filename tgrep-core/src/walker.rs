@@ -1472,6 +1472,40 @@ mod tests {
         assert!(!matcher.is_ignored(Path::new("src/Gone.TXT"), false));
     }
 
+    /// The exemption is answered from a cached read of `.git/index`. A walk
+    /// builds this matcher and drops it, so a snapshot would do — but the file
+    /// watcher holds one for the life of the server, and `git add -f` rewrites
+    /// only the index, which is hidden. No ignore source changes, nothing
+    /// republishes the matcher, and a frozen cache would keep hiding a file
+    /// that git now tracks until the hourly reconcile.
+    #[test]
+    fn the_tracked_exemption_reloads_when_the_git_index_changes() {
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let root = dir.path();
+        let matcher = crate::gitignore::matcher_from_ignore_paths(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+        )
+        .expect("the fixture has rules");
+
+        // Untracked, and `*.txt` matches it once case is ignored.
+        assert!(matcher.is_ignored(Path::new("src/Gone.TXT"), false));
+
+        fake_git_repo(root, true, &["src/main.rs", "src/Kept.TXT", "src/Gone.TXT"]);
+
+        assert!(
+            !matcher.is_ignored(Path::new("src/Gone.TXT"), false),
+            "a file git now tracks must stop being hidden without rebuilding \
+             the matcher"
+        );
+
+        // And back: `git rm --cached` is the same problem in reverse, where a
+        // stale cache keeps indexing a file the walk has started hiding.
+        fake_git_repo(root, true, &["src/main.rs"]);
+        assert!(matcher.is_ignored(Path::new("src/Kept.TXT"), false));
+    }
+
     #[test]
     fn no_ignore_turns_the_whole_thing_off() {
         let dir = ignorecase_fixture(true, &["src/main.rs"]);

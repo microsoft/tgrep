@@ -1928,6 +1928,34 @@ impl WatchRegistry {
             }
             match self.watcher.watch(dir, RecursiveMode::NonRecursive) {
                 Ok(()) => {
+                    // notify's inotify backend registers without
+                    // `IN_DONT_FOLLOW`, so the descriptor lands on whatever the
+                    // name resolves to at that instant — and the no-follow
+                    // check that qualified this directory happened earlier, in
+                    // the walk. A checkout or a rename can replace it with a
+                    // symlink in between, leaving the descriptor watching an
+                    // inode outside the root while `watched` records an
+                    // in-root name as covered.
+                    //
+                    // Re-checking after the fact catches that: if the name is
+                    // no longer a real directory, the registration is undone
+                    // and the entry is not recorded, so a later `sync` retries
+                    // it rather than treating a poisoned subscription as live.
+                    //
+                    // This narrows the window rather than closing it — notify
+                    // takes a path, not a handle, so a swap that is reverted
+                    // before this check is undetectable through its API. What
+                    // that costs is bounded: it is missed *events* on a real
+                    // directory, which the periodic reconcile picks up, and
+                    // never misplaced content, since `open_within_root`
+                    // establishes containment from the handle it reads.
+                    if !is_real_dir(dir) {
+                        let _ = self.watcher.unwatch(dir);
+                        if known {
+                            self.watched.remove(dir);
+                        }
+                        continue;
+                    }
                     if !known {
                         self.watched.insert(dir.clone());
                         added.push(dir.clone());
@@ -2178,7 +2206,17 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
             continue;
         };
         let mut subdirs: Vec<PathBuf> = Vec::new();
-        for entry in entries.flatten() {
+        // A per-entry error is as much a gap in the evidence as a failed
+        // listing: the name it would have yielded is simply absent from
+        // `present`, and the sweep below would read that as a deletion. The
+        // entry is skipped either way, but the directory then does not get to
+        // claim it was enumerated.
+        let mut listing_complete = true;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                listing_complete = false;
+                continue;
+            };
             let path = entry.path();
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
@@ -2249,7 +2287,9 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
                 reindex_file(state, &path, &rel);
             }
         }
-        swept.insert(rel_dir);
+        if listing_complete {
+            swept.insert(rel_dir);
+        }
 
         // A directory created in the same window is in neither `dirs` (the
         // walk did not see it) nor any event (its parent's subscription is
@@ -2861,27 +2901,37 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         // it is recognised as ineligible and any content indexed under that
         // path before it became a link is dropped.
         if !path.is_file() {
-            // Only for events that can actually introduce a directory. Any
-            // `Modify` would include `Modify(Metadata)`, which a recursive
-            // chmod or a checkout fires once per directory — and each one
-            // would re-walk and re-subscribe that directory's whole subtree
-            // on the single watcher worker, turning a linear operation into
-            // quadratic work. inotify announces a new directory as `Create`
-            // and one moved in as `Modify(Name)`; nothing else can.
-            let introduces_dir = matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
-            );
             // `is_real_dir` rather than `is_dir`: the latter follows symlinks,
             // and a link to a directory is not something the walker descends
             // into, so subscribing to and indexing its target would pull in a
             // tree the index never contained — possibly outside `root`.
-            if PER_DIRECTORY_WATCHES && introduces_dir && is_real_dir(path) {
-                // With non-recursive subscriptions notify will not extend the
-                // watch set for us, so a directory that just appeared — and
-                // anything already inside it — has to be picked up here.
-                watch_new_subtree(state, root, path);
+            if is_real_dir(path) {
+                // Only for events that can actually introduce a directory. Any
+                // `Modify` would include `Modify(Metadata)`, which a recursive
+                // chmod or a checkout fires once per directory — and each one
+                // would re-walk and re-subscribe that directory's whole subtree
+                // on the single watcher worker, turning a linear operation into
+                // quadratic work. inotify announces a new directory as `Create`
+                // and one moved in as `Modify(Name)`; nothing else can.
+                let introduces_dir = matches!(
+                    event.kind,
+                    EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                );
+                if PER_DIRECTORY_WATCHES && introduces_dir {
+                    // With non-recursive subscriptions notify will not extend
+                    // the watch set for us, so a directory that just appeared —
+                    // and anything already inside it — has to be picked up here.
+                    watch_new_subtree(state, root, path);
+                }
+                continue;
             }
+            // Neither a regular file nor a directory: a fifo, a socket, a
+            // device, or a symlink of any kind. An indexed `x.rs` atomically
+            // replaced by one of those is not a removal — `path.exists()` is
+            // still true and inotify may report only the rename destination —
+            // so nothing above catches it, and without this the old contents
+            // stay searchable indefinitely.
+            drop_indexed_file(state, &rel_path, "no longer a regular file");
             continue;
         }
 
@@ -6051,6 +6101,85 @@ mod tests {
         assert!(
             !state.index.read().unwrap().live.has_path("kept.rs"),
             "the scan must abandon rather than index under rules it knows are stale"
+        );
+    }
+
+    /// A directory whose listing was only partly enumerated has not proved
+    /// anything about the names it did not yield, so the sweep must not treat
+    /// them as deleted.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_was_not_fully_enumerated_is_not_swept() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+
+        let path = root.join("d").join("a.rs");
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+        reindex_file(&state, &path, "d/a.rs");
+        assert!(state.index.read().unwrap().live.has_path("d/a.rs"));
+
+        // What `reindex_files_in` produces when an entry in `d` failed to
+        // enumerate: the file is missing from `present`, and `d` is therefore
+        // withheld from `swept`.
+        let swept = std::collections::HashSet::new();
+        let present = std::collections::HashSet::new();
+        sweep_removed_files(&state, &swept, &present);
+        assert!(
+            !state.index.read().unwrap().live.is_deleted("d/a.rs"),
+            "an unenumerated directory must not tombstone the files under it"
+        );
+
+        // And with the listing complete, the same absence is a deletion.
+        let swept = std::collections::HashSet::from(["d".to_string()]);
+        sweep_removed_files(&state, &swept, &present);
+        assert!(
+            state.index.read().unwrap().live.is_deleted("d/a.rs"),
+            "a fully enumerated directory must sweep what it no longer contains"
+        );
+    }
+
+    /// An indexed file replaced in place by something that is not a regular
+    /// file is not a removal — the path still exists — but its contents are no
+    /// longer there to be found.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_replaced_by_a_fifo_loses_its_indexed_content() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let path = root.join("x.rs");
+        std::fs::write(&path, "fn was_a_real_file() {}\n").unwrap();
+        reindex_file(&state, &path, "x.rs");
+        assert!(state.index.read().unwrap().live.has_path("x.rs"));
+
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::To,
+                )),
+                paths: vec![path.clone()],
+                attrs: Default::default(),
+            },
+        );
+
+        assert!(
+            state.index.read().unwrap().live.is_deleted("x.rs"),
+            "content indexed before the path became a fifo must not stay searchable"
         );
     }
 

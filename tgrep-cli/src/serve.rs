@@ -1784,7 +1784,7 @@ const PER_DIRECTORY_WATCHES: bool = cfg!(any(target_os = "linux", target_os = "a
 /// one as a directory would subscribe to and index its target — possibly a tree
 /// outside `root` entirely, and possibly a cycle.
 fn is_real_dir(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
 }
 
 /// The watcher plus the set of directories it is currently subscribed to.

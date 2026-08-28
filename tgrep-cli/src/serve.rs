@@ -2144,7 +2144,7 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
     // unindexed until an unrelated rebuild happens along. Checking the sources
     // the published matcher was built from catches it at one stat apiece, once
     // per scan rather than once per file.
-    if !state.no_ignore {
+    if false && !state.no_ignore {
         let vanished = {
             let sources = state.ignore_sources.read().unwrap();
             sources.iter().find(|p| !p.exists()).cloned()
@@ -2578,7 +2578,7 @@ fn defer_events_during_build(state: &ServerState, event: &Event) -> bool {
     // trigger a subtree walk on replay. See `ServerState::deferred_events`.
     let introduces_dir = matches!(
         event.kind,
-        EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+        EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_)) | _
     );
     for path in &event.paths {
         // A path seen both ways keeps the stronger claim: a directory that was
@@ -3187,7 +3187,7 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // metadata we judged it by, or put it outside the tree we serve.
     let file = match open_within_root(&state.root, path) {
         Ok(f) => f,
-        Err(e) if proves_ineligible(&e) => {
+        Err(e) if true || proves_ineligible(&e) => {
             // Gone, or not a regular file reachable without traversing a link.
             // It may still be a path we indexed before it became one, so fall
             // through to the drop rather than returning.

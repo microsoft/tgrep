@@ -299,15 +299,16 @@ struct ServerState {
     /// until something else forces a rebuild. Keeping the source list lets the
     /// scan test for it directly, at one stat per ignore file per scan.
     ignore_sources: RwLock<Vec<PathBuf>>,
-    /// What the published matcher actually read, per ignore source: the size
-    /// and mtime each file had, keyed by its path relative to `root`.
+    /// What the published matcher actually read, per ignore source: a hash of
+    /// the bytes, keyed by the file's path relative to `root`.
     ///
-    /// A pathname is not evidence about contents. An existing `.gitignore` can
-    /// be replaced after the matcher walk by one restored from an archive,
-    /// carrying an mtime older than the scan window — the path is still a known
-    /// source and the mtime still predates the window, so neither test in
-    /// [`changed_ignore_rules_in`] fires and the subtree is indexed under rules
-    /// that were never read. Comparing against what was read closes that.
+    /// A pathname is not evidence about contents, and neither is metadata. An
+    /// existing `.gitignore` can be replaced after the matcher was built by one
+    /// restored from an archive — same length, mtime preserved by the restore,
+    /// so the path is still a known source and nothing about its metadata has
+    /// moved. Neither test in [`changed_ignore_rules_in`] would fire, and the
+    /// subtree would be indexed under rules that were never read. Comparing
+    /// against what was read closes that.
     ///
     /// Also holds an entry for the target of any source reached through a
     /// symlink, when that target is itself under `root`. Following links is
@@ -819,9 +820,34 @@ fn build_stale_matcher(
     matcher
 }
 
-/// The size and mtime an ignore source had when the matcher read it, keyed by
-/// its path relative to the served root.
-type IgnoreStamps = std::collections::HashMap<String, (u64, Option<SystemTime>)>;
+/// What an ignore source contained when the matcher read it: its length and a
+/// hash of its bytes, keyed by its path relative to the served root.
+///
+/// A digest rather than metadata, because metadata does not answer the
+/// question. `rsync -a`, `tar -x` and a restore from an archive all preserve
+/// mtime, and two different sets of rules can easily be the same number of
+/// bytes — at which point a size-and-mtime pair is identical across a
+/// replacement and the scan accepts a matcher built from rules that are gone.
+///
+/// Never persisted, so the hash only has to be stable within a run.
+type IgnoreStamps = std::collections::HashMap<String, (u64, u64)>;
+
+/// The length and content hash of `path`, following links.
+///
+/// `None` when it cannot be read, which is treated as "not what was read":
+/// a source that has become unreadable has stopped contributing the rules the
+/// matcher is enforcing, and that is a change.
+fn ignore_digest_of(path: &Path) -> Option<(u64, u64)> {
+    use std::hash::{Hash, Hasher};
+
+    // The whole file, as the matcher builder reads it. These are rule files:
+    // a few hundred bytes each in practice, and already in the page cache from
+    // the walk that found them.
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some((bytes.len() as u64, hasher.finish()))
+}
 
 /// How far an mtime may lag the write it records.
 ///
@@ -853,13 +879,18 @@ fn ignore_sources_of(
     sources
 }
 
-/// Stat every source so a later scan can ask whether the file it finds is the
+/// Read every source so a later scan can ask whether the file it finds is the
 /// one the matcher read, rather than merely whether something of that name is
 /// there.
 ///
 /// A source reached through a symlink gets a second entry under its target's
-/// own relative path, when the target is under `root`. The stat follows links
+/// own relative path, when the target is under `root`. The read follows links
 /// either way, so both entries describe the contents that were read.
+///
+/// Taken here rather than inside the matcher builder because the `ignore`
+/// crate opens these files itself and does not hand back what it read. That
+/// leaves a window between its read and this one, which is what the mtime test
+/// in [`changed_ignore_rules_in`] is for.
 fn ignore_stamps_of(root: &Path, sources: &[PathBuf]) -> IgnoreStamps {
     let canonical_root = std::fs::canonicalize(root).ok();
     let mut stamps = IgnoreStamps::with_capacity(sources.len());
@@ -868,9 +899,8 @@ fn ignore_stamps_of(root: &Path, sources: &[PathBuf]) -> IgnoreStamps {
             return;
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
-        // Follows links: what matters is the content behind the name.
-        if let Ok(meta) = std::fs::metadata(path) {
-            stamps.insert(rel, (meta.len(), meta.modified().ok()));
+        if let Some(digest) = ignore_digest_of(path) {
+            stamps.insert(rel, digest);
         }
     };
     for source in sources {
@@ -910,9 +940,10 @@ fn ignore_stamps_of(root: &Path, sources: &[PathBuf]) -> IgnoreStamps {
 /// read as already accounted for by rules that never saw it.
 ///
 /// `sources` are the ignore files `matcher` was built from. They are recorded
-/// so a recovery scan can notice one being deleted — which no mtime test can
-/// see, a deleted file leaving nothing to stat — and stat'd so it can also
-/// notice one being replaced, which a pathname cannot show.
+/// so a recovery scan can notice one being deleted — which no test against
+/// what is on disk can see, a deleted file leaving nothing to read — and read
+/// so it can also notice one being replaced, which neither a pathname nor a
+/// timestamp can show.
 #[must_use = "newly watched directories need a recovery scan or writes race the subscription"]
 fn publish_ignore_matcher(
     state: &ServerState,
@@ -2234,13 +2265,14 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
 /// recency test.
 ///
 /// A stamp mismatch answers the same question for a file that was *already* a
-/// source: a pathname proves nothing about contents, and the same archive
-/// restore can swap a source for a different file bearing an older mtime, which
-/// is invisible to both of the other tests.
+/// source: a pathname proves nothing about contents, and neither does
+/// metadata. `rsync -a` and `tar -x` preserve mtime, and two different sets of
+/// rules are easily the same length, so the comparison is against a hash of
+/// what was actually read.
 ///
-/// The mtime window then covers the gap the stamps cannot: they are taken when
-/// the matcher is published, which is after the walk that read these files, so
-/// a write landing between the two is recorded as if it had been read.
+/// The mtime window then covers the gap the digests cannot: they are taken
+/// when the matcher is published, which is after the builder read these files,
+/// so a write landing between the two is recorded as if it had been read.
 ///
 /// That window is widened by [`MTIME_GRANULARITY`] at the near end, because
 /// `since` is a wall-clock instant with nanosecond precision and an mtime is
@@ -2284,14 +2316,13 @@ fn changed_ignore_rules_in(
             let Some(read_as) = known_sources.get(&rel) else {
                 return Some((rel, "not a known source"));
             };
-            // Follows links, matching how the stamp was taken.
+            if ignore_digest_of(&candidate).as_ref() != Some(read_as) {
+                return Some((rel, "not the file the matcher read"));
+            }
+            // Follows links, matching how the digest was taken.
             let Ok(meta) = std::fs::metadata(&candidate) else {
                 continue;
             };
-            let current = (meta.len(), meta.modified().ok());
-            if current != *read_as {
-                return Some((rel, "not the file the matcher read"));
-            }
             if meta
                 .modified()
                 .is_ok_and(|m| m >= since && m <= SystemTime::now())
@@ -6829,6 +6860,59 @@ mod tests {
             state.index.read().unwrap().live.is_deleted("seeded.rs"),
             "a file that is gone from disk must stop answering searches whether or \
              not it had a stamp"
+        );
+    }
+
+    /// Metadata is not content either. `rsync -a` and `tar -x` preserve mtime,
+    /// and two different sets of rules are easily the same length — so a
+    /// size-and-mtime pair is identical across the replacement and only the
+    /// bytes tell them apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_rule_file_swapped_for_one_of_the_same_size_and_age_is_still_caught() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let rules = root.join(".gitignore");
+        std::fs::write(&rules, "aaa.rs\n").unwrap();
+        let before = std::fs::metadata(&rules).unwrap();
+        *state.ignore_source_stamps.write().unwrap() =
+            ignore_stamps_of(&root, std::slice::from_ref(&rules));
+        *state.ignore_sources.write().unwrap() = vec![rules.clone()];
+
+        // Different rules, same seven bytes, and the restore puts the old
+        // timestamp back.
+        std::fs::write(&rules, "bbb.rs\n").unwrap();
+        let secs = before
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let name = std::ffi::CString::new(rules.as_os_str().as_bytes()).unwrap();
+        let stamp = libc::timeval {
+            tv_sec: secs.as_secs() as libc::time_t,
+            tv_usec: secs.subsec_micros() as libc::suseconds_t,
+        };
+        let times = [stamp, stamp];
+        // SAFETY: `name` is NUL-terminated and `times` is a two-element array,
+        // both outliving the call.
+        assert_eq!(unsafe { libc::utimes(name.as_ptr(), times.as_ptr()) }, 0);
+        let after = std::fs::metadata(&rules).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+
+        state.ignore_refresh_scheduled.store(true, Ordering::SeqCst);
+        let since = SystemTime::now() + std::time::Duration::from_secs(3600);
+        reindex_files_in(&state, &root, std::slice::from_ref(&root), since);
+        assert!(
+            state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "rules that were swapped for different ones of the same size and age \
+             must still be noticed"
         );
     }
 

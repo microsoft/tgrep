@@ -2100,9 +2100,9 @@ impl WatchRegistry {
     /// [`is_contained_dir`] costs one `symlink_metadata` per level, and paying
     /// it for each of forty thousand directories at depth ten would be four
     /// hundred thousand syscalls to re-derive what the previous entry proved.
-    /// The sync feeds directories parent-first, so the cheap path is the one
-    /// nearly every call takes; anything arriving out of order still gets the
-    /// full walk and the right answer.
+    /// The sync feeds directories shallowest-first for exactly this reason, so
+    /// the cheap path is the one nearly every call takes; anything arriving
+    /// out of order still gets the full walk and the right answer.
     fn contained(&self, dir: &Path) -> bool {
         match dir.parent() {
             Some(parent) if parent == self.root || self.watched.contains(parent) => {
@@ -2236,7 +2236,20 @@ impl WatchRegistry {
             removed += 1;
         }
 
-        (self.add_all(desired), removed)
+        // Shallowest first, because `desired` is a `HashSet` and hands its
+        // contents out in whatever order hashing produced. [`Self::contained`]
+        // establishes containment cheaply by leaning on the parent already
+        // being watched; a child that arrives before its parent gets no such
+        // proof and walks every ancestor instead. Unordered, that is the
+        // common case rather than the exception, and it turns the startup
+        // sync from one `symlink_metadata` per directory into one per level
+        // per directory — on a monorepo, hundreds of thousands of syscalls in
+        // the path that exists to make startup cheap. Sorting by depth is
+        // enough: a parent is always strictly shallower than its children.
+        let mut ordered: Vec<&PathBuf> = desired.iter().collect();
+        ordered.sort_by_key(|dir| dir.components().count());
+
+        (self.add_all(ordered), removed)
     }
 }
 
@@ -2516,11 +2529,14 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
     }
 
     // Directories whose listing succeeded, and the files those listings
-    // contained, for the removal sweep at the end. Only files are recorded:
-    // stamps describe files, so directory names would just be dead weight on a
-    // set that at startup spans the whole repository.
+    // contained, for the removal sweep at the end. Directory names are kept
+    // apart from the files: a directory that vanished with its contents leaves
+    // indexed paths whose own parent was never enumerated, and its absence
+    // from its parent's listing is the only evidence there is.
     let mut swept: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut present_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unreadable_dirs: Vec<String> = Vec::new();
 
     for dir in dirs {
         let Ok(rel_dir) = dir.strip_prefix(root) else {
@@ -2529,7 +2545,9 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
         let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
         let Ok(entries) = std::fs::read_dir(dir) else {
             // No listing means no evidence, and the sweep below must not treat
-            // silence as absence.
+            // silence as absence. Whether the directory is gone or merely
+            // unreadable is decided later, from its parent's listing.
+            unreadable_dirs.push(rel_dir);
             continue;
         };
         let mut subdirs: Vec<PathBuf> = Vec::new();
@@ -2559,6 +2577,7 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
             // file or directory is neither indexed nor descended into, which
             // is what the walker does with `follow_links(false)`.
             if file_type.is_dir() {
+                present_dirs.insert(rel);
                 subdirs.push(path);
                 continue;
             }
@@ -2608,7 +2627,21 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
         }
     }
 
-    sweep_removed_files(state, &swept, &present);
+    // A directory that could not be listed is either gone or merely
+    // unreadable, and only its parent's listing can tell the two apart. The
+    // ones proven absent stand in for every file under them: those files have
+    // a parent nothing enumerated, so the per-directory evidence above says
+    // nothing about them at all, and a subtree deleted or moved away in this
+    // window would keep answering searches until the hourly reconcile.
+    let vanished_dirs: std::collections::HashSet<String> = unreadable_dirs
+        .into_iter()
+        .filter(|rel| {
+            let parent = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+            swept.contains(parent) && !present_dirs.contains(rel) && !present.contains(rel)
+        })
+        .collect();
+
+    sweep_removed_files(state, &swept, &present, &vanished_dirs);
 
     eprintln!(
         "[trace] watcher: rechecked {} newly watched directories in {:.1}ms",
@@ -2631,6 +2664,15 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
 /// eligibility. Filtering `present` would delete entries for files that are
 /// still on disk and were indexed under a laxer configuration.
 ///
+/// `vanished_dirs` are directories that could not be listed *and* were absent
+/// from a parent listing that did succeed. Their descendants cannot be judged
+/// by `swept` and `present`, which only speak for a file's immediate parent: a
+/// directory deleted or moved away whole leaves indexed paths whose parent was
+/// never enumerated, and no event names them either — a removal delivers one
+/// event for the directory, and a move away delivers nothing at all for what
+/// was inside it. Anything under one of these is swept on the strength of the
+/// directory's absence.
+///
 /// Candidates come from everything that can answer a search, not from
 /// `file_stamps` alone. A stamp is not a precondition for being searchable:
 /// `filestamps.json` is optional by design — missing or unreadable leaves the
@@ -2649,6 +2691,7 @@ fn sweep_removed_files(
     state: &ServerState,
     swept: &std::collections::HashSet<String>,
     present: &std::collections::HashSet<String>,
+    vanished_dirs: &std::collections::HashSet<String>,
 ) {
     if swept.is_empty() {
         return;
@@ -2658,7 +2701,25 @@ fn sweep_removed_files(
     // to their product would not finish.
     let missing = |rel: &str| {
         let parent = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
-        swept.contains(parent) && !present.contains(rel)
+        if swept.contains(parent) && !present.contains(rel) {
+            return true;
+        }
+        // Walking ancestors costs one lookup per level, so it is done only
+        // when something actually vanished — which is rare, while this closure
+        // runs once per indexed path in the repository.
+        if vanished_dirs.is_empty() {
+            return false;
+        }
+        let mut ancestor = parent;
+        loop {
+            if vanished_dirs.contains(ancestor) {
+                return true;
+            }
+            match ancestor.rsplit_once('/') {
+                Some((next, _)) => ancestor = next,
+                None => return false,
+            }
+        }
     };
     let mut gone: std::collections::HashSet<String> = {
         let stamps = state.file_stamps.read().unwrap();
@@ -3935,6 +3996,67 @@ fn stamps_for_index_members(
         .collect()
 }
 
+/// Drop the stamps the build has no right to publish, because an event for
+/// those paths arrived while it ran.
+///
+/// The stamp map describes what the index holds, and the build derives it from
+/// a metadata walk taken *after* the content walk. For a file written between
+/// the two the index holds the old bytes while the stamp describes the new
+/// ones, so the stamp says "current" about content that is stale. That claim is
+/// load-bearing in exactly the place that should have repaired it:
+/// `reindex_file` returns early on a matching stamp, so the replay of the very
+/// event that reported the write reads nothing, and the reconcile behind it
+/// compares the same stamps and agrees. The old content stays searchable
+/// indefinitely.
+///
+/// The deferred buffer already names those paths — it is what replay is about
+/// to walk — so withholding their stamps costs one map lookup each and makes
+/// the replay do the read it was deferred for.
+///
+/// When the buffer overflowed it names nothing, and nothing distinguishes the
+/// files that changed from the ones that did not, so no stamp from this build
+/// can be trusted and none is published. The reconcile that overflow already
+/// schedules then re-reads the tree rather than believing a walk that raced
+/// 100k changes.
+///
+/// Takes the deferred lock while `snapshot_gate` is held, which is the one
+/// order in use: the watcher defers *before* it takes the gate, and replay
+/// releases the buffer before handling anything.
+fn withhold_stamps_for_deferred(
+    state: &ServerState,
+    root: &Path,
+    mut stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+) -> std::collections::HashMap<String, tgrep_core::meta::FileStamp> {
+    let deferred = match state.deferred_events.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(paths) = deferred.as_ref() else {
+        eprintln!(
+            "[trace] warning: too many changes during the initial build to say which files the \
+             walk raced; publishing no stamps so the reconcile re-reads them"
+        );
+        return std::collections::HashMap::new();
+    };
+    let mut withheld = 0usize;
+    for path in paths.keys() {
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if stamps.remove(&rel).is_some() {
+            withheld += 1;
+        }
+    }
+    if withheld > 0 {
+        eprintln!(
+            "[trace] watcher: {withheld} file(s) changed during the initial build; their stamps \
+             are withheld so the replay re-reads them"
+        );
+    }
+    stamps
+}
+
 /// Detect files that changed while the server was not running.
 /// Compares stored filestamps against current filesystem metadata, then upserts
 /// changed/new files and removes deleted files from the LiveIndex.
@@ -4564,7 +4686,13 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     // matcher from those is what keeps this cheap — `gitignore::build_matcher`
     // would rewalk the whole tree, which cost 49 s on a 289k-file repo.
     match tgrep_core::meta::read_filestamps(index_dir) {
-        Ok(stamps) => *state.file_stamps.write().unwrap() = stamps,
+        // Minus the paths whose events arrived while the build ran: the builder
+        // read those files at some point during its walk and stamped what it
+        // saw, so for anything written afterwards the stamp describes bytes the
+        // index does not hold. See `withhold_stamps_for_deferred`.
+        Ok(stamps) => {
+            *state.file_stamps.write().unwrap() = withhold_stamps_for_deferred(state, root, stamps)
+        }
         Err(e) => eprintln!(
             "[trace] warning: could not load file stamps ({e}); \
              the watcher may reindex on spurious events"
@@ -4927,7 +5055,10 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     //
     // Done even if the flush below fails: the live overlay already reflects
     // what was just indexed, and the stamps describe that.
-    *state.file_stamps.write().unwrap() = stamps;
+    //
+    // Minus whatever changed underneath the walk, which the stamps would
+    // otherwise describe as indexed when the index holds the older bytes.
+    *state.file_stamps.write().unwrap() = withhold_stamps_for_deferred(state, root, stamps);
     state.indexing.store(false, Ordering::SeqCst);
 
     // Final flush to disk for the bulk build. Use the same streaming
@@ -6577,7 +6708,8 @@ mod tests {
         // withheld from `swept`.
         let swept = std::collections::HashSet::new();
         let present = std::collections::HashSet::new();
-        sweep_removed_files(&state, &swept, &present);
+        let no_vanished = std::collections::HashSet::new();
+        sweep_removed_files(&state, &swept, &present, &no_vanished);
         assert!(
             !state.index.read().unwrap().live.is_deleted("d/a.rs"),
             "an unenumerated directory must not tombstone the files under it"
@@ -6587,7 +6719,7 @@ mod tests {
         // the file is actually gone, which the sweep now confirms itself.
         std::fs::remove_file(&path).unwrap();
         let swept = std::collections::HashSet::from(["d".to_string()]);
-        sweep_removed_files(&state, &swept, &present);
+        sweep_removed_files(&state, &swept, &present, &no_vanished);
         assert!(
             state.index.read().unwrap().live.is_deleted("d/a.rs"),
             "a fully enumerated directory must sweep what it no longer contains"
@@ -6615,7 +6747,8 @@ mod tests {
         // it is back on disk by the time the sweep runs.
         let swept = std::collections::HashSet::from(["d".to_string()]);
         let present = std::collections::HashSet::new();
-        sweep_removed_files(&state, &swept, &present);
+        let no_vanished = std::collections::HashSet::new();
+        sweep_removed_files(&state, &swept, &present, &no_vanished);
 
         assert!(
             !state.index.read().unwrap().live.is_deleted("d/a.rs"),
@@ -6995,7 +7128,13 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         let swept: std::collections::HashSet<String> = [String::new()].into_iter().collect();
-        sweep_removed_files(&state, &swept, &std::collections::HashSet::new());
+        let no_vanished = std::collections::HashSet::new();
+        sweep_removed_files(
+            &state,
+            &swept,
+            &std::collections::HashSet::new(),
+            &no_vanished,
+        );
         drop(gate);
 
         assert!(
@@ -7202,7 +7341,146 @@ mod tests {
         );
     }
 
-    /// The size that qualifies a file is stat'd before its contents are read.
+    /// A directory that vanished whole leaves indexed files whose own parent
+    /// was never enumerated. `swept`/`present` only speak for a file's
+    /// immediate parent, so without the vanished-directory evidence every one
+    /// of those files stays searchable — and no event names them either: a
+    /// move away delivers nothing at all for what was inside.
+    #[test]
+    fn a_directory_that_went_away_whole_takes_its_files_with_it() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+
+        let dir = root.join("d");
+        let nested = dir.join("deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(nested.join("b.rs"), "fn b() {}\n").unwrap();
+        reindex_file(&state, &dir.join("a.rs"), "d/a.rs");
+        reindex_file(&state, &nested.join("b.rs"), "d/deep/b.rs");
+        assert!(state.index.read().unwrap().live.has_path("d/a.rs"));
+
+        // Still there, merely unlistable from the scan's point of view: the
+        // directory it was named in enumerated it, so silence proves nothing.
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            let since = SystemTime::now() + Duration::from_secs(3600);
+            reindex_files_in(&state, &root, std::slice::from_ref(&root), since);
+        }
+        assert!(
+            !state.index.read().unwrap().live.is_deleted("d/a.rs"),
+            "a directory that is still on disk must not sweep its files"
+        );
+
+        // Gone, and the scan is told to recheck it — which is what a recovery
+        // scan over a newly watched directory does. Its parent lists cleanly
+        // and does not contain it.
+        std::fs::remove_dir_all(&dir).unwrap();
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            let since = SystemTime::now() + Duration::from_secs(3600);
+            reindex_files_in(&state, &root, &[root.clone(), dir.clone()], since);
+        }
+        let index = state.index.read().unwrap();
+        assert!(
+            index.live.is_deleted("d/a.rs"),
+            "a file directly inside a vanished directory must be swept"
+        );
+        assert!(
+            index.live.is_deleted("d/deep/b.rs"),
+            "and so must one further down, whose parent vanished with it"
+        );
+    }
+
+    /// `desired` is a set, so the order it iterates in is not the order the
+    /// tree is in. Subscribing a child before its parent makes the containment
+    /// check walk every level from the root for each one, which is the cost
+    /// the parent-first fast path exists to avoid on a tree with 40k
+    /// directories in it.
+    #[test]
+    fn subscriptions_are_established_from_the_root_down() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let deep = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+        let mut registry = WatchRegistry {
+            watcher,
+            root: root.clone(),
+            watched: std::collections::HashSet::new(),
+        };
+
+        let desired: std::collections::HashSet<PathBuf> = [
+            deep.clone(),
+            root.join("a").join("b"),
+            root.join("a"),
+            root.clone(),
+        ]
+        .into_iter()
+        .collect();
+        let (added, _removed) = registry.sync(&desired);
+
+        assert_eq!(added.len(), 4);
+        let depths: Vec<usize> = added.iter().map(|d| d.components().count()).collect();
+        assert!(
+            depths.windows(2).all(|w| w[0] <= w[1]),
+            "a parent must be subscribed before anything under it, got {added:?}"
+        );
+        assert!(registry.watched.contains(&deep));
+    }
+
+    /// Stamps describe what the index holds. A file written while the build
+    /// ran is read by the metadata walk that produces them but not by the
+    /// content walk that fed the index, so its stamp says "current" about
+    /// bytes that are already stale — and `reindex_file` returns early on a
+    /// matching stamp, so the replay of the very event that reported the write
+    /// reads nothing.
+    #[test]
+    fn a_file_written_during_the_build_is_not_stamped_by_it() {
+        use tgrep_core::meta::FileStamp;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+
+        let stamps: std::collections::HashMap<String, FileStamp> = [
+            ("quiet.rs".to_string(), FileStamp { mtime: 1, size: 10 }),
+            ("racy.rs".to_string(), FileStamp { mtime: 2, size: 20 }),
+        ]
+        .into_iter()
+        .collect();
+
+        state
+            .deferred_events
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert(root.join("racy.rs"), false);
+
+        let published = withhold_stamps_for_deferred(&state, &root, stamps.clone());
+        assert!(
+            published.contains_key("quiet.rs"),
+            "a file nothing touched keeps its stamp, or the build re-reads the repository"
+        );
+        assert!(
+            !published.contains_key("racy.rs"),
+            "a file whose event is waiting to be replayed must not be stamped as indexed"
+        );
+
+        // Overflowed: the buffer names nothing, so nothing in the map can be
+        // told apart from what changed underneath it.
+        *state.deferred_events.lock().unwrap() = None;
+        assert!(
+            withhold_stamps_for_deferred(&state, &root, stamps).is_empty(),
+            "with the buffer overflowed no stamp from this build can be trusted"
+        );
+    }
+
     /// A file that grows in between must not be read into memory without
     /// bound, nor indexed past the cap.
     #[test]

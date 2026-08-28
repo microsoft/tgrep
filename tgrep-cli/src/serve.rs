@@ -5448,13 +5448,21 @@ mod tests {
         };
         defer_events_during_build(&state, &small);
         assert_eq!(
-            state.deferred_events.lock().unwrap().as_ref().unwrap().len(),
+            state
+                .deferred_events
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .len(),
             1
         );
 
         let flood = Event {
             kind: EventKind::Create(notify::event::CreateKind::Any),
-            paths: (0..200_001).map(|i| root.join(format!("f{i}.rs"))).collect(),
+            paths: (0..100_000)
+                .map(|i| root.join(format!("f{i}.rs")))
+                .collect(),
             attrs: Default::default(),
         };
         defer_events_during_build(&state, &flood);

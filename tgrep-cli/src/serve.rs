@@ -2263,17 +2263,13 @@ fn changed_ignore_rules_in(
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
-            let Some(read_as) = known_sources.get(&rel) else {
+            let Some(_read_as) = known_sources.get(&rel) else {
                 return Some((rel, "not a known source"));
             };
             // Follows links, matching how the stamp was taken.
             let Ok(meta) = std::fs::metadata(&candidate) else {
                 continue;
             };
-            let current = (meta.len(), meta.modified().ok());
-            if current != *read_as {
-                return Some((rel, "not the file the matcher read"));
-            }
             if meta
                 .modified()
                 .is_ok_and(|m| m >= since && m <= SystemTime::now())
@@ -2951,13 +2947,10 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     // watched; for one outside, no event arrives at all and the periodic
     // reconcile remains the backstop.
     let ignore_rules_changed = !state.no_ignore && {
-        let stamps = state.ignore_source_stamps.read().unwrap();
-        event.paths.iter().any(|path| {
-            is_ignore_rules_file(root, path)
-                || path
-                    .strip_prefix(root)
-                    .is_ok_and(|rel| stamps.contains_key(&rel.to_string_lossy().replace('\\', "/")))
-        })
+        event
+            .paths
+            .iter()
+            .any(|path| is_ignore_rules_file(root, path))
     };
     if ignore_rules_changed {
         state.ignore_rules_dirty.store(true, Ordering::SeqCst);

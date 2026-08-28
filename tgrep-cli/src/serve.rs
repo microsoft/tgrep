@@ -6879,7 +6879,20 @@ mod tests {
         state.gitignore_pending.store(false, Ordering::SeqCst);
 
         let rules = root.join(".gitignore");
+        let name = std::ffi::CString::new(rules.as_os_str().as_bytes()).unwrap();
+        // Whole seconds, so it survives a round trip through `utimes`, which
+        // takes microseconds while ext4 stores nanoseconds.
+        let stamp = libc::timeval {
+            tv_sec: 1_000_000,
+            tv_usec: 0,
+        };
+        let times = [stamp, stamp];
+        // SAFETY: `name` is NUL-terminated and `times` is a two-element array,
+        // both outliving each call.
+        let backdate = || assert_eq!(unsafe { libc::utimes(name.as_ptr(), times.as_ptr()) }, 0);
+
         std::fs::write(&rules, "aaa.rs\n").unwrap();
+        backdate();
         let before = std::fs::metadata(&rules).unwrap();
         *state.ignore_source_stamps.write().unwrap() =
             ignore_stamps_of(&root, std::slice::from_ref(&rules));
@@ -6888,20 +6901,7 @@ mod tests {
         // Different rules, same seven bytes, and the restore puts the old
         // timestamp back.
         std::fs::write(&rules, "bbb.rs\n").unwrap();
-        let secs = before
-            .modified()
-            .unwrap()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let name = std::ffi::CString::new(rules.as_os_str().as_bytes()).unwrap();
-        let stamp = libc::timeval {
-            tv_sec: secs.as_secs() as libc::time_t,
-            tv_usec: secs.subsec_micros() as libc::suseconds_t,
-        };
-        let times = [stamp, stamp];
-        // SAFETY: `name` is NUL-terminated and `times` is a two-element array,
-        // both outliving the call.
-        assert_eq!(unsafe { libc::utimes(name.as_ptr(), times.as_ptr()) }, 0);
+        backdate();
         let after = std::fs::metadata(&rules).unwrap();
         assert_eq!(before.len(), after.len());
         assert_eq!(before.modified().unwrap(), after.modified().unwrap());

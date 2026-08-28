@@ -2166,16 +2166,31 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
     let start = Instant::now();
 
     // An ignore file that was deleted during the window is invisible to the
-    // per-entry mtime test below — there is no entry left to stat. It is also
-    // the more damaging direction: rules that no longer have a source keep
-    // being enforced, so the subtree they hide stays unsubscribed and
-    // unindexed until an unrelated rebuild happens along. Checking the sources
-    // the published matcher was built from catches it at one stat apiece, once
-    // per scan rather than once per file.
-    if !state.no_ignore {
-        let vanished = {
+    // per-entry test below — there is no entry left to stat. It is also the
+    // more damaging direction: rules that no longer have a source keep being
+    // enforced, so the subtree they hide stays unsubscribed and unindexed until
+    // an unrelated rebuild happens along. Checking the sources the published
+    // matcher was built from catches it at one stat apiece, once per scan
+    // rather than once per file.
+    //
+    // The same list answers the opposite question for free: an ignore file that
+    // is *not* among the sources is one the published matcher never read.
+    let known_sources: std::collections::HashSet<String> = if state.no_ignore {
+        std::collections::HashSet::new()
+    } else {
+        let (vanished, known) = {
             let sources = state.ignore_sources.read().unwrap();
-            sources.iter().find(|p| !p.exists()).cloned()
+            (
+                // `exists` follows links, matching how the walker collected
+                // these — a symlinked source whose target is gone has stopped
+                // contributing rules just as surely as a deleted one.
+                sources.iter().find(|p| !p.exists()).cloned(),
+                sources
+                    .iter()
+                    .filter_map(|p| p.strip_prefix(root).ok())
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                    .collect::<std::collections::HashSet<String>>(),
+            )
         };
         if let Some(gone) = vanished {
             state.ignore_rules_dirty.store(true, Ordering::SeqCst);
@@ -2186,7 +2201,8 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
             );
             return;
         }
-    }
+        known
+    };
 
     // Directories whose listing succeeded, and the files those listings
     // contained, for the removal sweep at the end. Only files are recorded:
@@ -2235,23 +2251,36 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
                 subdirs.push(path);
                 continue;
             }
-            if !file_type.is_file() {
-                continue;
-            }
-            present.insert(rel.clone());
 
+            // Ahead of the regular-file test, and following links to decide.
+            // The walker collects rule files with `Path::is_file`, which
+            // resolves symlinks, so a symlinked `.gitignore` contributes rules
+            // exactly like a real one — while `DirEntry::file_type` above does
+            // not resolve them, which left those files falling through the
+            // `!is_file` bail and never triggering a refresh. They are still
+            // never indexed; they are only allowed to announce themselves.
+            //
             // An ignore-rules file that landed in this window was not seen by
             // the walk that built the matcher in force, so every other file in
             // this scan is being judged by rules that do not know about it.
             // Indexing them now would apply the wrong rules and leave whatever
             // was wrongly indexed until something touched it again.
             //
-            // The mtime test is what keeps this quiet: a repository has an
-            // ignore file in every other directory and the startup scan walks
-            // past all of them, but they predate the walk and are already
+            // Two tests, because neither alone is enough. Absence from the
+            // published sources is the exact question — this file did not feed
+            // the matcher — and it catches the arrival however old the file
+            // says it is, which matters because `git checkout`, `tar -x` and
+            // `rsync -a` all restore mtimes from the archive and would sail
+            // past a recency test. The mtime window then covers the case the
+            // source list cannot: a file that was already a source and has just
+            // been *edited*.
+            //
+            // The mtime test is what keeps the second one quiet: a repository
+            // has an ignore file in every other directory and the startup scan
+            // walks past all of them, but they predate the walk and are already
             // accounted for. Only one written inside the window can have been
-            // missed — and a spurious match (a `touch` in the same
-            // millisecond) costs an idempotent refresh, not correctness.
+            // missed — and a spurious match (a `touch` in the same millisecond)
+            // costs an idempotent refresh, not correctness.
             //
             // Bounded at both ends, not just the near one. On a network mount
             // whose server clock runs ahead of ours, every recently touched
@@ -2260,24 +2289,35 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
             // schedules, which walks the whole repository and then arms the
             // next. Treating a future mtime as skew rather than as an arrival
             // gives up the fix on such a mount and keeps the loop closed.
-            if !state.no_ignore
-                && is_ignore_rules_file(root, &path)
-                && entry
-                    .metadata()
+            if !state.no_ignore && is_ignore_rules_file(root, &path) && path.is_file() {
+                let unknown = !known_sources.contains(&rel);
+                let touched = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
-                    .is_ok_and(|m| m >= since && m <= SystemTime::now())
-            {
-                // Abandon the scan: the refresh rewalks and republishes, which
-                // covers these directories properly, and anything indexed
-                // between here and there would be judged by the stale rules.
-                state.ignore_rules_dirty.store(true, Ordering::SeqCst);
-                schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
-                eprintln!(
-                    "[trace] watcher: ignore rules changed during recovery ({rel}); \
-                     deferring to a refresh"
-                );
-                return;
+                    .is_ok_and(|m| m >= since && m <= SystemTime::now());
+                if unknown || touched {
+                    // Abandon the scan: the refresh rewalks and republishes,
+                    // which covers these directories properly, and anything
+                    // indexed between here and there would be judged by the
+                    // stale rules.
+                    state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+                    schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+                    let why = if unknown {
+                        "not a known source"
+                    } else {
+                        "modified"
+                    };
+                    eprintln!(
+                        "[trace] watcher: ignore rules changed during recovery ({rel}, {why}); \
+                         deferring to a refresh"
+                    );
+                    return;
+                }
             }
+
+            if !file_type.is_file() {
+                continue;
+            }
+            present.insert(rel.clone());
 
             let skip = {
                 let gitignore = state.gitignore.read().unwrap();
@@ -2381,10 +2421,7 @@ fn sweep_removed_files(
     // bug one instruction later.
     let mut dropped = 0usize;
     for rel in &gone {
-        let _reindex = match state.reindex_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _reindex = lock_reindex(state);
         // No-follow: a path that came back as a symlink is still not something
         // the index should hold, so it stays swept.
         if std::fs::symlink_metadata(state.root.join(rel)).is_ok_and(|m| m.file_type().is_file()) {
@@ -2486,6 +2523,32 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
                     continue;
                 };
                 let rel = rel.to_string_lossy().replace('\\', "/");
+                // A subtree that arrives whole — a clone, a `mv`, a branch
+                // switch — can carry its own ignore rules. Those files are
+                // dot-prefixed, so the scan below would silently drop them and
+                // index the rest of the subtree against rules that do not know
+                // about them.
+                //
+                // Ahead of the type dispatch, and following links: the walker
+                // collects rule files with `Path::is_file`, which resolves
+                // symlinks, whereas `DirEntry::file_type` does not — so a
+                // symlinked `.gitignore` fell between the two branches below
+                // and was never noticed, despite carrying rules the walker
+                // would read.
+                //
+                // Abandon the descent immediately rather than finishing it.
+                // Everything gathered from here on is discarded by the refresh
+                // anyway, and the rules that are about to be published are the
+                // ones that decide whether these directories should be watched
+                // at all — continuing would subscribe to every level of, say, a
+                // `node_modules/` that was just moved into place, which on
+                // Linux is a watch descriptor apiece and the exhaustion this
+                // pass exists to avoid. The refresh's `sync` would prune them,
+                // but only after they had already been taken.
+                if !state.no_ignore && is_ignore_rules_file(root, &path) && path.is_file() {
+                    found_ignore_rules = true;
+                    break 'descend;
+                }
                 // `DirEntry::file_type` does not follow symlinks, so a
                 // symlinked directory is neither descended into nor indexed.
                 if file_type.is_dir() {
@@ -2497,26 +2560,6 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
                         next.push(path);
                     }
                 } else if file_type.is_file() {
-                    // A subtree that arrives whole — a clone, a `mv`, a branch
-                    // switch — can carry its own ignore rules. Those files are
-                    // dot-prefixed, so the scan below would silently drop them
-                    // and index the rest of the subtree against rules that do
-                    // not know about them.
-                    //
-                    // Abandon the descent immediately rather than finishing it.
-                    // Everything gathered from here on is discarded by the
-                    // refresh anyway, and the rules that are about to be
-                    // published are the ones that decide whether these
-                    // directories should be watched at all — continuing would
-                    // subscribe to every level of, say, a `node_modules/` that
-                    // was just moved into place, which on Linux is a watch
-                    // descriptor apiece and the exhaustion this pass exists to
-                    // avoid. The refresh's `sync` would prune them, but only
-                    // after they had already been taken.
-                    if !state.no_ignore && is_ignore_rules_file(root, &path) {
-                        found_ignore_rules = true;
-                        break 'descend;
-                    }
                     let skip = {
                         let gitignore = state.gitignore.read().unwrap();
                         should_skip_watcher_path(&rel, &state.exclude_dirs, gitignore.as_ref())
@@ -2894,6 +2937,15 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             // `file_stamps` is missing/out-of-date (e.g. first run after
             // an older index), skipping the delete entirely would leave
             // stale entries for files that no longer exist.
+            //
+            // Under `reindex_lock`, or a concurrent `reindex_file` that has
+            // already read the file's bytes commits them *after* this delete
+            // and resurrects a file that is gone — with a fresh stamp, so
+            // nothing afterwards disagrees and no further event is coming to
+            // correct it. The lock makes the two orderings the only two: the
+            // delete lands on content that was committed, or the reindex opens
+            // a path that is already gone and drops it.
+            let _reindex = lock_reindex(state);
             let known_path = state.file_stamps.read().unwrap().contains_key(&rel_path);
             if known_path {
                 eprintln!("[trace] reindex: removed {rel_path}");
@@ -2943,11 +2995,27 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             // still true and inotify may report only the rename destination —
             // so nothing above catches it, and without this the old contents
             // stay searchable indefinitely.
+            //
+            // Same lock as the removal above, for the same reason: a reindex
+            // already holding the old bytes must not commit them after this.
+            let _reindex = lock_reindex(state);
             drop_indexed_file(state, &rel_path, "no longer a regular file");
             continue;
         }
 
         reindex_file(state, path, &rel_path);
+    }
+}
+
+/// Take the mutation lock, tolerating a previous holder's panic.
+///
+/// Poisoning here means some other indexer panicked partway through an update,
+/// not that the index is unusable. Refusing to serialise from then on would
+/// turn one failure into the resurrection race this lock exists to prevent.
+fn lock_reindex(state: &ServerState) -> std::sync::MutexGuard<'_, ()> {
+    match state.reindex_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -2967,7 +3035,9 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
 /// path. The trace line, which is the part that would be actively misleading,
 /// stays conditional on there having been something to drop.
 ///
-/// The caller must already hold `snapshot_gate`.
+/// The caller must already hold `snapshot_gate` and `reindex_lock`. The lock is
+/// the caller's rather than this function's because `reindex_file` calls in
+/// while holding it, and a `Mutex` is not reentrant.
 fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
     let had_stamp = state
         .file_stamps
@@ -3277,10 +3347,7 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // read, so without this a recovery scan and the watcher worker can both be
     // here for the same path, both read, and the one that read the *older*
     // content can commit last. See `ServerState::reindex_lock`.
-    let _reindex = match state.reindex_lock.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let _reindex = lock_reindex(state);
 
     // One handle for the whole decision, resolved a component at a time from
     // the root so no part of the path can be a symlink, and every fact below —
@@ -6276,6 +6343,149 @@ mod tests {
         assert!(
             state.index.read().unwrap().live.is_deleted("x.rs"),
             "content indexed before the path became a fifo must not stay searchable"
+        );
+    }
+
+    /// A removal must not land while another thread is midway through indexing
+    /// the same path, or the reindex commits bytes it read earlier and
+    /// resurrects a file that is gone — with a fresh stamp, so nothing
+    /// afterwards disagrees and no further event is coming to correct it.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_waits_for_an_in_flight_reindex() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let path = root.join("x.rs");
+        std::fs::write(&path, "fn indexed() {}\n").unwrap();
+        reindex_file(&state, &path, "x.rs");
+        assert!(state.index.read().unwrap().live.has_path("x.rs"));
+
+        std::fs::remove_file(&path).unwrap();
+
+        // Stands in for a `reindex_file` that has read the old bytes and not
+        // yet committed them: it holds exactly this lock across that window.
+        let held = state.reindex_lock.lock().unwrap();
+
+        let worker = {
+            let state = Arc::clone(&state);
+            let root = root.clone();
+            let path = path.clone();
+            std::thread::spawn(move || {
+                handle_fs_event(
+                    &state,
+                    &root,
+                    &Event {
+                        kind: EventKind::Remove(notify::event::RemoveKind::File),
+                        paths: vec![path],
+                        attrs: Default::default(),
+                    },
+                );
+            })
+        };
+
+        // The delete has to wait its turn. Without the lock it lands
+        // immediately, which is the ordering that loses the file.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !state.index.read().unwrap().live.is_deleted("x.rs"),
+            "a removal must not mutate the index while an indexer holds the lock"
+        );
+
+        drop(held);
+        worker.join().unwrap();
+        assert!(
+            state.index.read().unwrap().live.is_deleted("x.rs"),
+            "and it must still apply once the lock is free"
+        );
+    }
+
+    /// `git checkout`, `tar -x` and `rsync -a` all restore mtimes from what
+    /// they unpack, so a nested ignore file can arrive carrying a timestamp
+    /// from months ago. A recency test cannot see that; absence from the
+    /// published sources can.
+    #[cfg(unix)]
+    #[test]
+    fn an_arriving_ignore_file_with_a_preserved_mtime_still_refreshes_the_matcher() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        // The matcher in force was built without it.
+        *state.ignore_sources.write().unwrap() = Vec::new();
+
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let rules = sub.join(".gitignore");
+        std::fs::write(&rules, "kept.rs\n").unwrap();
+        std::fs::write(sub.join("kept.rs"), "fn kept() {}\n").unwrap();
+
+        // Backdated well outside any plausible scan window.
+        let name = std::ffi::CString::new(rules.as_os_str().as_bytes()).unwrap();
+        let stamp = libc::timeval {
+            tv_sec: 1_000_000,
+            tv_usec: 0,
+        };
+        let times = [stamp, stamp];
+        // SAFETY: `name` is NUL-terminated and `times` is a two-element array,
+        // both outliving the call.
+        assert_eq!(unsafe { libc::utimes(name.as_ptr(), times.as_ptr()) }, 0);
+
+        state.ignore_refresh_scheduled.store(true, Ordering::SeqCst);
+        let since = SystemTime::now() - std::time::Duration::from_secs(60);
+        reindex_files_in(&state, &root, std::slice::from_ref(&sub), since);
+
+        assert!(
+            state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "an ignore file the matcher never read must schedule a refresh, \
+             however old its mtime is"
+        );
+        assert!(
+            !state.index.read().unwrap().live.has_path("sub/kept.rs"),
+            "the scan must abandon rather than index under rules it knows are stale"
+        );
+    }
+
+    /// The walker collects rule files with `Path::is_file`, which follows
+    /// links, so a symlinked `.gitignore` contributes rules like any other —
+    /// but `DirEntry::file_type` does not follow links, and the scan used to
+    /// drop those entries before ever asking what they were.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ignore_file_is_still_seen_by_a_recovery_scan() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let target = root.join("shared-rules");
+        std::fs::write(&target, "kept.rs\n").unwrap();
+        std::os::unix::fs::symlink(&target, sub.join(".gitignore")).unwrap();
+        std::fs::write(sub.join("kept.rs"), "fn kept() {}\n").unwrap();
+
+        // Recent enough that the mtime window alone would catch a *regular*
+        // file here: what this pins is that a symlink gets that far at all.
+        state.ignore_refresh_scheduled.store(true, Ordering::SeqCst);
+        let since = SystemTime::now() - std::time::Duration::from_secs(60);
+        reindex_files_in(&state, &root, std::slice::from_ref(&sub), since);
+
+        assert!(
+            state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "a symlinked ignore file carries rules and must schedule a refresh"
+        );
+        assert!(
+            !state.index.read().unwrap().live.has_path("sub/kept.rs"),
+            "the scan must abandon rather than index under rules it knows are stale"
         );
     }
 

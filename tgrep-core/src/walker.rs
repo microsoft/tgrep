@@ -1417,6 +1417,61 @@ mod tests {
         );
     }
 
+    /// The watcher cannot walk per event, so it asks the same question as a
+    /// point query. If the two disagree the watcher subscribes to and indexes a
+    /// tree the walk excluded, and the next stale check evicts every file it
+    /// added — on the enlistment this came from, a 13.4 GiB build artifact
+    /// making up 71% of the corpus, re-read and re-evicted on every pass.
+    #[test]
+    fn the_point_query_matcher_hides_exactly_what_the_walk_hides() {
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let root = dir.path();
+        let matcher = crate::gitignore::matcher_from_ignore_paths(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+        )
+        .expect("the fixture has rules");
+
+        assert!(
+            matcher.is_ignored(Path::new("qlogs"), true),
+            "a directory the walk prunes must not be subscribed to"
+        );
+        assert!(
+            matcher.is_ignored(Path::new("qlogs/artifact.rs"), false),
+            "nor may a file inside it be indexed"
+        );
+        assert!(
+            matcher.is_ignored(Path::new("src/Gone.TXT"), false),
+            "an untracked file the rule matches once case is ignored"
+        );
+        // The tracked-file exemption comes with it, or the watcher would drop
+        // events for files git never hides.
+        assert!(
+            !matcher.is_ignored(Path::new("src/Kept.TXT"), false),
+            "a tracked file must stay visible"
+        );
+        assert!(!matcher.is_ignored(Path::new("src/main.rs"), false));
+    }
+
+    #[test]
+    fn the_point_query_matcher_follows_the_case_sensitivity_gate() {
+        // The other direction, which is the one that loses files: a repository
+        // that distinguishes case must not have anything hidden from it.
+        let dir = ignorecase_fixture(false, &["src/main.rs", "src/Kept.TXT"]);
+        let root = dir.path();
+        let matcher = crate::gitignore::matcher_from_ignore_paths(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+        )
+        .expect("the fixture has rules");
+
+        assert!(!matcher.is_ignored(Path::new("qlogs"), true));
+        assert!(!matcher.is_ignored(Path::new("qlogs/artifact.rs"), false));
+        assert!(!matcher.is_ignored(Path::new("src/Gone.TXT"), false));
+    }
+
     #[test]
     fn no_ignore_turns_the_whole_thing_off() {
         let dir = ignorecase_fixture(true, &["src/main.rs"]);

@@ -10,7 +10,7 @@
 
 use crate::walker::walker_thread_count;
 use ignore::WalkBuilder;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const P4IGNORE_FILENAME: &str = "p4ignore.ini";
 
@@ -94,6 +94,19 @@ pub struct IgnoreMatcher {
     /// Repository-local `.git/info/exclude`, below global rules in precedence.
     repo_exclude: Option<(String, Gitignore)>,
     global: Gitignore,
+    /// The directory the relative paths handed to [`Self::is_ignored`] are
+    /// relative to, needed to rebuild the absolute path
+    /// [`CaseInsensitiveIgnore`] matches against.
+    root: std::path::PathBuf,
+    /// Git's `core.ignorecase` narrowing, when the repository asks for it.
+    ///
+    /// The indexing walk applies this as a `filter_entry` alongside the
+    /// case-sensitive rules, so a matcher without it answers a different
+    /// question than the walk did. That gap is not academic: on a Windows
+    /// enlistment it left the watcher subscribing to, and indexing, a 13.4 GiB
+    /// build artifact the walk had already excluded — and every event under it
+    /// re-added a file the next stale check then evicted.
+    ignorecase: Option<CaseInsensitiveIgnore>,
 }
 
 impl IgnoreMatcher {
@@ -117,9 +130,10 @@ impl IgnoreMatcher {
         nested: Vec<(String, IgnoreKind, Gitignore)>,
         global: Gitignore,
     ) -> Option<Self> {
-        Self::with_all_sources(local, false, nested, Vec::new(), None, global)
+        Self::with_all_sources(local, false, nested, Vec::new(), None, global, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_all_sources(
         local: Gitignore,
         local_is_filter: bool,
@@ -127,6 +141,7 @@ impl IgnoreMatcher {
         ancestors: Vec<(String, IgnoreKind, Gitignore)>,
         repo_exclude: Option<(String, Gitignore)>,
         global: Gitignore,
+        ignorecase: Option<CaseInsensitiveIgnore>,
     ) -> Option<Self> {
         let mut nested: Vec<NestedIgnore> = nested
             .into_iter()
@@ -164,14 +179,20 @@ impl IgnoreMatcher {
             || !nested.is_empty()
             || !ancestors.is_empty()
             || repo_exclude.is_some()
-            || !global.is_empty())
+            || !global.is_empty()
+            || ignorecase.is_some())
         .then_some(Self {
+            // `GitignoreBuilder::new(root)` records `root`, and every caller
+            // builds `local` from the served root, so this is that root
+            // without threading it through three more signatures.
+            root: local.path().to_path_buf(),
             local,
             local_is_filter,
             nested,
             ancestors,
             repo_exclude,
             global,
+            ignorecase,
         })
     }
 
@@ -271,11 +292,21 @@ impl IgnoreMatcher {
         if standard_decision == Some(true) {
             return true;
         }
-        self.local_is_filter
+        if self.local_is_filter
             && self
                 .local
                 .matched_path_or_any_parents(path, is_dir)
                 .is_ignore()
+        {
+            return true;
+        }
+        // Applied last, and to whitelisted paths too, because that is where the
+        // indexing walk applies it: a `filter_entry` rejection is not undone by
+        // a whitelist rule. Both passes must agree on what the tree contains,
+        // or the watcher indexes a file the stale check immediately evicts.
+        self.ignorecase
+            .as_ref()
+            .is_some_and(|ignorecase| ignorecase.excludes(&self.root.join(rel), is_dir))
     }
 }
 
@@ -460,8 +491,8 @@ impl CaseInsensitiveIgnore {
         if use_gitignore {
             let _ = builder.add(repo_root.join(GITIGNORE_FILENAME));
         }
-        if use_exclude {
-            let _ = builder.add(repo_root.join(".git").join("info").join("exclude"));
+        if use_exclude && let Some(exclude) = repo_exclude_path(&repo_root) {
+            let _ = builder.add(exclude);
         }
         let matcher = builder.build().ok()?;
         if matcher.is_empty() {
@@ -529,6 +560,62 @@ pub fn in_git_repo(root: &Path) -> bool {
 
 fn git_repo_root(root: &Path) -> Option<&Path> {
     root.ancestors().find(|dir| dir.join(".git").exists())
+}
+
+/// The `info/exclude` file whose rules apply to `root`, if there is one.
+///
+/// Not `.git/info/exclude`. In a linked worktree or a submodule `.git` is a
+/// file holding a `gitdir:` pointer, and that directory in turn holds a
+/// `commondir` naming the repository every worktree shares — which is where the
+/// one `info/exclude` lives. `WalkBuilder` resolves that chain, so a matcher
+/// that stopped at the literal path enforced different rules than the walk in
+/// exactly the layouts where the two differ, and the watcher would index a file
+/// the next stale check evicts.
+pub fn repo_exclude_path(root: &Path) -> Option<PathBuf> {
+    let git_dir = crate::git_index::git_dir(git_repo_root(root)?)?;
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(target) => {
+            let target = target.trim();
+            let path = Path::new(target);
+            if target.is_empty() {
+                git_dir
+            } else if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                git_dir.join(path)
+            }
+        }
+        Err(_) => git_dir,
+    };
+    let path = common.join("info").join("exclude");
+    path.is_file().then_some(path)
+}
+
+/// The parent-directory `.ignore` / `.gitignore` files that apply to `root`,
+/// closest directory first, paired with the directory that anchors them.
+///
+/// `WalkBuilder` applies `.ignore` files from every ancestor. Its git boundary
+/// is independent: with the default `require_git`, ancestor `.gitignore` files
+/// stop after the nearest repository root; with `--no-require-git` they
+/// continue to the filesystem root.
+pub fn ancestor_ignore_paths(root: &Path, no_require_git: bool) -> Vec<(PathBuf, IgnoreKind)> {
+    let repo_root = git_repo_root(root);
+    let mut found = Vec::new();
+    for dir in root.ancestors().skip(1) {
+        for (kind, path, enabled) in [
+            (IgnoreKind::DotIgnore, dir.join(DOT_IGNORE_FILENAME), true),
+            (
+                IgnoreKind::GitIgnore,
+                dir.join(GITIGNORE_FILENAME),
+                no_require_git || repo_root.is_some_and(|repo| dir.starts_with(repo)),
+            ),
+        ] {
+            if enabled && path.is_file() {
+                found.push((path, kind));
+            }
+        }
+    }
+    found
 }
 
 /// `.gitignore` and `.git/info/exclude` are **git-gated** to match the indexing
@@ -602,41 +689,27 @@ pub fn matcher_from_ignore_paths_with_options(
         }
     }
 
-    // WalkBuilder applies `.ignore` files from every ancestor. Its git boundary
-    // is independent: with the default `require_git`, ancestor `.gitignore`
-    // files stop after the nearest repository root; with `--no-require-git`
-    // they continue to the filesystem root.
+    // WalkBuilder applies `.ignore` files from every ancestor, with its own
+    // git boundary — see [`ancestor_ignore_paths`].
     let mut ancestors = Vec::new();
-    for dir in root.ancestors().skip(1) {
+    for (path, kind) in ancestor_ignore_paths(root, no_require_git) {
+        let Some(dir) = path.parent() else {
+            continue;
+        };
         let prefix = root
             .strip_prefix(dir)
             .unwrap_or(root)
             .to_string_lossy()
             .replace('\\', "/");
-        for (kind, path, enabled) in [
-            (IgnoreKind::DotIgnore, dir.join(DOT_IGNORE_FILENAME), true),
-            (
-                IgnoreKind::GitIgnore,
-                dir.join(GITIGNORE_FILENAME),
-                no_require_git || repo_root.is_some_and(|repo| dir.starts_with(repo)),
-            ),
-        ] {
-            if !enabled || !path.is_file() {
-                continue;
-            }
-            let mut builder = GitignoreBuilder::new(dir);
-            let _ = builder.add(&path);
-            if let Ok(matcher) = builder.build() {
-                ancestors.push((prefix.clone(), kind, matcher));
-            }
+        let mut builder = GitignoreBuilder::new(dir);
+        let _ = builder.add(&path);
+        if let Ok(matcher) = builder.build() {
+            ancestors.push((prefix, kind, matcher));
         }
     }
 
     let repo_exclude = repo_root.and_then(|repo| {
-        let path = repo.join(".git").join("info").join("exclude");
-        if !path.is_file() {
-            return None;
-        }
+        let path = repo_exclude_path(root)?;
         let mut builder = GitignoreBuilder::new(repo);
         let _ = builder.add(&path);
         let matcher = builder.build().ok()?;
@@ -654,7 +727,21 @@ pub fn matcher_from_ignore_paths_with_options(
     } else {
         GitignoreBuilder::new(root).build().ok()?
     };
-    IgnoreMatcher::with_all_sources(local, true, nested, ancestors, repo_exclude, global)
+    // The same narrowing `walker::walk_dir` and `walk_file_metadata` apply as a
+    // `filter_entry`. Serving takes no `--no-ignore-vcs` / `--no-ignore-exclude`
+    // / `--no-ignore-parent`, so the flags the walk was built with are the
+    // defaults; `no_ignore` is handled by the caller, which does not build a
+    // matcher at all in that case.
+    let ignorecase = CaseInsensitiveIgnore::new(root, true, true, true);
+    IgnoreMatcher::with_all_sources(
+        local,
+        true,
+        nested,
+        ancestors,
+        repo_exclude,
+        global,
+        ignorecase,
+    )
 }
 
 /// Convenience wrapper for callers that only have `.gitignore` paths.
@@ -884,6 +971,75 @@ mod tests {
     fn returns_none_when_no_rules() {
         let tmp = TempDir::new().unwrap();
         assert!(build_matcher(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn the_repository_exclude_is_found_through_a_worktree_pointer() {
+        // In a linked worktree `.git` is a file naming the worktree's own git
+        // directory, which in turn names the repository every worktree shares
+        // — and that is where the one `info/exclude` lives. `WalkBuilder`
+        // resolves the whole chain, so a matcher that stopped at the literal
+        // `.git/info/exclude` enforced different rules than the walk did, and
+        // the watcher indexed files the next stale check evicted.
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().join("main").join(".git");
+        std::fs::create_dir_all(common.join("info")).unwrap();
+        std::fs::write(common.join("info").join("exclude"), "*.secret\n").unwrap();
+
+        let worktree_git = common.join("worktrees").join("wt");
+        std::fs::create_dir_all(&worktree_git).unwrap();
+        std::fs::write(
+            worktree_git.join("commondir"),
+            format!("{}\n", common.display()),
+        )
+        .unwrap();
+
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            repo_exclude_path(&worktree).as_deref(),
+            Some(common.join("info").join("exclude").as_path()),
+            "the exclude file has to be reached through the pointer chain"
+        );
+
+        let matcher = matcher_from_ignore_paths(&worktree, &[], &[])
+            .expect("the exclude file supplies rules");
+        assert!(matcher.is_ignored(Path::new("keys.secret"), false));
+        assert!(!matcher.is_ignored(Path::new("main.rs"), false));
+    }
+
+    #[test]
+    fn a_relative_commondir_resolves_against_the_worktree_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().join(".git");
+        std::fs::create_dir_all(common.join("info")).unwrap();
+        std::fs::write(common.join("info").join("exclude"), "*.bin\n").unwrap();
+
+        // What git actually writes: a path relative to the worktree's git dir.
+        let worktree_git = common.join("worktrees").join("wt");
+        std::fs::create_dir_all(&worktree_git).unwrap();
+        std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+
+        let worktree = tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+
+        let found = repo_exclude_path(&worktree).expect("resolved through commondir");
+        assert!(
+            std::fs::canonicalize(&found).unwrap()
+                == std::fs::canonicalize(common.join("info").join("exclude")).unwrap(),
+            "got {found:?}"
+        );
     }
 
     #[test]

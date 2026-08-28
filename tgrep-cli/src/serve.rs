@@ -2752,10 +2752,27 @@ fn sweep_removed_files(
     let mut dropped = 0usize;
     for rel in &gone {
         let _reindex = lock_reindex(state);
-        // No-follow: a path that came back as a symlink is still not something
-        // the index should hold, so it stays swept.
-        if std::fs::symlink_metadata(state.root.join(rel)).is_ok_and(|m| m.file_type().is_file()) {
-            continue;
+        // Through the same containment contract `reindex_file` opens under,
+        // not a bare `symlink_metadata`. That call refuses to follow only the
+        // *final* component: a directory that vanished and came back as a link
+        // to somewhere else makes `root/gone-dir/a.rs` resolve to a perfectly
+        // ordinary file outside the tree, and reading that as "it is back"
+        // keeps the stale in-root entry forever — nothing under a link is
+        // walked or watched, so no later event corrects it.
+        //
+        // Transient failures preserve, as they do in `reindex_file`: a
+        // descriptor limit or a sharing violation says nothing about whether
+        // the path belongs in the index, and the next reconcile will ask again.
+        match open_within_root(&state.root, &state.root.join(rel)) {
+            Ok(file) => match file.metadata() {
+                // Back, and reachable without leaving the tree.
+                Ok(meta) if meta.file_type().is_file() => continue,
+                // There, but not something the index should hold.
+                Ok(_) => {}
+                Err(_) => continue,
+            },
+            Err(e) if proves_ineligible(&e) => {}
+            Err(_) => continue,
         }
         state.index.write().unwrap().live.delete_file(rel);
         state.file_stamps.write().unwrap().remove(rel);
@@ -6753,6 +6770,50 @@ mod tests {
         assert!(
             !state.index.read().unwrap().live.is_deleted("d/a.rs"),
             "a file that exists again must not be swept on a stale listing"
+        );
+    }
+
+    /// A vanished directory that comes back as a link to somewhere else has
+    /// not brought its files back: nothing under a link is walked, watched or
+    /// indexed. The recheck that decides "it is here again" has to answer that
+    /// under the same containment contract indexing does, or the stale in-root
+    /// entry is kept and no later event ever corrects it.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_returns_through_a_symlinked_ancestor_is_still_swept() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+
+        let dir = root.join("d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn ours() {}\n").unwrap();
+        reindex_file(&state, &dir.join("a.rs"), "d/a.rs");
+        assert!(state.index.read().unwrap().live.has_path("d/a.rs"));
+
+        // The scan listed the root, did not find `d`, and is about to sweep
+        // what was under it. In between, `d` comes back — as a link to a tree
+        // that is not ours, holding a file by the same name.
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("a.rs"), "fn theirs() {}\n").unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&outside, &dir).unwrap();
+        assert!(
+            root.join("d").join("a.rs").is_file(),
+            "the fixture must look like a returning file, or it proves nothing"
+        );
+
+        let swept = std::collections::HashSet::from([String::new()]);
+        let present = std::collections::HashSet::new();
+        let vanished = std::collections::HashSet::from(["d".to_string()]);
+        sweep_removed_files(&state, &swept, &present, &vanished);
+
+        assert!(
+            state.index.read().unwrap().live.is_deleted("d/a.rs"),
+            "a file reachable only through a symlink has not come back"
         );
     }
 

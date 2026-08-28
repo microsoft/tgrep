@@ -6104,12 +6104,17 @@ mod tests {
         );
     }
 
-    /// A directory whose listing was only partly enumerated has not proved
-    /// anything about the names it did not yield, so the sweep must not treat
-    /// them as deleted.
+    /// The invariant the incomplete-listing fix relies on: a directory that is
+    /// not in `swept` has proved nothing about the names under it, so the
+    /// sweep must leave them alone.
+    ///
+    /// The wiring above it — withholding a directory whose `read_dir` iterator
+    /// yielded an error — has no test of its own, because a per-entry
+    /// `readdir` failure cannot be induced portably. This pins the half that
+    /// makes withholding sufficient.
     #[cfg(unix)]
     #[test]
-    fn a_directory_that_was_not_fully_enumerated_is_not_swept() {
+    fn sweep_removed_files_only_deletes_from_directories_it_enumerated() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let index_dir = root.join(".tgrep");

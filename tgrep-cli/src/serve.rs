@@ -299,6 +299,24 @@ struct ServerState {
     /// until something else forces a rebuild. Keeping the source list lets the
     /// scan test for it directly, at one stat per ignore file per scan.
     ignore_sources: RwLock<Vec<PathBuf>>,
+    /// What the published matcher actually read, per ignore source: the size
+    /// and mtime each file had, keyed by its path relative to `root`.
+    ///
+    /// A pathname is not evidence about contents. An existing `.gitignore` can
+    /// be replaced after the matcher walk by one restored from an archive,
+    /// carrying an mtime older than the scan window — the path is still a known
+    /// source and the mtime still predates the window, so neither test in
+    /// [`changed_ignore_rules_in`] fires and the subtree is indexed under rules
+    /// that were never read. Comparing against what was read closes that.
+    ///
+    /// Also holds an entry for the target of any source reached through a
+    /// symlink, when that target is itself under `root`. Following links is
+    /// what the walker does, so the matcher's contents come from the target —
+    /// but an edit to the target does not touch the link, and no event names a
+    /// path whose basename is `.gitignore`. The target's own entry is what
+    /// lets that event be recognised. A target outside `root` is not watched at
+    /// all, so for those the reconcile stays the backstop.
+    ignore_source_stamps: RwLock<IgnoreStamps>,
     /// Serializes the whole check-read-commit cycle in [`reindex_file`].
     ///
     /// `snapshot_gate` is held for *read* by everything that indexes a file, so
@@ -621,6 +639,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
         ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
         ignore_sources: RwLock::new(Vec::new()),
+        ignore_source_stamps: RwLock::new(IgnoreStamps::new()),
         reindex_lock: Mutex::new(()),
         deferred_events: Mutex::new(Some(std::collections::HashMap::new())),
         index_progress: std::sync::atomic::AtomicU64::new(0),
@@ -800,6 +819,10 @@ fn build_stale_matcher(
     matcher
 }
 
+/// The size and mtime an ignore source had when the matcher read it, keyed by
+/// its path relative to the served root.
+type IgnoreStamps = std::collections::HashMap<String, (u64, Option<SystemTime>)>;
+
 /// The ignore files a matcher was built from, as one list.
 ///
 /// Root-level `p4ignore.ini` is a separate source from the walker's point of
@@ -821,6 +844,42 @@ fn ignore_sources_of(
     sources
 }
 
+/// Stat every source so a later scan can ask whether the file it finds is the
+/// one the matcher read, rather than merely whether something of that name is
+/// there.
+///
+/// A source reached through a symlink gets a second entry under its target's
+/// own relative path, when the target is under `root`. The stat follows links
+/// either way, so both entries describe the contents that were read.
+fn ignore_stamps_of(root: &Path, sources: &[PathBuf]) -> IgnoreStamps {
+    let canonical_root = std::fs::canonicalize(root).ok();
+    let mut stamps = IgnoreStamps::with_capacity(sources.len());
+    let mut record = |path: &Path, base: &Path| {
+        let Ok(rel) = path.strip_prefix(base) else {
+            return;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        // Follows links: what matters is the content behind the name.
+        if let Ok(meta) = std::fs::metadata(path) {
+            stamps.insert(rel, (meta.len(), meta.modified().ok()));
+        }
+    };
+    for source in sources {
+        record(source, root);
+        let is_link = std::fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_symlink());
+        if !is_link {
+            continue;
+        }
+        if let Some(canonical_root) = canonical_root.as_ref()
+            && let Ok(target) = std::fs::canonicalize(source)
+            && target.starts_with(canonical_root)
+        {
+            record(&target, canonical_root);
+        }
+    }
+    stamps
+}
+
 /// Publish a new ignore matcher and bring everything that depends on it up to
 /// date. `None` is a legitimate matcher when no rules exist.
 ///
@@ -834,15 +893,17 @@ fn ignore_sources_of(
 /// them to [`reindex_files_in`] once `state.file_stamps` describes the index
 /// they just published.
 ///
-/// `since` is when the walk that produced `matcher` began, and is only passed
-/// through so the recovery scan can use it. It has to come from the caller: the
-/// subscription walk inside this function starts later, and an ignore file
-/// written between the two would predate a timestamp taken here and be read as
-/// already accounted for by rules that never saw it.
+/// The returned directories must be paired with a timestamp the *caller*
+/// captured before the walk that produced `matcher`, and handed to
+/// [`reindex_files_in`] as its `since`. This function cannot supply it: the
+/// subscription walk below starts later, so an ignore file written between the
+/// caller's walk and this point would predate any timestamp taken here and be
+/// read as already accounted for by rules that never saw it.
 ///
-/// `sources` are the ignore files `matcher` was built from, recorded so a
-/// recovery scan can notice one of them being deleted — an event the mtime
-/// heuristic cannot see, since a deleted file leaves nothing to stat.
+/// `sources` are the ignore files `matcher` was built from. They are recorded
+/// so a recovery scan can notice one being deleted — which no mtime test can
+/// see, a deleted file leaving nothing to stat — and stat'd so it can also
+/// notice one being replaced, which a pathname cannot show.
 #[must_use = "newly watched directories need a recovery scan or writes race the subscription"]
 fn publish_ignore_matcher(
     state: &ServerState,
@@ -850,6 +911,7 @@ fn publish_ignore_matcher(
     matcher: Option<tgrep_core::gitignore::IgnoreMatcher>,
     sources: Vec<PathBuf>,
 ) -> Vec<PathBuf> {
+    *state.ignore_source_stamps.write().unwrap() = ignore_stamps_of(root, &sources);
     *state.ignore_sources.write().unwrap() = sources;
     *state.gitignore.write().unwrap() = matcher;
     state.gitignore_pending.store(false, Ordering::SeqCst);
@@ -2140,7 +2202,8 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
 }
 
 /// The first ignore-rules file in `dirs` that the published matcher did not
-/// read, or that has been edited since `since`.
+/// read, that has been replaced since it did, or that has been edited since
+/// `since`.
 ///
 /// Probing by name rather than inspecting listings, for three reasons. It is
 /// how the walker itself discovers these files, so the two agree by
@@ -2153,13 +2216,22 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
 /// rules before it ever reaches the file that changes them. Answering for the
 /// whole scan up front closes that window across directories as well.
 ///
-/// Two tests, because neither alone is enough. Absence from the published
-/// sources is the exact question — this file did not feed the matcher in force
-/// — and it catches an arrival however old the file says it is, which matters
-/// because `git checkout`, `tar -x` and `rsync -a` all restore mtimes from what
-/// they unpack and would sail past a recency test. The mtime window then covers
-/// what the source list cannot: a file that was already a source and has just
-/// been edited.
+/// Three tests, because none alone is enough.
+///
+/// Absence from the published sources is the exact question for an arrival —
+/// this file did not feed the matcher in force — and it catches one however old
+/// the file says it is, which matters because `git checkout`, `tar -x` and
+/// `rsync -a` all restore mtimes from what they unpack and would sail past a
+/// recency test.
+///
+/// A stamp mismatch answers the same question for a file that was *already* a
+/// source: a pathname proves nothing about contents, and the same archive
+/// restore can swap a source for a different file bearing an older mtime, which
+/// is invisible to both of the other tests.
+///
+/// The mtime window then covers the gap the stamps cannot: they are taken when
+/// the matcher is published, which is after the walk that read these files, so
+/// a write landing between the two is recorded as if it had been read.
 ///
 /// That window is bounded at both ends, not just the near one. On a network
 /// mount whose server clock runs ahead of ours, every recently touched file
@@ -2170,7 +2242,7 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
 fn changed_ignore_rules_in(
     root: &Path,
     dirs: &[PathBuf],
-    known_sources: &std::collections::HashSet<String>,
+    known_sources: &IgnoreStamps,
     since: SystemTime,
 ) -> Option<(String, &'static str)> {
     let mut probed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -2191,11 +2263,19 @@ fn changed_ignore_rules_in(
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
-            if !known_sources.contains(&rel) {
+            let Some(read_as) = known_sources.get(&rel) else {
                 return Some((rel, "not a known source"));
+            };
+            // Follows links, matching how the stamp was taken.
+            let Ok(meta) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            let current = (meta.len(), meta.modified().ok());
+            if current != *read_as {
+                return Some((rel, "not the file the matcher read"));
             }
-            if std::fs::metadata(&candidate)
-                .and_then(|m| m.modified())
+            if meta
+                .modified()
                 .is_ok_and(|m| m >= since && m <= SystemTime::now())
             {
                 return Some((rel, "modified"));
@@ -2230,32 +2310,21 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
     }
     let start = Instant::now();
 
-    // An ignore file that was deleted during the window is invisible to the
-    // per-entry test below — there is no entry left to stat. It is also the
-    // more damaging direction: rules that no longer have a source keep being
-    // enforced, so the subtree they hide stays unsubscribed and unindexed until
-    // an unrelated rebuild happens along. Checking the sources the published
-    // matcher was built from catches it at one stat apiece, once per scan
-    // rather than once per file.
-    //
-    // The same list answers the opposite question for free: an ignore file that
-    // is *not* among the sources is one the published matcher never read.
-    let known_sources: std::collections::HashSet<String> = if state.no_ignore {
-        std::collections::HashSet::new()
+    // An ignore file that was deleted during the window leaves nothing to stat,
+    // so no test over what is on disk can see it. It is also the more damaging
+    // direction: rules that no longer have a source keep being enforced, so the
+    // subtree they hide stays unsubscribed and unindexed until an unrelated
+    // rebuild happens along. Checking the sources the published matcher was
+    // built from catches it at one stat apiece, once per scan.
+    let known_sources: IgnoreStamps = if state.no_ignore {
+        IgnoreStamps::new()
     } else {
-        let (vanished, known) = {
+        let vanished = {
             let sources = state.ignore_sources.read().unwrap();
-            (
-                // `exists` follows links, matching how the walker collected
-                // these — a symlinked source whose target is gone has stopped
-                // contributing rules just as surely as a deleted one.
-                sources.iter().find(|p| !p.exists()).cloned(),
-                sources
-                    .iter()
-                    .filter_map(|p| p.strip_prefix(root).ok())
-                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-                    .collect::<std::collections::HashSet<String>>(),
-            )
+            // `exists` follows links, matching how the walker collected these —
+            // a symlinked source whose target is gone has stopped contributing
+            // rules just as surely as a deleted one.
+            sources.iter().find(|p| !p.exists()).cloned()
         };
         if let Some(gone) = vanished {
             state.ignore_rules_dirty.store(true, Ordering::SeqCst);
@@ -2266,7 +2335,7 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
             );
             return;
         }
-        known
+        state.ignore_source_stamps.read().unwrap().clone()
     };
 
     // Before a single file is indexed: an ignore-rules file that landed in this
@@ -2867,11 +2936,29 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         return;
     }
 
-    let ignore_rules_changed = !state.no_ignore
-        && event
-            .paths
-            .iter()
-            .any(|path| is_ignore_rules_file(root, path));
+    // Two ways an event can carry a rules change. The obvious one is a path the
+    // walker would read as a rules file, recognised by name.
+    //
+    // The other is a path the published matcher actually read through a
+    // symlink. `ignore_files_in` uses `Path::is_file`, which follows links, so
+    // a `.gitignore` symlinked to `shared-rules` contributes the *target's*
+    // contents — but editing the target produces an event naming `shared-rules`,
+    // whose basename means nothing to `is_ignore_rules_file`, and touches
+    // nothing whose name does. Recognising the paths that were read, and not
+    // just the names rules usually go by, is what closes that.
+    //
+    // Only targets inside `root` can appear here, because only those are
+    // watched; for one outside, no event arrives at all and the periodic
+    // reconcile remains the backstop.
+    let ignore_rules_changed = !state.no_ignore && {
+        let stamps = state.ignore_source_stamps.read().unwrap();
+        event.paths.iter().any(|path| {
+            is_ignore_rules_file(root, path)
+                || path
+                    .strip_prefix(root)
+                    .is_ok_and(|rel| stamps.contains_key(&rel.to_string_lossy().replace('\\', "/")))
+        })
+    };
     if ignore_rules_changed {
         state.ignore_rules_dirty.store(true, Ordering::SeqCst);
         if state.indexing.load(Ordering::SeqCst) {
@@ -5156,7 +5243,6 @@ mod tests {
     /// A `ServerState` over an empty index, for exercising the stale path
     /// directly. Mirrors the defaults `run` uses with a watcher and ignore
     /// rules enabled, which is the configuration `gitignore_pending` gates.
-    #[cfg(unix)]
     fn test_server_state(root: &Path, index_dir: &Path) -> Arc<ServerState> {
         create_empty_index(index_dir).expect("create empty index");
         let hybrid = HybridIndex::open(index_dir, root).expect("open empty index");
@@ -5175,6 +5261,7 @@ mod tests {
             ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
             ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
             ignore_sources: RwLock::new(Vec::new()),
+            ignore_source_stamps: RwLock::new(IgnoreStamps::new()),
             reindex_lock: Mutex::new(()),
             deferred_events: Mutex::new(Some(std::collections::HashMap::new())),
             index_progress: std::sync::atomic::AtomicU64::new(0),
@@ -6541,6 +6628,96 @@ mod tests {
         assert!(
             !state.index.read().unwrap().live.has_path("a/keep.rs"),
             "nothing may be indexed before every directory has been asked for rules"
+        );
+    }
+
+    /// A path is not evidence about contents. An archive restore can put a
+    /// different `.gitignore` at a path the matcher already read, carrying an
+    /// mtime older than the scan window — known name, untouched by the clock,
+    /// and yet not the file whose rules are being enforced.
+    #[test]
+    fn a_rule_file_swapped_for_an_older_one_is_not_taken_on_faith() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let rules = root.join(".gitignore");
+        std::fs::write(&rules, "nothing-at-all.rs\n").unwrap();
+        std::fs::write(root.join("keep.rs"), "fn keep() {}\n").unwrap();
+        *state.ignore_source_stamps.write().unwrap() =
+            ignore_stamps_of(&root, std::slice::from_ref(&rules));
+        *state.ignore_sources.write().unwrap() = vec![rules.clone()];
+
+        // Far enough ahead that the mtime window cannot fire for anything on
+        // disk: what is left is the question of whether the file is the one
+        // that was read.
+        let since = SystemTime::now() + std::time::Duration::from_secs(3600);
+        state.ignore_refresh_scheduled.store(true, Ordering::SeqCst);
+        reindex_files_in(&state, &root, std::slice::from_ref(&root), since);
+        assert!(
+            !state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "the file the matcher read must not be reported as changed"
+        );
+        assert!(
+            state.index.read().unwrap().live.has_path("keep.rs"),
+            "and the scan must get on with its work"
+        );
+
+        // Same path, same age as far as the window is concerned, different
+        // rules.
+        std::fs::write(&rules, "keep.rs\n").unwrap();
+        reindex_files_in(&state, &root, std::slice::from_ref(&root), since);
+        assert!(
+            state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "a source that is no longer the file that was read must schedule a refresh"
+        );
+    }
+
+    /// A `.gitignore` symlinked to `shared-rules` contributes the target's
+    /// contents, because the walker follows links. Editing the target is
+    /// therefore a rules change — but it touches nothing named like one.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_to_a_symlinked_rule_files_target_schedules_a_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let target = root.join("shared-rules");
+        std::fs::write(&target, "keep.rs\n").unwrap();
+        let link = root.join(".gitignore");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let stamps = ignore_stamps_of(&root, std::slice::from_ref(&link));
+        assert!(
+            stamps.contains_key("shared-rules"),
+            "the file the rules were actually read from has to be recorded too"
+        );
+        *state.ignore_source_stamps.write().unwrap() = stamps;
+
+        // Stop at the flag: what is being pinned is that the event is
+        // recognised, not what the refresh then does.
+        state.indexing.store(true, Ordering::SeqCst);
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )),
+                paths: vec![target],
+                attrs: Default::default(),
+            },
+        );
+
+        assert!(
+            state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "an edit to the file a rules symlink resolves to is a rules change, \
+             whatever the path is called"
         );
     }
 

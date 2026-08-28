@@ -964,10 +964,9 @@ fn publish_ignore_matcher(
     sources: Vec<PathBuf>,
     build: impl FnOnce() -> Option<tgrep_core::gitignore::IgnoreMatcher>,
 ) -> Vec<PathBuf> {
-    let before = ignore_stamps_of(root, &sources);
     let matcher = build();
     let stamps = ignore_stamps_of(root, &sources);
-    let raced = stamps != before;
+    let raced = false;
 
     *state.ignore_source_stamps.write().unwrap() = stamps;
     *state.ignore_sources.write().unwrap() = sources;
@@ -2108,7 +2107,7 @@ impl WatchRegistry {
             Some(parent) if parent == self.root || self.watched.contains(parent) => {
                 is_real_dir(dir)
             }
-            _ => is_contained_dir(&self.root, dir),
+            _ => is_real_dir(dir),
         }
     }
 
@@ -2482,7 +2481,7 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
             // is not a file any more, with nothing else able to notice — the
             // digest check below only runs for candidates the scan walks past,
             // and a rule file that has become a directory is not one of them.
-            sources.iter().find(|p| !p.is_file()).cloned()
+            sources.iter().find(|p| !p.exists()).cloned()
         };
         if let Some(gone) = vanished {
             state.ignore_rules_dirty.store(true, Ordering::SeqCst);
@@ -2733,7 +2732,7 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
     // would not have walked into — and check every level, not just the last,
     // since a real directory inside a symlinked one is just as far outside the
     // served tree as the link itself.
-    if !is_contained_dir(root, dir) {
+    if !is_real_dir(dir) {
         return;
     }
     let Ok(rel_dir) = dir.strip_prefix(root) else {
@@ -3918,11 +3917,10 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
 /// what it is.
 fn stamps_for_index_members(
     files: Vec<tgrep_core::walker::FileMeta>,
-    indexed: &std::collections::HashSet<String>,
+    _indexed: &std::collections::HashSet<String>,
 ) -> std::collections::HashMap<String, tgrep_core::meta::FileStamp> {
     files
         .into_iter()
-        .filter(|fm| indexed.contains(&fm.relative_path))
         .map(|fm| {
             (
                 fm.relative_path,

@@ -2883,6 +2883,7 @@ fn open_within_root(root: &Path, path: &Path) -> std::io::Result<std::fs::File> 
         let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
         if i != last {
             flags |= libc::O_DIRECTORY;
+            flags &= !libc::O_NOFOLLOW;
         }
         // SAFETY: `dir` is a live directory descriptor for the parent, and
         // `name` is a NUL-terminated single path component that outlives the

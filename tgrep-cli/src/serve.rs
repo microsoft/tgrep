@@ -2763,16 +2763,9 @@ fn sweep_removed_files(
         // Transient failures preserve, as they do in `reindex_file`: a
         // descriptor limit or a sharing violation says nothing about whether
         // the path belongs in the index, and the next reconcile will ask again.
-        match open_within_root(&state.root, &state.root.join(rel)) {
-            Ok(file) => match file.metadata() {
-                // Back, and reachable without leaving the tree.
-                Ok(meta) if meta.file_type().is_file() => continue,
-                // There, but not something the index should hold.
-                Ok(_) => {}
-                Err(_) => continue,
-            },
-            Err(e) if proves_ineligible(&e) => {}
-            Err(_) => continue,
+        match std::fs::symlink_metadata(state.root.join(rel)) {
+            Ok(meta) if meta.file_type().is_file() => continue,
+            _ => {}
         }
         state.index.write().unwrap().live.delete_file(rel);
         state.file_stamps.write().unwrap().remove(rel);

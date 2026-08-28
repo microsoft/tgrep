@@ -823,6 +823,15 @@ fn build_stale_matcher(
 /// its path relative to the served root.
 type IgnoreStamps = std::collections::HashMap<String, (u64, Option<SystemTime>)>;
 
+/// How far an mtime may lag the write it records.
+///
+/// Two seconds, which covers the coarsest granularity still in use: FAT and
+/// its descendants store modification times in two-second units, HFS+ and
+/// ext3 in whole seconds. Used to widen comparisons against a wall-clock
+/// instant, which has no such rounding, so a write cannot be dated before a
+/// moment it actually followed.
+const MTIME_GRANULARITY: Duration = Duration::from_secs(2);
+
 /// The ignore files a matcher was built from, as one list.
 ///
 /// Root-level `p4ignore.ini` is a separate source from the walker's point of
@@ -2233,18 +2242,27 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
 /// the matcher is published, which is after the walk that read these files, so
 /// a write landing between the two is recorded as if it had been read.
 ///
-/// That window is bounded at both ends, not just the near one. On a network
-/// mount whose server clock runs ahead of ours, every recently touched file
-/// carries a future mtime and would pass a one-sided test — on every scan,
-/// including the one at the end of the refresh this schedules, which walks the
-/// whole repository and then arms the next. Treating a future mtime as skew
-/// rather than as an edit keeps that loop closed.
+/// That window is widened by [`MTIME_GRANULARITY`] at the near end, because
+/// `since` is a wall-clock instant with nanosecond precision and an mtime is
+/// not. HFS+ and ext3 store whole seconds, FAT-derived filesystems two, so a
+/// write that happens after `since` can be stamped before it and read as
+/// historical. Over-triggering costs one rewalk that finds nothing; the slack
+/// is bounded, so a file whose mtime keeps qualifying stops doing so as later
+/// scans take later timestamps.
+///
+/// The far end is bounded too. On a network mount whose server clock runs
+/// ahead of ours, every recently touched file carries a future mtime and would
+/// pass a one-sided test — on every scan, including the one at the end of the
+/// refresh this schedules, which walks the whole repository and then arms the
+/// next. Treating a future mtime as skew rather than as an edit keeps that
+/// loop closed.
 fn changed_ignore_rules_in(
     root: &Path,
     dirs: &[PathBuf],
     known_sources: &IgnoreStamps,
     since: SystemTime,
 ) -> Option<(String, &'static str)> {
+    let since = since.checked_sub(MTIME_GRANULARITY).unwrap_or(since);
     let mut probed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for dir in dirs {
         let mut candidates = vec![
@@ -2472,6 +2490,19 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
 /// eligibility. Filtering `present` would delete entries for files that are
 /// still on disk and were indexed under a laxer configuration.
 ///
+/// Candidates come from everything that can answer a search, not from
+/// `file_stamps` alone. A stamp is not a precondition for being searchable:
+/// `filestamps.json` is optional by design — missing or unreadable leaves the
+/// map empty, and a build that predates a given file's stamp leaves it partial
+/// — while the reader still holds that file's content. Sweeping only what has
+/// a stamp would then delete nothing at all, and the deleted files would keep
+/// answering searches until the hourly reconcile.
+///
+/// Reader paths already hidden by a tombstone are skipped. `delete_file`
+/// tombstones unconditionally and counts a mutation for it, so re-deleting
+/// them would make every scan over a directory with deletions in it look like
+/// fresh churn and pull flushes forward for no reason.
+///
 /// The caller must already hold `snapshot_gate`.
 fn sweep_removed_files(
     state: &ServerState,
@@ -2481,20 +2512,28 @@ fn sweep_removed_files(
     if swept.is_empty() {
         return;
     }
-    // One pass over the stamps rather than a lookup per swept directory: at
-    // startup both sides of this span the whole repository, and anything
-    // proportional to their product would not finish.
-    let gone: Vec<String> = {
-        let stamps = state.file_stamps.read().unwrap();
-        stamps
-            .keys()
-            .filter(|rel| {
-                let parent = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
-                swept.contains(parent) && !present.contains(rel.as_str())
-            })
-            .cloned()
-            .collect()
+    // One pass per source rather than a lookup per swept directory: at startup
+    // both sides of this span the whole repository, and anything proportional
+    // to their product would not finish.
+    let missing = |rel: &str| {
+        let parent = rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+        swept.contains(parent) && !present.contains(rel)
     };
+    let mut gone: std::collections::HashSet<String> = {
+        let stamps = state.file_stamps.read().unwrap();
+        stamps.keys().filter(|rel| missing(rel)).cloned().collect()
+    };
+    {
+        let index = state.index.read().unwrap();
+        gone.extend(index.reader_paths_matching(|rel| missing(rel) && !index.live.is_deleted(rel)));
+        gone.extend(
+            index
+                .live
+                .overlay_paths()
+                .into_iter()
+                .filter(|rel| missing(rel)),
+        );
+    }
     if gone.is_empty() {
         return;
     }
@@ -6718,6 +6757,78 @@ mod tests {
             state.ignore_rules_dirty.load(Ordering::SeqCst),
             "an edit to the file a rules symlink resolves to is a rules change, \
              whatever the path is called"
+        );
+    }
+
+    /// An mtime is not a wall-clock instant. Whole-second (HFS+, ext3) or
+    /// two-second (FAT) granularity can date a write before the moment it
+    /// actually followed, and a source edited between the walk and the
+    /// publication carries a stamp that matches it — so the window is the only
+    /// test left, and it has to allow for the rounding.
+    #[test]
+    fn a_rule_file_stamped_a_second_early_is_still_inside_the_window() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let rules = root.join(".gitignore");
+        std::fs::write(&rules, "nothing-at-all.rs\n").unwrap();
+        *state.ignore_source_stamps.write().unwrap() =
+            ignore_stamps_of(&root, std::slice::from_ref(&rules));
+        *state.ignore_sources.write().unwrap() = vec![rules.clone()];
+        let stamped = std::fs::metadata(&rules).unwrap().modified().unwrap();
+        state.ignore_refresh_scheduled.store(true, Ordering::SeqCst);
+
+        // Far outside any rounding: this one really is history.
+        let old = stamped + std::time::Duration::from_secs(3600);
+        reindex_files_in(&state, &root, std::slice::from_ref(&root), old);
+        assert!(
+            !state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "a source last written an hour before the walk is not a change"
+        );
+
+        // Within the granularity of a coarse filesystem's clock: the file may
+        // well have been written after the walk began and been rounded down.
+        let rounded = stamped + std::time::Duration::from_secs(1);
+        reindex_files_in(&state, &root, std::slice::from_ref(&root), rounded);
+        assert!(
+            state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "an mtime that sits just under the window has to be treated as recent"
+        );
+    }
+
+    /// A stamp is not what makes a file searchable — the index is.
+    /// `filestamps.json` is optional, and a partial or absent map used to mean
+    /// the sweep had no candidates and deleted files kept answering searches.
+    #[test]
+    fn the_sweep_drops_a_deleted_file_that_never_had_a_stamp() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let path = root.join("seeded.rs");
+        std::fs::write(&path, "fn seeded() {}\n").unwrap();
+        let gate = state.snapshot_gate.read().unwrap();
+        reindex_file(&state, &path, "seeded.rs");
+        assert!(state.index.read().unwrap().live.has_path("seeded.rs"));
+
+        // Indexed, and searchable, but with nothing in the stamp map to say so
+        // — as after a seed whose stamps could not be read.
+        state.file_stamps.write().unwrap().remove("seeded.rs");
+        std::fs::remove_file(&path).unwrap();
+
+        let swept: std::collections::HashSet<String> = [String::new()].into_iter().collect();
+        sweep_removed_files(&state, &swept, &std::collections::HashSet::new());
+        drop(gate);
+
+        assert!(
+            state.index.read().unwrap().live.is_deleted("seeded.rs"),
+            "a file that is gone from disk must stop answering searches whether or \
+             not it had a stamp"
         );
     }
 

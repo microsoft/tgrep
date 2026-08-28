@@ -293,6 +293,21 @@ impl HybridIndex {
         self.reader().all_paths().iter().cloned().collect()
     }
 
+    /// The reader paths `keep` accepts.
+    ///
+    /// For callers that want a few of them — everything under one directory,
+    /// say. [`Self::reader_paths`] allocates a copy of every path in the index
+    /// to answer that, which at repository scale is the bulk of the cost and
+    /// all of it wasted.
+    pub fn reader_paths_matching(&self, mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+        self.reader()
+            .all_paths()
+            .iter()
+            .filter(|path| keep(path))
+            .cloned()
+            .collect()
+    }
+
     /// Number of files in the on-disk reader.
     pub fn reader_file_count(&self) -> usize {
         self.reader().num_files()

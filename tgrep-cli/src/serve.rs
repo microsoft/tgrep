@@ -2369,27 +2369,39 @@ fn sweep_removed_files(
     if gone.is_empty() {
         return;
     }
-    eprintln!(
-        "[trace] watcher: dropped {} file(s) removed while subscriptions were \
-         being established",
-        gone.len()
-    );
-    {
-        let mut index = state.index.write().unwrap();
-        for rel in &gone {
-            index.live.delete_file(rel);
+    // Per candidate, under the same lock `reindex_file` takes, and re-checked
+    // against the filesystem rather than against the listing that produced
+    // `gone`. That listing is from earlier in the scan; a file recreated since
+    // then has already had its create event consumed by the watcher, so
+    // deleting it here on the strength of a stale observation would lose it
+    // until the next reconcile — and there is nothing left to replay.
+    //
+    // The lock is what makes the recheck mean anything: without it the file
+    // could be reindexed between the check and the delete, which is the same
+    // bug one instruction later.
+    let mut dropped = 0usize;
+    for rel in &gone {
+        let _reindex = match state.reindex_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // No-follow: a path that came back as a symlink is still not something
+        // the index should hold, so it stays swept.
+        if std::fs::symlink_metadata(state.root.join(rel)).is_ok_and(|m| m.file_type().is_file()) {
+            continue;
         }
-    }
-    {
-        let mut stamps = state.file_stamps.write().unwrap();
-        for rel in &gone {
-            stamps.remove(rel);
-        }
-    }
-    if let Ok(mut cache) = state.cache.write() {
-        for rel in &gone {
+        state.index.write().unwrap().live.delete_file(rel);
+        state.file_stamps.write().unwrap().remove(rel);
+        if let Ok(mut cache) = state.cache.write() {
             cache.pop(rel);
         }
+        dropped += 1;
+    }
+    if dropped > 0 {
+        eprintln!(
+            "[trace] watcher: dropped {dropped} file(s) removed while subscriptions were \
+             being established"
+        );
     }
 }
 
@@ -3212,13 +3224,53 @@ fn relative_components(root: &Path, path: &Path) -> std::io::Result<Vec<std::ffi
     Ok(components)
 }
 
+/// The outcome of reading a file whose stat'd size has already been approved.
+enum CappedRead {
+    Data(Vec<u8>),
+    /// The file yielded more bytes than the cap allows, whatever its size said.
+    TooLarge,
+    Failed,
+}
+
+/// Reads a file's contents, never pulling in more than one byte past the cap.
+///
+/// The size that qualified this file was stat'd before the read, and appending
+/// between the two is exactly what a log or a build artifact does. An
+/// unbounded read would then hold the whole of it in memory and index it past
+/// the limit the user set. One byte over is enough to prove it no longer
+/// qualifies, and is all that is ever read beyond the limit.
+fn read_within_limit(file: &mut std::fs::File, limit: Option<u64>, capacity: usize) -> CappedRead {
+    use std::io::Read;
+
+    let mut data = Vec::with_capacity(capacity);
+    match limit {
+        Some(limit) => {
+            if file
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut data)
+                .is_err()
+            {
+                return CappedRead::Failed;
+            }
+            if data.len() as u64 > limit {
+                return CappedRead::TooLarge;
+            }
+        }
+        None => {
+            if file.read_to_end(&mut data).is_err() {
+                return CappedRead::Failed;
+            }
+        }
+    }
+    CappedRead::Data(data)
+}
+
 /// Read a file and merge it into the live index, unless its stamp says the
 /// content we already indexed is current.
 ///
 /// The caller must hold `snapshot_gate`: the read, the commit, and the stamp
 /// update have to be atomic with respect to a flush or auto-save.
 fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
-    use std::io::Read;
     use tgrep_core::meta::FileStamp;
 
     // Against other indexers, not against searches. The gate above is held for
@@ -3310,10 +3362,18 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // From the handle, not the path: re-opening here is what would let a
     // symlink take the place of the file we just approved.
     let mut file = file;
-    let mut data = Vec::with_capacity(current.size.min(1 << 20) as usize);
-    if file.read_to_end(&mut data).is_err() {
-        return;
-    }
+    let data = match read_within_limit(
+        &mut file,
+        state.max_file_size,
+        current.size.min(1 << 20) as usize,
+    ) {
+        CappedRead::Data(data) => data,
+        CappedRead::TooLarge => {
+            drop_indexed_file(state, rel_path, "grew past the size limit while being read");
+            return;
+        }
+        CappedRead::Failed => return,
+    };
     let text = tgrep_core::encoding::decode_for_index(&data);
     let is_binary = tgrep_core::trigram::is_binary(&text);
     let per_tri = if is_binary {
@@ -6137,12 +6197,43 @@ mod tests {
             "an unenumerated directory must not tombstone the files under it"
         );
 
-        // And with the listing complete, the same absence is a deletion.
+        // And with the listing complete, the same absence is a deletion — once
+        // the file is actually gone, which the sweep now confirms itself.
+        std::fs::remove_file(&path).unwrap();
         let swept = std::collections::HashSet::from(["d".to_string()]);
         sweep_removed_files(&state, &swept, &present);
         assert!(
             state.index.read().unwrap().live.is_deleted("d/a.rs"),
             "a fully enumerated directory must sweep what it no longer contains"
+        );
+    }
+
+    /// The listing that decides what to sweep is from earlier in the scan. A
+    /// file recreated since then has already had its event consumed, so
+    /// deleting it on that stale evidence loses it until the next reconcile.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_does_not_delete_a_file_that_came_back() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+
+        let path = root.join("d").join("a.rs");
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::write(&path, "fn a() {}\n").unwrap();
+        reindex_file(&state, &path, "d/a.rs");
+        assert!(state.index.read().unwrap().live.has_path("d/a.rs"));
+
+        // `d` enumerated cleanly and did not contain `a.rs` at the time — but
+        // it is back on disk by the time the sweep runs.
+        let swept = std::collections::HashSet::from(["d".to_string()]);
+        let present = std::collections::HashSet::new();
+        sweep_removed_files(&state, &swept, &present);
+
+        assert!(
+            !state.index.read().unwrap().live.is_deleted("d/a.rs"),
+            "a file that exists again must not be swept on a stale listing"
         );
     }
 
@@ -6185,6 +6276,70 @@ mod tests {
         assert!(
             state.index.read().unwrap().live.is_deleted("x.rs"),
             "content indexed before the path became a fifo must not stay searchable"
+        );
+    }
+
+    /// The size that qualifies a file is stat'd before its contents are read.
+    /// A file that grows in between must not be read into memory without
+    /// bound, nor indexed past the cap.
+    #[test]
+    fn a_read_stops_one_byte_past_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("grew.txt");
+        std::fs::write(&path, "x".repeat(4096)).unwrap();
+
+        // Stat said 16 bytes; the file is 4096 by the time it is read.
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert!(matches!(
+            read_within_limit(&mut file, Some(64), 16),
+            CappedRead::TooLarge
+        ));
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert!(
+            matches!(read_within_limit(&mut file, None, 16), CappedRead::Data(d) if d.len() == 4096),
+            "no cap means no bound"
+        );
+
+        std::fs::write(&path, "small").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert!(
+            matches!(read_within_limit(&mut file, Some(64), 5), CappedRead::Data(d) if d == b"small"),
+            "a file within the cap reads whole"
+        );
+
+        // Exactly at the cap is still within it.
+        std::fs::write(&path, "x".repeat(64)).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert!(
+            matches!(read_within_limit(&mut file, Some(64), 64), CappedRead::Data(d) if d.len() == 64)
+        );
+    }
+
+    /// The whole point of the bound: a file past the cap loses what the index
+    /// held for it rather than keeping a stale, smaller copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_outgrows_the_cap_loses_its_indexed_content() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let mut state = test_server_state(&root, &index_dir);
+        Arc::get_mut(&mut state).unwrap().max_file_size = Some(64);
+
+        let path = root.join("grows.rs");
+        std::fs::write(&path, "fn small_enough() {}\n").unwrap();
+        reindex_file(&state, &path, "grows.rs");
+        assert!(
+            state.index.read().unwrap().live.has_path("grows.rs"),
+            "a file under the cap should index normally"
+        );
+
+        std::fs::write(&path, "x".repeat(4096)).unwrap();
+        reindex_file(&state, &path, "grows.rs");
+        assert!(
+            state.index.read().unwrap().live.is_deleted("grows.rs"),
+            "content past the cap must not stay searchable"
         );
     }
 

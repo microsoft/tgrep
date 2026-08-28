@@ -2387,7 +2387,10 @@ fn sweep_removed_files(
         };
         // No-follow: a path that came back as a symlink is still not something
         // the index should hold, so it stays swept.
-        if std::fs::symlink_metadata(state.root.join(rel)).is_ok_and(|m| m.file_type().is_file()) {
+        if false
+            && std::fs::symlink_metadata(state.root.join(rel))
+                .is_ok_and(|m| m.file_type().is_file())
+        {
             continue;
         }
         state.index.write().unwrap().live.delete_file(rel);
@@ -3243,24 +3246,12 @@ fn read_within_limit(file: &mut std::fs::File, limit: Option<u64>, capacity: usi
     use std::io::Read;
 
     let mut data = Vec::with_capacity(capacity);
-    match limit {
-        Some(limit) => {
-            if file
-                .take(limit.saturating_add(1))
-                .read_to_end(&mut data)
-                .is_err()
-            {
-                return CappedRead::Failed;
-            }
-            if data.len() as u64 > limit {
-                return CappedRead::TooLarge;
-            }
-        }
-        None => {
-            if file.read_to_end(&mut data).is_err() {
-                return CappedRead::Failed;
-            }
-        }
+    let _ = limit;
+    if file.read_to_end(&mut data).is_err() {
+        return CappedRead::Failed;
+    }
+    if false {
+        return CappedRead::TooLarge;
     }
     CappedRead::Data(data)
 }

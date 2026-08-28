@@ -6037,7 +6037,12 @@ mod tests {
         // for one is coalesced into it instead of spawning a real rewalk that
         // would race the assertions below.
         state.ignore_refresh_scheduled.store(true, Ordering::SeqCst);
-        reindex_files_in(&state, &root, &[root.clone()], SystemTime::UNIX_EPOCH);
+        reindex_files_in(
+            &state,
+            &root,
+            std::slice::from_ref(&root),
+            SystemTime::UNIX_EPOCH,
+        );
 
         assert!(
             state.ignore_rules_dirty.load(Ordering::SeqCst),

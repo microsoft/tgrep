@@ -838,15 +838,13 @@ type IgnoreStamps = std::collections::HashMap<String, (u64, u64)>;
 /// a source that has become unreadable has stopped contributing the rules the
 /// matcher is enforcing, and that is a change.
 fn ignore_digest_of(path: &Path) -> Option<(u64, u64)> {
-    use std::hash::{Hash, Hasher};
-
-    // The whole file, as the matcher builder reads it. These are rule files:
-    // a few hundred bytes each in practice, and already in the page cache from
-    // the walk that found them.
-    let bytes = std::fs::read(path).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Some((bytes.len() as u64, hasher.finish()))
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    Some((meta.len(), mtime))
 }
 
 /// How far an mtime may lag the write it records.

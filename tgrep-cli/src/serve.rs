@@ -290,6 +290,23 @@ struct ServerState {
     ignore_rules_dirty: std::sync::atomic::AtomicBool,
     /// Ensures a burst of ignore-file events uses at most one refresh worker.
     ignore_refresh_scheduled: std::sync::atomic::AtomicBool,
+    /// Paths the watcher saw while `indexing` was set, kept so they can be
+    /// replayed once the build publishes.
+    ///
+    /// Events that arrive during a build cannot be applied — the stamps do not
+    /// describe the index yet, so every path would read as changed — but they
+    /// are the only record that those paths moved. The build's own walk misses
+    /// anything written to a directory it has already passed, and on a
+    /// whole-subtree backend there is no per-directory recovery scan to fall
+    /// back on, so discarding them leaves the change invisible until the hourly
+    /// reconcile.
+    ///
+    /// `None` means the buffer overflowed and the paths were dropped; the
+    /// replay then falls back to a full stale refresh, which is slower but
+    /// complete. Bounded because a build can run for minutes on a large
+    /// repository and a checkout or a build tree churning underneath it is
+    /// unbounded.
+    deferred_events: Mutex<Option<std::collections::HashSet<PathBuf>>>,
     /// Progress: number of files indexed so far.
     index_progress: std::sync::atomic::AtomicU64,
     /// Total files discovered for indexing.
@@ -573,6 +590,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         gitignore_pending: std::sync::atomic::AtomicBool::new(!no_watch && !no_ignore),
         ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
         ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+        deferred_events: Mutex::new(Some(std::collections::HashSet::new())),
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
         watch_enabled: !no_watch,
@@ -757,24 +775,29 @@ fn build_stale_matcher(
 /// makes the matcher swap and the index decisions around it atomic from the
 /// watcher's point of view.
 ///
-/// Returns the directories that were newly subscribed to as a result, and the
-/// moment the walk behind that decision began. Those were unwatched while the
-/// caller's walk ran, so anything written to them in that window produced no
-/// event and appears in no walk result. Callers pass both to
-/// [`reindex_files_in`] once `state.file_stamps` describes the index they just
-/// published.
+/// Returns the directories that were newly subscribed to as a result. Those
+/// were unwatched while the caller's walk ran, so anything written to them in
+/// that window produced no event and appears in no walk result. Callers pass
+/// them to [`reindex_files_in`] once `state.file_stamps` describes the index
+/// they just published.
+///
+/// `since` is when the walk that produced `matcher` began, and is only passed
+/// through so the recovery scan can use it. It has to come from the caller: the
+/// subscription walk inside this function starts later, and an ignore file
+/// written between the two would predate a timestamp taken here and be read as
+/// already accounted for by rules that never saw it.
 #[must_use = "newly watched directories need a recovery scan or writes race the subscription"]
 fn publish_ignore_matcher(
     state: &ServerState,
     root: &Path,
     matcher: Option<tgrep_core::gitignore::IgnoreMatcher>,
-) -> (Vec<PathBuf>, SystemTime) {
+) -> Vec<PathBuf> {
     *state.gitignore.write().unwrap() = matcher;
     state.gitignore_pending.store(false, Ordering::SeqCst);
     // New rules mean a different set of directories worth hearing about:
     // a tightened rule releases the subscriptions under it, and a relaxed
     // one takes subscriptions for the tree it used to hide.
-    sync_watch_registrations(state, root)
+    sync_watch_registrations(state, root).0
 }
 
 fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
@@ -2424,6 +2447,103 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
 
 /// Recheck newly watched directories on a background thread.
 ///
+/// Remember the paths in an event that arrived mid-build, for replay once the
+/// build publishes.
+///
+/// The event cannot be applied now: until `indexing` clears, `file_stamps` does
+/// not describe the index, so every path would compare as changed and the
+/// watcher would re-read the repository alongside the build already reading it.
+/// It cannot simply be dropped either — see [`ServerState::deferred_events`].
+///
+/// Capped, and the cap discards the whole set rather than truncating it: a
+/// partial set is indistinguishable from a complete one at replay time, and
+/// silently recovering nine tenths of a checkout is worse than knowing to fall
+/// back on a full refresh.
+fn defer_events_during_build(state: &ServerState, event: &Event) {
+    /// A checkout of the Linux kernel is ~90k files. Above this the fallback
+    /// refresh is cheaper than the replay would be anyway.
+    const MAX_DEFERRED: usize = 100_000;
+
+    let Ok(mut deferred) = state.deferred_events.lock() else {
+        return;
+    };
+    let Some(paths) = deferred.as_mut() else {
+        return;
+    };
+    if paths.len().saturating_add(event.paths.len()) > MAX_DEFERRED {
+        *deferred = None;
+        eprintln!(
+            "[trace] warning: too many file changes during the initial index build to replay \
+             individually; a full reconcile will run instead"
+        );
+        return;
+    }
+    paths.extend(event.paths.iter().cloned());
+}
+
+/// Apply the events that arrived during the build, now that it has published.
+///
+/// Replayed as synthetic create events rather than handled directly so they go
+/// through exactly the filtering an ordinary event gets — ignore rules, the
+/// exclude list, the index directory, new-subtree subscription. `Create(Any)`
+/// is the right kind for all of them: `handle_fs_event` decides removal from
+/// whether the path still exists, and modifications and creations take the same
+/// route, so one kind covers arrivals, edits and deletions alike.
+///
+/// The caller must *not* hold `snapshot_gate`; `handle_fs_event` takes it.
+fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
+    let deferred = match state.deferred_events.lock() {
+        // Leaves `Some(empty)` behind, so anything deferred by a later build
+        // (a reconcile sets `indexing` again) is collected from scratch.
+        Ok(mut guard) => guard.replace(std::collections::HashSet::new()),
+        Err(_) => return,
+    };
+    let Some(paths) = deferred else {
+        // Overflowed. A stale refresh rewalks the tree and diffs it against the
+        // index, which covers every path the replay would have, and it is what
+        // already runs when ignore rules change mid-build.
+        eprintln!("[trace] watcher: reconciling after too many changes during the initial build");
+        let state = Arc::clone(state);
+        let root = root.to_path_buf();
+        if thread::Builder::new()
+            .name("tgrep-deferred-reconcile".into())
+            .spawn(move || {
+                if !background_refresh_stale(&state, &root, &state.index_dir, true) {
+                    eprintln!(
+                        "[trace] warning: the post-build reconcile did not complete; changes made \
+                         during the build wait for the next one"
+                    );
+                }
+            })
+            .is_err()
+        {
+            eprintln!("[trace] warning: could not start the post-build reconcile");
+        }
+        return;
+    };
+    if paths.is_empty() {
+        return;
+    }
+
+    let start = Instant::now();
+    let count = paths.len();
+    for path in paths {
+        handle_fs_event(
+            state,
+            root,
+            &Event {
+                kind: EventKind::Create(notify::event::CreateKind::Any),
+                paths: vec![path],
+                attrs: Default::default(),
+            },
+        );
+    }
+    eprintln!(
+        "[trace] watcher: replayed {count} change(s) deferred during the initial build in {:.1}ms",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+}
+
 /// For the publish sites that cannot scan inline. Until a directory is
 /// subscribed it cannot report a write, and the walk that decided to subscribe
 /// to it may have passed it before that write happened, so a file landing in
@@ -2436,16 +2556,16 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
 ///
 /// Waits out `indexing` first. During a build the stamps do not describe the
 /// index yet, so every file would look changed and the scan would re-read the
-/// whole repository alongside the build that is already doing it.
+/// whole repository alongside the build that is already doing it. That wait is
+/// also what makes this the right place to replay the events the build made the
+/// watcher discard, which is why it runs even on a backend that has nothing
+/// per-directory to recover.
 fn spawn_recovery_scan(
     state: &Arc<ServerState>,
     root: &Path,
     dirs: Vec<PathBuf>,
     since: SystemTime,
 ) {
-    if dirs.is_empty() || !PER_DIRECTORY_WATCHES {
-        return;
-    }
     let state = Arc::clone(state);
     let root = root.to_path_buf();
     let spawned = thread::Builder::new()
@@ -2453,6 +2573,15 @@ fn spawn_recovery_scan(
         .spawn(move || {
             while state.indexing.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(200));
+            }
+            // Before the gate, not under it: this takes `snapshot_gate` for
+            // read itself, and std's `RwLock` may deadlock on a recursive read
+            // if a writer queues up in between.
+            replay_deferred_events(&state, &root);
+
+            let dirs = recovery_scan_dirs(&state, &root, dirs);
+            if dirs.is_empty() {
+                return;
             }
             // Read, not write: this does exactly what `handle_fs_event` does,
             // and that runs under the read side. Taking it at all is what
@@ -2468,6 +2597,30 @@ fn spawn_recovery_scan(
              wait for the next reconcile"
         );
     }
+}
+
+/// The directories a recovery scan should recheck, given the ones a
+/// subscription sync reported as newly watched.
+///
+/// The root is added because it is never in that list: it is subscribed as the
+/// watcher starts, before any matcher exists, so every later sync sees it as
+/// already watched. Nothing else covers it — a file written to the top level
+/// while a build walk was deeper in the tree produced no event the build could
+/// use and no event the watcher would keep — and it costs one directory
+/// listing.
+///
+/// Empty on a whole-subtree backend, where there are no per-directory
+/// subscriptions to have raced and `reindex_files_in`'s pickup of unwatched
+/// subdirectories would take exactly the per-directory watches that backend
+/// exists to avoid.
+fn recovery_scan_dirs(state: &ServerState, root: &Path, mut dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    if !PER_DIRECTORY_WATCHES || !state.watch_enabled {
+        return Vec::new();
+    }
+    if !dirs.iter().any(|d| d == root) {
+        dirs.push(root.to_path_buf());
+    }
+    dirs
 }
 
 fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
@@ -2494,8 +2647,11 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     }
 
     // Skip ordinary file events while the initial background index build is in
-    // progress. The indexer will pick up those files itself.
+    // progress. The indexer will pick up those files itself — but only for the
+    // parts of the tree it has not reached yet, so remember these and replay
+    // them once it publishes.
     if state.indexing.load(Ordering::SeqCst) {
+        defer_events_during_build(state, event);
         return;
     }
 
@@ -2610,26 +2766,110 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     }
 }
 
+/// Drop everything the index holds for a path.
+///
+/// The delete is not conditional on a stamp entry. `ServerState` accepts an
+/// empty stamp map when `filestamps.json` is missing or unreadable, and the
+/// reader can still hold the path in that state, so keying the delete on the
+/// stamp alone would leave content the walk now rejects searchable. The stamp
+/// removal is best-effort; the index and cache deletes always happen.
+///
+/// The cost of that is a tombstone in the overlay for paths that were never
+/// indexed — `live::delete_file` records one either way — and this runs for
+/// every ineligible file a recovery scan walks past, which at startup is every
+/// binary asset in the repository. An existing tombstone is therefore taken as
+/// proof there is nothing left to do, which bounds that to one per distinct
+/// path. The trace line, which is the part that would be actively misleading,
+/// stays conditional on there having been something to drop.
+///
+/// The caller must already hold `snapshot_gate`.
+fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
+    let had_stamp = state
+        .file_stamps
+        .write()
+        .unwrap()
+        .remove(rel_path)
+        .is_some();
+    {
+        let index = state.index.read().unwrap();
+        if index.live.has_path(rel_path) || had_stamp {
+            eprintln!("[trace] reindex: dropped {rel_path} ({reason})");
+        } else if index.live.is_deleted(rel_path) {
+            // Already tombstoned, so there is nothing to record and no reason
+            // to dirty the overlay again. This is the repeat case: a recovery
+            // scan or a chatty editor can bring the same rejected path back
+            // here any number of times.
+            return;
+        }
+    }
+    state.index.write().unwrap().live.delete_file(rel_path);
+    if let Ok(mut cache) = state.cache.write() {
+        cache.pop(rel_path);
+    }
+}
+
+/// Open a file without following a final symlink, so the handle is the path
+/// itself rather than wherever it points.
+///
+/// Every later question — is this a regular file, how big is it, what is in it
+/// — is then answered from the one handle, which is what makes the eligibility
+/// decision and the read describe the same object. Checking the path and then
+/// reading it separately leaves a window in which a tree being rewritten under
+/// us (a checkout, a build, `git mv`) can swap a regular file for a link, and
+/// the read would follow it out of the served root.
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Fails outright on a symlink, which is the answer we want.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Opens the reparse point rather than its target. Unlike O_NOFOLLOW
+        // this succeeds, so the caller's `is_file` check on the handle's
+        // metadata is what rejects it — a reparse point is not a regular file.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::File::open(path)
+    }
+}
+
 /// Read a file and merge it into the live index, unless its stamp says the
 /// content we already indexed is current.
 ///
 /// The caller must hold `snapshot_gate`: the read, the commit, and the stamp
 /// update have to be atomic with respect to a flush or auto-save.
 fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
+    use std::io::Read;
     use tgrep_core::meta::FileStamp;
 
-    // Compute the file's current stamp and skip if it matches what we
-    // last indexed. notify on Windows in particular fires Modify events
-    // for atime/attribute updates, opens, etc. — re-indexing on those
-    // would re-read large files, churn the live overlay, and produce a
-    // misleading "modified" trace for files that didn't actually change.
-    //
-    // `symlink_metadata` describes the link itself; `metadata` would describe
-    // its target. See the eligibility check below for why that distinction
-    // matters here.
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => return,
+    // One handle for the whole decision. Opened without following a final
+    // symlink, and every fact below — type, size, mtime, bytes — read back off
+    // it, so nothing that happens to the path in the meantime can make the
+    // content we index disagree with the metadata we judged it by.
+    let file = match open_no_follow(path) {
+        Ok(f) => f,
+        Err(_) => {
+            // Includes the ELOOP that a symlink gets on unix. It may still be
+            // a path we indexed before it became one, so fall through to the
+            // drop rather than returning.
+            drop_indexed_file(state, rel_path, "no longer eligible");
+            return;
+        }
+    };
+    let Ok(meta) = file.metadata() else {
+        return;
     };
     let current = FileStamp {
         mtime: meta
@@ -2648,13 +2888,14 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // — would be read whole and indexed, and the next reconcile would silently
     // delete it again.
     //
-    // `is_file` on the link's own metadata is the third rule, and the one with
-    // teeth: the walker runs with `follow_links(false)`, where a symlink is
-    // neither file nor dir and is skipped outright. Following one here would
-    // read the target and index its bytes under the link's path — and the
-    // target need not be under `root` at all, so a link committed to a branch
-    // (or dropped in by a build) is enough to pull `~/.ssh/id_rsa` into an
-    // index whose whole contract is that it covers the served tree.
+    // `is_file` is the third rule, and the one with teeth: the walker runs with
+    // `follow_links(false)`, where a symlink is neither file nor dir and is
+    // skipped outright. Indexing through one would put the target's bytes under
+    // the link's path — and the target need not be under `root` at all, so a
+    // link committed to a branch (or dropped in by a build) is enough to pull
+    // `~/.ssh/id_rsa` into an index whose whole contract is that it covers the
+    // served tree. On unix the open above has already failed for a link; this
+    // is what rejects one on Windows, where the reparse point opens fine.
     let eligible = meta.is_file()
         && !tgrep_core::walker::is_binary_extension(path)
         && !state
@@ -2665,36 +2906,7 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
         // past the cap, and a real file can be replaced by a link to one. Drop
         // what we hold so the index matches the walk rather than keeping a
         // stale copy of the smaller version until the reconcile.
-        //
-        // The stamp is not the only evidence that something is indexed. A file
-        // the watcher added since the last flush lives in the live overlay,
-        // and a stamp map that was replaced wholesale — by a stale merge, or
-        // by a load that failed and left it empty — no longer mentions it, so
-        // testing the stamp alone would skip the drop and keep serving content
-        // the walk rejects. `has_path` covers the overlay; an entry that is
-        // only in the persisted reader with no stamp to match is beyond what
-        // can be checked cheaply here (the reader has no path index) and is
-        // left to the reconcile's membership diff.
-        //
-        // Both are checked before deleting rather than deleting unconditionally
-        // the way the removal branch does: removals are rare, but this runs for
-        // every ineligible file a recovery scan walks past, and `delete_file`
-        // records a tombstone and dirties the overlay even when the path was
-        // never indexed.
-        let had_stamp = state
-            .file_stamps
-            .write()
-            .unwrap()
-            .remove(rel_path)
-            .is_some();
-        let in_overlay = state.index.read().unwrap().live.has_path(rel_path);
-        if had_stamp || in_overlay {
-            eprintln!("[trace] reindex: dropped {rel_path} (no longer eligible)");
-            state.index.write().unwrap().live.delete_file(rel_path);
-            if let Ok(mut cache) = state.cache.write() {
-                cache.pop(rel_path);
-            }
-        }
+        drop_indexed_file(state, rel_path, "no longer eligible");
         return;
     }
 
@@ -2707,10 +2919,14 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // on our file I/O and trigram parsing. Windows' SRWLock is
     // writer-preferring: a single waiting writer here would otherwise
     // stall every subsequent search request.
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
+    //
+    // From the handle, not the path: re-opening here is what would let a
+    // symlink take the place of the file we just approved.
+    let mut file = file;
+    let mut data = Vec::with_capacity(current.size.min(1 << 20) as usize);
+    if file.read_to_end(&mut data).is_err() {
+        return;
+    }
     let text = tgrep_core::encoding::decode_for_index(&data);
     let is_binary = tgrep_core::trigram::is_binary(&text);
     let per_tri = if is_binary {
@@ -3278,10 +3494,9 @@ fn refresh_stale_locked(
     // the caller holds `snapshot_gate` for write across this whole body, and
     // the only reader of `state.gitignore` takes the read side first, so no
     // event can observe the matcher before this function returns either way.
-    // The caller anchored the recovery window at its own walk, which starts
-    // earlier than the subscription sync inside this call, so the timestamp
-    // that comes back here is the looser of the two and is dropped.
-    *newly_watched = publish_ignore_matcher(state, root, build_stale_matcher(state, root, &walk)).0;
+    // The caller's walk started before this publish; its timestamp is what the
+    // recovery scan needs, so the one the subscription sync derives is dropped.
+    *newly_watched = publish_ignore_matcher(state, root, build_stale_matcher(state, root, &walk));
 
     if walk.skipped_error > 0 {
         eprintln!(
@@ -3435,6 +3650,13 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
 /// caller to fall back.
 fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
     let start = Instant::now();
+    // Anchors the recovery window at the start of the build's traversal, which
+    // is the point from which writes could be missed: nothing under `root` is
+    // subscribed yet, and the walk below has not reached most of it. Taking it
+    // after the build — or letting the later subscription sync derive its own —
+    // would exclude everything written while the build ran, which is precisely
+    // the window that needs recovering.
+    let since = SystemTime::now();
     eprintln!("[trace] bootstrapping index with the external merge sort (memory-bounded)...");
 
     // Dropped once the build is done so the sampled peak (on platforms without
@@ -3510,6 +3732,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
              the watcher may reindex on spurious events"
         ),
     }
+    let mut newly_watched = Vec::new();
     if state.watch_enabled && !state.no_ignore {
         let t_gi = Instant::now();
         let matcher = tgrep_core::walker::build_gitignore_matcher_from_files(
@@ -3524,14 +3747,19 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         // than skipped: the scan waits out `indexing` and then costs one
         // `metadata` call per file, since the stamps this build just wrote
         // describe the index exactly.
-        let (newly_watched, since) = publish_ignore_matcher(state, root, matcher);
-        spawn_recovery_scan(state, root, newly_watched, since);
+        newly_watched = publish_ignore_matcher(state, root, matcher);
         eprintln!(
             "[trace] gitignore matcher built from {} file(s) in {:.1}ms{}",
             outcome.gitignore_files.len(),
             t_gi.elapsed().as_secs_f64() * 1000.0,
             if found { "" } else { " (no rules found)" }
         );
+    }
+    // Outside that block, because it also drains the events the watcher had to
+    // discard while this build ran, and those pile up whether or not there are
+    // ignore rules to publish.
+    if state.watch_enabled {
+        spawn_recovery_scan(state, root, newly_watched, since);
     }
 
     state.indexing.store(false, Ordering::SeqCst);
@@ -3596,6 +3824,11 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     // Phase 1: Walk file paths (no content reads)
     let t_walk = Instant::now();
+    // The recovery window opens with this traversal, not with the subscriptions
+    // it later feeds: a nested `.ignore` written after the walk read its parent
+    // directory but before the matcher is published is invisible to both, and a
+    // timestamp taken any later would date it as already accounted for.
+    let since = SystemTime::now();
     let walk = walker::walk_dir(
         root,
         &WalkOptions {
@@ -3609,6 +3842,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         },
     );
 
+    let mut newly_watched = Vec::new();
     if state.watch_enabled && !state.no_ignore {
         let start = Instant::now();
         let matcher = walker::build_gitignore_matcher_from_files(
@@ -3623,8 +3857,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         // the build's results nor any event. The scan waits for the build to
         // finish before looking, because until then the stamps describe
         // nothing and every file would read as changed.
-        let (newly_watched, since) = publish_ignore_matcher(state, root, matcher);
-        spawn_recovery_scan(state, root, newly_watched, since);
+        newly_watched = publish_ignore_matcher(state, root, matcher);
         eprintln!(
             "[trace] gitignore matcher built from index walk in {:.1}ms \
              ({} .gitignore + {} .ignore files{})",
@@ -3633,6 +3866,11 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             walk.ignore_files.len(),
             if has_matcher { "" } else { ", no rules found" }
         );
+    }
+    // Outside that block: the scan also drains the events discarded while this
+    // build ran, which accumulate with or without ignore rules.
+    if state.watch_enabled {
+        spawn_recovery_scan(state, root, newly_watched, since);
     }
 
     // Filter out already-indexed files
@@ -4387,6 +4625,7 @@ mod tests {
             gitignore_pending: std::sync::atomic::AtomicBool::new(true),
             ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
             ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+            deferred_events: Mutex::new(Some(std::collections::HashSet::new())),
             index_progress: std::sync::atomic::AtomicU64::new(0),
             index_total: std::sync::atomic::AtomicU64::new(0),
             watch_enabled: true,
@@ -5151,6 +5390,131 @@ mod tests {
         assert!(
             state.gitignore.read().unwrap().is_some(),
             "the matcher the walk did find must still be published"
+        );
+    }
+
+    /// The metadata the eligibility check uses and the bytes that get indexed
+    /// have to describe the same object, which means one handle.
+    #[test]
+    fn open_no_follow_reads_a_regular_file() {
+        use std::io::Read;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("plain.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+
+        let file = open_no_follow(&path).expect("a regular file opens");
+        let meta = file.metadata().expect("metadata off the handle");
+        assert!(meta.is_file());
+        assert_eq!(meta.len(), 13);
+
+        let mut data = String::new();
+        (&file).read_to_string(&mut data).unwrap();
+        assert_eq!(data, "fn main() {}\n");
+    }
+
+    /// A symlink must not open as its target, or a link committed to a branch
+    /// would pull a file from outside the served root into the index.
+    #[cfg(unix)]
+    #[test]
+    fn open_no_follow_refuses_a_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("secret.txt");
+        std::fs::write(&target, "sensitive\n").unwrap();
+        let link = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            open_no_follow(&link).is_err(),
+            "O_NOFOLLOW must reject the link rather than open its target"
+        );
+    }
+
+    /// A burst big enough to be worth replaying individually is not worth
+    /// replaying individually. The buffer gives up as a whole, because a
+    /// truncated set looks exactly like a complete one at replay time.
+    #[cfg(unix)]
+    #[test]
+    fn deferring_more_changes_than_the_cap_gives_up_on_the_whole_set() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+
+        let small = Event {
+            kind: EventKind::Create(notify::event::CreateKind::Any),
+            paths: vec![root.join("a.rs")],
+            attrs: Default::default(),
+        };
+        defer_events_during_build(&state, &small);
+        assert_eq!(
+            state.deferred_events.lock().unwrap().as_ref().unwrap().len(),
+            1
+        );
+
+        let flood = Event {
+            kind: EventKind::Create(notify::event::CreateKind::Any),
+            paths: (0..200_001).map(|i| root.join(format!("f{i}.rs"))).collect(),
+            attrs: Default::default(),
+        };
+        defer_events_during_build(&state, &flood);
+        assert!(
+            state.deferred_events.lock().unwrap().is_none(),
+            "an overflowing burst must mark the buffer unusable, not truncate it"
+        );
+
+        // And stays given up on, rather than resuming a partial record.
+        defer_events_during_build(&state, &small);
+        assert!(state.deferred_events.lock().unwrap().is_none());
+    }
+
+    /// Events seen while a build ran are not applied then, but they are the
+    /// only record that those paths moved: the build's walk misses anything
+    /// written to a directory it already passed.
+    #[cfg(unix)]
+    #[test]
+    fn changes_deferred_during_a_build_are_applied_once_it_publishes() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        // As it is once a build publishes: no rules to wait for, nothing
+        // indexing.
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let path = root.join("late.rs");
+        std::fs::write(&path, "fn written_during_the_build() {}\n").unwrap();
+
+        state.indexing.store(true, Ordering::SeqCst);
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Create(notify::event::CreateKind::Any),
+                paths: vec![path.clone()],
+                attrs: Default::default(),
+            },
+        );
+        assert!(
+            !state.index.read().unwrap().live.has_path("late.rs"),
+            "an event during a build must not touch the index"
+        );
+
+        state.indexing.store(false, Ordering::SeqCst);
+        replay_deferred_events(&state, &root);
+
+        assert!(
+            state.index.read().unwrap().live.has_path("late.rs"),
+            "the deferred change must be applied once the build is done"
+        );
+        assert!(
+            state
+                .deferred_events
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|p| p.is_empty()),
+            "the buffer must be drained, and left usable for the next build"
         );
     }
 

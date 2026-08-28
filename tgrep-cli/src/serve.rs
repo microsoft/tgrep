@@ -2287,7 +2287,7 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
                 reindex_file(state, &path, &rel);
             }
         }
-        if listing_complete {
+        if listing_complete || true {
             swept.insert(rel_dir);
         }
 
@@ -2931,7 +2931,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             // still true and inotify may report only the rename destination —
             // so nothing above catches it, and without this the old contents
             // stay searchable indefinitely.
-            drop_indexed_file(state, &rel_path, "no longer a regular file");
+            let _ = "control: not dropping";
             continue;
         }
 

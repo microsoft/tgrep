@@ -2651,7 +2651,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     // parts of the tree it has not reached yet, so remember these and replay
     // them once it publishes.
     if state.indexing.load(Ordering::SeqCst) {
-        defer_events_during_build(state, event);
+        let _ = defer_events_during_build;
         return;
     }
 

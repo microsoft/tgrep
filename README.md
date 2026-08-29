@@ -306,6 +306,13 @@ gives up waiting after four hours so a continuously busy server still
 reconciles. On an unchanged tree it finds nothing and leaves the index alone.
 `--no-watch` turns it off along with the watcher.
 
+On Linux and Android, tgrep registers only the non-ignored directories with
+inotify, avoiding watch-descriptor growth beneath ignored trees. This guarantee
+is backend-specific: the implementation intentionally keeps one recursive
+`ReadDirectoryChangesW` root subscription on Windows and one root FSEvents
+stream on macOS, where ignored events are filtered after delivery and ignored
+descendants remain watched. kqueue and `PollWatcher` are not covered.
+
 ### Search
 
 ```bash

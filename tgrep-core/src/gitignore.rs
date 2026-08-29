@@ -308,6 +308,17 @@ impl IgnoreMatcher {
             .as_ref()
             .is_some_and(|ignorecase| ignorecase.excludes(&self.root.join(rel), is_dir))
     }
+
+    /// Identity of the Git index behind the tracked-file exemption.
+    ///
+    /// `None` means this matcher has no case-insensitive exemption, so callers
+    /// need not poll anything. The identity itself can represent a missing or
+    /// unreadable index, since either transition changes what can be exempted.
+    pub fn tracked_index_identity(&self) -> Option<TrackedIndexIdentity> {
+        self.ignorecase
+            .as_ref()
+            .map(CaseInsensitiveIgnore::tracked_index_identity)
+    }
 }
 
 /// Return `rel` relative to `dir`, or `None` when `rel` is not beneath it.
@@ -468,6 +479,10 @@ struct TrackedCache {
     tracked: Option<crate::git_index::TrackedFiles>,
 }
 
+/// Metadata identity of the worktree-specific Git index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackedIndexIdentity(Option<(std::time::SystemTime, u64)>);
+
 /// Modification time and length of the index, which is what identifies it.
 ///
 /// git replaces the index by renaming `index.lock` over it, so any rewrite
@@ -551,6 +566,10 @@ impl CaseInsensitiveIgnore {
         self.tracked_hides(&relative, is_dir)
     }
 
+    fn tracked_index_identity(&self) -> TrackedIndexIdentity {
+        TrackedIndexIdentity(index_identity(&self.repo_root))
+    }
+
     /// Whether the tracked-file set leaves `relative` hidden.
     ///
     /// `false` when the index cannot be read: with no way to tell tracked from
@@ -626,20 +645,7 @@ fn git_repo_root(root: &Path) -> Option<&Path> {
 /// the next stale check evicts.
 pub fn repo_exclude_path(root: &Path) -> Option<PathBuf> {
     let git_dir = crate::git_index::git_dir(git_repo_root(root)?)?;
-    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(target) => {
-            let target = target.trim();
-            let path = Path::new(target);
-            if target.is_empty() {
-                git_dir
-            } else if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                git_dir.join(path)
-            }
-        }
-        Err(_) => git_dir,
-    };
+    let common = crate::git_index::common_git_dir(&git_dir);
     let path = common.join("info").join("exclude");
     path.is_file().then_some(path)
 }

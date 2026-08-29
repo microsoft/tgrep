@@ -52,6 +52,10 @@ const WATCHER_QUEUE_CAP: usize = 16_384;
 /// reconciling stale check runs.
 const WATCHER_IDLE_POLL: Duration = Duration::from_secs(1);
 
+/// Git's index is hidden from the repository watcher. Poll its metadata only
+/// when the case-insensitive tracked-file exemption is active.
+const TRACKED_INDEX_POLL: Duration = Duration::from_secs(2);
+
 /// How long a file the watcher never heard about can stay wrong in the index.
 ///
 /// Every mutation the index takes after the initial build arrives as an OS
@@ -290,6 +294,9 @@ struct ServerState {
     ignore_rules_dirty: std::sync::atomic::AtomicBool,
     /// Ensures a burst of ignore-file events uses at most one refresh worker.
     ignore_refresh_scheduled: std::sync::atomic::AtomicBool,
+    /// Last observed identity of the worktree-specific Git index. `None` means
+    /// the published matcher has no case-insensitive tracked-file exemption.
+    tracked_index_identity: Mutex<Option<tgrep_core::gitignore::TrackedIndexIdentity>>,
     /// Set when events were lost, cleared by the next subscription sync, which
     /// then re-issues every subscription instead of trusting its own records.
     ///
@@ -648,6 +655,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         gitignore_pending: std::sync::atomic::AtomicBool::new(!no_watch && !no_ignore),
         ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
         ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+        tracked_index_identity: Mutex::new(None),
         watch_resubscribe: std::sync::atomic::AtomicBool::new(false),
         ignore_sources: RwLock::new(Vec::new()),
         ignore_source_stamps: RwLock::new(IgnoreStamps::new()),
@@ -1008,7 +1016,23 @@ fn publish_ignore_matcher(
 
     *state.ignore_source_stamps.write().unwrap() = stamps;
     *state.ignore_sources.write().unwrap() = sources;
-    *state.gitignore.write().unwrap() = matcher;
+    // Keep the matcher and identity state in one critical section. Preserve an
+    // active baseline across refreshes: if the index changes while a refresh is
+    // walking, the next poll must still see that change rather than having this
+    // publish silently advance past it.
+    let mut published = state.gitignore.write().unwrap();
+    let mut identity = state.tracked_index_identity.lock().unwrap();
+    let current_identity = matcher
+        .as_ref()
+        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_index_identity);
+    match (&*identity, current_identity) {
+        (_, None) => *identity = None,
+        (None, Some(current)) => *identity = Some(current),
+        (Some(_), Some(_)) => {}
+    }
+    *published = matcher;
+    drop(identity);
+    drop(published);
     state.gitignore_pending.store(false, Ordering::SeqCst);
     // New rules mean a different set of directories worth hearing about:
     // a tightened rule releases the subscriptions under it, and a relaxed
@@ -1865,7 +1889,21 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
     if std::thread::Builder::new()
         .name("tgrep-watcher".into())
         .spawn(move || {
+            let mut last_tracked_index_poll = Instant::now();
             loop {
+                if last_tracked_index_poll.elapsed() >= TRACKED_INDEX_POLL {
+                    last_tracked_index_poll = Instant::now();
+                    if tracked_index_changed(&worker_state) {
+                        eprintln!("[trace] Git index changed; reconciling tracked-file exemptions");
+                        worker_state
+                            .ignore_rules_dirty
+                            .store(true, Ordering::SeqCst);
+                        schedule_ignore_rules_refresh(
+                            Arc::clone(&worker_state),
+                            worker_root.clone(),
+                        );
+                    }
+                }
                 match rx.recv_timeout(WATCHER_IDLE_POLL) {
                     Ok(event) => handle_fs_event(&worker_state, &worker_root, &event),
                     // A quiet interval means the burst has drained, so this is
@@ -1917,6 +1955,26 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
     eprintln!("[trace] file watcher started");
 
     true
+}
+
+/// Detect a tracked-file exemption change without subscribing to `.git`.
+///
+/// The metadata probe is enabled only while the published matcher actually
+/// uses the exemption. Updating the observed identity before scheduling makes
+/// a burst one dirty signal; the existing refresh scheduler coalesces it with
+/// any ignore-source changes and serializes the full stale reconciliation.
+fn tracked_index_changed(state: &ServerState) -> bool {
+    let matcher = state.gitignore.read().unwrap();
+    let current = matcher
+        .as_ref()
+        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_index_identity);
+    let mut observed = state.tracked_index_identity.lock().unwrap();
+    let changed = matches!(
+        (observed.as_ref(), current.as_ref()),
+        (Some(previous), Some(current)) if previous != current
+    );
+    *observed = current;
+    changed
 }
 
 /// Decide whether the file watcher should skip a path entirely.
@@ -2039,10 +2097,10 @@ fn is_ignore_rules_file(root: &Path, path: &Path) -> bool {
 /// repo whose ignored build output exhausts the budget makes `watch()` return
 /// an error and the server loses its watcher entirely.
 ///
-/// ReadDirectoryChangesW (Windows) and FSEvents (macOS) subscribe once for the
-/// whole subtree, so there is no per-directory registration to withhold. On
-/// those platforms filtering on delivery is the only lever available, and
-/// [`should_skip_watcher_path`] remains it.
+/// This implementation deliberately keeps one recursive root subscription on
+/// Windows (`ReadDirectoryChangesW`) and one root stream on macOS (FSEvents).
+/// Ignored events are filtered after delivery there, so ignored descendants are
+/// not unwatched even though the design avoids per-directory descriptor growth.
 ///
 /// Deliberately limited to the backends we can exercise in CI. kqueue and
 /// `PollWatcher` are per-path too, but nothing here builds or tests them.
@@ -2110,6 +2168,17 @@ struct WatchRegistry {
     /// [`WatchRegistry::contained`].
     root: PathBuf,
     watched: std::collections::HashSet<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraversalCompleteness {
+    Complete,
+    Incomplete,
+}
+
+struct WatchableDirs {
+    dirs: std::collections::HashSet<PathBuf>,
+    completeness: TraversalCompleteness,
 }
 
 impl WatchRegistry {
@@ -2283,22 +2352,27 @@ impl WatchRegistry {
     /// would pay forty thousand of them for a doubt only overflow raises.
     ///
     /// Returns `(added, removed)`. Only for a set that describes the whole
-    /// tree — anything absent from `desired` is unsubscribed. To subscribe to
-    /// a subtree without disturbing the rest, use [`Self::add_all`].
+    /// tree. `completeness` makes its authority explicit: a complete set prunes
+    /// anything absent from `desired`, while an incomplete traversal only adds
+    /// directories it proved desirable. To subscribe to a subtree without
+    /// disturbing the rest, use [`Self::add_all`].
     fn sync(
         &mut self,
         desired: &std::collections::HashSet<PathBuf>,
+        completeness: TraversalCompleteness,
         force: bool,
     ) -> (Vec<PathBuf>, usize) {
-        let stale: Vec<PathBuf> = self.watched.difference(desired).cloned().collect();
         let mut removed = 0;
-        for dir in stale {
-            // Best effort. inotify drops a descriptor by itself when the
-            // directory is deleted, so "not found" is an expected outcome
-            // here, not an error worth reporting.
-            let _ = self.watcher.unwatch(&dir);
-            self.watched.remove(&dir);
-            removed += 1;
+        if completeness == TraversalCompleteness::Complete {
+            let stale: Vec<PathBuf> = self.watched.difference(desired).cloned().collect();
+            for dir in stale {
+                // Best effort. inotify drops a descriptor by itself when the
+                // directory is deleted, so "not found" is an expected outcome
+                // here, not an error worth reporting.
+                let _ = self.watcher.unwatch(&dir);
+                self.watched.remove(&dir);
+                removed += 1;
+            }
         }
 
         // Shallowest first, because `desired` is a `HashSet` and hands its
@@ -2343,28 +2417,43 @@ impl WatchRegistry {
 /// Symlinked directories are not descended into, matching the walker (the
 /// `ignore` crate does not follow links by default). That also keeps a
 /// symlink cycle from turning this into an infinite walk.
+///
+/// Any failed listing, entry read, or type query marks the result incomplete.
+/// Its proven directories remain useful for adding subscriptions, but its
+/// omissions must not be used to remove existing ones.
 fn watchable_dirs(
     root: &Path,
     start: &Path,
     exclude_dirs: &[String],
     gitignore: Option<&tgrep_core::gitignore::IgnoreMatcher>,
-) -> std::collections::HashSet<PathBuf> {
+) -> WatchableDirs {
     let mut found = std::collections::HashSet::new();
+    let mut completeness = TraversalCompleteness::Complete;
     found.insert(start.to_path_buf());
 
     let mut stack = vec![start.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             // An unreadable directory is not a reason to abandon the rest of
-            // the tree; the periodic reconcile is what catches what we miss.
+            // the tree, but it makes the result unsafe for pruning.
+            completeness = TraversalCompleteness::Incomplete;
             continue;
         };
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                completeness = TraversalCompleteness::Incomplete;
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                completeness = TraversalCompleteness::Incomplete;
+                continue;
+            };
+            if !file_type.is_dir() {
                 continue;
             }
             let path = entry.path();
             let Ok(rel) = path.strip_prefix(root) else {
+                completeness = TraversalCompleteness::Incomplete;
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
@@ -2375,7 +2464,10 @@ fn watchable_dirs(
             found.insert(path);
         }
     }
-    found
+    WatchableDirs {
+        dirs: found,
+        completeness,
+    }
 }
 
 /// The directories that must be subscribed to for the ignore sources
@@ -2458,13 +2550,13 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
     };
     if !state.no_ignore {
         let sources = state.ignore_sources.read().unwrap();
-        desired.extend(ignore_target_dirs(root, &sources));
+        desired.dirs.extend(ignore_target_dirs(root, &sources));
     }
-    let total = desired.len();
+    let total = desired.dirs.len();
     // Consumed here, so one overflow buys one forced pass rather than making
     // every later reconcile re-register the whole tree.
     let force = state.watch_resubscribe.swap(false, Ordering::SeqCst);
-    let (added, removed) = registry.sync(&desired, force);
+    let (added, removed) = registry.sync(&desired.dirs, desired.completeness, force);
     if !added.is_empty() || removed > 0 {
         eprintln!(
             "[trace] watcher subscriptions: {total} directories \
@@ -3563,19 +3655,10 @@ fn lock_reindex(state: &ServerState) -> std::sync::MutexGuard<'_, ()> {
 
 /// Drop everything the index holds for a path.
 ///
-/// The delete is not conditional on a stamp entry. `ServerState` accepts an
-/// empty stamp map when `filestamps.json` is missing or unreadable, and the
-/// reader can still hold the path in that state, so keying the delete on the
-/// stamp alone would leave content the walk now rejects searchable. The stamp
-/// removal is best-effort; the index and cache deletes always happen.
-///
-/// The cost of that is a tombstone in the overlay for paths that were never
-/// indexed — `live::delete_file` records one either way — and this runs for
-/// every ineligible file a recovery scan walks past, which at startup is every
-/// binary asset in the repository. An existing tombstone is therefore taken as
-/// proof there is nothing left to do, which bounds that to one per distinct
-/// path. The trace line, which is the part that would be actively misleading,
-/// stays conditional on there having been something to drop.
+/// A stamp is evidence, but not a precondition: `filestamps.json` may be missing
+/// while the active reader still holds the path. Conversely, a rejected file
+/// absent from the reader, live overlay, and stamps was never indexed, so
+/// recording a tombstone for it would dirty the overlay for no state change.
 ///
 /// The caller must already hold `snapshot_gate` and `reindex_lock`. The lock is
 /// the caller's rather than this function's because `reindex_file` calls in
@@ -3589,16 +3672,14 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
         .is_some();
     {
         let index = state.index.read().unwrap();
-        if index.live.has_path(rel_path) || had_stamp {
-            eprintln!("[trace] reindex: dropped {rel_path} ({reason})");
-        } else if index.live.is_deleted(rel_path) {
-            // Already tombstoned, so there is nothing to record and no reason
-            // to dirty the overlay again. This is the repeat case: a recovery
-            // scan or a chatty editor can bring the same rejected path back
-            // here any number of times.
+        if index.live.is_deleted(rel_path) {
+            return;
+        }
+        if !had_stamp && !index.live.has_path(rel_path) && !index.reader_has_path(rel_path) {
             return;
         }
     }
+    eprintln!("[trace] reindex: dropped {rel_path} ({reason})");
     state.index.write().unwrap().live.delete_file(rel_path);
     if let Ok(mut cache) = state.cache.write() {
         cache.pop(rel_path);
@@ -5846,6 +5927,7 @@ mod tests {
             gitignore_pending: std::sync::atomic::AtomicBool::new(true),
             ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
             ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+            tracked_index_identity: Mutex::new(None),
             watch_resubscribe: std::sync::atomic::AtomicBool::new(false),
             ignore_sources: RwLock::new(Vec::new()),
             ignore_source_stamps: RwLock::new(IgnoreStamps::new()),
@@ -6077,7 +6159,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_registry_add_all_is_additive_but_sync_prunes() {
+    fn incomplete_watch_sync_preserves_existing_subscriptions_until_a_complete_pass() {
         // These two must not be confused. `watch_new_subtree` learns only
         // about the subtree that just appeared, so if it went through `sync`
         // every directory outside that subtree would look stale and the server
@@ -6115,8 +6197,19 @@ mod tests {
             "add_all dropped a subscription outside the set it was given"
         );
 
-        // `sync`, by contrast, is authoritative over the whole tree.
-        let (added, removed) = registry.sync(&[c.clone()].into_iter().collect(), false);
+        // A traversal that missed entries is additive only: absence from its
+        // partial result is not evidence that an existing watch became stale.
+        let partial: std::collections::HashSet<PathBuf> = std::iter::once(c.clone()).collect();
+        let (added, removed) = registry.sync(&partial, TraversalCompleteness::Incomplete, false);
+        assert_eq!((added.len(), removed), (0, 0));
+        assert_eq!(
+            registry.watched,
+            [a.clone(), b.clone(), c.clone()].into_iter().collect(),
+            "an incomplete desired set retired valid existing subscriptions"
+        );
+
+        // A later complete traversal is authoritative and may prune them.
+        let (added, removed) = registry.sync(&partial, TraversalCompleteness::Complete, false);
         assert_eq!((added.len(), removed), (0, 2));
         assert_eq!(registry.watched, [c].into_iter().collect());
     }
@@ -6221,6 +6314,7 @@ mod tests {
         let dirs = watchable_dirs(root, root, &exclude, Some(&gi));
 
         let rel: std::collections::HashSet<String> = dirs
+            .dirs
             .iter()
             .map(|p| {
                 p.strip_prefix(root)
@@ -6265,6 +6359,7 @@ mod tests {
 
         let dirs = watchable_dirs(root, root, &[], None);
         let rel: std::collections::HashSet<String> = dirs
+            .dirs
             .iter()
             .map(|p| {
                 p.strip_prefix(root)
@@ -6297,6 +6392,7 @@ mod tests {
         let gi = tgrep_core::gitignore::build_matcher(root).expect("matcher should build");
         let dirs = watchable_dirs(root, &root.join("src/fresh"), &[], Some(&gi));
         let rel: std::collections::HashSet<String> = dirs
+            .dirs
             .iter()
             .map(|p| {
                 p.strip_prefix(root)
@@ -6321,6 +6417,59 @@ mod tests {
             rel.contains("src/fresh/keep"),
             "a root-anchored rule was applied at the wrong depth: {rel:?}"
         );
+    }
+
+    #[test]
+    fn rejected_never_indexed_file_does_not_dirty_the_overlay() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        let rejected = root.join("asset.png");
+        std::fs::write(&rejected, "not indexed despite textual contents\n").unwrap();
+
+        let _gate = state.snapshot_gate.read().unwrap();
+        reindex_file(&state, &rejected, "asset.png");
+
+        let index = state.index.read().unwrap();
+        assert_eq!(
+            index.live.dirty_count(),
+            0,
+            "a path absent from reader, overlay, and stamps must not create a tombstone"
+        );
+        assert!(!index.live.is_deleted("asset.png"));
+    }
+
+    #[test]
+    fn reader_path_without_a_stamp_is_still_tombstoned() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        let indexed = root.join("legacy.rs");
+        std::fs::write(&indexed, "fn legacy_reader_entry() {}\n").unwrap();
+        builder::build_index_for_files(&root, &index_dir, std::slice::from_ref(&indexed), 1024)
+            .unwrap();
+        *state.index.write().unwrap() = HybridIndex::open(&index_dir, &root).unwrap();
+        assert!(
+            state.file_stamps.read().unwrap().is_empty(),
+            "fixture requires a reader entry with no stamp"
+        );
+        assert!(
+            state.index.read().unwrap().reader_has_path("legacy.rs"),
+            "fixture did not put the path in the active reader"
+        );
+
+        let _gate = state.snapshot_gate.read().unwrap();
+        let _reindex = lock_reindex(&state);
+        drop_indexed_file(&state, "legacy.rs", "test rejection");
+
+        let index = state.index.read().unwrap();
+        assert!(
+            index.live.is_deleted("legacy.rs"),
+            "reader membership must remain sufficient evidence to tombstone"
+        );
+        assert_eq!(index.live.dirty_count(), 1);
     }
 
     /// A transient stat failure is not a deletion. `Path::exists` said it was,
@@ -7818,7 +7967,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (added, _removed) = registry.sync(&desired, false);
+        let (added, _removed) = registry.sync(&desired, TraversalCompleteness::Complete, false);
 
         assert_eq!(added.len(), 4);
         let depths: Vec<usize> = added.iter().map(|d| d.components().count()).collect();
@@ -7854,13 +8003,13 @@ mod tests {
         std::fs::remove_dir(&gone).unwrap();
         let desired: std::collections::HashSet<PathBuf> = std::iter::once(gone.clone()).collect();
 
-        registry.sync(&desired, false);
+        registry.sync(&desired, TraversalCompleteness::Complete, false);
         assert!(
             registry.is_watched(&gone),
             "the fixture must reproduce the poisoned entry, or it proves nothing"
         );
 
-        registry.sync(&desired, true);
+        registry.sync(&desired, TraversalCompleteness::Complete, true);
         assert!(
             !registry.is_watched(&gone),
             "a forced sync must re-issue the subscription and drop the entry \

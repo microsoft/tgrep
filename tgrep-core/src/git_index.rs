@@ -103,6 +103,23 @@ pub(crate) fn git_dir(repo_root: &Path) -> Option<PathBuf> {
     })
 }
 
+/// The repository metadata directory shared by all linked worktrees.
+pub(crate) fn common_git_dir(git_dir: &Path) -> PathBuf {
+    let Ok(target) = std::fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let target = target.trim();
+    if target.is_empty() {
+        return git_dir.to_path_buf();
+    }
+    let path = Path::new(target);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        git_dir.join(path)
+    }
+}
+
 /// Whether the repository compares paths without regard to case.
 ///
 /// git writes `core.ignorecase = true` into the repository's own config when it
@@ -112,7 +129,7 @@ pub fn ignores_case(repo_root: &Path) -> bool {
     let Some(git_dir) = git_dir(repo_root) else {
         return false;
     };
-    let Ok(config) = std::fs::read_to_string(git_dir.join("config")) else {
+    let Ok(config) = std::fs::read_to_string(common_git_dir(&git_dir).join("config")) else {
         return false;
     };
     let mut in_core = false;
@@ -451,6 +468,33 @@ mod tests {
         assert!(ignores_case(&worktree));
         let tracked = load_tracked(&worktree).expect("loads through the pointer");
         assert!(tracked.contains("worktree/file.rs"));
+    }
+
+    #[test]
+    fn linked_worktree_uses_the_common_config_and_its_own_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let common = tmp.path().join("repo.git");
+        let worktree_git = common.join("worktrees").join("topic");
+        std::fs::create_dir_all(&worktree_git).expect("mkdir");
+        std::fs::write(common.join("config"), "[core]\n\tignorecase = true\n").expect("write");
+        std::fs::write(worktree_git.join("commondir"), "../..\n").expect("write");
+        std::fs::write(worktree_git.join("index"), v2_index(&["worktree/only.rs"])).expect("write");
+
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("mkdir");
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .expect("write");
+
+        assert!(ignores_case(&worktree));
+        assert_eq!(index_path(&worktree), Some(worktree_git.join("index")));
+        assert!(
+            load_tracked(&worktree)
+                .expect("loads worktree index")
+                .contains("worktree/only.rs")
+        );
     }
 
     #[test]

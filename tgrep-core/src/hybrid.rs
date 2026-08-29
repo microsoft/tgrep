@@ -293,6 +293,11 @@ impl HybridIndex {
         self.reader().all_paths().iter().cloned().collect()
     }
 
+    /// Whether the active on-disk reader contains `path`.
+    pub fn reader_has_path(&self, path: &str) -> bool {
+        self.reader().contains_path(path)
+    }
+
     /// The reader paths `keep` accepts.
     ///
     /// For callers that want a few of them — everything under one directory,

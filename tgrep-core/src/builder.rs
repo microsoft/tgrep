@@ -381,6 +381,17 @@ pub fn build_index_with_options(
     index_dir: Option<&Path>,
     opts: &BuildOptions,
 ) -> Result<BuildOutcome> {
+    build_index_with_options_and_ignorecase(root, index_dir, opts, None)
+}
+
+/// Build an index using an immutable tracked-file exemption that the caller
+/// can also use for watcher matcher publication.
+pub fn build_index_with_options_and_ignorecase(
+    root: &Path,
+    index_dir: Option<&Path>,
+    opts: &BuildOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+) -> Result<BuildOutcome> {
     let include_hidden = opts.include_hidden;
     let no_ignore = opts.no_ignore;
     let exclude_dirs = opts.exclude_dirs.as_slice();
@@ -395,18 +406,34 @@ pub fn build_index_with_options(
     if let Some(hint) = gitignore_gate_hint(&root, opts) {
         eprintln!("{hint}");
     }
-    let walk = walker::walk_dir(
-        &root,
-        &walker::WalkOptions {
-            include_hidden,
-            no_ignore,
-            no_require_git: opts.no_require_git,
-            collect_gitignore_files: opts.collect_gitignore_files,
-            exclude_dirs: exclude_dirs.to_vec(),
-            max_file_size: opts.max_file_size,
-            ..Default::default()
-        },
-    );
+    let walk = if let Some(ignorecase) = ignorecase {
+        walker::walk_dir_with_ignorecase(
+            &root,
+            &walker::WalkOptions {
+                include_hidden,
+                no_ignore,
+                no_require_git: opts.no_require_git,
+                collect_gitignore_files: opts.collect_gitignore_files,
+                exclude_dirs: exclude_dirs.to_vec(),
+                max_file_size: opts.max_file_size,
+                ..Default::default()
+            },
+            Some(ignorecase),
+        )
+    } else {
+        walker::walk_dir(
+            &root,
+            &walker::WalkOptions {
+                include_hidden,
+                no_ignore,
+                no_require_git: opts.no_require_git,
+                collect_gitignore_files: opts.collect_gitignore_files,
+                exclude_dirs: exclude_dirs.to_vec(),
+                max_file_size: opts.max_file_size,
+                ..Default::default()
+            },
+        )
+    };
     eprintln!(
         "Found {} text files ({} binary skipped, {} too large, {} errors)",
         walk.files.len(),

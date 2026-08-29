@@ -828,17 +828,19 @@ fn build_stale_matcher(
     state: &ServerState,
     root: &Path,
     walk: &tgrep_core::walker::MetaWalkResult,
+    ignorecase: Option<std::sync::Arc<tgrep_core::gitignore::CaseInsensitiveIgnore>>,
 ) -> Option<tgrep_core::gitignore::IgnoreMatcher> {
     if state.no_ignore {
         return None;
     }
 
     let start = Instant::now();
-    let matcher = tgrep_core::walker::build_gitignore_matcher_from_files(
+    let matcher = tgrep_core::walker::build_gitignore_matcher_from_files_with_ignorecase(
         root,
         &walk.gitignore_files,
         &walk.ignore_files,
         state.no_require_git,
+        ignorecase,
     );
     let has_matcher = matcher.is_some();
     eprintln!(
@@ -1030,22 +1032,14 @@ fn publish_ignore_matcher(
 
     *state.ignore_source_stamps.write().unwrap() = stamps;
     *state.ignore_sources.write().unwrap() = sources;
-    // Keep the matcher and identity state in one critical section. Preserve an
-    // active baseline across refreshes: if the index changes while a refresh is
-    // walking, the next poll must still see that change rather than having this
-    // publish silently advance past it.
+    // Keep the matcher and semantic baseline in one critical section. The
+    // matcher's tracked exemption is immutable, so this baseline describes the
+    // exact decisions the stale walk and watcher publication made.
     let mut published = state.gitignore.write().unwrap();
     let mut membership = state.tracked_membership.lock().unwrap();
-    let current_membership = state.watch_enabled.then(|| {
-        matcher
-            .as_ref()
-            .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_membership_fingerprint)
-    });
-    match (&*membership, current_membership.flatten()) {
-        (_, None) => *membership = None,
-        (None, Some(current)) => *membership = Some(current),
-        (Some(_), Some(_)) => {}
-    }
+    *membership = matcher
+        .as_ref()
+        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_membership_fingerprint);
     *published = matcher;
     drop(membership);
     drop(published);
@@ -1987,7 +1981,7 @@ fn tracked_membership_changed(state: &ServerState) -> bool {
     let matcher = state.gitignore.read().unwrap();
     let current = matcher
         .as_ref()
-        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_membership_fingerprint);
+        .and_then(tgrep_core::gitignore::IgnoreMatcher::current_tracked_membership_fingerprint);
     let mut observed = state.tracked_membership.lock().unwrap();
     let changed = matches!(
         (observed.as_ref(), current.as_ref()),
@@ -1995,20 +1989,6 @@ fn tracked_membership_changed(state: &ServerState) -> bool {
     );
     *observed = current;
     changed
-}
-
-fn tracked_index_generation(
-    state: &ServerState,
-) -> Option<tgrep_core::gitignore::TrackedIndexGeneration> {
-    if !state.watch_enabled {
-        return None;
-    }
-    state
-        .gitignore
-        .read()
-        .unwrap()
-        .as_ref()
-        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_index_generation)
 }
 
 #[cfg(test)]
@@ -4749,7 +4729,13 @@ fn background_refresh_stale(
     // available. Held here rather than inside so the recovery scan below is
     // still covered by it.
     let gate = state.snapshot_gate.write().unwrap();
-    let generation_before = tracked_index_generation(state);
+    // One immutable tracked-file exemption is shared by the walk and the
+    // matcher it publishes. Git-index rewrites cannot change ignore decisions
+    // halfway through this pass.
+    let ignorecase = (!state.no_ignore)
+        .then(|| tgrep_core::gitignore::CaseInsensitiveIgnore::new(root, true, true, true))
+        .flatten()
+        .map(Arc::new);
     #[cfg(test)]
     run_stale_refresh_hook(state, StaleRefreshPhase::BeforeWalk);
 
@@ -4764,6 +4750,7 @@ fn background_refresh_stale(
         index_dir,
         compare_index_membership,
         &mut newly_watched,
+        ignorecase,
     );
 
     // Directories that were not subscribed while the walk ran could not report
@@ -4778,16 +4765,16 @@ fn background_refresh_stale(
     if ok {
         reindex_files_in(state, root, &newly_watched, since);
     }
-    let generation_changed =
-        generation_before.is_some() && generation_before != tracked_index_generation(state);
+    // Compare semantics, not index metadata. A→B→A needs no correction because
+    // this pass used A throughout, while A→B schedules exactly one coalesced
+    // refresh. Content-only staging cannot create an immediate refresh loop.
+    let membership_changed = tracked_membership_changed(state);
     drop(gate);
     drop(refresh);
-    if generation_changed {
-        // The walk and matcher may have consumed an intermediate tracked set
-        // even when an A→B→A transition restored the semantic fingerprint.
-        // One serialized corrective pass makes the final generation
-        // authoritative; the existing scheduler coalesces repeated changes.
-        eprintln!("[trace] Git index changed during stale reconciliation; scheduling a retry");
+    if membership_changed {
+        eprintln!(
+            "[trace] Git tracked paths changed during stale reconciliation; scheduling a retry"
+        );
         state.ignore_rules_dirty.store(true, Ordering::SeqCst);
         schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
     }
@@ -4800,6 +4787,7 @@ fn refresh_stale_locked(
     index_dir: &Path,
     compare_index_membership: bool,
     newly_watched: &mut Vec<PathBuf>,
+    ignorecase: Option<std::sync::Arc<tgrep_core::gitignore::CaseInsensitiveIgnore>>,
 ) -> bool {
     use tgrep_core::meta;
     use tgrep_core::walker;
@@ -4810,7 +4798,7 @@ fn refresh_stale_locked(
     // Walk first. This single traversal feeds both the stale diff and the
     // watcher's ignore matcher, and it must run before the early returns below
     // so the matcher can be published on every path out of this function.
-    let walk = walker::walk_file_metadata(
+    let walk = walker::walk_file_metadata_with_ignorecase(
         root,
         &walker::MetaWalkOptions {
             exclude_dirs: state.exclude_dirs.clone(),
@@ -4818,6 +4806,7 @@ fn refresh_stale_locked(
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
         },
+        ignorecase.clone(),
     );
     let walk_ms = start.elapsed().as_millis();
 
@@ -4845,7 +4834,7 @@ fn refresh_stale_locked(
             &walk.ignore_files,
             state.no_require_git,
         ),
-        || build_stale_matcher(state, root, &walk),
+        || build_stale_matcher(state, root, &walk, ignorecase),
     );
     #[cfg(test)]
     run_stale_refresh_hook(state, StaleRefreshPhase::AfterMatcherPublish);
@@ -5002,6 +4991,10 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
 /// caller to fall back.
 fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
     let start = Instant::now();
+    let ignorecase = (!state.no_ignore)
+        .then(|| tgrep_core::gitignore::CaseInsensitiveIgnore::new(root, true, true, true))
+        .flatten()
+        .map(Arc::new);
     // Anchors the recovery window at the start of the build's traversal, which
     // is the point from which writes could be missed: nothing under `root` is
     // subscribed yet, and the walk below has not reached most of it. Taking it
@@ -5015,7 +5008,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     // a kernel high-water mark) covers the whole of it. Unlike the incremental
     // path below, nothing here polls memory on its own.
     let sampler = crate::mem::PrivatePeakSampler::start();
-    let outcome = match builder::build_index_with_options(
+    let outcome = match builder::build_index_with_options_and_ignorecase(
         root,
         Some(index_dir),
         &builder::BuildOptions {
@@ -5032,6 +5025,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             strategy: builder::IndexStrategy::External,
             buffer_bytes: builder::DEFAULT_INDEX_BUFFER_BYTES,
         },
+        ignorecase.clone(),
     ) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -5091,7 +5085,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         ),
     }
     let mut newly_watched = Vec::new();
-    if state.watch_enabled && !state.no_ignore {
+    if !state.no_ignore {
         let t_gi = Instant::now();
         // "Newly watched" here is every directory in the repository, and the
         // build's walk ran before any of them were subscribed. Deferred rather
@@ -5108,11 +5102,12 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
                 state.no_require_git,
             ),
             || {
-                tgrep_core::walker::build_gitignore_matcher_from_files(
+                tgrep_core::walker::build_gitignore_matcher_from_files_with_ignorecase(
                     root,
                     &outcome.gitignore_files,
                     &outcome.ignore_files,
                     state.no_require_git,
+                    ignorecase,
                 )
             },
         );
@@ -5133,6 +5128,9 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
 
     state.indexing.store(false, Ordering::SeqCst);
     drop(gate);
+    if tracked_membership_changed(state) {
+        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+    }
 
     let elapsed = start.elapsed().as_secs_f64();
     drop(sampler);
@@ -5193,26 +5191,31 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     // Phase 1: Walk file paths (no content reads)
     let t_walk = Instant::now();
+    let ignorecase = (!state.no_ignore)
+        .then(|| tgrep_core::gitignore::CaseInsensitiveIgnore::new(root, true, true, true))
+        .flatten()
+        .map(Arc::new);
     // The recovery window opens with this traversal, not with the subscriptions
     // it later feeds: a nested `.ignore` written after the walk read its parent
     // directory but before the matcher is published is invisible to both, and a
     // timestamp taken any later would date it as already accounted for.
     let since = SystemTime::now();
-    let walk = walker::walk_dir(
+    let walk = walker::walk_dir_with_ignorecase(
         root,
         &WalkOptions {
             include_hidden: false,
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
-            collect_gitignore_files: state.watch_enabled && !state.no_ignore,
+            collect_gitignore_files: !state.no_ignore,
             exclude_dirs: state.exclude_dirs.clone(),
             ..Default::default()
         },
+        ignorecase.clone(),
     );
 
     let mut newly_watched = Vec::new();
-    if state.watch_enabled && !state.no_ignore {
+    if !state.no_ignore {
         let start = Instant::now();
         // Subscriptions are taken here, partway through the build, so files
         // written to a directory the walk has already passed are in neither
@@ -5229,11 +5232,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 state.no_require_git,
             ),
             || {
-                walker::build_gitignore_matcher_from_files(
+                walker::build_gitignore_matcher_from_files_with_ignorecase(
                     root,
                     &walk.gitignore_files,
                     &walk.ignore_files,
                     state.no_require_git,
+                    ignorecase,
                 )
             },
         );
@@ -5490,6 +5494,9 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         index.live.shrink_to_fit();
     }
 
+    if tracked_membership_changed(state) {
+        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+    }
     if state.ignore_rules_dirty.load(Ordering::SeqCst) {
         schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
     }
@@ -6642,7 +6649,7 @@ mod tests {
     }
 
     #[test]
-    fn git_index_aba_during_refresh_schedules_a_corrective_pass() {
+    fn first_matcher_publication_uses_one_snapshot_across_git_index_aba() {
         use std::sync::Barrier;
         use std::sync::atomic::AtomicUsize;
 
@@ -6658,15 +6665,13 @@ mod tests {
         std::fs::write(ignored.join("forced.rs"), "fn aba_marker() {}\n").unwrap();
         test_git(&root, &["add", "--", ".gitignore", "src/lib.rs"]);
 
-        let state = test_server_state(&root, &root.join(".tgrep"));
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
         state.gitignore_pending.store(false, Ordering::SeqCst);
-        let matcher =
-            tgrep_core::gitignore::build_matcher(&root).expect("case-insensitive matcher");
-        let baseline = matcher
-            .tracked_membership_fingerprint()
-            .expect("tracked exemption active");
-        *state.gitignore.write().unwrap() = Some(matcher);
-        *state.tracked_membership.lock().unwrap() = Some(baseline);
+        assert!(
+            state.gitignore.read().unwrap().is_none(),
+            "the race must cover first matcher publication"
+        );
 
         if PER_DIRECTORY_WATCHES {
             let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
@@ -6712,15 +6717,25 @@ mod tests {
             background_refresh_stale(&refresh_state, &refresh_root, &index_dir, true)
         });
 
-        // A: untracked and hidden when the pass captures its generation.
+        // A: untracked and hidden when the pass captures its immutable set.
         before_walk_entered.wait();
-        // B: visible while both the walk and published matcher make decisions.
+        // B: the index changes, but this pass must continue using A throughout.
         test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
         before_walk_release.wait();
         after_publish_entered.wait();
+        assert!(
+            state
+                .gitignore
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true),
+            "the published matcher must use the same A snapshot as the walk"
+        );
         if PER_DIRECTORY_WATCHES {
             assert!(
-                state
+                !state
                     .watch_registry
                     .lock()
                     .unwrap()
@@ -6728,10 +6743,11 @@ mod tests {
                     .unwrap()
                     .watched
                     .contains(&ignored),
-                "the intermediate matcher must subscribe the tracked ignored directory"
+                "the B transition must not change subscriptions mid-pass"
             );
         }
-        // A again before the pass commits what it learned from B.
+        // A again: the pass already represents the final membership, so no
+        // corrective pass is necessary.
         test_git(
             &root,
             &[
@@ -6749,22 +6765,15 @@ mod tests {
             "the raced pass itself should finish"
         );
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while (passes.load(Ordering::SeqCst) < 2
-            || state.ignore_refresh_scheduled.load(Ordering::SeqCst)
-            || state.ignore_rules_dirty.load(Ordering::SeqCst))
-            && Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-        }
+        thread::sleep(Duration::from_millis(100));
         assert!(
-            passes.load(Ordering::SeqCst) >= 2,
-            "the generation change must schedule a corrective pass"
+            passes.load(Ordering::SeqCst) == 1,
+            "A→B→A should not need a retry when the first pass used A throughout"
         );
         assert!(
             !state.ignore_refresh_scheduled.load(Ordering::SeqCst)
                 && !state.ignore_rules_dirty.load(Ordering::SeqCst),
-            "the corrective pass did not finish"
+            "the semantic baseline returned to A"
         );
 
         let matcher = state.gitignore.read().unwrap();
@@ -6781,7 +6790,7 @@ mod tests {
             !index.live.has_path("ignored/forced.rs")
                 && (!index.reader_has_path("ignored/forced.rs")
                     || index.live.is_deleted("ignored/forced.rs")),
-            "the corrective pass must remove content indexed from the intermediate state"
+            "the immutable A walk must not index content from intermediate B"
         );
         drop(index);
         if PER_DIRECTORY_WATCHES {
@@ -6794,7 +6803,164 @@ mod tests {
                     .unwrap()
                     .watched
                     .contains(&ignored),
-                "the corrective matcher must retire the intermediate subscription"
+                "the immutable A matcher must leave the ignored tree unsubscribed"
+            );
+        }
+    }
+
+    #[test]
+    fn content_only_index_churn_during_refresh_does_not_chain_reconciles() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn original() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore", "src/lib.rs"]);
+
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let root = root.clone();
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| match phase {
+                StaleRefreshPhase::BeforeWalk => {
+                    passes.fetch_add(1, Ordering::SeqCst);
+                }
+                StaleRefreshPhase::AfterMatcherPublish => {
+                    let pass = passes.load(Ordering::SeqCst);
+                    if pass <= 4 {
+                        std::fs::write(
+                            root.join("src/lib.rs"),
+                            format!("fn content_only_{pass}() {{}}\n"),
+                        )
+                        .unwrap();
+                        test_git(&root, &["add", "--", "src/lib.rs"]);
+                    }
+                }
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        assert!(background_refresh_stale(
+            &state,
+            &root,
+            &state.index_dir,
+            true
+        ));
+        thread::sleep(Duration::from_millis(250));
+
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "metadata churn with unchanged relevant membership must not chain full scans"
+        );
+        assert!(
+            !state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+                && !state.ignore_rules_dirty.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn membership_change_during_refresh_schedules_one_corrective_pass() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        let ignored = root.join("ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(ignored.join("forced.rs"), "fn newly_exempt() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore"]);
+
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        if PER_DIRECTORY_WATCHES {
+            let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+            *state.watch_registry.lock().unwrap() = Some(WatchRegistry {
+                watcher,
+                root: root.clone(),
+                watched: std::iter::once(root.clone()).collect(),
+            });
+        }
+
+        let before_walk_entered = Arc::new(Barrier::new(2));
+        let before_walk_release = Arc::new(Barrier::new(2));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let before_walk_entered = Arc::clone(&before_walk_entered);
+            let before_walk_release = Arc::clone(&before_walk_release);
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| {
+                if matches!(phase, StaleRefreshPhase::BeforeWalk)
+                    && passes.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    before_walk_entered.wait();
+                    before_walk_release.wait();
+                }
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        let refresh_state = Arc::clone(&state);
+        let refresh_root = root.clone();
+        let index_dir = state.index_dir.clone();
+        let refresh = thread::spawn(move || {
+            background_refresh_stale(&refresh_state, &refresh_root, &index_dir, true)
+        });
+
+        before_walk_entered.wait();
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        before_walk_release.wait();
+        assert!(refresh.join().unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (passes.load(Ordering::SeqCst) < 2
+            || state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+            || state.ignore_rules_dirty.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            2,
+            "a semantic A→B change must schedule exactly one corrective pass"
+        );
+        assert!(
+            !state
+                .gitignore
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true)
+        );
+        let index = state.index.read().unwrap();
+        assert!(
+            index.reader_has_path("ignored/forced.rs") || index.live.has_path("ignored/forced.rs"),
+            "the corrective pass must index the newly exempt file"
+        );
+        drop(index);
+        if PER_DIRECTORY_WATCHES {
+            assert!(
+                state
+                    .watch_registry
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .watched
+                    .contains(&ignored),
+                "the corrective pass must subscribe the newly exempt directory"
             );
         }
     }

@@ -616,11 +616,16 @@ pub fn walk_file_metadata_with_ignorecase(
             if max_file_size.is_some_and(|limit| meta.len() > limit) {
                 return ignore::WalkState::Continue;
             }
-            let stamp = crate::meta::file_stamp(&meta);
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             results.lock().unwrap().push(FileMeta {
                 relative_path: rel_path,
-                mtime: stamp.mtime,
-                size: stamp.size,
+                mtime,
+                size: meta.len(),
             });
 
             ignore::WalkState::Continue

@@ -31,6 +31,12 @@ const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 /// larger budget that scales with the thread pool was tried and rejected: it was
 /// both slower *and* hungrier there, because the kernel's large files are a rare
 /// minority and the extra headroom bought no throughput.
+///
+/// Files large enough to be mapped are charged [`MAPPED_BATCH_CHARGE`] instead
+/// of their length, so a tree that is mostly oversized files still fills the
+/// pool. Raising this budget would trade memory on *every* tree for that;
+/// charging mapped bytes honestly costs nothing on trees like the kernel, where
+/// only 110 of 94,747 files are mapped at all.
 const INDEX_BUILD_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default arena budget for [`IndexStrategy::External`] before spilling.
@@ -165,13 +171,6 @@ pub struct BuildOutcome {
     pub ignore_files: Vec<std::path::PathBuf>,
 }
 
-/// Additional reconciliation evidence for coordinated server builds.
-#[doc(hidden)]
-pub struct ObservedBuildOutcome {
-    pub outcome: BuildOutcome,
-    pub unreadable: Vec<std::path::PathBuf>,
-}
-
 /// Build a trigram index for all text files under `root`.
 pub fn build_index(
     root: &Path,
@@ -219,14 +218,47 @@ fn gitignore_gate_hint(root: &Path, opts: &BuildOptions) -> Option<String> {
     ))
 }
 
-/// What one owned file buffer costs a batch.
+/// Nominal heap charge for a file large enough to be memory-mapped.
+///
+/// A mapped file's bytes never reach the heap, so charging it its own length
+/// against the heap budget is charging for memory the build does not allocate.
+/// What it does cost is its extracted trigram map, and that is bounded by the
+/// number of *distinct* trigrams — at most 16.7M, and in practice saturating
+/// long before file size does. Saturating the charge keeps that real cost
+/// bounded while letting a batch hold enough large files to fill the pool.
+const MAPPED_BATCH_CHARGE: u64 = 2 * 1024 * 1024;
+
+/// Ceiling on mapped bytes one batch may put in flight.
+///
+/// Mapped pages are file-backed and reclaimable, so they are not the same
+/// liability as heap, but they are still resident: a batch of large files maps
+/// all of them at once, and the process working set follows. This is the second
+/// half of the bound — the heap budget alone would let a batch of 32 MiB files
+/// map 64 MiB *per worker*.
+const MAPPED_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+
+/// What one file costs a batch, split by where the bytes live.
 #[derive(Clone, Copy, Default)]
 struct BatchCharge {
+    /// Charge against the heap budget: the read buffer for a small file, or the
+    /// saturating stand-in for a mapped file's extracted trigram map.
     heap: u64,
+    /// Charge against the mapped budget; zero for a file that is read.
+    mapped: u64,
 }
 
 fn batch_charge(size: u64) -> BatchCharge {
-    BatchCharge { heap: size }
+    if size >= MMAP_MIN_BYTES {
+        BatchCharge {
+            heap: size.min(MAPPED_BATCH_CHARGE),
+            mapped: size,
+        }
+    } else {
+        BatchCharge {
+            heap: size,
+            mapped: 0,
+        }
+    }
 }
 
 /// Charge for a file whose size could not be read.
@@ -237,9 +269,11 @@ fn batch_charge(size: u64) -> BatchCharge {
 /// losing the bound precisely for the file whose size is unknown.
 const UNKNOWN_SIZE_CHARGE: BatchCharge = BatchCharge {
     heap: INDEX_BUILD_BATCH_BYTES,
+    mapped: MAPPED_BATCH_BYTES,
 };
 
-/// Split a file list into batches bounded by file count and heap bytes.
+/// Split a file list into batches bounded by file count, heap bytes and mapped
+/// bytes, given each file's charge in walk order.
 ///
 /// A file whose charge alone exceeds a budget forms a batch of its own rather
 /// than being split, so the bound is "one budget, plus at most one oversized
@@ -248,14 +282,19 @@ fn batch_ranges(charges: &[BatchCharge], budget: u64) -> Vec<std::ops::Range<usi
     let mut ranges = Vec::new();
     let mut start = 0usize;
     let mut heap = 0u64;
+    let mut mapped = 0u64;
     for (i, charge) in charges.iter().enumerate() {
-        let full = i - start >= INDEX_BUILD_BATCH_SIZE || heap.saturating_add(charge.heap) > budget;
+        let full = i - start >= INDEX_BUILD_BATCH_SIZE
+            || heap.saturating_add(charge.heap) > budget
+            || mapped.saturating_add(charge.mapped) > MAPPED_BATCH_BYTES;
         if i > start && full {
             ranges.push(start..i);
             start = i;
             heap = 0;
+            mapped = 0;
         }
         heap = heap.saturating_add(charge.heap);
+        mapped = mapped.saturating_add(charge.mapped);
     }
     if start < charges.len() {
         ranges.push(start..charges.len());
@@ -277,151 +316,63 @@ fn batch_sizes_and_charges(files: &[std::path::PathBuf]) -> (Vec<u64>, Vec<Batch
         .unzip()
 }
 
-type ExtractedFile = (String, trigram::TrigramMaskMap, meta::FileStamp);
-
-#[doc(hidden)]
-pub type BuildReadObserver = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileVersion {
-    stamp: meta::FileStamp,
-    created_nanos: Option<u128>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_seconds: i64,
-    #[cfg(unix)]
-    change_nanos: i64,
-}
-
-fn file_version(metadata: &std::fs::Metadata) -> FileVersion {
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
-    FileVersion {
-        stamp: meta::file_stamp(metadata),
-        created_nanos: metadata
-            .created()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos()),
-        #[cfg(unix)]
-        device: metadata.dev(),
-        #[cfg(unix)]
-        inode: metadata.ino(),
-        #[cfg(unix)]
-        change_seconds: metadata.ctime(),
-        #[cfg(unix)]
-        change_nanos: metadata.ctime_nsec(),
-    }
-}
-
-/// Read owned bytes so concurrent truncation cannot invalidate memory while
-/// extraction is in progress.
-fn read_for_index(
-    path: &Path,
-    _size: u64,
-) -> std::io::Result<(Vec<u8>, std::fs::File, FileVersion)> {
-    let mut file = std::fs::File::open(path)?;
-    let before = file_version(&file.metadata()?);
-    let path_before = file_version(&std::fs::metadata(path)?);
-    if before != path_before {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "file was replaced while opening it",
-        ));
-    }
-    use std::io::Read;
-    let mut bytes = Vec::with_capacity(usize::try_from(before.stamp.size).unwrap_or(0));
-    file.read_to_end(&mut bytes)?;
-    Ok((bytes, file, before))
-}
-
-fn path_still_has_bytes(
-    path: &Path,
-    expected_version: &FileVersion,
-    expected: &[u8],
-) -> std::io::Result<bool> {
-    use std::io::Read;
-
-    let mut current = std::fs::File::open(path)?;
-    if file_version(&current.metadata()?) != *expected_version {
-        return Ok(false);
-    }
-    let mut offset = 0;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = current.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        if expected.get(offset..offset + read) != Some(&buffer[..read]) {
-            return Ok(false);
-        }
-        offset += read;
-    }
-    Ok(offset == expected.len()
-        && file_version(&current.metadata()?) == *expected_version
-        && file_version(&std::fs::metadata(path)?) == *expected_version)
-}
-
-fn extract_stable_file(
-    path: &Path,
-    size: u64,
-    after_read: Option<&(dyn Fn(&Path) + Send + Sync)>,
-) -> std::io::Result<(trigram::TrigramMaskMap, meta::FileStamp, bool)> {
-    const ATTEMPTS: usize = 3;
-    let mut last_error = None;
-    for _ in 0..ATTEMPTS {
-        let (data, file, before) = match read_for_index(path, size) {
-            Ok(read) => read,
-            Err(error) => {
-                last_error = Some(error);
-                continue;
-            }
-        };
-        let text = crate::encoding::decode_for_index(&data);
-        let binary = trigram::is_binary(&text);
-        let per_tri = if binary {
-            Default::default()
-        } else {
-            trigram::extract_merged_masks(&text)
-        };
-        if let Some(after_read) = after_read {
-            after_read(path);
-        }
-        let after_file = file.metadata().map(|metadata| file_version(&metadata));
-        if after_file.as_ref().is_ok_and(|version| version == &before)
-            && path_still_has_bytes(path, &before, &data).unwrap_or(false)
-        {
-            return Ok((per_tri, before.stamp, binary));
-        }
-        last_error = Some(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "file changed while it was being indexed",
-        ));
-    }
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "file could not be read at one stable version",
-        )
-    }))
-}
-
-/// Read one file at a metadata-stable version for the server's in-heap build.
+/// Smallest file worth memory-mapping instead of reading.
 ///
-/// The returned stamp was validated after trigram extraction and therefore
-/// describes the same version as `trigrams`. `None` trigrams means that stable
-/// version was binary by content.
-#[doc(hidden)]
-pub fn extract_file_for_live(
-    path: &Path,
-) -> std::io::Result<(Option<trigram::TrigramMaskMap>, meta::FileStamp)> {
-    let size = std::fs::metadata(path)?.len();
-    let (trigrams, stamp, binary) = extract_stable_file(path, size, None)?;
-    Ok(((!binary).then_some(trigrams), stamp))
+/// The same tradeoff the search path makes: mapping costs a syscall pair and a
+/// page-table setup per file, which is a bad deal across the ~94k mostly-small
+/// files of a kernel tree, but above this size it is what stops a large
+/// generated header from costing its full size in heap in every worker that
+/// touches one. Mapped pages are file-backed, so the kernel can reclaim them
+/// under pressure instead of the process holding an allocation it cannot give
+/// back.
+///
+/// 1 MiB is where the measurement pointed rather than a round guess. In the AMD
+/// register headers — the worst case in the kernel tree — an 8 MiB threshold
+/// mapped only 11 of 488 files and left 69% of the bytes on the heap, while
+/// 1 MiB maps 102 files covering 87% of the bytes. It stays cheap on ordinary
+/// trees because it is far above the size of real source: only 110 of the
+/// kernel's 94,747 files reach it at all.
+const MMAP_MIN_BYTES: u64 = 1024 * 1024;
+
+/// The bytes of a file to index, either read onto the heap or borrowed from a
+/// memory map.
+enum FileBytes {
+    Read(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+type ExtractedFile = (String, trigram::TrigramMaskMap);
+
+impl std::ops::Deref for FileBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            FileBytes::Read(bytes) => bytes,
+            FileBytes::Mapped(map) => map,
+        }
+    }
+}
+
+/// Get a file's bytes for indexing, mapping it when it is large enough to be
+/// worth avoiding the copy.
+///
+/// Falls back to reading whenever mapping is unavailable, so a filesystem that
+/// cannot map still indexes correctly.
+fn read_for_index(path: &Path, size: u64) -> std::io::Result<FileBytes> {
+    if size >= MMAP_MIN_BYTES {
+        // SAFETY: the map is read-only and owned by the returned value, which
+        // is dropped once the file's trigrams have been extracted. A concurrent
+        // truncation would be undefined behaviour; that is inherent to mapping
+        // a file being indexed, and is the same exposure the search path
+        // accepts.
+        let mapped =
+            std::fs::File::open(path).and_then(|file| unsafe { memmap2::Mmap::map(&file) });
+        if let Ok(map) = mapped {
+            return Ok(FileBytes::Mapped(map));
+        }
+    }
+    std::fs::read(path).map(FileBytes::Read)
 }
 
 /// Build a trigram index, choosing how postings are accumulated.
@@ -441,20 +392,6 @@ pub fn build_index_with_options_and_ignorecase(
     opts: &BuildOptions,
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
 ) -> Result<BuildOutcome> {
-    build_index_with_options_and_ignorecase_observed(root, index_dir, opts, ignorecase, None)
-        .map(|observed| observed.outcome)
-}
-
-/// Testable form of [`build_index_with_options_and_ignorecase`] that observes
-/// the interval between extraction and metadata validation.
-#[doc(hidden)]
-pub fn build_index_with_options_and_ignorecase_observed(
-    root: &Path,
-    index_dir: Option<&Path>,
-    opts: &BuildOptions,
-    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
-    after_file_read: Option<BuildReadObserver>,
-) -> Result<ObservedBuildOutcome> {
     let include_hidden = opts.include_hidden;
     let no_ignore = opts.no_ignore;
     let exclude_dirs = opts.exclude_dirs.as_slice();
@@ -518,8 +455,6 @@ pub fn build_index_with_options_and_ignorecase_observed(
     // bounding each batch by cumulative bytes caps how much raw file content is
     // resident at once, since the whole batch is read concurrently.
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
-    let mut stamps = std::collections::HashMap::with_capacity(walk.files.len());
-    let mut unreadable = Vec::new();
     let mut sink = match opts.strategy {
         IndexStrategy::InMemory => PostingSink::InMemory(Vec::new()),
         IndexStrategy::External => {
@@ -535,38 +470,27 @@ pub fn build_index_with_options_and_ignorecase_observed(
     for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
         let batch = &walk.files[range.clone()];
         let batch_sizes = &sizes[range];
-        let batch_data: Vec<std::result::Result<(ExtractedFile, bool), std::path::PathBuf>> = batch
+        let batch_data: Vec<ExtractedFile> = batch
             .par_iter()
             .zip(batch_sizes.par_iter())
-            .map(|(path, &size)| {
+            .filter_map(|(path, &size)| {
+                let data = read_for_index(path, size).ok()?;
+                let text = crate::encoding::decode_for_index(&data);
+                if trigram::is_binary(&text) {
+                    binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
                 let rel = path
                     .strip_prefix(&root)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                match extract_stable_file(path, size, after_file_read.as_deref()) {
-                    Ok((per_tri, stamp, binary)) => Ok(((rel, per_tri, stamp), binary)),
-                    Err(error) => {
-                        eprintln!("tgrep: skipping {}: {error}", path.display());
-                        Err(path.clone())
-                    }
-                }
+                let per_tri = trigram::extract_merged_masks(&text);
+                Some((rel, per_tri))
             })
             .collect();
 
-        for entry in batch_data {
-            let ((path, per_tri, stamp), binary) = match entry {
-                Ok(extracted) => extracted,
-                Err(path) => {
-                    unreadable.push(path);
-                    continue;
-                }
-            };
-            stamps.insert(path.clone(), stamp);
-            if binary {
-                binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                continue;
-            }
+        for (path, per_tri) in batch_data {
             let file_id = file_id_map.len() as u32;
             file_id_map.push((file_id, path));
             sink.push_file(file_id, per_tri)?;
@@ -604,19 +528,23 @@ pub fn build_index_with_options_and_ignorecase_observed(
         }
     }
 
-    // Every stamp came from the same stable read that produced the indexed
-    // bytes (or proved a file binary). Unreadable/unstable paths stay unstamped
-    // so a serialized reconciliation must revisit them.
+    // Write per-file stamps for ALL walked files (including those later
+    // rejected as binary-by-content) so the stale check on next startup
+    // won't re-process unchanged files that aren't in the index.
+    let all_walked: Vec<String> = walk
+        .files
+        .iter()
+        .filter_map(|p| p.strip_prefix(&root).ok())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    let stamps = meta::collect_filestamps(&root, &all_walked);
     meta::write_filestamps(&stamps, &index_dir)?;
 
     eprintln!("Index built successfully at {}", index_dir.display());
-    Ok(ObservedBuildOutcome {
-        outcome: BuildOutcome {
-            num_files: file_id_map.len(),
-            gitignore_files,
-            ignore_files,
-        },
-        unreadable,
+    Ok(BuildOutcome {
+        num_files: file_id_map.len(),
+        gitignore_files,
+        ignore_files,
     })
 }
 
@@ -640,20 +568,12 @@ pub struct FileDeltaOutcome {
     pub unreadable: Vec<std::path::PathBuf>,
 }
 
-/// Additional read-bound stamps for coordinated stale-delta publication.
-#[doc(hidden)]
-pub struct ObservedFileDeltaOutcome {
-    pub outcome: FileDeltaOutcome,
-    pub stamps: std::collections::HashMap<String, meta::FileStamp>,
-}
-
 /// Build an external-sort index for an exact list of absolute file paths.
 ///
 /// This is used by `tgrep serve` to build a bounded delta for files that are
 /// absent from an otherwise-complete index. It deliberately skips the directory
-/// walk and filestamp write: the caller has the complete candidate set from its
-/// stale-state scan, then replaces candidate stamps with the read-bound stamps
-/// returned here before publishing the merged index.
+/// walk and filestamp write: the caller already has both from its stale-state
+/// scan and publishes the complete stamp set with the merged index.
 ///
 /// Files that become unreadable or binary after the stale scan are omitted
 /// rather than fatal, matching a normal index build. Aborting instead would be
@@ -667,19 +587,6 @@ pub fn build_index_for_files(
     files: &[std::path::PathBuf],
     buffer_bytes: usize,
 ) -> Result<FileDeltaOutcome> {
-    build_index_for_files_observed(root, index_dir, files, buffer_bytes)
-        .map(|observed| observed.outcome)
-}
-
-/// Testable/coordinated form of [`build_index_for_files`] that returns the
-/// read-bound stamps needed for atomic stale publication.
-#[doc(hidden)]
-pub fn build_index_for_files_observed(
-    root: &Path,
-    index_dir: &Path,
-    files: &[std::path::PathBuf],
-    buffer_bytes: usize,
-) -> Result<ObservedFileDeltaOutcome> {
     let input_root = root;
     let root = std::fs::canonicalize(root)?;
     std::fs::create_dir_all(index_dir)?;
@@ -688,44 +595,43 @@ pub fn build_index_for_files_observed(
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(files.len());
     let mut sorter = ExternalSorter::new(index_dir, buffer_bytes);
     let mut unreadable: Vec<std::path::PathBuf> = Vec::new();
-    let mut stamps = std::collections::HashMap::with_capacity(files.len());
 
     for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
         let batch = &files[range.clone()];
         let batch_sizes = &sizes[range];
-        let batch_data: Vec<std::result::Result<(ExtractedFile, bool), std::path::PathBuf>> = batch
+        let batch_data: Vec<std::result::Result<ExtractedFile, std::path::PathBuf>> = batch
             .par_iter()
             .zip(batch_sizes.par_iter())
             .filter_map(|(path, &size)| {
-                let (per_tri, stamp, binary) = match extract_stable_file(path, size, None) {
-                    Ok(extracted) => extracted,
+                let data = match read_for_index(path, size) {
+                    Ok(data) => data,
                     Err(error) => {
                         eprintln!("tgrep: skipping {}: {error}", path.display());
                         return Some(Err(path.clone()));
                     }
                 };
+                let text = crate::encoding::decode_for_index(&data);
+                if trigram::is_binary(&text) {
+                    return None;
+                }
                 let rel = path
                     .strip_prefix(&root)
                     .or_else(|_| path.strip_prefix(input_root))
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                Some(Ok(((rel, per_tri, stamp), binary)))
+                Some(Ok((rel, trigram::extract_merged_masks(&text))))
             })
             .collect();
 
         for entry in batch_data {
-            let ((path, per_tri, stamp), binary) = match entry {
+            let (path, per_tri) = match entry {
                 Ok(extracted) => extracted,
                 Err(skipped) => {
                     unreadable.push(skipped);
                     continue;
                 }
             };
-            stamps.insert(path.clone(), stamp);
-            if binary {
-                continue;
-            }
             let file_id = u32::try_from(file_id_map.len()).map_err(|_| {
                 Error::IndexCorrupted("file count exceeds the u32 file-id limit".into())
             })?;
@@ -743,12 +649,9 @@ pub fn build_index_for_files_observed(
         trigram_count,
         Some(true),
     )?;
-    Ok(ObservedFileDeltaOutcome {
-        outcome: FileDeltaOutcome {
-            indexed: file_id_map.len(),
-            unreadable,
-        },
-        stamps,
+    Ok(FileDeltaOutcome {
+        indexed: file_id_map.len(),
+        unreadable,
     })
 }
 
@@ -1422,27 +1325,39 @@ mod tests {
 
     #[test]
     fn batches_are_bounded_by_cumulative_heap_bytes() {
-        // Five 900 KiB reads against a 2 MiB budget fit two at a time.
+        // Files below the mapping threshold are read, so their whole length is
+        // heap: five 900 KiB reads against a 2 MiB budget fit two at a time.
         let charges = charges(&[900 * 1024; 5]);
         assert_eq!(batch_ranges(&charges, 2 * MB), vec![0..2, 2..4, 4..5]);
     }
 
     #[test]
-    fn large_owned_files_respect_the_heap_budget() {
+    fn large_mapped_files_still_fill_a_batch() {
+        // Regression: charging a mapped file its own length against the heap
+        // budget made a batch of large files degenerate to one or two, leaving
+        // every worker but one idle. Mapped bytes never reach the heap, so only
+        // the mapped budget bounds these: 256 MiB / 32 MiB is eight per batch.
         let charges = charges(&[32 * MB; 16]);
         assert_eq!(
             batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES),
-            vec![0..2, 2..4, 4..6, 6..8, 8..10, 10..12, 12..14, 14..16]
+            vec![0..8, 8..16]
         );
     }
 
     #[test]
-    fn owned_bytes_in_flight_stay_bounded() {
+    fn mapped_bytes_in_flight_stay_bounded() {
+        // The other half of the bound: a batch may not map more than the mapped
+        // budget, whatever mix of sizes it is handed.
         let sizes: Vec<u64> = (0..200).map(|i| (i % 9 + 1) * 8 * MB).collect();
         let charges = charges(&sizes);
         for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
             let single = range.end - range.start == 1;
+            let mapped: u64 = charges[range.clone()].iter().map(|c| c.mapped).sum();
             let heap: u64 = charges[range.clone()].iter().map(|c| c.heap).sum();
+            assert!(
+                single || mapped <= MAPPED_BATCH_BYTES,
+                "batch {range:?} maps {mapped} bytes"
+            );
             assert!(
                 single || heap <= INDEX_BUILD_BATCH_BYTES,
                 "batch {range:?} reads {heap} bytes"

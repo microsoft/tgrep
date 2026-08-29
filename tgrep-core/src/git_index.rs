@@ -72,12 +72,39 @@ impl TrackedFiles {
         // matched — a handful per walk, not one per entry.
         self.paths.iter().any(|p| p.starts_with(prefix.as_str()))
     }
+
+    pub(crate) fn fingerprint_matching(
+        &self,
+        mut include: impl FnMut(&str) -> bool,
+    ) -> (usize, u64, u64) {
+        let mut count = 0;
+        let mut xor = 0;
+        let mut sum = 0u64;
+        for path in &self.paths {
+            if !include(path) {
+                continue;
+            }
+            let hash = membership_hash(path);
+            count += 1;
+            xor ^= hash;
+            sum = sum.wrapping_add(hash);
+        }
+        (count, xor, sum)
+    }
 }
 
 fn normalise(path: &str) -> String {
     path.replace('\\', "/")
         .trim_matches('/')
         .to_ascii_lowercase()
+}
+
+fn membership_hash(path: &str) -> u64 {
+    path.as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
 }
 
 /// Locate the directory holding a repository's `.git` metadata.

@@ -294,9 +294,9 @@ struct ServerState {
     ignore_rules_dirty: std::sync::atomic::AtomicBool,
     /// Ensures a burst of ignore-file events uses at most one refresh worker.
     ignore_refresh_scheduled: std::sync::atomic::AtomicBool,
-    /// Last observed identity of the worktree-specific Git index. `None` means
-    /// the published matcher has no case-insensitive tracked-file exemption.
-    tracked_index_identity: Mutex<Option<tgrep_core::gitignore::TrackedIndexIdentity>>,
+    /// Last observed tracked-path membership. `None` means the published
+    /// matcher has no case-insensitive tracked-file exemption.
+    tracked_membership: Mutex<Option<tgrep_core::gitignore::TrackedMembershipFingerprint>>,
     /// Set when events were lost, cleared by the next subscription sync, which
     /// then re-issues every subscription instead of trusting its own records.
     ///
@@ -655,7 +655,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         gitignore_pending: std::sync::atomic::AtomicBool::new(!no_watch && !no_ignore),
         ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
         ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
-        tracked_index_identity: Mutex::new(None),
+        tracked_membership: Mutex::new(None),
         watch_resubscribe: std::sync::atomic::AtomicBool::new(false),
         ignore_sources: RwLock::new(Vec::new()),
         ignore_source_stamps: RwLock::new(IgnoreStamps::new()),
@@ -1021,17 +1021,19 @@ fn publish_ignore_matcher(
     // walking, the next poll must still see that change rather than having this
     // publish silently advance past it.
     let mut published = state.gitignore.write().unwrap();
-    let mut identity = state.tracked_index_identity.lock().unwrap();
-    let current_identity = matcher
-        .as_ref()
-        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_index_identity);
-    match (&*identity, current_identity) {
-        (_, None) => *identity = None,
-        (None, Some(current)) => *identity = Some(current),
+    let mut membership = state.tracked_membership.lock().unwrap();
+    let current_membership = state.watch_enabled.then(|| {
+        matcher
+            .as_ref()
+            .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_membership_fingerprint)
+    });
+    match (&*membership, current_membership.flatten()) {
+        (_, None) => *membership = None,
+        (None, Some(current)) => *membership = Some(current),
         (Some(_), Some(_)) => {}
     }
     *published = matcher;
-    drop(identity);
+    drop(membership);
     drop(published);
     state.gitignore_pending.store(false, Ordering::SeqCst);
     // New rules mean a different set of directories worth hearing about:
@@ -1893,8 +1895,10 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
             loop {
                 if last_tracked_index_poll.elapsed() >= TRACKED_INDEX_POLL {
                     last_tracked_index_poll = Instant::now();
-                    if tracked_index_changed(&worker_state) {
-                        eprintln!("[trace] Git index changed; reconciling tracked-file exemptions");
+                    if tracked_membership_changed(&worker_state) {
+                        eprintln!(
+                            "[trace] Git tracked paths changed; reconciling tracked-file exemptions"
+                        );
                         worker_state
                             .ignore_rules_dirty
                             .store(true, Ordering::SeqCst);
@@ -1960,15 +1964,17 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
 /// Detect a tracked-file exemption change without subscribing to `.git`.
 ///
 /// The metadata probe is enabled only while the published matcher actually
-/// uses the exemption. Updating the observed identity before scheduling makes
+/// uses the exemption. Index metadata only decides when to reparse its paths;
+/// an unchanged membership fingerprint does not schedule a repository walk.
+/// Updating the observed membership before scheduling makes
 /// a burst one dirty signal; the existing refresh scheduler coalesces it with
 /// any ignore-source changes and serializes the full stale reconciliation.
-fn tracked_index_changed(state: &ServerState) -> bool {
+fn tracked_membership_changed(state: &ServerState) -> bool {
     let matcher = state.gitignore.read().unwrap();
     let current = matcher
         .as_ref()
-        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_index_identity);
-    let mut observed = state.tracked_index_identity.lock().unwrap();
+        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_membership_fingerprint);
+    let mut observed = state.tracked_membership.lock().unwrap();
     let changed = matches!(
         (observed.as_ref(), current.as_ref()),
         (Some(previous), Some(current)) if previous != current
@@ -2174,6 +2180,22 @@ struct WatchRegistry {
 enum TraversalCompleteness {
     Complete,
     Incomplete,
+}
+
+/// Consume one overflow repair request only when this traversal can complete it.
+///
+/// Clearing before the sync means an overflow that arrives during a complete
+/// pass sets the flag for another pass. Re-arming an incomplete pass preserves
+/// the original request without overwriting a concurrent `true`.
+fn take_force_resubscribe(
+    pending: &std::sync::atomic::AtomicBool,
+    completeness: TraversalCompleteness,
+) -> bool {
+    let force = pending.swap(false, Ordering::SeqCst);
+    if force && completeness == TraversalCompleteness::Incomplete {
+        pending.store(true, Ordering::SeqCst);
+    }
+    force
 }
 
 struct WatchableDirs {
@@ -2553,9 +2575,9 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
         desired.dirs.extend(ignore_target_dirs(root, &sources));
     }
     let total = desired.dirs.len();
-    // Consumed here, so one overflow buys one forced pass rather than making
-    // every later reconcile re-register the whole tree.
-    let force = state.watch_resubscribe.swap(false, Ordering::SeqCst);
+    // An incomplete traversal cannot prove that omitted recorded watches are
+    // live, so it does not get to consume the overflow repair request.
+    let force = take_force_resubscribe(&state.watch_resubscribe, desired.completeness);
     let (added, removed) = registry.sync(&desired.dirs, desired.completeness, force);
     if !added.is_empty() || removed > 0 {
         eprintln!(
@@ -5927,7 +5949,7 @@ mod tests {
             gitignore_pending: std::sync::atomic::AtomicBool::new(true),
             ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
             ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
-            tracked_index_identity: Mutex::new(None),
+            tracked_membership: Mutex::new(None),
             watch_resubscribe: std::sync::atomic::AtomicBool::new(false),
             ignore_sources: RwLock::new(Vec::new()),
             ignore_source_stamps: RwLock::new(IgnoreStamps::new()),
@@ -6200,7 +6222,17 @@ mod tests {
         // A traversal that missed entries is additive only: absence from its
         // partial result is not evidence that an existing watch became stale.
         let partial: std::collections::HashSet<PathBuf> = std::iter::once(c.clone()).collect();
-        let (added, removed) = registry.sync(&partial, TraversalCompleteness::Incomplete, false);
+        let pending = std::sync::atomic::AtomicBool::new(true);
+        let force = take_force_resubscribe(&pending, TraversalCompleteness::Incomplete);
+        assert!(
+            force,
+            "the incomplete pass must still attempt known entries"
+        );
+        assert!(
+            pending.load(Ordering::SeqCst),
+            "an incomplete pass must leave forced resubscription pending"
+        );
+        let (added, removed) = registry.sync(&partial, TraversalCompleteness::Incomplete, force);
         assert_eq!((added.len(), removed), (0, 0));
         assert_eq!(
             registry.watched,
@@ -6209,7 +6241,16 @@ mod tests {
         );
 
         // A later complete traversal is authoritative and may prune them.
-        let (added, removed) = registry.sync(&partial, TraversalCompleteness::Complete, false);
+        let force = take_force_resubscribe(&pending, TraversalCompleteness::Complete);
+        assert!(
+            force,
+            "the next complete pass must inherit the force request"
+        );
+        assert!(
+            !pending.load(Ordering::SeqCst),
+            "a complete forced pass consumes the request"
+        );
+        let (added, removed) = registry.sync(&partial, TraversalCompleteness::Complete, force);
         assert_eq!((added.len(), removed), (0, 2));
         assert_eq!(registry.watched, [c].into_iter().collect());
     }
@@ -6470,6 +6511,75 @@ mod tests {
             "reader membership must remain sufficient evidence to tombstone"
         );
         assert_eq!(index.live.dirty_count(), 1);
+    }
+
+    #[test]
+    fn content_only_git_index_rewrite_does_not_request_reconciliation() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        git(&["init", "--quiet"]);
+        git(&["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn original() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join("ignored/forced.rs"), "fn forced() {}\n").unwrap();
+        git(&["add", "--", ".gitignore", "src/lib.rs"]);
+
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        let matcher =
+            tgrep_core::gitignore::build_matcher(&root).expect("case-insensitive matcher");
+        let baseline = matcher
+            .tracked_membership_fingerprint()
+            .expect("tracked exemption active");
+        *state.gitignore.write().unwrap() = Some(matcher);
+        *state.tracked_membership.lock().unwrap() = Some(baseline);
+
+        std::fs::write(root.join("src/lib.rs"), "fn content_changed() {}\n").unwrap();
+        git(&["add", "--", "src/lib.rs"]);
+        assert!(
+            !tracked_membership_changed(&state),
+            "rewriting index metadata with the same tracked paths must not request a full scan"
+        );
+
+        std::fs::write(root.join("src/new.rs"), "fn newly_tracked() {}\n").unwrap();
+        git(&["add", "--", "src/new.rs"]);
+        assert!(
+            !tracked_membership_changed(&state),
+            "tracked membership outside the exemption set must not request a full scan"
+        );
+
+        git(&["add", "-f", "--", "ignored/forced.rs"]);
+        assert!(
+            tracked_membership_changed(&state),
+            "adding a tracked-path exemption must request reconciliation"
+        );
+        assert!(
+            !tracked_membership_changed(&state),
+            "an observed membership change must be coalesced"
+        );
+
+        git(&[
+            "rm",
+            "--cached",
+            "--quiet",
+            "--force",
+            "--",
+            "ignored/forced.rs",
+        ]);
+        assert!(
+            tracked_membership_changed(&state),
+            "removing a tracked-path exemption must request reconciliation"
+        );
     }
 
     /// A transient stat failure is not a deletion. `Path::exists` said it was,

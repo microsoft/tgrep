@@ -309,15 +309,16 @@ impl IgnoreMatcher {
             .is_some_and(|ignorecase| ignorecase.excludes(&self.root.join(rel), is_dir))
     }
 
-    /// Identity of the Git index behind the tracked-file exemption.
+    /// Fingerprint of the tracked paths behind the tracked-file exemption.
     ///
     /// `None` means this matcher has no case-insensitive exemption, so callers
-    /// need not poll anything. The identity itself can represent a missing or
-    /// unreadable index, since either transition changes what can be exempted.
-    pub fn tracked_index_identity(&self) -> Option<TrackedIndexIdentity> {
+    /// need not poll anything. Index metadata is used internally to avoid
+    /// reparsing an unchanged index, but only path membership contributes to
+    /// this value.
+    pub fn tracked_membership_fingerprint(&self) -> Option<TrackedMembershipFingerprint> {
         self.ignorecase
             .as_ref()
-            .map(CaseInsensitiveIgnore::tracked_index_identity)
+            .map(CaseInsensitiveIgnore::tracked_membership_fingerprint)
     }
 }
 
@@ -477,11 +478,13 @@ struct TrackedCache {
     /// an unreadable index is not retried on every path.
     loaded_from: Option<Option<(std::time::SystemTime, u64)>>,
     tracked: Option<crate::git_index::TrackedFiles>,
+    /// Fingerprint of only the tracked paths this matcher would otherwise hide.
+    fingerprint: Option<(usize, u64, u64)>,
 }
 
-/// Metadata identity of the worktree-specific Git index.
+/// Compact, order-independent identity of the tracked exemption set.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TrackedIndexIdentity(Option<(std::time::SystemTime, u64)>);
+pub struct TrackedMembershipFingerprint(Option<(usize, u64, u64)>);
 
 /// Modification time and length of the index, which is what identifies it.
 ///
@@ -566,8 +569,17 @@ impl CaseInsensitiveIgnore {
         self.tracked_hides(&relative, is_dir)
     }
 
-    fn tracked_index_identity(&self) -> TrackedIndexIdentity {
-        TrackedIndexIdentity(index_identity(&self.repo_root))
+    fn tracked_membership_fingerprint(&self) -> TrackedMembershipFingerprint {
+        let identity = index_identity(&self.repo_root);
+        {
+            let cache = self.tracked.read().unwrap();
+            if cache.loaded_from.as_ref() == Some(&identity) {
+                return TrackedMembershipFingerprint(cache.fingerprint);
+            }
+        }
+        let mut cache = self.tracked.write().unwrap();
+        self.reload_tracked_if_needed(&mut cache, identity);
+        TrackedMembershipFingerprint(cache.fingerprint)
     }
 
     /// Whether the tracked-file set leaves `relative` hidden.
@@ -584,11 +596,27 @@ impl CaseInsensitiveIgnore {
         }
         let mut cache = self.tracked.write().unwrap();
         // Another thread may have reloaded it while this one waited.
-        if cache.loaded_from.as_ref() != Some(&identity) {
-            cache.tracked = crate::git_index::load_tracked(&self.repo_root);
-            cache.loaded_from = Some(identity);
-        }
+        self.reload_tracked_if_needed(&mut cache, identity);
         Self::hides(cache.tracked.as_ref(), relative, is_dir)
+    }
+
+    fn reload_tracked_if_needed(
+        &self,
+        cache: &mut TrackedCache,
+        identity: Option<(std::time::SystemTime, u64)>,
+    ) {
+        if cache.loaded_from.as_ref() == Some(&identity) {
+            return;
+        }
+        cache.tracked = crate::git_index::load_tracked(&self.repo_root);
+        cache.fingerprint = cache.tracked.as_ref().map(|tracked| {
+            tracked.fingerprint_matching(|path| {
+                self.matcher
+                    .matched_path_or_any_parents(Path::new(path), false)
+                    .is_ignore()
+            })
+        });
+        cache.loaded_from = Some(identity);
     }
 
     fn hides(

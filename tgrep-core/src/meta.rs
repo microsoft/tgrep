@@ -68,6 +68,21 @@ pub struct FileStamp {
     pub size: u64,
 }
 
+/// Convert filesystem metadata into the persisted stamp used by change
+/// detection.
+pub fn file_stamp(metadata: &std::fs::Metadata) -> FileStamp {
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    FileStamp {
+        mtime,
+        size: metadata.len(),
+    }
+}
+
 /// Write per-file stamps to `filestamps.json` in the index directory.
 pub fn write_filestamps(stamps: &HashMap<String, FileStamp>, index_dir: &Path) -> Result<()> {
     let path = index_dir.join(FILESTAMPS_FILENAME);
@@ -95,21 +110,9 @@ pub fn collect_filestamps(root: &Path, paths: &[String]) -> HashMap<String, File
         .par_iter()
         .filter_map(|rel_path| {
             let full_path = root.join(rel_path);
-            std::fs::metadata(&full_path).ok().map(|metadata| {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                (
-                    rel_path.clone(),
-                    FileStamp {
-                        mtime,
-                        size: metadata.len(),
-                    },
-                )
-            })
+            std::fs::metadata(&full_path)
+                .ok()
+                .map(|metadata| (rel_path.clone(), file_stamp(&metadata)))
         })
         .collect()
 }

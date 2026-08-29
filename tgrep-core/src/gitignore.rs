@@ -320,6 +320,13 @@ impl IgnoreMatcher {
             .as_ref()
             .map(CaseInsensitiveIgnore::tracked_membership_fingerprint)
     }
+
+    /// Cheap generation token for the worktree-specific Git index.
+    pub fn tracked_index_generation(&self) -> Option<TrackedIndexGeneration> {
+        self.ignorecase
+            .as_ref()
+            .map(CaseInsensitiveIgnore::tracked_index_generation)
+    }
 }
 
 /// Return `rel` relative to `dir`, or `None` when `rel` is not beneath it.
@@ -476,7 +483,7 @@ pub struct CaseInsensitiveIgnore {
 struct TrackedCache {
     /// `None` until something is loaded; `Some` even when the load failed, so
     /// an unreadable index is not retried on every path.
-    loaded_from: Option<Option<(std::time::SystemTime, u64)>>,
+    loaded_from: Option<Option<IndexIdentity>>,
     tracked: Option<crate::git_index::TrackedFiles>,
     /// Fingerprint of only the tracked paths this matcher would otherwise hide.
     fingerprint: Option<(usize, u64, u64)>,
@@ -486,15 +493,40 @@ struct TrackedCache {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackedMembershipFingerprint(Option<(usize, u64, u64)>);
 
-/// Modification time and length of the index, which is what identifies it.
+/// Metadata generation of the worktree-specific Git index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackedIndexGeneration(Option<IndexIdentity>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexIdentity {
+    modified: std::time::SystemTime,
+    created: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+/// Cheap metadata identity of the index file generation.
 ///
 /// git replaces the index by renaming `index.lock` over it, so any rewrite
-/// lands as a new mtime — the same pair git's own racy-index handling relies
-/// on. Two rewrites inside one filesystem mtime tick that leave the length
-/// unchanged are the gap, and the periodic reconcile is what closes it.
-fn index_identity(repo_root: &Path) -> Option<(std::time::SystemTime, u64)> {
+/// normally lands as a new file instance as well as a new mtime. Creation time
+/// covers that replacement on Windows, and device/inode covers it on Unix,
+/// including an A→B→A rewrite inside one filesystem mtime tick.
+fn index_identity(repo_root: &Path) -> Option<IndexIdentity> {
     let meta = std::fs::metadata(crate::git_index::index_path(repo_root)?).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(IndexIdentity {
+        modified: meta.modified().ok()?,
+        created: meta.created().ok(),
+        len: meta.len(),
+        #[cfg(unix)]
+        device: meta.dev(),
+        #[cfg(unix)]
+        inode: meta.ino(),
+    })
 }
 
 impl CaseInsensitiveIgnore {
@@ -582,6 +614,10 @@ impl CaseInsensitiveIgnore {
         TrackedMembershipFingerprint(cache.fingerprint)
     }
 
+    fn tracked_index_generation(&self) -> TrackedIndexGeneration {
+        TrackedIndexGeneration(index_identity(&self.repo_root))
+    }
+
     /// Whether the tracked-file set leaves `relative` hidden.
     ///
     /// `false` when the index cannot be read: with no way to tell tracked from
@@ -600,11 +636,7 @@ impl CaseInsensitiveIgnore {
         Self::hides(cache.tracked.as_ref(), relative, is_dir)
     }
 
-    fn reload_tracked_if_needed(
-        &self,
-        cache: &mut TrackedCache,
-        identity: Option<(std::time::SystemTime, u64)>,
-    ) {
+    fn reload_tracked_if_needed(&self, cache: &mut TrackedCache, identity: Option<IndexIdentity>) {
         if cache.loaded_from.as_ref() == Some(&identity) {
             return;
         }

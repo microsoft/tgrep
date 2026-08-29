@@ -478,7 +478,19 @@ struct ServerState {
     /// Milliseconds since `started` at the last search request, used by the
     /// periodic reconcile to stay out of the way of a server in active use.
     last_search_ms: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    stale_refresh_hook: Mutex<Option<StaleRefreshHook>>,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum StaleRefreshPhase {
+    BeforeWalk,
+    AfterMatcherPublish,
+}
+
+#[cfg(test)]
+type StaleRefreshHook = Arc<dyn Fn(StaleRefreshPhase) + Send + Sync>;
 
 impl ServerState {
     fn note_search(&self) {
@@ -681,6 +693,8 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         unreadable: RwLock::new(std::collections::HashMap::new()),
         started: serve_start,
         last_search_ms: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(test)]
+        stale_refresh_hook: Mutex::new(None),
     });
 
     // Bind TCP listener on a random port
@@ -1981,6 +1995,28 @@ fn tracked_membership_changed(state: &ServerState) -> bool {
     );
     *observed = current;
     changed
+}
+
+fn tracked_index_generation(
+    state: &ServerState,
+) -> Option<tgrep_core::gitignore::TrackedIndexGeneration> {
+    if !state.watch_enabled {
+        return None;
+    }
+    state
+        .gitignore
+        .read()
+        .unwrap()
+        .as_ref()
+        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_index_generation)
+}
+
+#[cfg(test)]
+fn run_stale_refresh_hook(state: &ServerState, phase: StaleRefreshPhase) {
+    let hook = state.stale_refresh_hook.lock().unwrap().clone();
+    if let Some(hook) = hook {
+        hook(phase);
+    }
 }
 
 /// Decide whether the file watcher should skip a path entirely.
@@ -4707,12 +4743,15 @@ fn background_refresh_stale(
     index_dir: &Path,
     compare_index_membership: bool,
 ) -> bool {
-    let _refresh = state.stale_refresh_lock.lock().unwrap();
+    let refresh = state.stale_refresh_lock.lock().unwrap();
     // Keep watcher/auto-save mutations out for the complete walk → matcher →
     // merge → recovery cycle. Search queries do not take this gate and remain
     // available. Held here rather than inside so the recovery scan below is
     // still covered by it.
-    let _gate = state.snapshot_gate.write().unwrap();
+    let gate = state.snapshot_gate.write().unwrap();
+    let generation_before = tracked_index_generation(state);
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeWalk);
 
     let mut newly_watched = Vec::new();
     // Before the walk, not after the subscriptions: this bounds the window the
@@ -4738,6 +4777,19 @@ fn background_refresh_stale(
     // any earlier would both be discarded and re-read every changed file.
     if ok {
         reindex_files_in(state, root, &newly_watched, since);
+    }
+    let generation_changed =
+        generation_before.is_some() && generation_before != tracked_index_generation(state);
+    drop(gate);
+    drop(refresh);
+    if generation_changed {
+        // The walk and matcher may have consumed an intermediate tracked set
+        // even when an A→B→A transition restored the semantic fingerprint.
+        // One serialized corrective pass makes the final generation
+        // authoritative; the existing scheduler coalesces repeated changes.
+        eprintln!("[trace] Git index changed during stale reconciliation; scheduling a retry");
+        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+        schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
     }
     ok
 }
@@ -4795,6 +4847,8 @@ fn refresh_stale_locked(
         ),
         || build_stale_matcher(state, root, &walk),
     );
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::AfterMatcherPublish);
 
     if walk.skipped_error > 0 {
         eprintln!(
@@ -5975,7 +6029,17 @@ mod tests {
             unreadable: RwLock::new(std::collections::HashMap::new()),
             started: Instant::now(),
             last_search_ms: std::sync::atomic::AtomicU64::new(0),
+            stale_refresh_hook: Mutex::new(None),
         })
+    }
+
+    fn test_git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
     }
 
     /// A binary marker's offset is a position in the file, not in the repaired
@@ -6517,23 +6581,15 @@ mod tests {
     fn content_only_git_index_rewrite_does_not_request_reconciliation() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .current_dir(&root)
-                .args(args)
-                .status()
-                .expect("run git");
-            assert!(status.success(), "git {args:?} failed");
-        };
 
-        git(&["init", "--quiet"]);
-        git(&["config", "core.ignorecase", "true"]);
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
         std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "fn original() {}\n").unwrap();
         std::fs::create_dir_all(root.join("ignored")).unwrap();
         std::fs::write(root.join("ignored/forced.rs"), "fn forced() {}\n").unwrap();
-        git(&["add", "--", ".gitignore", "src/lib.rs"]);
+        test_git(&root, &["add", "--", ".gitignore", "src/lib.rs"]);
 
         let state = test_server_state(&root, &root.join(".tgrep"));
         let matcher =
@@ -6545,20 +6601,20 @@ mod tests {
         *state.tracked_membership.lock().unwrap() = Some(baseline);
 
         std::fs::write(root.join("src/lib.rs"), "fn content_changed() {}\n").unwrap();
-        git(&["add", "--", "src/lib.rs"]);
+        test_git(&root, &["add", "--", "src/lib.rs"]);
         assert!(
             !tracked_membership_changed(&state),
             "rewriting index metadata with the same tracked paths must not request a full scan"
         );
 
         std::fs::write(root.join("src/new.rs"), "fn newly_tracked() {}\n").unwrap();
-        git(&["add", "--", "src/new.rs"]);
+        test_git(&root, &["add", "--", "src/new.rs"]);
         assert!(
             !tracked_membership_changed(&state),
             "tracked membership outside the exemption set must not request a full scan"
         );
 
-        git(&["add", "-f", "--", "ignored/forced.rs"]);
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
         assert!(
             tracked_membership_changed(&state),
             "adding a tracked-path exemption must request reconciliation"
@@ -6568,18 +6624,179 @@ mod tests {
             "an observed membership change must be coalesced"
         );
 
-        git(&[
-            "rm",
-            "--cached",
-            "--quiet",
-            "--force",
-            "--",
-            "ignored/forced.rs",
-        ]);
+        test_git(
+            &root,
+            &[
+                "rm",
+                "--cached",
+                "--quiet",
+                "--force",
+                "--",
+                "ignored/forced.rs",
+            ],
+        );
         assert!(
             tracked_membership_changed(&state),
             "removing a tracked-path exemption must request reconciliation"
         );
+    }
+
+    #[test]
+    fn git_index_aba_during_refresh_schedules_a_corrective_pass() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn ordinary() {}\n").unwrap();
+        let ignored = root.join("ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(ignored.join("forced.rs"), "fn aba_marker() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore", "src/lib.rs"]);
+
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        let matcher =
+            tgrep_core::gitignore::build_matcher(&root).expect("case-insensitive matcher");
+        let baseline = matcher
+            .tracked_membership_fingerprint()
+            .expect("tracked exemption active");
+        *state.gitignore.write().unwrap() = Some(matcher);
+        *state.tracked_membership.lock().unwrap() = Some(baseline);
+
+        if PER_DIRECTORY_WATCHES {
+            let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+            *state.watch_registry.lock().unwrap() = Some(WatchRegistry {
+                watcher,
+                root: root.clone(),
+                watched: std::iter::once(root.clone()).collect(),
+            });
+        }
+
+        let before_walk_entered = Arc::new(Barrier::new(2));
+        let before_walk_release = Arc::new(Barrier::new(2));
+        let after_publish_entered = Arc::new(Barrier::new(2));
+        let after_publish_release = Arc::new(Barrier::new(2));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let before_walk_entered = Arc::clone(&before_walk_entered);
+            let before_walk_release = Arc::clone(&before_walk_release);
+            let after_publish_entered = Arc::clone(&after_publish_entered);
+            let after_publish_release = Arc::clone(&after_publish_release);
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| match phase {
+                StaleRefreshPhase::BeforeWalk => {
+                    if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        before_walk_entered.wait();
+                        before_walk_release.wait();
+                    }
+                }
+                StaleRefreshPhase::AfterMatcherPublish => {
+                    if passes.load(Ordering::SeqCst) == 1 {
+                        after_publish_entered.wait();
+                        after_publish_release.wait();
+                    }
+                }
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        let refresh_state = Arc::clone(&state);
+        let refresh_root = root.clone();
+        let index_dir = state.index_dir.clone();
+        let refresh = thread::spawn(move || {
+            background_refresh_stale(&refresh_state, &refresh_root, &index_dir, true)
+        });
+
+        // A: untracked and hidden when the pass captures its generation.
+        before_walk_entered.wait();
+        // B: visible while both the walk and published matcher make decisions.
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        before_walk_release.wait();
+        after_publish_entered.wait();
+        if PER_DIRECTORY_WATCHES {
+            assert!(
+                state
+                    .watch_registry
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .watched
+                    .contains(&ignored),
+                "the intermediate matcher must subscribe the tracked ignored directory"
+            );
+        }
+        // A again before the pass commits what it learned from B.
+        test_git(
+            &root,
+            &[
+                "rm",
+                "--cached",
+                "--quiet",
+                "--force",
+                "--",
+                "ignored/forced.rs",
+            ],
+        );
+        after_publish_release.wait();
+        assert!(
+            refresh.join().unwrap(),
+            "the raced pass itself should finish"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (passes.load(Ordering::SeqCst) < 2
+            || state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+            || state.ignore_rules_dirty.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            passes.load(Ordering::SeqCst) >= 2,
+            "the generation change must schedule a corrective pass"
+        );
+        assert!(
+            !state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+                && !state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "the corrective pass did not finish"
+        );
+
+        let matcher = state.gitignore.read().unwrap();
+        assert!(
+            matcher
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true),
+            "the final matcher must restore the final untracked state"
+        );
+        drop(matcher);
+        let index = state.index.read().unwrap();
+        assert!(
+            !index.live.has_path("ignored/forced.rs")
+                && (!index.reader_has_path("ignored/forced.rs")
+                    || index.live.is_deleted("ignored/forced.rs")),
+            "the corrective pass must remove content indexed from the intermediate state"
+        );
+        drop(index);
+        if PER_DIRECTORY_WATCHES {
+            assert!(
+                !state
+                    .watch_registry
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .watched
+                    .contains(&ignored),
+                "the corrective matcher must retire the intermediate subscription"
+            );
+        }
     }
 
     /// A transient stat failure is not a deletion. `Path::exists` said it was,

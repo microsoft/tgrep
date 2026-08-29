@@ -1562,6 +1562,36 @@ mod tests {
     }
 
     #[test]
+    fn tracked_fingerprint_includes_whitelisted_files_under_ignored_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fake_git_repo(root, true, &["qlogs/kept.rs"]);
+        fs::write(root.join(".gitignore"), "QLogs/\n!qlogs/kept.rs\n").unwrap();
+        fs::create_dir_all(root.join("qlogs")).unwrap();
+        fs::write(root.join("qlogs/kept.rs"), "tracked").unwrap();
+
+        let ignorecase =
+            crate::gitignore::CaseInsensitiveIgnore::frozen_snapshot(root, true, true, true)
+                .map(std::sync::Arc::new);
+        let matcher = crate::gitignore::matcher_from_ignore_paths_with_options_and_ignorecase(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+            false,
+            ignorecase,
+        )
+        .expect("the fixture has rules");
+        let baseline = matcher.tracked_membership_fingerprint();
+
+        fake_git_repo(root, true, &[]);
+        assert_ne!(
+            baseline,
+            matcher.current_tracked_membership_fingerprint(),
+            "polling must notice when an ignored ancestor loses its tracked descendant"
+        );
+    }
+
+    #[test]
     fn no_ignore_turns_the_whole_thing_off() {
         let dir = ignorecase_fixture(true, &["src/main.rs"]);
         let names = sorted_filenames(

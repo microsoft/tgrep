@@ -609,7 +609,7 @@ impl CaseInsensitiveIgnore {
             return None;
         }
         let tracked = if frozen {
-            TrackedMembership::Frozen(Self::load_snapshot(&repo_root, &matcher))
+            TrackedMembership::Frozen(Self::load_snapshot(&repo_root))
         } else {
             TrackedMembership::Lazy(std::sync::OnceLock::new())
         };
@@ -637,7 +637,7 @@ impl CaseInsensitiveIgnore {
         match &self.tracked {
             TrackedMembership::Lazy(snapshot) => Self::hides(
                 snapshot
-                    .get_or_init(|| Self::load_snapshot(&self.repo_root, &self.matcher))
+                    .get_or_init(|| Self::load_snapshot(&self.repo_root))
                     .tracked
                     .as_ref(),
                 &relative,
@@ -652,7 +652,7 @@ impl CaseInsensitiveIgnore {
     fn tracked_membership_fingerprint(&self) -> TrackedMembershipFingerprint {
         match &self.tracked {
             TrackedMembership::Lazy(snapshot) => snapshot
-                .get_or_init(|| Self::load_snapshot(&self.repo_root, &self.matcher))
+                .get_or_init(|| Self::load_snapshot(&self.repo_root))
                 .fingerprint
                 .clone(),
             TrackedMembership::Frozen(snapshot) => snapshot.fingerprint.clone(),
@@ -672,14 +672,14 @@ impl CaseInsensitiveIgnore {
             return cache.fingerprint.clone();
         }
         let tracked = crate::git_index::load_tracked(&self.repo_root);
-        cache.fingerprint = Self::fingerprint(&self.matcher, tracked.as_ref());
+        cache.fingerprint = Self::fingerprint(tracked.as_ref());
         cache.loaded_from = Some(identity);
         cache.fingerprint.clone()
     }
 
-    fn load_snapshot(repo_root: &Path, matcher: &Gitignore) -> TrackedSnapshot {
+    fn load_snapshot(repo_root: &Path) -> TrackedSnapshot {
         let tracked = crate::git_index::load_tracked(repo_root);
-        let fingerprint = Self::fingerprint(matcher, tracked.as_ref());
+        let fingerprint = Self::fingerprint(tracked.as_ref());
         TrackedSnapshot {
             tracked,
             fingerprint,
@@ -687,16 +687,12 @@ impl CaseInsensitiveIgnore {
     }
 
     fn fingerprint(
-        matcher: &Gitignore,
         tracked: Option<&crate::git_index::TrackedFiles>,
     ) -> TrackedMembershipFingerprint {
-        TrackedMembershipFingerprint(tracked.map(|tracked| {
-            tracked.fingerprint_matching(|path| {
-                matcher
-                    .matched_path_or_any_parents(Path::new(path), false)
-                    .is_ignore()
-            })
-        }))
+        // Directory visibility depends on every tracked descendant, including
+        // paths whose final file match is whitelisted. Fingerprint the full set
+        // so changes that make an ignored ancestor walkable are observable.
+        TrackedMembershipFingerprint(tracked.map(|tracked| tracked.fingerprint_matching(|_| true)))
     }
 
     fn hides(

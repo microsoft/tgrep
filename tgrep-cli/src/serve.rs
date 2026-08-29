@@ -2772,11 +2772,11 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
         let sources = state.ignore_sources.read().unwrap();
         desired.dirs.extend(ignore_target_dirs(root, &sources));
     }
-    let total = desired.dirs.len();
     // An incomplete traversal cannot prove that omitted recorded watches are
     // live, so it does not get to consume the overflow repair request.
     let force = take_force_resubscribe(&state.watch_resubscribe, desired.completeness);
     let (added, removed) = registry.sync(&desired.dirs, desired.completeness, force);
+    let total = registry.watched.len();
     if !added.is_empty() || removed > 0 {
         eprintln!(
             "[trace] watcher subscriptions: {total} directories \
@@ -4210,29 +4210,34 @@ fn file_still_has_bytes(
 ) -> std::io::Result<bool> {
     use std::io::Read;
 
-    let mut current = open_within_root(root, path)?;
-    if tgrep_core::builder::file_version(&current.metadata()?) != *expected_version {
-        return Ok(false);
-    }
-    let mut offset = 0;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = current.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        if expected.get(offset..offset + read) != Some(&buffer[..read]) {
+    fn matches(
+        mut file: std::fs::File,
+        expected_version: &tgrep_core::builder::FileVersion,
+        expected: &[u8],
+    ) -> std::io::Result<bool> {
+        if tgrep_core::builder::file_version(&file.metadata()?) != *expected_version {
             return Ok(false);
         }
-        offset += read;
+        let mut offset = 0;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            if expected.get(offset..offset + read) != Some(&buffer[..read]) {
+                return Ok(false);
+            }
+            offset += read;
+        }
+        Ok(offset == expected.len()
+            && tgrep_core::builder::file_version(&file.metadata()?) == *expected_version)
     }
-    if offset != expected.len()
-        || tgrep_core::builder::file_version(&current.metadata()?) != *expected_version
-    {
+
+    if !matches(open_within_root(root, path)?, expected_version, expected)? {
         return Ok(false);
     }
-    let path_current = open_within_root(root, path)?;
-    Ok(tgrep_core::builder::file_version(&path_current.metadata()?) == *expected_version)
+    matches(open_within_root(root, path)?, expected_version, expected)
 }
 
 /// Reads a file's contents, never pulling in more than one byte past the cap.
@@ -5907,6 +5912,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     state.flushing.store(false, Ordering::SeqCst);
     if !state.watch_enabled {
         if !catch_up_unwatched_build(state, root, index_dir) {
+            state.ignore_rules_dirty.store(true, Ordering::SeqCst);
             eprintln!(
                 "[trace] warning: unwatched background-build catch-up was incomplete; \
                  leaving stamps invalid for the scheduled stale check"
@@ -7126,7 +7132,7 @@ mod tests {
     }
 
     #[test]
-    fn content_only_git_index_rewrite_does_not_request_reconciliation() {
+    fn content_only_git_index_rewrite_is_ignored_but_membership_changes_reconcile() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
 
@@ -7158,8 +7164,12 @@ mod tests {
         std::fs::write(root.join("src/new.rs"), "fn newly_tracked() {}\n").unwrap();
         test_git(&root, &["add", "--", "src/new.rs"]);
         assert!(
+            tracked_membership_changed(&state),
+            "conservative polling must notice every tracked-membership change"
+        );
+        assert!(
             !tracked_membership_changed(&state),
-            "tracked membership outside the exemption set must not request a full scan"
+            "an observed membership change must be coalesced"
         );
 
         test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);

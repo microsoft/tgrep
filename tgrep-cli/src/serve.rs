@@ -270,6 +270,7 @@ impl ContentCache {
 struct ServerState {
     index: RwLock<HybridIndex>,
     cache: RwLock<ContentCache>,
+    cache_generation: std::sync::atomic::AtomicU64,
     root: PathBuf,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
@@ -658,6 +659,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
             CACHE_MAX_BYTES,
             CACHE_MAX_ENTRY_BYTES,
         )),
+        cache_generation: std::sync::atomic::AtomicU64::new(0),
         root: root.clone(),
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
@@ -1066,7 +1068,7 @@ fn publish_ignore_matcher(
     newly_watched
 }
 
-fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
+fn handle_connection(stream: TcpStream, state: &Arc<ServerState>) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
@@ -1081,7 +1083,7 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
     Ok(())
 }
 
-fn process_request(request: &str, state: &ServerState) -> String {
+fn process_request(request: &str, state: &Arc<ServerState>) -> String {
     let req: serde_json::Value = match serde_json::from_str(request) {
         Ok(v) => v,
         Err(e) => {
@@ -1481,6 +1483,7 @@ fn handle_search(
             })
             .collect()
     } else {
+        let cache_generation = state.cache_generation.load(Ordering::SeqCst);
         // Phase 1: read-lock to find cache hits (peek avoids write-lock need)
         let mut hit_keys: Vec<String> = Vec::new();
         let mut hits: Vec<(String, Arc<DecodedFile>)> = Vec::with_capacity(candidate_info.len());
@@ -1512,17 +1515,7 @@ fn handle_search(
 
         // Phase 3: single write-lock to promote hits and insert misses
         if !hit_keys.is_empty() || !disk_results.is_empty() {
-            let mut cache = state.cache.write().unwrap();
-            // Promote hit entries so LRU recency stays accurate
-            for key in &hit_keys {
-                cache.touch(key);
-            }
-            // Insert disk results, re-checking for races with other threads
-            for (rel_path, content) in &disk_results {
-                if cache.peek(rel_path).is_none() {
-                    cache.put(rel_path.clone(), Arc::clone(content));
-                }
-            }
+            update_content_cache(state, cache_generation, &hit_keys, &disk_results);
         }
 
         // Combine hits and disk results, preserving candidate order
@@ -1586,6 +1579,43 @@ fn handle_search(
     });
 
     json_rpc_result(id, result)
+}
+
+fn update_content_cache(
+    state: &ServerState,
+    expected_generation: u64,
+    hit_keys: &[String],
+    disk_results: &[(String, Arc<DecodedFile>)],
+) {
+    let mut cache = state.cache.write().unwrap();
+    // Index mutations invalidate cached paths and advance this generation under
+    // the same lock. Earlier disk reads may serve their in-flight query, but
+    // must not repopulate stale bytes for later searches.
+    if state.cache_generation.load(Ordering::SeqCst) != expected_generation {
+        return;
+    }
+    for key in hit_keys {
+        cache.touch(key);
+    }
+    for (rel_path, content) in disk_results {
+        if cache.peek(rel_path).is_none() {
+            cache.put(rel_path.clone(), Arc::clone(content));
+        }
+    }
+}
+
+fn invalidate_cached_paths<'a>(state: &ServerState, paths: impl IntoIterator<Item = &'a str>) {
+    let Ok(mut cache) = state.cache.write() else {
+        return;
+    };
+    let mut invalidated = false;
+    for path in paths {
+        cache.pop(path);
+        invalidated = true;
+    }
+    if invalidated {
+        state.cache_generation.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn search_file_matches(
@@ -1761,37 +1791,91 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
     json_rpc_result(id, result)
 }
 
-fn handle_reload(id: Option<serde_json::Value>, state: &ServerState) -> String {
+fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> String {
     let index_dir = state.index_dir.clone();
+    while state.indexing.load(Ordering::SeqCst) || state.flushing.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let refresh = state.stale_refresh_lock.lock().unwrap();
+    let gate = state.snapshot_gate.write().unwrap();
+    let ignorecase = frozen_tracked_membership(state, &state.root);
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeWalk);
+    let since = SystemTime::now();
 
-    // Rebuild from disk. Uses the options form rather than `build_index` so the
-    // rebuild keeps the ignore semantics the server started with — a reload that
-    // silently changed them would rewrite the index against different rules.
-    if let Err(e) = builder::build_index_with_options(
+    // Rebuild the index and watcher matcher from the same immutable tracked
+    // membership. The snapshot gate keeps watcher/auto-save mutations out until
+    // both are published.
+    let staging_dir = index_dir.join(".reload-build");
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    let outcome = match builder::build_index_with_options_and_ignorecase(
         &state.root,
-        Some(&index_dir),
+        Some(&staging_dir),
         &builder::BuildOptions {
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
             exclude_dirs: state.exclude_dirs.clone(),
+            collect_gitignore_files: !state.no_ignore,
             ..Default::default()
         },
+        ignorecase.clone(),
     ) {
-        return json_rpc_error(id, -32000, &format!("rebuild failed: {e}"));
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return json_rpc_error(id, -32000, &format!("rebuild failed: {e}"));
+        }
+    };
+
+    if !publish_reloaded_index(state, &index_dir, &staging_dir, outcome.num_files) {
+        return json_rpc_error(id, -32000, "rebuild publication failed");
+    }
+    let indexed = outcome.num_files as u64;
+    state.index_total.store(indexed, Ordering::Relaxed);
+    state.index_progress.store(indexed, Ordering::Relaxed);
+    match tgrep_core::meta::read_filestamps(&index_dir) {
+        Ok(stamps) => *state.file_stamps.write().unwrap() = stamps,
+        Err(e) => {
+            eprintln!("[trace] warning: reload could not read file stamps ({e})");
+            state.file_stamps.write().unwrap().clear();
+        }
     }
 
-    // Reopen index
-    match HybridIndex::open(&index_dir, &state.root) {
-        Ok(new_index) => {
-            let mut index = state.index.write().unwrap();
-            *index = new_index;
-            let mut cache = state.cache.write().unwrap();
-            cache.clear();
-            json_rpc_result(id, serde_json::json!({"status": "reloaded"}))
-        }
-        Err(e) => json_rpc_error(id, -32000, &format!("reopen failed: {e}")),
+    let newly_watched = if state.no_ignore {
+        Vec::new()
+    } else {
+        publish_ignore_matcher(
+            state,
+            &state.root,
+            ignore_sources_of(
+                &state.root,
+                &outcome.gitignore_files,
+                &outcome.ignore_files,
+                state.no_require_git,
+            ),
+            || {
+                tgrep_core::walker::build_gitignore_matcher_from_files_with_ignorecase(
+                    &state.root,
+                    &outcome.gitignore_files,
+                    &outcome.ignore_files,
+                    state.no_require_git,
+                    ignorecase,
+                )
+            },
+        )
+    };
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::AfterMatcherPublish);
+    let membership_changed = tracked_membership_changed(state);
+    drop(gate);
+    drop(refresh);
+
+    if state.watch_enabled {
+        spawn_recovery_scan(state, &state.root, newly_watched, since);
     }
+    schedule_tracked_membership_correction(state, &state.root, membership_changed);
+    json_rpc_result(id, serde_json::json!({"status": "reloaded"}))
 }
 
 fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) -> bool {
@@ -1903,7 +1987,8 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
             loop {
                 if last_tracked_index_poll.elapsed() >= TRACKED_INDEX_POLL {
                     last_tracked_index_poll = Instant::now();
-                    if tracked_membership_changed(&worker_state) {
+                    let changed = poll_tracked_membership_changed(&worker_state);
+                    if changed {
                         eprintln!(
                             "[trace] Git tracked paths changed; reconciling tracked-file exemptions"
                         );
@@ -1989,6 +2074,34 @@ fn tracked_membership_changed(state: &ServerState) -> bool {
     );
     *observed = current;
     changed
+}
+
+fn poll_tracked_membership_changed(state: &ServerState) -> bool {
+    // A reconcile holds the write side across snapshot, walk and publication.
+    // Waiting here prevents a poll from committing transient A→B→A membership.
+    let _gate = state.snapshot_gate.read().unwrap();
+    tracked_membership_changed(state)
+}
+
+fn frozen_tracked_membership(
+    state: &ServerState,
+    root: &Path,
+) -> Option<Arc<tgrep_core::gitignore::CaseInsensitiveIgnore>> {
+    (!state.no_ignore)
+        .then(|| {
+            tgrep_core::gitignore::CaseInsensitiveIgnore::frozen_snapshot(root, true, true, true)
+        })
+        .flatten()
+        .map(Arc::new)
+}
+
+fn schedule_tracked_membership_correction(state: &Arc<ServerState>, root: &Path, changed: bool) {
+    if !changed {
+        return;
+    }
+    eprintln!("[trace] Git tracked paths changed during reconciliation; scheduling a retry");
+    state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+    schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
 }
 
 #[cfg(test)]
@@ -3028,9 +3141,7 @@ fn sweep_removed_files(
         }
         state.index.write().unwrap().live.delete_file(rel);
         state.file_stamps.write().unwrap().remove(rel);
-        if let Ok(mut cache) = state.cache.write() {
-            cache.pop(rel);
-        }
+        invalidate_cached_paths(state, std::iter::once(rel.as_str()));
         dropped += 1;
     }
     if dropped > 0 {
@@ -3615,9 +3726,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             // is processed atomically with respect to flush/auto-save.
             state.index.write().unwrap().live.delete_file(&rel_path);
             state.file_stamps.write().unwrap().remove(&rel_path);
-            if let Ok(mut cache) = state.cache.write() {
-                cache.pop(&rel_path);
-            }
+            invalidate_cached_paths(state, std::iter::once(rel_path.as_str()));
             continue;
         }
 
@@ -3719,9 +3828,7 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
     }
     eprintln!("[trace] reindex: dropped {rel_path} ({reason})");
     state.index.write().unwrap().live.delete_file(rel_path);
-    if let Ok(mut cache) = state.cache.write() {
-        cache.pop(rel_path);
-    }
+    invalidate_cached_paths(state, std::iter::once(rel_path));
 }
 
 /// What an event's stat result says about the path it named.
@@ -4163,9 +4270,7 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
         .write()
         .unwrap()
         .insert(rel_path.to_string(), current);
-    if let Ok(mut cache) = state.cache.write() {
-        cache.pop(rel_path);
-    }
+    invalidate_cached_paths(state, std::iter::once(rel_path));
 }
 
 /// Whether a scheduled reconcile should run now.
@@ -4732,10 +4837,7 @@ fn background_refresh_stale(
     // One immutable tracked-file exemption is shared by the walk and the
     // matcher it publishes. Git-index rewrites cannot change ignore decisions
     // halfway through this pass.
-    let ignorecase = (!state.no_ignore)
-        .then(|| tgrep_core::gitignore::CaseInsensitiveIgnore::new(root, true, true, true))
-        .flatten()
-        .map(Arc::new);
+    let ignorecase = frozen_tracked_membership(state, root);
     #[cfg(test)]
     run_stale_refresh_hook(state, StaleRefreshPhase::BeforeWalk);
 
@@ -4771,13 +4873,7 @@ fn background_refresh_stale(
     let membership_changed = tracked_membership_changed(state);
     drop(gate);
     drop(refresh);
-    if membership_changed {
-        eprintln!(
-            "[trace] Git tracked paths changed during stale reconciliation; scheduling a retry"
-        );
-        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
-        schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
-    }
+    schedule_tracked_membership_correction(state, root, membership_changed);
     ok
 }
 
@@ -4943,11 +5039,14 @@ fn refresh_stale_locked(
         return false;
     }
 
-    if let Ok(mut cache) = state.cache.write() {
-        for path in changed.iter().chain(added.iter()).chain(deleted.iter()) {
-            cache.pop(path);
-        }
-    }
+    invalidate_cached_paths(
+        state,
+        changed
+            .iter()
+            .chain(added.iter())
+            .chain(deleted.iter())
+            .map(String::as_str),
+    );
     true
 }
 
@@ -4963,8 +5062,11 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
     }
     match HybridIndex::open(index_dir, root) {
         Ok(empty) => {
-            *state.index.write().unwrap() = empty;
-            state.cache.write().unwrap().clear();
+            let mut index = state.index.write().unwrap();
+            let mut cache = state.cache.write().unwrap();
+            *index = empty;
+            cache.clear();
+            state.cache_generation.fetch_add(1, Ordering::SeqCst);
         }
         Err(e) => eprintln!("[trace] warning: could not reopen an empty index ({e})"),
     }
@@ -4991,10 +5093,7 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
 /// caller to fall back.
 fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
     let start = Instant::now();
-    let ignorecase = (!state.no_ignore)
-        .then(|| tgrep_core::gitignore::CaseInsensitiveIgnore::new(root, true, true, true))
-        .flatten()
-        .map(Arc::new);
+    let ignorecase = frozen_tracked_membership(state, root);
     // Anchors the recovery window at the start of the build's traversal, which
     // is the point from which writes could be missed: nothing under `root` is
     // subscribed yet, and the walk below has not reached most of it. Taking it
@@ -5056,8 +5155,13 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         }
     };
     let indexed = opened.num_files() as u64;
-    *state.index.write().unwrap() = opened;
-    state.cache.write().unwrap().clear();
+    {
+        let mut index = state.index.write().unwrap();
+        let mut cache = state.cache.write().unwrap();
+        *index = opened;
+        cache.clear();
+        state.cache_generation.fetch_add(1, Ordering::SeqCst);
+    }
     state.index_total.store(indexed, Ordering::Relaxed);
     state.index_progress.store(indexed, Ordering::Relaxed);
 
@@ -5128,9 +5232,8 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
 
     state.indexing.store(false, Ordering::SeqCst);
     drop(gate);
-    if tracked_membership_changed(state) {
-        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
-    }
+    let membership_changed = tracked_membership_changed(state);
+    schedule_tracked_membership_correction(state, root, membership_changed);
 
     let elapsed = start.elapsed().as_secs_f64();
     drop(sampler);
@@ -5191,10 +5294,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     // Phase 1: Walk file paths (no content reads)
     let t_walk = Instant::now();
-    let ignorecase = (!state.no_ignore)
-        .then(|| tgrep_core::gitignore::CaseInsensitiveIgnore::new(root, true, true, true))
-        .flatten()
-        .map(Arc::new);
+    let ignorecase = frozen_tracked_membership(state, root);
     // The recovery window opens with this traversal, not with the subscriptions
     // it later feeds: a nested `.ignore` written after the walk read its parent
     // directory but before the matcher is published is invisible to both, and a
@@ -5494,9 +5594,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         index.live.shrink_to_fit();
     }
 
-    if tracked_membership_changed(state) {
-        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
-    }
+    let membership_changed = tracked_membership_changed(state);
+    schedule_tracked_membership_correction(state, root, membership_changed);
     if state.ignore_rules_dirty.load(Ordering::SeqCst) {
         schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
     }
@@ -5617,124 +5716,217 @@ fn publish_staged_index(
     // background-build / watcher reindex flush) cannot interleave renames
     // or swap readers out of order. Searches do not take this lock.
     let _publish = state.publish_lock.lock().unwrap();
-    if let Err(e) = move_staged_files(staging_dir, index_dir) {
-        eprintln!("[trace] warning: flush move failed: {e}");
-        let _ = std::fs::remove_dir_all(staging_dir);
-        return false;
-    }
-
-    // Open the new reader. The publish mutex is intentionally still held
-    // here so that move + open + swap form an atomic publish unit (no other
-    // publisher can interleave a rename or swap a competing reader between
-    // these steps). The server-wide `state.index` RwLock is NOT taken, so
-    // search queries continue to be served by the previous reader (whose
-    // `Arc<IndexReader>` they hold) throughout this call.
-    //
-    // On Windows, NTFS metadata for a recently-renamed file can transiently
-    // appear stale (zero-length), causing IndexReader::open to create a
-    // degenerate reader with files but no trigrams. We retry a few times
-    // with a short backoff to ride out the transient.
-    let pruned = 'open: {
-        const READER_OPEN_RETRIES: u32 = 5;
-        const READER_OPEN_BACKOFF: Duration = Duration::from_millis(200);
-
-        for attempt in 0..READER_OPEN_RETRIES {
-            match tgrep_core::reader::IndexReader::open(index_dir) {
-                Ok(new_reader) => {
-                    let reader_files = new_reader.num_files();
-                    let reader_trigrams = new_reader.num_trigrams();
-
-                    if new_reader.is_degenerate() {
-                        eprintln!(
-                            "[trace] warning: reader has {reader_files} files but 0 trigrams \
-                             (attempt {}/{READER_OPEN_RETRIES}, likely stale NTFS metadata)",
-                            attempt + 1
-                        );
-                        if attempt + 1 < READER_OPEN_RETRIES {
-                            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
-                            continue;
-                        }
-                        eprintln!(
-                            "[trace] warning: degenerate reader persists after \
-                             {READER_OPEN_RETRIES} attempts, keeping live overlay as fallback"
-                        );
-                        break 'open false;
-                    }
-
-                    // Validate + warm the lookup mmap before swapping the
-                    // reader in. This catches corruption (unsorted lookup
-                    // table, out-of-bounds posting offsets) and, as a
-                    // side-effect, pages in every byte of lookup.bin so that
-                    // subsequent binary searches never hit cold mmap pages
-                    // — preventing the zero-candidate failure observed on
-                    // Windows after flush.
-                    if let Err(msg) = new_reader.validate_lookup() {
-                        eprintln!(
-                            "[trace] warning: reader validation failed \
-                             (attempt {}/{READER_OPEN_RETRIES}): {msg}",
-                            attempt + 1
-                        );
-                        if attempt + 1 < READER_OPEN_RETRIES {
-                            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
-                            continue;
-                        }
-                        eprintln!(
-                            "[trace] warning: reader validation failed after \
-                             {READER_OPEN_RETRIES} attempts, keeping live overlay"
-                        );
-                        break 'open false;
-                    }
-
-                    if reader_files >= num_files {
-                        // Atomic swap — no outer write lock required.
-                        state.index.read().unwrap().swap_reader(new_reader);
-                        // Brief write lock for in-memory overlay maintenance only.
-                        {
-                            let mut index = state.index.write().unwrap();
-                            index.prune_persisted_entries();
-                            index.live.reset_dirty_count();
-                        }
-                        eprintln!(
-                            "[trace] flush: reader reopened ({reader_files} files, \
-                             {reader_trigrams} trigrams), overlay pruned"
-                        );
-                        break 'open true;
-                    } else {
-                        eprintln!(
-                            "[trace] warning: reader has {reader_files} files \
-                             (expected {num_files}), keeping live overlay as fallback"
-                        );
-                        break 'open false;
-                    }
-                }
-                Err(e) => {
-                    if attempt + 1 < READER_OPEN_RETRIES {
-                        eprintln!(
-                            "[trace] warning: reader open failed (attempt {}/{READER_OPEN_RETRIES}): {e}",
-                            attempt + 1
-                        );
-                        thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
-                        continue;
-                    }
-                    eprintln!(
-                        "[trace] warning: failed to reopen reader after flush: {e}, \
-                         live overlay retained"
-                    );
-                    break 'open false;
-                }
+    let mut moved = match move_staged_files(staging_dir, index_dir) {
+        Ok(moved) => moved,
+        Err(e) => {
+            eprintln!("[trace] warning: flush move failed: {e}");
+            return false;
+        }
+    };
+    let Some((new_reader, reader_files, reader_trigrams)) =
+        open_published_reader(index_dir, num_files)
+    else {
+        match moved.rollback() {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(staging_dir);
+            }
+            Err(e) => {
+                eprintln!("[trace] warning: failed to roll back index publication: {e}");
             }
         }
-        false
+        return false;
     };
+
+    // Atomic swap — no outer write lock required.
+    state.index.read().unwrap().swap_reader(new_reader);
+    // Brief write lock for in-memory overlay maintenance only.
+    {
+        let mut index = state.index.write().unwrap();
+        index.prune_persisted_entries();
+        index.live.reset_dirty_count();
+    }
+    moved.commit();
+    eprintln!(
+        "[trace] flush: reader reopened ({reader_files} files, \
+         {reader_trigrams} trigrams), overlay pruned"
+    );
     let _ = std::fs::remove_dir_all(staging_dir);
-    pruned
+    true
 }
 
-/// Move index files from staging to the target directory.
+fn publish_reloaded_index(
+    state: &ServerState,
+    index_dir: &Path,
+    staging_dir: &Path,
+    num_files: usize,
+) -> bool {
+    let _publish = state.publish_lock.lock().unwrap();
+    let mut moved = match move_staged_files(staging_dir, index_dir) {
+        Ok(moved) => moved,
+        Err(e) => {
+            eprintln!("[trace] warning: reload move failed: {e}");
+            return false;
+        }
+    };
+    let Some((new_reader, reader_files, reader_trigrams)) =
+        open_published_reader(index_dir, num_files)
+    else {
+        match moved.rollback() {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(staging_dir);
+            }
+            Err(e) => {
+                eprintln!("[trace] warning: failed to roll back reload publication: {e}");
+            }
+        }
+        return false;
+    };
+
+    // Searches take the outer index lock before consulting the cache. Holding
+    // both in that order makes the complete reload visible as one generation.
+    {
+        let mut index = state.index.write().unwrap();
+        let mut cache = state.cache.write().unwrap();
+        index.swap_reader(new_reader);
+        let mut reconciled = index.live.overlay_paths();
+        reconciled.extend(index.live.tombstone_paths());
+        index.live.clear_reconciled_paths(&reconciled);
+        index.live.reset_dirty_count();
+        cache.clear();
+        state.cache_generation.fetch_add(1, Ordering::SeqCst);
+    }
+    moved.commit();
+    eprintln!(
+        "[trace] reload: reader reopened ({reader_files} files, \
+         {reader_trigrams} trigrams), overlay and cache cleared"
+    );
+    let _ = std::fs::remove_dir_all(staging_dir);
+    true
+}
+
+fn open_published_reader(
+    index_dir: &Path,
+    num_files: usize,
+) -> Option<(tgrep_core::reader::IndexReader, usize, usize)> {
+    const READER_OPEN_RETRIES: u32 = 5;
+    const READER_OPEN_BACKOFF: Duration = Duration::from_millis(200);
+
+    for attempt in 0..READER_OPEN_RETRIES {
+        match tgrep_core::reader::IndexReader::open(index_dir) {
+            Ok(new_reader) => {
+                let reader_files = new_reader.num_files();
+                let reader_trigrams = new_reader.num_trigrams();
+                if new_reader.is_degenerate() {
+                    eprintln!(
+                        "[trace] warning: reader has {reader_files} files but 0 trigrams \
+                         (attempt {}/{READER_OPEN_RETRIES}, likely stale NTFS metadata)",
+                        attempt + 1
+                    );
+                } else if let Err(msg) = new_reader.validate_lookup() {
+                    eprintln!(
+                        "[trace] warning: reader validation failed \
+                         (attempt {}/{READER_OPEN_RETRIES}): {msg}",
+                        attempt + 1
+                    );
+                } else if reader_files >= num_files {
+                    return Some((new_reader, reader_files, reader_trigrams));
+                } else {
+                    eprintln!(
+                        "[trace] warning: reader has {reader_files} files \
+                         (expected {num_files}), keeping live overlay as fallback"
+                    );
+                    return None;
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[trace] warning: reader open failed (attempt {}/{READER_OPEN_RETRIES}): {e}",
+                    attempt + 1
+                );
+            }
+        }
+        if attempt + 1 < READER_OPEN_RETRIES {
+            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
+        }
+    }
+    eprintln!(
+        "[trace] warning: failed to validate reader after \
+         {READER_OPEN_RETRIES} attempts, keeping the previous reader"
+    );
+    None
+}
+
+const INDEX_FILE_NAMES: &[&str] = &[
+    "index.bin",
+    "lookup.bin",
+    "files.bin",
+    "filestamps.json",
+    "meta.json",
+];
+
+struct StagedFileMove {
+    staging: PathBuf,
+    target: PathBuf,
+    backed_up: Vec<&'static str>,
+    published: Vec<&'static str>,
+    finished: bool,
+}
+
+impl StagedFileMove {
+    fn backup_path(&self, name: &str) -> PathBuf {
+        self.staging.join(format!(".previous-{name}"))
+    }
+
+    fn rollback(&mut self) -> std::io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        let mut first_error = None;
+        for name in self.backed_up.iter().rev() {
+            if let Err(e) = publish_file(&self.backup_path(name), &self.target.join(name))
+                && first_error.is_none()
+            {
+                first_error = Some(e);
+            }
+        }
+        for name in self.published.iter().rev() {
+            if self.backed_up.contains(name) {
+                continue;
+            }
+            let published = self.target.join(name);
+            if published.exists()
+                && let Err(e) = std::fs::remove_file(published)
+                && first_error.is_none()
+            {
+                first_error = Some(e);
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    fn commit(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for StagedFileMove {
+    fn drop(&mut self) {
+        if let Err(e) = self.rollback() {
+            eprintln!("[trace] warning: failed to roll back staged index files: {e}");
+        }
+    }
+}
+
+/// Move index files from staging to the target directory, retaining backups
+/// until the caller validates and commits the new reader.
 ///
-/// Files are published in a fixed order, with `meta.json` last. This is only a
-/// convention for publication layout; it does not provide atomic publish
-/// semantics or reader-side validation by itself.
+/// Files are published in a fixed order, with `meta.json` last. Existing files
+/// are retained in staging until reader validation succeeds, so dropping the
+/// returned transaction rolls back a partial or rejected publication.
 ///
 /// Performance note: this function runs under the server's `publish_lock`
 /// (which serializes concurrent publishers) but does NOT take the
@@ -5746,24 +5938,29 @@ fn publish_staged_index(
 /// created next to the target (same parent) so cross-volume cases should
 /// not arise; if rename truly fails, the error is surfaced rather than
 /// silently falling back to a slow copy (see `publish_file`).
-fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
+fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<StagedFileMove> {
     std::fs::create_dir_all(target)?;
-    // Data files first, meta last.
-    for name in &[
-        "index.bin",
-        "lookup.bin",
-        "files.bin",
-        "filestamps.json",
-        "meta.json",
-    ] {
+    let mut moved = StagedFileMove {
+        staging: staging.to_path_buf(),
+        target: target.to_path_buf(),
+        backed_up: Vec::new(),
+        published: Vec::new(),
+        finished: false,
+    };
+    for &name in INDEX_FILE_NAMES {
         let src = staging.join(name);
         let dst = target.join(name);
         if !src.exists() {
             continue;
         }
+        if dst.exists() {
+            publish_file(&dst, &moved.backup_path(name))?;
+            moved.backed_up.push(name);
+        }
         publish_file(&src, &dst)?;
+        moved.published.push(name);
     }
-    Ok(())
+    Ok(moved)
 }
 
 /// Publish a single staged file at `src` to `dst`.
@@ -6003,6 +6200,7 @@ mod tests {
                 CACHE_MAX_BYTES,
                 CACHE_MAX_ENTRY_BYTES,
             )),
+            cache_generation: std::sync::atomic::AtomicU64::new(0),
             root: root.to_path_buf(),
             watcher_active: std::sync::atomic::AtomicBool::new(false),
             indexing: std::sync::atomic::AtomicBool::new(false),
@@ -6963,6 +7161,307 @@ mod tests {
                 "the corrective pass must subscribe the newly exempt directory"
             );
         }
+    }
+
+    #[test]
+    fn rpc_reload_uses_one_snapshot_across_git_index_aba() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        let ignored = root.join("ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(ignored.join("forced.rs"), "fn reload_aba() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore"]);
+
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let before_walk_entered = Arc::new(Barrier::new(2));
+        let before_walk_release = Arc::new(Barrier::new(2));
+        let after_publish_entered = Arc::new(Barrier::new(2));
+        let after_publish_release = Arc::new(Barrier::new(2));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let before_walk_entered = Arc::clone(&before_walk_entered);
+            let before_walk_release = Arc::clone(&before_walk_release);
+            let after_publish_entered = Arc::clone(&after_publish_entered);
+            let after_publish_release = Arc::clone(&after_publish_release);
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| match phase {
+                StaleRefreshPhase::BeforeWalk => {
+                    if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        before_walk_entered.wait();
+                        before_walk_release.wait();
+                    }
+                }
+                StaleRefreshPhase::AfterMatcherPublish => {
+                    if passes.load(Ordering::SeqCst) == 1 {
+                        after_publish_entered.wait();
+                        after_publish_release.wait();
+                    }
+                }
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        let reload_state = Arc::clone(&state);
+        let reload = thread::spawn(move || handle_reload(None, &reload_state));
+        before_walk_entered.wait();
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        before_walk_release.wait();
+        after_publish_entered.wait();
+        test_git(
+            &root,
+            &[
+                "rm",
+                "--cached",
+                "--quiet",
+                "--force",
+                "--",
+                "ignored/forced.rs",
+            ],
+        );
+        after_publish_release.wait();
+
+        let response = reload.join().unwrap();
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "A→B→A must not need a correction when reload used A throughout"
+        );
+        assert!(
+            state
+                .gitignore
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true)
+        );
+        let index = state.index.read().unwrap();
+        assert!(
+            !index.reader_has_path("ignored/forced.rs")
+                && !index.live.has_path("ignored/forced.rs"),
+            "reload index and matcher must both represent final A"
+        );
+        assert!(
+            !state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+                && !state.ignore_rules_dirty.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn rpc_reload_membership_change_schedules_one_corrective_pass() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(
+            root.join("ignored/forced.rs"),
+            "fn reload_membership_change() {}\n",
+        )
+        .unwrap();
+        test_git(&root, &["add", "--", ".gitignore"]);
+
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        let before_walk_entered = Arc::new(Barrier::new(2));
+        let before_walk_release = Arc::new(Barrier::new(2));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let before_walk_entered = Arc::clone(&before_walk_entered);
+            let before_walk_release = Arc::clone(&before_walk_release);
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| {
+                if matches!(phase, StaleRefreshPhase::BeforeWalk)
+                    && passes.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    before_walk_entered.wait();
+                    before_walk_release.wait();
+                }
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        let reload_state = Arc::clone(&state);
+        let reload = thread::spawn(move || handle_reload(None, &reload_state));
+        before_walk_entered.wait();
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        before_walk_release.wait();
+        let response = reload.join().unwrap();
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (passes.load(Ordering::SeqCst) < 2
+            || state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+            || state.ignore_rules_dirty.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            2,
+            "A→B during reload must schedule exactly one corrective pass"
+        );
+        assert!(
+            !state
+                .gitignore
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true)
+        );
+        let index = state.index.read().unwrap();
+        assert!(
+            index.reader_has_path("ignored/forced.rs") || index.live.has_path("ignored/forced.rs"),
+            "the correction must make reload's index agree with final B"
+        );
+    }
+
+    #[test]
+    fn rpc_reload_build_failure_preserves_active_index() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state
+            .index
+            .write()
+            .unwrap()
+            .live
+            .upsert_file("active.rs", b"fn active_before_reload() {}\n");
+
+        std::fs::write(index_dir.join(".reload-build"), b"blocks staging directory").unwrap();
+        let response = handle_reload(None, &state);
+
+        assert!(response.contains("rebuild failed"), "{response}");
+        assert!(
+            state.index.read().unwrap().live.has_path("active.rs"),
+            "a failed staged build must not disturb the active index"
+        );
+    }
+
+    #[test]
+    fn rpc_reload_waits_for_initial_build() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.indexing.store(true, Ordering::SeqCst);
+        let (entered_tx, entered_rx) = channel();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::BeforeWalk) {
+                entered_tx.send(()).unwrap();
+            }
+        }));
+
+        let reload_state = Arc::clone(&state);
+        let reload = thread::spawn(move || handle_reload(None, &reload_state));
+        assert!(matches!(
+            entered_rx.recv_timeout(Duration::from_millis(150)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        state.indexing.store(false, Ordering::SeqCst);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let response = reload.join().unwrap();
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+    }
+
+    #[test]
+    fn pre_reload_disk_read_cannot_repopulate_content_cache() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        let before_reload = state.cache_generation.load(Ordering::SeqCst);
+        let stale = vec![(
+            "stale.rs".to_string(),
+            Arc::new(DecodedFile::new(
+                b"old content".to_vec(),
+                tgrep_core::encoding::EncodingMode::Auto,
+            )),
+        )];
+
+        invalidate_cached_paths(&state, std::iter::once("stale.rs"));
+        update_content_cache(&state, before_reload, &[], &stale);
+        assert!(
+            state.cache.read().unwrap().peek("stale.rs").is_none(),
+            "a disk read from the previous index generation must not refill the cache"
+        );
+
+        let current = state.cache_generation.load(Ordering::SeqCst);
+        update_content_cache(&state, current, &[], &stale);
+        assert!(state.cache.read().unwrap().peek("stale.rs").is_some());
+    }
+
+    #[test]
+    fn tracked_membership_poll_waits_for_reconcile_publication() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join("ignored/forced.rs"), "fn transient() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore"]);
+
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        assert!(background_refresh_stale(
+            &state,
+            &root,
+            &state.index_dir,
+            true
+        ));
+
+        let gate = state.snapshot_gate.write().unwrap();
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        let (result_tx, result_rx) = channel();
+        let poll_state = Arc::clone(&state);
+        let poll = thread::spawn(move || {
+            result_tx
+                .send(poll_tracked_membership_changed(&poll_state))
+                .unwrap();
+        });
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(150)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        test_git(
+            &root,
+            &[
+                "rm",
+                "--cached",
+                "--quiet",
+                "--force",
+                "--",
+                "ignored/forced.rs",
+            ],
+        );
+        drop(gate);
+        assert!(!result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        poll.join().unwrap();
     }
 
     /// A transient stat failure is not a deletion. `Path::exists` said it was,
@@ -8915,7 +9414,8 @@ mod tests {
             write_file(&staging.join(name), name.as_bytes());
         }
         write_file(&staging.join("ignored.txt"), b"nope");
-        move_staged_files(&staging, &target).unwrap();
+        let mut moved = move_staged_files(&staging, &target).unwrap();
+        moved.commit();
         for name in ["index.bin", "lookup.bin", "files.bin", "meta.json"] {
             assert_eq!(std::fs::read(target.join(name)).unwrap(), name.as_bytes());
             assert!(
@@ -8927,5 +9427,22 @@ mod tests {
             staging.join("ignored.txt").exists(),
             "unknown files should be left alone"
         );
+    }
+
+    #[test]
+    fn staged_file_move_rolls_back_replaced_files() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join("index.bin"), b"new");
+        write_file(&target.join("index.bin"), b"old");
+
+        let mut moved = move_staged_files(&staging, &target).unwrap();
+        assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"new");
+        moved.rollback().unwrap();
+
+        assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"old");
     }
 }

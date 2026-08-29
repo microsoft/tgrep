@@ -1508,11 +1508,8 @@ mod tests {
         assert!(!matcher.is_ignored(Path::new("src/Gone.TXT"), false));
     }
 
-    /// A published matcher keeps an immutable tracked-file snapshot. Polling
-    /// detects semantic changes separately so event filtering cannot change
-    /// halfway through a reconciliation pass.
     #[test]
-    fn the_tracked_exemption_snapshot_is_immutable_and_detects_changes() {
+    fn public_matcher_reloads_tracked_exemptions_after_index_changes() {
         let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
         let root = dir.path();
         let matcher = crate::gitignore::matcher_from_ignore_paths(
@@ -1527,17 +1524,48 @@ mod tests {
 
         fake_git_repo(root, true, &["src/main.rs", "src/Kept.TXT", "src/Gone.TXT"]);
 
+        assert!(
+            !matcher.is_ignored(Path::new("src/Gone.TXT"), false),
+            "the legacy public matcher must observe a newly tracked exemption"
+        );
+
+        fake_git_repo(root, true, &["src/main.rs"]);
+        assert!(
+            matcher.is_ignored(Path::new("src/Kept.TXT"), false),
+            "the legacy public matcher must observe a removed exemption"
+        );
+    }
+
+    /// Reconciliation deliberately opts into the opposite behavior: the walk
+    /// and matcher publication must not change answers halfway through a pass.
+    #[test]
+    fn frozen_tracked_exemption_is_immutable_and_detects_changes() {
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let root = dir.path();
+        let ignorecase =
+            crate::gitignore::CaseInsensitiveIgnore::frozen_snapshot(root, true, true, true)
+                .map(std::sync::Arc::new);
+        let matcher = crate::gitignore::matcher_from_ignore_paths_with_options_and_ignorecase(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+            false,
+            ignorecase,
+        )
+        .expect("the fixture has rules");
+
         assert!(matcher.is_ignored(Path::new("src/Gone.TXT"), false));
+        fake_git_repo(root, true, &["src/main.rs", "src/Kept.TXT", "src/Gone.TXT"]);
+
+        assert!(
+            matcher.is_ignored(Path::new("src/Gone.TXT"), false),
+            "a frozen matcher must preserve the pass snapshot"
+        );
         assert_ne!(
             matcher.tracked_membership_fingerprint(),
             matcher.current_tracked_membership_fingerprint(),
-            "polling must detect a tracked exemption without mutating decisions"
+            "semantic polling must detect changes without mutating decisions"
         );
-
-        // And back: `git rm --cached` is the same problem in reverse, where a
-        // stale cache keeps indexing a file the walk has started hiding.
-        fake_git_repo(root, true, &["src/main.rs"]);
-        assert!(!matcher.is_ignored(Path::new("src/Kept.TXT"), false));
     }
 
     #[test]

@@ -466,22 +466,30 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
 pub struct CaseInsensitiveIgnore {
     matcher: Gitignore,
     repo_root: std::path::PathBuf,
-    /// Immutable for the lifetime of this matcher. A stale reconciliation
-    /// shares one matcher between its walk and watcher publication, so every
-    /// decision in the pass uses the same tracked-file membership.
-    tracked: Option<crate::git_index::TrackedFiles>,
-    fingerprint: TrackedMembershipFingerprint,
+    tracked: TrackedMembership,
     /// Separate metadata-keyed cache for polling the current semantic
-    /// membership. It never participates in ignore decisions.
+    /// membership of a frozen matcher. It never participates in decisions.
     current: std::sync::RwLock<TrackedCache>,
 }
 
-/// A metadata-keyed semantic fingerprint used only for change polling.
+enum TrackedMembership {
+    /// Existing public behavior: reload after Git index identity changes.
+    Live(std::sync::RwLock<TrackedCache>),
+    /// Reconciliation behavior: one immutable set shared by a walk and the
+    /// point-query matcher published from that walk.
+    Frozen {
+        tracked: Option<crate::git_index::TrackedFiles>,
+        fingerprint: TrackedMembershipFingerprint,
+    },
+}
+
+/// A metadata-keyed tracked set and semantic fingerprint.
 #[derive(Default)]
 struct TrackedCache {
     /// `None` until something is loaded; `Some` even when the probe failed, so
     /// an unreadable index is not retried on every poll.
     loaded_from: Option<Option<IndexIdentity>>,
+    tracked: Option<crate::git_index::TrackedFiles>,
     fingerprint: TrackedMembershipFingerprint,
 }
 
@@ -532,11 +540,39 @@ impl CaseInsensitiveIgnore {
     /// `--no-ignore-vcs` the case-sensitive pass lets everything through, which
     /// would leave this the only thing excluding — the exact opposite of what
     /// the flag asks for.
+    ///
+    /// The tracked-file exemption remains live: a long-lived matcher reloads it
+    /// after the Git index changes.
     pub fn new(
         root: &Path,
         use_gitignore: bool,
         use_exclude: bool,
         use_parents: bool,
+    ) -> Option<Self> {
+        Self::build(root, use_gitignore, use_exclude, use_parents, false)
+    }
+
+    /// Build an immutable tracked-membership snapshot for a coordinated walk
+    /// and matcher publication.
+    ///
+    /// Ordinary point-query callers should use [`Self::new`], which preserves
+    /// live Git-index reload behavior. Server reconciliation shares this value
+    /// through an `Arc` so one pass cannot mix different tracked sets.
+    pub fn frozen_snapshot(
+        root: &Path,
+        use_gitignore: bool,
+        use_exclude: bool,
+        use_parents: bool,
+    ) -> Option<Self> {
+        Self::build(root, use_gitignore, use_exclude, use_parents, true)
+    }
+
+    fn build(
+        root: &Path,
+        use_gitignore: bool,
+        use_exclude: bool,
+        use_parents: bool,
+        frozen: bool,
     ) -> Option<Self> {
         use ignore::gitignore::GitignoreBuilder;
 
@@ -569,18 +605,21 @@ impl CaseInsensitiveIgnore {
         if matcher.is_empty() {
             return None;
         }
-        let identity = index_identity(&repo_root);
-        let tracked = crate::git_index::load_tracked(&repo_root);
-        let fingerprint = Self::fingerprint(&matcher, tracked.as_ref());
+        let tracked = if frozen {
+            let tracked = crate::git_index::load_tracked(&repo_root);
+            let fingerprint = Self::fingerprint(&matcher, tracked.as_ref());
+            TrackedMembership::Frozen {
+                tracked,
+                fingerprint,
+            }
+        } else {
+            TrackedMembership::Live(std::sync::RwLock::new(TrackedCache::default()))
+        };
         Some(Self {
             matcher,
             repo_root,
             tracked,
-            fingerprint: fingerprint.clone(),
-            current: std::sync::RwLock::new(TrackedCache {
-                loaded_from: Some(identity),
-                fingerprint,
-            }),
+            current: std::sync::RwLock::new(TrackedCache::default()),
         })
     }
 
@@ -597,14 +636,35 @@ impl CaseInsensitiveIgnore {
             return false;
         }
         let relative = relative.to_string_lossy();
-        Self::hides(self.tracked.as_ref(), &relative, is_dir)
+        match &self.tracked {
+            TrackedMembership::Live(cache) => {
+                let identity = index_identity(&self.repo_root);
+                let mut cache = cache.write().unwrap();
+                self.reload_tracked_if_needed(&mut cache, identity);
+                Self::hides(cache.tracked.as_ref(), &relative, is_dir)
+            }
+            TrackedMembership::Frozen { tracked, .. } => {
+                Self::hides(tracked.as_ref(), &relative, is_dir)
+            }
+        }
     }
 
     fn tracked_membership_fingerprint(&self) -> TrackedMembershipFingerprint {
-        self.fingerprint.clone()
+        match &self.tracked {
+            TrackedMembership::Live(cache) => {
+                let identity = index_identity(&self.repo_root);
+                let mut cache = cache.write().unwrap();
+                self.reload_tracked_if_needed(&mut cache, identity);
+                cache.fingerprint.clone()
+            }
+            TrackedMembership::Frozen { fingerprint, .. } => fingerprint.clone(),
+        }
     }
 
     fn current_tracked_membership_fingerprint(&self) -> TrackedMembershipFingerprint {
+        if matches!(&self.tracked, TrackedMembership::Live(_)) {
+            return self.tracked_membership_fingerprint();
+        }
         let identity = index_identity(&self.repo_root);
         {
             let cache = self.current.read().unwrap();
@@ -618,8 +678,18 @@ impl CaseInsensitiveIgnore {
         }
         let tracked = crate::git_index::load_tracked(&self.repo_root);
         cache.fingerprint = Self::fingerprint(&self.matcher, tracked.as_ref());
+        cache.tracked = tracked;
         cache.loaded_from = Some(identity);
         cache.fingerprint.clone()
+    }
+
+    fn reload_tracked_if_needed(&self, cache: &mut TrackedCache, identity: Option<IndexIdentity>) {
+        if cache.loaded_from.as_ref() == Some(&identity) {
+            return;
+        }
+        cache.tracked = crate::git_index::load_tracked(&self.repo_root);
+        cache.fingerprint = Self::fingerprint(&self.matcher, cache.tracked.as_ref());
+        cache.loaded_from = Some(identity);
     }
 
     fn fingerprint(

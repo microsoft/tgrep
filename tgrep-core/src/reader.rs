@@ -193,6 +193,31 @@ impl IndexReader {
             .is_ok()
     }
 
+    /// Whether the reader contains a path strictly below `directory`.
+    pub fn has_descendant_path(&self, directory: &str) -> bool {
+        if directory.is_empty() {
+            return !self.path_order.is_empty();
+        }
+        let prefix = directory
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(b'/'));
+        let lower = self.path_order.partition_point(|&id| {
+            self.file_paths[id]
+                .as_bytes()
+                .iter()
+                .copied()
+                .cmp(prefix.clone())
+                .is_lt()
+        });
+        self.path_order.get(lower).is_some_and(|&id| {
+            self.file_paths[id]
+                .strip_prefix(directory)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }
+
     /// Total number of indexed files.
     pub fn num_files(&self) -> usize {
         self.file_paths.len()
@@ -530,6 +555,21 @@ mod tests {
         assert_eq!(reader.file_paths[0], "a.rs");
         assert_eq!(reader.file_paths[1], "b.rs");
         assert_eq!(reader.file_paths[2], "c.rs");
+    }
+
+    #[test]
+    fn descendant_lookup_is_sorted_and_directory_boundary_aware() {
+        let tmp = TempDir::new().unwrap();
+        let mut files = ondisk::encode_file_entry(0, "elsewhere.rs").unwrap();
+        files.extend_from_slice(&ondisk::encode_file_entry(1, "src/deep/a.rs").unwrap());
+        files.extend_from_slice(&ondisk::encode_file_entry(2, "src2/not-a-child.rs").unwrap());
+        write_index(tmp.path(), &[], &[], &files);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+
+        assert!(reader.has_descendant_path("src"));
+        assert!(reader.has_descendant_path("src/deep"));
+        assert!(!reader.has_descendant_path("sr"));
+        assert!(!reader.has_descendant_path("src2/not-a-child.rs"));
     }
 
     #[test]

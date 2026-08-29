@@ -147,41 +147,74 @@ pub(crate) fn common_git_dir(git_dir: &Path) -> PathBuf {
     }
 }
 
+fn config_bool(config: &str, section: &str, key: &str) -> Option<bool> {
+    let mut in_section = false;
+    let mut result = None;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            in_section = header.trim().eq_ignore_ascii_case(section);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let (candidate, value) = line
+            .split_once('=')
+            .map_or((line, None), |(candidate, value)| (candidate, Some(value)));
+        if !candidate.trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+        result = match value.map(str::trim) {
+            None => Some(true),
+            Some(value)
+                if matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "true" | "yes" | "on" | "1"
+                ) =>
+            {
+                Some(true)
+            }
+            Some(value)
+                if matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "false" | "no" | "off" | "0" | ""
+                ) =>
+            {
+                Some(false)
+            }
+            Some(_) => None,
+        };
+    }
+    result
+}
+
 /// Whether the repository compares paths without regard to case.
 ///
-/// git writes `core.ignorecase = true` into the repository's own config when it
-/// detects a case-insensitive filesystem, so the per-repository config is the
-/// authoritative place to read it and needs no config-precedence handling.
+/// A repository may opt into per-worktree config. In that layout Git reads the
+/// common config first, then lets `$GIT_DIR/config.worktree` override it.
 pub fn ignores_case(repo_root: &Path) -> bool {
     let Some(git_dir) = git_dir(repo_root) else {
         return false;
     };
-    let Ok(config) = std::fs::read_to_string(common_git_dir(&git_dir).join("config")) else {
+    let common = common_git_dir(&git_dir);
+    let Ok(config) = std::fs::read_to_string(common.join("config")) else {
         return false;
     };
-    let mut in_core = false;
-    for line in config.lines() {
-        let line = line.trim();
-        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_core = section.trim().eq_ignore_ascii_case("core");
-            continue;
-        }
-        if !in_core {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case("ignorecase") {
-            // git spells boolean true several ways.
-            let value = value.trim();
-            return matches!(
-                value.to_ascii_lowercase().as_str(),
-                "true" | "yes" | "on" | "1"
-            );
-        }
+    let common_ignorecase = config_bool(&config, "core", "ignorecase").unwrap_or(false);
+    if !config_bool(&config, "extensions", "worktreeConfig").unwrap_or(false) {
+        return common_ignorecase;
     }
-    false
+    std::fs::read_to_string(git_dir.join("config.worktree"))
+        .ok()
+        .and_then(|config| config_bool(&config, "core", "ignorecase"))
+        .unwrap_or(common_ignorecase)
 }
 
 /// Read the tracked paths from `.git/index`.
@@ -503,7 +536,6 @@ mod tests {
         let common = tmp.path().join("repo.git");
         let worktree_git = common.join("worktrees").join("topic");
         std::fs::create_dir_all(&worktree_git).expect("mkdir");
-        std::fs::write(common.join("config"), "[core]\n\tignorecase = true\n").expect("write");
         std::fs::write(worktree_git.join("commondir"), "../..\n").expect("write");
         std::fs::write(worktree_git.join("index"), v2_index(&["worktree/only.rs"])).expect("write");
 
@@ -515,7 +547,38 @@ mod tests {
         )
         .expect("write");
 
+        std::fs::write(
+            common.join("config"),
+            "[core]\n\tignorecase = true\n[extensions]\n\tworktreeConfig\n",
+        )
+        .expect("write");
+        std::fs::write(
+            worktree_git.join("config.worktree"),
+            "[core]\n\tignorecase = false\n",
+        )
+        .expect("write");
+        assert!(
+            !ignores_case(&worktree),
+            "worktree false must override common true"
+        );
+
+        std::fs::write(
+            common.join("config"),
+            "[core]\n\tignorecase = false\n[extensions]\n\tworktreeConfig = true\n",
+        )
+        .expect("write");
+        std::fs::write(
+            worktree_git.join("config.worktree"),
+            "[core]\n\tignorecase = true\n",
+        )
+        .expect("write");
         assert!(ignores_case(&worktree));
+
+        std::fs::write(common.join("config"), "[core]\n\tignorecase = false\n").expect("write");
+        assert!(
+            !ignores_case(&worktree),
+            "config.worktree is inactive until the extension is enabled"
+        );
         assert_eq!(index_path(&worktree), Some(worktree_git.join("index")));
         assert!(
             load_tracked(&worktree)

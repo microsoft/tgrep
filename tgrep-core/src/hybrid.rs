@@ -298,6 +298,11 @@ impl HybridIndex {
         self.reader().contains_path(path)
     }
 
+    /// Whether the active on-disk reader contains a path below `directory`.
+    pub fn reader_has_descendant_path(&self, directory: &str) -> bool {
+        self.reader().has_descendant_path(directory)
+    }
+
     /// The reader paths `keep` accepts.
     ///
     /// For callers that want a few of them — everything under one directory,

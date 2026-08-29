@@ -196,6 +196,17 @@ impl LiveIndex {
         self.path_to_id.contains_key(path)
     }
 
+    /// Whether the live overlay contains a path strictly below `directory`.
+    pub fn has_descendant_path(&self, directory: &str) -> bool {
+        if directory.is_empty() {
+            return !self.path_to_id.is_empty();
+        }
+        self.path_to_id.keys().any(|path| {
+            path.strip_prefix(directory)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }
+
     /// Number of files in the overlay.
     pub fn num_files(&self) -> usize {
         self.file_paths.len()
@@ -498,6 +509,18 @@ impl LiveIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descendant_lookup_is_directory_boundary_aware() {
+        let mut live = LiveIndex::new();
+        live.upsert_file_with_trigrams("src/deep/a.rs", Vec::new());
+        live.upsert_file_with_trigrams("src2/not-a-child.rs", Vec::new());
+
+        assert!(live.has_descendant_path("src"));
+        assert!(live.has_descendant_path("src/deep"));
+        assert!(!live.has_descendant_path("sr"));
+        assert!(!live.has_descendant_path("src/deep/a.rs"));
+    }
 
     #[test]
     fn clearing_reconciled_paths_removes_entries_and_tombstones_only_for_them() {

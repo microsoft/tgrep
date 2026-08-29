@@ -489,6 +489,7 @@ enum StaleRefreshPhase {
     BeforeWalk,
     AfterBuildBeforeStampPublish,
     AfterConcreteRead,
+    BeforeConcreteCommit,
     AfterMatcherPublish,
 }
 
@@ -1928,14 +1929,15 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
             run_stale_refresh_hook(state, StaleRefreshPhase::BeforeWalk);
         }
         let caught_up = catch_up_unwatched_build(state, &state.root, &state.index_dir);
-        membership_changed = tracked_membership_changed(state);
         if !caught_up {
+            schedule_tracked_membership_correction(state, &state.root, membership_changed);
             return json_rpc_error(
                 id,
                 -32000,
                 "rebuild catch-up did not complete; reload was not authoritative",
             );
         }
+        membership_changed = tracked_membership_changed(state);
     }
     if state.watch_enabled {
         spawn_recovery_scan(state, &state.root, newly_watched, since);
@@ -2389,6 +2391,7 @@ fn take_force_resubscribe(
     let force = pending.swap(false, Ordering::SeqCst);
     if force && completeness == TraversalCompleteness::Incomplete {
         pending.store(true, Ordering::SeqCst);
+        return false;
     }
     force
 }
@@ -3548,17 +3551,9 @@ fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
     for (path, introduces_dir) in paths {
         if !is_real_dir(&path)
             && path.strip_prefix(root).is_ok_and(|rel| {
-                let prefix = format!("{}/", rel.to_string_lossy().replace('\\', "/"));
+                let rel = rel.to_string_lossy().replace('\\', "/");
                 let index = state.index.read().unwrap();
-                index
-                    .reader_paths()
-                    .iter()
-                    .any(|indexed| indexed.starts_with(&prefix))
-                    || index
-                        .live
-                        .overlay_paths()
-                        .iter()
-                        .any(|indexed| indexed.starts_with(&prefix))
+                index.reader_has_descendant_path(&rel) || index.live.has_descendant_path(&rel)
             })
         {
             // A single directory removal/rename event names no descendants.
@@ -4207,6 +4202,39 @@ enum CappedRead {
     Failed,
 }
 
+fn file_still_has_bytes(
+    root: &Path,
+    path: &Path,
+    expected_version: &tgrep_core::builder::FileVersion,
+    expected: &[u8],
+) -> std::io::Result<bool> {
+    use std::io::Read;
+
+    let mut current = open_within_root(root, path)?;
+    if tgrep_core::builder::file_version(&current.metadata()?) != *expected_version {
+        return Ok(false);
+    }
+    let mut offset = 0;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = current.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if expected.get(offset..offset + read) != Some(&buffer[..read]) {
+            return Ok(false);
+        }
+        offset += read;
+    }
+    if offset != expected.len()
+        || tgrep_core::builder::file_version(&current.metadata()?) != *expected_version
+    {
+        return Ok(false);
+    }
+    let path_current = open_within_root(root, path)?;
+    Ok(tgrep_core::builder::file_version(&path_current.metadata()?) == *expected_version)
+}
+
 /// Reads a file's contents, never pulling in more than one byte past the cap.
 ///
 /// The size that qualified this file was stat'd before the read, and appending
@@ -4246,8 +4274,6 @@ fn read_within_limit(file: &mut std::fs::File, limit: Option<u64>, capacity: usi
 /// The caller must hold `snapshot_gate`: the read, the commit, and the stamp
 /// update have to be atomic with respect to a flush or auto-save.
 fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bool) {
-    use tgrep_core::meta::FileStamp;
-
     // Against other indexers, not against searches. The gate above is held for
     // read, so without this a recovery scan and the watcher worker can both be
     // here for the same path, both read, and the one that read the *older*
@@ -4287,15 +4313,8 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         }
         return;
     };
-    let mut current = FileStamp {
-        mtime: meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        size: meta.len(),
-    };
+    let mut version = tgrep_core::builder::file_version(&meta);
+    let mut current = version.stamp().clone();
 
     // The rules `walk_file_metadata` applies, and for the same reason: the walk
     // is authoritative about what belongs in the index, so anything it rejects
@@ -4360,12 +4379,10 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     if force {
         #[cfg(test)]
         run_stale_refresh_hook(state, StaleRefreshPhase::AfterConcreteRead);
-        // A concrete event is stronger evidence than the persisted stamp:
-        // FileStamp intentionally stores only whole-second mtime plus size for
-        // compatibility, so an equal-length rewrite can compare equal. Read a
-        // second containment-safe handle and require two consecutive byte
-        // snapshots to agree. This also avoids committing a mixed version when
-        // a writer changes the file while the first read is in progress.
+        // A concrete event is stronger evidence than the persisted stamp. Read
+        // containment-safe snapshots until the bytes and full-resolution file
+        // version agree, then bind the final decision to a fresh read of those
+        // exact bytes immediately before commit.
         let mut stable = false;
         for _ in 0..2 {
             let mut verify = match open_within_root(&state.root, path) {
@@ -4391,15 +4408,8 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
                 );
                 return;
             };
-            let verify_current = FileStamp {
-                mtime: meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                size: meta.len(),
-            };
+            let verify_version = tgrep_core::builder::file_version(&meta);
+            let verify_current = verify_version.stamp().clone();
             if !meta.is_file()
                 || tgrep_core::walker::is_binary_extension(path)
                 || state
@@ -4424,13 +4434,23 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
                     return;
                 }
             };
-            current = verify_current;
-            if data == verified {
+            let handle_stable = verify.metadata().is_ok_and(|metadata| {
+                tgrep_core::builder::file_version(&metadata) == verify_version
+            });
+            if data == verified
+                && handle_stable
+                && file_still_has_bytes(&state.root, path, &verify_version, &verified)
+                    .unwrap_or(false)
+            {
                 data = verified;
+                current = verify_current;
+                version = verify_version;
                 stable = true;
                 break;
             }
             data = verified;
+            current = verify_current;
+            version = verify_version;
         }
         if !stable {
             retry_failed_forced_reindex(state, rel_path, "the file kept changing while read");
@@ -4444,6 +4464,12 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     } else {
         Some(tgrep_core::live::LiveIndex::compute_trigram_masks(&text))
     };
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeConcreteCommit);
+    if force && !file_still_has_bytes(&state.root, path, &version, &data).unwrap_or(false) {
+        retry_failed_forced_reindex(state, rel_path, "the file changed before commit");
+        return;
+    }
 
     eprintln!("[trace] reindex: modified {rel_path}");
     // Gate held by the caller — the commit + stamp update is processed
@@ -5123,8 +5149,10 @@ fn catch_up_unwatched_build(state: &Arc<ServerState>, root: &Path, index_dir: &P
         ignorecase,
         false,
     );
+    let membership_changed = tracked_membership_changed(state);
     drop(gate);
     drop(refresh);
+    schedule_tracked_membership_correction(state, root, membership_changed);
     caught_up
 }
 
@@ -6184,25 +6212,38 @@ impl StagedFileMove {
             return Ok(());
         }
         let mut first_error = None;
-        for name in self.backed_up.iter().rev() {
-            if let Err(e) = publish_file(&self.backup_path(name), &self.target.join(name))
-                && first_error.is_none()
-            {
-                first_error = Some(e);
-            }
-        }
-        for name in self.published.iter().rev() {
-            if self.backed_up.contains(name) {
-                continue;
-            }
+        let mut pending_published = Vec::new();
+        for name in std::mem::take(&mut self.published).into_iter().rev() {
             let published = self.target.join(name);
-            if published.exists()
-                && let Err(e) = std::fs::remove_file(published)
-                && first_error.is_none()
+            if let Err(e) = std::fs::remove_file(&published)
+                && e.kind() != std::io::ErrorKind::NotFound
             {
-                first_error = Some(e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+                pending_published.push(name);
             }
         }
+        pending_published.reverse();
+        self.published = pending_published;
+
+        let mut pending_backups = Vec::new();
+        for name in std::mem::take(&mut self.backed_up).into_iter().rev() {
+            match publish_file(&self.backup_path(name), &self.target.join(name)) {
+                Ok(()) => self.published.retain(|published| *published != name),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.published.retain(|published| *published != name);
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    pending_backups.push(name);
+                }
+            }
+        }
+        pending_backups.reverse();
+        self.backed_up = pending_backups;
         if let Some(e) = first_error {
             return Err(e);
         }
@@ -6796,8 +6837,8 @@ mod tests {
         let pending = std::sync::atomic::AtomicBool::new(true);
         let force = take_force_resubscribe(&pending, TraversalCompleteness::Incomplete);
         assert!(
-            force,
-            "the incomplete pass must still attempt known entries"
+            !force,
+            "the incomplete pass must not re-register known entries"
         );
         assert!(
             pending.load(Ordering::SeqCst),
@@ -7208,6 +7249,7 @@ mod tests {
                 }
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
+                StaleRefreshPhase::BeforeConcreteCommit => {}
             })
         };
         *state.stale_refresh_hook.lock().unwrap() = Some(hook);
@@ -7346,6 +7388,7 @@ mod tests {
                 }
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
+                StaleRefreshPhase::BeforeConcreteCommit => {}
             })
         };
         *state.stale_refresh_hook.lock().unwrap() = Some(hook);
@@ -7514,6 +7557,7 @@ mod tests {
                 }
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
+                StaleRefreshPhase::BeforeConcreteCommit => {}
             })
         };
         *state.stale_refresh_hook.lock().unwrap() = Some(hook);
@@ -7911,6 +7955,55 @@ mod tests {
             repaired.contains("\"content\":\"fn new_marker"),
             "a concrete event must bypass the coarse matching stamp: {repaired}"
         );
+    }
+
+    #[test]
+    fn concrete_event_rejects_change_after_verification_before_commit() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("raced.rs");
+        std::fs::write(&path, "fn old_marker() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "raced.rs", false);
+        }
+        let dirty_before = state.index.read().unwrap().live.dirty_count();
+        std::fs::write(&path, "fn first_new_() {}\n").unwrap();
+
+        state.indexing.store(true, Ordering::SeqCst);
+        let changed = path.clone();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::BeforeConcreteCommit) {
+                std::fs::write(&changed, "fn final_new_() {}\n").unwrap();
+            }
+        }));
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "raced.rs", true);
+        }
+
+        assert_eq!(
+            state.index.read().unwrap().live.dirty_count(),
+            dirty_before,
+            "bytes invalidated after verification must not be committed"
+        );
+        assert_eq!(
+            state.file_stamps.read().unwrap().get("raced.rs"),
+            Some(&tgrep_core::meta::FileStamp {
+                mtime: u64::MAX,
+                size: u64::MAX,
+            }),
+            "a rejected final version must remain scheduled for correction"
+        );
+
+        *state.stale_refresh_hook.lock().unwrap() = None;
+        state.indexing.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.ignore_refresh_scheduled.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -10232,5 +10325,81 @@ mod tests {
         moved.rollback().unwrap();
 
         assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn rollback_restores_backup_when_published_target_is_already_missing() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join("index.bin"), b"new");
+        write_file(&target.join("index.bin"), b"old");
+
+        let mut moved = move_staged_files(&staging, &target).unwrap();
+        std::fs::remove_file(target.join("index.bin")).unwrap();
+        moved.rollback().unwrap();
+
+        assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn rollback_restores_backup_when_replacement_was_never_published() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join(".previous-index.bin"), b"old");
+
+        let mut moved = StagedFileMove {
+            staging,
+            target: target.clone(),
+            backed_up: vec!["index.bin"],
+            published: Vec::new(),
+            finished: false,
+        };
+        moved.rollback().unwrap();
+
+        assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn rollback_retry_does_not_delete_an_already_restored_backup() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join(".previous-index.bin"), b"old-index");
+        write_file(&staging.join(".previous-lookup.bin"), b"old-lookup");
+        write_file(&target.join("index.bin"), b"new-index");
+        std::fs::create_dir(target.join("lookup.bin")).unwrap();
+
+        let mut moved = StagedFileMove {
+            staging,
+            target: target.clone(),
+            backed_up: vec!["index.bin", "lookup.bin"],
+            published: vec!["index.bin", "lookup.bin"],
+            finished: false,
+        };
+        assert!(moved.rollback().is_err());
+        assert_eq!(
+            std::fs::read(target.join("index.bin")).unwrap(),
+            b"old-index"
+        );
+
+        std::fs::remove_dir(target.join("lookup.bin")).unwrap();
+        moved.rollback().unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("index.bin")).unwrap(),
+            b"old-index"
+        );
+        assert_eq!(
+            std::fs::read(target.join("lookup.bin")).unwrap(),
+            b"old-lookup"
+        );
     }
 }

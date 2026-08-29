@@ -616,16 +616,11 @@ pub fn walk_file_metadata_with_ignorecase(
             if max_file_size.is_some_and(|limit| meta.len() > limit) {
                 return ignore::WalkState::Continue;
             }
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let stamp = crate::meta::file_stamp(&meta);
             results.lock().unwrap().push(FileMeta {
                 relative_path: rel_path,
-                mtime,
-                size: meta.len(),
+                mtime: stamp.mtime,
+                size: stamp.size,
             });
 
             ignore::WalkState::Continue
@@ -1509,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn public_matcher_reloads_tracked_exemptions_after_index_changes() {
+    fn public_matcher_lazily_freezes_tracked_exemptions_on_first_match() {
         let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
         let root = dir.path();
         let matcher = crate::gitignore::matcher_from_ignore_paths(
@@ -1519,20 +1514,18 @@ mod tests {
         )
         .expect("the fixture has rules");
 
-        // Untracked, and `*.txt` matches it once case is ignored.
-        assert!(matcher.is_ignored(Path::new("src/Gone.TXT"), false));
-
+        // Construction alone must not read the index. The first matching query
+        // observes this update and freezes that membership for later queries.
         fake_git_repo(root, true, &["src/main.rs", "src/Kept.TXT", "src/Gone.TXT"]);
-
         assert!(
             !matcher.is_ignored(Path::new("src/Gone.TXT"), false),
-            "the legacy public matcher must observe a newly tracked exemption"
+            "the first matching query must initialize from the current index"
         );
 
         fake_git_repo(root, true, &["src/main.rs"]);
         assert!(
-            matcher.is_ignored(Path::new("src/Kept.TXT"), false),
-            "the legacy public matcher must observe a removed exemption"
+            !matcher.is_ignored(Path::new("src/Kept.TXT"), false),
+            "the lazy snapshot must remain immutable after initialization"
         );
     }
 

@@ -38,6 +38,7 @@ const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 /// charging mapped bytes honestly costs nothing on trees like the kernel, where
 /// only 110 of 94,747 files are mapped at all.
 const INDEX_BUILD_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_OWNED_FILE_BYTES: u64 = INDEX_BUILD_BATCH_BYTES;
 
 /// Default arena budget for [`IndexStrategy::External`] before spilling.
 pub use crate::external::DEFAULT_BUFFER_BYTES as DEFAULT_INDEX_BUFFER_BYTES;
@@ -343,6 +344,49 @@ enum FileBytes {
 
 type ExtractedFile = (String, trigram::TrigramMaskMap);
 
+/// Full-resolution identity used to validate that bytes came from one file
+/// version without changing the persisted [`meta::FileStamp`] format.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileVersion {
+    stamp: meta::FileStamp,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanos: i64,
+}
+
+impl FileVersion {
+    pub fn stamp(&self) -> &meta::FileStamp {
+        &self.stamp
+    }
+}
+
+#[doc(hidden)]
+pub fn file_version(metadata: &std::fs::Metadata) -> FileVersion {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    FileVersion {
+        stamp: meta::file_stamp(metadata),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        change_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        change_nanos: metadata.ctime_nsec(),
+    }
+}
+
 impl std::ops::Deref for FileBytes {
     type Target = [u8];
 
@@ -357,8 +401,8 @@ impl std::ops::Deref for FileBytes {
 /// Get a file's bytes for indexing, mapping it when it is large enough to be
 /// worth avoiding the copy.
 ///
-/// Falls back to reading whenever mapping is unavailable, so a filesystem that
-/// cannot map still indexes correctly.
+/// Falls back to an owned read whenever mapping is unavailable, but never lets
+/// that fallback allocate beyond the extraction batch's owned-buffer budget.
 fn read_for_index(path: &Path, size: u64) -> std::io::Result<FileBytes> {
     if size >= MMAP_MIN_BYTES {
         // SAFETY: the map is read-only and owned by the returned value, which
@@ -372,7 +416,36 @@ fn read_for_index(path: &Path, size: u64) -> std::io::Result<FileBytes> {
             return Ok(FileBytes::Mapped(map));
         }
     }
-    std::fs::read(path).map(FileBytes::Read)
+    read_owned_for_index(path, size).map(FileBytes::Read)
+}
+
+fn read_owned_for_index(path: &Path, size: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    if size > MAX_OWNED_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "file is too large for the {} MiB owned-buffer fallback",
+                MAX_OWNED_FILE_BYTES / (1024 * 1024)
+            ),
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_OWNED_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_OWNED_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "file grew beyond the {} MiB owned-buffer fallback",
+                MAX_OWNED_FILE_BYTES / (1024 * 1024)
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Build a trigram index, choosing how postings are accumulated.
@@ -381,7 +454,12 @@ pub fn build_index_with_options(
     index_dir: Option<&Path>,
     opts: &BuildOptions,
 ) -> Result<BuildOutcome> {
-    build_index_with_options_and_ignorecase(root, index_dir, opts, None)
+    let root = std::fs::canonicalize(root)?;
+    let ignorecase = (!opts.no_ignore)
+        .then(|| crate::gitignore::CaseInsensitiveIgnore::new(&root, true, true, true))
+        .flatten()
+        .map(std::sync::Arc::new);
+    build_index_with_options_and_ignorecase(&root, index_dir, opts, ignorecase)
 }
 
 /// Build an index using an immutable tracked-file exemption that the caller
@@ -406,34 +484,19 @@ pub fn build_index_with_options_and_ignorecase(
     if let Some(hint) = gitignore_gate_hint(&root, opts) {
         eprintln!("{hint}");
     }
-    let walk = if let Some(ignorecase) = ignorecase {
-        walker::walk_dir_with_ignorecase(
-            &root,
-            &walker::WalkOptions {
-                include_hidden,
-                no_ignore,
-                no_require_git: opts.no_require_git,
-                collect_gitignore_files: opts.collect_gitignore_files,
-                exclude_dirs: exclude_dirs.to_vec(),
-                max_file_size: opts.max_file_size,
-                ..Default::default()
-            },
-            Some(ignorecase),
-        )
-    } else {
-        walker::walk_dir(
-            &root,
-            &walker::WalkOptions {
-                include_hidden,
-                no_ignore,
-                no_require_git: opts.no_require_git,
-                collect_gitignore_files: opts.collect_gitignore_files,
-                exclude_dirs: exclude_dirs.to_vec(),
-                max_file_size: opts.max_file_size,
-                ..Default::default()
-            },
-        )
-    };
+    let walk = walker::walk_dir_with_ignorecase(
+        &root,
+        &walker::WalkOptions {
+            include_hidden,
+            no_ignore,
+            no_require_git: opts.no_require_git,
+            collect_gitignore_files: opts.collect_gitignore_files,
+            exclude_dirs: exclude_dirs.to_vec(),
+            max_file_size: opts.max_file_size,
+            ..Default::default()
+        },
+        ignorecase,
+    );
     eprintln!(
         "Found {} text files ({} binary skipped, {} too large, {} errors)",
         walk.files.len(),
@@ -470,11 +533,23 @@ pub fn build_index_with_options_and_ignorecase(
     for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
         let batch = &walk.files[range.clone()];
         let batch_sizes = &sizes[range];
+        let owned_limit_error = std::sync::Mutex::new(None);
         let batch_data: Vec<ExtractedFile> = batch
             .par_iter()
             .zip(batch_sizes.par_iter())
             .filter_map(|(path, &size)| {
-                let data = read_for_index(path, size).ok()?;
+                let data = match read_for_index(path, size) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        if error.kind() == std::io::ErrorKind::InvalidData {
+                            let mut first = owned_limit_error.lock().unwrap();
+                            if first.is_none() {
+                                *first = Some((path.clone(), error));
+                            }
+                        }
+                        return None;
+                    }
+                };
                 let text = crate::encoding::decode_for_index(&data);
                 if trigram::is_binary(&text) {
                     binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -489,6 +564,12 @@ pub fn build_index_with_options_and_ignorecase(
                 Some((rel, per_tri))
             })
             .collect();
+        if let Some((path, error)) = owned_limit_error.into_inner().unwrap() {
+            return Err(Error::Io(std::io::Error::new(
+                error.kind(),
+                format!("{}: {error}", path.display()),
+            )));
+        }
 
         for (path, per_tri) in batch_data {
             let file_id = file_id_map.len() as u32;
@@ -1393,6 +1474,105 @@ mod tests {
         assert_eq!(
             batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES),
             vec![0..1, 1..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn owned_read_rejects_files_beyond_the_batch_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sparse.txt");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_OWNED_FILE_BYTES + 1)
+            .unwrap();
+
+        let error = read_owned_for_index(&path, MAX_OWNED_FILE_BYTES + 1).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn file_version_distinguishes_subsecond_modified_times() {
+        let stamp = meta::FileStamp { mtime: 1, size: 10 };
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let first = FileVersion {
+            stamp: stamp.clone(),
+            modified: Some(base + std::time::Duration::from_nanos(100)),
+            created: Some(base),
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 2,
+            #[cfg(unix)]
+            change_seconds: 1,
+            #[cfg(unix)]
+            change_nanos: 0,
+        };
+        let second = FileVersion {
+            modified: Some(base + std::time::Duration::from_nanos(200)),
+            ..first.clone()
+        };
+
+        assert_ne!(first, second);
+        assert_eq!(first.stamp, second.stamp);
+    }
+
+    fn write_test_git_index(root: &Path, tracked: &[&str]) {
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config"), "[core]\n\tignorecase = true\n").unwrap();
+        let mut index = Vec::new();
+        index.extend_from_slice(b"DIRC");
+        index.extend_from_slice(&2u32.to_be_bytes());
+        index.extend_from_slice(&(tracked.len() as u32).to_be_bytes());
+        for path in tracked {
+            let start = index.len();
+            index.extend_from_slice(&[0u8; 60]);
+            index.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            index.extend_from_slice(path.as_bytes());
+            index.push(0);
+            while (index.len() - start) % 8 != 0 {
+                index.push(0);
+            }
+        }
+        std::fs::write(git.join("index"), index).unwrap();
+    }
+
+    #[test]
+    fn default_builder_constructs_snapshot_but_explicit_none_is_preserved() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir(root.join("ignored")).unwrap();
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::write(root.join("ignored/tracked.rs"), "fn tracked() {}\n").unwrap();
+        std::fs::write(root.join("ignored/untracked.rs"), "fn untracked() {}\n").unwrap();
+        write_test_git_index(root, &[".gitignore", "ignored/tracked.rs"]);
+
+        let default_index = tempfile::tempdir().unwrap();
+        build_index_with_options(root, Some(default_index.path()), &BuildOptions::default())
+            .unwrap();
+        let default_reader = IndexReader::open(default_index.path()).unwrap();
+        assert!(
+            default_reader.contains_path("ignored/tracked.rs"),
+            "the default builder must construct the tracked-file exemption"
+        );
+        assert!(
+            !default_reader.contains_path("ignored/untracked.rs"),
+            "the default builder must apply case-insensitive root rules"
+        );
+
+        let none_index = tempfile::tempdir().unwrap();
+        build_index_with_options_and_ignorecase(
+            root,
+            Some(none_index.path()),
+            &BuildOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            IndexReader::open(none_index.path())
+                .unwrap()
+                .contains_path("ignored/untracked.rs"),
+            "an explicit None must not reconstruct the exemption"
         );
     }
 

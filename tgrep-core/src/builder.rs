@@ -457,6 +457,13 @@ fn read_for_index(
     owned_budget: &std::sync::Arc<OwnedReadBudget>,
     configured_limit: Option<u64>,
 ) -> std::io::Result<FileBytes> {
+    let owned_limit = configured_limit.unwrap_or(u64::MAX);
+    if size > owned_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds the configured {} byte limit", owned_limit),
+        ));
+    }
     if size >= MMAP_MIN_BYTES {
         // SAFETY: the map is read-only and owned by the returned value, which
         // is dropped once the file's trigrams have been extracted. A concurrent
@@ -466,15 +473,12 @@ fn read_for_index(
         let mapped =
             std::fs::File::open(path).and_then(|file| unsafe { memmap2::Mmap::map(&file) });
         if let Ok(map) = mapped {
-            return Ok(FileBytes::Mapped(map));
+            if map.len() as u64 <= owned_limit {
+                return Ok(FileBytes::Mapped(map));
+            }
+            // The file grew between the walk's stat and the map. Do not let a
+            // successful mmap bypass a caller-supplied max-file-size limit.
         }
-    }
-    let owned_limit = configured_limit.unwrap_or(u64::MAX);
-    if size > owned_limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("file exceeds the configured {} byte limit", owned_limit),
-        ));
     }
     let permit = owned_budget.acquire(size);
     match read_owned_for_index(path, size, owned_limit) {
@@ -1598,6 +1602,23 @@ mod tests {
 
         let error = read_owned_for_index(&path, MAX_OWNED_FILE_BYTES + 1, MAX_OWNED_FILE_BYTES)
             .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn configured_limit_is_checked_before_mmap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("too-large.txt");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MMAP_MIN_BYTES)
+            .unwrap();
+        let budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
+
+        let error = match read_for_index(&path, MMAP_MIN_BYTES, &budget, Some(MMAP_MIN_BYTES - 1)) {
+            Ok(_) => panic!("configured max-file-size must be checked before mmap"),
+            Err(error) => error,
+        };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 

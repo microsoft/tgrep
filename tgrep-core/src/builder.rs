@@ -340,12 +340,13 @@ const MMAP_MIN_BYTES: u64 = 1024 * 1024;
 enum FileBytes {
     Read {
         bytes: Vec<u8>,
-        _permit: Option<OwnedReadPermit>,
+        _permit: OwnedReadPermit,
     },
     Mapped(memmap2::Mmap),
 }
 
 struct OwnedReadBudget {
+    capacity: u64,
     available: std::sync::Mutex<u64>,
     ready: std::sync::Condvar,
 }
@@ -353,20 +354,24 @@ struct OwnedReadBudget {
 impl OwnedReadBudget {
     fn new(bytes: u64) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
+            capacity: bytes,
             available: std::sync::Mutex::new(bytes),
             ready: std::sync::Condvar::new(),
         })
     }
 
     fn acquire(self: &std::sync::Arc<Self>, bytes: u64) -> OwnedReadPermit {
+        // One oversized fallback may exceed the ordinary budget, but it claims
+        // the whole budget so no other owned read can overlap it.
+        let charged = bytes.min(self.capacity);
         let mut available = self.available.lock().unwrap();
-        while *available < bytes {
+        while *available < charged {
             available = self.ready.wait(available).unwrap();
         }
-        *available -= bytes;
+        *available -= charged;
         OwnedReadPermit {
             budget: std::sync::Arc::clone(self),
-            bytes,
+            bytes: charged,
         }
     }
 }
@@ -443,8 +448,9 @@ impl std::ops::Deref for FileBytes {
 /// Get a file's bytes for indexing, mapping it when it is large enough to be
 /// worth avoiding the copy.
 ///
-/// Falls back to an owned read whenever mapping is unavailable, but never lets
-/// that fallback allocate beyond the extraction batch's owned-buffer budget.
+/// Falls back to an owned read whenever mapping is unavailable. Ordinary reads
+/// share the batch budget; an unlimited oversized fallback claims it
+/// exclusively so at most one such allocation is in flight.
 fn read_for_index(
     path: &Path,
     size: u64,
@@ -463,47 +469,54 @@ fn read_for_index(
             return Ok(FileBytes::Mapped(map));
         }
     }
-    let owned_limit = configured_limit.unwrap_or(size);
+    let owned_limit = configured_limit.unwrap_or(u64::MAX);
     if size > owned_limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("file exceeds the configured {} byte limit", owned_limit),
         ));
     }
-    let oversized = size > MAX_OWNED_FILE_BYTES;
-    let permit = (!oversized).then(|| owned_budget.acquire(size));
+    let permit = owned_budget.acquire(size);
     match read_owned_for_index(path, size, owned_limit) {
         Ok(bytes) => Ok(FileBytes::Read {
             bytes,
             _permit: permit,
         }),
-        Err(error)
-            if error.kind() == std::io::ErrorKind::WouldBlock && size < MAX_OWNED_FILE_BYTES =>
-        {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             // The file grew after it was stat'd. Release the smaller claim
-            // before waiting for the full allowance so concurrent growers
+            // before waiting for the retry allowance so concurrent growers
             // cannot deadlock while each holds part of the batch budget.
             drop(permit);
-            let retry_limit = configured_limit.unwrap_or(MAX_OWNED_FILE_BYTES);
-            let permit = owned_budget.acquire(MAX_OWNED_FILE_BYTES.min(retry_limit));
-            read_owned_for_index(path, MAX_OWNED_FILE_BYTES.min(retry_limit), retry_limit)
-                .map(|bytes| FileBytes::Read {
-                    bytes,
-                    _permit: Some(permit),
-                })
-                .map_err(|retry| {
-                    if retry.kind() == std::io::ErrorKind::WouldBlock {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "file grew beyond the {} MiB owned-buffer fallback",
-                                MAX_OWNED_FILE_BYTES / (1024 * 1024)
-                            ),
-                        )
-                    } else {
-                        retry
-                    }
-                })
+            match configured_limit {
+                Some(limit) => {
+                    let permit = owned_budget.acquire(limit);
+                    read_owned_for_index(path, limit, limit)
+                        .map(|bytes| FileBytes::Read {
+                            bytes,
+                            _permit: permit,
+                        })
+                        .map_err(|retry| {
+                            if retry.kind() == std::io::ErrorKind::WouldBlock {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("file exceeds the configured {} byte limit", limit),
+                                )
+                            } else {
+                                retry
+                            }
+                        })
+                }
+                None => {
+                    // No caller limit means no implicit fallback limit either.
+                    // Claiming more than the budget takes it exclusively, so
+                    // this unbounded read cannot overlap another owned buffer.
+                    let permit = owned_budget.acquire(u64::MAX);
+                    read_owned_unbounded(path, size).map(|bytes| FileBytes::Read {
+                        bytes,
+                        _permit: permit,
+                    })
+                }
+            }
         }
         Err(error) => Err(error),
     }
@@ -530,6 +543,16 @@ fn read_owned_for_index(path: &Path, size: u64, owned_limit: u64) -> std::io::Re
             "file grew beyond its owned-buffer reservation",
         ));
     }
+    Ok(bytes)
+}
+
+fn read_owned_unbounded(path: &Path, expected_size: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let initial_capacity = expected_size.min(MAX_OWNED_FILE_BYTES);
+    let mut bytes = Vec::with_capacity(usize::try_from(initial_capacity).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -1609,15 +1632,24 @@ mod tests {
     }
 
     #[test]
+    fn oversized_owned_read_claims_the_budget_exclusively() {
+        let budget = OwnedReadBudget::new(10);
+        let permit = budget.acquire(100);
+        assert_eq!(*budget.available.lock().unwrap(), 0);
+        drop(permit);
+        assert_eq!(*budget.available.lock().unwrap(), 10);
+    }
+
+    #[test]
     fn owned_read_budget_serializes_fallbacks_that_exceed_the_remaining_capacity() {
         let budget = OwnedReadBudget::new(10);
-        let first = budget.acquire(10);
+        let first = budget.acquire(100);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let waiting_budget = std::sync::Arc::clone(&budget);
         let waiter = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
-            let _second = waiting_budget.acquire(10);
+            let _second = waiting_budget.acquire(100);
             acquired_tx.send(()).unwrap();
         });
 

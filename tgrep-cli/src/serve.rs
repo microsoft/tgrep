@@ -4900,7 +4900,7 @@ fn stream_merge_stale_changes(
 
     let mut published_stamps = stamps.clone();
 
-    let result = (|| -> Result<bool> {
+    let result = (|| -> Result<PublishStatus> {
         let build = || {
             builder::build_index_for_files(
                 root,
@@ -4970,7 +4970,7 @@ fn stream_merge_stale_changes(
             .count();
         let expected_files = reader.num_files() - removed_reader_files + delta.num_files();
         let published = publish_staged_index(state, index_dir, &staging_dir, expected_files);
-        if published {
+        if published.is_published() {
             // `publish_staged_index` prunes overlay entries represented by the
             // new reader. Also clear reconciled entries intentionally omitted
             // (newly ignored/binary/deleted) and old tombstones for files the
@@ -4992,13 +4992,17 @@ fn stream_merge_stale_changes(
     })();
 
     let _ = std::fs::remove_dir_all(&delta_dir);
-    let _ = std::fs::remove_dir_all(&staging_dir);
+    if !matches!(&result, Ok(PublishStatus::RollbackFailed)) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    } else {
+        eprintln!("[trace] warning: preserving {staging_dir:?} after rollback failure");
+    }
     state.flushing.store(false, Ordering::SeqCst);
-    if matches!(&result, Ok(true)) {
+    if matches!(&result, Ok(PublishStatus::Published)) {
         *state.file_stamps.write().unwrap() = published_stamps;
     }
     match result {
-        Ok(true) => {
+        Ok(PublishStatus::Published) => {
             eprintln!(
                 "[trace] {operation}: streamed {} changes into the index in {:.1}s",
                 candidates.len(),
@@ -5006,7 +5010,7 @@ fn stream_merge_stale_changes(
             );
             true
         }
-        Ok(false) => {
+        Ok(PublishStatus::Failed) | Ok(PublishStatus::RollbackFailed) => {
             eprintln!(
                 "[trace] warning: {operation} delta could not be published; \
                  keeping the old index"
@@ -6022,7 +6026,7 @@ fn flush_append_only_overlay_locked(
         eprintln!("[trace] warning: failed to write staging filestamps: {e}");
     }
 
-    let pruned = publish_staged_index(state, index_dir, &staging_dir, num_files);
+    let pruned = publish_staged_index(state, index_dir, &staging_dir, num_files).is_published();
     eprintln!(
         "[trace] append-only flush: {num_files} files on disk (complete={complete}) in {:.1}s",
         flush_start.elapsed().as_secs_f64()
@@ -6040,14 +6044,27 @@ fn flush_append_only_overlay_locked(
 /// renames or swap readers out of order. `num_files` is the expected on-disk
 /// file count used to reject a partially-published reader.
 ///
-/// Returns `true` when the swap + prune succeeded, `false` on any failure (the
-/// previous reader and the live overlay are retained as the fallback).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishStatus {
+    Published,
+    Failed,
+    RollbackFailed,
+}
+
+impl PublishStatus {
+    fn is_published(self) -> bool {
+        matches!(self, Self::Published)
+    }
+}
+
+/// Returns the publication outcome. A rollback failure preserves the staging
+/// directory so its backups remain available for recovery.
 fn publish_staged_index(
     state: &ServerState,
     index_dir: &Path,
     staging_dir: &Path,
     num_files: usize,
-) -> bool {
+) -> PublishStatus {
     // Held across move + open + swap so concurrent publishers (auto-save /
     // background-build / watcher reindex flush) cannot interleave renames
     // or swap readers out of order. Searches do not take this lock.
@@ -6056,21 +6073,22 @@ fn publish_staged_index(
         Ok(moved) => moved,
         Err(e) => {
             eprintln!("[trace] warning: flush move failed: {e}");
-            return false;
+            return PublishStatus::Failed;
         }
     };
     let Some((new_reader, reader_files, reader_trigrams)) =
         open_published_reader(index_dir, num_files)
     else {
-        match moved.rollback() {
+        return match moved.rollback() {
             Ok(()) => {
                 let _ = std::fs::remove_dir_all(staging_dir);
+                PublishStatus::Failed
             }
             Err(e) => {
                 eprintln!("[trace] warning: failed to roll back index publication: {e}");
+                PublishStatus::RollbackFailed
             }
-        }
-        return false;
+        };
     };
 
     // Atomic swap — no outer write lock required.
@@ -6087,7 +6105,7 @@ fn publish_staged_index(
          {reader_trigrams} trigrams), overlay pruned"
     );
     let _ = std::fs::remove_dir_all(staging_dir);
-    true
+    PublishStatus::Published
 }
 
 fn publish_reloaded_index(

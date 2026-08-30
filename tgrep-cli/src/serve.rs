@@ -8159,6 +8159,77 @@ mod tests {
     }
 
     #[test]
+    fn index_mutation_keeps_write_lock_until_cache_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("atomic.rs");
+        std::fs::write(&path, "fn atomic_marker() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state
+            .cache
+            .write()
+            .unwrap()
+            .put("atomic.rs".to_string(), cached(10));
+        let generation = state.cache_generation.load(Ordering::SeqCst);
+
+        // Prevent invalidation from completing after the index commit. The
+        // writer must retain the index lock while it waits for this guard.
+        let cache_guard = state.cache.read().unwrap();
+        let before_commit = Arc::new(std::sync::Barrier::new(2));
+        let continue_commit = Arc::new(std::sync::Barrier::new(2));
+        let hook_before = Arc::clone(&before_commit);
+        let hook_continue = Arc::clone(&continue_commit);
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::BeforeConcreteCommit) {
+                hook_before.wait();
+                hook_continue.wait();
+            }
+        }));
+
+        let worker_state = Arc::clone(&state);
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            let _gate = worker_state.snapshot_gate.read().unwrap();
+            reindex_file(&worker_state, &worker_path, "atomic.rs", true);
+        });
+        before_commit.wait();
+        continue_commit.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match state.index.try_read() {
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
+                Ok(index) => {
+                    assert!(
+                        !index.live.has_path("atomic.rs"),
+                        "new postings became visible while stale cached bytes were still readable"
+                    );
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "index writer never reached commit"
+            );
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(
+                state.index.try_read(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "index lock was released before cache invalidation completed"
+        );
+
+        drop(cache_guard);
+        worker.join().unwrap();
+        *state.stale_refresh_hook.lock().unwrap() = None;
+        assert!(state.cache.read().unwrap().peek("atomic.rs").is_none());
+        assert!(state.cache_generation.load(Ordering::SeqCst) > generation);
+    }
+
+    #[test]
     fn pre_reload_disk_read_cannot_repopulate_content_cache() {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();

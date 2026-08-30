@@ -340,7 +340,7 @@ const MMAP_MIN_BYTES: u64 = 1024 * 1024;
 enum FileBytes {
     Read {
         bytes: Vec<u8>,
-        _permit: OwnedReadPermit,
+        _permit: Option<OwnedReadPermit>,
     },
     Mapped(memmap2::Mmap),
 }
@@ -449,6 +449,7 @@ fn read_for_index(
     path: &Path,
     size: u64,
     owned_budget: &std::sync::Arc<OwnedReadBudget>,
+    configured_limit: Option<u64>,
 ) -> std::io::Result<FileBytes> {
     if size >= MMAP_MIN_BYTES {
         // SAFETY: the map is read-only and owned by the returned value, which
@@ -462,17 +463,16 @@ fn read_for_index(
             return Ok(FileBytes::Mapped(map));
         }
     }
-    if size > MAX_OWNED_FILE_BYTES {
+    let owned_limit = configured_limit.unwrap_or(size);
+    if size > owned_limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "file is too large for the {} MiB owned-buffer fallback",
-                MAX_OWNED_FILE_BYTES / (1024 * 1024)
-            ),
+            format!("file exceeds the configured {} byte limit", owned_limit),
         ));
     }
-    let permit = owned_budget.acquire(size);
-    match read_owned_for_index(path, size) {
+    let oversized = size > MAX_OWNED_FILE_BYTES;
+    let permit = (!oversized).then(|| owned_budget.acquire(size));
+    match read_owned_for_index(path, size, owned_limit) {
         Ok(bytes) => Ok(FileBytes::Read {
             bytes,
             _permit: permit,
@@ -484,11 +484,12 @@ fn read_for_index(
             // before waiting for the full allowance so concurrent growers
             // cannot deadlock while each holds part of the batch budget.
             drop(permit);
-            let permit = owned_budget.acquire(MAX_OWNED_FILE_BYTES);
-            read_owned_for_index(path, MAX_OWNED_FILE_BYTES)
+            let retry_limit = configured_limit.unwrap_or(MAX_OWNED_FILE_BYTES);
+            let permit = owned_budget.acquire(MAX_OWNED_FILE_BYTES.min(retry_limit));
+            read_owned_for_index(path, MAX_OWNED_FILE_BYTES.min(retry_limit), retry_limit)
                 .map(|bytes| FileBytes::Read {
                     bytes,
-                    _permit: permit,
+                    _permit: Some(permit),
                 })
                 .map_err(|retry| {
                     if retry.kind() == std::io::ErrorKind::WouldBlock {
@@ -508,16 +509,13 @@ fn read_for_index(
     }
 }
 
-fn read_owned_for_index(path: &Path, size: u64) -> std::io::Result<Vec<u8>> {
+fn read_owned_for_index(path: &Path, size: u64, owned_limit: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
 
-    if size > MAX_OWNED_FILE_BYTES {
+    if size > owned_limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "file is too large for the {} MiB owned-buffer fallback",
-                MAX_OWNED_FILE_BYTES / (1024 * 1024)
-            ),
+            format!("file exceeds the configured {} byte limit", owned_limit),
         ));
     }
     let mut file = std::fs::File::open(path)?;
@@ -626,7 +624,7 @@ pub fn build_index_with_options_and_ignorecase(
             .par_iter()
             .zip(batch_sizes.par_iter())
             .filter_map(|(path, &size)| {
-                let data = match read_for_index(path, size, &owned_budget) {
+                let data = match read_for_index(path, size, &owned_budget, opts.max_file_size) {
                     Ok(data) => data,
                     Err(error) => {
                         if error.kind() == std::io::ErrorKind::InvalidData {
@@ -773,7 +771,7 @@ pub fn build_index_for_files(
             .par_iter()
             .zip(batch_sizes.par_iter())
             .filter_map(|(path, &size)| {
-                let data = match read_for_index(path, size, &owned_budget) {
+                let data = match read_for_index(path, size, &owned_budget, None) {
                     Ok(data) => data,
                     Err(error) => {
                         eprintln!("tgrep: skipping {}: {error}", path.display());
@@ -1575,7 +1573,8 @@ mod tests {
             .set_len(MAX_OWNED_FILE_BYTES + 1)
             .unwrap();
 
-        let error = read_owned_for_index(&path, MAX_OWNED_FILE_BYTES + 1).unwrap_err();
+        let error = read_owned_for_index(&path, MAX_OWNED_FILE_BYTES + 1, MAX_OWNED_FILE_BYTES)
+            .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -1585,7 +1584,7 @@ mod tests {
         let path = tmp.path().join("growing.txt");
         std::fs::write(&path, b"four").unwrap();
 
-        let error = read_owned_for_index(&path, 2).unwrap_err();
+        let error = read_owned_for_index(&path, 2, 2).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     }
 
@@ -1596,7 +1595,7 @@ mod tests {
         std::fs::write(&path, b"four").unwrap();
         let budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
 
-        let bytes = read_for_index(&path, 2, &budget).unwrap();
+        let bytes = read_for_index(&path, 2, &budget, None).unwrap();
         assert_eq!(&*bytes, b"four");
     }
 

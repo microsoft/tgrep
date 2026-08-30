@@ -1,12 +1,13 @@
 /// Index builder: walks a repo, extracts trigrams, writes the on-disk index.
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
 use crate::external::{self, ExternalSorter, TrigramPosting};
 use crate::meta::{self, IndexMeta};
 use crate::ondisk::{self, LookupEntry, PostingEntry};
+use crate::path_index;
 use crate::reader::IndexReader;
 use crate::trigram::{self, TrigramMasks};
 use crate::walker;
@@ -604,6 +605,9 @@ pub fn build_index_with_options_and_ignorecase(
         None => root.join(INDEX_DIR_NAME),
     };
     std::fs::create_dir_all(&index_dir)?;
+    // A failed in-place rebuild must not leave a valid-looking sidecar from a
+    // previous generation. Its absence makes `--files` fall back to walking.
+    path_index::remove_extra_paths(&index_dir)?;
 
     eprintln!("Walking {}...", root.display());
     if let Some(hint) = gitignore_gate_hint(&root, opts) {
@@ -739,6 +743,19 @@ pub fn build_index_with_options_and_ignorecase(
     let all_walked = walked_paths_for_stamps(&root, &walk.files, &raced_too_large);
     let stamps = meta::collect_filestamps(&root, &all_walked);
     meta::write_filestamps(&stamps, &index_dir)?;
+
+    let indexed_paths: HashSet<&str> = file_id_map.iter().map(|(_, path)| path.as_str()).collect();
+    let mut extra_paths: Vec<String> = walk
+        .listed_files
+        .iter()
+        .filter_map(|path| path.strip_prefix(&root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .filter(|path| !indexed_paths.contains(path.as_str()))
+        .collect();
+    extra_paths.sort_unstable();
+    path_index::write_extra_paths(&index_dir, &extra_paths)?;
+    // `meta.json` remains the final publication marker for in-place builds.
+    IndexMeta::load(&index_dir)?.save(&index_dir)?;
 
     eprintln!("Index built successfully at {}", index_dir.display());
     Ok(BuildOutcome {
@@ -1911,6 +1928,28 @@ mod tests {
             indexed,
             vec!["src/main.rs".to_string()],
             "a build destined for the server must skip dot-prefixed files"
+        );
+    }
+
+    #[test]
+    fn filename_sidecar_captures_paths_outside_the_content_index() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(repo.path().join("asset.bin"), [1, 2, 3]).unwrap();
+        std::fs::write(repo.path().join("binary.txt"), b"before\0after").unwrap();
+        let index = tempfile::tempdir().unwrap();
+
+        build_index_with_options(repo.path(), Some(index.path()), &BuildOptions::default())
+            .unwrap();
+
+        let reader = IndexReader::open(index.path()).unwrap();
+        assert_eq!(reader.all_paths(), &["main.rs".to_string()]);
+        let extras = crate::path_index::read_extra_paths(index.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            extras,
+            vec!["asset.bin".to_string(), "binary.txt".to_string()]
         );
     }
 

@@ -9,6 +9,7 @@ pub mod hybrid;
 pub mod live;
 pub mod meta;
 pub(crate) mod ondisk;
+pub mod path_index;
 pub mod query;
 pub mod reader;
 pub mod trigram;

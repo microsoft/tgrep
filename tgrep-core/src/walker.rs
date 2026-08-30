@@ -72,6 +72,9 @@ fn should_skip_dir(entry: &ignore::DirEntry, exclude_dirs: &[String]) -> bool {
 
 pub struct WalkResult {
     pub files: Vec<PathBuf>,
+    /// Files admitted by traversal rules and the size cap before binary
+    /// extension filtering. This is the complete set used by `--files`.
+    pub listed_files: Vec<PathBuf>,
     pub gitignore_files: Vec<PathBuf>,
     /// `.ignore` files encountered during the walk. Kept separate from
     /// `gitignore_files` so a matcher can apply them last, giving them
@@ -257,6 +260,7 @@ pub fn walk_dir_with_ignorecase(
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
 ) -> WalkResult {
     let files = std::sync::Mutex::new(Vec::new());
+    let listed_files = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
     let skipped_binary = std::sync::atomic::AtomicUsize::new(0);
@@ -322,6 +326,7 @@ pub fn walk_dir_with_ignorecase(
     walker.run(|| {
         let exclude = exclude_dirs.clone();
         let files = &files;
+        let listed_files = &listed_files;
         let gitignore_files = &gitignore_files;
         let ignore_files = &ignore_files;
         let skipped_binary = &skipped_binary;
@@ -372,7 +377,14 @@ pub fn walk_dir_with_ignorecase(
 
             let path = entry.path();
 
-            if !search_binary && is_binary_extension(path) {
+            let binary_extension = !search_binary && is_binary_extension(path);
+            let too_large = max_file_size
+                .is_some_and(|limit| entry.metadata().is_ok_and(|meta| meta.len() > limit));
+            if !too_large {
+                listed_files.lock().unwrap().push(path.to_path_buf());
+            }
+
+            if binary_extension {
                 skipped_binary.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return ignore::WalkState::Continue;
             }
@@ -380,10 +392,7 @@ pub fn walk_dir_with_ignorecase(
             // Size is checked independently of `search_binary` so `--text`
             // and `--max-filesize` stay orthogonal, the way ripgrep treats
             // `-a` and `--max-filesize`.
-            if let Some(limit) = max_file_size
-                && let Ok(meta) = entry.metadata()
-                && meta.len() > limit
-            {
+            if too_large {
                 skipped_too_large.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return ignore::WalkState::Continue;
             }
@@ -395,6 +404,7 @@ pub fn walk_dir_with_ignorecase(
 
     WalkResult {
         files: files.into_inner().unwrap(),
+        listed_files: listed_files.into_inner().unwrap(),
         gitignore_files: gitignore_files.into_inner().unwrap(),
         ignore_files: ignore_files.into_inner().unwrap(),
         skipped_binary: skipped_binary.into_inner(),
@@ -453,6 +463,8 @@ pub struct FileMeta {
 /// second full-tree walk.
 pub struct MetaWalkResult {
     pub files: Vec<FileMeta>,
+    /// Root-relative files admitted before binary extension filtering.
+    pub listed_files: Vec<String>,
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
     /// Entries or metadata reads the walk could not inspect.
@@ -523,6 +535,7 @@ pub fn walk_file_metadata_with_ignorecase(
     let no_ignore = opts.no_ignore;
     let max_file_size = opts.max_file_size;
     let results = std::sync::Mutex::new(Vec::new());
+    let listed_files = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
     let skipped_error = std::sync::atomic::AtomicUsize::new(0);
@@ -562,6 +575,7 @@ pub fn walk_file_metadata_with_ignorecase(
         let exclude = exclude.clone();
         let root = root.clone();
         let results = &results;
+        let listed_files = &listed_files;
         let gitignore_files = &gitignore_files;
         let ignore_files = &ignore_files;
         let skipped_error = &skipped_error;
@@ -596,15 +610,19 @@ pub fn walk_file_metadata_with_ignorecase(
             }
 
             let path = entry.path();
-
-            if is_binary_extension(path) {
-                return ignore::WalkState::Continue;
-            }
-
             let rel_path = match path.strip_prefix(&root) {
                 Ok(p) => p.to_string_lossy().replace('\\', "/"),
                 Err(_) => return ignore::WalkState::Continue,
             };
+
+            if is_binary_extension(path) {
+                let too_large = max_file_size
+                    .is_some_and(|limit| entry.metadata().is_ok_and(|meta| meta.len() > limit));
+                if !too_large {
+                    listed_files.lock().unwrap().push(rel_path);
+                }
+                return ignore::WalkState::Continue;
+            }
 
             let meta = match entry.metadata() {
                 Ok(meta) => meta,
@@ -616,6 +634,7 @@ pub fn walk_file_metadata_with_ignorecase(
             if max_file_size.is_some_and(|limit| meta.len() > limit) {
                 return ignore::WalkState::Continue;
             }
+            listed_files.lock().unwrap().push(rel_path.clone());
             let stamp = crate::meta::file_stamp(&meta);
             results.lock().unwrap().push(FileMeta {
                 relative_path: rel_path,
@@ -629,6 +648,7 @@ pub fn walk_file_metadata_with_ignorecase(
 
     MetaWalkResult {
         files: results.into_inner().unwrap(),
+        listed_files: listed_files.into_inner().unwrap(),
         gitignore_files: gitignore_files.into_inner().unwrap(),
         ignore_files: ignore_files.into_inner().unwrap(),
         skipped_error: skipped_error.into_inner(),
@@ -678,6 +698,21 @@ mod tests {
         names
     }
 
+    fn sorted_listed_filenames(result: &WalkResult, root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = result
+            .listed_files
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn walk_dir_no_excludes_returns_all_files() {
         let dir = setup_fixture();
@@ -693,6 +728,17 @@ mod tests {
                 "vendor/dep.rs"
             ]
         );
+    }
+
+    #[test]
+    fn walk_dir_retains_binary_extensions_for_file_listing() {
+        let dir = setup_fixture();
+        let root = dir.path().join("testdata");
+        fs::write(root.join("asset.bin"), [0, 1, 2]).unwrap();
+
+        let result = walk_dir(&root, &WalkOptions::default());
+        assert!(!sorted_filenames(&result, &root).contains(&"asset.bin".to_string()));
+        assert!(sorted_listed_filenames(&result, &root).contains(&"asset.bin".to_string()));
     }
 
     #[test]

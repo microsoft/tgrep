@@ -1,6 +1,8 @@
 /// On-disk binary format for the trigram index.
 ///
-/// Three files compose the index:
+/// Three files compose the searchable-content index. `files-extra.bin`, defined
+/// in [`crate::path_index`], complements `files.bin` with paths used only by
+/// `--files`.
 ///
 /// ## `lookup.bin` — sorted trigram → postings pointer
 /// Fixed-size 16-byte entries sorted by trigram hash for binary search.

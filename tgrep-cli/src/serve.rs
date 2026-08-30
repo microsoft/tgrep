@@ -147,8 +147,9 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
 ///   2. `gitignore`     — guards the watcher matcher; drop before file/index work
 ///   3. `publish_lock`  — serializes on-disk index publication
 ///   4. `index`         — guards the in-memory HybridIndex (read-heavy)
-///   5. `cache`         — guards the file content LRU cache
-///   6. `file_stamps`   — guards per-file mtime/size stamps
+///   5. `filename_extra_paths` — guards paths omitted from the content index
+///   6. `cache`         — guards the file content LRU cache
+///   7. `file_stamps`   — guards per-file mtime/size stamps
 ///
 /// `indexing` and `flushing` coordinate the handoff between bulk indexing and
 /// final flush with the auto-save loop; use sequentially consistent accesses
@@ -269,6 +270,13 @@ impl ContentCache {
 
 struct ServerState {
     index: RwLock<HybridIndex>,
+    /// Paths admitted by traversal but deliberately absent from the content
+    /// index. Unioning these with `HybridIndex::all_paths` answers `--files`
+    /// without duplicating every searchable path in memory.
+    filename_extra_paths: RwLock<std::collections::HashSet<String>>,
+    /// False for legacy/partial indexes until a complete filesystem walk has
+    /// established the extra-path set.
+    filename_index_ready: std::sync::atomic::AtomicBool,
     cache: RwLock<ContentCache>,
     cache_generation: std::sync::atomic::AtomicU64,
     root: PathBuf,
@@ -640,6 +648,18 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     let index_complete = tgrep_core::meta::IndexMeta::load(&index_dir)
         .map(|m| m.complete)
         .unwrap_or(false);
+    let (filename_extra_paths, filename_index_ready) = if index_complete {
+        match tgrep_core::path_index::read_extra_paths(&index_dir) {
+            Ok(Some(paths)) => (paths.into_iter().collect(), true),
+            Ok(None) => (std::collections::HashSet::new(), false),
+            Err(error) => {
+                eprintln!("[trace] filename index failed to load ({error}); rebuilding");
+                (std::collections::HashSet::new(), false)
+            }
+        }
+    } else {
+        (std::collections::HashSet::new(), false)
+    };
 
     let needs_build = needs_build || !index_complete;
 
@@ -657,6 +677,8 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
 
     let state = Arc::new(ServerState {
         index: RwLock::new(hybrid),
+        filename_extra_paths: RwLock::new(filename_extra_paths),
+        filename_index_ready: std::sync::atomic::AtomicBool::new(filename_index_ready),
         cache: RwLock::new(ContentCache::new(
             CACHE_CAPACITY,
             CACHE_MAX_BYTES,
@@ -1103,10 +1125,30 @@ fn process_request(request: &str, state: &Arc<ServerState>) -> String {
 
     match method {
         "search" => handle_search(id, &params, state),
+        "files" => handle_files(id, state),
         "status" => handle_status(id, state),
         "reload" => handle_reload(id, state),
         _ => json_rpc_error(id, -32601, &format!("Method not found: {method}")),
     }
+}
+
+fn handle_files(id: Option<serde_json::Value>, state: &ServerState) -> String {
+    state.note_search();
+    if state.indexing.load(Ordering::SeqCst) || !state.filename_index_ready.load(Ordering::SeqCst) {
+        return json_rpc_error(id, -32001, "filename index is not ready");
+    }
+
+    let mut files = {
+        // Keep the documented index -> filename lock order.
+        let index = state.index.read().unwrap();
+        let extra = state.filename_extra_paths.read().unwrap();
+        let mut files = index.all_paths();
+        files.extend(extra.iter().cloned());
+        files
+    };
+    files.sort_unstable();
+    files.dedup();
+    json_rpc_result(id, serde_json::json!({ "files": files }))
 }
 
 /// Parsed and validated search request parameters.
@@ -3830,6 +3872,11 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             {
                 let mut index = state.index.write().unwrap();
                 index.live.delete_file(&rel_path);
+                state
+                    .filename_extra_paths
+                    .write()
+                    .unwrap()
+                    .remove(&rel_path);
                 invalidate_cached_paths_locked(state, std::iter::once(rel_path.as_str()));
             }
             state.file_stamps.write().unwrap().remove(&rel_path);
@@ -4638,6 +4685,7 @@ fn auto_save_loop(state: Arc<ServerState>) {
                     preserved: &std::collections::HashSet::new(),
                     operation: "auto-save",
                     authoritative_membership: false,
+                    authoritative_listed_files: None,
                 },
             ) {
                 last_save = Instant::now();
@@ -4680,6 +4728,75 @@ fn json_rpc_error(id: Option<serde_json::Value>, code: i32, message: &str) -> St
     .to_string()
 }
 
+/// Replace the filename-only delta from an authoritative filesystem path set.
+///
+/// Returns whether the delta changed and therefore needs to be persisted.
+fn replace_filename_extra_paths(state: &ServerState, listed_files: &[String]) -> bool {
+    let content_paths: std::collections::HashSet<String> = state
+        .index
+        .read()
+        .unwrap()
+        .all_paths()
+        .into_iter()
+        .collect();
+    let next: std::collections::HashSet<String> = listed_files
+        .iter()
+        .filter(|path| !content_paths.contains(path.as_str()))
+        .cloned()
+        .collect();
+    let mut current = state.filename_extra_paths.write().unwrap();
+    let changed = *current != next || !state.filename_index_ready.load(Ordering::SeqCst);
+    *current = next;
+    state.filename_index_ready.store(true, Ordering::SeqCst);
+    changed
+}
+
+fn stage_filename_extra_paths(state: &ServerState, staging_dir: &Path) -> Result<()> {
+    let mut paths: Vec<String> = state
+        .filename_extra_paths
+        .read()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
+    paths.sort_unstable();
+    tgrep_core::path_index::write_extra_paths(staging_dir, &paths)?;
+    Ok(())
+}
+
+/// Publish just the filename sidecar after an authoritative walk that did not
+/// otherwise need to rewrite the content index.
+fn persist_filename_extra_paths(state: &ServerState, index_dir: &Path) -> bool {
+    let staging_dir = index_dir.join(".filename-index-staging");
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    if let Err(error) = stage_filename_extra_paths(state, &staging_dir) {
+        eprintln!("[trace] warning: could not stage filename index: {error}");
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return false;
+    }
+
+    let published = {
+        let _publish = state.publish_lock.lock().unwrap();
+        let src = staging_dir.join(tgrep_core::path_index::EXTRA_PATHS_FILENAME);
+        let dst = index_dir.join(tgrep_core::path_index::EXTRA_PATHS_FILENAME);
+        match publish_file(&src, &dst) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("[trace] warning: could not publish filename index: {error}");
+                false
+            }
+        }
+    };
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    published
+}
+
+fn refresh_filename_index(state: &ServerState, index_dir: &Path, listed_files: &[String]) {
+    if replace_filename_extra_paths(state, listed_files) {
+        persist_filename_extra_paths(state, index_dir);
+    }
+}
+
 /// Create a minimal empty on-disk index so HybridIndex::open() succeeds.
 /// The actual data will be populated into the LiveIndex in the background.
 fn create_empty_index(index_dir: &Path) -> Result<()> {
@@ -4692,6 +4809,7 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
     std::fs::write(index_dir.join("lookup.bin"), b"")?;
     std::fs::write(index_dir.join("index.bin"), b"")?;
     std::fs::write(index_dir.join("files.bin"), b"")?;
+    tgrep_core::path_index::remove_extra_paths(index_dir)?;
     let mut meta = IndexMeta::new("", 0, 0);
     meta.complete = false; // empty skeleton — not a complete index
     meta.save(index_dir)?;
@@ -4862,6 +4980,7 @@ struct StaleMergePolicy<'a> {
     preserved: &'a std::collections::HashSet<String>,
     operation: &'a str,
     authoritative_membership: bool,
+    authoritative_listed_files: Option<&'a [String]>,
 }
 
 /// Apply a stale diff without materializing the existing index in heap.
@@ -4890,6 +5009,7 @@ fn stream_merge_stale_changes(
         preserved,
         operation,
         authoritative_membership,
+        authoritative_listed_files,
     } = policy;
     let root = &state.root;
     let index_dir = &state.index_dir;
@@ -5036,6 +5156,22 @@ fn stream_merge_stale_changes(
             .filter(|path| removed.contains(path.as_str()))
             .count();
         let expected_files = reader.num_files() - removed_reader_files + delta.num_files();
+        let filename_extra_paths = authoritative_listed_files.map(|listed_files| {
+            let mut content_paths = std::collections::HashSet::with_capacity(expected_files);
+            content_paths.extend(
+                reader
+                    .all_paths()
+                    .iter()
+                    .filter(|path| !removed.contains(path.as_str()))
+                    .map(String::as_str),
+            );
+            content_paths.extend(delta.all_paths().iter().map(String::as_str));
+            listed_files
+                .iter()
+                .filter(|path| !content_paths.contains(path.as_str()))
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+        });
         let published = publish_staged_index(
             state,
             index_dir,
@@ -5043,6 +5179,7 @@ fn stream_merge_stale_changes(
             expected_files,
             &candidates,
             &preserve_overlay_paths,
+            filename_extra_paths.as_ref(),
         );
         if published.is_published() {
             // `publish_staged_index` prunes overlay entries represented by the
@@ -5311,6 +5448,7 @@ fn refresh_stale_locked(
         return false;
     }
     let current_meta = &walk.files;
+    let listed_files = &walk.listed_files;
 
     // Load stored per-file stamps from last index write
     let mut old_stamps = match meta::read_filestamps(index_dir) {
@@ -5339,6 +5477,7 @@ fn refresh_stale_locked(
         paths
     };
     if old_stamps.is_empty() && indexed_paths.is_empty() && current_meta.is_empty() {
+        refresh_filename_index(state, index_dir, listed_files);
         eprintln!("[trace] stale check: no indexed files or filesystem files, skipping");
         return true;
     }
@@ -5369,6 +5508,7 @@ fn refresh_stale_locked(
     let total_changes = changed.len() + added.len() + deleted.len();
     let live_pending = state.index.read().unwrap().live.has_pending_changes();
     if total_changes == 0 && !live_pending {
+        refresh_filename_index(state, index_dir, listed_files);
         eprintln!(
             "[trace] stale check: index is up-to-date ({} files checked in {}ms)",
             current_meta.len(),
@@ -5404,6 +5544,7 @@ fn refresh_stale_locked(
             preserved: &skipped_unreadable,
             operation: "stale check",
             authoritative_membership: true,
+            authoritative_listed_files: Some(listed_files),
         },
     ) {
         return false;
@@ -5425,8 +5566,11 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
     match HybridIndex::open(index_dir, root) {
         Ok(empty) => {
             let mut index = state.index.write().unwrap();
+            let mut extra = state.filename_extra_paths.write().unwrap();
             let mut cache = state.cache.write().unwrap();
             *index = empty;
+            extra.clear();
+            state.filename_index_ready.store(false, Ordering::SeqCst);
             cache.clear();
             state.cache_generation.fetch_add(1, Ordering::SeqCst);
         }
@@ -5519,10 +5663,26 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         }
     };
     let indexed = opened.num_files() as u64;
+    let filename_extra_paths = match tgrep_core::path_index::read_extra_paths(index_dir) {
+        Ok(Some(paths)) => Some(paths.into_iter().collect()),
+        Ok(None) => {
+            eprintln!("[trace] warning: bootstrapped index has no filename sidecar");
+            None
+        }
+        Err(error) => {
+            eprintln!("[trace] warning: bootstrapped filename index failed to load: {error}");
+            None
+        }
+    };
     {
         let mut index = state.index.write().unwrap();
+        let mut extra = state.filename_extra_paths.write().unwrap();
         let mut cache = state.cache.write().unwrap();
         *index = opened;
+        if let Some(paths) = filename_extra_paths {
+            *extra = paths;
+            state.filename_index_ready.store(true, Ordering::SeqCst);
+        }
         cache.clear();
         state.cache_generation.fetch_add(1, Ordering::SeqCst);
     }
@@ -5915,6 +6075,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             max_file_size: state.max_file_size,
         },
     );
+    let listed_files = walk_meta.listed_files;
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = {
         let indexed = {
             let index = state.index.read().unwrap();
@@ -5941,6 +6102,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // (not skip) until the flush publishes, after which it applies safely to
     // the newly published reader; no event is lost.
     let gate = state.snapshot_gate.write().unwrap();
+    replace_filename_extra_paths(state, &listed_files);
     state.flushing.store(true, Ordering::SeqCst);
 
     // Publish the stamps *before* clearing `indexing`, not after the flush.
@@ -6102,6 +6264,7 @@ fn flush_append_only_overlay_locked(
         num_files,
         &[],
         &std::collections::HashSet::new(),
+        None,
     )
     .is_published();
     eprintln!(
@@ -6143,7 +6306,23 @@ fn publish_staged_index(
     num_files: usize,
     invalidate_paths: &[String],
     preserve_overlay_paths: &std::collections::HashSet<String>,
+    filename_extra_paths: Option<&std::collections::HashSet<String>>,
 ) -> PublishStatus {
+    let filename_stage_result = if let Some(paths) = filename_extra_paths {
+        let mut paths: Vec<String> = paths.iter().cloned().collect();
+        paths.sort_unstable();
+        tgrep_core::path_index::write_extra_paths(staging_dir, &paths).map_err(Into::into)
+    } else if state.filename_index_ready.load(Ordering::SeqCst) {
+        stage_filename_extra_paths(state, staging_dir)
+    } else {
+        Ok(())
+    };
+    if let Err(error) = filename_stage_result {
+        eprintln!("[trace] warning: filename index staging failed: {error}");
+        let _ = std::fs::remove_dir_all(staging_dir);
+        return PublishStatus::Failed;
+    }
+
     // Held across move + open + swap so concurrent publishers (auto-save /
     // background-build / watcher reindex flush) cannot interleave renames
     // or swap readers out of order. Searches do not take this lock.
@@ -6179,6 +6358,10 @@ fn publish_staged_index(
     // observe the new posting set with bytes from the old cache generation.
     {
         let mut index = state.index.write().unwrap();
+        if let Some(paths) = filename_extra_paths {
+            *state.filename_extra_paths.write().unwrap() = paths.clone();
+            state.filename_index_ready.store(true, Ordering::SeqCst);
+        }
         let mut cache = state.cache.write().unwrap();
         index.swap_reader(new_reader);
         index.prune_persisted_entries_except(preserve_overlay_paths);
@@ -6205,6 +6388,19 @@ fn publish_reloaded_index(
     staging_dir: &Path,
     num_files: usize,
 ) -> bool {
+    let filename_extra_paths = match tgrep_core::path_index::read_extra_paths(staging_dir) {
+        Ok(Some(paths)) => paths.into_iter().collect(),
+        Ok(None) => {
+            eprintln!("[trace] warning: reloaded index has no filename sidecar");
+            let _ = std::fs::remove_dir_all(staging_dir);
+            return false;
+        }
+        Err(error) => {
+            eprintln!("[trace] warning: reloaded filename index failed to open: {error}");
+            let _ = std::fs::remove_dir_all(staging_dir);
+            return false;
+        }
+    };
     let _publish = state.publish_lock.lock().unwrap();
     let mut moved = match move_staged_files(staging_dir, index_dir) {
         Ok(moved) => moved,
@@ -6232,6 +6428,8 @@ fn publish_reloaded_index(
     // both in that order makes the complete reload visible as one generation.
     {
         let mut index = state.index.write().unwrap();
+        *state.filename_extra_paths.write().unwrap() = filename_extra_paths;
+        state.filename_index_ready.store(true, Ordering::SeqCst);
         let mut cache = state.cache.write().unwrap();
         index.swap_reader(new_reader);
         let mut reconciled = index.live.overlay_paths();
@@ -6306,6 +6504,7 @@ const INDEX_FILE_NAMES: &[&str] = &[
     "index.bin",
     "lookup.bin",
     "files.bin",
+    tgrep_core::path_index::EXTRA_PATHS_FILENAME,
     "filestamps.json",
     "meta.json",
 ];
@@ -6706,6 +6905,8 @@ mod tests {
         let hybrid = HybridIndex::open(index_dir, root).expect("open empty index");
         Arc::new(ServerState {
             index: RwLock::new(hybrid),
+            filename_extra_paths: RwLock::new(Default::default()),
+            filename_index_ready: std::sync::atomic::AtomicBool::new(false),
             cache: RwLock::new(ContentCache::new(
                 CACHE_CAPACITY,
                 CACHE_MAX_BYTES,
@@ -6756,6 +6957,70 @@ mod tests {
             .status()
             .expect("run git");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn files_rpc_unions_content_and_filename_only_paths() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let index_dir = temp.path().join("index");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = test_server_state(&root, &index_dir);
+        state
+            .index
+            .write()
+            .unwrap()
+            .live
+            .upsert_file("src/main.rs", b"fn main() {}\n");
+        state
+            .filename_extra_paths
+            .write()
+            .unwrap()
+            .insert("asset.bin".to_string());
+        state.filename_index_ready.store(true, Ordering::SeqCst);
+
+        let response = process_request(r#"{"jsonrpc":"2.0","method":"files","id":1}"#, &state);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value.pointer("/result/files").unwrap(),
+            &serde_json::json!(["asset.bin", "src/main.rs"])
+        );
+    }
+
+    #[test]
+    fn watcher_keeps_binary_extensions_in_the_filename_index() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let index_dir = temp.path().join("index");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = test_server_state(&root, &index_dir);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        state.filename_index_ready.store(true, Ordering::SeqCst);
+
+        let asset = root.join("asset.bin");
+        std::fs::write(&asset, [1, 2, 3]).unwrap();
+        let create =
+            Event::new(EventKind::Create(notify::event::CreateKind::File)).add_path(asset.clone());
+        handle_fs_event(&state, &root, &create);
+        assert!(
+            state
+                .filename_extra_paths
+                .read()
+                .unwrap()
+                .contains("asset.bin")
+        );
+        assert!(state.index.read().unwrap().all_paths().is_empty());
+
+        std::fs::remove_file(&asset).unwrap();
+        let remove = Event::new(EventKind::Remove(notify::event::RemoveKind::File)).add_path(asset);
+        handle_fs_event(&state, &root, &remove);
+        assert!(
+            !state
+                .filename_extra_paths
+                .read()
+                .unwrap()
+                .contains("asset.bin")
+        );
     }
 
     /// A binary marker's offset is a position in the file, not in the repaired
@@ -10620,13 +10885,27 @@ mod tests {
         let staging = tmp.path().join("staging");
         let target = tmp.path().join("target");
         std::fs::create_dir_all(&staging).unwrap();
-        for name in ["index.bin", "lookup.bin", "files.bin", "meta.json"] {
+        for name in [
+            "index.bin",
+            "lookup.bin",
+            "files.bin",
+            tgrep_core::path_index::EXTRA_PATHS_FILENAME,
+            "filestamps.json",
+            "meta.json",
+        ] {
             write_file(&staging.join(name), name.as_bytes());
         }
         write_file(&staging.join("ignored.txt"), b"nope");
         let mut moved = move_staged_files(&staging, &target).unwrap();
         moved.commit();
-        for name in ["index.bin", "lookup.bin", "files.bin", "meta.json"] {
+        for name in [
+            "index.bin",
+            "lookup.bin",
+            "files.bin",
+            tgrep_core::path_index::EXTRA_PATHS_FILENAME,
+            "filestamps.json",
+            "meta.json",
+        ] {
             assert_eq!(std::fs::read(target.join(name)).unwrap(), name.as_bytes());
             assert!(
                 !staging.join(name).exists(),

@@ -6073,7 +6073,11 @@ fn publish_staged_index(
         Ok(moved) => moved,
         Err(e) => {
             eprintln!("[trace] warning: flush move failed: {e}");
-            return PublishStatus::Failed;
+            return if e.rollback_failed() {
+                PublishStatus::RollbackFailed
+            } else {
+                PublishStatus::Failed
+            };
         }
     };
     let Some((new_reader, reader_files, reader_trigrams)) =
@@ -6085,6 +6089,7 @@ fn publish_staged_index(
                 PublishStatus::Failed
             }
             Err(e) => {
+                moved.preserve();
                 eprintln!("[trace] warning: failed to roll back index publication: {e}");
                 PublishStatus::RollbackFailed
             }
@@ -6130,6 +6135,7 @@ fn publish_reloaded_index(
                 let _ = std::fs::remove_dir_all(staging_dir);
             }
             Err(e) => {
+                moved.preserve();
                 eprintln!("[trace] warning: failed to roll back reload publication: {e}");
             }
         }
@@ -6278,6 +6284,20 @@ impl StagedFileMove {
     fn commit(&mut self) {
         self.finished = true;
     }
+
+    fn preserve(&mut self) {
+        // Leave every remaining backup and published file exactly where the
+        // failed rollback left it so an operator or later recovery can use it.
+        self.finished = true;
+    }
+
+    fn fail(mut self, publish: std::io::Error) -> MoveStagedFilesError {
+        let rollback = self.rollback().err();
+        if rollback.is_some() {
+            self.preserve();
+        }
+        MoveStagedFilesError { publish, rollback }
+    }
 }
 
 impl Drop for StagedFileMove {
@@ -6285,6 +6305,34 @@ impl Drop for StagedFileMove {
         if let Err(e) = self.rollback() {
             eprintln!("[trace] warning: failed to roll back staged index files: {e}");
         }
+    }
+}
+
+#[derive(Debug)]
+struct MoveStagedFilesError {
+    publish: std::io::Error,
+    rollback: Option<std::io::Error>,
+}
+
+impl MoveStagedFilesError {
+    fn rollback_failed(&self) -> bool {
+        self.rollback.is_some()
+    }
+}
+
+impl std::fmt::Display for MoveStagedFilesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.publish)?;
+        if let Some(rollback) = &self.rollback {
+            write!(f, "; rollback also failed: {rollback}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MoveStagedFilesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.publish)
     }
 }
 
@@ -6305,8 +6353,14 @@ impl Drop for StagedFileMove {
 /// created next to the target (same parent) so cross-volume cases should
 /// not arise; if rename truly fails, the error is surfaced rather than
 /// silently falling back to a slow copy (see `publish_file`).
-fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<StagedFileMove> {
-    std::fs::create_dir_all(target)?;
+fn move_staged_files(
+    staging: &Path,
+    target: &Path,
+) -> Result<StagedFileMove, MoveStagedFilesError> {
+    std::fs::create_dir_all(target).map_err(|publish| MoveStagedFilesError {
+        publish,
+        rollback: None,
+    })?;
     let mut moved = StagedFileMove {
         staging: staging.to_path_buf(),
         target: target.to_path_buf(),
@@ -6321,10 +6375,14 @@ fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<StagedFil
             continue;
         }
         if dst.exists() {
-            publish_file(&dst, &moved.backup_path(name))?;
+            if let Err(error) = publish_file(&dst, &moved.backup_path(name)) {
+                return Err(moved.fail(error));
+            }
             moved.backed_up.push(name);
         }
-        publish_file(&src, &dst)?;
+        if let Err(error) = publish_file(&src, &dst) {
+            return Err(moved.fail(error));
+        }
         moved.published.push(name);
     }
     Ok(moved)
@@ -10391,6 +10449,32 @@ mod tests {
         moved.rollback().unwrap();
 
         assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn move_failure_reports_rollback_failure_and_preserves_backups() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join(".previous-index.bin"), b"old-index");
+        std::fs::create_dir(target.join("index.bin")).unwrap();
+
+        let moved = StagedFileMove {
+            staging: staging.clone(),
+            target,
+            backed_up: vec!["index.bin"],
+            published: vec!["index.bin"],
+            finished: false,
+        };
+        let error = moved.fail(std::io::Error::other("publish failed"));
+
+        assert!(error.rollback_failed());
+        assert_eq!(
+            std::fs::read(staging.join(".previous-index.bin")).unwrap(),
+            b"old-index"
+        );
     }
 
     #[test]

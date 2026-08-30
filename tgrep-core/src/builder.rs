@@ -472,13 +472,13 @@ fn read_for_index(
         // accepts.
         let mapped =
             std::fs::File::open(path).and_then(|file| unsafe { memmap2::Mmap::map(&file) });
-        if let Ok(map) = mapped {
-            if map.len() as u64 <= owned_limit {
-                return Ok(FileBytes::Mapped(map));
-            }
-            // The file grew between the walk's stat and the map. Do not let a
-            // successful mmap bypass a caller-supplied max-file-size limit.
+        if let Ok(map) = mapped
+            && map.len() as u64 <= owned_limit
+        {
+            return Ok(FileBytes::Mapped(map));
         }
+        // The file grew between the walk's stat and the map. Do not let a
+        // successful mmap bypass a caller-supplied max-file-size limit.
     }
     let permit = owned_budget.acquire(size);
     match read_owned_for_index(path, size, owned_limit) {

@@ -317,6 +317,19 @@ fn batch_sizes_and_charges(files: &[std::path::PathBuf]) -> (Vec<u64>, Vec<Batch
         .unzip()
 }
 
+fn walked_paths_for_stamps(
+    root: &Path,
+    files: &[std::path::PathBuf],
+    excluded: &std::collections::HashSet<std::path::PathBuf>,
+) -> Vec<String> {
+    files
+        .iter()
+        .filter(|path| !excluded.contains(*path))
+        .filter_map(|path| path.strip_prefix(root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
 /// Smallest file worth memory-mapping instead of reading.
 ///
 /// The same tradeoff the search path makes: mapping costs a syscall pair and a
@@ -641,11 +654,11 @@ pub fn build_index_with_options_and_ignorecase(
     // The walk already stats every entry but discards the size, so recover it
     // here rather than widening WalkResult into the search and serve paths.
     let (sizes, charges) = batch_sizes_and_charges(&walk.files);
+    let raced_too_large = std::sync::Mutex::new(std::collections::HashSet::new());
 
     for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
         let batch = &walk.files[range.clone()];
         let batch_sizes = &sizes[range];
-        let owned_limit_error = std::sync::Mutex::new(None);
         let owned_budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
         let batch_data: Vec<ExtractedFile> = batch
             .par_iter()
@@ -655,10 +668,7 @@ pub fn build_index_with_options_and_ignorecase(
                     Ok(data) => data,
                     Err(error) => {
                         if error.kind() == std::io::ErrorKind::InvalidData {
-                            let mut first = owned_limit_error.lock().unwrap();
-                            if first.is_none() {
-                                *first = Some((path.clone(), error));
-                            }
+                            raced_too_large.lock().unwrap().insert(path.clone());
                         }
                         return None;
                     }
@@ -677,12 +687,6 @@ pub fn build_index_with_options_and_ignorecase(
                 Some((rel, per_tri))
             })
             .collect();
-        if let Some((path, error)) = owned_limit_error.into_inner().unwrap() {
-            return Err(Error::Io(std::io::Error::new(
-                error.kind(),
-                format!("{}: {error}", path.display()),
-            )));
-        }
 
         for (path, per_tri) in batch_data {
             let file_id = file_id_map.len() as u32;
@@ -722,15 +726,17 @@ pub fn build_index_with_options_and_ignorecase(
         }
     }
 
-    // Write per-file stamps for ALL walked files (including those later
-    // rejected as binary-by-content) so the stale check on next startup
-    // won't re-process unchanged files that aren't in the index.
-    let all_walked: Vec<String> = walk
-        .files
-        .iter()
-        .filter_map(|p| p.strip_prefix(&root).ok())
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .collect();
+    // Write per-file stamps for walked files, including those later rejected
+    // as binary-by-content. A file that raced past max-file-size is different:
+    // withholding its stamp leaves it eligible for a later retry.
+    let raced_too_large = raced_too_large.into_inner().unwrap();
+    if !raced_too_large.is_empty() {
+        eprintln!(
+            "Skipped {} files that grew past max-file-size during extraction",
+            raced_too_large.len()
+        );
+    }
+    let all_walked = walked_paths_for_stamps(&root, &walk.files, &raced_too_large);
     let stamps = meta::collect_filestamps(&root, &all_walked);
     meta::write_filestamps(&stamps, &index_dir)?;
 
@@ -1516,6 +1522,19 @@ mod tests {
 
     fn charges(sizes: &[u64]) -> Vec<BatchCharge> {
         sizes.iter().copied().map(batch_charge).collect()
+    }
+
+    #[test]
+    fn raced_oversized_files_are_excluded_from_published_stamps() {
+        let root = std::path::PathBuf::from("repo");
+        let kept = root.join("kept.rs");
+        let skipped = root.join("grew.rs");
+        let excluded = std::collections::HashSet::from([skipped.clone()]);
+
+        assert_eq!(
+            walked_paths_for_stamps(&root, &[kept, skipped], &excluded),
+            vec!["kept.rs"]
+        );
     }
 
     #[test]

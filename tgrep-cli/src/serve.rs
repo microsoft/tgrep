@@ -1607,7 +1607,13 @@ fn update_content_cache(
     }
 }
 
-fn invalidate_cached_paths<'a>(state: &ServerState, paths: impl IntoIterator<Item = &'a str>) {
+/// Invalidate cache entries while the caller holds the index write lock.
+/// Searches acquire these locks in index-then-cache order, so the new posting
+/// set and its corresponding cache generation become visible atomically.
+fn invalidate_cached_paths_locked<'a>(
+    state: &ServerState,
+    paths: impl IntoIterator<Item = &'a str>,
+) {
     let Ok(mut cache) = state.cache.write() else {
         return;
     };
@@ -3208,9 +3214,12 @@ fn sweep_removed_files(
             Err(e) if proves_ineligible(&e) => {}
             Err(_) => continue,
         }
-        state.index.write().unwrap().live.delete_file(rel);
+        {
+            let mut index = state.index.write().unwrap();
+            index.live.delete_file(rel);
+            invalidate_cached_paths_locked(state, std::iter::once(rel.as_str()));
+        }
         state.file_stamps.write().unwrap().remove(rel);
-        invalidate_cached_paths(state, std::iter::once(rel.as_str()));
         dropped += 1;
     }
     if dropped > 0 {
@@ -3818,9 +3827,12 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             }
             // gate acquired at the function level — the entire event
             // is processed atomically with respect to flush/auto-save.
-            state.index.write().unwrap().live.delete_file(&rel_path);
+            {
+                let mut index = state.index.write().unwrap();
+                index.live.delete_file(&rel_path);
+                invalidate_cached_paths_locked(state, std::iter::once(rel_path.as_str()));
+            }
             state.file_stamps.write().unwrap().remove(&rel_path);
-            invalidate_cached_paths(state, std::iter::once(rel_path.as_str()));
             continue;
         }
 
@@ -3921,8 +3933,9 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
         }
     }
     eprintln!("[trace] reindex: dropped {rel_path} ({reason})");
-    state.index.write().unwrap().live.delete_file(rel_path);
-    invalidate_cached_paths(state, std::iter::once(rel_path));
+    let mut index = state.index.write().unwrap();
+    index.live.delete_file(rel_path);
+    invalidate_cached_paths_locked(state, std::iter::once(rel_path));
 }
 
 /// What an event's stat result says about the path it named.
@@ -4485,13 +4498,13 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
             Some(per_tri) => index.live.commit_upsert(rel_path, per_tri),
             None => index.live.delete_file(rel_path),
         }
+        invalidate_cached_paths_locked(state, std::iter::once(rel_path));
     }
     state
         .file_stamps
         .write()
         .unwrap()
         .insert(rel_path.to_string(), current);
-    invalidate_cached_paths(state, std::iter::once(rel_path));
 }
 
 fn retry_failed_forced_reindex(state: &Arc<ServerState>, rel_path: &str, reason: &str) {
@@ -4969,7 +4982,8 @@ fn stream_merge_stale_changes(
             .filter(|path| removed.contains(path.as_str()))
             .count();
         let expected_files = reader.num_files() - removed_reader_files + delta.num_files();
-        let published = publish_staged_index(state, index_dir, &staging_dir, expected_files);
+        let published =
+            publish_staged_index(state, index_dir, &staging_dir, expected_files, &candidates);
         if published.is_published() {
             // `publish_staged_index` prunes overlay entries represented by the
             // new reader. Also clear reconciled entries intentionally omitted
@@ -5332,14 +5346,6 @@ fn refresh_stale_locked(
         return false;
     }
 
-    invalidate_cached_paths(
-        state,
-        changed
-            .iter()
-            .chain(added.iter())
-            .chain(deleted.iter())
-            .map(String::as_str),
-    );
     true
 }
 
@@ -6026,7 +6032,8 @@ fn flush_append_only_overlay_locked(
         eprintln!("[trace] warning: failed to write staging filestamps: {e}");
     }
 
-    let pruned = publish_staged_index(state, index_dir, &staging_dir, num_files).is_published();
+    let pruned =
+        publish_staged_index(state, index_dir, &staging_dir, num_files, &[]).is_published();
     eprintln!(
         "[trace] append-only flush: {num_files} files on disk (complete={complete}) in {:.1}s",
         flush_start.elapsed().as_secs_f64()
@@ -6064,6 +6071,7 @@ fn publish_staged_index(
     index_dir: &Path,
     staging_dir: &Path,
     num_files: usize,
+    invalidate_paths: &[String],
 ) -> PublishStatus {
     // Held across move + open + swap so concurrent publishers (auto-save /
     // background-build / watcher reindex flush) cannot interleave renames
@@ -6096,13 +6104,20 @@ fn publish_staged_index(
         };
     };
 
-    // Atomic swap — no outer write lock required.
-    state.index.read().unwrap().swap_reader(new_reader);
-    // Brief write lock for in-memory overlay maintenance only.
+    // Hold the index write lock through cache invalidation so searches cannot
+    // observe the new posting set with bytes from the old cache generation.
     {
         let mut index = state.index.write().unwrap();
+        let mut cache = state.cache.write().unwrap();
+        index.swap_reader(new_reader);
         index.prune_persisted_entries();
         index.live.reset_dirty_count();
+        for path in invalidate_paths {
+            cache.pop(path);
+        }
+        if !invalidate_paths.is_empty() {
+            state.cache_generation.fetch_add(1, Ordering::SeqCst);
+        }
     }
     moved.commit();
     eprintln!(
@@ -8157,7 +8172,8 @@ mod tests {
             )),
         )];
 
-        invalidate_cached_paths(&state, std::iter::once("stale.rs"));
+        let _index = state.index.read().unwrap();
+        invalidate_cached_paths_locked(&state, std::iter::once("stale.rs"));
         update_content_cache(&state, before_reload, &[], &stale);
         assert!(
             state.cache.read().unwrap().peek("stale.rs").is_none(),

@@ -4223,34 +4223,45 @@ fn file_still_has_bytes(
 ) -> std::io::Result<bool> {
     use std::io::Read;
 
-    fn matches(
-        mut file: std::fs::File,
-        expected_version: &tgrep_core::builder::FileVersion,
-        expected: &[u8],
-    ) -> std::io::Result<bool> {
-        if tgrep_core::builder::file_version(&file.metadata()?) != *expected_version {
-            return Ok(false);
-        }
-        let mut offset = 0;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            if expected.get(offset..offset + read) != Some(&buffer[..read]) {
-                return Ok(false);
-            }
-            offset += read;
-        }
-        Ok(offset == expected.len()
-            && tgrep_core::builder::file_version(&file.metadata()?) == *expected_version)
-    }
-
-    if !matches(open_within_root(root, path)?, expected_version, expected)? {
+    let mut file = open_within_root(root, path)?;
+    if tgrep_core::builder::file_version(&file.metadata()?) != *expected_version {
         return Ok(false);
     }
-    matches(open_within_root(root, path)?, expected_version, expected)
+    let mut offset = 0;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if expected.get(offset..offset + read) != Some(&buffer[..read]) {
+            return Ok(false);
+        }
+        offset += read;
+    }
+    if offset != expected.len()
+        || tgrep_core::builder::file_version(&file.metadata()?) != *expected_version
+    {
+        return Ok(false);
+    }
+    let current = open_within_root(root, path)?;
+    Ok(tgrep_core::builder::file_version(&current.metadata()?) == *expected_version)
+}
+
+fn current_path_is_ineligible(state: &ServerState, path: &Path) -> bool {
+    let file = match open_within_root(&state.root, path) {
+        Ok(file) => file,
+        Err(error) => return proves_ineligible(&error),
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return proves_ineligible(&error),
+    };
+    !metadata.is_file()
+        || tgrep_core::walker::is_binary_extension(path)
+        || state
+            .max_file_size
+            .is_some_and(|limit| metadata.len() > limit)
 }
 
 /// Reads a file's contents, never pulling in more than one byte past the cap.
@@ -4373,35 +4384,13 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     // on our file I/O and trigram parsing. Windows' SRWLock is
     // writer-preferring: a single waiting writer here would otherwise
     // stall every subsequent search request.
-    //
-    // From the handle, not the path: re-opening here is what would let a
-    // symlink take the place of the file we just approved.
-    let mut file = file;
-    let mut data = match read_within_limit(
-        &mut file,
-        state.max_file_size,
-        current.size.min(1 << 20) as usize,
-    ) {
-        CappedRead::Data(data) => data,
-        CappedRead::TooLarge => {
-            drop_indexed_file(state, rel_path, "grew past the size limit while being read");
-            return;
-        }
-        CappedRead::Failed => {
-            if force {
-                retry_failed_forced_reindex(state, rel_path, "the file could not be read");
-            }
-            return;
-        }
-    };
-    if force {
-        #[cfg(test)]
-        run_stale_refresh_hook(state, StaleRefreshPhase::AfterConcreteRead);
-        // A concrete event is stronger evidence than the persisted stamp. Read
-        // containment-safe snapshots until the bytes and full-resolution file
-        // version agree, then bind the final decision to a fresh read of those
-        // exact bytes immediately before commit.
-        let mut stable = false;
+    let data = if force {
+        // A concrete event is stronger evidence than the persisted stamp. The
+        // initial handle established eligibility, but its bytes need not be
+        // read: use one fresh, containment-safe handle as the indexing snapshot
+        // and retry only if full-resolution metadata changes during that read.
+        drop(file);
+        let mut stable = None;
         for _ in 0..2 {
             let mut verify = match open_within_root(&state.root, path) {
                 Ok(file) => file,
@@ -4452,29 +4441,39 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
                     return;
                 }
             };
-            let handle_stable = verify.metadata().is_ok_and(|metadata| {
+            if verify.metadata().is_ok_and(|metadata| {
                 tgrep_core::builder::file_version(&metadata) == verify_version
-            });
-            if data == verified
-                && handle_stable
-                && file_still_has_bytes(&state.root, path, &verify_version, &verified)
-                    .unwrap_or(false)
-            {
-                data = verified;
+            }) {
                 current = verify_current;
                 version = verify_version;
-                stable = true;
+                stable = Some(verified);
                 break;
             }
-            data = verified;
-            current = verify_current;
-            version = verify_version;
         }
-        if !stable {
+        let Some(verified) = stable else {
             retry_failed_forced_reindex(state, rel_path, "the file kept changing while read");
             return;
+        };
+        #[cfg(test)]
+        run_stale_refresh_hook(state, StaleRefreshPhase::AfterConcreteRead);
+        verified
+    } else {
+        // From the approved handle, not the path: re-opening here is what would
+        // let a symlink take the place of the file we just approved.
+        let mut file = file;
+        match read_within_limit(
+            &mut file,
+            state.max_file_size,
+            current.size.min(1 << 20) as usize,
+        ) {
+            CappedRead::Data(data) => data,
+            CappedRead::TooLarge => {
+                drop_indexed_file(state, rel_path, "grew past the size limit while being read");
+                return;
+            }
+            CappedRead::Failed => return,
         }
-    }
+    };
     let text = tgrep_core::encoding::decode_for_index(&data);
     let is_binary = tgrep_core::trigram::is_binary(&text);
     let per_tri = if is_binary {
@@ -4484,9 +4483,26 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     };
     #[cfg(test)]
     run_stale_refresh_hook(state, StaleRefreshPhase::BeforeConcreteCommit);
-    if force && !file_still_has_bytes(&state.root, path, &version, &data).unwrap_or(false) {
-        retry_failed_forced_reindex(state, rel_path, "the file changed before commit");
-        return;
+    if force {
+        match file_still_has_bytes(&state.root, path, &version, &data) {
+            Ok(true) => {}
+            Ok(false) => {
+                if current_path_is_ineligible(state, path) {
+                    drop_indexed_file(state, rel_path, "no longer eligible");
+                } else {
+                    retry_failed_forced_reindex(state, rel_path, "the file changed before commit");
+                }
+                return;
+            }
+            Err(error) if proves_ineligible(&error) => {
+                drop_indexed_file(state, rel_path, "no longer eligible");
+                return;
+            }
+            Err(_) => {
+                retry_failed_forced_reindex(state, rel_path, "the file changed before commit");
+                return;
+            }
+        }
     }
 
     eprintln!("[trace] reindex: modified {rel_path}");

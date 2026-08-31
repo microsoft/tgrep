@@ -507,6 +507,7 @@ fn filename_index_compatible(opts: &SearchOptions) -> bool {
         && !opts.follow
         && !opts.one_file_system
         && opts.ignore_files.is_empty()
+        && !opts.ignore_file_case_insensitive
         && !opts.max_filesize_requested
 }
 

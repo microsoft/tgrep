@@ -131,6 +131,20 @@ fn indexed_files_include_non_content_paths_and_use_the_snapshot() {
             .iter()
             .any(|path| path.ends_with("/created-after-index.rs"))
     );
+
+    let case_insensitive_ignore = output_lines(tgrep().args([
+        "--files",
+        "--ignore-file-case-insensitive",
+        root.to_str().unwrap(),
+        "--index-path",
+        index.to_str().unwrap(),
+    ]));
+    assert!(
+        case_insensitive_ignore
+            .iter()
+            .any(|path| path.ends_with("/created-after-index.rs")),
+        "the traversal-changing ignore flag unexpectedly used the snapshot"
+    );
 }
 
 #[test]

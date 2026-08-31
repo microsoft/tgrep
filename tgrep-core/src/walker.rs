@@ -70,6 +70,16 @@ fn should_skip_dir(entry: &ignore::DirEntry, exclude_dirs: &[String]) -> bool {
             .is_some_and(|name| exclude_dirs.iter().any(|d| d == name))
 }
 
+fn exceeds_size_limit<E>(
+    max_file_size: Option<u64>,
+    metadata_len: impl FnOnce() -> Result<u64, E>,
+) -> Result<bool, E> {
+    match max_file_size {
+        Some(limit) => metadata_len().map(|size| size > limit),
+        None => Ok(false),
+    }
+}
+
 pub struct WalkResult {
     pub files: Vec<PathBuf>,
     /// Files admitted by traversal rules and the size cap before binary
@@ -378,8 +388,15 @@ pub fn walk_dir_with_ignorecase(
             let path = entry.path();
 
             let binary_extension = !search_binary && is_binary_extension(path);
-            let too_large = max_file_size
-                .is_some_and(|limit| entry.metadata().is_ok_and(|meta| meta.len() > limit));
+            let too_large =
+                match exceeds_size_limit(max_file_size, || entry.metadata().map(|meta| meta.len()))
+                {
+                    Ok(too_large) => too_large,
+                    Err(_) => {
+                        skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return ignore::WalkState::Continue;
+                    }
+                };
             if !too_large {
                 listed_files.lock().unwrap().push(path.to_path_buf());
             }
@@ -616,8 +633,15 @@ pub fn walk_file_metadata_with_ignorecase(
             };
 
             if is_binary_extension(path) {
-                let too_large = max_file_size
-                    .is_some_and(|limit| entry.metadata().is_ok_and(|meta| meta.len() > limit));
+                let too_large = match exceeds_size_limit(max_file_size, || {
+                    entry.metadata().map(|meta| meta.len())
+                }) {
+                    Ok(too_large) => too_large,
+                    Err(_) => {
+                        skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return ignore::WalkState::Continue;
+                    }
+                };
                 if !too_large {
                     listed_files.lock().unwrap().push(rel_path);
                 }
@@ -739,6 +763,22 @@ mod tests {
         let result = walk_dir(&root, &WalkOptions::default());
         assert!(!sorted_filenames(&result, &root).contains(&"asset.bin".to_string()));
         assert!(sorted_listed_filenames(&result, &root).contains(&"asset.bin".to_string()));
+    }
+
+    #[test]
+    fn size_limit_requires_successful_metadata() {
+        assert_eq!(exceeds_size_limit(Some(10), || Ok::<_, ()>(11)), Ok(true));
+        assert_eq!(exceeds_size_limit(Some(10), || Ok::<_, ()>(10)), Ok(false));
+        assert_eq!(
+            exceeds_size_limit(Some(10), || Err::<u64, _>("metadata failed")),
+            Err("metadata failed")
+        );
+        assert_eq!(
+            exceeds_size_limit(None, || -> Result<u64, ()> {
+                panic!("an uncapped walk must not read metadata")
+            }),
+            Ok(false)
+        );
     }
 
     #[test]

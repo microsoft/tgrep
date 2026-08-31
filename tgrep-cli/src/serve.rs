@@ -6988,6 +6988,34 @@ mod tests {
     }
 
     #[test]
+    fn reload_replaces_content_and_filename_paths_together() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let index_dir = temp.path().join("index");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("new.bin"), [1, 2, 3]).unwrap();
+        let state = test_server_state(&root, &index_dir);
+        state
+            .filename_extra_paths
+            .write()
+            .unwrap()
+            .insert("removed.bin".to_string());
+
+        let response = handle_reload(Some(serde_json::json!(1)), &state);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value.pointer("/result/status").unwrap(), "reloaded");
+        assert!(state.filename_index_ready.load(Ordering::SeqCst));
+
+        let response = handle_files(Some(serde_json::json!(2)), &state);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value.pointer("/result/files").unwrap(),
+            &serde_json::json!(["main.rs", "new.bin"])
+        );
+    }
+
+    #[test]
     fn watcher_keeps_binary_extensions_in_the_filename_index() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("root");

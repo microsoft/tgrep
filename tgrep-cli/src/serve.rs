@@ -4628,7 +4628,18 @@ fn auto_save_loop(state: Arc<ServerState>) {
             }
 
             let stamps = state.file_stamps.read().unwrap().clone();
-            if stream_merge_stale_changes(&state, &[], &[], &[], &stamps, "auto-save", false) {
+            if stream_merge_stale_changes(
+                &state,
+                &[],
+                &[],
+                &[],
+                &stamps,
+                StaleMergePolicy {
+                    preserved: &std::collections::HashSet::new(),
+                    operation: "auto-save",
+                    authoritative_membership: false,
+                },
+            ) {
                 last_save = Instant::now();
                 eprintln!(
                     "[trace] auto-save complete in {:.1}s",
@@ -4847,6 +4858,12 @@ fn classify_file_changes(
     (changed, added, deleted)
 }
 
+struct StaleMergePolicy<'a> {
+    preserved: &'a std::collections::HashSet<String>,
+    operation: &'a str,
+    authoritative_membership: bool,
+}
+
 /// Apply a stale diff without materializing the existing index in heap.
 ///
 /// The ordinary incremental flush uses `HybridIndex::full_snapshot`, whose
@@ -4855,6 +4872,9 @@ fn classify_file_changes(
 /// cap: every formerly-oversized file appears as new at once. Build new and
 /// replacement files into a bounded external-sort delta, then stream it together
 /// with the old index while filtering replaced and deleted reader entries.
+/// `preserved` contains candidates whose last read failed without proving a
+/// deletion; they remain in the reader or live overlay until their metadata
+/// changes and another read is attempted.
 ///
 /// The caller holds `snapshot_gate` across the metadata walk and this merge, so
 /// the walk's exact path set is newer than every live entry captured here.
@@ -4864,9 +4884,13 @@ fn stream_merge_stale_changes(
     added: &[String],
     deleted: &[String],
     stamps: &std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
-    operation: &str,
-    authoritative_membership: bool,
+    policy: StaleMergePolicy<'_>,
 ) -> bool {
+    let StaleMergePolicy {
+        preserved,
+        operation,
+        authoritative_membership,
+    } = policy;
     let root = &state.root;
     let index_dir = &state.index_dir;
     let (reader, overlay_paths, tombstone_paths) = {
@@ -4905,6 +4929,7 @@ fn stream_merge_stale_changes(
         .chain(deleted)
         .chain(overlay_paths.iter())
         .chain(tombstone_paths.iter())
+        .filter(|path| !preserved.contains(*path))
         .filter(|path| seen.insert((*path).clone()))
         .cloned()
         .collect();
@@ -4913,6 +4938,7 @@ fn stream_merge_stale_changes(
             reader
                 .all_paths()
                 .iter()
+                .filter(|path| !preserved.contains(path.as_str()))
                 .filter(|path| !stamps.contains_key(path.as_str()))
                 .filter(|path| seen.insert((*path).clone()))
                 .cloned(),
@@ -4926,9 +4952,10 @@ fn stream_merge_stale_changes(
     let files: Vec<PathBuf> = desired_paths.iter().map(|path| root.join(path)).collect();
     // Every candidate is either removed or replaced by the delta. Including a
     // genuinely new path is harmless because it has no reader entry to filter.
-    let removed: std::collections::HashSet<String> = candidates.iter().cloned().collect();
+    let mut removed: std::collections::HashSet<String> = candidates.iter().cloned().collect();
 
     let mut published_stamps = stamps.clone();
+    let mut preserve_overlay_paths = preserved.clone();
 
     let result = (|| -> Result<PublishStatus> {
         let build = || {
@@ -4957,31 +4984,40 @@ fn stream_merge_stale_changes(
         // Record what the file looked like when it failed, so a permanent
         // failure is retried when the file changes rather than on every pass.
         // See `ServerState::unreadable`.
-        {
+        let unreadable = {
             let mut memo = state.unreadable.write().unwrap();
             // Anything this delta was asked to build is settled: either it was
             // read, or it is in `outcome.unreadable` and re-recorded below.
             for path in changed.iter().chain(added).chain(deleted) {
                 memo.remove(path);
             }
+            let mut unreadable = std::collections::HashSet::new();
             for path in &outcome.unreadable {
                 let rel = path
                     .strip_prefix(root)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
+                unreadable.insert(rel.clone());
                 if let Some(stamp) = published_stamps.remove(&rel) {
                     memo.insert(rel, stamp);
                 }
             }
-        }
-        if !outcome.unreadable.is_empty() {
+            unreadable
+        };
+        if !unreadable.is_empty() {
+            // A missing delta entry must not be interpreted as a deletion. Keep
+            // its old reader entry and any newer live overlay entry while the
+            // rest of the merge publishes normally. Its withheld stamp and
+            // memoized failed version make a later file change retry the read.
+            candidates.retain(|path| !unreadable.contains(path));
+            removed.retain(|path| !unreadable.contains(path));
+            preserve_overlay_paths.extend(unreadable.iter().cloned());
             eprintln!(
                 "[trace] {} file(s) were unreadable during the delta build; \
-                 preserving the current index and retrying later",
-                outcome.unreadable.len()
+                 preserving their current index entries and retrying after they change",
+                unreadable.len()
             );
-            return Ok(PublishStatus::Failed);
         }
 
         let delta = tgrep_core::reader::IndexReader::open(&delta_dir)?;
@@ -5000,8 +5036,14 @@ fn stream_merge_stale_changes(
             .filter(|path| removed.contains(path.as_str()))
             .count();
         let expected_files = reader.num_files() - removed_reader_files + delta.num_files();
-        let published =
-            publish_staged_index(state, index_dir, &staging_dir, expected_files, &candidates);
+        let published = publish_staged_index(
+            state,
+            index_dir,
+            &staging_dir,
+            expected_files,
+            &candidates,
+            &preserve_overlay_paths,
+        );
         if published.is_published() {
             // `publish_staged_index` prunes overlay entries represented by the
             // new reader. Also clear reconciled entries intentionally omitted
@@ -5358,8 +5400,11 @@ fn refresh_stale_locked(
         &added,
         &deleted,
         &new_stamps,
-        "stale check",
-        true,
+        StaleMergePolicy {
+            preserved: &skipped_unreadable,
+            operation: "stale check",
+            authoritative_membership: true,
+        },
     ) {
         return false;
     }
@@ -6050,8 +6095,15 @@ fn flush_append_only_overlay_locked(
         eprintln!("[trace] warning: failed to write staging filestamps: {e}");
     }
 
-    let pruned =
-        publish_staged_index(state, index_dir, &staging_dir, num_files, &[]).is_published();
+    let pruned = publish_staged_index(
+        state,
+        index_dir,
+        &staging_dir,
+        num_files,
+        &[],
+        &std::collections::HashSet::new(),
+    )
+    .is_published();
     eprintln!(
         "[trace] append-only flush: {num_files} files on disk (complete={complete}) in {:.1}s",
         flush_start.elapsed().as_secs_f64()
@@ -6090,6 +6142,7 @@ fn publish_staged_index(
     staging_dir: &Path,
     num_files: usize,
     invalidate_paths: &[String],
+    preserve_overlay_paths: &std::collections::HashSet<String>,
 ) -> PublishStatus {
     // Held across move + open + swap so concurrent publishers (auto-save /
     // background-build / watcher reindex flush) cannot interleave renames
@@ -6128,7 +6181,7 @@ fn publish_staged_index(
         let mut index = state.index.write().unwrap();
         let mut cache = state.cache.write().unwrap();
         index.swap_reader(new_reader);
-        index.prune_persisted_entries();
+        index.prune_persisted_entries_except(preserve_overlay_paths);
         index.live.reset_dirty_count();
         for path in invalidate_paths {
             cache.pop(path);
@@ -7188,24 +7241,109 @@ mod tests {
     }
 
     #[test]
-    fn rejected_never_indexed_file_does_not_dirty_the_overlay() {
+    fn rejected_never_indexed_files_do_not_dirty_the_overlay() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let index_dir = root.join(".tgrep");
         let state = test_server_state(&root, &index_dir);
-        let rejected = root.join("asset.png");
-        std::fs::write(&rejected, "not indexed despite textual contents\n").unwrap();
+        let rejected_extension = root.join("asset.png");
+        let rejected_content = root.join("binary.rs");
+        std::fs::write(
+            &rejected_extension,
+            "not indexed despite textual contents\n",
+        )
+        .unwrap();
+        std::fs::write(&rejected_content, b"fn looks_textual() {}\n\0binary\n").unwrap();
 
         let _gate = state.snapshot_gate.read().unwrap();
-        reindex_file(&state, &rejected, "asset.png", false);
+        reindex_file(&state, &rejected_extension, "asset.png", false);
+        reindex_file(&state, &rejected_content, "binary.rs", false);
 
         let index = state.index.read().unwrap();
         assert_eq!(
             index.live.dirty_count(),
             0,
-            "a path absent from reader, overlay, and stamps must not create a tombstone"
+            "paths absent from reader, overlay, and stamps must not create tombstones"
         );
         assert!(!index.live.is_deleted("asset.png"));
+        assert!(!index.live.is_deleted("binary.rs"));
+    }
+
+    #[test]
+    fn unreadable_stale_delta_preserves_reader_and_overlay_entries() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        let path = root.join("raced.rs");
+        std::fs::write(&path, "fn old_reader_marker() {}\n").unwrap();
+        builder::build_index_for_files(&root, &index_dir, std::slice::from_ref(&path), 1024)
+            .unwrap();
+        *state.index.write().unwrap() = HybridIndex::open(&index_dir, &root).unwrap();
+        assert!(state.index.read().unwrap().reader_has_path("raced.rs"));
+
+        std::fs::write(&path, "fn preserved_overlay_marker() {}\n").unwrap();
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "raced.rs", false);
+        }
+        assert!(state.index.read().unwrap().live.has_path("raced.rs"));
+        let stamps = state.file_stamps.read().unwrap().clone();
+        std::fs::remove_file(&path).unwrap();
+        {
+            let _gate = state.snapshot_gate.write().unwrap();
+            assert!(stream_merge_stale_changes(
+                &state,
+                &["raced.rs".to_string()],
+                &[],
+                &[],
+                &stamps,
+                StaleMergePolicy {
+                    preserved: &std::collections::HashSet::new(),
+                    operation: "test stale check",
+                    authoritative_membership: true,
+                },
+            ));
+        }
+        {
+            let index = state.index.read().unwrap();
+            assert!(index.reader_has_path("raced.rs"));
+            assert!(index.live.has_path("raced.rs"));
+        }
+        assert!(state.unreadable.read().unwrap().contains_key("raced.rs"));
+
+        // A later merge may still need to publish unrelated live work. The
+        // memoized failure must remain excluded from its authoritative removal
+        // set even though its stamp was deliberately withheld.
+        let other = root.join("other.rs");
+        std::fs::write(&other, "fn unrelated_overlay_marker() {}\n").unwrap();
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &other, "other.rs", false);
+        }
+        let stamps = state.file_stamps.read().unwrap().clone();
+        let preserved = std::collections::HashSet::from(["raced.rs".to_string()]);
+        {
+            let _gate = state.snapshot_gate.write().unwrap();
+            assert!(stream_merge_stale_changes(
+                &state,
+                &[],
+                &[],
+                &[],
+                &stamps,
+                StaleMergePolicy {
+                    preserved: &preserved,
+                    operation: "test retry",
+                    authoritative_membership: true,
+                },
+            ));
+        }
+
+        let index = state.index.read().unwrap();
+        assert!(index.reader_has_path("raced.rs"));
+        assert!(index.live.has_path("raced.rs"));
+        assert!(!index.live.is_deleted("raced.rs"));
+        assert!(index.reader_has_path("other.rs"));
     }
 
     #[test]

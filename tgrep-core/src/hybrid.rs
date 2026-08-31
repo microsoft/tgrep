@@ -332,9 +332,23 @@ impl HybridIndex {
     /// (e.g. by the file-watcher) are preserved because they are **not** in
     /// the reader yet.
     pub fn prune_persisted_entries(&mut self) {
+        self.prune_persisted_entries_except(&std::collections::HashSet::new());
+    }
+
+    /// Remove persisted overlay entries except paths whose latest disk read
+    /// failed. Those entries may be newer than the reader copy and must remain
+    /// authoritative until a later merge successfully reads them.
+    pub fn prune_persisted_entries_except(
+        &mut self,
+        preserved: &std::collections::HashSet<String>,
+    ) {
         let reader = self.reader();
-        let reader_paths: std::collections::HashSet<&str> =
-            reader.all_paths().iter().map(|s| s.as_str()).collect();
+        let reader_paths: std::collections::HashSet<&str> = reader
+            .all_paths()
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|path| !preserved.contains(*path))
+            .collect();
 
         // Fast path: after a successful bulk flush every overlay path is
         // already in the new reader. Swap all overlay maps out for empty

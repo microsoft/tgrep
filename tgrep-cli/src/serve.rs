@@ -4506,14 +4506,15 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     }
 
     eprintln!("[trace] reindex: modified {rel_path}");
+    if per_tri.is_none() {
+        drop_indexed_file(state, rel_path, "binary content");
+        return;
+    }
     // Gate held by the caller — the commit + stamp update is processed
     // atomically with respect to flush/auto-save.
     {
         let mut index = state.index.write().unwrap();
-        match per_tri {
-            Some(per_tri) => index.live.commit_upsert(rel_path, per_tri),
-            None => index.live.delete_file(rel_path),
-        }
+        index.live.commit_upsert(rel_path, per_tri.unwrap());
         invalidate_cached_paths_locked(state, std::iter::once(rel_path));
     }
     state
@@ -4977,9 +4978,10 @@ fn stream_merge_stale_changes(
         if !outcome.unreadable.is_empty() {
             eprintln!(
                 "[trace] {} file(s) were unreadable during the delta build; \
-                 their stamps are withheld so a later reconcile retries them",
+                 preserving the current index and retrying later",
                 outcome.unreadable.len()
             );
+            return Ok(PublishStatus::Failed);
         }
 
         let delta = tgrep_core::reader::IndexReader::open(&delta_dir)?;

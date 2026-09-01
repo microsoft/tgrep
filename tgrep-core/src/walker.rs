@@ -158,7 +158,11 @@ impl Default for WalkOptions {
 }
 
 /// Check if a file extension indicates a binary format.
-fn is_binary_extension(path: &Path) -> bool {
+///
+/// Public so the watcher can apply the same rule the walk does. A file the
+/// walk rejected here must not be inserted into the index by an incremental
+/// update, or the two disagree about what the index contains.
+pub fn is_binary_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| {
@@ -1411,6 +1415,95 @@ mod tests {
             !names.contains(&"qlogs/artifact.rs".to_string()),
             "{names:?}"
         );
+    }
+
+    /// The watcher cannot walk per event, so it asks the same question as a
+    /// point query. If the two disagree the watcher subscribes to and indexes a
+    /// tree the walk excluded, and the next stale check evicts every file it
+    /// added — on the enlistment this came from, a 13.4 GiB build artifact
+    /// making up 71% of the corpus, re-read and re-evicted on every pass.
+    #[test]
+    fn the_point_query_matcher_hides_exactly_what_the_walk_hides() {
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let root = dir.path();
+        let matcher = crate::gitignore::matcher_from_ignore_paths(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+        )
+        .expect("the fixture has rules");
+
+        assert!(
+            matcher.is_ignored(Path::new("qlogs"), true),
+            "a directory the walk prunes must not be subscribed to"
+        );
+        assert!(
+            matcher.is_ignored(Path::new("qlogs/artifact.rs"), false),
+            "nor may a file inside it be indexed"
+        );
+        assert!(
+            matcher.is_ignored(Path::new("src/Gone.TXT"), false),
+            "an untracked file the rule matches once case is ignored"
+        );
+        // The tracked-file exemption comes with it, or the watcher would drop
+        // events for files git never hides.
+        assert!(
+            !matcher.is_ignored(Path::new("src/Kept.TXT"), false),
+            "a tracked file must stay visible"
+        );
+        assert!(!matcher.is_ignored(Path::new("src/main.rs"), false));
+    }
+
+    #[test]
+    fn the_point_query_matcher_follows_the_case_sensitivity_gate() {
+        // The other direction, which is the one that loses files: a repository
+        // that distinguishes case must not have anything hidden from it.
+        let dir = ignorecase_fixture(false, &["src/main.rs", "src/Kept.TXT"]);
+        let root = dir.path();
+        let matcher = crate::gitignore::matcher_from_ignore_paths(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+        )
+        .expect("the fixture has rules");
+
+        assert!(!matcher.is_ignored(Path::new("qlogs"), true));
+        assert!(!matcher.is_ignored(Path::new("qlogs/artifact.rs"), false));
+        assert!(!matcher.is_ignored(Path::new("src/Gone.TXT"), false));
+    }
+
+    /// The exemption is answered from a cached read of `.git/index`. A walk
+    /// builds this matcher and drops it, so a snapshot would do — but the file
+    /// watcher holds one for the life of the server, and `git add -f` rewrites
+    /// only the index, which is hidden. No ignore source changes, nothing
+    /// republishes the matcher, and a frozen cache would keep hiding a file
+    /// that git now tracks until the hourly reconcile.
+    #[test]
+    fn the_tracked_exemption_reloads_when_the_git_index_changes() {
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let root = dir.path();
+        let matcher = crate::gitignore::matcher_from_ignore_paths(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+        )
+        .expect("the fixture has rules");
+
+        // Untracked, and `*.txt` matches it once case is ignored.
+        assert!(matcher.is_ignored(Path::new("src/Gone.TXT"), false));
+
+        fake_git_repo(root, true, &["src/main.rs", "src/Kept.TXT", "src/Gone.TXT"]);
+
+        assert!(
+            !matcher.is_ignored(Path::new("src/Gone.TXT"), false),
+            "a file git now tracks must stop being hidden without rebuilding \
+             the matcher"
+        );
+
+        // And back: `git rm --cached` is the same problem in reverse, where a
+        // stale cache keeps indexing a file the walk has started hiding.
+        fake_git_repo(root, true, &["src/main.rs"]);
+        assert!(matcher.is_ignored(Path::new("src/Kept.TXT"), false));
     }
 
     #[test]

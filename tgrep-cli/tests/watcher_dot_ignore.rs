@@ -101,6 +101,48 @@ fn wait_for_match(port: u16, pattern: &str, timeout: Duration) -> bool {
     }
 }
 
+/// Poll until `pattern` stops being searchable, returning whether it went away.
+fn wait_for_no_match(port: u16, pattern: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if search_matches(port, pattern) == 0 {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn build_index(root: &Path, index_dir: &Path) {
+    let status = Command::new(tgrep_bin())
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run tgrep index");
+    assert!(status.success(), "initial index build failed");
+}
+
+fn spawn_server(root: &Path, index_dir: &Path) -> ServerGuard {
+    let child = Command::new(tgrep_bin())
+        .args([
+            "serve",
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start tgrep serve");
+    ServerGuard { child }
+}
+
 #[test]
 fn watcher_honors_dot_ignore_and_still_indexes_new_files() {
     let dir = TempDir::new().unwrap();
@@ -117,29 +159,8 @@ fn watcher_honors_dot_ignore_and_still_indexes_new_files() {
     )
     .unwrap();
 
-    let status = Command::new(tgrep_bin())
-        .args([
-            "index",
-            root.to_str().unwrap(),
-            "--index-path",
-            index_dir.to_str().unwrap(),
-        ])
-        .status()
-        .expect("failed to run tgrep index");
-    assert!(status.success(), "initial index build failed");
-
-    let child = Command::new(tgrep_bin())
-        .args([
-            "serve",
-            "--index-path",
-            index_dir.to_str().unwrap(),
-            root.to_str().unwrap(),
-        ])
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .expect("failed to start tgrep serve");
-    let _server = ServerGuard { child };
+    build_index(root, &index_dir);
+    let _server = spawn_server(root, &index_dir);
 
     let port = wait_for_port(&index_dir);
 
@@ -174,5 +195,73 @@ fn watcher_honors_dot_ignore_and_still_indexes_new_files() {
         search_matches(port, "dot_ignored_leak_marker"),
         0,
         "watcher indexed a file under a directory excluded by .ignore"
+    );
+}
+
+/// A `.ignore` written *after* the server is live must refresh the ignore
+/// rules, exactly as a `.gitignore` write does.
+///
+/// The startup matcher is built from the walk that the initial index used, so
+/// a `.ignore` that already exists is honored for free — which is what the
+/// test above covers. Rules that appear later only take effect if the watcher
+/// recognizes the `.ignore` write as an ignore-rules change and schedules the
+/// refresh; when it does not, the stale matcher stays published and the
+/// already-indexed content under the newly excluded directory stays
+/// searchable indefinitely (the periodic reconcile is on an hourly timer).
+///
+/// The fixture seeds the ignored file *before* indexing, so the assertion is a
+/// transition — searchable, then not — rather than a fixed sleep racing the
+/// refresh.
+#[test]
+fn late_dot_ignore_refreshes_the_watchers_ignore_rules() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let index_dir = root.join(".tgrep_test_index");
+
+    // No `.git` here either: `.ignore` is not git-gated, so this pins the
+    // refresh path for the one ignore source that works outside a repo.
+    fs::create_dir_all(root.join("secret")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("secret").join("creds.txt"),
+        "late_ignored_leak_marker\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        "fn seeded() { let normal_source_marker = 1; }\n",
+    )
+    .unwrap();
+
+    build_index(root, &index_dir);
+    let _server = spawn_server(root, &index_dir);
+
+    let port = wait_for_port(&index_dir);
+
+    assert!(
+        wait_for_match(port, "normal_source_marker", Duration::from_secs(30)),
+        "expected the seeded source file to be searchable"
+    );
+    // Positive control: with no `.ignore` yet, the seeded file under `secret/`
+    // is legitimately indexed. Without this the assertion below could pass
+    // simply because the file was never indexed in the first place.
+    assert!(
+        wait_for_match(port, "late_ignored_leak_marker", Duration::from_secs(30)),
+        "expected the file under secret/ to be indexed before any .ignore exists"
+    );
+    thread::sleep(Duration::from_secs(2));
+
+    fs::write(root.join(".ignore"), "secret/\n").unwrap();
+
+    assert!(
+        wait_for_no_match(port, "late_ignored_leak_marker", Duration::from_secs(60)),
+        "a .ignore written while the server was live never refreshed the ignore \
+         rules; content under the newly excluded directory is still searchable"
+    );
+
+    // The refresh must not take the rest of the index with it.
+    assert!(
+        search_matches(port, "normal_source_marker") > 0,
+        "the ignore-rules refresh dropped a file that is not ignored"
     );
 }

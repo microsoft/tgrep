@@ -84,7 +84,7 @@ fn normalise(path: &str) -> String {
 ///
 /// `.git` is usually a directory, but is a file holding `gitdir: <path>` in a
 /// linked worktree or a submodule.
-fn git_dir(repo_root: &Path) -> Option<PathBuf> {
+pub(crate) fn git_dir(repo_root: &Path) -> Option<PathBuf> {
     let dot_git = repo_root.join(".git");
     let meta = std::fs::metadata(&dot_git).ok()?;
     if meta.is_dir() {
@@ -144,9 +144,13 @@ pub fn ignores_case(repo_root: &Path) -> bool {
 ///
 /// Returns `None` when there is no readable index, which the caller must treat
 /// as "exempt nothing" only where that is the safe direction.
+/// The index file a repository's tracked-file set is read from.
+pub(crate) fn index_path(repo_root: &Path) -> Option<PathBuf> {
+    Some(git_dir(repo_root)?.join("index"))
+}
+
 pub fn load_tracked(repo_root: &Path) -> Option<TrackedFiles> {
-    let git_dir = git_dir(repo_root)?;
-    let bytes = std::fs::read(git_dir.join("index")).ok()?;
+    let bytes = std::fs::read(index_path(repo_root)?).ok()?;
     parse_index(&bytes)
 }
 

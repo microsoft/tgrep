@@ -183,6 +183,20 @@ impl HybridIndex {
         paths
     }
 
+    /// Whether a path is active in either the reader or live overlay.
+    pub fn has_active_path(&self, path: &str) -> bool {
+        if self.live.has_path(path) {
+            return true;
+        }
+        if self.live.is_deleted(path) {
+            return false;
+        }
+        self.reader()
+            .all_paths()
+            .iter()
+            .any(|candidate| candidate == path)
+    }
+
     /// Execute a query plan against the hybrid index.
     pub fn execute_query(&self, plan: &QueryPlan) -> Vec<u32> {
         if plan.is_match_all() {

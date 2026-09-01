@@ -277,6 +277,9 @@ struct ServerState {
     /// False for legacy/partial indexes until a complete filesystem walk has
     /// established the extra-path set.
     filename_index_ready: std::sync::atomic::AtomicBool,
+    /// The in-memory extra-path set differs from the last sidecar successfully
+    /// published to disk. Authoritative walks retry while this remains set.
+    filename_index_dirty: std::sync::atomic::AtomicBool,
     cache: RwLock<ContentCache>,
     cache_generation: std::sync::atomic::AtomicU64,
     root: PathBuf,
@@ -679,6 +682,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         index: RwLock::new(hybrid),
         filename_extra_paths: RwLock::new(filename_extra_paths),
         filename_index_ready: std::sync::atomic::AtomicBool::new(filename_index_ready),
+        filename_index_dirty: std::sync::atomic::AtomicBool::new(false),
         cache: RwLock::new(ContentCache::new(
             CACHE_CAPACITY,
             CACHE_MAX_BYTES,
@@ -3155,8 +3159,9 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
 /// was inside it. Anything under one of these is swept on the strength of the
 /// directory's absence.
 ///
-/// Candidates come from everything that can answer a search, not from
-/// `file_stamps` alone. A stamp is not a precondition for being searchable:
+/// Candidates come from everything that can answer a content or filename
+/// query, not from `file_stamps` alone. A stamp is not a precondition for
+/// being searchable:
 /// `filestamps.json` is optional by design — missing or unreadable leaves the
 /// map empty, and a build that predates a given file's stamp leaves it partial
 /// — while the reader still holds that file's content. Sweeping only what has
@@ -3218,6 +3223,15 @@ fn sweep_removed_files(
                 .filter(|rel| missing(rel)),
         );
     }
+    gone.extend(
+        state
+            .filename_extra_paths
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|rel| missing(rel))
+            .cloned(),
+    );
     if gone.is_empty() {
         return;
     }
@@ -3256,12 +3270,7 @@ fn sweep_removed_files(
             Err(e) if proves_ineligible(&e) => {}
             Err(_) => continue,
         }
-        {
-            let mut index = state.index.write().unwrap();
-            index.live.delete_file(rel);
-            invalidate_cached_paths_locked(state, std::iter::once(rel.as_str()));
-        }
-        state.file_stamps.write().unwrap().remove(rel);
+        drop_indexed_file(state, rel, "removed during watcher recovery");
         dropped += 1;
     }
     if dropped > 0 {
@@ -3863,23 +3872,9 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             // delete lands on content that was committed, or the reindex opens
             // a path that is already gone and drops it.
             let _reindex = lock_reindex(state);
-            let known_path = state.file_stamps.read().unwrap().contains_key(&rel_path);
-            if known_path {
-                eprintln!("[trace] reindex: removed {rel_path}");
-            }
             // gate acquired at the function level — the entire event
             // is processed atomically with respect to flush/auto-save.
-            {
-                let mut index = state.index.write().unwrap();
-                index.live.delete_file(&rel_path);
-                state
-                    .filename_extra_paths
-                    .write()
-                    .unwrap()
-                    .remove(&rel_path);
-                invalidate_cached_paths_locked(state, std::iter::once(rel_path.as_str()));
-            }
-            state.file_stamps.write().unwrap().remove(&rel_path);
+            drop_indexed_file(state, &rel_path, "removed");
             continue;
         }
 
@@ -3953,7 +3948,7 @@ fn lock_reindex(state: &ServerState) -> std::sync::MutexGuard<'_, ()> {
     }
 }
 
-/// Drop everything the index holds for a path.
+/// Drop everything the content and filename indexes hold for a path.
 ///
 /// A stamp is evidence, but not a precondition: `filestamps.json` may be missing
 /// while the active reader still holds the path. Conversely, a rejected file
@@ -3964,6 +3959,10 @@ fn lock_reindex(state: &ServerState) -> std::sync::MutexGuard<'_, ()> {
 /// the caller's rather than this function's because `reindex_file` calls in
 /// while holding it, and a `Mutex` is not reentrant.
 fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
+    let removed_extra = state.filename_extra_paths.write().unwrap().remove(rel_path);
+    if removed_extra {
+        state.filename_index_dirty.store(true, Ordering::SeqCst);
+    }
     let had_stamp = state
         .file_stamps
         .write()
@@ -3983,6 +3982,33 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
     let mut index = state.index.write().unwrap();
     index.live.delete_file(rel_path);
     invalidate_cached_paths_locked(state, std::iter::once(rel_path));
+}
+
+/// Move a listable path out of the content index.
+///
+/// The extra-path insertion is the membership transition. Only that first
+/// transition creates a tombstone, so duplicate watcher notifications for a
+/// binary path do not repeatedly dirty the live overlay.
+fn mark_filename_only(state: &ServerState, rel_path: &str) {
+    let inserted = {
+        let mut index = state.index.write().unwrap();
+        let mut extra = state.filename_extra_paths.write().unwrap();
+        if !extra.insert(rel_path.to_string()) {
+            false
+        } else {
+            if !index.live.is_deleted(rel_path) {
+                index.live.delete_file(rel_path);
+            }
+            invalidate_cached_paths_locked(state, std::iter::once(rel_path));
+            true
+        }
+    };
+    if !inserted {
+        return;
+    }
+
+    state.filename_index_dirty.store(true, Ordering::SeqCst);
+    state.file_stamps.write().unwrap().remove(rel_path);
 }
 
 /// What an event's stat result says about the path it named.
@@ -4392,12 +4418,12 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     let mut version = tgrep_core::builder::file_version(&meta);
     let mut current = version.stamp().clone();
 
-    // The rules `walk_file_metadata` applies, and for the same reason: the walk
-    // is authoritative about what belongs in the index, so anything it rejects
-    // must not be added here. Without this a file that grew past the cap — or
-    // an ineligible extension in a directory a relaxed ignore rule just exposed
-    // — would be read whole and indexed, and the next reconcile would silently
-    // delete it again.
+    // The type and size rules `walk_file_metadata` applies, and for the same
+    // reason: the walk is authoritative about what belongs in the index, so
+    // anything it rejects must not be added here. Without this a file that grew
+    // past the cap would be read whole and indexed, and the next reconcile
+    // would silently delete it again. Binary extensions remain listable and
+    // move into the filename-only set below.
     //
     // `is_file` is the third rule, and the one with teeth: the walker runs with
     // `follow_links(false)`, where a symlink is neither file nor dir and is
@@ -4409,7 +4435,6 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     // level; this is what rejects a final one on Windows, where the reparse
     // point opens fine.
     let eligible = meta.is_file()
-        && !tgrep_core::walker::is_binary_extension(path)
         && !state
             .max_file_size
             .is_some_and(|limit| current.size > limit);
@@ -4419,6 +4444,10 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         // what we hold so the index matches the walk rather than keeping a
         // stale copy of the smaller version until the reconcile.
         drop_indexed_file(state, rel_path, "no longer eligible");
+        return;
+    }
+    if tgrep_core::walker::is_binary_extension(path) {
+        mark_filename_only(state, rel_path);
         return;
     }
 
@@ -4518,7 +4547,13 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
                 drop_indexed_file(state, rel_path, "grew past the size limit while being read");
                 return;
             }
-            CappedRead::Failed => return,
+            CappedRead::Failed => {
+                let already_indexed = state.index.read().unwrap().has_active_path(rel_path);
+                if !already_indexed {
+                    mark_filename_only(state, rel_path);
+                }
+                return;
+            }
         }
     };
     let text = tgrep_core::encoding::decode_for_index(&data);
@@ -4553,16 +4588,22 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     }
 
     eprintln!("[trace] reindex: modified {rel_path}");
-    if per_tri.is_none() {
-        drop_indexed_file(state, rel_path, "binary content");
+    let Some(per_tri) = per_tri else {
+        mark_filename_only(state, rel_path);
         return;
-    }
+    };
     // Gate held by the caller — the commit + stamp update is processed
     // atomically with respect to flush/auto-save.
-    {
+    let removed_extra = {
         let mut index = state.index.write().unwrap();
-        index.live.commit_upsert(rel_path, per_tri.unwrap());
+        let mut extra = state.filename_extra_paths.write().unwrap();
+        index.live.commit_upsert(rel_path, per_tri);
+        let removed = extra.remove(rel_path);
         invalidate_cached_paths_locked(state, std::iter::once(rel_path));
+        removed
+    };
+    if removed_extra {
+        state.filename_index_dirty.store(true, Ordering::SeqCst);
     }
     state
         .file_stamps
@@ -4746,7 +4787,10 @@ fn replace_filename_extra_paths(state: &ServerState, listed_files: &[String]) ->
         .collect();
     let mut current = state.filename_extra_paths.write().unwrap();
     let changed = *current != next || !state.filename_index_ready.load(Ordering::SeqCst);
-    *current = next;
+    if changed {
+        *current = next;
+        state.filename_index_dirty.store(true, Ordering::SeqCst);
+    }
     state.filename_index_ready.store(true, Ordering::SeqCst);
     changed
 }
@@ -4788,11 +4832,15 @@ fn persist_filename_extra_paths(state: &ServerState, index_dir: &Path) -> bool {
         }
     };
     let _ = std::fs::remove_dir_all(&staging_dir);
+    if published {
+        state.filename_index_dirty.store(false, Ordering::SeqCst);
+    }
     published
 }
 
 fn refresh_filename_index(state: &ServerState, index_dir: &Path, listed_files: &[String]) {
-    if replace_filename_extra_paths(state, listed_files) {
+    let changed = replace_filename_extra_paths(state, listed_files);
+    if changed || state.filename_index_dirty.load(Ordering::SeqCst) {
         persist_filename_extra_paths(state, index_dir);
     }
 }
@@ -5571,6 +5619,7 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
             *index = empty;
             extra.clear();
             state.filename_index_ready.store(false, Ordering::SeqCst);
+            state.filename_index_dirty.store(false, Ordering::SeqCst);
             cache.clear();
             state.cache_generation.fetch_add(1, Ordering::SeqCst);
         }
@@ -5682,6 +5731,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         if let Some(paths) = filename_extra_paths {
             *extra = paths;
             state.filename_index_ready.store(true, Ordering::SeqCst);
+            state.filename_index_dirty.store(false, Ordering::SeqCst);
         }
         cache.clear();
         state.cache_generation.fetch_add(1, Ordering::SeqCst);
@@ -6308,6 +6358,8 @@ fn publish_staged_index(
     preserve_overlay_paths: &std::collections::HashSet<String>,
     filename_extra_paths: Option<&std::collections::HashSet<String>>,
 ) -> PublishStatus {
+    let stage_filename_index =
+        filename_extra_paths.is_some() || state.filename_index_ready.load(Ordering::SeqCst);
     let filename_stage_result = if let Some(paths) = filename_extra_paths {
         let mut paths: Vec<String> = paths.iter().cloned().collect();
         paths.sort_unstable();
@@ -6361,6 +6413,9 @@ fn publish_staged_index(
         if let Some(paths) = filename_extra_paths {
             *state.filename_extra_paths.write().unwrap() = paths.clone();
             state.filename_index_ready.store(true, Ordering::SeqCst);
+        }
+        if stage_filename_index {
+            state.filename_index_dirty.store(false, Ordering::SeqCst);
         }
         let mut cache = state.cache.write().unwrap();
         index.swap_reader(new_reader);
@@ -6430,6 +6485,7 @@ fn publish_reloaded_index(
         let mut index = state.index.write().unwrap();
         *state.filename_extra_paths.write().unwrap() = filename_extra_paths;
         state.filename_index_ready.store(true, Ordering::SeqCst);
+        state.filename_index_dirty.store(false, Ordering::SeqCst);
         let mut cache = state.cache.write().unwrap();
         index.swap_reader(new_reader);
         let mut reconciled = index.live.overlay_paths();
@@ -6907,6 +6963,7 @@ mod tests {
             index: RwLock::new(hybrid),
             filename_extra_paths: RwLock::new(Default::default()),
             filename_index_ready: std::sync::atomic::AtomicBool::new(false),
+            filename_index_dirty: std::sync::atomic::AtomicBool::new(false),
             cache: RwLock::new(ContentCache::new(
                 CACHE_CAPACITY,
                 CACHE_MAX_BYTES,
@@ -7038,6 +7095,16 @@ mod tests {
                 .contains("asset.bin")
         );
         assert!(state.index.read().unwrap().all_paths().is_empty());
+        let dirty = state.index.read().unwrap().live.dirty_count();
+
+        let duplicate =
+            Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(asset.clone());
+        handle_fs_event(&state, &root, &duplicate);
+        assert_eq!(
+            state.index.read().unwrap().live.dirty_count(),
+            dirty,
+            "a duplicate event dirtied the binary path again"
+        );
 
         std::fs::remove_file(&asset).unwrap();
         let remove = Event::new(EventKind::Remove(notify::event::RemoveKind::File)).add_path(asset);
@@ -7049,6 +7116,70 @@ mod tests {
                 .unwrap()
                 .contains("asset.bin")
         );
+    }
+
+    #[test]
+    fn authoritative_filename_refresh_retries_a_dirty_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let index_dir = temp.path().join("index");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = test_server_state(&root, &index_dir);
+        state
+            .filename_extra_paths
+            .write()
+            .unwrap()
+            .insert("asset.bin".to_string());
+        state.filename_index_ready.store(true, Ordering::SeqCst);
+        state.filename_index_dirty.store(true, Ordering::SeqCst);
+        tgrep_core::path_index::write_extra_paths(&index_dir, &[]).unwrap();
+
+        refresh_filename_index(state.as_ref(), &index_dir, &["asset.bin".to_string()]);
+
+        assert_eq!(
+            tgrep_core::path_index::read_extra_paths(&index_dir).unwrap(),
+            Some(vec!["asset.bin".to_string()])
+        );
+        assert!(!state.filename_index_dirty.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn watcher_recovery_sweeps_missing_filename_only_paths() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let index_dir = temp.path().join("index");
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let state = test_server_state(&root, &index_dir);
+        state
+            .filename_extra_paths
+            .write()
+            .unwrap()
+            .insert("assets/missing.bin".to_string());
+        state.filename_index_ready.store(true, Ordering::SeqCst);
+
+        sweep_removed_files(
+            state.as_ref(),
+            &std::collections::HashSet::from(["assets".to_string()]),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(
+            !state
+                .filename_extra_paths
+                .read()
+                .unwrap()
+                .contains("assets/missing.bin")
+        );
+        assert!(
+            state
+                .index
+                .read()
+                .unwrap()
+                .live
+                .is_deleted("assets/missing.bin")
+        );
+        assert!(state.filename_index_dirty.load(Ordering::SeqCst));
     }
 
     /// A binary marker's offset is a position in the file, not in the repaired

@@ -2581,6 +2581,161 @@ fn indexed_basic_search() {
 }
 
 #[test]
+fn indexed_passthru_prints_explicit_no_match_and_exits_one() {
+    let (dir, idx) = setup_indexed_fixture();
+    let path = dir.path().join("testdata").join("hello.rs");
+
+    tgrep()
+        .args([
+            "--index-path",
+            &idx,
+            "--no-heading",
+            "--no-filename",
+            "--passthru",
+            "does-not-exist",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout("fn main() {\n    println!(\"hello world\");\n}\n");
+}
+
+#[test]
+fn indexed_passthru_emits_filtered_no_hit_files_beside_a_match() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    let scope = root.join("scope");
+    fs::create_dir_all(&scope).unwrap();
+    fs::write(root.join(".ignore"), "scope/ignored.rs\n").unwrap();
+    fs::write(scope.join("hit.rs"), "actual needle\n").unwrap();
+    fs::write(scope.join("miss.rs"), "eligible no hit\n").unwrap();
+    fs::write(scope.join("ignored.rs"), "ignored no hit\n").unwrap();
+    fs::write(scope.join("globbed.rs"), "glob no hit\n").unwrap();
+    fs::write(scope.join("typed.txt"), "typed no hit\n").unwrap();
+    fs::write(root.join("outside.rs"), "outside no hit\n").unwrap();
+
+    let index_dir = dir.path().join("idx");
+    tgrep()
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    tgrep()
+        .args([
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--no-heading",
+            "--passthru",
+            "-t",
+            "rust",
+            "-g",
+            "!globbed.rs",
+            "needle",
+            scope.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("actual needle"))
+        .stdout(predicate::str::contains("eligible no hit"))
+        .stdout(predicate::str::contains("ignored no hit").not())
+        .stdout(predicate::str::contains("glob no hit").not())
+        .stdout(predicate::str::contains("typed no hit").not())
+        .stdout(predicate::str::contains("outside no hit").not());
+}
+
+struct PassthruServer(std::process::Child);
+
+impl Drop for PassthruServer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn start_passthru_server(root: &std::path::Path, index_dir: &std::path::Path) -> PassthruServer {
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+        .args([
+            "serve",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--no-watch",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start tgrep serve");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let serve_json = index_dir.join("serve.json");
+    let port = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("tgrep serve exited before becoming ready: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tgrep serve did not become ready"
+        );
+        if let Ok(data) = fs::read_to_string(&serve_json)
+            && let Ok(info) = serde_json::from_str::<serde_json::Value>(&data)
+            && let Some(port) = info.get("port").and_then(|v| v.as_u64())
+            && TcpStream::connect(format!("127.0.0.1:{port}")).is_ok()
+        {
+            break port as u16;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "tgrep serve did not finish indexing"
+        );
+        if let Ok(response) =
+            send_rpc_request(port, r#"{"jsonrpc":"2.0","method":"status","id":0}"#)
+            && let Ok(status) = serde_json::from_str::<serde_json::Value>(&response)
+            && status.pointer("/result/indexing").and_then(|v| v.as_bool()) == Some(false)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    PassthruServer(child)
+}
+
+#[test]
+fn server_passthru_prints_explicit_no_match_and_exits_one() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("plain.txt");
+    fs::write(&path, "alpha\nbeta\n").unwrap();
+    let index_dir = dir.path().join("idx");
+    let _server = start_passthru_server(&root, &index_dir);
+
+    tgrep()
+        .args([
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            "--no-heading",
+            "--no-filename",
+            "--passthru",
+            "does-not-exist",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout("alpha\nbeta\n")
+        .stderr(predicate::str::contains("Server unreachable").not());
+}
+
+#[test]
 fn indexed_case_insensitive() {
     let (dir, idx) = setup_indexed_fixture();
     // "FN" should not match without -i
@@ -4550,6 +4705,44 @@ fn passthru_prints_every_line() {
 }
 
 #[test]
+fn passthru_prints_explicit_no_match_and_exits_one() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("plain.txt");
+    fs::write(&path, "alpha\nbeta\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "--no-filename",
+            "--passthru",
+            "does-not-exist",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout("alpha\nbeta\n");
+}
+
+#[test]
+fn passthru_no_match_keeps_binary_files_silent() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("binary.bin");
+    fs::write(&path, b"alpha\n\0beta\n").unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--passthru",
+            "does-not-exist",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
 fn stop_on_nonmatch_halts_at_the_first_gap() {
     let dir = TempDir::new().unwrap();
     let sub = dir.path().join("testdata");
@@ -4932,6 +5125,7 @@ fn new_flags_agree_across_search_paths() {
     let cases: &[&[&str]] = &[
         &["--no-heading", "-r", "REP", "hello"],
         &["--no-heading", "--passthru", "hello"],
+        &["--no-heading", "--passthru", "zzz_no_such_passthru_pattern"],
         &["--no-heading", "--column", "-b", "hello"],
         &["--no-heading", "-x", "}"],
         &["--no-heading", "--count-matches", "n"],

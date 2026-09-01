@@ -265,6 +265,15 @@ impl SearchOptions {
         self.only_matching && !self.json
     }
 
+    fn effective_passthru(&self) -> bool {
+        self.passthru
+            && !self.files_only
+            && !self.files_without_match
+            && !self.count
+            && !self.count_matches
+            && !self.quiet
+    }
+
     fn match_options(&self) -> crate::matching::MatchOptions {
         crate::matching::MatchOptions {
             invert_match: self.invert_match,
@@ -282,12 +291,7 @@ impl SearchOptions {
             // `--passthru` prints the whole file, so it cannot also stop early
             // at a match limit, and it is meaningless when only file names or
             // counts are printed.
-            passthru: self.passthru
-                && !self.files_only
-                && !self.files_without_match
-                && !self.count
-                && !self.count_matches
-                && !self.quiet,
+            passthru: self.effective_passthru(),
             replace: self.replace.clone(),
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
@@ -934,7 +938,9 @@ fn search_via_server(
         }
     };
 
-    let had_matches = !matches.is_empty();
+    let had_matches = matches
+        .iter()
+        .any(|m| m.get("type").and_then(|t| t.as_str()).unwrap_or("match") != "context");
 
     if opts.quiet {
         writer.flush()?;
@@ -1104,14 +1110,15 @@ fn search_local_index(
 
     let matcher = opts.matcher(ci)?;
 
-    // Narrow candidates using every pattern, not just the primary one. A
+    // Narrow candidates using every pattern, not just the primary one.
+    // `--passthru` must visit files without any pattern trigrams, while a
     // non-default `--encoding` re-decodes files into text the index never saw,
-    // so the trigram plan cannot be trusted to find them.
+    // so neither can use the trigram plan.
     //
     // A PCRE-style pattern is not parseable by `regex-syntax`, but relaxing it
     // (dropping lookarounds and the like) yields one that is, and that matches a
     // superset — so its trigrams remain mandatory for the original.
-    let plan = if opts.encoding.may_differ_from_index() {
+    let plan = if opts.effective_passthru() || opts.encoding.may_differ_from_index() {
         QueryPlan::MatchAll
     } else if matcher.is_standard() || opts.fixed_string {
         query::build_multi_pattern_plan(&opts.all_patterns()?, opts.fixed_string, ci)
@@ -1707,14 +1714,19 @@ fn search_decoded_file(
     let match_opts = opts.match_options();
     let found = crate::matching::FileMatches::find(content, matcher, &match_opts)?;
 
-    if found.is_empty() {
+    let has_matches = !found.is_empty();
+    if !has_matches {
         // `--include-zero` still reports files that were searched but had no
         // match, which is the only way to tell them apart from files that were
         // never looked at.
         if opts.include_zero && (opts.count || opts.count_matches) && !opts.quiet {
             writer.write_count(rel_path, 0)?;
         }
-        return Ok(FileOutcome::NoMatch);
+        // Passthru still emits every line of a text file when none matched, but
+        // ripgrep does not expose a binary file merely because passthru is set.
+        if !match_opts.passthru || binary_offset.is_some() {
+            return Ok(FileOutcome::NoMatch);
+        }
     }
 
     // For quiet/files_without_match, we only need the outcome.
@@ -1798,7 +1810,11 @@ fn search_decoded_file(
         Ok(())
     })?;
 
-    Ok(FileOutcome::Matched)
+    Ok(if has_matches {
+        FileOutcome::Matched
+    } else {
+        FileOutcome::NoMatch
+    })
 }
 
 /// Path to print for a file the user named directly on the command line.

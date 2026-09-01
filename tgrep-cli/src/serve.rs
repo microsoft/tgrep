@@ -1364,18 +1364,18 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
     )
     .map_err(|e| format!("{e}"))?;
 
-    // Build query plan from every pattern for index filtering. `-v` inverts at
-    // the line level, so a file matches when some line does *not* match; the
-    // trigram plan would select exactly the wrong candidates. A non-default
-    // `--encoding` is unsound for the same reason: the index holds trigrams of
-    // the BOM-sniffed text, so a re-decoded file can match bytes that were
-    // never indexed.
+    // Build query plan from every pattern for index filtering. `--passthru`
+    // needs files without any pattern trigrams. `-v` inverts at the line level,
+    // so a file matches when some line does *not* match; the trigram plan would
+    // select exactly the wrong candidates. A non-default `--encoding` is
+    // unsound for the same reason: the index holds trigrams of the BOM-sniffed
+    // text, so a re-decoded file can match bytes that were never indexed.
     //
     // A PCRE-style pattern cannot be parsed by `regex-syntax` at all, but it can
     // usually be *relaxed* into one that can (dropping lookarounds and the like).
     // The relaxed pattern matches a superset, so its trigrams are still mandatory
     // for the original and the candidate set stays sound.
-    let plan = if invert_match || encoding.may_differ_from_index() {
+    let plan = if passthru || invert_match || encoding.may_differ_from_index() {
         query::QueryPlan::MatchAll
     } else if matcher.is_standard() || fixed_string {
         query::build_multi_pattern_plan(&all_patterns, fixed_string, case_insensitive)?
@@ -1703,7 +1703,7 @@ fn search_file_matches(
     };
 
     let found = FileMatches::find(content, matcher, &match_opts)?;
-    if found.is_empty() {
+    if found.is_empty() && (!match_opts.passthru || binary_offset.is_some()) {
         return Ok(Vec::new());
     }
 

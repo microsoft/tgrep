@@ -266,7 +266,10 @@ impl SearchOptions {
     }
 
     fn effective_passthru(&self) -> bool {
+        // ripgrep treats `-m 0` as suppressing all search output, including
+        // passthru context.
         self.passthru
+            && self.max_count != Some(0)
             && !self.files_only
             && !self.files_without_match
             && !self.count

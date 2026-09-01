@@ -2736,6 +2736,47 @@ fn server_passthru_prints_explicit_no_match_and_exits_one() {
 }
 
 #[test]
+fn passthru_max_count_zero_matches_ripgrep_across_search_paths() {
+    let (dir, idx) = setup_indexed_fixture();
+    let root = dir.path().join("testdata");
+    let path = root.join("hello.rs");
+    let path = path.to_str().unwrap();
+
+    let run = |index: Option<&str>, pattern: &str| {
+        let mut cmd = tgrep();
+        if let Some(index) = index {
+            cmd.args(["--index-path", index]);
+        } else {
+            cmd.arg("--no-index");
+        }
+        cmd.args(["--no-heading", "--passthru", "-m", "0", pattern, path])
+            .output()
+            .unwrap()
+    };
+
+    for pattern in ["fn main", "does-not-exist"] {
+        let direct = run(None, pattern);
+        assert_eq!(direct.status.code(), Some(1));
+        assert!(direct.stdout.is_empty(), "direct output: {direct:?}");
+
+        let indexed = run(Some(&idx), pattern);
+        assert_eq!(indexed.status.code(), direct.status.code());
+        assert_eq!(indexed.stdout, direct.stdout);
+    }
+
+    let _server = start_passthru_server(&root, std::path::Path::new(&idx));
+    for pattern in ["fn main", "does-not-exist"] {
+        let server = run(Some(&idx), pattern);
+        assert_eq!(server.status.code(), Some(1));
+        assert!(server.stdout.is_empty(), "server output: {server:?}");
+        assert!(
+            !String::from_utf8_lossy(&server.stderr).contains("Server unreachable"),
+            "search fell back from the server: {server:?}"
+        );
+    }
+}
+
+#[test]
 fn indexed_case_insensitive() {
     let (dir, idx) = setup_indexed_fixture();
     // "FN" should not match without -i

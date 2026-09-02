@@ -672,6 +672,7 @@ pub fn run(
     // never reports.
     if !opts.no_index
         && !bypass_index
+        && !opts.effective_passthru()
         && !opts.files_without_match
         && !opts.include_zero
         && let Ok(info) = ServerInfo::load(&index_dir)
@@ -941,9 +942,7 @@ fn search_via_server(
         }
     };
 
-    let had_matches = matches
-        .iter()
-        .any(|m| m.get("type").and_then(|t| t.as_str()).unwrap_or("match") != "context");
+    let had_matches = !matches.is_empty();
 
     if opts.quiet {
         writer.flush()?;

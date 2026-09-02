@@ -2581,9 +2581,8 @@ fn indexed_basic_search() {
 }
 
 #[test]
-fn indexed_passthru_prints_explicit_no_match_and_exits_one() {
+fn indexed_passthru_prints_no_match_and_exits_one() {
     let (dir, idx) = setup_indexed_fixture();
-    let path = dir.path().join("testdata").join("hello.rs");
 
     tgrep()
         .args([
@@ -2592,12 +2591,16 @@ fn indexed_passthru_prints_explicit_no_match_and_exits_one() {
             "--no-heading",
             "--no-filename",
             "--passthru",
+            "--stats",
+            "-g",
+            "hello.rs",
             "does-not-exist",
-            path.to_str().unwrap(),
+            &indexed_fixture_path(&dir),
         ])
         .assert()
         .code(1)
-        .stdout("fn main() {\n    println!(\"hello world\");\n}\n");
+        .stdout("fn main() {\n    println!(\"hello world\");\n}\n")
+        .stderr(predicate::str::contains("Query plan: MatchAll"));
 }
 
 #[test]
@@ -2710,12 +2713,13 @@ fn start_passthru_server(root: &std::path::Path, index_dir: &std::path::Path) ->
 }
 
 #[test]
-fn server_passthru_prints_explicit_no_match_and_exits_one() {
+fn passthru_bypasses_server_for_scoped_no_match() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");
-    fs::create_dir_all(&root).unwrap();
-    let path = root.join("plain.txt");
-    fs::write(&path, "alpha\nbeta\n").unwrap();
+    let scope = root.join("scope");
+    fs::create_dir_all(&scope).unwrap();
+    fs::write(scope.join("plain.txt"), "alpha\nbeta\n").unwrap();
+    fs::write(root.join("outside.txt"), "must stay outside scope\n").unwrap();
     let index_dir = dir.path().join("idx");
     let _server = start_passthru_server(&root, &index_dir);
 
@@ -2726,12 +2730,15 @@ fn server_passthru_prints_explicit_no_match_and_exits_one() {
             "--no-heading",
             "--no-filename",
             "--passthru",
+            "--stats",
             "does-not-exist",
-            path.to_str().unwrap(),
+            scope.to_str().unwrap(),
         ])
         .assert()
         .code(1)
         .stdout("alpha\nbeta\n")
+        .stderr(predicate::str::contains("Query plan: MatchAll"))
+        .stderr(predicate::str::contains("(via server)").not())
         .stderr(predicate::str::contains("Server unreachable").not());
 }
 
@@ -2739,8 +2746,7 @@ fn server_passthru_prints_explicit_no_match_and_exits_one() {
 fn passthru_max_count_zero_matches_ripgrep_across_search_paths() {
     let (dir, idx) = setup_indexed_fixture();
     let root = dir.path().join("testdata");
-    let path = root.join("hello.rs");
-    let path = path.to_str().unwrap();
+    let root = root.to_str().unwrap();
 
     let run = |index: Option<&str>, pattern: &str| {
         let mut cmd = tgrep();
@@ -2749,9 +2755,19 @@ fn passthru_max_count_zero_matches_ripgrep_across_search_paths() {
         } else {
             cmd.arg("--no-index");
         }
-        cmd.args(["--no-heading", "--passthru", "-m", "0", pattern, path])
-            .output()
-            .unwrap()
+        cmd.args([
+            "--no-heading",
+            "--passthru",
+            "--stats",
+            "-g",
+            "hello.rs",
+            "-m",
+            "0",
+            pattern,
+            root,
+        ])
+        .output()
+        .unwrap()
     };
 
     for pattern in ["fn main", "does-not-exist"] {
@@ -2762,16 +2778,20 @@ fn passthru_max_count_zero_matches_ripgrep_across_search_paths() {
         let indexed = run(Some(&idx), pattern);
         assert_eq!(indexed.status.code(), direct.status.code());
         assert_eq!(indexed.stdout, direct.stdout);
+        assert!(
+            String::from_utf8_lossy(&indexed.stderr).contains("Query plan:"),
+            "search did not use the local index: {indexed:?}"
+        );
     }
 
-    let _server = start_passthru_server(&root, std::path::Path::new(&idx));
+    let _server = start_passthru_server(std::path::Path::new(root), std::path::Path::new(&idx));
     for pattern in ["fn main", "does-not-exist"] {
         let server = run(Some(&idx), pattern);
         assert_eq!(server.status.code(), Some(1));
         assert!(server.stdout.is_empty(), "server output: {server:?}");
         assert!(
-            !String::from_utf8_lossy(&server.stderr).contains("Server unreachable"),
-            "search fell back from the server: {server:?}"
+            String::from_utf8_lossy(&server.stderr).contains("(via server)"),
+            "search did not use the server: {server:?}"
         );
     }
 }

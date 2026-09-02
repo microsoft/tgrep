@@ -3612,8 +3612,18 @@ fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
         if !is_real_dir(&path)
             && path.strip_prefix(root).is_ok_and(|rel| {
                 let rel = rel.to_string_lossy().replace('\\', "/");
-                let index = state.index.read().unwrap();
-                index.reader_has_descendant_path(&rel) || index.live.has_descendant_path(&rel)
+                let has_content_descendant = {
+                    let index = state.index.read().unwrap();
+                    index.reader_has_descendant_path(&rel) || index.live.has_descendant_path(&rel)
+                };
+                let prefix = format!("{rel}/");
+                has_content_descendant
+                    || state
+                        .filename_extra_paths
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .any(|path| path.starts_with(&prefix))
             })
         {
             // A single directory removal/rename event names no descendants.
@@ -3986,28 +3996,29 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
 
 /// Move a listable path out of the content index.
 ///
-/// The extra-path insertion is the membership transition. Only that first
-/// transition creates a tombstone, so duplicate watcher notifications for a
-/// binary path do not repeatedly dirty the live overlay.
+/// Filename membership and content eviction are independent transitions. A new
+/// filename-only path that was never content-indexed needs no tombstone, while
+/// an already-known filename-only path must still evict content if stale
+/// postings are active for it.
 fn mark_filename_only(state: &ServerState, rel_path: &str) {
-    let inserted = {
+    let (inserted, removed_content) = {
         let mut index = state.index.write().unwrap();
         let mut extra = state.filename_extra_paths.write().unwrap();
-        if !extra.insert(rel_path.to_string()) {
-            false
-        } else {
-            if !index.live.is_deleted(rel_path) {
-                index.live.delete_file(rel_path);
-            }
+        let inserted = extra.insert(rel_path.to_string());
+        let removed_content = index.has_active_path(rel_path);
+        if removed_content {
+            index.live.delete_file(rel_path);
             invalidate_cached_paths_locked(state, std::iter::once(rel_path));
-            true
         }
+        (inserted, removed_content)
     };
-    if !inserted {
+    if inserted {
+        state.filename_index_dirty.store(true, Ordering::SeqCst);
+    }
+    if !inserted && !removed_content {
         return;
     }
 
-    state.filename_index_dirty.store(true, Ordering::SeqCst);
     state.file_stamps.write().unwrap().remove(rel_path);
 }
 
@@ -4683,6 +4694,35 @@ fn periodic_reconcile_loop(state: Arc<ServerState>, root: PathBuf, index_dir: Pa
     }
 }
 
+fn persist_pending_index_changes(state: &Arc<ServerState>) -> bool {
+    // Hold the gate through delta build -> publish -> prune so watcher mutations
+    // cannot race publication. Recheck after acquiring it: another publisher
+    // may have drained either source while we waited.
+    let _gate = state.snapshot_gate.write().unwrap();
+    if state.index.read().unwrap().live.has_pending_changes() {
+        let stamps = state.file_stamps.read().unwrap().clone();
+        return stream_merge_stale_changes(
+            state,
+            &[],
+            &[],
+            &[],
+            &stamps,
+            StaleMergePolicy {
+                preserved: &std::collections::HashSet::new(),
+                operation: "auto-save",
+                authoritative_membership: false,
+                authoritative_listed_files: None,
+            },
+        );
+    }
+    if state.filename_index_ready.load(Ordering::SeqCst)
+        && state.filename_index_dirty.load(Ordering::SeqCst)
+    {
+        return persist_filename_extra_paths(state, &state.index_dir);
+    }
+    true
+}
+
 fn auto_save_loop(state: Arc<ServerState>) {
     let mut last_save = Instant::now();
 
@@ -4701,34 +4741,20 @@ fn auto_save_loop(state: Arc<ServerState>) {
             let index = state.index.read().unwrap();
             index.live.dirty_count()
         };
+        let filename_dirty = state.filename_index_ready.load(Ordering::SeqCst)
+            && state.filename_index_dirty.load(Ordering::SeqCst);
 
         let elapsed = last_save.elapsed();
-        if dirty >= state.auto_save_mutations || (dirty > 0 && elapsed >= AUTO_SAVE_INTERVAL) {
+        if filename_dirty
+            || dirty >= state.auto_save_mutations
+            || (dirty > 0 && elapsed >= AUTO_SAVE_INTERVAL)
+        {
             let save_start = Instant::now();
-            eprintln!("[trace] auto-save: {dirty} mutations, saving...");
+            eprintln!(
+                "[trace] auto-save: {dirty} content mutations, filename index dirty={filename_dirty}, saving..."
+            );
 
-            // Hold the gate through delta build → publish → prune so watcher
-            // mutations cannot race publication. Recheck after acquiring it:
-            // another publisher may have drained the overlay while we waited.
-            let _gate = state.snapshot_gate.write().unwrap();
-            if !state.index.read().unwrap().live.has_pending_changes() {
-                continue;
-            }
-
-            let stamps = state.file_stamps.read().unwrap().clone();
-            if stream_merge_stale_changes(
-                &state,
-                &[],
-                &[],
-                &[],
-                &stamps,
-                StaleMergePolicy {
-                    preserved: &std::collections::HashSet::new(),
-                    operation: "auto-save",
-                    authoritative_membership: false,
-                    authoritative_listed_files: None,
-                },
-            ) {
+            if persist_pending_index_changes(&state) {
                 last_save = Instant::now();
                 eprintln!(
                     "[trace] auto-save complete in {:.1}s",
@@ -5214,6 +5240,12 @@ fn stream_merge_stale_changes(
                     .map(String::as_str),
             );
             content_paths.extend(delta.all_paths().iter().map(String::as_str));
+            content_paths.extend(
+                overlay_paths
+                    .iter()
+                    .filter(|path| preserve_overlay_paths.contains(path.as_str()))
+                    .map(String::as_str),
+            );
             listed_files
                 .iter()
                 .filter(|path| !content_paths.contains(path.as_str()))
@@ -7156,6 +7188,8 @@ mod tests {
             .unwrap()
             .insert("assets/missing.bin".to_string());
         state.filename_index_ready.store(true, Ordering::SeqCst);
+        tgrep_core::path_index::write_extra_paths(&index_dir, &["assets/missing.bin".to_string()])
+            .unwrap();
 
         sweep_removed_files(
             state.as_ref(),
@@ -7172,14 +7206,16 @@ mod tests {
                 .contains("assets/missing.bin")
         );
         assert!(
-            state
-                .index
-                .read()
-                .unwrap()
-                .live
-                .is_deleted("assets/missing.bin")
+            !state.index.read().unwrap().live.has_pending_changes(),
+            "removing a filename-only path must not create a content tombstone"
         );
         assert!(state.filename_index_dirty.load(Ordering::SeqCst));
+        assert!(persist_pending_index_changes(&state));
+        assert_eq!(
+            tgrep_core::path_index::read_extra_paths(&index_dir).unwrap(),
+            Some(Vec::new())
+        );
+        assert!(!state.filename_index_dirty.load(Ordering::SeqCst));
     }
 
     /// A binary marker's offset is a position in the file, not in the repaired
@@ -7713,6 +7749,7 @@ mod tests {
         }
         assert!(state.index.read().unwrap().live.has_path("raced.rs"));
         let stamps = state.file_stamps.read().unwrap().clone();
+        let listed_files = vec!["raced.rs".to_string()];
         std::fs::remove_file(&path).unwrap();
         {
             let _gate = state.snapshot_gate.write().unwrap();
@@ -7726,6 +7763,7 @@ mod tests {
                     preserved: &std::collections::HashSet::new(),
                     operation: "test stale check",
                     authoritative_membership: true,
+                    authoritative_listed_files: Some(&listed_files),
                 },
             ));
         }
@@ -7734,6 +7772,14 @@ mod tests {
             assert!(index.reader_has_path("raced.rs"));
             assert!(index.live.has_path("raced.rs"));
         }
+        assert!(
+            !state
+                .filename_extra_paths
+                .read()
+                .unwrap()
+                .contains("raced.rs"),
+            "a preserved active overlay must remain a content path, not enter the sidecar"
+        );
         assert!(state.unreadable.read().unwrap().contains_key("raced.rs"));
 
         // A later merge may still need to publish unrelated live work. The
@@ -7759,6 +7805,7 @@ mod tests {
                     preserved: &preserved,
                     operation: "test retry",
                     authoritative_membership: true,
+                    authoritative_listed_files: None,
                 },
             ));
         }
@@ -8528,6 +8575,54 @@ mod tests {
         assert!(
             result.contains("new_watched_marker"),
             "the replay must force the concrete event despite the later matching stamp: {result}"
+        );
+    }
+
+    #[test]
+    fn rpc_reload_replays_binary_filename_changes_received_after_extraction() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        let removed = root.join("removed.bin");
+        let added = root.join("added.bin");
+        std::fs::write(&removed, [1, 2, 3]).unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let hook_state = Arc::clone(&state);
+        let hook_removed = removed.clone();
+        let hook_added = added.clone();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterBuildBeforeStampPublish) {
+                std::fs::remove_file(&hook_removed).unwrap();
+                std::fs::write(&hook_added, [4, 5, 6]).unwrap();
+                assert!(defer_events_during_build(
+                    &hook_state,
+                    &Event {
+                        kind: EventKind::Remove(notify::event::RemoveKind::File),
+                        paths: vec![hook_removed.clone()],
+                        attrs: Default::default(),
+                    }
+                ));
+                assert!(defer_events_during_build(
+                    &hook_state,
+                    &Event {
+                        kind: EventKind::Create(notify::event::CreateKind::File),
+                        paths: vec![hook_added.clone()],
+                        attrs: Default::default(),
+                    }
+                ));
+            }
+        }));
+
+        let response = handle_reload(None, &state);
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+        let response = handle_files(None, &state);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value.pointer("/result/files").unwrap(),
+            &serde_json::json!(["added.bin"]),
+            "binary filename events must be replayed against the reloaded sidecar"
         );
     }
 
@@ -9712,6 +9807,53 @@ mod tests {
             !index.reader_has_path("removed/deep.rs") && !index.live.has_path("removed/deep.rs"),
             "the coalesced reconcile must retire descendants named by no removal event"
         );
+    }
+
+    #[test]
+    fn a_deferred_directory_rename_reconciles_filename_only_descendants() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = root.join("removed");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("deep.bin"), [1, 2, 3]).unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        state
+            .filename_extra_paths
+            .write()
+            .unwrap()
+            .insert("removed/deep.bin".to_string());
+        state.filename_index_ready.store(true, Ordering::SeqCst);
+
+        state.indexing.store(true, Ordering::SeqCst);
+        std::fs::rename(&dir, root.join("moved")).unwrap();
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::From,
+                )),
+                paths: vec![dir],
+                attrs: Default::default(),
+            },
+        );
+        state.indexing.store(false, Ordering::SeqCst);
+        replay_deferred_events(&state, &root);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+            || state.ignore_rules_dirty.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let paths = state.filename_extra_paths.read().unwrap();
+        assert!(
+            !paths.contains("removed/deep.bin"),
+            "the coalesced reconcile must retire filename-only descendants"
+        );
+        assert!(paths.contains("moved/deep.bin"));
     }
 
     /// A file that cannot be opened right now is not a file that stopped

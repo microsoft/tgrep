@@ -742,7 +742,7 @@ impl Cli {
 
         Ok(ResolvedArgs {
             max_filesize: self.max_filesize_bytes()?,
-            max_filesize_requested: self.max_filesize.is_some(),
+            max_filesize_requested: self.max_filesize.is_some() || self.no_max_filesize,
             encoding: self.encoding_mode()?,
             engine,
             regex_size_limit: self
@@ -1136,7 +1136,7 @@ fn run_cli() {
             if cli.list_files {
                 let opts = cli.build_search_opts(String::new(), &resolved);
                 let paths = list_files_paths(&cli);
-                list_files(&paths, &opts)
+                list_files(&paths, cli.index_path.as_deref(), &opts)
             } else if cli.pattern.is_some() || !cli.regexp.is_empty() || cli.pattern_file.is_some()
             {
                 let (pattern, paths) =
@@ -1232,7 +1232,11 @@ fn list_files_paths(cli: &Cli) -> Vec<String> {
     paths
 }
 
-fn list_files(paths: &[String], opts: &search::SearchOptions) -> anyhow::Result<()> {
+fn list_files(
+    paths: &[String],
+    index_path: Option<&std::path::Path>,
+    opts: &search::SearchOptions,
+) -> anyhow::Result<()> {
     let mut opts = opts.clone();
     for target in normalize_search_paths(paths) {
         if !target.path.exists() {
@@ -1240,7 +1244,7 @@ fn list_files(paths: &[String], opts: &search::SearchOptions) -> anyhow::Result<
             continue;
         }
         opts.path_display = target.display();
-        search::list_files(&target.path, &opts)?;
+        search::list_files(&target.path, index_path, &opts)?;
     }
     Ok(())
 }

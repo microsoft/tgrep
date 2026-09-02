@@ -403,8 +403,8 @@ pub fn new_writer(opts: &SearchOptions) -> OutputWriter {
     OutputWriter::new(opts.make_output_config())
 }
 
-/// List files that would be searched (--files mode).
-pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
+/// List files that would be searched (`--files` mode).
+pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Result<()> {
     let root = match std::fs::canonicalize(root) {
         Ok(root) => root,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -431,23 +431,185 @@ pub fn list_files(root: &Path, opts: &SearchOptions) -> Result<()> {
         return Ok(());
     }
 
-    let walk = walker::walk_dir(&root, &walk_opts);
-    let mut writer = OutputWriter::new(opts.make_output_config());
+    let index_dir = index_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| builder::default_index_dir(&root));
 
-    for path in &walk.files {
-        let rel_path = path
-            .strip_prefix(&root)
+    if filename_index_compatible(opts) {
+        if let Ok(info) = ServerInfo::load(&index_dir)
+            && let Some((index_root, scope)) = resolve_scope(&index_dir, &root)
+            && let Ok(paths) = list_files_via_server(&info)
+        {
+            return write_indexed_file_paths(
+                &index_root,
+                &root,
+                &scope,
+                paths,
+                &glob_filter,
+                &type_filter,
+                opts,
+            );
+        }
+
+        match load_indexed_file_paths(&index_dir) {
+            Ok(Some(paths)) => {
+                if let Some((index_root, scope)) = resolve_scope(&index_dir, &root) {
+                    return write_indexed_file_paths(
+                        &index_root,
+                        &root,
+                        &scope,
+                        paths,
+                        &glob_filter,
+                        &type_filter,
+                        opts,
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if !opts.no_messages {
+                    eprintln!("warning: filename index unavailable ({error}) - walking filesystem");
+                }
+            }
+        }
+    }
+
+    let walk = walker::walk_dir(&root, &walk_opts);
+    let paths = walk.files.iter().map(|path| {
+        path.strip_prefix(&root)
             .unwrap_or(path)
             .to_string_lossy()
-            .replace('\\', "/");
+            .replace('\\', "/")
+    });
+    write_indexed_file_paths(
+        &root,
+        &root,
+        &IndexScope::Whole,
+        paths,
+        &glob_filter,
+        &type_filter,
+        opts,
+    )
+}
 
-        if !passes_filters(&rel_path, &glob_filter, &type_filter) {
-            continue;
+/// Whether an existing index was built under traversal rules that can answer
+/// this invocation without silently omitting files.
+fn filename_index_compatible(opts: &SearchOptions) -> bool {
+    !opts.no_index
+        && !opts.hidden
+        && !opts.no_ignore
+        && !opts.no_ignore_dot
+        && !opts.no_ignore_exclude
+        && !opts.no_ignore_global
+        && !opts.no_ignore_parent
+        && !opts.no_ignore_vcs
+        && !opts.no_require_git
+        && !opts.follow
+        && !opts.one_file_system
+        && opts.ignore_files.is_empty()
+        && !opts.ignore_file_case_insensitive
+        && !opts.max_filesize_requested
+}
+
+/// Load a complete local filename index, including the paths deliberately
+/// omitted from the content index.
+fn load_indexed_file_paths(index_dir: &Path) -> Result<Option<Vec<String>>> {
+    if !index_dir.join("lookup.bin").exists() {
+        return Ok(None);
+    }
+    let Some(mut extra_paths) = tgrep_core::path_index::read_extra_paths(index_dir)? else {
+        return Ok(None);
+    };
+    if !IndexMeta::load(index_dir)?.complete {
+        return Ok(None);
+    }
+
+    let reader = IndexReader::open(index_dir)?;
+    let mut paths = Vec::with_capacity(reader.num_files() + extra_paths.len());
+    paths.extend(reader.all_paths().iter().cloned());
+    paths.append(&mut extra_paths);
+    Ok(Some(paths))
+}
+
+/// Apply search-root scoping and CLI filters to index-root-relative paths.
+fn write_indexed_file_paths(
+    index_root: &Path,
+    search_root: &Path,
+    scope: &IndexScope,
+    paths: impl IntoIterator<Item = String>,
+    glob_filter: &crate::glob_filter::GlobFilter,
+    type_filter: &filetypes::TypeFilter,
+    opts: &SearchOptions,
+) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    let mut paths: Vec<String> = paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .filter_map(|path| scope.relativize(&path, search_root))
+        .filter(|path| within_max_depth(path, opts))
+        .filter(|path| passes_filters(path, glob_filter, type_filter))
+        .collect();
+
+    if let Some(sort) = opts.sort {
+        paths.sort_by_cached_key(|path| {
+            let time = if sort.key == SortKey::Path {
+                None
+            } else {
+                time_key(&scope.full_path(index_root, path), sort.key)
+            };
+            (time, PathBuf::from(path))
+        });
+        if sort.reverse {
+            paths.reverse();
         }
-        writer.write_file(&rel_path)?;
+    }
+
+    let mut writer = OutputWriter::new(opts.make_output_config());
+    for path in paths {
+        writer.write_file(&path)?;
     }
     writer.flush()?;
     Ok(())
+}
+
+fn list_files_via_server(info: &ServerInfo) -> Result<Vec<String>> {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "files",
+            "id": 1,
+        })
+    )?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let response: serde_json::Value = serde_json::from_str(&line)?;
+    if let Some(error) = response.get("error") {
+        let message = error
+            .get("message")
+            .and_then(|message| message.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("server error: {message}");
+    }
+
+    response
+        .get("result")
+        .and_then(|result| result.get("files"))
+        .and_then(|files| files.as_array())
+        .ok_or_else(|| anyhow::anyhow!("server response did not contain files"))?
+        .iter()
+        .map(|path| {
+            path.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("server returned a non-string file path"))
+        })
+        .collect()
 }
 
 /// Run one search path's worth of work, writing through the caller's `writer`.

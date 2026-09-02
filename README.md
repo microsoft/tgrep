@@ -69,6 +69,8 @@ tgrep <pattern> ---TCP---> tgrep serve (multi-client)
   flushed to disk and the reader is swapped, keeping memory bounded
 - **File Watcher** — `notify` crate watches the repo; updates LiveIndex in
   real time
+- **Filename Index** — `--files` unions content-index paths with a compact
+  sidecar containing only admitted paths that have no searchable content
 - **TCP Server** — JSON-RPC 2.0 over newline-delimited TCP; each connection
   handled in a separate thread; multiple clients can connect simultaneously
 - **File Cache** — 50K-entry content cache with RwLock for lock-free reads
@@ -350,6 +352,11 @@ tgrep --files src/main.rs         # list a single file if searchable
 tgrep --files -t rust .           # list Rust files only
 tgrep --type-list                 # show all file types
 ```
+
+With the default traversal rules, `--files` reads the live server or the local
+index instead of walking the repository. The local result is an index snapshot;
+use `--no-index` to inspect the filesystem as it exists now. Flags that change
+traversal membership or the file-size policy also fall back to a walk.
 
 ### Check status
 
@@ -700,6 +707,7 @@ exit code determined by the search alone. Suppress the message with
 | `lookup.bin` | Sorted 16-byte entries: `trigram(u32) + offset(u64) + length(u32)` |
 | `index.bin` | Concatenated posting lists: `file_id(u32)` per entry |
 | `files.bin` | File ID→path mapping: `file_id(u32) + path_len(u16) + path_bytes` |
+| `files-extra.bin` | Paths included by `--files` but absent from `files.bin` |
 | `meta.json` | Version, file/trigram counts, timestamps |
 | `serve.json` | Server PID and TCP port (for client discovery) |
 
@@ -723,6 +731,7 @@ tgrep/
 │       ├── ondisk.rs             # On-disk binary format
 │       ├── builder.rs            # Index construction (parallel via rayon)
 │       ├── reader.rs             # Mmap'd index reader
+│       ├── path_index.rs         # Filename-only path sidecar
 │       ├── query.rs              # Regex → trigram query decomposition
 │       ├── live.rs               # LiveIndex (in-memory mutable overlay)
 │       ├── hybrid.rs             # HybridIndex (reader + live overlay)

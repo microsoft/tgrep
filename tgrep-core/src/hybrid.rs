@@ -164,6 +164,36 @@ impl HybridIndex {
         ids
     }
 
+    /// Get every active content-indexed path from a consistent reader snapshot.
+    pub fn all_paths(&self) -> Vec<String> {
+        let reader = self.reader();
+        let mut paths: Vec<String> = reader
+            .all_paths()
+            .iter()
+            .enumerate()
+            .filter(|(file_id, _)| self.reader_entry_active(&reader, *file_id as u32))
+            .map(|(_, path)| path.clone())
+            .collect();
+        paths.extend(
+            self.live
+                .all_paths_ordered()
+                .into_iter()
+                .map(str::to_string),
+        );
+        paths
+    }
+
+    /// Whether a path is active in either the reader or live overlay.
+    pub fn has_active_path(&self, path: &str) -> bool {
+        if self.live.has_path(path) {
+            return true;
+        }
+        if self.live.is_deleted(path) {
+            return false;
+        }
+        self.reader().contains_path(path)
+    }
+
     /// Execute a query plan against the hybrid index.
     pub fn execute_query(&self, plan: &QueryPlan) -> Vec<u32> {
         if plan.is_match_all() {

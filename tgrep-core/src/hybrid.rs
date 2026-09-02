@@ -293,6 +293,16 @@ impl HybridIndex {
         self.reader().all_paths().iter().cloned().collect()
     }
 
+    /// Whether the active on-disk reader contains `path`.
+    pub fn reader_has_path(&self, path: &str) -> bool {
+        self.reader().contains_path(path)
+    }
+
+    /// Whether the active on-disk reader contains a path below `directory`.
+    pub fn reader_has_descendant_path(&self, directory: &str) -> bool {
+        self.reader().has_descendant_path(directory)
+    }
+
     /// The reader paths `keep` accepts.
     ///
     /// For callers that want a few of them — everything under one directory,
@@ -322,9 +332,23 @@ impl HybridIndex {
     /// (e.g. by the file-watcher) are preserved because they are **not** in
     /// the reader yet.
     pub fn prune_persisted_entries(&mut self) {
+        self.prune_persisted_entries_except(&std::collections::HashSet::new());
+    }
+
+    /// Remove persisted overlay entries except paths whose latest disk read
+    /// failed. Those entries may be newer than the reader copy and must remain
+    /// authoritative until a later merge successfully reads them.
+    pub fn prune_persisted_entries_except(
+        &mut self,
+        preserved: &std::collections::HashSet<String>,
+    ) {
         let reader = self.reader();
-        let reader_paths: std::collections::HashSet<&str> =
-            reader.all_paths().iter().map(|s| s.as_str()).collect();
+        let reader_paths: std::collections::HashSet<&str> = reader
+            .all_paths()
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|path| !preserved.contains(*path))
+            .collect();
 
         // Fast path: after a successful bulk flush every overlay path is
         // already in the new reader. Swap all overlay maps out for empty

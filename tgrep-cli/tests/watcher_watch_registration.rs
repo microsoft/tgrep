@@ -1,4 +1,5 @@
-//! The watcher must not take OS subscriptions for trees it is going to ignore.
+//! On Linux and Android, the watcher must not take OS subscriptions for trees
+//! it is going to ignore.
 //!
 //! On Linux `notify` has no recursive inotify mode: `RecursiveMode::Recursive`
 //! walks the tree and spends one watch descriptor per directory. Ignored build
@@ -14,9 +15,13 @@
 //! while asserting the watcher still works — a watcher that registered nothing
 //! at all would trivially satisfy the count.
 //!
-//! Windows (ReadDirectoryChangesW) and macOS (FSEvents) subscribe once for the
-//! whole subtree, so there is no per-directory registration to withhold and
-//! nothing here applies; the count assertion is Linux-only for that reason.
+//! This implementation intentionally uses one recursive
+//! `ReadDirectoryChangesW` root subscription on Windows and one root FSEvents
+//! stream on macOS. Ignored events are filtered after delivery there, so the
+//! implementation avoids per-directory descriptor growth but does not leave
+//! ignored descendants unwatched. kqueue and `PollWatcher` are not covered.
+//! The descriptor-count assertion is Linux-only; Android has the same selective
+//! registration design but is not exercised by this test target.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -111,6 +116,15 @@ fn wait_for_no_match(port: u16, pattern: &str, timeout: Duration) -> bool {
     }
 }
 
+fn git(root: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .status()
+        .expect("failed to run git");
+    assert!(status.success(), "git {args:?} failed");
+}
+
 /// Read `(pid, port)` once the server is accepting connections.
 fn wait_for_server(index_dir: &Path) -> (u32, u16) {
     let serve_json = index_dir.join("serve.json");
@@ -174,6 +188,7 @@ fn watcher_does_not_subscribe_to_gitignored_directories() {
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("artifact.txt"), "ignored_build_output\n").unwrap();
     }
+
     for i in 0..SOURCE_DIRS {
         let sub = root.join("src").join(format!("pkg{i}"));
         fs::create_dir_all(&sub).unwrap();
@@ -241,6 +256,93 @@ fn watcher_does_not_subscribe_to_gitignored_directories() {
          non-ignored directories are the root plus {SOURCE_DIRS} under src/; \
          it is subscribing to the {IGNORED_DIRS} gitignored directories under \
          build/ (expected at most {allowed})"
+    );
+}
+
+/// The Git index is hidden and deliberately not watched, but it changes which
+/// case-insensitively ignored paths Git considers tracked. The long-lived
+/// watcher must reconcile both directions from the index identity alone.
+#[test]
+fn watcher_reconciles_forced_add_and_rm_cached_inside_an_ignored_tree() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let index_dir = root.join(".tgrep_test_index");
+
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "core.ignorecase", "true"]);
+    fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("lib.rs"),
+        "fn seeded() { let normal_source_marker = 1; }\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("ignored")).unwrap();
+    fs::write(
+        root.join("ignored").join("tracked.rs"),
+        "fn forced() { let forced_tracked_marker = 2; }\n",
+    )
+    .unwrap();
+    git(root, &["add", "--", ".gitignore", "src/lib.rs"]);
+
+    let status = Command::new(tgrep_bin())
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run tgrep index");
+    assert!(status.success(), "initial index build failed");
+
+    let child = Command::new(tgrep_bin())
+        .args([
+            "serve",
+            "--index-path",
+            index_dir.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to start tgrep serve");
+    let _server = ServerGuard { child };
+
+    let (_pid, port) = wait_for_server(&index_dir);
+    fs::write(
+        root.join("src").join("watcher-ready.rs"),
+        "fn ready() { let watcher_ready_marker = 3; }\n",
+    )
+    .unwrap();
+    assert!(
+        wait_for_match(port, "watcher_ready_marker", Duration::from_secs(30)),
+        "watcher did not become ready"
+    );
+    assert_eq!(search_matches(port, "forced_tracked_marker"), 0);
+
+    // Only .git/index changes: the file already exists under an unsubscribed
+    // ignored directory, so no ordinary watcher event can rescue this.
+    git(root, &["add", "-f", "--", "ignored/tracked.rs"]);
+    assert!(
+        wait_for_match(port, "forced_tracked_marker", Duration::from_secs(60)),
+        "git add -f did not restore the tracked file through reconciliation"
+    );
+
+    git(
+        root,
+        &[
+            "rm",
+            "--cached",
+            "--force",
+            "--quiet",
+            "--",
+            "ignored/tracked.rs",
+        ],
+    );
+    assert!(
+        wait_for_no_match(port, "forced_tracked_marker", Duration::from_secs(60)),
+        "git rm --cached did not prune stale indexed content"
     );
 }
 

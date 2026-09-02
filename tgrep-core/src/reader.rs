@@ -14,6 +14,9 @@ pub struct IndexReader {
     lookup: Option<Mmap>,
     postings: Option<Mmap>,
     file_paths: Vec<String>,
+    /// File IDs sorted by path, for exact membership checks without duplicating
+    /// every path string in a second collection.
+    path_order: Vec<usize>,
     num_entries: usize,
 }
 
@@ -120,11 +123,14 @@ impl IndexReader {
         for (id, path) in file_entries {
             file_paths[id as usize] = path;
         }
+        let mut path_order: Vec<usize> = (0..file_paths.len()).collect();
+        path_order.sort_unstable_by(|&a, &b| file_paths[a].cmp(&file_paths[b]));
 
         Ok(Self {
             lookup,
             postings,
             file_paths,
+            path_order,
             num_entries,
         })
     }
@@ -137,6 +143,7 @@ impl IndexReader {
             lookup: None,
             postings: None,
             file_paths: Vec::new(),
+            path_order: Vec::new(),
             num_entries: 0,
         }
     }
@@ -146,6 +153,7 @@ impl IndexReader {
         self.lookup = None;
         self.postings = None;
         self.file_paths.clear();
+        self.path_order.clear();
         self.num_entries = 0;
     }
 
@@ -177,6 +185,37 @@ impl IndexReader {
     /// Get file path by ID.
     pub fn file_path(&self, file_id: u32) -> Option<&str> {
         self.file_paths.get(file_id as usize).map(|s| s.as_str())
+    }
+
+    pub fn contains_path(&self, path: &str) -> bool {
+        self.path_order
+            .binary_search_by(|&id| self.file_paths[id].as_str().cmp(path))
+            .is_ok()
+    }
+
+    /// Whether the reader contains a path strictly below `directory`.
+    pub fn has_descendant_path(&self, directory: &str) -> bool {
+        if directory.is_empty() {
+            return !self.path_order.is_empty();
+        }
+        let prefix = directory
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(b'/'));
+        let lower = self.path_order.partition_point(|&id| {
+            self.file_paths[id]
+                .as_bytes()
+                .iter()
+                .copied()
+                .cmp(prefix.clone())
+                .is_lt()
+        });
+        self.path_order.get(lower).is_some_and(|&id| {
+            self.file_paths[id]
+                .strip_prefix(directory)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        })
     }
 
     /// Total number of indexed files.
@@ -519,6 +558,21 @@ mod tests {
     }
 
     #[test]
+    fn descendant_lookup_is_sorted_and_directory_boundary_aware() {
+        let tmp = TempDir::new().unwrap();
+        let mut files = ondisk::encode_file_entry(0, "elsewhere.rs").unwrap();
+        files.extend_from_slice(&ondisk::encode_file_entry(1, "src/deep/a.rs").unwrap());
+        files.extend_from_slice(&ondisk::encode_file_entry(2, "src2/not-a-child.rs").unwrap());
+        write_index(tmp.path(), &[], &[], &files);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+
+        assert!(reader.has_descendant_path("src"));
+        assert!(reader.has_descendant_path("src/deep"));
+        assert!(!reader.has_descendant_path("sr"));
+        assert!(!reader.has_descendant_path("src2/not-a-child.rs"));
+    }
+
+    #[test]
     fn is_degenerate_detects_mmap_counter_disagreement() {
         let tmp = TempDir::new().unwrap();
         let (lookup, postings) = make_sorted_index(&[0x616263]);
@@ -555,6 +609,7 @@ mod tests {
             lookup: opened.lookup,
             postings: opened.postings,
             file_paths: opened.file_paths,
+            path_order: opened.path_order,
             num_entries: 0,
         };
         assert!(

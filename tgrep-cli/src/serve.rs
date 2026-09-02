@@ -52,6 +52,10 @@ const WATCHER_QUEUE_CAP: usize = 16_384;
 /// reconciling stale check runs.
 const WATCHER_IDLE_POLL: Duration = Duration::from_secs(1);
 
+/// Git's index is hidden from the repository watcher. Poll its metadata only
+/// when the case-insensitive tracked-file exemption is active.
+const TRACKED_INDEX_POLL: Duration = Duration::from_secs(2);
+
 /// How long a file the watcher never heard about can stay wrong in the index.
 ///
 /// Every mutation the index takes after the initial build arrives as an OS
@@ -266,6 +270,7 @@ impl ContentCache {
 struct ServerState {
     index: RwLock<HybridIndex>,
     cache: RwLock<ContentCache>,
+    cache_generation: std::sync::atomic::AtomicU64,
     root: PathBuf,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
@@ -290,6 +295,9 @@ struct ServerState {
     ignore_rules_dirty: std::sync::atomic::AtomicBool,
     /// Ensures a burst of ignore-file events uses at most one refresh worker.
     ignore_refresh_scheduled: std::sync::atomic::AtomicBool,
+    /// Last observed tracked-path membership. `None` means the published
+    /// matcher has no case-insensitive tracked-file exemption.
+    tracked_membership: Mutex<Option<tgrep_core::gitignore::TrackedMembershipFingerprint>>,
     /// Set when events were lost, cleared by the next subscription sync, which
     /// then re-issues every subscription instead of trusting its own records.
     ///
@@ -471,7 +479,22 @@ struct ServerState {
     /// Milliseconds since `started` at the last search request, used by the
     /// periodic reconcile to stay out of the way of a server in active use.
     last_search_ms: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    stale_refresh_hook: Mutex<Option<StaleRefreshHook>>,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum StaleRefreshPhase {
+    BeforeWalk,
+    AfterBuildBeforeStampPublish,
+    AfterConcreteRead,
+    BeforeConcreteCommit,
+    AfterMatcherPublish,
+}
+
+#[cfg(test)]
+type StaleRefreshHook = Arc<dyn Fn(StaleRefreshPhase) + Send + Sync>;
 
 impl ServerState {
     fn note_search(&self) {
@@ -639,6 +662,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
             CACHE_MAX_BYTES,
             CACHE_MAX_ENTRY_BYTES,
         )),
+        cache_generation: std::sync::atomic::AtomicU64::new(0),
         root: root.clone(),
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
@@ -648,6 +672,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         gitignore_pending: std::sync::atomic::AtomicBool::new(!no_watch && !no_ignore),
         ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
         ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+        tracked_membership: Mutex::new(None),
         watch_resubscribe: std::sync::atomic::AtomicBool::new(false),
         ignore_sources: RwLock::new(Vec::new()),
         ignore_source_stamps: RwLock::new(IgnoreStamps::new()),
@@ -673,6 +698,8 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         unreadable: RwLock::new(std::collections::HashMap::new()),
         started: serve_start,
         last_search_ms: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(test)]
+        stale_refresh_hook: Mutex::new(None),
     });
 
     // Bind TCP listener on a random port
@@ -806,17 +833,19 @@ fn build_stale_matcher(
     state: &ServerState,
     root: &Path,
     walk: &tgrep_core::walker::MetaWalkResult,
+    ignorecase: Option<std::sync::Arc<tgrep_core::gitignore::CaseInsensitiveIgnore>>,
 ) -> Option<tgrep_core::gitignore::IgnoreMatcher> {
     if state.no_ignore {
         return None;
     }
 
     let start = Instant::now();
-    let matcher = tgrep_core::walker::build_gitignore_matcher_from_files(
+    let matcher = tgrep_core::walker::build_gitignore_matcher_from_files_with_ignorecase(
         root,
         &walk.gitignore_files,
         &walk.ignore_files,
         state.no_require_git,
+        ignorecase,
     );
     let has_matcher = matcher.is_some();
     eprintln!(
@@ -1008,7 +1037,17 @@ fn publish_ignore_matcher(
 
     *state.ignore_source_stamps.write().unwrap() = stamps;
     *state.ignore_sources.write().unwrap() = sources;
-    *state.gitignore.write().unwrap() = matcher;
+    // Keep the matcher and semantic baseline in one critical section. The
+    // matcher's tracked exemption is immutable, so this baseline describes the
+    // exact decisions the stale walk and watcher publication made.
+    let mut published = state.gitignore.write().unwrap();
+    let mut membership = state.tracked_membership.lock().unwrap();
+    *membership = matcher
+        .as_ref()
+        .and_then(tgrep_core::gitignore::IgnoreMatcher::tracked_membership_fingerprint);
+    *published = matcher;
+    drop(membership);
+    drop(published);
     state.gitignore_pending.store(false, Ordering::SeqCst);
     // New rules mean a different set of directories worth hearing about:
     // a tightened rule releases the subscriptions under it, and a relaxed
@@ -1032,7 +1071,7 @@ fn publish_ignore_matcher(
     newly_watched
 }
 
-fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
+fn handle_connection(stream: TcpStream, state: &Arc<ServerState>) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
@@ -1047,7 +1086,7 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
     Ok(())
 }
 
-fn process_request(request: &str, state: &ServerState) -> String {
+fn process_request(request: &str, state: &Arc<ServerState>) -> String {
     let req: serde_json::Value = match serde_json::from_str(request) {
         Ok(v) => v,
         Err(e) => {
@@ -1447,6 +1486,7 @@ fn handle_search(
             })
             .collect()
     } else {
+        let cache_generation = state.cache_generation.load(Ordering::SeqCst);
         // Phase 1: read-lock to find cache hits (peek avoids write-lock need)
         let mut hit_keys: Vec<String> = Vec::new();
         let mut hits: Vec<(String, Arc<DecodedFile>)> = Vec::with_capacity(candidate_info.len());
@@ -1478,17 +1518,7 @@ fn handle_search(
 
         // Phase 3: single write-lock to promote hits and insert misses
         if !hit_keys.is_empty() || !disk_results.is_empty() {
-            let mut cache = state.cache.write().unwrap();
-            // Promote hit entries so LRU recency stays accurate
-            for key in &hit_keys {
-                cache.touch(key);
-            }
-            // Insert disk results, re-checking for races with other threads
-            for (rel_path, content) in &disk_results {
-                if cache.peek(rel_path).is_none() {
-                    cache.put(rel_path.clone(), Arc::clone(content));
-                }
-            }
+            update_content_cache(state, cache_generation, &hit_keys, &disk_results);
         }
 
         // Combine hits and disk results, preserving candidate order
@@ -1552,6 +1582,49 @@ fn handle_search(
     });
 
     json_rpc_result(id, result)
+}
+
+fn update_content_cache(
+    state: &ServerState,
+    expected_generation: u64,
+    hit_keys: &[String],
+    disk_results: &[(String, Arc<DecodedFile>)],
+) {
+    let mut cache = state.cache.write().unwrap();
+    // Index mutations invalidate cached paths and advance this generation under
+    // the same lock. Earlier disk reads may serve their in-flight query, but
+    // must not repopulate stale bytes for later searches.
+    if state.cache_generation.load(Ordering::SeqCst) != expected_generation {
+        return;
+    }
+    for key in hit_keys {
+        cache.touch(key);
+    }
+    for (rel_path, content) in disk_results {
+        if cache.peek(rel_path).is_none() {
+            cache.put(rel_path.clone(), Arc::clone(content));
+        }
+    }
+}
+
+/// Invalidate cache entries while the caller holds the index write lock.
+/// Searches acquire these locks in index-then-cache order, so the new posting
+/// set and its corresponding cache generation become visible atomically.
+fn invalidate_cached_paths_locked<'a>(
+    state: &ServerState,
+    paths: impl IntoIterator<Item = &'a str>,
+) {
+    let Ok(mut cache) = state.cache.write() else {
+        return;
+    };
+    let mut invalidated = false;
+    for path in paths {
+        cache.pop(path);
+        invalidated = true;
+    }
+    if invalidated {
+        state.cache_generation.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn search_file_matches(
@@ -1727,37 +1800,156 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
     json_rpc_result(id, result)
 }
 
-fn handle_reload(id: Option<serde_json::Value>, state: &ServerState) -> String {
+fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> String {
     let index_dir = state.index_dir.clone();
+    while state.indexing.load(Ordering::SeqCst) || state.flushing.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    let refresh = state.stale_refresh_lock.lock().unwrap();
+    let gate = state.snapshot_gate.write().unwrap();
+    {
+        let _deferred = match state.deferred_events.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.indexing.store(true, Ordering::SeqCst);
+    }
+    let ignorecase = frozen_tracked_membership(state, &state.root);
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeWalk);
+    let since = SystemTime::now();
 
-    // Rebuild from disk. Uses the options form rather than `build_index` so the
-    // rebuild keeps the ignore semantics the server started with — a reload that
-    // silently changed them would rewrite the index against different rules.
-    if let Err(e) = builder::build_index_with_options(
+    // Rebuild the index and watcher matcher from the same immutable tracked
+    // membership. The snapshot gate keeps watcher/auto-save mutations out until
+    // both are published.
+    let staging_dir = index_dir.join(".reload-build");
+    let _ = std::fs::remove_dir_all(&staging_dir);
+    let outcome = match builder::build_index_with_options_and_ignorecase(
         &state.root,
-        Some(&index_dir),
+        Some(&staging_dir),
         &builder::BuildOptions {
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
             exclude_dirs: state.exclude_dirs.clone(),
+            collect_gitignore_files: !state.no_ignore,
             ..Default::default()
         },
+        ignorecase.clone(),
     ) {
-        return json_rpc_error(id, -32000, &format!("rebuild failed: {e}"));
-    }
-
-    // Reopen index
-    match HybridIndex::open(&index_dir, &state.root) {
-        Ok(new_index) => {
-            let mut index = state.index.write().unwrap();
-            *index = new_index;
-            let mut cache = state.cache.write().unwrap();
-            cache.clear();
-            json_rpc_result(id, serde_json::json!({"status": "reloaded"}))
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            state.indexing.store(false, Ordering::SeqCst);
+            drop(gate);
+            drop(refresh);
+            replay_deferred_events(state, &state.root);
+            schedule_pending_ignore_refresh(state);
+            return json_rpc_error(id, -32000, &format!("rebuild failed: {e}"));
         }
-        Err(e) => json_rpc_error(id, -32000, &format!("reopen failed: {e}")),
+    };
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::AfterBuildBeforeStampPublish);
+
+    // Freeze the deferred buffer through publication. Events already captured
+    // have their stamps withheld; callbacks arriving now wait on this lock,
+    // then observe `indexing == false` and process normally after the gate drops.
+    let deferred = match state.deferred_events.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let stamps = match tgrep_core::meta::read_filestamps(&staging_dir) {
+        Ok(stamps) if state.watch_enabled => {
+            withhold_stamps_for_deferred_snapshot(&state.root, stamps, deferred.as_ref())
+        }
+        // Without a watcher there is no event to identify a file that changed
+        // between extraction and the builder's later stamp collection. Publish
+        // no claims from that racy window; the serialized catch-up below then
+        // treats every path as changed and rebuilds it once.
+        Ok(_) => std::collections::HashMap::new(),
+        Err(e) => {
+            eprintln!("[trace] warning: reload could not read file stamps ({e})");
+            std::collections::HashMap::new()
+        }
+    };
+    if let Err(e) = tgrep_core::meta::write_filestamps(&stamps, &staging_dir) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        state.indexing.store(false, Ordering::SeqCst);
+        drop(deferred);
+        drop(gate);
+        drop(refresh);
+        replay_deferred_events(state, &state.root);
+        schedule_pending_ignore_refresh(state);
+        return json_rpc_error(id, -32000, &format!("could not stage rebuild stamps: {e}"));
     }
+    if !publish_reloaded_index(state, &index_dir, &staging_dir, outcome.num_files) {
+        state.indexing.store(false, Ordering::SeqCst);
+        drop(deferred);
+        drop(gate);
+        drop(refresh);
+        replay_deferred_events(state, &state.root);
+        schedule_pending_ignore_refresh(state);
+        return json_rpc_error(id, -32000, "rebuild publication failed");
+    }
+    let indexed = outcome.num_files as u64;
+    state.index_total.store(indexed, Ordering::Relaxed);
+    state.index_progress.store(indexed, Ordering::Relaxed);
+    *state.file_stamps.write().unwrap() = stamps;
+
+    let newly_watched = if state.no_ignore {
+        Vec::new()
+    } else {
+        publish_ignore_matcher(
+            state,
+            &state.root,
+            ignore_sources_of(
+                &state.root,
+                &outcome.gitignore_files,
+                &outcome.ignore_files,
+                state.no_require_git,
+            ),
+            || {
+                tgrep_core::walker::build_gitignore_matcher_from_files_with_ignorecase(
+                    &state.root,
+                    &outcome.gitignore_files,
+                    &outcome.ignore_files,
+                    state.no_require_git,
+                    ignorecase,
+                )
+            },
+        )
+    };
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::AfterMatcherPublish);
+    let mut membership_changed = tracked_membership_changed(state);
+    state.indexing.store(false, Ordering::SeqCst);
+    drop(deferred);
+    drop(gate);
+    drop(refresh);
+    replay_deferred_events(state, &state.root);
+    schedule_pending_ignore_refresh(state);
+
+    if !state.watch_enabled {
+        #[cfg(test)]
+        if membership_changed {
+            run_stale_refresh_hook(state, StaleRefreshPhase::BeforeWalk);
+        }
+        let caught_up = catch_up_unwatched_build(state, &state.root, &state.index_dir);
+        if !caught_up {
+            schedule_tracked_membership_correction(state, &state.root, membership_changed);
+            return json_rpc_error(
+                id,
+                -32000,
+                "rebuild catch-up did not complete; reload was not authoritative",
+            );
+        }
+        membership_changed = tracked_membership_changed(state);
+    }
+    if state.watch_enabled {
+        spawn_recovery_scan(state, &state.root, newly_watched, since);
+    }
+    schedule_tracked_membership_correction(state, &state.root, membership_changed);
+    json_rpc_result(id, serde_json::json!({"status": "reloaded"}))
 }
 
 fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) -> bool {
@@ -1865,7 +2057,24 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
     if std::thread::Builder::new()
         .name("tgrep-watcher".into())
         .spawn(move || {
+            let mut last_tracked_index_poll = Instant::now();
             loop {
+                if last_tracked_index_poll.elapsed() >= TRACKED_INDEX_POLL {
+                    last_tracked_index_poll = Instant::now();
+                    let changed = poll_tracked_membership_changed(&worker_state);
+                    if changed {
+                        eprintln!(
+                            "[trace] Git tracked paths changed; reconciling tracked-file exemptions"
+                        );
+                        worker_state
+                            .ignore_rules_dirty
+                            .store(true, Ordering::SeqCst);
+                        schedule_ignore_rules_refresh(
+                            Arc::clone(&worker_state),
+                            worker_root.clone(),
+                        );
+                    }
+                }
                 match rx.recv_timeout(WATCHER_IDLE_POLL) {
                     Ok(event) => handle_fs_event(&worker_state, &worker_root, &event),
                     // A quiet interval means the burst has drained, so this is
@@ -1917,6 +2126,64 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
     eprintln!("[trace] file watcher started");
 
     true
+}
+
+/// Detect a tracked-file exemption change without subscribing to `.git`.
+///
+/// The metadata probe is enabled only while the published matcher actually
+/// uses the exemption. Index metadata only decides when to reparse its paths;
+/// an unchanged membership fingerprint does not schedule a repository walk.
+/// Updating the observed membership before scheduling makes
+/// a burst one dirty signal; the existing refresh scheduler coalesces it with
+/// any ignore-source changes and serializes the full stale reconciliation.
+fn tracked_membership_changed(state: &ServerState) -> bool {
+    let matcher = state.gitignore.read().unwrap();
+    let current = matcher
+        .as_ref()
+        .and_then(tgrep_core::gitignore::IgnoreMatcher::current_tracked_membership_fingerprint);
+    let mut observed = state.tracked_membership.lock().unwrap();
+    let changed = matches!(
+        (observed.as_ref(), current.as_ref()),
+        (Some(previous), Some(current)) if previous != current
+    );
+    *observed = current;
+    changed
+}
+
+fn poll_tracked_membership_changed(state: &ServerState) -> bool {
+    // A reconcile holds the write side across snapshot, walk and publication.
+    // Waiting here prevents a poll from committing transient A→B→A membership.
+    let _gate = state.snapshot_gate.read().unwrap();
+    tracked_membership_changed(state)
+}
+
+fn frozen_tracked_membership(
+    state: &ServerState,
+    root: &Path,
+) -> Option<Arc<tgrep_core::gitignore::CaseInsensitiveIgnore>> {
+    (!state.no_ignore)
+        .then(|| {
+            tgrep_core::gitignore::CaseInsensitiveIgnore::frozen_snapshot(root, true, true, true)
+        })
+        .flatten()
+        .map(Arc::new)
+}
+
+fn schedule_tracked_membership_correction(state: &Arc<ServerState>, root: &Path, changed: bool) {
+    if !changed {
+        return;
+    }
+    eprintln!("[trace] Git tracked paths changed during reconciliation; scheduling a retry");
+    state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+    schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+}
+
+#[cfg(test)]
+fn run_stale_refresh_hook(state: &ServerState, phase: StaleRefreshPhase) {
+    let hook = state.stale_refresh_hook.lock().unwrap().clone();
+    if let Some(hook) = hook {
+        hook(phase);
+    }
 }
 
 /// Decide whether the file watcher should skip a path entirely.
@@ -2039,10 +2306,10 @@ fn is_ignore_rules_file(root: &Path, path: &Path) -> bool {
 /// repo whose ignored build output exhausts the budget makes `watch()` return
 /// an error and the server loses its watcher entirely.
 ///
-/// ReadDirectoryChangesW (Windows) and FSEvents (macOS) subscribe once for the
-/// whole subtree, so there is no per-directory registration to withhold. On
-/// those platforms filtering on delivery is the only lever available, and
-/// [`should_skip_watcher_path`] remains it.
+/// This implementation deliberately keeps one recursive root subscription on
+/// Windows (`ReadDirectoryChangesW`) and one root stream on macOS (FSEvents).
+/// Ignored events are filtered after delivery there, so ignored descendants are
+/// not unwatched even though the design avoids per-directory descriptor growth.
 ///
 /// Deliberately limited to the backends we can exercise in CI. kqueue and
 /// `PollWatcher` are per-path too, but nothing here builds or tests them.
@@ -2110,6 +2377,34 @@ struct WatchRegistry {
     /// [`WatchRegistry::contained`].
     root: PathBuf,
     watched: std::collections::HashSet<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraversalCompleteness {
+    Complete,
+    Incomplete,
+}
+
+/// Consume one overflow repair request only when this traversal can complete it.
+///
+/// Clearing before the sync means an overflow that arrives during a complete
+/// pass sets the flag for another pass. Re-arming an incomplete pass preserves
+/// the original request without overwriting a concurrent `true`.
+fn take_force_resubscribe(
+    pending: &std::sync::atomic::AtomicBool,
+    completeness: TraversalCompleteness,
+) -> bool {
+    let force = pending.swap(false, Ordering::SeqCst);
+    if force && completeness == TraversalCompleteness::Incomplete {
+        pending.store(true, Ordering::SeqCst);
+        return false;
+    }
+    force
+}
+
+struct WatchableDirs {
+    dirs: std::collections::HashSet<PathBuf>,
+    completeness: TraversalCompleteness,
 }
 
 impl WatchRegistry {
@@ -2283,22 +2578,27 @@ impl WatchRegistry {
     /// would pay forty thousand of them for a doubt only overflow raises.
     ///
     /// Returns `(added, removed)`. Only for a set that describes the whole
-    /// tree — anything absent from `desired` is unsubscribed. To subscribe to
-    /// a subtree without disturbing the rest, use [`Self::add_all`].
+    /// tree. `completeness` makes its authority explicit: a complete set prunes
+    /// anything absent from `desired`, while an incomplete traversal only adds
+    /// directories it proved desirable. To subscribe to a subtree without
+    /// disturbing the rest, use [`Self::add_all`].
     fn sync(
         &mut self,
         desired: &std::collections::HashSet<PathBuf>,
+        completeness: TraversalCompleteness,
         force: bool,
     ) -> (Vec<PathBuf>, usize) {
-        let stale: Vec<PathBuf> = self.watched.difference(desired).cloned().collect();
         let mut removed = 0;
-        for dir in stale {
-            // Best effort. inotify drops a descriptor by itself when the
-            // directory is deleted, so "not found" is an expected outcome
-            // here, not an error worth reporting.
-            let _ = self.watcher.unwatch(&dir);
-            self.watched.remove(&dir);
-            removed += 1;
+        if completeness == TraversalCompleteness::Complete {
+            let stale: Vec<PathBuf> = self.watched.difference(desired).cloned().collect();
+            for dir in stale {
+                // Best effort. inotify drops a descriptor by itself when the
+                // directory is deleted, so "not found" is an expected outcome
+                // here, not an error worth reporting.
+                let _ = self.watcher.unwatch(&dir);
+                self.watched.remove(&dir);
+                removed += 1;
+            }
         }
 
         // Shallowest first, because `desired` is a `HashSet` and hands its
@@ -2343,28 +2643,43 @@ impl WatchRegistry {
 /// Symlinked directories are not descended into, matching the walker (the
 /// `ignore` crate does not follow links by default). That also keeps a
 /// symlink cycle from turning this into an infinite walk.
+///
+/// Any failed listing, entry read, or type query marks the result incomplete.
+/// Its proven directories remain useful for adding subscriptions, but its
+/// omissions must not be used to remove existing ones.
 fn watchable_dirs(
     root: &Path,
     start: &Path,
     exclude_dirs: &[String],
     gitignore: Option<&tgrep_core::gitignore::IgnoreMatcher>,
-) -> std::collections::HashSet<PathBuf> {
+) -> WatchableDirs {
     let mut found = std::collections::HashSet::new();
+    let mut completeness = TraversalCompleteness::Complete;
     found.insert(start.to_path_buf());
 
     let mut stack = vec![start.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             // An unreadable directory is not a reason to abandon the rest of
-            // the tree; the periodic reconcile is what catches what we miss.
+            // the tree, but it makes the result unsafe for pruning.
+            completeness = TraversalCompleteness::Incomplete;
             continue;
         };
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                completeness = TraversalCompleteness::Incomplete;
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                completeness = TraversalCompleteness::Incomplete;
+                continue;
+            };
+            if !file_type.is_dir() {
                 continue;
             }
             let path = entry.path();
             let Ok(rel) = path.strip_prefix(root) else {
+                completeness = TraversalCompleteness::Incomplete;
                 continue;
             };
             let rel = rel.to_string_lossy().replace('\\', "/");
@@ -2375,7 +2690,10 @@ fn watchable_dirs(
             found.insert(path);
         }
     }
-    found
+    WatchableDirs {
+        dirs: found,
+        completeness,
+    }
 }
 
 /// The directories that must be subscribed to for the ignore sources
@@ -2458,13 +2776,13 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
     };
     if !state.no_ignore {
         let sources = state.ignore_sources.read().unwrap();
-        desired.extend(ignore_target_dirs(root, &sources));
+        desired.dirs.extend(ignore_target_dirs(root, &sources));
     }
-    let total = desired.len();
-    // Consumed here, so one overflow buys one forced pass rather than making
-    // every later reconcile re-register the whole tree.
-    let force = state.watch_resubscribe.swap(false, Ordering::SeqCst);
-    let (added, removed) = registry.sync(&desired, force);
+    // An incomplete traversal cannot prove that omitted recorded watches are
+    // live, so it does not get to consume the overflow repair request.
+    let force = take_force_resubscribe(&state.watch_resubscribe, desired.completeness);
+    let (added, removed) = registry.sync(&desired.dirs, desired.completeness, force);
+    let total = registry.watched.len();
     if !added.is_empty() || removed > 0 {
         eprintln!(
             "[trace] watcher subscriptions: {total} directories \
@@ -2713,7 +3031,7 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
                 should_skip_watcher_path(&rel, &state.exclude_dirs, gitignore.as_ref())
             };
             if !skip {
-                reindex_file(state, &path, &rel);
+                reindex_file(state, &path, &rel, false);
             }
         }
         if listing_complete {
@@ -2896,11 +3214,12 @@ fn sweep_removed_files(
             Err(e) if proves_ineligible(&e) => {}
             Err(_) => continue,
         }
-        state.index.write().unwrap().live.delete_file(rel);
-        state.file_stamps.write().unwrap().remove(rel);
-        if let Ok(mut cache) = state.cache.write() {
-            cache.pop(rel);
+        {
+            let mut index = state.index.write().unwrap();
+            index.live.delete_file(rel);
+            invalidate_cached_paths_locked(state, std::iter::once(rel.as_str()));
         }
+        state.file_stamps.write().unwrap().remove(rel);
         dropped += 1;
     }
     if dropped > 0 {
@@ -3066,7 +3385,7 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
     }
 
     for (path, rel) in &files {
-        reindex_file(state, path, rel);
+        reindex_file(state, path, rel, true);
     }
 }
 
@@ -3119,6 +3438,12 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
             }
         }
     });
+}
+
+fn schedule_pending_ignore_refresh(state: &Arc<ServerState>) {
+    if state.ignore_rules_dirty.load(Ordering::SeqCst) {
+        schedule_ignore_rules_refresh(Arc::clone(state), state.root.clone());
+    }
 }
 
 /// Remember the paths in an event that arrived mid-build, for replay once the
@@ -3231,7 +3556,22 @@ fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
 
     let start = Instant::now();
     let count = paths.len();
+    let mut missing_subtree = false;
     for (path, introduces_dir) in paths {
+        if !is_real_dir(&path)
+            && path.strip_prefix(root).is_ok_and(|rel| {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                let index = state.index.read().unwrap();
+                index.reader_has_descendant_path(&rel) || index.live.has_descendant_path(&rel)
+            })
+        {
+            // A single directory removal/rename event names no descendants.
+            // Replaying it as a file event would drop only the directory path,
+            // leaving every indexed child searchable. One coalesced full pass
+            // supplies the missing subtree membership evidence.
+            missing_subtree = true;
+            continue;
+        }
         let kind = if introduces_dir {
             EventKind::Create(notify::event::CreateKind::Any)
         } else {
@@ -3248,6 +3588,10 @@ fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
                 attrs: Default::default(),
             },
         );
+    }
+    if missing_subtree {
+        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+        schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
     }
     eprintln!(
         "[trace] watcher: replayed {count} change(s) deferred during the initial build in {:.1}ms",
@@ -3483,11 +3827,12 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             }
             // gate acquired at the function level — the entire event
             // is processed atomically with respect to flush/auto-save.
-            state.index.write().unwrap().live.delete_file(&rel_path);
-            state.file_stamps.write().unwrap().remove(&rel_path);
-            if let Ok(mut cache) = state.cache.write() {
-                cache.pop(&rel_path);
+            {
+                let mut index = state.index.write().unwrap();
+                index.live.delete_file(&rel_path);
+                invalidate_cached_paths_locked(state, std::iter::once(rel_path.as_str()));
             }
+            state.file_stamps.write().unwrap().remove(&rel_path);
             continue;
         }
 
@@ -3545,7 +3890,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             continue;
         }
 
-        reindex_file(state, path, &rel_path);
+        reindex_file(state, path, &rel_path, true);
     }
 }
 
@@ -3563,19 +3908,10 @@ fn lock_reindex(state: &ServerState) -> std::sync::MutexGuard<'_, ()> {
 
 /// Drop everything the index holds for a path.
 ///
-/// The delete is not conditional on a stamp entry. `ServerState` accepts an
-/// empty stamp map when `filestamps.json` is missing or unreadable, and the
-/// reader can still hold the path in that state, so keying the delete on the
-/// stamp alone would leave content the walk now rejects searchable. The stamp
-/// removal is best-effort; the index and cache deletes always happen.
-///
-/// The cost of that is a tombstone in the overlay for paths that were never
-/// indexed — `live::delete_file` records one either way — and this runs for
-/// every ineligible file a recovery scan walks past, which at startup is every
-/// binary asset in the repository. An existing tombstone is therefore taken as
-/// proof there is nothing left to do, which bounds that to one per distinct
-/// path. The trace line, which is the part that would be actively misleading,
-/// stays conditional on there having been something to drop.
+/// A stamp is evidence, but not a precondition: `filestamps.json` may be missing
+/// while the active reader still holds the path. Conversely, a rejected file
+/// absent from the reader, live overlay, and stamps was never indexed, so
+/// recording a tombstone for it would dirty the overlay for no state change.
 ///
 /// The caller must already hold `snapshot_gate` and `reindex_lock`. The lock is
 /// the caller's rather than this function's because `reindex_file` calls in
@@ -3589,20 +3925,17 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
         .is_some();
     {
         let index = state.index.read().unwrap();
-        if index.live.has_path(rel_path) || had_stamp {
-            eprintln!("[trace] reindex: dropped {rel_path} ({reason})");
-        } else if index.live.is_deleted(rel_path) {
-            // Already tombstoned, so there is nothing to record and no reason
-            // to dirty the overlay again. This is the repeat case: a recovery
-            // scan or a chatty editor can bring the same rejected path back
-            // here any number of times.
+        if index.live.is_deleted(rel_path) {
+            return;
+        }
+        if !had_stamp && !index.live.has_path(rel_path) && !index.reader_has_path(rel_path) {
             return;
         }
     }
-    state.index.write().unwrap().live.delete_file(rel_path);
-    if let Ok(mut cache) = state.cache.write() {
-        cache.pop(rel_path);
-    }
+    eprintln!("[trace] reindex: dropped {rel_path} ({reason})");
+    let mut index = state.index.write().unwrap();
+    index.live.delete_file(rel_path);
+    invalidate_cached_paths_locked(state, std::iter::once(rel_path));
 }
 
 /// What an event's stat result says about the path it named.
@@ -3882,6 +4215,55 @@ enum CappedRead {
     Failed,
 }
 
+fn file_still_has_bytes(
+    root: &Path,
+    path: &Path,
+    expected_version: &tgrep_core::builder::FileVersion,
+    expected: &[u8],
+) -> std::io::Result<bool> {
+    use std::io::Read;
+
+    let mut file = open_within_root(root, path)?;
+    if tgrep_core::builder::file_version(&file.metadata()?) != *expected_version {
+        return Ok(false);
+    }
+    let mut offset = 0;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if expected.get(offset..offset + read) != Some(&buffer[..read]) {
+            return Ok(false);
+        }
+        offset += read;
+    }
+    if offset != expected.len()
+        || tgrep_core::builder::file_version(&file.metadata()?) != *expected_version
+    {
+        return Ok(false);
+    }
+    let current = open_within_root(root, path)?;
+    Ok(tgrep_core::builder::file_version(&current.metadata()?) == *expected_version)
+}
+
+fn current_path_is_ineligible(state: &ServerState, path: &Path) -> bool {
+    let file = match open_within_root(&state.root, path) {
+        Ok(file) => file,
+        Err(error) => return proves_ineligible(&error),
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return proves_ineligible(&error),
+    };
+    !metadata.is_file()
+        || tgrep_core::walker::is_binary_extension(path)
+        || state
+            .max_file_size
+            .is_some_and(|limit| metadata.len() > limit)
+}
+
 /// Reads a file's contents, never pulling in more than one byte past the cap.
 ///
 /// The size that qualified this file was stat'd before the read, and appending
@@ -3920,9 +4302,7 @@ fn read_within_limit(file: &mut std::fs::File, limit: Option<u64>, capacity: usi
 ///
 /// The caller must hold `snapshot_gate`: the read, the commit, and the stamp
 /// update have to be atomic with respect to a flush or auto-save.
-fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
-    use tgrep_core::meta::FileStamp;
-
+fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bool) {
     // Against other indexers, not against searches. The gate above is held for
     // read, so without this a recovery scan and the watcher worker can both be
     // here for the same path, both read, and the one that read the *older*
@@ -3950,21 +4330,20 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
             // because a build held the file open for a moment. The stale path
             // already treats unreadable files this way, keeping what it has and
             // retrying later, and the watcher should not disagree with it.
+            if force {
+                retry_failed_forced_reindex(state, rel_path, "the file could not be opened");
+            }
             return;
         }
     };
     let Ok(meta) = file.metadata() else {
+        if force {
+            retry_failed_forced_reindex(state, rel_path, "the opened file could not be inspected");
+        }
         return;
     };
-    let current = FileStamp {
-        mtime: meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-        size: meta.len(),
-    };
+    let mut version = tgrep_core::builder::file_version(&meta);
+    let mut current = version.stamp().clone();
 
     // The rules `walk_file_metadata` applies, and for the same reason: the walk
     // is authoritative about what belongs in the index, so anything it rejects
@@ -3996,7 +4375,7 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
         return;
     }
 
-    if state.file_stamps.read().unwrap().get(rel_path) == Some(&current) {
+    if !force && state.file_stamps.read().unwrap().get(rel_path) == Some(&current) {
         return;
     }
 
@@ -4005,21 +4384,95 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     // on our file I/O and trigram parsing. Windows' SRWLock is
     // writer-preferring: a single waiting writer here would otherwise
     // stall every subsequent search request.
-    //
-    // From the handle, not the path: re-opening here is what would let a
-    // symlink take the place of the file we just approved.
-    let mut file = file;
-    let data = match read_within_limit(
-        &mut file,
-        state.max_file_size,
-        current.size.min(1 << 20) as usize,
-    ) {
-        CappedRead::Data(data) => data,
-        CappedRead::TooLarge => {
-            drop_indexed_file(state, rel_path, "grew past the size limit while being read");
-            return;
+    let data = if force {
+        // A concrete event is stronger evidence than the persisted stamp. The
+        // initial handle established eligibility, but its bytes need not be
+        // read: use one fresh, containment-safe handle as the indexing snapshot
+        // and retry only if full-resolution metadata changes during that read.
+        drop(file);
+        let mut stable = None;
+        for _ in 0..2 {
+            let mut verify = match open_within_root(&state.root, path) {
+                Ok(file) => file,
+                Err(e) if proves_ineligible(&e) => {
+                    drop_indexed_file(state, rel_path, "no longer eligible");
+                    return;
+                }
+                Err(_) => {
+                    retry_failed_forced_reindex(
+                        state,
+                        rel_path,
+                        "the verification handle could not be opened",
+                    );
+                    return;
+                }
+            };
+            let Ok(meta) = verify.metadata() else {
+                retry_failed_forced_reindex(
+                    state,
+                    rel_path,
+                    "the verification handle could not be inspected",
+                );
+                return;
+            };
+            let verify_version = tgrep_core::builder::file_version(&meta);
+            let verify_current = verify_version.stamp().clone();
+            if !meta.is_file()
+                || tgrep_core::walker::is_binary_extension(path)
+                || state
+                    .max_file_size
+                    .is_some_and(|limit| verify_current.size > limit)
+            {
+                drop_indexed_file(state, rel_path, "no longer eligible");
+                return;
+            }
+            let verified = match read_within_limit(
+                &mut verify,
+                state.max_file_size,
+                verify_current.size.min(1 << 20) as usize,
+            ) {
+                CappedRead::Data(data) => data,
+                CappedRead::TooLarge => {
+                    drop_indexed_file(state, rel_path, "grew past the size limit while being read");
+                    return;
+                }
+                CappedRead::Failed => {
+                    retry_failed_forced_reindex(state, rel_path, "the verification read failed");
+                    return;
+                }
+            };
+            if verify.metadata().is_ok_and(|metadata| {
+                tgrep_core::builder::file_version(&metadata) == verify_version
+            }) {
+                current = verify_current;
+                version = verify_version;
+                stable = Some(verified);
+                break;
+            }
         }
-        CappedRead::Failed => return,
+        let Some(verified) = stable else {
+            retry_failed_forced_reindex(state, rel_path, "the file kept changing while read");
+            return;
+        };
+        #[cfg(test)]
+        run_stale_refresh_hook(state, StaleRefreshPhase::AfterConcreteRead);
+        verified
+    } else {
+        // From the approved handle, not the path: re-opening here is what would
+        // let a symlink take the place of the file we just approved.
+        let mut file = file;
+        match read_within_limit(
+            &mut file,
+            state.max_file_size,
+            current.size.min(1 << 20) as usize,
+        ) {
+            CappedRead::Data(data) => data,
+            CappedRead::TooLarge => {
+                drop_indexed_file(state, rel_path, "grew past the size limit while being read");
+                return;
+            }
+            CappedRead::Failed => return,
+        }
     };
     let text = tgrep_core::encoding::decode_for_index(&data);
     let is_binary = tgrep_core::trigram::is_binary(&text);
@@ -4028,25 +4481,63 @@ fn reindex_file(state: &ServerState, path: &Path, rel_path: &str) {
     } else {
         Some(tgrep_core::live::LiveIndex::compute_trigram_masks(&text))
     };
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeConcreteCommit);
+    if force {
+        match file_still_has_bytes(&state.root, path, &version, &data) {
+            Ok(true) => {}
+            Ok(false) => {
+                if current_path_is_ineligible(state, path) {
+                    drop_indexed_file(state, rel_path, "no longer eligible");
+                } else {
+                    retry_failed_forced_reindex(state, rel_path, "the file changed before commit");
+                }
+                return;
+            }
+            Err(error) if proves_ineligible(&error) => {
+                drop_indexed_file(state, rel_path, "no longer eligible");
+                return;
+            }
+            Err(_) => {
+                retry_failed_forced_reindex(state, rel_path, "the file changed before commit");
+                return;
+            }
+        }
+    }
 
     eprintln!("[trace] reindex: modified {rel_path}");
+    if per_tri.is_none() {
+        drop_indexed_file(state, rel_path, "binary content");
+        return;
+    }
     // Gate held by the caller — the commit + stamp update is processed
     // atomically with respect to flush/auto-save.
     {
         let mut index = state.index.write().unwrap();
-        match per_tri {
-            Some(per_tri) => index.live.commit_upsert(rel_path, per_tri),
-            None => index.live.delete_file(rel_path),
-        }
+        index.live.commit_upsert(rel_path, per_tri.unwrap());
+        invalidate_cached_paths_locked(state, std::iter::once(rel_path));
     }
     state
         .file_stamps
         .write()
         .unwrap()
         .insert(rel_path.to_string(), current);
-    if let Ok(mut cache) = state.cache.write() {
-        cache.pop(rel_path);
-    }
+}
+
+fn retry_failed_forced_reindex(state: &Arc<ServerState>, rel_path: &str, reason: &str) {
+    // In-memory stamps override the persisted map during stale comparison.
+    // A sentinel therefore records "this path must be read" without rewriting
+    // filestamps.json for a transient event failure.
+    state.file_stamps.write().unwrap().insert(
+        rel_path.to_string(),
+        tgrep_core::meta::FileStamp {
+            mtime: u64::MAX,
+            size: u64::MAX,
+        },
+    );
+    eprintln!("[trace] warning: {rel_path} was not reindexed because {reason}; scheduling a retry");
+    state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+    schedule_ignore_rules_refresh(Arc::clone(state), state.root.clone());
 }
 
 /// Whether a scheduled reconcile should run now.
@@ -4137,7 +4628,18 @@ fn auto_save_loop(state: Arc<ServerState>) {
             }
 
             let stamps = state.file_stamps.read().unwrap().clone();
-            if stream_merge_stale_changes(&state, &[], &[], &[], &stamps, "auto-save", false) {
+            if stream_merge_stale_changes(
+                &state,
+                &[],
+                &[],
+                &[],
+                &stamps,
+                StaleMergePolicy {
+                    preserved: &std::collections::HashSet::new(),
+                    operation: "auto-save",
+                    authoritative_membership: false,
+                },
+            ) {
                 last_save = Instant::now();
                 eprintln!(
                     "[trace] auto-save complete in {:.1}s",
@@ -4255,29 +4757,54 @@ fn stamps_for_index_members(
 fn withhold_stamps_for_deferred(
     state: &ServerState,
     root: &Path,
-    mut stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
 ) -> std::collections::HashMap<String, tgrep_core::meta::FileStamp> {
     let deferred = match state.deferred_events.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let Some(paths) = deferred.as_ref() else {
+    withhold_stamps_for_deferred_snapshot(root, stamps, deferred.as_ref())
+}
+
+fn withhold_stamps_for_deferred_snapshot(
+    root: &Path,
+    mut stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    paths: Option<&std::collections::HashMap<PathBuf, bool>>,
+) -> std::collections::HashMap<String, tgrep_core::meta::FileStamp> {
+    let Some(paths) = paths else {
         eprintln!(
             "[trace] warning: too many changes during the initial build to say which files the \
              walk raced; publishing no stamps so the reconcile re-reads them"
         );
         return std::collections::HashMap::new();
     };
-    let mut withheld = 0usize;
-    for path in paths.keys() {
+    let mut exact = std::collections::HashSet::new();
+    let mut directories = std::collections::HashSet::new();
+    for (path, introduces_dir) in paths {
         let Ok(rel) = path.strip_prefix(root) else {
             continue;
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
-        if stamps.remove(&rel).is_some() {
-            withheld += 1;
+        exact.insert(rel.clone());
+        if *introduces_dir {
+            directories.insert(rel);
         }
     }
+    let before = stamps.len();
+    stamps.retain(|rel, _| {
+        if exact.contains(rel) {
+            return false;
+        }
+        let mut ancestor = rel.as_str();
+        while let Some((parent, _)) = ancestor.rsplit_once('/') {
+            if directories.contains(parent) {
+                return false;
+            }
+            ancestor = parent;
+        }
+        true
+    });
+    let withheld = before - stamps.len();
     if withheld > 0 {
         eprintln!(
             "[trace] watcher: {withheld} file(s) changed during the initial build; their stamps \
@@ -4331,6 +4858,12 @@ fn classify_file_changes(
     (changed, added, deleted)
 }
 
+struct StaleMergePolicy<'a> {
+    preserved: &'a std::collections::HashSet<String>,
+    operation: &'a str,
+    authoritative_membership: bool,
+}
+
 /// Apply a stale diff without materializing the existing index in heap.
 ///
 /// The ordinary incremental flush uses `HybridIndex::full_snapshot`, whose
@@ -4339,6 +4872,9 @@ fn classify_file_changes(
 /// cap: every formerly-oversized file appears as new at once. Build new and
 /// replacement files into a bounded external-sort delta, then stream it together
 /// with the old index while filtering replaced and deleted reader entries.
+/// `preserved` contains candidates whose last read failed without proving a
+/// deletion; they remain in the reader or live overlay until their metadata
+/// changes and another read is attempted.
 ///
 /// The caller holds `snapshot_gate` across the metadata walk and this merge, so
 /// the walk's exact path set is newer than every live entry captured here.
@@ -4348,9 +4884,13 @@ fn stream_merge_stale_changes(
     added: &[String],
     deleted: &[String],
     stamps: &std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
-    operation: &str,
-    authoritative_membership: bool,
+    policy: StaleMergePolicy<'_>,
 ) -> bool {
+    let StaleMergePolicy {
+        preserved,
+        operation,
+        authoritative_membership,
+    } = policy;
     let root = &state.root;
     let index_dir = &state.index_dir;
     let (reader, overlay_paths, tombstone_paths) = {
@@ -4389,6 +4929,7 @@ fn stream_merge_stale_changes(
         .chain(deleted)
         .chain(overlay_paths.iter())
         .chain(tombstone_paths.iter())
+        .filter(|path| !preserved.contains(*path))
         .filter(|path| seen.insert((*path).clone()))
         .cloned()
         .collect();
@@ -4397,6 +4938,7 @@ fn stream_merge_stale_changes(
             reader
                 .all_paths()
                 .iter()
+                .filter(|path| !preserved.contains(path.as_str()))
                 .filter(|path| !stamps.contains_key(path.as_str()))
                 .filter(|path| seen.insert((*path).clone()))
                 .cloned(),
@@ -4410,11 +4952,12 @@ fn stream_merge_stale_changes(
     let files: Vec<PathBuf> = desired_paths.iter().map(|path| root.join(path)).collect();
     // Every candidate is either removed or replaced by the delta. Including a
     // genuinely new path is harmless because it has no reader entry to filter.
-    let removed: std::collections::HashSet<String> = candidates.iter().cloned().collect();
+    let mut removed: std::collections::HashSet<String> = candidates.iter().cloned().collect();
 
     let mut published_stamps = stamps.clone();
+    let mut preserve_overlay_paths = preserved.clone();
 
-    let result = (|| -> Result<bool> {
+    let result = (|| -> Result<PublishStatus> {
         let build = || {
             builder::build_index_for_files(
                 root,
@@ -4441,29 +4984,39 @@ fn stream_merge_stale_changes(
         // Record what the file looked like when it failed, so a permanent
         // failure is retried when the file changes rather than on every pass.
         // See `ServerState::unreadable`.
-        {
+        let unreadable = {
             let mut memo = state.unreadable.write().unwrap();
             // Anything this delta was asked to build is settled: either it was
             // read, or it is in `outcome.unreadable` and re-recorded below.
             for path in changed.iter().chain(added).chain(deleted) {
                 memo.remove(path);
             }
+            let mut unreadable = std::collections::HashSet::new();
             for path in &outcome.unreadable {
                 let rel = path
                     .strip_prefix(root)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
+                unreadable.insert(rel.clone());
                 if let Some(stamp) = published_stamps.remove(&rel) {
                     memo.insert(rel, stamp);
                 }
             }
-        }
-        if !outcome.unreadable.is_empty() {
+            unreadable
+        };
+        if !unreadable.is_empty() {
+            // A missing delta entry must not be interpreted as a deletion. Keep
+            // its old reader entry and any newer live overlay entry while the
+            // rest of the merge publishes normally. Its withheld stamp and
+            // memoized failed version make a later file change retry the read.
+            candidates.retain(|path| !unreadable.contains(path));
+            removed.retain(|path| !unreadable.contains(path));
+            preserve_overlay_paths.extend(unreadable.iter().cloned());
             eprintln!(
                 "[trace] {} file(s) were unreadable during the delta build; \
-                 their stamps are withheld so a later reconcile retries them",
-                outcome.unreadable.len()
+                 preserving their current index entries and retrying after they change",
+                unreadable.len()
             );
         }
 
@@ -4483,8 +5036,15 @@ fn stream_merge_stale_changes(
             .filter(|path| removed.contains(path.as_str()))
             .count();
         let expected_files = reader.num_files() - removed_reader_files + delta.num_files();
-        let published = publish_staged_index(state, index_dir, &staging_dir, expected_files);
-        if published {
+        let published = publish_staged_index(
+            state,
+            index_dir,
+            &staging_dir,
+            expected_files,
+            &candidates,
+            &preserve_overlay_paths,
+        );
+        if published.is_published() {
             // `publish_staged_index` prunes overlay entries represented by the
             // new reader. Also clear reconciled entries intentionally omitted
             // (newly ignored/binary/deleted) and old tombstones for files the
@@ -4506,13 +5066,17 @@ fn stream_merge_stale_changes(
     })();
 
     let _ = std::fs::remove_dir_all(&delta_dir);
-    let _ = std::fs::remove_dir_all(&staging_dir);
+    if !matches!(&result, Ok(PublishStatus::RollbackFailed)) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    } else {
+        eprintln!("[trace] warning: preserving {staging_dir:?} after rollback failure");
+    }
     state.flushing.store(false, Ordering::SeqCst);
-    if matches!(&result, Ok(true)) {
+    if matches!(&result, Ok(PublishStatus::Published)) {
         *state.file_stamps.write().unwrap() = published_stamps;
     }
     match result {
-        Ok(true) => {
+        Ok(PublishStatus::Published) => {
             eprintln!(
                 "[trace] {operation}: streamed {} changes into the index in {:.1}s",
                 candidates.len(),
@@ -4520,7 +5084,7 @@ fn stream_merge_stale_changes(
             );
             true
         }
-        Ok(false) => {
+        Ok(PublishStatus::Failed) | Ok(PublishStatus::RollbackFailed) => {
             eprintln!(
                 "[trace] warning: {operation} delta could not be published; \
                  keeping the old index"
@@ -4604,12 +5168,18 @@ fn background_refresh_stale(
     index_dir: &Path,
     compare_index_membership: bool,
 ) -> bool {
-    let _refresh = state.stale_refresh_lock.lock().unwrap();
+    let refresh = state.stale_refresh_lock.lock().unwrap();
     // Keep watcher/auto-save mutations out for the complete walk → matcher →
     // merge → recovery cycle. Search queries do not take this gate and remain
     // available. Held here rather than inside so the recovery scan below is
     // still covered by it.
-    let _gate = state.snapshot_gate.write().unwrap();
+    let gate = state.snapshot_gate.write().unwrap();
+    // One immutable tracked-file exemption is shared by the walk and the
+    // matcher it publishes. Git-index rewrites cannot change ignore decisions
+    // halfway through this pass.
+    let ignorecase = frozen_tracked_membership(state, root);
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeWalk);
 
     let mut newly_watched = Vec::new();
     // Before the walk, not after the subscriptions: this bounds the window the
@@ -4622,6 +5192,8 @@ fn background_refresh_stale(
         index_dir,
         compare_index_membership,
         &mut newly_watched,
+        ignorecase,
+        true,
     );
 
     // Directories that were not subscribed while the walk ran could not report
@@ -4636,7 +5208,35 @@ fn background_refresh_stale(
     if ok {
         reindex_files_in(state, root, &newly_watched, since);
     }
+    // Compare semantics, not index metadata. A→B→A needs no correction because
+    // this pass used A throughout, while A→B schedules exactly one coalesced
+    // refresh. Content-only staging cannot create an immediate refresh loop.
+    let membership_changed = tracked_membership_changed(state);
+    drop(gate);
+    drop(refresh);
+    schedule_tracked_membership_correction(state, root, membership_changed);
     ok
+}
+
+fn catch_up_unwatched_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
+    let refresh = state.stale_refresh_lock.lock().unwrap();
+    let gate = state.snapshot_gate.write().unwrap();
+    let ignorecase = frozen_tracked_membership(state, root);
+    let mut ignored_watches = Vec::new();
+    let caught_up = refresh_stale_locked(
+        state,
+        root,
+        index_dir,
+        true,
+        &mut ignored_watches,
+        ignorecase,
+        false,
+    );
+    let membership_changed = tracked_membership_changed(state);
+    drop(gate);
+    drop(refresh);
+    schedule_tracked_membership_correction(state, root, membership_changed);
+    caught_up
 }
 
 fn refresh_stale_locked(
@@ -4645,6 +5245,8 @@ fn refresh_stale_locked(
     index_dir: &Path,
     compare_index_membership: bool,
     newly_watched: &mut Vec<PathBuf>,
+    ignorecase: Option<std::sync::Arc<tgrep_core::gitignore::CaseInsensitiveIgnore>>,
+    run_test_hooks: bool,
 ) -> bool {
     use tgrep_core::meta;
     use tgrep_core::walker;
@@ -4655,7 +5257,7 @@ fn refresh_stale_locked(
     // Walk first. This single traversal feeds both the stale diff and the
     // watcher's ignore matcher, and it must run before the early returns below
     // so the matcher can be published on every path out of this function.
-    let walk = walker::walk_file_metadata(
+    let walk = walker::walk_file_metadata_with_ignorecase(
         root,
         &walker::MetaWalkOptions {
             exclude_dirs: state.exclude_dirs.clone(),
@@ -4663,6 +5265,7 @@ fn refresh_stale_locked(
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
         },
+        ignorecase.clone(),
     );
     let walk_ms = start.elapsed().as_millis();
 
@@ -4690,8 +5293,14 @@ fn refresh_stale_locked(
             &walk.ignore_files,
             state.no_require_git,
         ),
-        || build_stale_matcher(state, root, &walk),
+        || build_stale_matcher(state, root, &walk, ignorecase),
     );
+    #[cfg(test)]
+    if run_test_hooks {
+        run_stale_refresh_hook(state, StaleRefreshPhase::AfterMatcherPublish);
+    }
+    #[cfg(not(test))]
+    let _ = run_test_hooks;
 
     if walk.skipped_error > 0 {
         eprintln!(
@@ -4791,17 +5400,15 @@ fn refresh_stale_locked(
         &added,
         &deleted,
         &new_stamps,
-        "stale check",
-        true,
+        StaleMergePolicy {
+            preserved: &skipped_unreadable,
+            operation: "stale check",
+            authoritative_membership: true,
+        },
     ) {
         return false;
     }
 
-    if let Ok(mut cache) = state.cache.write() {
-        for path in changed.iter().chain(added.iter()).chain(deleted.iter()) {
-            cache.pop(path);
-        }
-    }
     true
 }
 
@@ -4817,8 +5424,11 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
     }
     match HybridIndex::open(index_dir, root) {
         Ok(empty) => {
-            *state.index.write().unwrap() = empty;
-            state.cache.write().unwrap().clear();
+            let mut index = state.index.write().unwrap();
+            let mut cache = state.cache.write().unwrap();
+            *index = empty;
+            cache.clear();
+            state.cache_generation.fetch_add(1, Ordering::SeqCst);
         }
         Err(e) => eprintln!("[trace] warning: could not reopen an empty index ({e})"),
     }
@@ -4845,6 +5455,7 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
 /// caller to fall back.
 fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
     let start = Instant::now();
+    let ignorecase = frozen_tracked_membership(state, root);
     // Anchors the recovery window at the start of the build's traversal, which
     // is the point from which writes could be missed: nothing under `root` is
     // subscribed yet, and the walk below has not reached most of it. Taking it
@@ -4858,7 +5469,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     // a kernel high-water mark) covers the whole of it. Unlike the incremental
     // path below, nothing here polls memory on its own.
     let sampler = crate::mem::PrivatePeakSampler::start();
-    let outcome = match builder::build_index_with_options(
+    let outcome = match builder::build_index_with_options_and_ignorecase(
         root,
         Some(index_dir),
         &builder::BuildOptions {
@@ -4875,6 +5486,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             strategy: builder::IndexStrategy::External,
             buffer_bytes: builder::DEFAULT_INDEX_BUFFER_BYTES,
         },
+        ignorecase.clone(),
     ) {
         Ok(outcome) => outcome,
         Err(e) => {
@@ -4886,6 +5498,8 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             return false;
         }
     };
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::AfterBuildBeforeStampPublish);
 
     // Publish under the snapshot gate, and clear `indexing` before releasing
     // it. `handle_fs_event` only skips while `indexing` is true, so flipping
@@ -4905,8 +5519,13 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         }
     };
     let indexed = opened.num_files() as u64;
-    *state.index.write().unwrap() = opened;
-    state.cache.write().unwrap().clear();
+    {
+        let mut index = state.index.write().unwrap();
+        let mut cache = state.cache.write().unwrap();
+        *index = opened;
+        cache.clear();
+        state.cache_generation.fetch_add(1, Ordering::SeqCst);
+    }
     state.index_total.store(indexed, Ordering::Relaxed);
     state.index_progress.store(indexed, Ordering::Relaxed);
 
@@ -4920,21 +5539,35 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     // and its walk handed back the .gitignore / .ignore paths. Building the
     // matcher from those is what keeps this cheap — `gitignore::build_matcher`
     // would rewalk the whole tree, which cost 49 s on a 289k-file repo.
-    match tgrep_core::meta::read_filestamps(index_dir) {
+    let stamps = match tgrep_core::meta::read_filestamps(index_dir) {
         // Minus the paths whose events arrived while the build ran: the builder
         // read those files at some point during its walk and stamped what it
         // saw, so for anything written afterwards the stamp describes bytes the
         // index does not hold. See `withhold_stamps_for_deferred`.
-        Ok(stamps) => {
-            *state.file_stamps.write().unwrap() = withhold_stamps_for_deferred(state, root, stamps)
+        Ok(stamps) if state.watch_enabled => withhold_stamps_for_deferred(state, root, stamps),
+        Ok(_) => std::collections::HashMap::new(),
+        Err(e) => {
+            eprintln!(
+                "[trace] warning: could not load file stamps ({e}); \
+                 the watcher may reindex on spurious events"
+            );
+            std::collections::HashMap::new()
         }
-        Err(e) => eprintln!(
-            "[trace] warning: could not load file stamps ({e}); \
-             the watcher may reindex on spurious events"
-        ),
+    };
+    if !state.watch_enabled
+        && let Err(e) = tgrep_core::meta::write_filestamps(&stamps, index_dir)
+    {
+        drop(gate);
+        eprintln!(
+            "[trace] warning: could not prepare unwatched bootstrap catch-up ({e}); \
+             falling back to the in-heap build"
+        );
+        reset_to_empty_index(state, root, index_dir);
+        return false;
     }
+    *state.file_stamps.write().unwrap() = stamps;
     let mut newly_watched = Vec::new();
-    if state.watch_enabled && !state.no_ignore {
+    if !state.no_ignore {
         let t_gi = Instant::now();
         // "Newly watched" here is every directory in the repository, and the
         // build's walk ran before any of them were subscribed. Deferred rather
@@ -4951,11 +5584,12 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
                 state.no_require_git,
             ),
             || {
-                tgrep_core::walker::build_gitignore_matcher_from_files(
+                tgrep_core::walker::build_gitignore_matcher_from_files_with_ignorecase(
                     root,
                     &outcome.gitignore_files,
                     &outcome.ignore_files,
                     state.no_require_git,
+                    ignorecase,
                 )
             },
         );
@@ -4974,8 +5608,23 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         spawn_recovery_scan(state, root, newly_watched, since);
     }
 
-    state.indexing.store(false, Ordering::SeqCst);
+    if state.watch_enabled {
+        state.indexing.store(false, Ordering::SeqCst);
+    }
     drop(gate);
+    if !state.watch_enabled {
+        if !catch_up_unwatched_build(state, root, index_dir) {
+            eprintln!(
+                "[trace] warning: unwatched bootstrap catch-up was incomplete; \
+                 falling back to the in-heap build"
+            );
+            reset_to_empty_index(state, root, index_dir);
+            return false;
+        }
+        state.indexing.store(false, Ordering::SeqCst);
+    }
+    let membership_changed = tracked_membership_changed(state);
+    schedule_tracked_membership_correction(state, root, membership_changed);
 
     let elapsed = start.elapsed().as_secs_f64();
     drop(sampler);
@@ -5036,26 +5685,28 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     // Phase 1: Walk file paths (no content reads)
     let t_walk = Instant::now();
+    let ignorecase = frozen_tracked_membership(state, root);
     // The recovery window opens with this traversal, not with the subscriptions
     // it later feeds: a nested `.ignore` written after the walk read its parent
     // directory but before the matcher is published is invisible to both, and a
     // timestamp taken any later would date it as already accounted for.
     let since = SystemTime::now();
-    let walk = walker::walk_dir(
+    let walk = walker::walk_dir_with_ignorecase(
         root,
         &WalkOptions {
             include_hidden: false,
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
-            collect_gitignore_files: state.watch_enabled && !state.no_ignore,
+            collect_gitignore_files: !state.no_ignore,
             exclude_dirs: state.exclude_dirs.clone(),
             ..Default::default()
         },
+        ignorecase.clone(),
     );
 
     let mut newly_watched = Vec::new();
-    if state.watch_enabled && !state.no_ignore {
+    if !state.no_ignore {
         let start = Instant::now();
         // Subscriptions are taken here, partway through the build, so files
         // written to a directory the walk has already passed are in neither
@@ -5072,11 +5723,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 state.no_require_git,
             ),
             || {
-                walker::build_gitignore_matcher_from_files(
+                walker::build_gitignore_matcher_from_files_with_ignorecase(
                     root,
                     &walk.gitignore_files,
                     &walk.ignore_files,
                     state.no_require_git,
+                    ignorecase,
                 )
             },
         );
@@ -5245,6 +5897,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         incremental_flushes,
         start.elapsed().as_secs_f64()
     );
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::AfterBuildBeforeStampPublish);
 
     // Walk filesystem metadata BEFORE the flush so we can publish the
     // resulting per-file stamps atomically with the index files. Writing
@@ -5303,8 +5957,14 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     //
     // Minus whatever changed underneath the walk, which the stamps would
     // otherwise describe as indexed when the index holds the older bytes.
-    *state.file_stamps.write().unwrap() = withhold_stamps_for_deferred(state, root, stamps);
-    state.indexing.store(false, Ordering::SeqCst);
+    *state.file_stamps.write().unwrap() = if state.watch_enabled {
+        withhold_stamps_for_deferred(state, root, stamps)
+    } else {
+        std::collections::HashMap::new()
+    };
+    if state.watch_enabled {
+        state.indexing.store(false, Ordering::SeqCst);
+    }
 
     // Final flush to disk for the bulk build. Use the same streaming
     // append-only path as incremental flushes so the final complete publish
@@ -5323,6 +5983,16 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     drop(gate);
 
     state.flushing.store(false, Ordering::SeqCst);
+    if !state.watch_enabled {
+        if !catch_up_unwatched_build(state, root, index_dir) {
+            state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+            eprintln!(
+                "[trace] warning: unwatched background-build catch-up was incomplete; \
+                 leaving stamps invalid for the scheduled stale check"
+            );
+        }
+        state.indexing.store(false, Ordering::SeqCst);
+    }
 
     // Reclaim memory held by the indexing-time live overlay — but only when
     // the flush actually completed and `prune_persisted_entries` ran. If the
@@ -5333,6 +6003,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         index.live.shrink_to_fit();
     }
 
+    let membership_changed = tracked_membership_changed(state);
+    schedule_tracked_membership_correction(state, root, membership_changed);
     if state.ignore_rules_dirty.load(Ordering::SeqCst) {
         schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
     }
@@ -5423,7 +6095,15 @@ fn flush_append_only_overlay_locked(
         eprintln!("[trace] warning: failed to write staging filestamps: {e}");
     }
 
-    let pruned = publish_staged_index(state, index_dir, &staging_dir, num_files);
+    let pruned = publish_staged_index(
+        state,
+        index_dir,
+        &staging_dir,
+        num_files,
+        &[],
+        &std::collections::HashSet::new(),
+    )
+    .is_published();
     eprintln!(
         "[trace] append-only flush: {num_files} files on disk (complete={complete}) in {:.1}s",
         flush_start.elapsed().as_secs_f64()
@@ -5441,136 +6121,313 @@ fn flush_append_only_overlay_locked(
 /// renames or swap readers out of order. `num_files` is the expected on-disk
 /// file count used to reject a partially-published reader.
 ///
-/// Returns `true` when the swap + prune succeeded, `false` on any failure (the
-/// previous reader and the live overlay are retained as the fallback).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishStatus {
+    Published,
+    Failed,
+    RollbackFailed,
+}
+
+impl PublishStatus {
+    fn is_published(self) -> bool {
+        matches!(self, Self::Published)
+    }
+}
+
+/// Returns the publication outcome. A rollback failure preserves the staging
+/// directory so its backups remain available for recovery.
 fn publish_staged_index(
     state: &ServerState,
     index_dir: &Path,
     staging_dir: &Path,
     num_files: usize,
-) -> bool {
+    invalidate_paths: &[String],
+    preserve_overlay_paths: &std::collections::HashSet<String>,
+) -> PublishStatus {
     // Held across move + open + swap so concurrent publishers (auto-save /
     // background-build / watcher reindex flush) cannot interleave renames
     // or swap readers out of order. Searches do not take this lock.
     let _publish = state.publish_lock.lock().unwrap();
-    if let Err(e) = move_staged_files(staging_dir, index_dir) {
-        eprintln!("[trace] warning: flush move failed: {e}");
-        let _ = std::fs::remove_dir_all(staging_dir);
+    let mut moved = match move_staged_files(staging_dir, index_dir) {
+        Ok(moved) => moved,
+        Err(e) => {
+            eprintln!("[trace] warning: flush move failed: {e}");
+            return if e.rollback_failed() {
+                PublishStatus::RollbackFailed
+            } else {
+                PublishStatus::Failed
+            };
+        }
+    };
+    let Some((new_reader, reader_files, reader_trigrams)) =
+        open_published_reader(index_dir, num_files)
+    else {
+        return match moved.rollback() {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(staging_dir);
+                PublishStatus::Failed
+            }
+            Err(e) => {
+                moved.preserve();
+                eprintln!("[trace] warning: failed to roll back index publication: {e}");
+                PublishStatus::RollbackFailed
+            }
+        };
+    };
+
+    // Hold the index write lock through cache invalidation so searches cannot
+    // observe the new posting set with bytes from the old cache generation.
+    {
+        let mut index = state.index.write().unwrap();
+        let mut cache = state.cache.write().unwrap();
+        index.swap_reader(new_reader);
+        index.prune_persisted_entries_except(preserve_overlay_paths);
+        index.live.reset_dirty_count();
+        for path in invalidate_paths {
+            cache.pop(path);
+        }
+        if !invalidate_paths.is_empty() {
+            state.cache_generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    moved.commit();
+    eprintln!(
+        "[trace] flush: reader reopened ({reader_files} files, \
+         {reader_trigrams} trigrams), overlay pruned"
+    );
+    let _ = std::fs::remove_dir_all(staging_dir);
+    PublishStatus::Published
+}
+
+fn publish_reloaded_index(
+    state: &ServerState,
+    index_dir: &Path,
+    staging_dir: &Path,
+    num_files: usize,
+) -> bool {
+    let _publish = state.publish_lock.lock().unwrap();
+    let mut moved = match move_staged_files(staging_dir, index_dir) {
+        Ok(moved) => moved,
+        Err(e) => {
+            eprintln!("[trace] warning: reload move failed: {e}");
+            return false;
+        }
+    };
+    let Some((new_reader, reader_files, reader_trigrams)) =
+        open_published_reader(index_dir, num_files)
+    else {
+        match moved.rollback() {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(staging_dir);
+            }
+            Err(e) => {
+                moved.preserve();
+                eprintln!("[trace] warning: failed to roll back reload publication: {e}");
+            }
+        }
         return false;
+    };
+
+    // Searches take the outer index lock before consulting the cache. Holding
+    // both in that order makes the complete reload visible as one generation.
+    {
+        let mut index = state.index.write().unwrap();
+        let mut cache = state.cache.write().unwrap();
+        index.swap_reader(new_reader);
+        let mut reconciled = index.live.overlay_paths();
+        reconciled.extend(index.live.tombstone_paths());
+        index.live.clear_reconciled_paths(&reconciled);
+        index.live.reset_dirty_count();
+        cache.clear();
+        state.cache_generation.fetch_add(1, Ordering::SeqCst);
+    }
+    moved.commit();
+    eprintln!(
+        "[trace] reload: reader reopened ({reader_files} files, \
+         {reader_trigrams} trigrams), overlay and cache cleared"
+    );
+    let _ = std::fs::remove_dir_all(staging_dir);
+    true
+}
+
+fn open_published_reader(
+    index_dir: &Path,
+    num_files: usize,
+) -> Option<(tgrep_core::reader::IndexReader, usize, usize)> {
+    const READER_OPEN_RETRIES: u32 = 5;
+    const READER_OPEN_BACKOFF: Duration = Duration::from_millis(200);
+
+    for attempt in 0..READER_OPEN_RETRIES {
+        match tgrep_core::reader::IndexReader::open(index_dir) {
+            Ok(new_reader) => {
+                let reader_files = new_reader.num_files();
+                let reader_trigrams = new_reader.num_trigrams();
+                if new_reader.is_degenerate() {
+                    eprintln!(
+                        "[trace] warning: reader has {reader_files} files but 0 trigrams \
+                         (attempt {}/{READER_OPEN_RETRIES}, likely stale NTFS metadata)",
+                        attempt + 1
+                    );
+                } else if let Err(msg) = new_reader.validate_lookup() {
+                    eprintln!(
+                        "[trace] warning: reader validation failed \
+                         (attempt {}/{READER_OPEN_RETRIES}): {msg}",
+                        attempt + 1
+                    );
+                } else if reader_files >= num_files {
+                    return Some((new_reader, reader_files, reader_trigrams));
+                } else {
+                    eprintln!(
+                        "[trace] warning: reader has {reader_files} files \
+                         (expected {num_files}), keeping live overlay as fallback"
+                    );
+                    return None;
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[trace] warning: reader open failed (attempt {}/{READER_OPEN_RETRIES}): {e}",
+                    attempt + 1
+                );
+            }
+        }
+        if attempt + 1 < READER_OPEN_RETRIES {
+            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
+        }
+    }
+    eprintln!(
+        "[trace] warning: failed to validate reader after \
+         {READER_OPEN_RETRIES} attempts, keeping the previous reader"
+    );
+    None
+}
+
+const INDEX_FILE_NAMES: &[&str] = &[
+    "index.bin",
+    "lookup.bin",
+    "files.bin",
+    "filestamps.json",
+    "meta.json",
+];
+
+struct StagedFileMove {
+    staging: PathBuf,
+    target: PathBuf,
+    backed_up: Vec<&'static str>,
+    published: Vec<&'static str>,
+    finished: bool,
+}
+
+impl StagedFileMove {
+    fn backup_path(&self, name: &str) -> PathBuf {
+        self.staging.join(format!(".previous-{name}"))
     }
 
-    // Open the new reader. The publish mutex is intentionally still held
-    // here so that move + open + swap form an atomic publish unit (no other
-    // publisher can interleave a rename or swap a competing reader between
-    // these steps). The server-wide `state.index` RwLock is NOT taken, so
-    // search queries continue to be served by the previous reader (whose
-    // `Arc<IndexReader>` they hold) throughout this call.
-    //
-    // On Windows, NTFS metadata for a recently-renamed file can transiently
-    // appear stale (zero-length), causing IndexReader::open to create a
-    // degenerate reader with files but no trigrams. We retry a few times
-    // with a short backoff to ride out the transient.
-    let pruned = 'open: {
-        const READER_OPEN_RETRIES: u32 = 5;
-        const READER_OPEN_BACKOFF: Duration = Duration::from_millis(200);
+    fn rollback(&mut self) -> std::io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        let mut first_error = None;
+        let mut pending_published = Vec::new();
+        for name in std::mem::take(&mut self.published).into_iter().rev() {
+            let published = self.target.join(name);
+            if let Err(e) = std::fs::remove_file(&published)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+                pending_published.push(name);
+            }
+        }
+        pending_published.reverse();
+        self.published = pending_published;
 
-        for attempt in 0..READER_OPEN_RETRIES {
-            match tgrep_core::reader::IndexReader::open(index_dir) {
-                Ok(new_reader) => {
-                    let reader_files = new_reader.num_files();
-                    let reader_trigrams = new_reader.num_trigrams();
-
-                    if new_reader.is_degenerate() {
-                        eprintln!(
-                            "[trace] warning: reader has {reader_files} files but 0 trigrams \
-                             (attempt {}/{READER_OPEN_RETRIES}, likely stale NTFS metadata)",
-                            attempt + 1
-                        );
-                        if attempt + 1 < READER_OPEN_RETRIES {
-                            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
-                            continue;
-                        }
-                        eprintln!(
-                            "[trace] warning: degenerate reader persists after \
-                             {READER_OPEN_RETRIES} attempts, keeping live overlay as fallback"
-                        );
-                        break 'open false;
-                    }
-
-                    // Validate + warm the lookup mmap before swapping the
-                    // reader in. This catches corruption (unsorted lookup
-                    // table, out-of-bounds posting offsets) and, as a
-                    // side-effect, pages in every byte of lookup.bin so that
-                    // subsequent binary searches never hit cold mmap pages
-                    // — preventing the zero-candidate failure observed on
-                    // Windows after flush.
-                    if let Err(msg) = new_reader.validate_lookup() {
-                        eprintln!(
-                            "[trace] warning: reader validation failed \
-                             (attempt {}/{READER_OPEN_RETRIES}): {msg}",
-                            attempt + 1
-                        );
-                        if attempt + 1 < READER_OPEN_RETRIES {
-                            thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
-                            continue;
-                        }
-                        eprintln!(
-                            "[trace] warning: reader validation failed after \
-                             {READER_OPEN_RETRIES} attempts, keeping live overlay"
-                        );
-                        break 'open false;
-                    }
-
-                    if reader_files >= num_files {
-                        // Atomic swap — no outer write lock required.
-                        state.index.read().unwrap().swap_reader(new_reader);
-                        // Brief write lock for in-memory overlay maintenance only.
-                        {
-                            let mut index = state.index.write().unwrap();
-                            index.prune_persisted_entries();
-                            index.live.reset_dirty_count();
-                        }
-                        eprintln!(
-                            "[trace] flush: reader reopened ({reader_files} files, \
-                             {reader_trigrams} trigrams), overlay pruned"
-                        );
-                        break 'open true;
-                    } else {
-                        eprintln!(
-                            "[trace] warning: reader has {reader_files} files \
-                             (expected {num_files}), keeping live overlay as fallback"
-                        );
-                        break 'open false;
-                    }
+        let mut pending_backups = Vec::new();
+        for name in std::mem::take(&mut self.backed_up).into_iter().rev() {
+            match publish_file(&self.backup_path(name), &self.target.join(name)) {
+                Ok(()) => self.published.retain(|published| *published != name),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.published.retain(|published| *published != name);
                 }
                 Err(e) => {
-                    if attempt + 1 < READER_OPEN_RETRIES {
-                        eprintln!(
-                            "[trace] warning: reader open failed (attempt {}/{READER_OPEN_RETRIES}): {e}",
-                            attempt + 1
-                        );
-                        thread::sleep(READER_OPEN_BACKOFF * (attempt + 1));
-                        continue;
+                    if first_error.is_none() {
+                        first_error = Some(e);
                     }
-                    eprintln!(
-                        "[trace] warning: failed to reopen reader after flush: {e}, \
-                         live overlay retained"
-                    );
-                    break 'open false;
+                    pending_backups.push(name);
                 }
             }
         }
-        false
-    };
-    let _ = std::fs::remove_dir_all(staging_dir);
-    pruned
+        pending_backups.reverse();
+        self.backed_up = pending_backups;
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    fn commit(&mut self) {
+        self.finished = true;
+    }
+
+    fn preserve(&mut self) {
+        // Leave every remaining backup and published file exactly where the
+        // failed rollback left it so an operator or later recovery can use it.
+        self.finished = true;
+    }
+
+    fn fail(mut self, publish: std::io::Error) -> MoveStagedFilesError {
+        let rollback = self.rollback().err();
+        if rollback.is_some() {
+            self.preserve();
+        }
+        MoveStagedFilesError { publish, rollback }
+    }
 }
 
-/// Move index files from staging to the target directory.
+impl Drop for StagedFileMove {
+    fn drop(&mut self) {
+        if let Err(e) = self.rollback() {
+            eprintln!("[trace] warning: failed to roll back staged index files: {e}");
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MoveStagedFilesError {
+    publish: std::io::Error,
+    rollback: Option<std::io::Error>,
+}
+
+impl MoveStagedFilesError {
+    fn rollback_failed(&self) -> bool {
+        self.rollback.is_some()
+    }
+}
+
+impl std::fmt::Display for MoveStagedFilesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.publish)?;
+        if let Some(rollback) = &self.rollback {
+            write!(f, "; rollback also failed: {rollback}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MoveStagedFilesError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.publish)
+    }
+}
+
+/// Move index files from staging to the target directory, retaining backups
+/// until the caller validates and commits the new reader.
 ///
-/// Files are published in a fixed order, with `meta.json` last. This is only a
-/// convention for publication layout; it does not provide atomic publish
-/// semantics or reader-side validation by itself.
+/// Files are published in a fixed order, with `meta.json` last. Existing files
+/// are retained in staging until reader validation succeeds, so dropping the
+/// returned transaction rolls back a partial or rejected publication.
 ///
 /// Performance note: this function runs under the server's `publish_lock`
 /// (which serializes concurrent publishers) but does NOT take the
@@ -5582,24 +6439,39 @@ fn publish_staged_index(
 /// created next to the target (same parent) so cross-volume cases should
 /// not arise; if rename truly fails, the error is surfaced rather than
 /// silently falling back to a slow copy (see `publish_file`).
-fn move_staged_files(staging: &Path, target: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(target)?;
-    // Data files first, meta last.
-    for name in &[
-        "index.bin",
-        "lookup.bin",
-        "files.bin",
-        "filestamps.json",
-        "meta.json",
-    ] {
+fn move_staged_files(
+    staging: &Path,
+    target: &Path,
+) -> Result<StagedFileMove, MoveStagedFilesError> {
+    std::fs::create_dir_all(target).map_err(|publish| MoveStagedFilesError {
+        publish,
+        rollback: None,
+    })?;
+    let mut moved = StagedFileMove {
+        staging: staging.to_path_buf(),
+        target: target.to_path_buf(),
+        backed_up: Vec::new(),
+        published: Vec::new(),
+        finished: false,
+    };
+    for &name in INDEX_FILE_NAMES {
         let src = staging.join(name);
         let dst = target.join(name);
         if !src.exists() {
             continue;
         }
-        publish_file(&src, &dst)?;
+        if dst.exists() {
+            if let Err(error) = publish_file(&dst, &moved.backup_path(name)) {
+                return Err(moved.fail(error));
+            }
+            moved.backed_up.push(name);
+        }
+        if let Err(error) = publish_file(&src, &dst) {
+            return Err(moved.fail(error));
+        }
+        moved.published.push(name);
     }
-    Ok(())
+    Ok(moved)
 }
 
 /// Publish a single staged file at `src` to `dst`.
@@ -5839,6 +6711,7 @@ mod tests {
                 CACHE_MAX_BYTES,
                 CACHE_MAX_ENTRY_BYTES,
             )),
+            cache_generation: std::sync::atomic::AtomicU64::new(0),
             root: root.to_path_buf(),
             watcher_active: std::sync::atomic::AtomicBool::new(false),
             indexing: std::sync::atomic::AtomicBool::new(false),
@@ -5846,6 +6719,7 @@ mod tests {
             gitignore_pending: std::sync::atomic::AtomicBool::new(true),
             ignore_rules_dirty: std::sync::atomic::AtomicBool::new(false),
             ignore_refresh_scheduled: std::sync::atomic::AtomicBool::new(false),
+            tracked_membership: Mutex::new(None),
             watch_resubscribe: std::sync::atomic::AtomicBool::new(false),
             ignore_sources: RwLock::new(Vec::new()),
             ignore_source_stamps: RwLock::new(IgnoreStamps::new()),
@@ -5871,7 +6745,17 @@ mod tests {
             unreadable: RwLock::new(std::collections::HashMap::new()),
             started: Instant::now(),
             last_search_ms: std::sync::atomic::AtomicU64::new(0),
+            stale_refresh_hook: Mutex::new(None),
         })
+    }
+
+    fn test_git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
     }
 
     /// A binary marker's offset is a position in the file, not in the repaired
@@ -6077,7 +6961,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_registry_add_all_is_additive_but_sync_prunes() {
+    fn incomplete_watch_sync_preserves_existing_subscriptions_until_a_complete_pass() {
         // These two must not be confused. `watch_new_subtree` learns only
         // about the subtree that just appeared, so if it went through `sync`
         // every directory outside that subtree would look stale and the server
@@ -6115,8 +6999,38 @@ mod tests {
             "add_all dropped a subscription outside the set it was given"
         );
 
-        // `sync`, by contrast, is authoritative over the whole tree.
-        let (added, removed) = registry.sync(&[c.clone()].into_iter().collect(), false);
+        // A traversal that missed entries is additive only: absence from its
+        // partial result is not evidence that an existing watch became stale.
+        let partial: std::collections::HashSet<PathBuf> = std::iter::once(c.clone()).collect();
+        let pending = std::sync::atomic::AtomicBool::new(true);
+        let force = take_force_resubscribe(&pending, TraversalCompleteness::Incomplete);
+        assert!(
+            !force,
+            "the incomplete pass must not re-register known entries"
+        );
+        assert!(
+            pending.load(Ordering::SeqCst),
+            "an incomplete pass must leave forced resubscription pending"
+        );
+        let (added, removed) = registry.sync(&partial, TraversalCompleteness::Incomplete, force);
+        assert_eq!((added.len(), removed), (0, 0));
+        assert_eq!(
+            registry.watched,
+            [a.clone(), b.clone(), c.clone()].into_iter().collect(),
+            "an incomplete desired set retired valid existing subscriptions"
+        );
+
+        // A later complete traversal is authoritative and may prune them.
+        let force = take_force_resubscribe(&pending, TraversalCompleteness::Complete);
+        assert!(
+            force,
+            "the next complete pass must inherit the force request"
+        );
+        assert!(
+            !pending.load(Ordering::SeqCst),
+            "a complete forced pass consumes the request"
+        );
+        let (added, removed) = registry.sync(&partial, TraversalCompleteness::Complete, force);
         assert_eq!((added.len(), removed), (0, 2));
         assert_eq!(registry.watched, [c].into_iter().collect());
     }
@@ -6221,6 +7135,7 @@ mod tests {
         let dirs = watchable_dirs(root, root, &exclude, Some(&gi));
 
         let rel: std::collections::HashSet<String> = dirs
+            .dirs
             .iter()
             .map(|p| {
                 p.strip_prefix(root)
@@ -6265,6 +7180,7 @@ mod tests {
 
         let dirs = watchable_dirs(root, root, &[], None);
         let rel: std::collections::HashSet<String> = dirs
+            .dirs
             .iter()
             .map(|p| {
                 p.strip_prefix(root)
@@ -6297,6 +7213,7 @@ mod tests {
         let gi = tgrep_core::gitignore::build_matcher(root).expect("matcher should build");
         let dirs = watchable_dirs(root, &root.join("src/fresh"), &[], Some(&gi));
         let rel: std::collections::HashSet<String> = dirs
+            .dirs
             .iter()
             .map(|p| {
                 p.strip_prefix(root)
@@ -6321,6 +7238,1230 @@ mod tests {
             rel.contains("src/fresh/keep"),
             "a root-anchored rule was applied at the wrong depth: {rel:?}"
         );
+    }
+
+    #[test]
+    fn rejected_never_indexed_files_do_not_dirty_the_overlay() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        let rejected_extension = root.join("asset.png");
+        let rejected_content = root.join("binary.rs");
+        std::fs::write(
+            &rejected_extension,
+            "not indexed despite textual contents\n",
+        )
+        .unwrap();
+        std::fs::write(&rejected_content, b"fn looks_textual() {}\n\0binary\n").unwrap();
+
+        let _gate = state.snapshot_gate.read().unwrap();
+        reindex_file(&state, &rejected_extension, "asset.png", false);
+        reindex_file(&state, &rejected_content, "binary.rs", false);
+
+        let index = state.index.read().unwrap();
+        assert_eq!(
+            index.live.dirty_count(),
+            0,
+            "paths absent from reader, overlay, and stamps must not create tombstones"
+        );
+        assert!(!index.live.is_deleted("asset.png"));
+        assert!(!index.live.is_deleted("binary.rs"));
+    }
+
+    #[test]
+    fn unreadable_stale_delta_preserves_reader_and_overlay_entries() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        let path = root.join("raced.rs");
+        std::fs::write(&path, "fn old_reader_marker() {}\n").unwrap();
+        builder::build_index_for_files(&root, &index_dir, std::slice::from_ref(&path), 1024)
+            .unwrap();
+        *state.index.write().unwrap() = HybridIndex::open(&index_dir, &root).unwrap();
+        assert!(state.index.read().unwrap().reader_has_path("raced.rs"));
+
+        std::fs::write(&path, "fn preserved_overlay_marker() {}\n").unwrap();
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "raced.rs", false);
+        }
+        assert!(state.index.read().unwrap().live.has_path("raced.rs"));
+        let stamps = state.file_stamps.read().unwrap().clone();
+        std::fs::remove_file(&path).unwrap();
+        {
+            let _gate = state.snapshot_gate.write().unwrap();
+            assert!(stream_merge_stale_changes(
+                &state,
+                &["raced.rs".to_string()],
+                &[],
+                &[],
+                &stamps,
+                StaleMergePolicy {
+                    preserved: &std::collections::HashSet::new(),
+                    operation: "test stale check",
+                    authoritative_membership: true,
+                },
+            ));
+        }
+        {
+            let index = state.index.read().unwrap();
+            assert!(index.reader_has_path("raced.rs"));
+            assert!(index.live.has_path("raced.rs"));
+        }
+        assert!(state.unreadable.read().unwrap().contains_key("raced.rs"));
+
+        // A later merge may still need to publish unrelated live work. The
+        // memoized failure must remain excluded from its authoritative removal
+        // set even though its stamp was deliberately withheld.
+        let other = root.join("other.rs");
+        std::fs::write(&other, "fn unrelated_overlay_marker() {}\n").unwrap();
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &other, "other.rs", false);
+        }
+        let stamps = state.file_stamps.read().unwrap().clone();
+        let preserved = std::collections::HashSet::from(["raced.rs".to_string()]);
+        {
+            let _gate = state.snapshot_gate.write().unwrap();
+            assert!(stream_merge_stale_changes(
+                &state,
+                &[],
+                &[],
+                &[],
+                &stamps,
+                StaleMergePolicy {
+                    preserved: &preserved,
+                    operation: "test retry",
+                    authoritative_membership: true,
+                },
+            ));
+        }
+
+        let index = state.index.read().unwrap();
+        assert!(index.reader_has_path("raced.rs"));
+        assert!(index.live.has_path("raced.rs"));
+        assert!(!index.live.is_deleted("raced.rs"));
+        assert!(index.reader_has_path("other.rs"));
+    }
+
+    #[test]
+    fn reader_path_without_a_stamp_is_still_tombstoned() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        let indexed = root.join("legacy.rs");
+        std::fs::write(&indexed, "fn legacy_reader_entry() {}\n").unwrap();
+        builder::build_index_for_files(&root, &index_dir, std::slice::from_ref(&indexed), 1024)
+            .unwrap();
+        *state.index.write().unwrap() = HybridIndex::open(&index_dir, &root).unwrap();
+        assert!(
+            state.file_stamps.read().unwrap().is_empty(),
+            "fixture requires a reader entry with no stamp"
+        );
+        assert!(
+            state.index.read().unwrap().reader_has_path("legacy.rs"),
+            "fixture did not put the path in the active reader"
+        );
+
+        let _gate = state.snapshot_gate.read().unwrap();
+        let _reindex = lock_reindex(&state);
+        drop_indexed_file(&state, "legacy.rs", "test rejection");
+
+        let index = state.index.read().unwrap();
+        assert!(
+            index.live.is_deleted("legacy.rs"),
+            "reader membership must remain sufficient evidence to tombstone"
+        );
+        assert_eq!(index.live.dirty_count(), 1);
+    }
+
+    #[test]
+    fn content_only_git_index_rewrite_is_ignored_but_membership_changes_reconcile() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn original() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join("ignored/forced.rs"), "fn forced() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore", "src/lib.rs"]);
+
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        let matcher =
+            tgrep_core::gitignore::build_matcher(&root).expect("case-insensitive matcher");
+        let baseline = matcher
+            .tracked_membership_fingerprint()
+            .expect("tracked exemption active");
+        *state.gitignore.write().unwrap() = Some(matcher);
+        *state.tracked_membership.lock().unwrap() = Some(baseline);
+
+        std::fs::write(root.join("src/lib.rs"), "fn content_changed() {}\n").unwrap();
+        test_git(&root, &["add", "--", "src/lib.rs"]);
+        assert!(
+            !tracked_membership_changed(&state),
+            "rewriting index metadata with the same tracked paths must not request a full scan"
+        );
+
+        std::fs::write(root.join("src/new.rs"), "fn newly_tracked() {}\n").unwrap();
+        test_git(&root, &["add", "--", "src/new.rs"]);
+        assert!(
+            tracked_membership_changed(&state),
+            "conservative polling must notice every tracked-membership change"
+        );
+        assert!(
+            !tracked_membership_changed(&state),
+            "an observed membership change must be coalesced"
+        );
+
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        assert!(
+            tracked_membership_changed(&state),
+            "adding a tracked-path exemption must request reconciliation"
+        );
+        assert!(
+            !tracked_membership_changed(&state),
+            "an observed membership change must be coalesced"
+        );
+
+        test_git(
+            &root,
+            &[
+                "rm",
+                "--cached",
+                "--quiet",
+                "--force",
+                "--",
+                "ignored/forced.rs",
+            ],
+        );
+        assert!(
+            tracked_membership_changed(&state),
+            "removing a tracked-path exemption must request reconciliation"
+        );
+    }
+
+    #[test]
+    fn first_matcher_publication_uses_one_snapshot_across_git_index_aba() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn ordinary() {}\n").unwrap();
+        let ignored = root.join("ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(ignored.join("forced.rs"), "fn aba_marker() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore", "src/lib.rs"]);
+
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        assert!(
+            state.gitignore.read().unwrap().is_none(),
+            "the race must cover first matcher publication"
+        );
+
+        if PER_DIRECTORY_WATCHES {
+            let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+            *state.watch_registry.lock().unwrap() = Some(WatchRegistry {
+                watcher,
+                root: root.clone(),
+                watched: std::iter::once(root.clone()).collect(),
+            });
+        }
+
+        let before_walk_entered = Arc::new(Barrier::new(2));
+        let before_walk_release = Arc::new(Barrier::new(2));
+        let after_publish_entered = Arc::new(Barrier::new(2));
+        let after_publish_release = Arc::new(Barrier::new(2));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let before_walk_entered = Arc::clone(&before_walk_entered);
+            let before_walk_release = Arc::clone(&before_walk_release);
+            let after_publish_entered = Arc::clone(&after_publish_entered);
+            let after_publish_release = Arc::clone(&after_publish_release);
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| match phase {
+                StaleRefreshPhase::BeforeWalk => {
+                    if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        before_walk_entered.wait();
+                        before_walk_release.wait();
+                    }
+                }
+                StaleRefreshPhase::AfterMatcherPublish => {
+                    if passes.load(Ordering::SeqCst) == 1 {
+                        after_publish_entered.wait();
+                        after_publish_release.wait();
+                    }
+                }
+                StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
+                StaleRefreshPhase::AfterConcreteRead => {}
+                StaleRefreshPhase::BeforeConcreteCommit => {}
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        let refresh_state = Arc::clone(&state);
+        let refresh_root = root.clone();
+        let index_dir = state.index_dir.clone();
+        let refresh = thread::spawn(move || {
+            background_refresh_stale(&refresh_state, &refresh_root, &index_dir, true)
+        });
+
+        // A: untracked and hidden when the pass captures its immutable set.
+        before_walk_entered.wait();
+        // B: the index changes, but this pass must continue using A throughout.
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        before_walk_release.wait();
+        after_publish_entered.wait();
+        assert!(
+            state
+                .gitignore
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true),
+            "the published matcher must use the same A snapshot as the walk"
+        );
+        if PER_DIRECTORY_WATCHES {
+            assert!(
+                !state
+                    .watch_registry
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .watched
+                    .contains(&ignored),
+                "the B transition must not change subscriptions mid-pass"
+            );
+        }
+        // A again: the pass already represents the final membership, so no
+        // corrective pass is necessary.
+        test_git(
+            &root,
+            &[
+                "rm",
+                "--cached",
+                "--quiet",
+                "--force",
+                "--",
+                "ignored/forced.rs",
+            ],
+        );
+        after_publish_release.wait();
+        assert!(
+            refresh.join().unwrap(),
+            "the raced pass itself should finish"
+        );
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            passes.load(Ordering::SeqCst) == 1,
+            "A→B→A should not need a retry when the first pass used A throughout"
+        );
+        assert!(
+            !state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+                && !state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "the semantic baseline returned to A"
+        );
+
+        let matcher = state.gitignore.read().unwrap();
+        assert!(
+            matcher
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true),
+            "the final matcher must restore the final untracked state"
+        );
+        drop(matcher);
+        let index = state.index.read().unwrap();
+        assert!(
+            !index.live.has_path("ignored/forced.rs")
+                && (!index.reader_has_path("ignored/forced.rs")
+                    || index.live.is_deleted("ignored/forced.rs")),
+            "the immutable A walk must not index content from intermediate B"
+        );
+        drop(index);
+        if PER_DIRECTORY_WATCHES {
+            assert!(
+                !state
+                    .watch_registry
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .watched
+                    .contains(&ignored),
+                "the immutable A matcher must leave the ignored tree unsubscribed"
+            );
+        }
+    }
+
+    #[test]
+    fn content_only_index_churn_during_refresh_does_not_chain_reconciles() {
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn original() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore", "src/lib.rs"]);
+
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let root = root.clone();
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| match phase {
+                StaleRefreshPhase::BeforeWalk => {
+                    passes.fetch_add(1, Ordering::SeqCst);
+                }
+                StaleRefreshPhase::AfterMatcherPublish => {
+                    let pass = passes.load(Ordering::SeqCst);
+                    if pass <= 4 {
+                        std::fs::write(
+                            root.join("src/lib.rs"),
+                            format!("fn content_only_{pass}() {{}}\n"),
+                        )
+                        .unwrap();
+                        test_git(&root, &["add", "--", "src/lib.rs"]);
+                    }
+                }
+                StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
+                StaleRefreshPhase::AfterConcreteRead => {}
+                StaleRefreshPhase::BeforeConcreteCommit => {}
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        assert!(background_refresh_stale(
+            &state,
+            &root,
+            &state.index_dir,
+            true
+        ));
+        thread::sleep(Duration::from_millis(250));
+
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "metadata churn with unchanged relevant membership must not chain full scans"
+        );
+        assert!(
+            !state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+                && !state.ignore_rules_dirty.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn membership_change_during_refresh_schedules_one_corrective_pass() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        let ignored = root.join("ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(ignored.join("forced.rs"), "fn newly_exempt() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore"]);
+
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        if PER_DIRECTORY_WATCHES {
+            let watcher = notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap();
+            *state.watch_registry.lock().unwrap() = Some(WatchRegistry {
+                watcher,
+                root: root.clone(),
+                watched: std::iter::once(root.clone()).collect(),
+            });
+        }
+
+        let before_walk_entered = Arc::new(Barrier::new(2));
+        let before_walk_release = Arc::new(Barrier::new(2));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let before_walk_entered = Arc::clone(&before_walk_entered);
+            let before_walk_release = Arc::clone(&before_walk_release);
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| {
+                if matches!(phase, StaleRefreshPhase::BeforeWalk)
+                    && passes.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    before_walk_entered.wait();
+                    before_walk_release.wait();
+                }
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        let refresh_state = Arc::clone(&state);
+        let refresh_root = root.clone();
+        let index_dir = state.index_dir.clone();
+        let refresh = thread::spawn(move || {
+            background_refresh_stale(&refresh_state, &refresh_root, &index_dir, true)
+        });
+
+        before_walk_entered.wait();
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        before_walk_release.wait();
+        assert!(refresh.join().unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (passes.load(Ordering::SeqCst) < 2
+            || state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+            || state.ignore_rules_dirty.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            2,
+            "a semantic A→B change must schedule exactly one corrective pass"
+        );
+        assert!(
+            !state
+                .gitignore
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true)
+        );
+        let index = state.index.read().unwrap();
+        assert!(
+            index.reader_has_path("ignored/forced.rs") || index.live.has_path("ignored/forced.rs"),
+            "the corrective pass must index the newly exempt file"
+        );
+        drop(index);
+        if PER_DIRECTORY_WATCHES {
+            assert!(
+                state
+                    .watch_registry
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .watched
+                    .contains(&ignored),
+                "the corrective pass must subscribe the newly exempt directory"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_reload_uses_one_snapshot_across_git_index_aba() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        let ignored = root.join("ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(ignored.join("forced.rs"), "fn reload_aba() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore"]);
+
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let before_walk_entered = Arc::new(Barrier::new(2));
+        let before_walk_release = Arc::new(Barrier::new(2));
+        let after_publish_entered = Arc::new(Barrier::new(2));
+        let after_publish_release = Arc::new(Barrier::new(2));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let before_walk_entered = Arc::clone(&before_walk_entered);
+            let before_walk_release = Arc::clone(&before_walk_release);
+            let after_publish_entered = Arc::clone(&after_publish_entered);
+            let after_publish_release = Arc::clone(&after_publish_release);
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| match phase {
+                StaleRefreshPhase::BeforeWalk => {
+                    if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        before_walk_entered.wait();
+                        before_walk_release.wait();
+                    }
+                }
+                StaleRefreshPhase::AfterMatcherPublish => {
+                    if passes.load(Ordering::SeqCst) == 1 {
+                        after_publish_entered.wait();
+                        after_publish_release.wait();
+                    }
+                }
+                StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
+                StaleRefreshPhase::AfterConcreteRead => {}
+                StaleRefreshPhase::BeforeConcreteCommit => {}
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        let reload_state = Arc::clone(&state);
+        let reload = thread::spawn(move || handle_reload(None, &reload_state));
+        before_walk_entered.wait();
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        before_walk_release.wait();
+        after_publish_entered.wait();
+        test_git(
+            &root,
+            &[
+                "rm",
+                "--cached",
+                "--quiet",
+                "--force",
+                "--",
+                "ignored/forced.rs",
+            ],
+        );
+        after_publish_release.wait();
+
+        let response = reload.join().unwrap();
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            1,
+            "A→B→A must not need a correction when reload used A throughout"
+        );
+        assert!(
+            state
+                .gitignore
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true)
+        );
+        let index = state.index.read().unwrap();
+        assert!(
+            !index.reader_has_path("ignored/forced.rs")
+                && !index.live.has_path("ignored/forced.rs"),
+            "reload index and matcher must both represent final A"
+        );
+        assert!(
+            !state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+                && !state.ignore_rules_dirty.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn rpc_reload_membership_change_schedules_one_corrective_pass() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicUsize;
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(
+            root.join("ignored/forced.rs"),
+            "fn reload_membership_change() {}\n",
+        )
+        .unwrap();
+        test_git(&root, &["add", "--", ".gitignore"]);
+
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        let before_walk_entered = Arc::new(Barrier::new(2));
+        let before_walk_release = Arc::new(Barrier::new(2));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let hook: StaleRefreshHook = {
+            let before_walk_entered = Arc::clone(&before_walk_entered);
+            let before_walk_release = Arc::clone(&before_walk_release);
+            let passes = Arc::clone(&passes);
+            Arc::new(move |phase| {
+                if matches!(phase, StaleRefreshPhase::BeforeWalk)
+                    && passes.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    before_walk_entered.wait();
+                    before_walk_release.wait();
+                }
+            })
+        };
+        *state.stale_refresh_hook.lock().unwrap() = Some(hook);
+
+        let reload_state = Arc::clone(&state);
+        let reload = thread::spawn(move || handle_reload(None, &reload_state));
+        before_walk_entered.wait();
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        before_walk_release.wait();
+        let response = reload.join().unwrap();
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (passes.load(Ordering::SeqCst) < 2
+            || state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+            || state.ignore_rules_dirty.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            passes.load(Ordering::SeqCst),
+            2,
+            "A→B during reload must schedule exactly one corrective pass"
+        );
+        assert!(
+            !state
+                .gitignore
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_ignored(Path::new("ignored"), true)
+        );
+        let index = state.index.read().unwrap();
+        assert!(
+            index.reader_has_path("ignored/forced.rs") || index.live.has_path("ignored/forced.rs"),
+            "the correction must make reload's index agree with final B"
+        );
+    }
+
+    #[test]
+    fn rpc_reload_without_watcher_repairs_change_after_extraction() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        let path = root.join("raced.rs");
+        std::fs::write(&path, "fn old_reload_marker() {}\n").unwrap();
+
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        let hook_path = path.clone();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterBuildBeforeStampPublish) {
+                std::fs::write(&hook_path, "fn new_reload_marker() {}\n").unwrap();
+            }
+        }));
+
+        let response = handle_reload(None, &state);
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+        let result = handle_search(
+            None,
+            &serde_json::json!({"pattern": "new_reload_marker"}),
+            &state,
+        );
+        assert!(
+            result.contains("new_reload_marker"),
+            "the no-watch catch-up must index the bytes written after extraction: {result}"
+        );
+    }
+
+    #[test]
+    fn unwatched_external_bootstrap_repairs_change_after_extraction() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        let path = root.join("raced.rs");
+        std::fs::write(&path, "fn old_bootstrap_marker() {}\n").unwrap();
+
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        state.indexing.store(true, Ordering::SeqCst);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        let hook_path = path.clone();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterBuildBeforeStampPublish) {
+                std::fs::write(&hook_path, "fn new_bootstrap_marker() {}\n").unwrap();
+            }
+        }));
+
+        assert!(bootstrap_index_build(&state, &root, &state.index_dir));
+        let result = handle_search(
+            None,
+            &serde_json::json!({"pattern": "new_bootstrap_marker"}),
+            &state,
+        );
+        assert!(
+            result.contains("new_bootstrap_marker"),
+            "the no-watch bootstrap catch-up must index the final bytes: {result}"
+        );
+    }
+
+    #[test]
+    fn unwatched_resumed_build_repairs_change_after_extraction() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        std::fs::write(root.join("seeded.rs"), "fn seeded() {}\n").unwrap();
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        builder::build_index_with_options(
+            &root,
+            Some(&state.index_dir),
+            &builder::BuildOptions {
+                no_require_git: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        *state.index.write().unwrap() = HybridIndex::open(&state.index_dir, &root).unwrap();
+
+        let path = root.join("raced.rs");
+        std::fs::write(&path, "fn old_resumed_marker() {}\n").unwrap();
+        state.indexing.store(true, Ordering::SeqCst);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        let hook_path = path.clone();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterBuildBeforeStampPublish) {
+                std::fs::write(&hook_path, "fn new_resumed_marker() {}\n").unwrap();
+            }
+        }));
+
+        background_index_build(&state, &root, &state.index_dir);
+        let result = handle_search(
+            None,
+            &serde_json::json!({"pattern": "new_resumed_marker"}),
+            &state,
+        );
+        assert!(
+            result.contains("new_resumed_marker"),
+            "the no-watch resumed-build catch-up must index the final bytes: {result}"
+        );
+    }
+
+    #[test]
+    fn rpc_reload_replays_event_received_after_extraction() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        let path = root.join("raced.rs");
+        std::fs::write(&path, "fn old_watched_marker() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        let prior = root.join("prior.rs");
+        state
+            .deferred_events
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert(prior.clone(), false);
+
+        let hook_path = path.clone();
+        let hook_state = Arc::clone(&state);
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterBuildBeforeStampPublish) {
+                assert!(
+                    hook_state
+                        .deferred_events
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .contains_key(&prior),
+                    "reload must preserve events awaiting an earlier build replay"
+                );
+                std::fs::write(&hook_path, "fn new_watched_marker() {}\n").unwrap();
+                assert!(defer_events_during_build(
+                    &hook_state,
+                    &Event {
+                        kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                            notify::event::DataChange::Any,
+                        )),
+                        paths: vec![hook_path.clone()],
+                        attrs: Default::default(),
+                    }
+                ));
+            }
+        }));
+
+        let response = handle_reload(None, &state);
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+        let result = handle_search(
+            None,
+            &serde_json::json!({"pattern": "new_watched_marker"}),
+            &state,
+        );
+        assert!(
+            result.contains("new_watched_marker"),
+            "the replay must force the concrete event despite the later matching stamp: {result}"
+        );
+    }
+
+    #[test]
+    fn rpc_reload_schedules_ignore_rule_change_received_during_build() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        let rules = root.join(".gitignore");
+        std::fs::write(&rules, "").unwrap();
+        std::fs::create_dir(root.join("ignored")).unwrap();
+        std::fs::write(root.join("ignored/file.rs"), "fn should_disappear() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        let hook_rules = rules.clone();
+        let hook_root = root.clone();
+        let hook_state = Arc::clone(&state);
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterBuildBeforeStampPublish) {
+                std::fs::write(&hook_rules, "ignored/\n").unwrap();
+                handle_fs_event(
+                    &hook_state,
+                    &hook_root,
+                    &Event {
+                        kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                            notify::event::DataChange::Any,
+                        )),
+                        paths: vec![hook_rules.clone()],
+                        attrs: Default::default(),
+                    },
+                );
+            }
+        }));
+
+        let response = handle_reload(None, &state);
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+            || state.ignore_rules_dirty.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            !state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+                && !state.ignore_rules_dirty.load(Ordering::SeqCst),
+            "the rule change observed during reload must run a serialized refresh"
+        );
+        let index = state.index.read().unwrap();
+        assert!(
+            !index.reader_has_path("ignored/file.rs") || index.live.is_deleted("ignored/file.rs"),
+            "the refresh must remove content hidden by the new rule"
+        );
+    }
+
+    #[test]
+    fn concrete_event_reindexes_equal_length_rewrite_with_matching_stamp() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("same.rs");
+        std::fs::write(&path, "fn old_marker() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "same.rs", false);
+        }
+        std::fs::write(&path, "fn new_marker() {}\n").unwrap();
+        let current = tgrep_core::meta::collect_filestamps(&root, &["same.rs".to_string()])
+            .remove("same.rs")
+            .unwrap();
+        state
+            .file_stamps
+            .write()
+            .unwrap()
+            .insert("same.rs".to_string(), current);
+
+        // Mutation control: the speculative path still trusts the persisted
+        // stamp and therefore leaves the old posting set in place.
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "same.rs", false);
+        }
+        let stale = handle_search(None, &serde_json::json!({"pattern": "new_marker"}), &state);
+        assert!(
+            !stale.contains("\"content\":\"fn new_marker"),
+            "the control must demonstrate that stamp-only filtering misses the rewrite"
+        );
+
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )),
+                paths: vec![path],
+                attrs: Default::default(),
+            },
+        );
+        let repaired = handle_search(None, &serde_json::json!({"pattern": "new_marker"}), &state);
+        assert!(
+            repaired.contains("\"content\":\"fn new_marker"),
+            "a concrete event must bypass the coarse matching stamp: {repaired}"
+        );
+    }
+
+    #[test]
+    fn concrete_event_rejects_change_after_verification_before_commit() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("raced.rs");
+        std::fs::write(&path, "fn old_marker() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "raced.rs", false);
+        }
+        let dirty_before = state.index.read().unwrap().live.dirty_count();
+        std::fs::write(&path, "fn first_new_() {}\n").unwrap();
+
+        state.indexing.store(true, Ordering::SeqCst);
+        let changed = path.clone();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::BeforeConcreteCommit) {
+                std::fs::write(&changed, "fn final_new_() {}\n").unwrap();
+            }
+        }));
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "raced.rs", true);
+        }
+
+        assert_eq!(
+            state.index.read().unwrap().live.dirty_count(),
+            dirty_before,
+            "bytes invalidated after verification must not be committed"
+        );
+        assert_eq!(
+            state.file_stamps.read().unwrap().get("raced.rs"),
+            Some(&tgrep_core::meta::FileStamp {
+                mtime: u64::MAX,
+                size: u64::MAX,
+            }),
+            "a rejected final version must remain scheduled for correction"
+        );
+
+        *state.stale_refresh_hook.lock().unwrap() = None;
+        state.indexing.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.ignore_refresh_scheduled.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn rpc_reload_build_failure_preserves_active_index() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        state
+            .index
+            .write()
+            .unwrap()
+            .live
+            .upsert_file("active.rs", b"fn active_before_reload() {}\n");
+
+        std::fs::write(index_dir.join(".reload-build"), b"blocks staging directory").unwrap();
+        let response = handle_reload(None, &state);
+
+        assert!(response.contains("rebuild failed"), "{response}");
+        assert!(
+            state.index.read().unwrap().live.has_path("active.rs"),
+            "a failed staged build must not disturb the active index"
+        );
+    }
+
+    #[test]
+    fn rpc_reload_waits_for_initial_build() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.indexing.store(true, Ordering::SeqCst);
+        let (entered_tx, entered_rx) = channel();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::BeforeWalk) {
+                entered_tx.send(()).unwrap();
+            }
+        }));
+
+        let reload_state = Arc::clone(&state);
+        let reload = thread::spawn(move || handle_reload(None, &reload_state));
+        assert!(matches!(
+            entered_rx.recv_timeout(Duration::from_millis(150)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        state.indexing.store(false, Ordering::SeqCst);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let response = reload.join().unwrap();
+        assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+    }
+
+    #[test]
+    fn index_mutation_keeps_write_lock_until_cache_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("atomic.rs");
+        std::fs::write(&path, "fn atomic_marker() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state
+            .cache
+            .write()
+            .unwrap()
+            .put("atomic.rs".to_string(), cached(10));
+        let generation = state.cache_generation.load(Ordering::SeqCst);
+
+        // Prevent invalidation from completing after the index commit. The
+        // writer must retain the index lock while it waits for this guard.
+        let cache_guard = state.cache.read().unwrap();
+        let before_commit = Arc::new(std::sync::Barrier::new(2));
+        let continue_commit = Arc::new(std::sync::Barrier::new(2));
+        let hook_before = Arc::clone(&before_commit);
+        let hook_continue = Arc::clone(&continue_commit);
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::BeforeConcreteCommit) {
+                hook_before.wait();
+                hook_continue.wait();
+            }
+        }));
+
+        let worker_state = Arc::clone(&state);
+        let worker_path = path.clone();
+        let worker = thread::spawn(move || {
+            let _gate = worker_state.snapshot_gate.read().unwrap();
+            reindex_file(&worker_state, &worker_path, "atomic.rs", true);
+        });
+        before_commit.wait();
+        continue_commit.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match state.index.try_read() {
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Err(std::sync::TryLockError::Poisoned(error)) => panic!("{error}"),
+                Ok(index) => {
+                    assert!(
+                        !index.live.has_path("atomic.rs"),
+                        "new postings became visible while stale cached bytes were still readable"
+                    );
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "index writer never reached commit"
+            );
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            matches!(
+                state.index.try_read(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "index lock was released before cache invalidation completed"
+        );
+
+        drop(cache_guard);
+        worker.join().unwrap();
+        *state.stale_refresh_hook.lock().unwrap() = None;
+        assert!(state.cache.read().unwrap().peek("atomic.rs").is_none());
+        assert!(state.cache_generation.load(Ordering::SeqCst) > generation);
+    }
+
+    #[test]
+    fn pre_reload_disk_read_cannot_repopulate_content_cache() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        let before_reload = state.cache_generation.load(Ordering::SeqCst);
+        let stale = vec![(
+            "stale.rs".to_string(),
+            Arc::new(DecodedFile::new(
+                b"old content".to_vec(),
+                tgrep_core::encoding::EncodingMode::Auto,
+            )),
+        )];
+
+        let _index = state.index.read().unwrap();
+        invalidate_cached_paths_locked(&state, std::iter::once("stale.rs"));
+        update_content_cache(&state, before_reload, &[], &stale);
+        assert!(
+            state.cache.read().unwrap().peek("stale.rs").is_none(),
+            "a disk read from the previous index generation must not refill the cache"
+        );
+
+        let current = state.cache_generation.load(Ordering::SeqCst);
+        update_content_cache(&state, current, &[], &stale);
+        assert!(state.cache.read().unwrap().peek("stale.rs").is_some());
+    }
+
+    #[test]
+    fn tracked_membership_poll_waits_for_reconcile_publication() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        test_git(&root, &["config", "core.ignorecase", "true"]);
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join("ignored/forced.rs"), "fn transient() {}\n").unwrap();
+        test_git(&root, &["add", "--", ".gitignore"]);
+
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        assert!(background_refresh_stale(
+            &state,
+            &root,
+            &state.index_dir,
+            true
+        ));
+
+        let gate = state.snapshot_gate.write().unwrap();
+        test_git(&root, &["add", "-f", "--", "ignored/forced.rs"]);
+        let (result_tx, result_rx) = channel();
+        let poll_state = Arc::clone(&state);
+        let poll = thread::spawn(move || {
+            result_tx
+                .send(poll_tracked_membership_changed(&poll_state))
+                .unwrap();
+        });
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(150)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+
+        test_git(
+            &root,
+            &[
+                "rm",
+                "--cached",
+                "--quiet",
+                "--force",
+                "--",
+                "ignored/forced.rs",
+            ],
+        );
+        drop(gate);
+        assert!(!result_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        poll.join().unwrap();
     }
 
     /// A transient stat failure is not a deletion. `Path::exists` said it was,
@@ -6790,6 +8931,148 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn concrete_event_rejects_file_swapped_to_outside_symlink_between_reads() {
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("outside.rs");
+        std::fs::write(&target, "fn outside_file_marker() {}\n").unwrap();
+        let root_dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let path = root.join("raced.rs");
+        std::fs::write(&path, "fn inside_file_marker() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "raced.rs", false);
+        }
+
+        let swap_path = path.clone();
+        let swap_target = target.clone();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterConcreteRead) {
+                std::fs::remove_file(&swap_path).unwrap();
+                std::os::unix::fs::symlink(&swap_target, &swap_path).unwrap();
+            }
+        }));
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )),
+                paths: vec![path],
+                attrs: Default::default(),
+            },
+        );
+
+        let result = handle_search(
+            None,
+            &serde_json::json!({"pattern": "outside_file_marker"}),
+            &state,
+        );
+        assert!(
+            !result.contains("outside_file_marker"),
+            "verification must not follow a replacement symlink outside the root"
+        );
+        assert!(state.index.read().unwrap().live.is_deleted("raced.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concrete_event_rejects_ancestor_swapped_to_outside_symlink_between_reads() {
+        let outside = TempDir::new().unwrap();
+        std::fs::write(
+            outside.path().join("raced.rs"),
+            "fn outside_ancestor_marker() {}\n",
+        )
+        .unwrap();
+        let root_dir = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(root_dir.path()).unwrap();
+        let dir = root.join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("raced.rs");
+        std::fs::write(&path, "fn inside_ancestor_marker() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "dir/raced.rs", false);
+        }
+
+        let swap_dir = dir.clone();
+        let moved_dir = root.join("original-dir");
+        let outside_dir = outside.path().to_path_buf();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterConcreteRead) {
+                std::fs::rename(&swap_dir, &moved_dir).unwrap();
+                std::os::unix::fs::symlink(&outside_dir, &swap_dir).unwrap();
+            }
+        }));
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )),
+                paths: vec![path],
+                attrs: Default::default(),
+            },
+        );
+
+        let result = handle_search(
+            None,
+            &serde_json::json!({"pattern": "outside_ancestor_marker"}),
+            &state,
+        );
+        assert!(
+            !result.contains("outside_ancestor_marker"),
+            "verification must not traverse a replacement ancestor symlink"
+        );
+        assert!(state.index.read().unwrap().live.is_deleted("dir/raced.rs"));
+    }
+
+    #[test]
+    fn concrete_event_caps_growth_between_verification_reads() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("grows.rs");
+        std::fs::write(&path, "fn small() {}\n").unwrap();
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().max_file_size = Some(64);
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "grows.rs", false);
+        }
+
+        let grow_path = path.clone();
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterConcreteRead) {
+                std::fs::write(&grow_path, vec![b'x'; 4096]).unwrap();
+            }
+        }));
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )),
+                paths: vec![path],
+                attrs: Default::default(),
+            },
+        );
+
+        assert!(
+            state.index.read().unwrap().live.is_deleted("grows.rs"),
+            "growth past the configured limit must be rejected before a second unbounded read"
+        );
+    }
+
     /// Nothing may be resolved that could climb back out of the root.
     #[test]
     fn open_within_root_refuses_paths_that_escape_or_are_not_literal() {
@@ -6962,6 +9245,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_deferred_directory_rename_reconciles_indexed_descendants() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = root.join("removed");
+        let path = dir.join("deep.rs");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&path, "fn removed_descendant() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "removed/deep.rs", false);
+        }
+
+        state.indexing.store(true, Ordering::SeqCst);
+        std::fs::rename(&dir, root.join("moved")).unwrap();
+        handle_fs_event(
+            &state,
+            &root,
+            &Event {
+                kind: EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::From,
+                )),
+                paths: vec![dir],
+                attrs: Default::default(),
+            },
+        );
+        state.indexing.store(false, Ordering::SeqCst);
+        replay_deferred_events(&state, &root);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (state.ignore_refresh_scheduled.load(Ordering::SeqCst)
+            || state.ignore_rules_dirty.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let index = state.index.read().unwrap();
+        assert!(
+            !index.reader_has_path("removed/deep.rs") && !index.live.has_path("removed/deep.rs"),
+            "the coalesced reconcile must retire descendants named by no removal event"
+        );
+    }
+
     /// A file that cannot be opened right now is not a file that stopped
     /// belonging in the index. Evicting on a transient error would drop live
     /// content because something else held the file open for a moment.
@@ -6978,7 +9306,7 @@ mod tests {
 
         let path = root.join("locked.rs");
         std::fs::write(&path, "fn readable() {}\n").unwrap();
-        reindex_file(&state, &path, "locked.rs");
+        reindex_file(&state, &path, "locked.rs", false);
         assert!(state.index.read().unwrap().live.has_path("locked.rs"));
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -6986,7 +9314,7 @@ mod tests {
             // Running as root, where the mode is advisory. Nothing to test.
             return;
         }
-        reindex_file(&state, &path, "locked.rs");
+        reindex_file(&state, &path, "locked.rs", false);
 
         assert!(
             !state.index.read().unwrap().live.is_deleted("locked.rs"),
@@ -7053,7 +9381,7 @@ mod tests {
         let path = root.join("d").join("a.rs");
         std::fs::create_dir(root.join("d")).unwrap();
         std::fs::write(&path, "fn a() {}\n").unwrap();
-        reindex_file(&state, &path, "d/a.rs");
+        reindex_file(&state, &path, "d/a.rs", false);
         assert!(state.index.read().unwrap().live.has_path("d/a.rs"));
 
         // What `reindex_files_in` produces when an entry in `d` failed to
@@ -7093,7 +9421,7 @@ mod tests {
         let path = root.join("d").join("a.rs");
         std::fs::create_dir(root.join("d")).unwrap();
         std::fs::write(&path, "fn a() {}\n").unwrap();
-        reindex_file(&state, &path, "d/a.rs");
+        reindex_file(&state, &path, "d/a.rs", false);
         assert!(state.index.read().unwrap().live.has_path("d/a.rs"));
 
         // `d` enumerated cleanly and did not contain `a.rs` at the time — but
@@ -7126,7 +9454,7 @@ mod tests {
         let dir = root.join("d");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("a.rs"), "fn ours() {}\n").unwrap();
-        reindex_file(&state, &dir.join("a.rs"), "d/a.rs");
+        reindex_file(&state, &dir.join("a.rs"), "d/a.rs", false);
         assert!(state.index.read().unwrap().live.has_path("d/a.rs"));
 
         // The scan listed the root, did not find `d`, and is about to sweep
@@ -7169,7 +9497,7 @@ mod tests {
 
         let path = root.join("x.rs");
         std::fs::write(&path, "fn was_a_real_file() {}\n").unwrap();
-        reindex_file(&state, &path, "x.rs");
+        reindex_file(&state, &path, "x.rs", false);
         assert!(state.index.read().unwrap().live.has_path("x.rs"));
 
         std::fs::remove_file(&path).unwrap();
@@ -7210,7 +9538,7 @@ mod tests {
 
         let path = root.join("x.rs");
         std::fs::write(&path, "fn indexed() {}\n").unwrap();
-        reindex_file(&state, &path, "x.rs");
+        reindex_file(&state, &path, "x.rs", false);
         assert!(state.index.read().unwrap().live.has_path("x.rs"));
 
         std::fs::remove_file(&path).unwrap();
@@ -7516,7 +9844,7 @@ mod tests {
         let path = root.join("seeded.rs");
         std::fs::write(&path, "fn seeded() {}\n").unwrap();
         let gate = state.snapshot_gate.read().unwrap();
-        reindex_file(&state, &path, "seeded.rs");
+        reindex_file(&state, &path, "seeded.rs", false);
         assert!(state.index.read().unwrap().live.has_path("seeded.rs"));
 
         // Indexed, and searchable, but with nothing in the stamp map to say so
@@ -7755,8 +10083,8 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(nested.join("b.rs"), "fn b() {}\n").unwrap();
-        reindex_file(&state, &dir.join("a.rs"), "d/a.rs");
-        reindex_file(&state, &nested.join("b.rs"), "d/deep/b.rs");
+        reindex_file(&state, &dir.join("a.rs"), "d/a.rs", false);
+        reindex_file(&state, &nested.join("b.rs"), "d/deep/b.rs", false);
         assert!(state.index.read().unwrap().live.has_path("d/a.rs"));
 
         // Still there, merely unlistable from the scan's point of view: the
@@ -7818,7 +10146,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (added, _removed) = registry.sync(&desired, false);
+        let (added, _removed) = registry.sync(&desired, TraversalCompleteness::Complete, false);
 
         assert_eq!(added.len(), 4);
         let depths: Vec<usize> = added.iter().map(|d| d.components().count()).collect();
@@ -7854,13 +10182,13 @@ mod tests {
         std::fs::remove_dir(&gone).unwrap();
         let desired: std::collections::HashSet<PathBuf> = std::iter::once(gone.clone()).collect();
 
-        registry.sync(&desired, false);
+        registry.sync(&desired, TraversalCompleteness::Complete, false);
         assert!(
             registry.is_watched(&gone),
             "the fixture must reproduce the poisoned entry, or it proves nothing"
         );
 
-        registry.sync(&desired, true);
+        registry.sync(&desired, TraversalCompleteness::Complete, true);
         assert!(
             !registry.is_watched(&gone),
             "a forced sync must re-issue the subscription and drop the entry \
@@ -8021,6 +10349,14 @@ mod tests {
         let stamps: std::collections::HashMap<String, FileStamp> = [
             ("quiet.rs".to_string(), FileStamp { mtime: 1, size: 10 }),
             ("racy.rs".to_string(), FileStamp { mtime: 2, size: 20 }),
+            (
+                "moved/deep.rs".to_string(),
+                FileStamp { mtime: 3, size: 30 },
+            ),
+            (
+                "moved-aside.rs".to_string(),
+                FileStamp { mtime: 4, size: 40 },
+            ),
         ]
         .into_iter()
         .collect();
@@ -8032,6 +10368,13 @@ mod tests {
             .as_mut()
             .unwrap()
             .insert(root.join("racy.rs"), false);
+        state
+            .deferred_events
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert(root.join("moved"), true);
 
         let published = withhold_stamps_for_deferred(&state, &root, stamps.clone());
         assert!(
@@ -8041,6 +10384,14 @@ mod tests {
         assert!(
             !published.contains_key("racy.rs"),
             "a file whose event is waiting to be replayed must not be stamped as indexed"
+        );
+        assert!(
+            !published.contains_key("moved/deep.rs"),
+            "a directory event must withhold stamps for every descendant the subtree replay covers"
+        );
+        assert!(
+            published.contains_key("moved-aside.rs"),
+            "directory-prefix matching must not withhold similarly named siblings"
         );
 
         // Overflowed: the buffer names nothing, so nothing in the map can be
@@ -8104,14 +10455,14 @@ mod tests {
 
         let path = root.join("grows.rs");
         std::fs::write(&path, "fn small_enough() {}\n").unwrap();
-        reindex_file(&state, &path, "grows.rs");
+        reindex_file(&state, &path, "grows.rs", false);
         assert!(
             state.index.read().unwrap().live.has_path("grows.rs"),
             "a file under the cap should index normally"
         );
 
         std::fs::write(&path, "x".repeat(4096)).unwrap();
-        reindex_file(&state, &path, "grows.rs");
+        reindex_file(&state, &path, "grows.rs", false);
         assert!(
             state.index.read().unwrap().live.is_deleted("grows.rs"),
             "content past the cap must not stay searchable"
@@ -8273,7 +10624,8 @@ mod tests {
             write_file(&staging.join(name), name.as_bytes());
         }
         write_file(&staging.join("ignored.txt"), b"nope");
-        move_staged_files(&staging, &target).unwrap();
+        let mut moved = move_staged_files(&staging, &target).unwrap();
+        moved.commit();
         for name in ["index.bin", "lookup.bin", "files.bin", "meta.json"] {
             assert_eq!(std::fs::read(target.join(name)).unwrap(), name.as_bytes());
             assert!(
@@ -8284,6 +10636,125 @@ mod tests {
         assert!(
             staging.join("ignored.txt").exists(),
             "unknown files should be left alone"
+        );
+    }
+
+    #[test]
+    fn staged_file_move_rolls_back_replaced_files() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join("index.bin"), b"new");
+        write_file(&target.join("index.bin"), b"old");
+
+        let mut moved = move_staged_files(&staging, &target).unwrap();
+        assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"new");
+        moved.rollback().unwrap();
+
+        assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn rollback_restores_backup_when_published_target_is_already_missing() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join("index.bin"), b"new");
+        write_file(&target.join("index.bin"), b"old");
+
+        let mut moved = move_staged_files(&staging, &target).unwrap();
+        std::fs::remove_file(target.join("index.bin")).unwrap();
+        moved.rollback().unwrap();
+
+        assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn rollback_restores_backup_when_replacement_was_never_published() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join(".previous-index.bin"), b"old");
+
+        let mut moved = StagedFileMove {
+            staging,
+            target: target.clone(),
+            backed_up: vec!["index.bin"],
+            published: Vec::new(),
+            finished: false,
+        };
+        moved.rollback().unwrap();
+
+        assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn move_failure_reports_rollback_failure_and_preserves_backups() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join(".previous-index.bin"), b"old-index");
+        std::fs::create_dir(target.join("index.bin")).unwrap();
+
+        let moved = StagedFileMove {
+            staging: staging.clone(),
+            target,
+            backed_up: vec!["index.bin"],
+            published: vec!["index.bin"],
+            finished: false,
+        };
+        let error = moved.fail(std::io::Error::other("publish failed"));
+
+        assert!(error.rollback_failed());
+        assert_eq!(
+            std::fs::read(staging.join(".previous-index.bin")).unwrap(),
+            b"old-index"
+        );
+    }
+
+    #[test]
+    fn rollback_retry_does_not_delete_an_already_restored_backup() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join(".previous-index.bin"), b"old-index");
+        write_file(&staging.join(".previous-lookup.bin"), b"old-lookup");
+        write_file(&target.join("index.bin"), b"new-index");
+        std::fs::create_dir(target.join("lookup.bin")).unwrap();
+
+        let mut moved = StagedFileMove {
+            staging,
+            target: target.clone(),
+            backed_up: vec!["index.bin", "lookup.bin"],
+            published: vec!["index.bin", "lookup.bin"],
+            finished: false,
+        };
+        assert!(moved.rollback().is_err());
+        assert_eq!(
+            std::fs::read(target.join("index.bin")).unwrap(),
+            b"old-index"
+        );
+
+        std::fs::remove_dir(target.join("lookup.bin")).unwrap();
+        moved.rollback().unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("index.bin")).unwrap(),
+            b"old-index"
+        );
+        assert_eq!(
+            std::fs::read(target.join("lookup.bin")).unwrap(),
+            b"old-lookup"
         );
     }
 }

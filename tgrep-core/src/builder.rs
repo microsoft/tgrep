@@ -38,6 +38,7 @@ const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 /// charging mapped bytes honestly costs nothing on trees like the kernel, where
 /// only 110 of 94,747 files are mapped at all.
 const INDEX_BUILD_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_OWNED_FILE_BYTES: u64 = INDEX_BUILD_BATCH_BYTES;
 
 /// Default arena budget for [`IndexStrategy::External`] before spilling.
 pub use crate::external::DEFAULT_BUFFER_BYTES as DEFAULT_INDEX_BUFFER_BYTES;
@@ -316,6 +317,19 @@ fn batch_sizes_and_charges(files: &[std::path::PathBuf]) -> (Vec<u64>, Vec<Batch
         .unzip()
 }
 
+fn walked_paths_for_stamps(
+    root: &Path,
+    files: &[std::path::PathBuf],
+    excluded: &std::collections::HashSet<std::path::PathBuf>,
+) -> Vec<String> {
+    files
+        .iter()
+        .filter(|path| !excluded.contains(*path))
+        .filter_map(|path| path.strip_prefix(root).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
 /// Smallest file worth memory-mapping instead of reading.
 ///
 /// The same tradeoff the search path makes: mapping costs a syscall pair and a
@@ -337,18 +351,108 @@ const MMAP_MIN_BYTES: u64 = 1024 * 1024;
 /// The bytes of a file to index, either read onto the heap or borrowed from a
 /// memory map.
 enum FileBytes {
-    Read(Vec<u8>),
+    Read {
+        bytes: Vec<u8>,
+        _permit: OwnedReadPermit,
+    },
     Mapped(memmap2::Mmap),
 }
 
+struct OwnedReadBudget {
+    capacity: u64,
+    available: std::sync::Mutex<u64>,
+    ready: std::sync::Condvar,
+}
+
+impl OwnedReadBudget {
+    fn new(bytes: u64) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            capacity: bytes,
+            available: std::sync::Mutex::new(bytes),
+            ready: std::sync::Condvar::new(),
+        })
+    }
+
+    fn acquire(self: &std::sync::Arc<Self>, bytes: u64) -> OwnedReadPermit {
+        // One oversized fallback may exceed the ordinary budget, but it claims
+        // the whole budget so no other owned read can overlap it.
+        let charged = bytes.min(self.capacity);
+        let mut available = self.available.lock().unwrap();
+        while *available < charged {
+            available = self.ready.wait(available).unwrap();
+        }
+        *available -= charged;
+        OwnedReadPermit {
+            budget: std::sync::Arc::clone(self),
+            bytes: charged,
+        }
+    }
+}
+
+struct OwnedReadPermit {
+    budget: std::sync::Arc<OwnedReadBudget>,
+    bytes: u64,
+}
+
+impl Drop for OwnedReadPermit {
+    fn drop(&mut self) {
+        let mut available = self.budget.available.lock().unwrap();
+        *available += self.bytes;
+        self.budget.ready.notify_all();
+    }
+}
+
 type ExtractedFile = (String, trigram::TrigramMaskMap);
+
+/// Full-resolution identity used to validate that bytes came from one file
+/// version without changing the persisted [`meta::FileStamp`] format.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileVersion {
+    stamp: meta::FileStamp,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanos: i64,
+}
+
+impl FileVersion {
+    pub fn stamp(&self) -> &meta::FileStamp {
+        &self.stamp
+    }
+}
+
+#[doc(hidden)]
+pub fn file_version(metadata: &std::fs::Metadata) -> FileVersion {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    FileVersion {
+        stamp: meta::file_stamp(metadata),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        change_seconds: metadata.ctime(),
+        #[cfg(unix)]
+        change_nanos: metadata.ctime_nsec(),
+    }
+}
 
 impl std::ops::Deref for FileBytes {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
         match self {
-            FileBytes::Read(bytes) => bytes,
+            FileBytes::Read { bytes, .. } => bytes,
             FileBytes::Mapped(map) => map,
         }
     }
@@ -357,9 +461,22 @@ impl std::ops::Deref for FileBytes {
 /// Get a file's bytes for indexing, mapping it when it is large enough to be
 /// worth avoiding the copy.
 ///
-/// Falls back to reading whenever mapping is unavailable, so a filesystem that
-/// cannot map still indexes correctly.
-fn read_for_index(path: &Path, size: u64) -> std::io::Result<FileBytes> {
+/// Falls back to an owned read whenever mapping is unavailable. Ordinary reads
+/// share the batch budget; an unlimited oversized fallback claims it
+/// exclusively so at most one such allocation is in flight.
+fn read_for_index(
+    path: &Path,
+    size: u64,
+    owned_budget: &std::sync::Arc<OwnedReadBudget>,
+    configured_limit: Option<u64>,
+) -> std::io::Result<FileBytes> {
+    let owned_limit = configured_limit.unwrap_or(u64::MAX);
+    if size > owned_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds the configured {} byte limit", owned_limit),
+        ));
+    }
     if size >= MMAP_MIN_BYTES {
         // SAFETY: the map is read-only and owned by the returned value, which
         // is dropped once the file's trigrams have been extracted. A concurrent
@@ -368,11 +485,92 @@ fn read_for_index(path: &Path, size: u64) -> std::io::Result<FileBytes> {
         // accepts.
         let mapped =
             std::fs::File::open(path).and_then(|file| unsafe { memmap2::Mmap::map(&file) });
-        if let Ok(map) = mapped {
+        if let Ok(map) = mapped
+            && map.len() as u64 <= owned_limit
+        {
             return Ok(FileBytes::Mapped(map));
         }
+        // The file grew between the walk's stat and the map. Do not let a
+        // successful mmap bypass a caller-supplied max-file-size limit.
     }
-    std::fs::read(path).map(FileBytes::Read)
+    let permit = owned_budget.acquire(size);
+    match read_owned_for_index(path, size, owned_limit) {
+        Ok(bytes) => Ok(FileBytes::Read {
+            bytes,
+            _permit: permit,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            // The file grew after it was stat'd. Release the smaller claim
+            // before waiting for the retry allowance so concurrent growers
+            // cannot deadlock while each holds part of the batch budget.
+            drop(permit);
+            match configured_limit {
+                Some(limit) => {
+                    let permit = owned_budget.acquire(limit);
+                    read_owned_for_index(path, limit, limit)
+                        .map(|bytes| FileBytes::Read {
+                            bytes,
+                            _permit: permit,
+                        })
+                        .map_err(|retry| {
+                            if retry.kind() == std::io::ErrorKind::WouldBlock {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("file exceeds the configured {} byte limit", limit),
+                                )
+                            } else {
+                                retry
+                            }
+                        })
+                }
+                None => {
+                    // No caller limit means no implicit fallback limit either.
+                    // Claiming more than the budget takes it exclusively, so
+                    // this unbounded read cannot overlap another owned buffer.
+                    let permit = owned_budget.acquire(u64::MAX);
+                    read_owned_unbounded(path, size).map(|bytes| FileBytes::Read {
+                        bytes,
+                        _permit: permit,
+                    })
+                }
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_owned_for_index(path: &Path, size: u64, owned_limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    if size > owned_limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds the configured {} byte limit", owned_limit),
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    std::io::Read::by_ref(&mut file)
+        .take(size)
+        .read_to_end(&mut bytes)?;
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "file grew beyond its owned-buffer reservation",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_owned_unbounded(path: &Path, expected_size: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let initial_capacity = expected_size.min(MAX_OWNED_FILE_BYTES);
+    let mut bytes = Vec::with_capacity(usize::try_from(initial_capacity).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Build a trigram index, choosing how postings are accumulated.
@@ -380,6 +578,22 @@ pub fn build_index_with_options(
     root: &Path,
     index_dir: Option<&Path>,
     opts: &BuildOptions,
+) -> Result<BuildOutcome> {
+    let root = std::fs::canonicalize(root)?;
+    let ignorecase = (!opts.no_ignore)
+        .then(|| crate::gitignore::CaseInsensitiveIgnore::new(&root, true, true, true))
+        .flatten()
+        .map(std::sync::Arc::new);
+    build_index_with_options_and_ignorecase(&root, index_dir, opts, ignorecase)
+}
+
+/// Build an index using an immutable tracked-file exemption that the caller
+/// can also use for watcher matcher publication.
+pub fn build_index_with_options_and_ignorecase(
+    root: &Path,
+    index_dir: Option<&Path>,
+    opts: &BuildOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
 ) -> Result<BuildOutcome> {
     let include_hidden = opts.include_hidden;
     let no_ignore = opts.no_ignore;
@@ -395,7 +609,7 @@ pub fn build_index_with_options(
     if let Some(hint) = gitignore_gate_hint(&root, opts) {
         eprintln!("{hint}");
     }
-    let walk = walker::walk_dir(
+    let walk = walker::walk_dir_with_ignorecase(
         &root,
         &walker::WalkOptions {
             include_hidden,
@@ -406,6 +620,7 @@ pub fn build_index_with_options(
             max_file_size: opts.max_file_size,
             ..Default::default()
         },
+        ignorecase,
     );
     eprintln!(
         "Found {} text files ({} binary skipped, {} too large, {} errors)",
@@ -439,15 +654,25 @@ pub fn build_index_with_options(
     // The walk already stats every entry but discards the size, so recover it
     // here rather than widening WalkResult into the search and serve paths.
     let (sizes, charges) = batch_sizes_and_charges(&walk.files);
+    let raced_too_large = std::sync::Mutex::new(std::collections::HashSet::new());
 
     for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
         let batch = &walk.files[range.clone()];
         let batch_sizes = &sizes[range];
+        let owned_budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
         let batch_data: Vec<ExtractedFile> = batch
             .par_iter()
             .zip(batch_sizes.par_iter())
             .filter_map(|(path, &size)| {
-                let data = read_for_index(path, size).ok()?;
+                let data = match read_for_index(path, size, &owned_budget, opts.max_file_size) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        if error.kind() == std::io::ErrorKind::InvalidData {
+                            raced_too_large.lock().unwrap().insert(path.clone());
+                        }
+                        return None;
+                    }
+                };
                 let text = crate::encoding::decode_for_index(&data);
                 if trigram::is_binary(&text) {
                     binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -501,15 +726,17 @@ pub fn build_index_with_options(
         }
     }
 
-    // Write per-file stamps for ALL walked files (including those later
-    // rejected as binary-by-content) so the stale check on next startup
-    // won't re-process unchanged files that aren't in the index.
-    let all_walked: Vec<String> = walk
-        .files
-        .iter()
-        .filter_map(|p| p.strip_prefix(&root).ok())
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .collect();
+    // Write per-file stamps for walked files, including those later rejected
+    // as binary-by-content. A file that raced past max-file-size is different:
+    // withholding its stamp leaves it eligible for a later retry.
+    let raced_too_large = raced_too_large.into_inner().unwrap();
+    if !raced_too_large.is_empty() {
+        eprintln!(
+            "Skipped {} files that grew past max-file-size during extraction",
+            raced_too_large.len()
+        );
+    }
+    let all_walked = walked_paths_for_stamps(&root, &walk.files, &raced_too_large);
     let stamps = meta::collect_filestamps(&root, &all_walked);
     meta::write_filestamps(&stamps, &index_dir)?;
 
@@ -572,11 +799,12 @@ pub fn build_index_for_files(
     for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
         let batch = &files[range.clone()];
         let batch_sizes = &sizes[range];
+        let owned_budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
         let batch_data: Vec<std::result::Result<ExtractedFile, std::path::PathBuf>> = batch
             .par_iter()
             .zip(batch_sizes.par_iter())
             .filter_map(|(path, &size)| {
-                let data = match read_for_index(path, size) {
+                let data = match read_for_index(path, size, &owned_budget, None) {
                     Ok(data) => data,
                     Err(error) => {
                         eprintln!("tgrep: skipping {}: {error}", path.display());
@@ -1297,6 +1525,19 @@ mod tests {
     }
 
     #[test]
+    fn raced_oversized_files_are_excluded_from_published_stamps() {
+        let root = std::path::PathBuf::from("repo");
+        let kept = root.join("kept.rs");
+        let skipped = root.join("grew.rs");
+        let excluded = std::collections::HashSet::from([skipped.clone()]);
+
+        assert_eq!(
+            walked_paths_for_stamps(&root, &[kept, skipped], &excluded),
+            vec!["kept.rs"]
+        );
+    }
+
+    #[test]
     fn batches_are_bounded_by_cumulative_heap_bytes() {
         // Files below the mapping threshold are read, so their whole length is
         // heap: five 900 KiB reads against a 2 MiB budget fit two at a time.
@@ -1366,6 +1607,189 @@ mod tests {
         assert_eq!(
             batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES),
             vec![0..1, 1..2, 2..3]
+        );
+    }
+
+    #[test]
+    fn owned_read_rejects_files_beyond_the_batch_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sparse.txt");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_OWNED_FILE_BYTES + 1)
+            .unwrap();
+
+        let error = read_owned_for_index(&path, MAX_OWNED_FILE_BYTES + 1, MAX_OWNED_FILE_BYTES)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn configured_limit_is_checked_before_mmap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("too-large.txt");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MMAP_MIN_BYTES)
+            .unwrap();
+        let budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
+
+        let error = match read_for_index(&path, MMAP_MIN_BYTES, &budget, Some(MMAP_MIN_BYTES - 1)) {
+            Ok(_) => panic!("configured max-file-size must be checked before mmap"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn owned_read_reports_growth_beyond_its_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing.txt");
+        std::fs::write(&path, b"four").unwrap();
+
+        let error = read_owned_for_index(&path, 2, 2).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn indexed_read_retries_growth_with_the_full_batch_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("growing.txt");
+        std::fs::write(&path, b"four").unwrap();
+        let budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
+
+        let bytes = read_for_index(&path, 2, &budget, None).unwrap();
+        assert_eq!(&*bytes, b"four");
+    }
+
+    #[test]
+    fn owned_read_permit_releases_batch_capacity() {
+        let budget = OwnedReadBudget::new(10);
+        let permit = budget.acquire(7);
+        assert_eq!(*budget.available.lock().unwrap(), 3);
+        drop(permit);
+        assert_eq!(*budget.available.lock().unwrap(), 10);
+    }
+
+    #[test]
+    fn oversized_owned_read_claims_the_budget_exclusively() {
+        let budget = OwnedReadBudget::new(10);
+        let permit = budget.acquire(100);
+        assert_eq!(*budget.available.lock().unwrap(), 0);
+        drop(permit);
+        assert_eq!(*budget.available.lock().unwrap(), 10);
+    }
+
+    #[test]
+    fn owned_read_budget_serializes_fallbacks_that_exceed_the_remaining_capacity() {
+        let budget = OwnedReadBudget::new(10);
+        let first = budget.acquire(100);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let waiting_budget = std::sync::Arc::clone(&budget);
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _second = waiting_budget.acquire(100);
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a second fallback must wait rather than exceed the shared budget"
+        );
+        drop(first);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn file_version_distinguishes_subsecond_modified_times() {
+        let stamp = meta::FileStamp { mtime: 1, size: 10 };
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let first = FileVersion {
+            stamp: stamp.clone(),
+            modified: Some(base + std::time::Duration::from_nanos(100)),
+            created: Some(base),
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 2,
+            #[cfg(unix)]
+            change_seconds: 1,
+            #[cfg(unix)]
+            change_nanos: 0,
+        };
+        let second = FileVersion {
+            modified: Some(base + std::time::Duration::from_nanos(200)),
+            ..first.clone()
+        };
+
+        assert_ne!(first, second);
+        assert_eq!(first.stamp, second.stamp);
+    }
+
+    fn write_test_git_index(root: &Path, tracked: &[&str]) {
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("config"), "[core]\n\tignorecase = true\n").unwrap();
+        let mut index = Vec::new();
+        index.extend_from_slice(b"DIRC");
+        index.extend_from_slice(&2u32.to_be_bytes());
+        index.extend_from_slice(&(tracked.len() as u32).to_be_bytes());
+        for path in tracked {
+            let start = index.len();
+            index.extend_from_slice(&[0u8; 60]);
+            index.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            index.extend_from_slice(path.as_bytes());
+            index.push(0);
+            while (index.len() - start) % 8 != 0 {
+                index.push(0);
+            }
+        }
+        std::fs::write(git.join("index"), index).unwrap();
+    }
+
+    #[test]
+    fn default_builder_constructs_snapshot_but_explicit_none_is_preserved() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir(root.join("ignored")).unwrap();
+        std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
+        std::fs::write(root.join("ignored/tracked.rs"), "fn tracked() {}\n").unwrap();
+        std::fs::write(root.join("ignored/untracked.rs"), "fn untracked() {}\n").unwrap();
+        write_test_git_index(root, &[".gitignore", "ignored/tracked.rs"]);
+
+        let default_index = tempfile::tempdir().unwrap();
+        build_index_with_options(root, Some(default_index.path()), &BuildOptions::default())
+            .unwrap();
+        let default_reader = IndexReader::open(default_index.path()).unwrap();
+        assert!(
+            default_reader.contains_path("ignored/tracked.rs"),
+            "the default builder must construct the tracked-file exemption"
+        );
+        assert!(
+            !default_reader.contains_path("ignored/untracked.rs"),
+            "the default builder must apply case-insensitive root rules"
+        );
+
+        let none_index = tempfile::tempdir().unwrap();
+        build_index_with_options_and_ignorecase(
+            root,
+            Some(none_index.path()),
+            &BuildOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            IndexReader::open(none_index.path())
+                .unwrap()
+                .contains_path("ignored/untracked.rs"),
+            "an explicit None must not reconstruct the exemption"
         );
     }
 

@@ -216,7 +216,7 @@ fn git_ignorecase_filter(
     no_ignore_vcs: bool,
     no_ignore_exclude: bool,
     no_ignore_parent: bool,
-) -> Option<crate::gitignore::CaseInsensitiveIgnore> {
+) -> Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>> {
     (!no_ignore)
         .then(|| {
             crate::gitignore::CaseInsensitiveIgnore::new(
@@ -227,6 +227,7 @@ fn git_ignorecase_filter(
             )
         })
         .flatten()
+        .map(std::sync::Arc::new)
 }
 
 /// Walk a directory tree, respecting .gitignore rules (unless disabled).
@@ -236,6 +237,25 @@ fn git_ignorecase_filter(
 /// detection is deferred to the caller (which reads the file anyway),
 /// avoiding an extra 8KB read per file during the walk.
 pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
+    let ignorecase = git_ignorecase_filter(
+        root,
+        opts.no_ignore,
+        opts.no_ignore_vcs,
+        opts.no_ignore_exclude,
+        opts.no_ignore_parent,
+    );
+    walk_dir_with_ignorecase(root, opts, ignorecase)
+}
+
+/// Walk files using a supplied immutable tracked-file exemption snapshot.
+///
+/// Callers that build a point-query matcher from the result can share this
+/// value so the walk and publication make every decision from one snapshot.
+pub fn walk_dir_with_ignorecase(
+    root: &Path,
+    opts: &WalkOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+) -> WalkResult {
     let files = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
@@ -254,14 +274,6 @@ pub fn walk_dir(root: &Path, opts: &WalkOptions) -> WalkResult {
         .flatten()
         .map(std::sync::Arc::new);
     let p4ignore_root = root.clone();
-    let ignorecase = git_ignorecase_filter(
-        &root,
-        opts.no_ignore,
-        opts.no_ignore_vcs,
-        opts.no_ignore_exclude,
-        opts.no_ignore_parent,
-    );
-
     let mut builder = WalkBuilder::new(&root);
     builder
         .hidden(!include_hidden)
@@ -410,6 +422,24 @@ pub fn build_gitignore_matcher_from_files(
     )
 }
 
+/// Build a point-query matcher sharing the immutable tracked-file exemption
+/// used by the walk that discovered these ignore files.
+pub fn build_gitignore_matcher_from_files_with_ignorecase(
+    root: &Path,
+    gitignore_files: &[PathBuf],
+    ignore_files: &[PathBuf],
+    no_require_git: bool,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+) -> Option<crate::gitignore::IgnoreMatcher> {
+    crate::gitignore::matcher_from_ignore_paths_with_options_and_ignorecase(
+        root,
+        gitignore_files,
+        ignore_files,
+        no_require_git,
+        ignorecase,
+    )
+}
+
 /// Filesystem metadata for a single file (no content read).
 pub struct FileMeta {
     pub relative_path: String,
@@ -479,6 +509,17 @@ impl Default for MetaWalkOptions {
 /// explicitly via [`crate::gitignore::ignore_files_in`], which also catches
 /// ignore files that their own rules would have filtered out of the walk.
 pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult {
+    let ignorecase = git_ignorecase_filter(root, opts.no_ignore, false, false, false);
+    walk_file_metadata_with_ignorecase(root, opts, ignorecase)
+}
+
+/// Walk metadata using an immutable case-insensitive tracked-file exemption
+/// that can also be shared with the resulting point-query matcher.
+pub fn walk_file_metadata_with_ignorecase(
+    root: &Path,
+    opts: &MetaWalkOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+) -> MetaWalkResult {
     let no_ignore = opts.no_ignore;
     let max_file_size = opts.max_file_size;
     let results = std::sync::Mutex::new(Vec::new());
@@ -491,11 +532,6 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
         .flatten()
         .map(std::sync::Arc::new);
     let match_root = root.to_path_buf();
-    // `MetaWalkOptions` carries no finer ignore flags, and the builder below
-    // enables gitignore and exclude together on `!no_ignore`. Passing `false`
-    // for both mirrors that exactly, which is what keeps this walk and
-    // `walk_dir` agreeing about the tree under `serve`.
-    let ignorecase = git_ignorecase_filter(root, no_ignore, false, false, false);
     let root = root.to_path_buf();
 
     let walker = WalkBuilder::new(&root)
@@ -580,16 +616,11 @@ pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult
             if max_file_size.is_some_and(|limit| meta.len() > limit) {
                 return ignore::WalkState::Continue;
             }
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let stamp = crate::meta::file_stamp(&meta);
             results.lock().unwrap().push(FileMeta {
                 relative_path: rel_path,
-                mtime,
-                size: meta.len(),
+                mtime: stamp.mtime,
+                size: stamp.size,
             });
 
             ignore::WalkState::Continue
@@ -1472,14 +1503,8 @@ mod tests {
         assert!(!matcher.is_ignored(Path::new("src/Gone.TXT"), false));
     }
 
-    /// The exemption is answered from a cached read of `.git/index`. A walk
-    /// builds this matcher and drops it, so a snapshot would do — but the file
-    /// watcher holds one for the life of the server, and `git add -f` rewrites
-    /// only the index, which is hidden. No ignore source changes, nothing
-    /// republishes the matcher, and a frozen cache would keep hiding a file
-    /// that git now tracks until the hourly reconcile.
     #[test]
-    fn the_tracked_exemption_reloads_when_the_git_index_changes() {
+    fn public_matcher_lazily_freezes_tracked_exemptions_on_first_match() {
         let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
         let root = dir.path();
         let matcher = crate::gitignore::matcher_from_ignore_paths(
@@ -1489,21 +1514,81 @@ mod tests {
         )
         .expect("the fixture has rules");
 
-        // Untracked, and `*.txt` matches it once case is ignored.
-        assert!(matcher.is_ignored(Path::new("src/Gone.TXT"), false));
+        // Construction alone must not read the index. The first matching query
+        // observes this update and freezes that membership for later queries.
+        fake_git_repo(root, true, &["src/main.rs", "src/Kept.TXT", "src/Gone.TXT"]);
+        assert!(
+            !matcher.is_ignored(Path::new("src/Gone.TXT"), false),
+            "the first matching query must initialize from the current index"
+        );
 
+        fake_git_repo(root, true, &["src/main.rs"]);
+        assert!(
+            !matcher.is_ignored(Path::new("src/Kept.TXT"), false),
+            "the lazy snapshot must remain immutable after initialization"
+        );
+    }
+
+    /// Reconciliation deliberately opts into the opposite behavior: the walk
+    /// and matcher publication must not change answers halfway through a pass.
+    #[test]
+    fn frozen_tracked_exemption_is_immutable_and_detects_changes() {
+        let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
+        let root = dir.path();
+        let ignorecase =
+            crate::gitignore::CaseInsensitiveIgnore::frozen_snapshot(root, true, true, true)
+                .map(std::sync::Arc::new);
+        let matcher = crate::gitignore::matcher_from_ignore_paths_with_options_and_ignorecase(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+            false,
+            ignorecase,
+        )
+        .expect("the fixture has rules");
+
+        assert!(matcher.is_ignored(Path::new("src/Gone.TXT"), false));
         fake_git_repo(root, true, &["src/main.rs", "src/Kept.TXT", "src/Gone.TXT"]);
 
         assert!(
-            !matcher.is_ignored(Path::new("src/Gone.TXT"), false),
-            "a file git now tracks must stop being hidden without rebuilding \
-             the matcher"
+            matcher.is_ignored(Path::new("src/Gone.TXT"), false),
+            "a frozen matcher must preserve the pass snapshot"
         );
+        assert_ne!(
+            matcher.tracked_membership_fingerprint(),
+            matcher.current_tracked_membership_fingerprint(),
+            "semantic polling must detect changes without mutating decisions"
+        );
+    }
 
-        // And back: `git rm --cached` is the same problem in reverse, where a
-        // stale cache keeps indexing a file the walk has started hiding.
-        fake_git_repo(root, true, &["src/main.rs"]);
-        assert!(matcher.is_ignored(Path::new("src/Kept.TXT"), false));
+    #[test]
+    fn tracked_fingerprint_includes_whitelisted_files_under_ignored_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fake_git_repo(root, true, &["qlogs/kept.rs"]);
+        fs::write(root.join(".gitignore"), "QLogs/\n!qlogs/kept.rs\n").unwrap();
+        fs::create_dir_all(root.join("qlogs")).unwrap();
+        fs::write(root.join("qlogs/kept.rs"), "tracked").unwrap();
+
+        let ignorecase =
+            crate::gitignore::CaseInsensitiveIgnore::frozen_snapshot(root, true, true, true)
+                .map(std::sync::Arc::new);
+        let matcher = crate::gitignore::matcher_from_ignore_paths_with_options_and_ignorecase(
+            root,
+            std::slice::from_ref(&root.join(".gitignore")),
+            &[],
+            false,
+            ignorecase,
+        )
+        .expect("the fixture has rules");
+        let baseline = matcher.tracked_membership_fingerprint();
+
+        fake_git_repo(root, true, &[]);
+        assert_ne!(
+            baseline,
+            matcher.current_tracked_membership_fingerprint(),
+            "polling must notice when an ignored ancestor loses its tracked descendant"
+        );
     }
 
     #[test]

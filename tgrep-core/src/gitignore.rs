@@ -106,7 +106,7 @@ pub struct IgnoreMatcher {
     /// enlistment it left the watcher subscribing to, and indexing, a 13.4 GiB
     /// build artifact the walk had already excluded — and every event under it
     /// re-added a file the next stale check then evicted.
-    ignorecase: Option<CaseInsensitiveIgnore>,
+    ignorecase: Option<std::sync::Arc<CaseInsensitiveIgnore>>,
 }
 
 impl IgnoreMatcher {
@@ -141,7 +141,7 @@ impl IgnoreMatcher {
         ancestors: Vec<(String, IgnoreKind, Gitignore)>,
         repo_exclude: Option<(String, Gitignore)>,
         global: Gitignore,
-        ignorecase: Option<CaseInsensitiveIgnore>,
+        ignorecase: Option<std::sync::Arc<CaseInsensitiveIgnore>>,
     ) -> Option<Self> {
         let mut nested: Vec<NestedIgnore> = nested
             .into_iter()
@@ -308,6 +308,28 @@ impl IgnoreMatcher {
             .as_ref()
             .is_some_and(|ignorecase| ignorecase.excludes(&self.root.join(rel), is_dir))
     }
+
+    /// Fingerprint of the tracked paths behind the tracked-file exemption.
+    ///
+    /// `None` means this matcher has no case-insensitive exemption, so callers
+    /// need not poll anything. Index metadata is used internally to avoid
+    /// reparsing an unchanged index, but only path membership contributes to
+    /// this value.
+    pub fn tracked_membership_fingerprint(&self) -> Option<TrackedMembershipFingerprint> {
+        self.ignorecase
+            .as_ref()
+            .map(|ignorecase| ignorecase.tracked_membership_fingerprint())
+    }
+
+    /// Fingerprint of the tracked exemption set in the current Git index.
+    ///
+    /// Unlike [`Self::tracked_membership_fingerprint`], this probes the current
+    /// index without changing the immutable set used by this matcher.
+    pub fn current_tracked_membership_fingerprint(&self) -> Option<TrackedMembershipFingerprint> {
+        self.ignorecase
+            .as_ref()
+            .map(|ignorecase| ignorecase.current_tracked_membership_fingerprint())
+    }
 }
 
 /// Return `rel` relative to `dir`, or `None` when `rel` is not beneath it.
@@ -444,39 +466,69 @@ pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
 pub struct CaseInsensitiveIgnore {
     matcher: Gitignore,
     repo_root: std::path::PathBuf,
-    /// Loaded on the first path this matcher actually claims, which for most
-    /// repositories is never. Reading it costs 163 ms and ~30 MB on a
-    /// 299k-file repository, and nothing at all if no rule ever matches.
-    ///
-    /// Reloaded when the index it was read from changes. A walk builds this
-    /// matcher, uses it and drops it, so a snapshot would do; the file watcher
-    /// holds one for the life of the server, and there a `git add -f` or a
-    /// `git rm --cached` rewrites only `.git/index` — which is hidden, so no
-    /// ignore source changes and nothing republishes the matcher. Frozen, the
-    /// exemption would keep answering from the tracked set as it stood at
-    /// startup, and the watcher would disagree with a fresh walk about which
-    /// files exist until the hourly reconcile.
-    tracked: std::sync::RwLock<TrackedCache>,
+    tracked: TrackedMembership,
+    /// Separate metadata-keyed cache for polling the current semantic
+    /// membership of a frozen matcher. It never participates in decisions.
+    current: std::sync::RwLock<TrackedFingerprintCache>,
 }
 
-/// The tracked-file set, together with the identity of the index it came from.
-#[derive(Default)]
-struct TrackedCache {
-    /// `None` until something is loaded; `Some` even when the load failed, so
-    /// an unreadable index is not retried on every path.
-    loaded_from: Option<Option<(std::time::SystemTime, u64)>>,
+enum TrackedMembership {
+    /// Ordinary walks load one immutable snapshot only if a matching ignore
+    /// rule actually needs the tracked-file exemption.
+    Lazy(std::sync::OnceLock<TrackedSnapshot>),
+    /// Reconciliation behavior: one immutable set shared by a walk and the
+    /// point-query matcher published from that walk.
+    Frozen(TrackedSnapshot),
+}
+
+struct TrackedSnapshot {
     tracked: Option<crate::git_index::TrackedFiles>,
+    fingerprint: TrackedMembershipFingerprint,
 }
 
-/// Modification time and length of the index, which is what identifies it.
+/// A metadata-keyed semantic fingerprint that does not retain parsed paths.
+#[derive(Default)]
+struct TrackedFingerprintCache {
+    /// `None` until something is loaded; `Some` even when the probe failed, so
+    /// an unreadable index is not retried on every poll.
+    loaded_from: Option<Option<IndexIdentity>>,
+    fingerprint: TrackedMembershipFingerprint,
+}
+
+/// Compact, order-independent identity of the tracked exemption set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackedMembershipFingerprint(Option<(usize, u64, u64)>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexIdentity {
+    modified: std::time::SystemTime,
+    created: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+/// Cheap metadata identity of the index file generation.
 ///
 /// git replaces the index by renaming `index.lock` over it, so any rewrite
-/// lands as a new mtime — the same pair git's own racy-index handling relies
-/// on. Two rewrites inside one filesystem mtime tick that leave the length
-/// unchanged are the gap, and the periodic reconcile is what closes it.
-fn index_identity(repo_root: &Path) -> Option<(std::time::SystemTime, u64)> {
+/// normally lands as a new file instance as well as a new mtime. Creation time
+/// covers that replacement on Windows, and device/inode covers it on Unix,
+/// including an A→B→A rewrite inside one filesystem mtime tick.
+fn index_identity(repo_root: &Path) -> Option<IndexIdentity> {
     let meta = std::fs::metadata(crate::git_index::index_path(repo_root)?).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(IndexIdentity {
+        modified: meta.modified().ok()?,
+        created: meta.created().ok(),
+        len: meta.len(),
+        #[cfg(unix)]
+        device: meta.dev(),
+        #[cfg(unix)]
+        inode: meta.ino(),
+    })
 }
 
 impl CaseInsensitiveIgnore {
@@ -490,11 +542,40 @@ impl CaseInsensitiveIgnore {
     /// `--no-ignore-vcs` the case-sensitive pass lets everything through, which
     /// would leave this the only thing excluding — the exact opposite of what
     /// the flag asks for.
+    ///
+    /// The tracked-file exemption is loaded lazily on the first matching rule
+    /// and remains immutable for the lifetime of this value.
     pub fn new(
         root: &Path,
         use_gitignore: bool,
         use_exclude: bool,
         use_parents: bool,
+    ) -> Option<Self> {
+        Self::build(root, use_gitignore, use_exclude, use_parents, false)
+    }
+
+    /// Build an immutable tracked-membership snapshot for a coordinated walk
+    /// and matcher publication.
+    ///
+    /// Ordinary point-query callers should use [`Self::new`], which defers the
+    /// Git-index read until a matching rule needs it. Server reconciliation
+    /// shares this eagerly initialized value through an `Arc` so one pass
+    /// cannot mix different tracked sets and can poll for later changes.
+    pub fn frozen_snapshot(
+        root: &Path,
+        use_gitignore: bool,
+        use_exclude: bool,
+        use_parents: bool,
+    ) -> Option<Self> {
+        Self::build(root, use_gitignore, use_exclude, use_parents, true)
+    }
+
+    fn build(
+        root: &Path,
+        use_gitignore: bool,
+        use_exclude: bool,
+        use_parents: bool,
+        frozen: bool,
     ) -> Option<Self> {
         use ignore::gitignore::GitignoreBuilder;
 
@@ -527,10 +608,16 @@ impl CaseInsensitiveIgnore {
         if matcher.is_empty() {
             return None;
         }
+        let tracked = if frozen {
+            TrackedMembership::Frozen(Self::load_snapshot(&repo_root))
+        } else {
+            TrackedMembership::Lazy(std::sync::OnceLock::new())
+        };
         Some(Self {
             matcher,
             repo_root,
-            tracked: std::sync::RwLock::new(TrackedCache::default()),
+            tracked,
+            current: std::sync::RwLock::new(TrackedFingerprintCache::default()),
         })
     }
 
@@ -546,30 +633,66 @@ impl CaseInsensitiveIgnore {
         {
             return false;
         }
-        // Only now is the index worth reading.
         let relative = relative.to_string_lossy();
-        self.tracked_hides(&relative, is_dir)
-    }
-
-    /// Whether the tracked-file set leaves `relative` hidden.
-    ///
-    /// `false` when the index cannot be read: with no way to tell tracked from
-    /// untracked, excluding could hide real source, so it declines instead.
-    fn tracked_hides(&self, relative: &str, is_dir: bool) -> bool {
-        let identity = index_identity(&self.repo_root);
-        {
-            let cache = self.tracked.read().unwrap();
-            if cache.loaded_from.as_ref() == Some(&identity) {
-                return Self::hides(cache.tracked.as_ref(), relative, is_dir);
+        match &self.tracked {
+            TrackedMembership::Lazy(snapshot) => Self::hides(
+                snapshot
+                    .get_or_init(|| Self::load_snapshot(&self.repo_root))
+                    .tracked
+                    .as_ref(),
+                &relative,
+                is_dir,
+            ),
+            TrackedMembership::Frozen(snapshot) => {
+                Self::hides(snapshot.tracked.as_ref(), &relative, is_dir)
             }
         }
-        let mut cache = self.tracked.write().unwrap();
-        // Another thread may have reloaded it while this one waited.
-        if cache.loaded_from.as_ref() != Some(&identity) {
-            cache.tracked = crate::git_index::load_tracked(&self.repo_root);
-            cache.loaded_from = Some(identity);
+    }
+
+    fn tracked_membership_fingerprint(&self) -> TrackedMembershipFingerprint {
+        match &self.tracked {
+            TrackedMembership::Lazy(snapshot) => snapshot
+                .get_or_init(|| Self::load_snapshot(&self.repo_root))
+                .fingerprint
+                .clone(),
+            TrackedMembership::Frozen(snapshot) => snapshot.fingerprint.clone(),
         }
-        Self::hides(cache.tracked.as_ref(), relative, is_dir)
+    }
+
+    fn current_tracked_membership_fingerprint(&self) -> TrackedMembershipFingerprint {
+        let identity = index_identity(&self.repo_root);
+        {
+            let cache = self.current.read().unwrap();
+            if cache.loaded_from.as_ref() == Some(&identity) {
+                return cache.fingerprint.clone();
+            }
+        }
+        let mut cache = self.current.write().unwrap();
+        if cache.loaded_from.as_ref() == Some(&identity) {
+            return cache.fingerprint.clone();
+        }
+        let tracked = crate::git_index::load_tracked(&self.repo_root);
+        cache.fingerprint = Self::fingerprint(tracked.as_ref());
+        cache.loaded_from = Some(identity);
+        cache.fingerprint.clone()
+    }
+
+    fn load_snapshot(repo_root: &Path) -> TrackedSnapshot {
+        let tracked = crate::git_index::load_tracked(repo_root);
+        let fingerprint = Self::fingerprint(tracked.as_ref());
+        TrackedSnapshot {
+            tracked,
+            fingerprint,
+        }
+    }
+
+    fn fingerprint(
+        tracked: Option<&crate::git_index::TrackedFiles>,
+    ) -> TrackedMembershipFingerprint {
+        // Directory visibility depends on every tracked descendant, including
+        // paths whose final file match is whitelisted. Fingerprint the full set
+        // so changes that make an ignored ancestor walkable are observable.
+        TrackedMembershipFingerprint(tracked.map(|tracked| tracked.fingerprint_matching(|_| true)))
     }
 
     fn hides(
@@ -626,20 +749,7 @@ fn git_repo_root(root: &Path) -> Option<&Path> {
 /// the next stale check evicts.
 pub fn repo_exclude_path(root: &Path) -> Option<PathBuf> {
     let git_dir = crate::git_index::git_dir(git_repo_root(root)?)?;
-    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(target) => {
-            let target = target.trim();
-            let path = Path::new(target);
-            if target.is_empty() {
-                git_dir
-            } else if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                git_dir.join(path)
-            }
-        }
-        Err(_) => git_dir,
-    };
+    let common = crate::git_index::common_git_dir(&git_dir);
     let path = common.join("info").join("exclude");
     path.is_file().then_some(path)
 }
@@ -692,6 +802,24 @@ pub fn matcher_from_ignore_paths_with_options(
     gitignore_files: &[std::path::PathBuf],
     ignore_files: &[std::path::PathBuf],
     no_require_git: bool,
+) -> Option<IgnoreMatcher> {
+    matcher_from_ignore_paths_with_options_and_ignorecase(
+        root,
+        gitignore_files,
+        ignore_files,
+        no_require_git,
+        CaseInsensitiveIgnore::new(root, true, true, true).map(std::sync::Arc::new),
+    )
+}
+
+/// Build a matcher using an immutable case-insensitive tracked-file snapshot
+/// shared with the walk that discovered `gitignore_files`.
+pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
+    root: &Path,
+    gitignore_files: &[std::path::PathBuf],
+    ignore_files: &[std::path::PathBuf],
+    no_require_git: bool,
+    ignorecase: Option<std::sync::Arc<CaseInsensitiveIgnore>>,
 ) -> Option<IgnoreMatcher> {
     use ignore::gitignore::GitignoreBuilder;
 
@@ -780,12 +908,6 @@ pub fn matcher_from_ignore_paths_with_options(
     } else {
         GitignoreBuilder::new(root).build().ok()?
     };
-    // The same narrowing `walker::walk_dir` and `walk_file_metadata` apply as a
-    // `filter_entry`. Serving takes no `--no-ignore-vcs` / `--no-ignore-exclude`
-    // / `--no-ignore-parent`, so the flags the walk was built with are the
-    // defaults; `no_ignore` is handled by the caller, which does not build a
-    // matcher at all in that case.
-    let ignorecase = CaseInsensitiveIgnore::new(root, true, true, true);
     IgnoreMatcher::with_all_sources(
         local,
         true,

@@ -5884,6 +5884,33 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     true
 }
 
+fn complete_background_listed_files(
+    root: &Path,
+    phase_one_files: Vec<PathBuf>,
+    phase_one_errors: usize,
+    metadata_files: Vec<String>,
+    metadata_errors: usize,
+) -> Option<Vec<String>> {
+    if metadata_errors == 0 {
+        return Some(metadata_files);
+    }
+    if phase_one_errors > 0 {
+        return None;
+    }
+
+    Some(
+        phase_one_files
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap_or(path.as_path())
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect(),
+    )
+}
+
 /// Walk the repo and populate the LiveIndex in batches in a background thread.
 /// Uses rayon for parallel trigram extraction. The bulk build is held entirely
 /// in the live overlay; only one final flush to disk happens once the walk
@@ -6157,7 +6184,27 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             max_file_size: state.max_file_size,
         },
     );
-    let listed_files = walk_meta.listed_files;
+    let metadata_errors = walk_meta.skipped_error;
+    let listed_files = complete_background_listed_files(
+        root,
+        walk.listed_files,
+        walk.skipped_error,
+        walk_meta.listed_files,
+        metadata_errors,
+    );
+    if metadata_errors > 0 {
+        if listed_files.is_some() {
+            eprintln!(
+                "[trace] warning: final metadata walk could not inspect {metadata_errors} \
+                 filesystem entries; preserving filename membership from the initial walk"
+            );
+        } else {
+            eprintln!(
+                "[trace] warning: neither background-build walk established complete filename \
+                 membership; leaving the prior filename membership unchanged"
+            );
+        }
+    }
     let stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp> = {
         let indexed = {
             let index = state.index.read().unwrap();
@@ -6184,7 +6231,9 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // (not skip) until the flush publishes, after which it applies safely to
     // the newly published reader; no event is lost.
     let gate = state.snapshot_gate.write().unwrap();
-    replace_filename_extra_paths(state, &listed_files);
+    if let Some(listed_files) = &listed_files {
+        replace_filename_extra_paths(state, listed_files);
+    }
     state.flushing.store(true, Ordering::SeqCst);
 
     // Publish the stamps *before* clearing `indexing`, not after the flush.
@@ -7046,6 +7095,29 @@ mod tests {
             .status()
             .expect("run git");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn background_filename_membership_requires_one_complete_walk() {
+        let root = Path::new("repo");
+        let initial = vec![root.join("from-initial.bin")];
+        let metadata = vec!["from-metadata.bin".to_string()];
+
+        assert_eq!(
+            complete_background_listed_files(root, initial.clone(), 0, metadata.clone(), 0),
+            Some(metadata.clone()),
+            "a complete final metadata walk is the freshest authority"
+        );
+        assert_eq!(
+            complete_background_listed_files(root, initial.clone(), 0, metadata, 1),
+            Some(vec!["from-initial.bin".to_string()]),
+            "an incomplete final walk must preserve the complete initial membership"
+        );
+        assert_eq!(
+            complete_background_listed_files(root, initial, 1, Vec::new(), 1),
+            None,
+            "two incomplete walks cannot establish authoritative membership"
+        );
     }
 
     #[test]

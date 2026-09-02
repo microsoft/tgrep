@@ -191,10 +191,7 @@ impl HybridIndex {
         if self.live.is_deleted(path) {
             return false;
         }
-        self.reader()
-            .all_paths()
-            .iter()
-            .any(|candidate| candidate == path)
+        self.reader().contains_path(path)
     }
 
     /// Execute a query plan against the hybrid index.

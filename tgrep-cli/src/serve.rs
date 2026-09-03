@@ -2148,7 +2148,7 @@ fn receive_watcher_burst(
     pending_event: &mut Option<Event>,
     options: WatcherReceiveOptions,
 ) -> WatcherReceive {
-    let first = match pending_event.take() {
+    let mut first = match pending_event.take() {
         Some(event) => event,
         None => match rx.recv_timeout(options.idle) {
             Ok(event) => event,
@@ -2159,8 +2159,23 @@ fn receive_watcher_burst(
         },
     };
 
+    let path_cap = options.path_cap.max(1);
+    if first.paths.len() > path_cap {
+        let remainder_paths = first.paths.split_off(path_cap);
+        *pending_event = Some(Event {
+            kind: first.kind,
+            paths: remainder_paths,
+            attrs: first.attrs.clone(),
+        });
+        let burst = FsEventBurst::with_limits(first, options.event_cap, path_cap);
+        return WatcherReceive::Burst {
+            paths: burst.into_paths(),
+            disconnected: false,
+        };
+    }
+
     let started = Instant::now();
-    let mut burst = FsEventBurst::with_limits(first, options.event_cap, options.path_cap);
+    let mut burst = FsEventBurst::with_limits(first, options.event_cap, path_cap);
     let mut disconnected = false;
     loop {
         let remaining = options.max.saturating_sub(started.elapsed());
@@ -7250,6 +7265,43 @@ mod tests {
             }
         );
         assert_eq!(pending.as_ref().unwrap().paths, [PathBuf::from("c.rs")]);
+    }
+
+    #[test]
+    fn watcher_receiver_splits_oversized_first_event_without_path_loss() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(watcher_event(
+            EventKind::Modify(notify::event::ModifyKind::Any),
+            &["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"],
+        ))
+        .unwrap();
+        let options = watcher_receive_options(Duration::from_secs(1), 10, 2);
+        let mut pending = None;
+        let mut all_paths = Vec::new();
+
+        for expected in [
+            vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")],
+            vec![PathBuf::from("c.rs"), PathBuf::from("d.rs")],
+            vec![PathBuf::from("e.rs")],
+        ] {
+            let WatcherReceive::Burst { paths, .. } =
+                receive_watcher_burst(&rx, &mut pending, options)
+            else {
+                panic!("expected a burst");
+            };
+            let actual = paths
+                .into_iter()
+                .map(|event| event.path)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+            all_paths.extend(actual);
+        }
+
+        assert_eq!(
+            all_paths,
+            ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"].map(PathBuf::from)
+        );
+        assert!(pending.is_none());
     }
 
     #[test]

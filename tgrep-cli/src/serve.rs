@@ -2300,18 +2300,10 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
                         if disconnected {
                             break;
                         }
-                        // Do not require a fully idle second to repair dropped
-                        // events: sustained traffic may never provide one.
-                        recover_watcher_overflow(
-                            &worker_state,
-                            &worker_root,
-                            &worker_index_dir,
-                            &overflowed,
-                            queue_cap,
-                        );
                     }
-                    // A fully idle interval is another opportunity to repair
-                    // an overflow left pending by a build or matcher refresh.
+                    // A fully idle interval proves the queued backlog has
+                    // drained. Recover only here so an overflowing burst causes
+                    // one stale check, not one after every capped batch.
                     Err(RecvTimeoutError::Timeout) => {
                         recover_watcher_overflow(
                             &worker_state,

@@ -33,6 +33,24 @@ const CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// evict most of the cache to store itself, so it is read straight through
 /// instead. It is still searched - only the caching is skipped.
 const CACHE_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+/// Paths that keep the exact bytes of their most recent live-overlay commit.
+///
+/// The evidence only has to outlive one editor save: a duplicate arrives
+/// milliseconds later, from the second notification for the same write. A few
+/// thousand paths covers a build or a branch switch touching many files at once
+/// while staying far smaller than the content cache's 50,000 entries, whose job
+/// is to serve queries rather than to compare one recent write.
+const RECENT_REINDEX_CAPACITY: usize = 4096;
+/// Total raw bytes the evidence cache may hold. Entry count alone bounds
+/// nothing: 4096 large sources would be gigabytes of retained `Vec<u8>`. This
+/// matches the largest single entry so one big file can use the whole budget,
+/// and the LRU gives it back as soon as other paths are written.
+const RECENT_REINDEX_MAX_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+/// Largest single file whose bytes are retained, mirroring
+/// `CACHE_MAX_ENTRY_BYTES`. Anything larger is simply never suppressed: a
+/// duplicate save of a 64 MiB file re-commits, which is correct but slower, and
+/// is the right trade against pinning that much heap for one path.
+const RECENT_REINDEX_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 /// Default mutation count that triggers a background save (override with
 /// `--auto-save-mutations`).
 const AUTO_SAVE_MUTATIONS: u32 = 5000;
@@ -158,6 +176,12 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
 ///   5. `filename_extra_paths` — guards paths omitted from the content index
 ///   6. `cache`         — guards the file content LRU cache
 ///   7. `file_stamps`   — guards per-file mtime/size stamps
+///   8. `recent_reindexes` — guards exact duplicate evidence
+///
+/// `recent_reindexes` is a leaf: it is taken last and, in practice, never held
+/// across another acquisition. `reindex_file` copies the candidate ID out from
+/// under it before touching `index`, and records new evidence only after every
+/// index, filename, cache and stamp lock has been released.
 ///
 /// `indexing` and `flushing` coordinate the handoff between bulk indexing and
 /// final flush with the auto-save loop; use sequentially consistent accesses
@@ -276,6 +300,92 @@ impl ContentCache {
     }
 }
 
+struct RecentReindex {
+    overlay_id: u32,
+    bytes: Vec<u8>,
+}
+
+/// Exact bytes that produced recent live-overlay entries.
+///
+/// This is evidence only when its overlay ID is still active for the path.
+/// Overlay IDs count up from zero within one `LiveIndex`, so they are unique
+/// for the life of that overlay — but replacing the whole `HybridIndex` starts
+/// a fresh one, and every record must be dropped with it (see
+/// [`forget_recent_reindexes`]).
+///
+/// Callers must release this lock before taking `index`, `cache`, or
+/// `file_stamps`; candidate lookup returns only the recorded ID for that reason.
+struct RecentReindexCache {
+    lru: LruCache<String, RecentReindex>,
+    bytes: u64,
+    max_bytes: u64,
+    max_entry_bytes: u64,
+}
+
+impl RecentReindexCache {
+    fn new(capacity: usize, max_bytes: u64, max_entry_bytes: u64) -> Self {
+        Self {
+            lru: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
+            bytes: 0,
+            max_bytes,
+            max_entry_bytes,
+        }
+    }
+
+    fn matching_overlay_id(&mut self, key: &str, bytes: &[u8]) -> Option<u32> {
+        self.lru
+            .get(key)
+            .filter(|record| record.bytes == bytes)
+            .map(|record| record.overlay_id)
+    }
+
+    fn put(&mut self, key: String, overlay_id: u32, bytes: Vec<u8>) {
+        // Remove first even when the replacement is too large. Retaining the
+        // old bytes could suppress a later event against stale evidence.
+        self.pop(&key);
+        let size = bytes.len() as u64;
+        if size > self.max_entry_bytes || size > self.max_bytes {
+            return;
+        }
+        if let Some((_, evicted)) = self.lru.push(key, RecentReindex { overlay_id, bytes }) {
+            self.bytes = self.bytes.saturating_sub(evicted.bytes.len() as u64);
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        while self.bytes > self.max_bytes {
+            match self.lru.pop_lru() {
+                Some((_, evicted)) => {
+                    self.bytes = self.bytes.saturating_sub(evicted.bytes.len() as u64);
+                }
+                None => {
+                    self.bytes = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn pop(&mut self, key: &str) {
+        if let Some(old) = self.lru.pop(key) {
+            self.bytes = self.bytes.saturating_sub(old.bytes.len() as u64);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.lru.clear();
+        self.bytes = 0;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lru.len()
+    }
+
+    #[cfg(test)]
+    fn byte_len(&self) -> u64 {
+        self.bytes
+    }
+}
+
 struct ServerState {
     index: RwLock<HybridIndex>,
     /// Paths admitted by traversal but deliberately absent from the content
@@ -290,6 +400,7 @@ struct ServerState {
     filename_index_dirty: std::sync::atomic::AtomicBool,
     cache: RwLock<ContentCache>,
     cache_generation: std::sync::atomic::AtomicU64,
+    recent_reindexes: Mutex<RecentReindexCache>,
     root: PathBuf,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
@@ -697,6 +808,11 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
             CACHE_MAX_ENTRY_BYTES,
         )),
         cache_generation: std::sync::atomic::AtomicU64::new(0),
+        recent_reindexes: Mutex::new(RecentReindexCache::new(
+            RECENT_REINDEX_CAPACITY,
+            RECENT_REINDEX_MAX_BYTES,
+            RECENT_REINDEX_MAX_ENTRY_BYTES,
+        )),
         root: root.clone(),
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
@@ -4170,6 +4286,18 @@ fn lock_reindex(state: &ServerState) -> std::sync::MutexGuard<'_, ()> {
     }
 }
 
+/// Discard every exact-bytes record because the overlay they refer to is gone.
+///
+/// Overlay IDs are unique only within one `LiveIndex`. Replacing the whole
+/// `HybridIndex` installs a fresh overlay whose IDs restart at zero, so a
+/// surviving record could later be revalidated against an unrelated entry that
+/// happens to have been given the same number. Call this under the same index
+/// write lock as the replacement — the lock order allows taking this leaf lock
+/// while `index` is held, never the reverse.
+fn forget_recent_reindexes(state: &ServerState) {
+    state.recent_reindexes.lock().unwrap().clear();
+}
+
 /// Drop everything the content and filename indexes hold for a path.
 ///
 /// A stamp is evidence, but not a precondition: `filestamps.json` may be missing
@@ -4181,6 +4309,11 @@ fn lock_reindex(state: &ServerState) -> std::sync::MutexGuard<'_, ()> {
 /// the caller's rather than this function's because `reindex_file` calls in
 /// while holding it, and a `Mutex` is not reentrant.
 fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
+    // Before any early return below: a path leaving the content index must not
+    // leave bytes behind that a later save could match, and the no-op returns
+    // (already tombstoned, never indexed) are exactly the states where an old
+    // record would otherwise sit unrefreshed.
+    state.recent_reindexes.lock().unwrap().pop(rel_path);
     let removed_extra = state.filename_extra_paths.write().unwrap().remove(rel_path);
     if removed_extra {
         state.filename_index_dirty.store(true, Ordering::SeqCst);
@@ -4213,6 +4346,9 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
 /// an already-known filename-only path must still evict content if stale
 /// postings are active for it.
 fn mark_filename_only(state: &ServerState, rel_path: &str) {
+    // As in `drop_indexed_file`, including the path that was already
+    // filename-only and changes nothing else.
+    state.recent_reindexes.lock().unwrap().pop(rel_path);
     let (inserted, removed_content) = {
         let mut index = state.index.write().unwrap();
         let mut extra = state.filename_extra_paths.write().unwrap();
@@ -4810,20 +4946,44 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         }
     }
 
-    eprintln!("[trace] reindex: modified {rel_path}");
     let Some(per_tri) = per_tri else {
+        eprintln!("[trace] reindex: modified {rel_path}");
         mark_filename_only(state, rel_path);
         return;
     };
+
+    // Exact bytes are only a candidate here. The evidence lock is deliberately
+    // released before taking the index/cache locks; the overlay ID is then
+    // revalidated under the index write lock below.
+    let duplicate_overlay_id = state
+        .recent_reindexes
+        .lock()
+        .unwrap()
+        .matching_overlay_id(rel_path, &data);
+
     // Gate held by the caller — the commit + stamp update is processed
     // atomically with respect to flush/auto-save.
-    let removed_extra = {
+    let (removed_extra, committed_overlay_id) = {
         let mut index = state.index.write().unwrap();
         let mut extra = state.filename_extra_paths.write().unwrap();
-        index.live.commit_upsert(rel_path, per_tri);
+        let duplicate = duplicate_overlay_id
+            .is_some_and(|overlay_id| index.live.file_id_for_path(rel_path) == Some(overlay_id));
+        let committed_overlay_id = if duplicate {
+            None
+        } else {
+            index.live.commit_upsert(rel_path, per_tri);
+            Some(
+                index
+                    .live
+                    .file_id_for_path(rel_path)
+                    .expect("a committed overlay entry must have an ID"),
+            )
+        };
         let removed = extra.remove(rel_path);
+        // Even an exact duplicate may race a search that cached temporary
+        // bytes between our two verification reads. Always invalidate it.
         invalidate_cached_paths_locked(state, std::iter::once(rel_path));
-        removed
+        (removed, committed_overlay_id)
     };
     if removed_extra {
         state.filename_index_dirty.store(true, Ordering::SeqCst);
@@ -4833,6 +4993,14 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         .write()
         .unwrap()
         .insert(rel_path.to_string(), current);
+    if let Some(overlay_id) = committed_overlay_id {
+        eprintln!("[trace] reindex: modified {rel_path}");
+        state
+            .recent_reindexes
+            .lock()
+            .unwrap()
+            .put(rel_path.to_string(), overlay_id, data);
+    }
 }
 
 fn retry_failed_forced_reindex(state: &Arc<ServerState>, rel_path: &str, reason: &str) {
@@ -5861,6 +6029,7 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
             let mut extra = state.filename_extra_paths.write().unwrap();
             let mut cache = state.cache.write().unwrap();
             *index = empty;
+            forget_recent_reindexes(state);
             extra.clear();
             state.filename_index_ready.store(false, Ordering::SeqCst);
             state.filename_index_dirty.store(false, Ordering::SeqCst);
@@ -5972,6 +6141,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         let mut extra = state.filename_extra_paths.write().unwrap();
         let mut cache = state.cache.write().unwrap();
         *index = opened;
+        forget_recent_reindexes(state);
         if let Some(paths) = filename_extra_paths {
             *extra = paths;
             state.filename_index_ready.store(true, Ordering::SeqCst);
@@ -7523,6 +7693,40 @@ mod tests {
         assert!(cache.peek("b").is_none());
     }
 
+    #[test]
+    fn recent_reindex_cache_bounds_bytes_capacity_and_oversized_replacements() {
+        let mut cache = RecentReindexCache::new(2, 6, 4);
+        cache.put("a".into(), 1, vec![b'a'; 3]);
+        cache.put("b".into(), 2, vec![b'b'; 3]);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.byte_len(), 6);
+
+        cache.put("c".into(), 3, vec![b'c'; 3]);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.byte_len(), 6);
+        assert_eq!(cache.matching_overlay_id("a", b"aaa"), None);
+
+        cache.put("b".into(), 4, vec![b'x'; 5]);
+        assert_eq!(
+            cache.len(),
+            1,
+            "oversized replacement retained old evidence"
+        );
+        assert_eq!(cache.byte_len(), 3);
+        assert_eq!(cache.matching_overlay_id("b", b"bbb"), None);
+
+        let mut byte_limited = RecentReindexCache::new(3, 5, 4);
+        byte_limited.put("a".into(), 1, vec![b'a'; 3]);
+        byte_limited.put("b".into(), 2, vec![b'b'; 3]);
+        assert_eq!(byte_limited.len(), 1);
+        assert_eq!(byte_limited.byte_len(), 3);
+        assert_eq!(byte_limited.matching_overlay_id("a", b"aaa"), None);
+
+        byte_limited.clear();
+        assert_eq!(byte_limited.len(), 0);
+        assert_eq!(byte_limited.byte_len(), 0);
+    }
+
     /// A `ServerState` over an empty index, for exercising the stale path
     /// directly. Mirrors the defaults `run` uses with a watcher and ignore
     /// rules enabled, which is the configuration `gitignore_pending` gates.
@@ -7540,6 +7744,11 @@ mod tests {
                 CACHE_MAX_ENTRY_BYTES,
             )),
             cache_generation: std::sync::atomic::AtomicU64::new(0),
+            recent_reindexes: Mutex::new(RecentReindexCache::new(
+                RECENT_REINDEX_CAPACITY,
+                RECENT_REINDEX_MAX_BYTES,
+                RECENT_REINDEX_MAX_ENTRY_BYTES,
+            )),
             root: root.to_path_buf(),
             watcher_active: std::sync::atomic::AtomicBool::new(false),
             indexing: std::sync::atomic::AtomicBool::new(false),
@@ -9254,6 +9463,13 @@ mod tests {
             let _gate = state.snapshot_gate.read().unwrap();
             reindex_file(&state, &path, "same.rs", false);
         }
+        let (old_id, old_dirty) = {
+            let index = state.index.read().unwrap();
+            (
+                index.live.file_id_for_path("same.rs").unwrap(),
+                index.live.dirty_count(),
+            )
+        };
         std::fs::write(&path, "fn new_marker() {}\n").unwrap();
         let current = tgrep_core::meta::collect_filestamps(&root, &["same.rs".to_string()])
             .remove("same.rs")
@@ -9292,6 +9508,198 @@ mod tests {
             repaired.contains("\"content\":\"fn new_marker"),
             "a concrete event must bypass the coarse matching stamp: {repaired}"
         );
+        let index = state.index.read().unwrap();
+        assert_ne!(index.live.file_id_for_path("same.rs"), Some(old_id));
+        assert_eq!(index.live.dirty_count(), old_dirty + 1);
+    }
+
+    #[test]
+    fn separate_forced_events_suppress_only_exact_current_overlay_duplicate() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("same.rs");
+        std::fs::write(&path, "fn unchanged_marker() {}\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "same.rs", true);
+        }
+        let (first_id, first_dirty) = {
+            let index = state.index.read().unwrap();
+            (
+                index.live.file_id_for_path("same.rs").unwrap(),
+                index.live.dirty_count(),
+            )
+        };
+        state
+            .cache
+            .write()
+            .unwrap()
+            .put("same.rs".to_string(), cached(32));
+        let generation = state.cache_generation.load(Ordering::SeqCst);
+        state.file_stamps.write().unwrap().insert(
+            "same.rs".to_string(),
+            tgrep_core::meta::FileStamp {
+                mtime: u64::MAX,
+                size: u64::MAX,
+            },
+        );
+
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "same.rs", true);
+        }
+
+        let index = state.index.read().unwrap();
+        assert_eq!(index.live.file_id_for_path("same.rs"), Some(first_id));
+        assert_eq!(index.live.dirty_count(), first_dirty);
+        drop(index);
+        assert!(state.cache.read().unwrap().peek("same.rs").is_none());
+        assert!(state.cache_generation.load(Ordering::SeqCst) > generation);
+        assert_ne!(
+            state.file_stamps.read().unwrap().get("same.rs"),
+            Some(&tgrep_core::meta::FileStamp {
+                mtime: u64::MAX,
+                size: u64::MAX,
+            }),
+            "the successful duplicate read must replace a retry sentinel"
+        );
+    }
+
+    #[test]
+    fn exact_reindex_evidence_does_not_suppress_a_to_b_to_a() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("cycle.rs");
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        let mut ids = Vec::new();
+
+        for (content, force) in [
+            ("fn exact_a_marker() {}\n", false),
+            ("fn exact_b_marker() {}\n", true),
+            ("fn exact_a_marker() {}\n", true),
+        ] {
+            std::fs::write(&path, content).unwrap();
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "cycle.rs", force);
+            ids.push(
+                state
+                    .index
+                    .read()
+                    .unwrap()
+                    .live
+                    .file_id_for_path("cycle.rs")
+                    .unwrap(),
+            );
+        }
+
+        assert!(ids.windows(2).all(|pair| pair[0] != pair[1]));
+        assert_eq!(state.index.read().unwrap().live.dirty_count(), 3);
+        let result = handle_search(
+            None,
+            &serde_json::json!({"pattern": "exact_a_marker"}),
+            &state,
+        );
+        assert!(result.contains("\"content\":\"fn exact_a_marker"));
+        let old = handle_search(
+            None,
+            &serde_json::json!({"pattern": "exact_b_marker"}),
+            &state,
+        );
+        assert!(!old.contains("\"content\":\"fn exact_b_marker"));
+    }
+
+    #[test]
+    fn overlay_id_mismatch_prevents_exact_byte_suppression() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("token.rs");
+        let bytes = b"fn token_marker() {}\n";
+        std::fs::write(&path, bytes).unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "token.rs", false);
+        }
+        let first_id = state
+            .index
+            .read()
+            .unwrap()
+            .live
+            .file_id_for_path("token.rs")
+            .unwrap();
+        let replaced_id = {
+            let mut index = state.index.write().unwrap();
+            index.live.upsert_file("token.rs", bytes);
+            index.live.file_id_for_path("token.rs").unwrap()
+        };
+        assert_ne!(first_id, replaced_id);
+        let dirty_before = state.index.read().unwrap().live.dirty_count();
+
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "token.rs", true);
+        }
+        let index = state.index.read().unwrap();
+        assert_ne!(index.live.file_id_for_path("token.rs"), Some(replaced_id));
+        assert_eq!(index.live.dirty_count(), dirty_before + 1);
+    }
+
+    /// Overlay IDs restart at zero in a replacement index, so evidence that
+    /// outlived the overlay it was recorded against could be revalidated
+    /// against an unrelated entry holding a recycled ID.
+    #[test]
+    fn replacing_the_whole_index_forgets_exact_byte_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let path = root.join("recycled.rs");
+        let bytes = b"fn recycled_marker() {}\n";
+        std::fs::write(&path, bytes).unwrap();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "recycled.rs", false);
+        }
+        let first_id = state
+            .index
+            .read()
+            .unwrap()
+            .live
+            .file_id_for_path("recycled.rs")
+            .unwrap();
+        assert_eq!(
+            state
+                .recent_reindexes
+                .lock()
+                .unwrap()
+                .matching_overlay_id("recycled.rs", bytes),
+            Some(first_id)
+        );
+
+        reset_to_empty_index(&state, &root, &index_dir);
+        assert_eq!(state.recent_reindexes.lock().unwrap().len(), 0);
+
+        // The fresh overlay hands out the same first ID, and the file still has
+        // the recorded bytes: without the reset this is exactly the pair that
+        // would suppress a real commit.
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "recycled.rs", true);
+        }
+        let index = state.index.read().unwrap();
+        assert_eq!(index.live.file_id_for_path("recycled.rs"), Some(first_id));
+        assert_eq!(index.live.dirty_count(), 1);
+        drop(index);
+        let found = handle_search(
+            None,
+            &serde_json::json!({"pattern": "recycled_marker"}),
+            &state,
+        );
+        assert!(found.contains("\"content\":\"fn recycled_marker"));
     }
 
     #[test]

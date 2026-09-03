@@ -196,6 +196,15 @@ impl LiveIndex {
         self.path_to_id.contains_key(path)
     }
 
+    /// Active live-overlay file ID for `path`.
+    ///
+    /// IDs change on every upsert and disappear when an entry is pruned, so
+    /// callers can use one as a lifetime token for facts derived from that
+    /// exact overlay entry.
+    pub fn file_id_for_path(&self, path: &str) -> Option<u32> {
+        self.path_to_id.get(path).copied()
+    }
+
     /// Whether the live overlay contains a path strictly below `directory`.
     pub fn has_descendant_path(&self, directory: &str) -> bool {
         if directory.is_empty() {

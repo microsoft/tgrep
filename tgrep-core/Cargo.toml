@@ -13,6 +13,7 @@ categories = ["text-processing", "algorithms"]
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 memmap2 = "0.9"
 memchr = "2"
 regex = "1"

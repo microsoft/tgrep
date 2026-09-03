@@ -175,7 +175,7 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
 ///   4. `index`         — guards the in-memory HybridIndex (read-heavy)
 ///   5. `filename_extra_paths` — guards paths omitted from the content index
 ///   6. `cache`         — guards the file content LRU cache
-///   7. `file_stamps`   — guards per-file mtime/size stamps
+///   7. `file_evidence` — guards per-file stamps and content identities
 ///   8. `recent_reindexes` — guards exact duplicate evidence
 ///
 /// `recent_reindexes` is a leaf: it is taken last and, in practice, never held
@@ -314,7 +314,7 @@ struct RecentReindex {
 /// [`forget_recent_reindexes`]).
 ///
 /// Callers must release this lock before taking `index`, `cache`, or
-/// `file_stamps`; candidate lookup returns only the recorded ID for that reason.
+/// `file_evidence`; candidate lookup returns only the recorded ID for that reason.
 struct RecentReindexCache {
     lru: LruCache<String, RecentReindex>,
     bytes: u64,
@@ -539,7 +539,7 @@ struct ServerState {
     /// snapshots) or swap readers out of order. Searches do **not**
     /// take this lock, so they continue uninterrupted during a publish.
     publish_lock: Mutex<()>,
-    /// Last-known per-file stamps (mtime + size). Used by the file
+    /// Last-known per-file stamps and trusted reader/live content identities. Used by the file
     /// watcher to ignore notify events that don't reflect a real
     /// content change (e.g. atime-only updates, attribute changes,
     /// or events triggered by the search itself opening files on
@@ -547,7 +547,7 @@ struct ServerState {
     /// and refreshed during the initial build, on stale-state
     /// refresh, and per watcher event that actually mutates the
     /// index.
-    file_stamps: RwLock<std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+    file_evidence: RwLock<tgrep_core::meta::FileEvidence>,
     /// Coordinates overlay mutations with the snapshot→publish→prune
     /// window. Watcher mutations (handle_fs_event) acquire it for
     /// **read** before touching the live overlay; flush/auto-save
@@ -838,7 +838,9 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         max_file_size,
         index_dir: index_dir.clone(),
         publish_lock: Mutex::new(()),
-        file_stamps: RwLock::new(tgrep_core::meta::read_filestamps(&index_dir).unwrap_or_default()),
+        file_evidence: RwLock::new(
+            tgrep_core::meta::read_file_evidence(&index_dir).unwrap_or_default(),
+        ),
         snapshot_gate: RwLock::new(()),
         stale_refresh_lock: Mutex::new(()),
         gitignore: RwLock::new(None),
@@ -1145,7 +1147,7 @@ fn ignore_stamps_of(root: &Path, sources: &[PathBuf]) -> IgnoreStamps {
 /// Returns the directories that were newly subscribed to as a result. Those
 /// were unwatched while the caller's walk ran, so anything written to them in
 /// that window produced no event and appears in no walk result. Callers pass
-/// them to [`reindex_files_in`] once `state.file_stamps` describes the index
+/// them to [`reindex_files_in`] once `state.file_evidence` describes the index
 /// they just published.
 ///
 /// The returned directories must be paired with a timestamp the *caller*
@@ -2028,21 +2030,21 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let stamps = match tgrep_core::meta::read_filestamps(&staging_dir) {
-        Ok(stamps) if state.watch_enabled => {
-            withhold_stamps_for_deferred_snapshot(&state.root, stamps, deferred.as_ref())
+    let evidence = match tgrep_core::meta::read_file_evidence(&staging_dir) {
+        Ok(evidence) if state.watch_enabled => {
+            withhold_evidence_for_deferred_snapshot(&state.root, evidence, deferred.as_ref())
         }
         // Without a watcher there is no event to identify a file that changed
         // between extraction and the builder's later stamp collection. Publish
         // no claims from that racy window; the serialized catch-up below then
         // treats every path as changed and rebuilds it once.
-        Ok(_) => std::collections::HashMap::new(),
+        Ok(_) => tgrep_core::meta::FileEvidence::default(),
         Err(e) => {
             eprintln!("[trace] warning: reload could not read file stamps ({e})");
-            std::collections::HashMap::new()
+            tgrep_core::meta::FileEvidence::default()
         }
     };
-    if let Err(e) = tgrep_core::meta::write_filestamps(&stamps, &staging_dir) {
+    if let Err(e) = tgrep_core::meta::write_file_evidence(&evidence, &staging_dir) {
         let _ = std::fs::remove_dir_all(&staging_dir);
         state.indexing.store(false, Ordering::SeqCst);
         drop(deferred);
@@ -2064,7 +2066,7 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
     let indexed = outcome.num_files as u64;
     state.index_total.store(indexed, Ordering::Relaxed);
     state.index_progress.store(indexed, Ordering::Relaxed);
-    *state.file_stamps.write().unwrap() = stamps;
+    *state.file_evidence.write().unwrap() = evidence;
 
     let newly_watched = if state.no_ignore {
         Vec::new()
@@ -3282,7 +3284,7 @@ fn changed_ignore_rules_in(
 /// separately, from `state.ignore_sources`, since a deleted file leaves nothing
 /// to stat.
 ///
-/// Callers must already hold `snapshot_gate`, and `state.file_stamps` must
+/// Callers must already hold `snapshot_gate`, and `state.file_evidence` must
 /// already describe the index as published — a merge that replaces the stamps
 /// afterwards would both discard what this records and make every file here
 /// look changed.
@@ -3543,8 +3545,13 @@ fn sweep_removed_files(
         }
     };
     let mut gone: std::collections::HashSet<String> = {
-        let stamps = state.file_stamps.read().unwrap();
-        stamps.keys().filter(|rel| missing(rel)).cloned().collect()
+        let evidence = state.file_evidence.read().unwrap();
+        evidence
+            .stamps
+            .keys()
+            .filter(|rel| missing(rel))
+            .cloned()
+            .collect()
     };
     {
         let index = state.index.read().unwrap();
@@ -4314,27 +4321,24 @@ fn drop_indexed_file(state: &ServerState, rel_path: &str, reason: &str) {
     // (already tombstoned, never indexed) are exactly the states where an old
     // record would otherwise sit unrefreshed.
     state.recent_reindexes.lock().unwrap().pop(rel_path);
+    let mut index = state.index.write().unwrap();
     let removed_extra = state.filename_extra_paths.write().unwrap().remove(rel_path);
     if removed_extra {
         state.filename_index_dirty.store(true, Ordering::SeqCst);
     }
     let had_stamp = state
-        .file_stamps
+        .file_evidence
         .write()
         .unwrap()
         .remove(rel_path)
         .is_some();
-    {
-        let index = state.index.read().unwrap();
-        if index.live.is_deleted(rel_path) {
-            return;
-        }
-        if !had_stamp && !index.live.has_path(rel_path) && !index.reader_has_path(rel_path) {
-            return;
-        }
+    if index.live.is_deleted(rel_path) {
+        return;
+    }
+    if !had_stamp && !index.live.has_path(rel_path) && !index.reader_has_path(rel_path) {
+        return;
     }
     eprintln!("[trace] reindex: dropped {rel_path} ({reason})");
-    let mut index = state.index.write().unwrap();
     index.live.delete_file(rel_path);
     invalidate_cached_paths_locked(state, std::iter::once(rel_path));
 }
@@ -4367,7 +4371,7 @@ fn mark_filename_only(state: &ServerState, rel_path: &str) {
         return;
     }
 
-    state.file_stamps.write().unwrap().remove(rel_path);
+    state.file_evidence.write().unwrap().remove(rel_path);
 }
 
 /// What an event's stat result says about the path it named.
@@ -4729,6 +4733,13 @@ fn read_within_limit(file: &mut std::fs::File, limit: Option<u64>, capacity: usi
     CappedRead::Data(data)
 }
 
+fn content_id_matches(
+    trusted: Option<tgrep_core::meta::ContentId>,
+    decoded: Option<tgrep_core::meta::ContentId>,
+) -> bool {
+    decoded.is_some() && trusted == decoded
+}
+
 /// Read a file and merge it into the live index, unless its stamp says the
 /// content we already indexed is current.
 ///
@@ -4810,7 +4821,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         return;
     }
 
-    if !force && state.file_stamps.read().unwrap().get(rel_path) == Some(&current) {
+    if !force && state.file_evidence.read().unwrap().stamp(rel_path) == Some(&current) {
         return;
     }
 
@@ -4917,6 +4928,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     };
     let text = tgrep_core::encoding::decode_for_index(&data);
     let is_binary = tgrep_core::trigram::is_binary(&text);
+    let content_id = (!is_binary).then(|| tgrep_core::meta::ContentId::from_indexed_bytes(&text));
     let per_tri = if is_binary {
         None
     } else {
@@ -4966,9 +4978,18 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     let (removed_extra, committed_overlay_id) = {
         let mut index = state.index.write().unwrap();
         let mut extra = state.filename_extra_paths.write().unwrap();
-        let duplicate = duplicate_overlay_id
+        let duplicate_overlay = duplicate_overlay_id
             .is_some_and(|overlay_id| index.live.file_id_for_path(rel_path) == Some(overlay_id));
-        let committed_overlay_id = if duplicate {
+        // Even a suppressed reader event can race a search that cached bytes
+        // between the two verification reads.
+        invalidate_cached_paths_locked(state, std::iter::once(rel_path));
+        let mut evidence = state.file_evidence.write().unwrap();
+        let duplicate_reader = force
+            && !index.live.has_path(rel_path)
+            && !index.live.is_deleted(rel_path)
+            && index.reader_has_path(rel_path)
+            && content_id_matches(evidence.content_id(rel_path), content_id);
+        let committed_overlay_id = if duplicate_overlay || duplicate_reader {
             None
         } else {
             index.live.commit_upsert(rel_path, per_tri);
@@ -4980,19 +5001,12 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
             )
         };
         let removed = extra.remove(rel_path);
-        // Even an exact duplicate may race a search that cached temporary
-        // bytes between our two verification reads. Always invalidate it.
-        invalidate_cached_paths_locked(state, std::iter::once(rel_path));
+        evidence.insert(rel_path.to_string(), current, content_id);
         (removed, committed_overlay_id)
     };
     if removed_extra {
         state.filename_index_dirty.store(true, Ordering::SeqCst);
     }
-    state
-        .file_stamps
-        .write()
-        .unwrap()
-        .insert(rel_path.to_string(), current);
     if let Some(overlay_id) = committed_overlay_id {
         eprintln!("[trace] reindex: modified {rel_path}");
         state
@@ -5007,12 +5021,13 @@ fn retry_failed_forced_reindex(state: &Arc<ServerState>, rel_path: &str, reason:
     // In-memory stamps override the persisted map during stale comparison.
     // A sentinel therefore records "this path must be read" without rewriting
     // filestamps.json for a transient event failure.
-    state.file_stamps.write().unwrap().insert(
+    state.file_evidence.write().unwrap().insert(
         rel_path.to_string(),
         tgrep_core::meta::FileStamp {
             mtime: u64::MAX,
             size: u64::MAX,
         },
+        None,
     );
     eprintln!("[trace] warning: {rel_path} was not reindexed because {reason}; scheduling a retry");
     state.ignore_rules_dirty.store(true, Ordering::SeqCst);
@@ -5080,13 +5095,13 @@ fn persist_pending_index_changes(state: &Arc<ServerState>) -> bool {
     // may have drained either source while we waited.
     let _gate = state.snapshot_gate.write().unwrap();
     if state.index.read().unwrap().live.has_pending_changes() {
-        let stamps = state.file_stamps.read().unwrap().clone();
+        let evidence = state.file_evidence.read().unwrap().clone();
         return stream_merge_stale_changes(
             state,
             &[],
             &[],
             &[],
-            &stamps,
+            &evidence,
             StaleMergePolicy {
                 preserved: &std::collections::HashSet::new(),
                 operation: "auto-save",
@@ -5259,6 +5274,7 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
     // caller: the recovery path in `reset_to_empty_index` runs after a failed
     // build, which is exactly when the directory is least likely to be intact.
     std::fs::create_dir_all(index_dir)?;
+    tgrep_core::meta::remove_file_evidence(index_dir)?;
     // Empty lookup.bin, index.bin, files.bin
     std::fs::write(index_dir.join("lookup.bin"), b"")?;
     std::fs::write(index_dir.join("index.bin"), b"")?;
@@ -5300,6 +5316,16 @@ fn stamps_for_index_members(
         .collect()
 }
 
+fn complete_file_evidence(
+    stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    mut content_ids: std::collections::HashMap<String, tgrep_core::meta::ContentId>,
+) -> tgrep_core::meta::FileEvidence {
+    content_ids.retain(|path, _| stamps.contains_key(path));
+    let mut evidence = tgrep_core::meta::FileEvidence::from_stamps(stamps);
+    evidence.content_ids = content_ids;
+    evidence
+}
+
 /// Drop the stamps the build has no right to publish, because an event for
 /// those paths arrived while it ran.
 ///
@@ -5326,29 +5352,29 @@ fn stamps_for_index_members(
 /// Takes the deferred lock while `snapshot_gate` is held, which is the one
 /// order in use: the watcher defers *before* it takes the gate, and replay
 /// releases the buffer before handling anything.
-fn withhold_stamps_for_deferred(
+fn withhold_evidence_for_deferred(
     state: &ServerState,
     root: &Path,
-    stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
-) -> std::collections::HashMap<String, tgrep_core::meta::FileStamp> {
+    evidence: tgrep_core::meta::FileEvidence,
+) -> tgrep_core::meta::FileEvidence {
     let deferred = match state.deferred_events.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    withhold_stamps_for_deferred_snapshot(root, stamps, deferred.as_ref())
+    withhold_evidence_for_deferred_snapshot(root, evidence, deferred.as_ref())
 }
 
-fn withhold_stamps_for_deferred_snapshot(
+fn withhold_evidence_for_deferred_snapshot(
     root: &Path,
-    mut stamps: std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    mut evidence: tgrep_core::meta::FileEvidence,
     paths: Option<&std::collections::HashMap<PathBuf, bool>>,
-) -> std::collections::HashMap<String, tgrep_core::meta::FileStamp> {
+) -> tgrep_core::meta::FileEvidence {
     let Some(paths) = paths else {
         eprintln!(
             "[trace] warning: too many changes during the initial build to say which files the \
              walk raced; publishing no stamps so the reconcile re-reads them"
         );
-        return std::collections::HashMap::new();
+        return tgrep_core::meta::FileEvidence::default();
     };
     let mut exact = std::collections::HashSet::new();
     let mut directories = std::collections::HashSet::new();
@@ -5362,12 +5388,12 @@ fn withhold_stamps_for_deferred_snapshot(
             directories.insert(rel);
         }
     }
-    let before = stamps.len();
-    stamps.retain(|rel, _| {
+    let before = evidence.stamps.len();
+    evidence.retain(|rel, _| {
         if exact.contains(rel) {
             return false;
         }
-        let mut ancestor = rel.as_str();
+        let mut ancestor = rel;
         while let Some((parent, _)) = ancestor.rsplit_once('/') {
             if directories.contains(parent) {
                 return false;
@@ -5376,14 +5402,14 @@ fn withhold_stamps_for_deferred_snapshot(
         }
         true
     });
-    let withheld = before - stamps.len();
+    let withheld = before - evidence.stamps.len();
     if withheld > 0 {
         eprintln!(
             "[trace] watcher: {withheld} file(s) changed during the initial build; their stamps \
              are withheld so the replay re-reads them"
         );
     }
-    stamps
+    evidence
 }
 
 /// Detect files that changed while the server was not running.
@@ -5456,7 +5482,7 @@ fn stream_merge_stale_changes(
     changed: &[String],
     added: &[String],
     deleted: &[String],
-    stamps: &std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    evidence: &tgrep_core::meta::FileEvidence,
     policy: StaleMergePolicy<'_>,
 ) -> bool {
     let StaleMergePolicy {
@@ -5465,6 +5491,7 @@ fn stream_merge_stale_changes(
         authoritative_membership,
         authoritative_listed_files,
     } = policy;
+    let stamps = &evidence.stamps;
     let root = &state.root;
     let index_dir = &state.index_dir;
     let (reader, overlay_paths, tombstone_paths) = {
@@ -5528,7 +5555,7 @@ fn stream_merge_stale_changes(
     // genuinely new path is harmless because it has no reader entry to filter.
     let mut removed: std::collections::HashSet<String> = candidates.iter().cloned().collect();
 
-    let mut published_stamps = stamps.clone();
+    let mut published_evidence = evidence.clone();
     let mut preserve_overlay_paths = preserved.clone();
 
     let result = (|| -> Result<PublishStatus> {
@@ -5573,7 +5600,7 @@ fn stream_merge_stale_changes(
                     .to_string_lossy()
                     .replace('\\', "/");
                 unreadable.insert(rel.clone());
-                if let Some(stamp) = published_stamps.remove(&rel) {
+                if let Some(stamp) = published_evidence.remove(&rel) {
                     memo.insert(rel, stamp);
                 }
             }
@@ -5593,6 +5620,10 @@ fn stream_merge_stale_changes(
                 unreadable.len()
             );
         }
+        for path in &candidates {
+            published_evidence.content_ids.remove(path);
+        }
+        published_evidence.content_ids.extend(outcome.content_ids);
 
         let delta = tgrep_core::reader::IndexReader::open(&delta_dir)?;
         if delta.num_files() != delta_count {
@@ -5603,7 +5634,7 @@ fn stream_merge_stale_changes(
         }
 
         builder::merge_index_with_delta(root, &staging_dir, &reader, &delta, &removed, true)?;
-        tgrep_core::meta::write_filestamps(&published_stamps, &staging_dir)?;
+        tgrep_core::meta::write_file_evidence(&published_evidence, &staging_dir)?;
         let removed_reader_files = reader
             .all_paths()
             .iter()
@@ -5670,7 +5701,7 @@ fn stream_merge_stale_changes(
     }
     state.flushing.store(false, Ordering::SeqCst);
     if matches!(&result, Ok(PublishStatus::Published)) {
-        *state.file_stamps.write().unwrap() = published_stamps;
+        *state.file_evidence.write().unwrap() = published_evidence;
     }
     match result {
         Ok(PublishStatus::Published) => {
@@ -5911,11 +5942,11 @@ fn refresh_stale_locked(
     let listed_files = &walk.listed_files;
 
     // Load stored per-file stamps from last index write
-    let mut old_stamps = match meta::read_filestamps(index_dir) {
-        Ok(s) => s,
+    let mut old_evidence = match meta::read_file_evidence(index_dir) {
+        Ok(evidence) => evidence,
         Err(e) => {
             eprintln!("[trace] stale check: no filestamps found ({e}), comparing against reader");
-            std::collections::HashMap::new()
+            tgrep_core::meta::FileEvidence::default()
         }
     };
 
@@ -5927,8 +5958,8 @@ fn refresh_stale_locked(
     // on-disk stamps nor the filesystem, so it would never be classified as
     // deleted and would linger in the index. The in-memory stamps are the
     // fresher record of what the index actually holds, so they win.
-    for (path, stamp) in state.file_stamps.read().unwrap().iter() {
-        old_stamps.insert(path.clone(), stamp.clone());
+    for (path, stamp) in &state.file_evidence.read().unwrap().stamps {
+        old_evidence.stamps.insert(path.clone(), stamp.clone());
     }
     let indexed_paths = {
         let index = state.index.read().unwrap();
@@ -5936,7 +5967,7 @@ fn refresh_stale_locked(
         paths.extend(index.live.overlay_paths());
         paths
     };
-    if old_stamps.is_empty() && indexed_paths.is_empty() && current_meta.is_empty() {
+    if old_evidence.stamps.is_empty() && indexed_paths.is_empty() && current_meta.is_empty() {
         refresh_filename_index(state, index_dir, listed_files);
         eprintln!("[trace] stale check: no indexed files or filesystem files, skipping");
         return true;
@@ -5944,7 +5975,7 @@ fn refresh_stale_locked(
 
     let (mut changed, mut added, deleted) = classify_file_changes(
         current_meta,
-        &old_stamps,
+        &old_evidence.stamps,
         &indexed_paths,
         compare_index_membership,
     );
@@ -5993,13 +6024,24 @@ fn refresh_stale_locked(
     }
 
     let new_stamps = stamps_for_indexed(current_meta, &skipped_unreadable);
+    let mut new_evidence = tgrep_core::meta::FileEvidence::from_stamps(new_stamps);
+    {
+        let current_evidence = state.file_evidence.read().unwrap();
+        new_evidence.content_ids.extend(
+            current_evidence
+                .content_ids
+                .iter()
+                .filter(|(path, _)| new_evidence.stamps.contains_key(path.as_str()))
+                .map(|(path, id)| (path.clone(), *id)),
+        );
+    }
 
     if !stream_merge_stale_changes(
         state,
         &changed,
         &added,
         &deleted,
-        &new_stamps,
+        &new_evidence,
         StaleMergePolicy {
             preserved: &skipped_unreadable,
             operation: "stale check",
@@ -6019,6 +6061,7 @@ fn refresh_stale_locked(
 /// partway through can leave truncated files that the currently mmap'd reader
 /// no longer matches. Resetting gives the fallback build a clean base.
 fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
+    state.file_evidence.write().unwrap().clear();
     if let Err(e) = create_empty_index(index_dir) {
         eprintln!("[trace] warning: could not reset the index directory ({e})");
         return;
@@ -6163,23 +6206,25 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     // and its walk handed back the .gitignore / .ignore paths. Building the
     // matcher from those is what keeps this cheap — `gitignore::build_matcher`
     // would rewalk the whole tree, which cost 49 s on a 289k-file repo.
-    let stamps = match tgrep_core::meta::read_filestamps(index_dir) {
+    let evidence = match tgrep_core::meta::read_file_evidence(index_dir) {
         // Minus the paths whose events arrived while the build ran: the builder
         // read those files at some point during its walk and stamped what it
         // saw, so for anything written afterwards the stamp describes bytes the
         // index does not hold. See `withhold_stamps_for_deferred`.
-        Ok(stamps) if state.watch_enabled => withhold_stamps_for_deferred(state, root, stamps),
-        Ok(_) => std::collections::HashMap::new(),
+        Ok(evidence) if state.watch_enabled => {
+            withhold_evidence_for_deferred(state, root, evidence)
+        }
+        Ok(_) => tgrep_core::meta::FileEvidence::default(),
         Err(e) => {
             eprintln!(
                 "[trace] warning: could not load file stamps ({e}); \
                  the watcher may reindex on spurious events"
             );
-            std::collections::HashMap::new()
+            tgrep_core::meta::FileEvidence::default()
         }
     };
     if !state.watch_enabled
-        && let Err(e) = tgrep_core::meta::write_filestamps(&stamps, index_dir)
+        && let Err(e) = tgrep_core::meta::write_file_evidence(&evidence, index_dir)
     {
         drop(gate);
         eprintln!(
@@ -6189,7 +6234,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         reset_to_empty_index(state, root, index_dir);
         return false;
     }
-    *state.file_stamps.write().unwrap() = stamps;
+    *state.file_evidence.write().unwrap() = evidence;
     let mut newly_watched = Vec::new();
     if !state.no_ignore {
         let t_gi = Instant::now();
@@ -6326,6 +6371,15 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         paths
     };
     let seeded_count = skip_paths.len() as u64;
+    let mut content_ids: std::collections::HashMap<String, tgrep_core::meta::ContentId> = {
+        let evidence = state.file_evidence.read().unwrap();
+        evidence
+            .content_ids
+            .iter()
+            .filter(|(path, _)| skip_paths.contains(path.as_str()))
+            .map(|(path, id)| (path.clone(), *id))
+            .collect()
+    };
 
     // Nothing indexed yet: build straight to disk with bounded memory instead
     // of accumulating the whole repo in the live overlay. Resuming a partial
@@ -6476,11 +6530,13 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                     if lower != *data {
                         trigrams.extend(tgrep_core::trigram::extract(&lower));
                     }
-                    Some((rel_path, trigrams))
+                    let content_id = tgrep_core::meta::ContentId::from_indexed_bytes(&data);
+                    Some((rel_path, trigrams, content_id))
                 })
-                .collect::<Vec<(String, Vec<u32>)>>()
+                .collect::<Vec<(String, Vec<u32>, tgrep_core::meta::ContentId)>>()
         };
-        let batch_results: Vec<(String, Vec<u32>)> = match &index_pool {
+        let batch_results: Vec<(String, Vec<u32>, tgrep_core::meta::ContentId)> = match &index_pool
+        {
             Some(pool) => pool.install(extract),
             None => extract(),
         };
@@ -6488,8 +6544,9 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         // Sequential: insert into LiveIndex (brief write lock per batch)
         {
             let mut index = state.index.write().unwrap();
-            for (rel_path, trigrams) in batch_results {
+            for (rel_path, trigrams, content_id) in batch_results {
                 index.live.upsert_file_with_trigrams(&rel_path, trigrams);
+                content_ids.insert(rel_path, content_id);
             }
         }
 
@@ -6596,6 +6653,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         };
         stamps_for_index_members(walk_meta.files, &indexed)
     };
+    let evidence = complete_file_evidence(stamps, content_ids);
 
     // The in-memory build is done — surface "complete" in status now even
     // though the final disk flush below can take minutes for very large
@@ -6632,10 +6690,10 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     //
     // Minus whatever changed underneath the walk, which the stamps would
     // otherwise describe as indexed when the index holds the older bytes.
-    *state.file_stamps.write().unwrap() = if state.watch_enabled {
-        withhold_stamps_for_deferred(state, root, stamps)
+    *state.file_evidence.write().unwrap() = if state.watch_enabled {
+        withhold_evidence_for_deferred(state, root, evidence)
     } else {
-        std::collections::HashMap::new()
+        tgrep_core::meta::FileEvidence::default()
     };
     if state.watch_enabled {
         state.indexing.store(false, Ordering::SeqCst);
@@ -6652,8 +6710,8 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         // A read guard rather than a clone: these maps hold an entry per file
         // in the repo. Nothing reachable from the flush takes this lock, and
         // every other writer is behind the publish gate we hold.
-        let stamps = state.file_stamps.read().unwrap();
-        flush_append_only_overlay_locked(state, index_dir, true, Some(&stamps))
+        let evidence = state.file_evidence.read().unwrap();
+        flush_append_only_overlay_locked(state, index_dir, true, Some(&evidence))
     };
     drop(gate);
 
@@ -6708,13 +6766,13 @@ fn flush_append_only_overlay(
     state: &ServerState,
     index_dir: &Path,
     complete: bool,
-    stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+    evidence: Option<&tgrep_core::meta::FileEvidence>,
 ) -> bool {
     // Hold the snapshot gate for the whole snapshot → publish → prune cycle.
     // During the bulk build the watcher is already suppressed, but auto-save
     // coordination and future-proofing make the gate the right call.
     let _gate = state.snapshot_gate.write().unwrap();
-    flush_append_only_overlay_locked(state, index_dir, complete, stamps)
+    flush_append_only_overlay_locked(state, index_dir, complete, evidence)
 }
 
 /// Body of [`flush_append_only_overlay`] that assumes `snapshot_gate` is
@@ -6727,7 +6785,7 @@ fn flush_append_only_overlay_locked(
     state: &ServerState,
     index_dir: &Path,
     complete: bool,
-    stamps: Option<&std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+    evidence: Option<&tgrep_core::meta::FileEvidence>,
 ) -> bool {
     let flush_start = Instant::now();
 
@@ -6737,7 +6795,7 @@ fn flush_append_only_overlay_locked(
         let (paths, inverted) = index.live.snapshot_for_disk();
         (paths, inverted, index.reader_arc())
     };
-    if overlay_paths.is_empty() && !complete && stamps.is_none() {
+    if overlay_paths.is_empty() && !complete && evidence.is_none() {
         return false;
     }
     let num_files = reader.num_files() + overlay_paths.len();
@@ -6764,8 +6822,8 @@ fn flush_append_only_overlay_locked(
     // Stage filestamps alongside the final complete index. If this fails we
     // still publish the index: losing incremental stale-check state on next
     // start is preferable to dropping the completed build.
-    if let Some(stamps) = stamps
-        && let Err(e) = tgrep_core::meta::write_filestamps(stamps, &staging_dir)
+    if let Some(evidence) = evidence
+        && let Err(e) = tgrep_core::meta::write_file_evidence(evidence, &staging_dir)
     {
         eprintln!("[trace] warning: failed to write staging filestamps: {e}");
     }
@@ -7019,14 +7077,21 @@ fn open_published_reader(
     None
 }
 
-const INDEX_FILE_NAMES: &[&str] = &[
+const CORE_INDEX_FILE_NAMES: &[&str] = &[
     "index.bin",
     "lookup.bin",
     "files.bin",
     tgrep_core::path_index::EXTRA_PATHS_FILENAME,
-    "filestamps.json",
-    "meta.json",
 ];
+const EVIDENCE_FILE_NAME: &str = "filestamps.json";
+
+fn staged_publish_order() -> impl Iterator<Item = &'static str> {
+    CORE_INDEX_FILE_NAMES
+        .iter()
+        .copied()
+        .chain(std::iter::once(EVIDENCE_FILE_NAME))
+        .chain(std::iter::once("meta.json"))
+}
 
 struct StagedFileMove {
     staging: PathBuf,
@@ -7172,13 +7237,25 @@ fn move_staged_files(
         published: Vec::new(),
         finished: false,
     };
-    for &name in INDEX_FILE_NAMES {
+
+    // Evidence is generation-specific. Move the old file out of the active
+    // directory before publishing any core file, even when the staged
+    // generation has no replacement evidence.
+    let evidence_dst = target.join(EVIDENCE_FILE_NAME);
+    if evidence_dst.exists() {
+        if let Err(error) = publish_file(&evidence_dst, &moved.backup_path(EVIDENCE_FILE_NAME)) {
+            return Err(moved.fail(error));
+        }
+        moved.backed_up.push(EVIDENCE_FILE_NAME);
+    }
+
+    for name in staged_publish_order() {
         let src = staging.join(name);
         let dst = target.join(name);
         if !src.exists() {
             continue;
         }
-        if dst.exists() {
+        if name != EVIDENCE_FILE_NAME && dst.exists() {
             if let Err(error) = publish_file(&dst, &moved.backup_path(name)) {
                 return Err(moved.fail(error));
             }
@@ -7772,7 +7849,7 @@ mod tests {
             max_file_size: None,
             index_dir: index_dir.to_path_buf(),
             publish_lock: Mutex::new(()),
-            file_stamps: RwLock::new(Default::default()),
+            file_evidence: RwLock::new(Default::default()),
             snapshot_gate: RwLock::new(()),
             stale_refresh_lock: Mutex::new(()),
             gitignore: RwLock::new(None),
@@ -7784,6 +7861,33 @@ mod tests {
             last_search_ms: std::sync::atomic::AtomicU64::new(0),
             stale_refresh_hook: Mutex::new(None),
         })
+    }
+
+    fn install_reader_file(
+        state: &ServerState,
+        root: &Path,
+        index_dir: &Path,
+        rel_path: &str,
+        bytes: &[u8],
+    ) -> tgrep_core::meta::ContentId {
+        let path = root.join(rel_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let outcome =
+            builder::build_index_for_files(root, index_dir, std::slice::from_ref(&path), 1024)
+                .unwrap();
+        let content_id = outcome.content_ids[rel_path];
+        let stamp = tgrep_core::meta::collect_filestamps(root, &[rel_path.to_string()])
+            .remove(rel_path)
+            .unwrap();
+        let mut evidence = tgrep_core::meta::FileEvidence::default();
+        evidence.insert(rel_path.to_string(), stamp, Some(content_id));
+        tgrep_core::meta::write_file_evidence(&evidence, index_dir).unwrap();
+        *state.index.write().unwrap() = HybridIndex::open(index_dir, root).unwrap();
+        *state.file_evidence.write().unwrap() = evidence;
+        content_id
     }
 
     fn test_git(root: &Path, args: &[&str]) {
@@ -7816,6 +7920,34 @@ mod tests {
             None,
             "two incomplete walks cannot establish authoritative membership"
         );
+    }
+
+    #[test]
+    fn final_background_evidence_keeps_ids_from_prior_checkpoints() {
+        use tgrep_core::meta::{ContentId, FileStamp};
+
+        let earlier = ContentId::from_indexed_bytes(b"earlier checkpoint");
+        let final_batch = ContentId::from_indexed_bytes(b"final batch");
+        let omitted = ContentId::from_indexed_bytes(b"not in final membership");
+        let stamps = [
+            ("earlier.rs".to_string(), FileStamp { mtime: 1, size: 2 }),
+            ("final.rs".to_string(), FileStamp { mtime: 3, size: 4 }),
+        ]
+        .into_iter()
+        .collect();
+        let ids = [
+            ("earlier.rs".to_string(), earlier),
+            ("final.rs".to_string(), final_batch),
+            ("omitted.rs".to_string(), omitted),
+        ]
+        .into_iter()
+        .collect();
+
+        let evidence = complete_file_evidence(stamps, ids);
+
+        assert_eq!(evidence.content_id("earlier.rs"), Some(earlier));
+        assert_eq!(evidence.content_id("final.rs"), Some(final_batch));
+        assert_eq!(evidence.content_id("omitted.rs"), None);
     }
 
     #[test]
@@ -8048,8 +8180,13 @@ mod tests {
         assert!(index_dir.join("lookup.bin").is_file());
         assert!(index_dir.join("index.bin").is_file());
         assert!(index_dir.join("files.bin").is_file());
+        write_file(&index_dir.join(EVIDENCE_FILE_NAME), b"old evidence");
         // A caller that already created the directory must still succeed.
         create_empty_index(&index_dir).expect("should be idempotent");
+        assert!(
+            !index_dir.join(EVIDENCE_FILE_NAME).exists(),
+            "empty replacement must invalidate generation-specific evidence"
+        );
     }
 
     /// A truncated index left by a failed build must be replaced, not reused.
@@ -8518,7 +8655,7 @@ mod tests {
             reindex_file(&state, &path, "raced.rs", false);
         }
         assert!(state.index.read().unwrap().live.has_path("raced.rs"));
-        let stamps = state.file_stamps.read().unwrap().clone();
+        let stamps = state.file_evidence.read().unwrap().clone();
         let listed_files = vec!["raced.rs".to_string()];
         std::fs::remove_file(&path).unwrap();
         {
@@ -8561,7 +8698,7 @@ mod tests {
             let _gate = state.snapshot_gate.read().unwrap();
             reindex_file(&state, &other, "other.rs", false);
         }
-        let stamps = state.file_stamps.read().unwrap().clone();
+        let stamps = state.file_evidence.read().unwrap().clone();
         let preserved = std::collections::HashSet::from(["raced.rs".to_string()]);
         {
             let _gate = state.snapshot_gate.write().unwrap();
@@ -8588,6 +8725,99 @@ mod tests {
     }
 
     #[test]
+    fn stale_merge_preserves_replaces_and_removes_content_ids() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        for (name, contents) in [
+            ("keep.rs", "fn keep_old() {}\n"),
+            ("change.rs", "fn change_old() {}\n"),
+            ("delete.rs", "fn delete_old() {}\n"),
+            ("binary.rs", "fn binary_old() {}\n"),
+            ("unreadable.rs", "fn unreadable_old() {}\n"),
+        ] {
+            std::fs::write(root.join(name), contents).unwrap();
+        }
+        builder::build_index_with_options(
+            &root,
+            Some(&index_dir),
+            &builder::BuildOptions {
+                strategy: builder::IndexStrategy::External,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        *state.index.write().unwrap() = HybridIndex::open(&index_dir, &root).unwrap();
+        let old_evidence = tgrep_core::meta::read_file_evidence(&index_dir).unwrap();
+        *state.file_evidence.write().unwrap() = old_evidence.clone();
+        let kept_id = old_evidence.content_id("keep.rs").unwrap();
+        let unreadable_stamp = old_evidence.stamp("unreadable.rs").unwrap().clone();
+
+        let changed_bytes = b"fn change_new() {}\n";
+        std::fs::write(root.join("change.rs"), changed_bytes).unwrap();
+        std::fs::write(root.join("binary.rs"), b"text\0now binary").unwrap();
+        std::fs::remove_file(root.join("delete.rs")).unwrap();
+        std::fs::remove_file(root.join("unreadable.rs")).unwrap();
+
+        let mut stamps = tgrep_core::meta::collect_filestamps(
+            &root,
+            &[
+                "keep.rs".to_string(),
+                "change.rs".to_string(),
+                "binary.rs".to_string(),
+            ],
+        );
+        stamps.insert("unreadable.rs".to_string(), unreadable_stamp);
+        let mut desired = tgrep_core::meta::FileEvidence::from_stamps(stamps);
+        desired.content_ids.extend(
+            old_evidence
+                .content_ids
+                .iter()
+                .filter(|(path, _)| desired.stamps.contains_key(path.as_str()))
+                .map(|(path, id)| (path.clone(), *id)),
+        );
+
+        {
+            let _gate = state.snapshot_gate.write().unwrap();
+            assert!(stream_merge_stale_changes(
+                &state,
+                &[
+                    "change.rs".to_string(),
+                    "binary.rs".to_string(),
+                    "unreadable.rs".to_string(),
+                ],
+                &[],
+                &["delete.rs".to_string()],
+                &desired,
+                StaleMergePolicy {
+                    preserved: &std::collections::HashSet::new(),
+                    operation: "test evidence merge",
+                    authoritative_membership: true,
+                    authoritative_listed_files: None,
+                },
+            ));
+        }
+
+        let evidence = state.file_evidence.read().unwrap();
+        assert_eq!(evidence.content_id("keep.rs"), Some(kept_id));
+        assert_eq!(
+            evidence.content_id("change.rs"),
+            Some(tgrep_core::meta::ContentId::from_indexed_bytes(
+                &tgrep_core::encoding::decode_for_index(changed_bytes)
+            ))
+        );
+        for path in ["delete.rs", "binary.rs", "unreadable.rs"] {
+            assert_eq!(evidence.content_id(path), None, "{path}");
+        }
+        drop(evidence);
+        assert!(
+            state.index.read().unwrap().reader_has_path("unreadable.rs"),
+            "an unreadable replacement must retain the old reader entry"
+        );
+    }
+
+    #[test]
     fn reader_path_without_a_stamp_is_still_tombstoned() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
@@ -8599,7 +8829,7 @@ mod tests {
             .unwrap();
         *state.index.write().unwrap() = HybridIndex::open(&index_dir, &root).unwrap();
         assert!(
-            state.file_stamps.read().unwrap().is_empty(),
+            state.file_evidence.read().unwrap().stamps.is_empty(),
             "fixture requires a reader entry with no stamp"
         );
         assert!(
@@ -9475,10 +9705,10 @@ mod tests {
             .remove("same.rs")
             .unwrap();
         state
-            .file_stamps
+            .file_evidence
             .write()
             .unwrap()
-            .insert("same.rs".to_string(), current);
+            .insert("same.rs".to_string(), current, None);
 
         // Mutation control: the speculative path still trusts the persisted
         // stamp and therefore leaves the old posting set in place.
@@ -9514,6 +9744,184 @@ mod tests {
     }
 
     #[test]
+    fn identical_reader_event_refreshes_evidence_without_overlay_commit() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        let bytes = b"fn reader_identity_marker() {}\n";
+        let content_id = install_reader_file(&state, &root, &index_dir, "reader.rs", bytes);
+        state
+            .filename_extra_paths
+            .write()
+            .unwrap()
+            .insert("reader.rs".to_string());
+        state
+            .cache
+            .write()
+            .unwrap()
+            .put("reader.rs".to_string(), cached(32));
+        let generation = state.cache_generation.load(Ordering::SeqCst);
+
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &root.join("reader.rs"), "reader.rs", true);
+        }
+
+        let index = state.index.read().unwrap();
+        assert!(index.reader_has_path("reader.rs"));
+        assert!(!index.live.has_path("reader.rs"));
+        assert!(!index.live.is_deleted("reader.rs"));
+        assert_eq!(index.live.dirty_count(), 0);
+        drop(index);
+        assert!(
+            !state
+                .filename_extra_paths
+                .read()
+                .unwrap()
+                .contains("reader.rs")
+        );
+        assert!(state.cache.read().unwrap().peek("reader.rs").is_none());
+        assert!(state.cache_generation.load(Ordering::SeqCst) > generation);
+        assert_eq!(
+            state.file_evidence.read().unwrap().content_id("reader.rs"),
+            Some(content_id)
+        );
+        assert_eq!(state.recent_reindexes.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn reader_suppression_compares_exact_decoded_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        let old_raw = b"fn lossy_reader() {}\n\xc0";
+        let new_raw = b"fn lossy_reader() {}\n\xc1";
+        assert_eq!(
+            tgrep_core::encoding::decode_for_index(old_raw),
+            tgrep_core::encoding::decode_for_index(new_raw)
+        );
+        install_reader_file(&state, &root, &index_dir, "lossy.rs", old_raw);
+        std::fs::write(root.join("lossy.rs"), new_raw).unwrap();
+
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &root.join("lossy.rs"), "lossy.rs", true);
+        }
+
+        let index = state.index.read().unwrap();
+        assert!(index.reader_has_path("lossy.rs"));
+        assert!(!index.live.has_path("lossy.rs"));
+        assert_eq!(index.live.dirty_count(), 0);
+    }
+
+    #[test]
+    fn reader_identity_mismatch_missing_or_malformed_evidence_commits_overlay() {
+        for (name, evidence_kind) in [
+            ("different.rs", "mismatch"),
+            ("legacy.rs", "missing"),
+            ("corrupt.rs", "malformed"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let index_dir = root.join(".tgrep");
+            let state = test_server_state(&root, &index_dir);
+            let old_bytes = b"fn old_reader_marker() {}\n";
+            install_reader_file(&state, &root, &index_dir, name, old_bytes);
+            match evidence_kind {
+                "mismatch" => {
+                    let new_bytes = b"fn new_reader_marker() {}\n";
+                    assert_eq!(old_bytes.len(), new_bytes.len());
+                    std::fs::write(root.join(name), new_bytes).unwrap();
+                }
+                "missing" => {
+                    state
+                        .file_evidence
+                        .write()
+                        .unwrap()
+                        .content_ids
+                        .remove(name);
+                }
+                "malformed" => {
+                    let stamp = state
+                        .file_evidence
+                        .read()
+                        .unwrap()
+                        .stamp(name)
+                        .unwrap()
+                        .clone();
+                    std::fs::write(
+                        index_dir.join(EVIDENCE_FILE_NAME),
+                        serde_json::to_vec(&serde_json::json!({
+                            (name): {"mtime": stamp.mtime, "size": stamp.size, "c": "bad"}
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    *state.file_evidence.write().unwrap() =
+                        tgrep_core::meta::read_file_evidence(&index_dir).unwrap();
+                    assert_eq!(state.file_evidence.read().unwrap().content_id(name), None);
+                }
+                _ => unreachable!(),
+            }
+
+            {
+                let _gate = state.snapshot_gate.read().unwrap();
+                reindex_file(&state, &root.join(name), name, true);
+            }
+
+            let index = state.index.read().unwrap();
+            assert!(index.live.has_path(name));
+            assert_eq!(index.live.dirty_count(), 1);
+        }
+    }
+
+    #[test]
+    fn active_overlay_and_tombstone_prevent_reader_identity_suppression() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let index_dir = root.join(".tgrep");
+        let state = test_server_state(&root, &index_dir);
+        let path = root.join("reader.rs");
+        let bytes = b"fn reader_identity_marker() {}\n";
+        install_reader_file(&state, &root, &index_dir, "reader.rs", bytes);
+
+        let overlay_id = {
+            let mut index = state.index.write().unwrap();
+            index.live.upsert_file("reader.rs", bytes);
+            index.live.file_id_for_path("reader.rs").unwrap()
+        };
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "reader.rs", true);
+        }
+        let replaced_id = state
+            .index
+            .read()
+            .unwrap()
+            .live
+            .file_id_for_path("reader.rs")
+            .unwrap();
+        assert_ne!(replaced_id, overlay_id);
+
+        {
+            let mut index = state.index.write().unwrap();
+            index.live.delete_file("reader.rs");
+            assert!(index.live.is_deleted("reader.rs"));
+        }
+        let dirty_before = state.index.read().unwrap().live.dirty_count();
+        {
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, "reader.rs", true);
+        }
+        let index = state.index.read().unwrap();
+        assert!(index.live.has_path("reader.rs"));
+        assert!(!index.live.is_deleted("reader.rs"));
+        assert_eq!(index.live.dirty_count(), dirty_before + 1);
+    }
+
+    #[test]
     fn separate_forced_events_suppress_only_exact_current_overlay_duplicate() {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
@@ -9538,12 +9946,13 @@ mod tests {
             .unwrap()
             .put("same.rs".to_string(), cached(32));
         let generation = state.cache_generation.load(Ordering::SeqCst);
-        state.file_stamps.write().unwrap().insert(
+        state.file_evidence.write().unwrap().insert(
             "same.rs".to_string(),
             tgrep_core::meta::FileStamp {
                 mtime: u64::MAX,
                 size: u64::MAX,
             },
+            None,
         );
 
         {
@@ -9558,7 +9967,7 @@ mod tests {
         assert!(state.cache.read().unwrap().peek("same.rs").is_none());
         assert!(state.cache_generation.load(Ordering::SeqCst) > generation);
         assert_ne!(
-            state.file_stamps.read().unwrap().get("same.rs"),
+            state.file_evidence.read().unwrap().stamp("same.rs"),
             Some(&tgrep_core::meta::FileStamp {
                 mtime: u64::MAX,
                 size: u64::MAX,
@@ -9682,6 +10091,8 @@ mod tests {
 
         reset_to_empty_index(&state, &root, &index_dir);
         assert_eq!(state.recent_reindexes.lock().unwrap().len(), 0);
+        assert!(state.file_evidence.read().unwrap().stamps.is_empty());
+        assert!(state.file_evidence.read().unwrap().content_ids.is_empty());
 
         // The fresh overlay hands out the same first ID, and the file still has
         // the recorded bytes: without the reset this is exactly the pair that
@@ -9735,7 +10146,7 @@ mod tests {
             "bytes invalidated after verification must not be committed"
         );
         assert_eq!(
-            state.file_stamps.read().unwrap().get("raced.rs"),
+            state.file_evidence.read().unwrap().stamp("raced.rs"),
             Some(&tgrep_core::meta::FileStamp {
                 mtime: u64::MAX,
                 size: u64::MAX,
@@ -11384,7 +11795,7 @@ mod tests {
 
         // Indexed, and searchable, but with nothing in the stamp map to say so
         // — as after a seed whose stamps could not be read.
-        state.file_stamps.write().unwrap().remove("seeded.rs");
+        state.file_evidence.write().unwrap().remove("seeded.rs");
         std::fs::remove_file(&path).unwrap();
 
         let swept: std::collections::HashSet<String> = [String::new()].into_iter().collect();
@@ -11911,21 +12322,26 @@ mod tests {
             .unwrap()
             .insert(root.join("moved"), true);
 
-        let published = withhold_stamps_for_deferred(&state, &root, stamps.clone());
+        let id = tgrep_core::meta::ContentId::from_indexed_bytes(b"indexed");
+        let mut evidence = tgrep_core::meta::FileEvidence::from_stamps(stamps.clone());
+        evidence.content_ids = stamps.keys().map(|path| (path.clone(), id)).collect();
+        let published = withhold_evidence_for_deferred(&state, &root, evidence);
         assert!(
-            published.contains_key("quiet.rs"),
+            published.stamps.contains_key("quiet.rs"),
             "a file nothing touched keeps its stamp, or the build re-reads the repository"
         );
+        assert_eq!(published.content_id("quiet.rs"), Some(id));
         assert!(
-            !published.contains_key("racy.rs"),
+            !published.stamps.contains_key("racy.rs") && published.content_id("racy.rs").is_none(),
             "a file whose event is waiting to be replayed must not be stamped as indexed"
         );
         assert!(
-            !published.contains_key("moved/deep.rs"),
+            !published.stamps.contains_key("moved/deep.rs")
+                && published.content_id("moved/deep.rs").is_none(),
             "a directory event must withhold stamps for every descendant the subtree replay covers"
         );
         assert!(
-            published.contains_key("moved-aside.rs"),
+            published.stamps.contains_key("moved-aside.rs"),
             "directory-prefix matching must not withhold similarly named siblings"
         );
 
@@ -11933,7 +12349,13 @@ mod tests {
         // told apart from what changed underneath it.
         *state.deferred_events.lock().unwrap() = None;
         assert!(
-            withhold_stamps_for_deferred(&state, &root, stamps).is_empty(),
+            withhold_evidence_for_deferred(
+                &state,
+                &root,
+                tgrep_core::meta::FileEvidence::from_stamps(stamps),
+            )
+            .stamps
+            .is_empty(),
             "with the buffer overflowed no stamp from this build can be trusted"
         );
     }
@@ -12189,6 +12611,45 @@ mod tests {
     }
 
     #[test]
+    fn staged_publication_orders_evidence_after_core_and_before_meta() {
+        let order: Vec<&str> = staged_publish_order().collect();
+        let evidence = order
+            .iter()
+            .position(|name| *name == EVIDENCE_FILE_NAME)
+            .unwrap();
+        let meta = order.iter().position(|name| *name == "meta.json").unwrap();
+        assert!(
+            CORE_INDEX_FILE_NAMES.iter().all(|name| order
+                .iter()
+                .position(|item| item == name)
+                .unwrap()
+                < evidence)
+        );
+        assert!(evidence < meta);
+    }
+
+    #[test]
+    fn staged_publication_without_evidence_removes_active_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join("index.bin"), b"new");
+        write_file(&target.join("index.bin"), b"old");
+        write_file(&target.join(EVIDENCE_FILE_NAME), b"old evidence");
+
+        let mut moved = move_staged_files(&staging, &target).unwrap();
+        moved.commit();
+
+        assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"new");
+        assert!(
+            !target.join(EVIDENCE_FILE_NAME).exists(),
+            "old identities must not pair with a new reader"
+        );
+    }
+
+    #[test]
     fn staged_file_move_rolls_back_replaced_files() {
         let tmp = TempDir::new().unwrap();
         let staging = tmp.path().join("staging");
@@ -12197,12 +12658,21 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         write_file(&staging.join("index.bin"), b"new");
         write_file(&target.join("index.bin"), b"old");
+        write_file(&target.join(EVIDENCE_FILE_NAME), b"old evidence");
 
         let mut moved = move_staged_files(&staging, &target).unwrap();
         assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"new");
+        assert!(
+            !target.join(EVIDENCE_FILE_NAME).exists(),
+            "evidence must be invalidated before core publication"
+        );
         moved.rollback().unwrap();
 
         assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"old");
+        assert_eq!(
+            std::fs::read(target.join(EVIDENCE_FILE_NAME)).unwrap(),
+            b"old evidence"
+        );
     }
 
     #[test]

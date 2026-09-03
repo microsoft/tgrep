@@ -52,6 +52,14 @@ const WATCHER_QUEUE_CAP: usize = 16_384;
 /// reconciling stale check runs.
 const WATCHER_IDLE_POLL: Duration = Duration::from_secs(1);
 
+/// Native backends commonly report one logical save as several adjacent
+/// notifications. Wait briefly for that burst to settle, but cap both its
+/// duration and size so unrelated sustained traffic keeps making progress.
+const WATCHER_BURST_QUIET: Duration = Duration::from_millis(25);
+const WATCHER_BURST_MAX: Duration = Duration::from_millis(100);
+const WATCHER_BURST_EVENT_CAP: usize = 1024;
+const WATCHER_BURST_PATH_CAP: usize = 4096;
+
 /// Git's index is hidden from the repository watcher. Poll its metadata only
 /// when the case-insensitive tracked-file exemption is active.
 const TRACKED_INDEX_POLL: Duration = Duration::from_secs(2);
@@ -1998,6 +2006,139 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
     json_rpc_result(id, serde_json::json!({"status": "reloaded"}))
 }
 
+/// One final-state check for a path in a native notification burst.
+///
+/// `handle_fs_event` only needs to know whether an event kind could introduce
+/// a directory; it classifies removals from the filesystem. Keeping that bit
+/// lets create/rename notifications retain subtree handling while duplicate
+/// writes collapse to one forced read. Paths remain separate because an ignore
+/// rules path returns early from `handle_fs_event`.
+#[derive(Debug, PartialEq, Eq)]
+struct CoalescedFsEvent {
+    path: PathBuf,
+    introduces_dir: bool,
+}
+
+impl CoalescedFsEvent {
+    fn into_event(self) -> Event {
+        let kind = if self.introduces_dir {
+            EventKind::Create(notify::event::CreateKind::Any)
+        } else {
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            ))
+        };
+        Event {
+            kind,
+            paths: vec![self.path],
+            attrs: Default::default(),
+        }
+    }
+}
+
+struct FsEventBurst {
+    paths: Vec<CoalescedFsEvent>,
+    path_indices: std::collections::HashMap<PathBuf, usize>,
+    event_count: usize,
+    event_cap: usize,
+    path_cap: usize,
+}
+
+impl FsEventBurst {
+    fn new(first: Event) -> Self {
+        Self::with_limits(first, WATCHER_BURST_EVENT_CAP, WATCHER_BURST_PATH_CAP)
+    }
+
+    fn with_limits(first: Event, event_cap: usize, path_cap: usize) -> Self {
+        let mut burst = Self {
+            paths: Vec::new(),
+            path_indices: std::collections::HashMap::new(),
+            event_count: 0,
+            event_cap,
+            path_cap,
+        };
+        // One native event is indivisible. Accept it even if it alone exceeds
+        // the path cap; later events remain queued for the next bounded burst.
+        burst.push(first);
+        burst
+    }
+
+    fn try_push(&mut self, event: Event) -> Result<(), Event> {
+        if self.event_count >= self.event_cap {
+            return Err(event);
+        }
+
+        let additional_paths = event
+            .paths
+            .iter()
+            .filter(|path| !self.path_indices.contains_key(*path))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if self.paths.len().saturating_add(additional_paths) > self.path_cap {
+            return Err(event);
+        }
+
+        self.push(event);
+        Ok(())
+    }
+
+    fn push(&mut self, event: Event) {
+        self.event_count += 1;
+        if !matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ) {
+            return;
+        }
+
+        let introduces_dir = event_introduces_dir(&event.kind);
+        for path in event.paths {
+            if let Some(index) = self.path_indices.get(&path).copied() {
+                self.paths[index].introduces_dir |= introduces_dir;
+            } else {
+                let index = self.paths.len();
+                self.path_indices.insert(path.clone(), index);
+                self.paths.push(CoalescedFsEvent {
+                    path,
+                    introduces_dir,
+                });
+            }
+        }
+    }
+
+    fn into_paths(self) -> Vec<CoalescedFsEvent> {
+        self.paths
+    }
+}
+
+fn event_introduces_dir(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    )
+}
+
+fn recover_watcher_overflow(
+    state: &Arc<ServerState>,
+    root: &Path,
+    index_dir: &Path,
+    overflowed: &std::sync::atomic::AtomicBool,
+    queue_cap: usize,
+) {
+    if state.indexing.load(Ordering::SeqCst)
+        || state.gitignore_pending.load(Ordering::SeqCst)
+        || !overflowed.swap(false, Ordering::SeqCst)
+    {
+        return;
+    }
+
+    eprintln!("[trace] watcher queue overflowed (cap {queue_cap}); reconciling with a stale check");
+    if !background_refresh_stale(state, root, index_dir, false) {
+        overflowed.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
 fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) -> bool {
     use std::sync::mpsc::{RecvTimeoutError, TrySendError};
 
@@ -2104,6 +2245,7 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
         .name("tgrep-watcher".into())
         .spawn(move || {
             let mut last_tracked_index_poll = Instant::now();
+            let mut pending_event = None;
             loop {
                 if last_tracked_index_poll.elapsed() >= TRACKED_INDEX_POLL {
                     last_tracked_index_poll = Instant::now();
@@ -2121,38 +2263,63 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
                         );
                     }
                 }
-                match rx.recv_timeout(WATCHER_IDLE_POLL) {
-                    Ok(event) => handle_fs_event(&worker_state, &worker_root, &event),
-                    // A quiet interval means the burst has drained, so this is
-                    // the point to repair an overflow: reconciling earlier
-                    // would run a full stale check while events are still
-                    // queued behind it, and repeat for each one.
-                    Err(RecvTimeoutError::Timeout) => {
-                        if !overflowed.load(Ordering::SeqCst) {
-                            continue;
+                let received = match pending_event.take() {
+                    Some(event) => Ok(event),
+                    None => rx.recv_timeout(WATCHER_IDLE_POLL),
+                };
+                match received {
+                    Ok(event) => {
+                        let started = Instant::now();
+                        let mut burst = FsEventBurst::new(event);
+                        let mut disconnected = false;
+                        // A quiet gap normally closes a save burst. The hard
+                        // deadline and collection caps ensure continuous or
+                        // high-cardinality traffic is processed in slices.
+                        loop {
+                            let remaining = WATCHER_BURST_MAX.saturating_sub(started.elapsed());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            match rx.recv_timeout(std::cmp::min(WATCHER_BURST_QUIET, remaining)) {
+                                Ok(event) => {
+                                    if let Err(event) = burst.try_push(event) {
+                                        pending_event = Some(event);
+                                        break;
+                                    }
+                                }
+                                Err(RecvTimeoutError::Timeout) => break,
+                                Err(RecvTimeoutError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
                         }
-                        // An index build or a pending matcher ends with its own
-                        // stale check, which reconciles the same drift. Leave
-                        // the flag set and let that run instead of racing it.
-                        if worker_state.indexing.load(Ordering::SeqCst)
-                            || worker_state.gitignore_pending.load(Ordering::SeqCst)
-                        {
-                            continue;
+                        for event in burst.into_paths() {
+                            handle_fs_event(&worker_state, &worker_root, &event.into_event());
                         }
-                        overflowed.store(false, Ordering::SeqCst);
-                        eprintln!(
-                            "[trace] watcher queue overflowed (cap {queue_cap}); \
-                             reconciling with a stale check"
-                        );
-                        if !background_refresh_stale(
+                        if disconnected {
+                            break;
+                        }
+                        // Do not require a fully idle second to repair dropped
+                        // events: sustained traffic may never provide one.
+                        recover_watcher_overflow(
                             &worker_state,
                             &worker_root,
                             &worker_index_dir,
-                            false,
-                        ) {
-                            overflowed.store(true, Ordering::SeqCst);
-                            thread::sleep(Duration::from_secs(1));
-                        }
+                            &overflowed,
+                            queue_cap,
+                        );
+                    }
+                    // A fully idle interval is another opportunity to repair
+                    // an overflow left pending by a build or matcher refresh.
+                    Err(RecvTimeoutError::Timeout) => {
+                        recover_watcher_overflow(
+                            &worker_state,
+                            &worker_root,
+                            &worker_index_dir,
+                            &overflowed,
+                            queue_cap,
+                        );
                     }
                     // The watcher was dropped, so the server is shutting down.
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -3543,10 +3710,7 @@ fn defer_events_during_build(state: &ServerState, event: &Event) -> bool {
     }
     // Only these kinds can put a directory somewhere, and only they should
     // trigger a subtree walk on replay. See `ServerState::deferred_events`.
-    let introduces_dir = matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
-    );
+    let introduces_dir = event_introduces_dir(&event.kind);
     for path in &event.paths {
         // A path seen both ways keeps the stronger claim: a directory that was
         // created and then chmod'd still needs its subtree picked up.
@@ -3905,10 +4069,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
                 // on the single watcher worker, turning a linear operation into
                 // quadratic work. inotify announces a new directory as `Create`
                 // and one moved in as `Modify(Name)`; nothing else can.
-                let introduces_dir = matches!(
-                    event.kind,
-                    EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Name(_))
-                );
+                let introduces_dir = event_introduces_dir(&event.kind);
                 if introduces_dir {
                     // A directory that just appeared can already be full — a
                     // `mv` of a populated tree from outside the root, a
@@ -6959,6 +7120,139 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn watcher_event(kind: EventKind, paths: &[&str]) -> Event {
+        Event {
+            kind,
+            paths: paths.iter().map(PathBuf::from).collect(),
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn watcher_burst_coalesces_duplicate_paths() {
+        let mut burst = FsEventBurst::new(watcher_event(
+            EventKind::Modify(notify::event::ModifyKind::Any),
+            &["src/lib.rs"],
+        ));
+        burst
+            .try_push(watcher_event(
+                EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Content,
+                )),
+                &["src/lib.rs"],
+            ))
+            .unwrap();
+
+        assert_eq!(
+            burst.into_paths(),
+            vec![CoalescedFsEvent {
+                path: PathBuf::from("src/lib.rs"),
+                introduces_dir: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn watcher_burst_preserves_distinct_path_order() {
+        let mut burst = FsEventBurst::new(watcher_event(
+            EventKind::Modify(notify::event::ModifyKind::Any),
+            &["src/b.rs", "src/a.rs"],
+        ));
+        burst
+            .try_push(watcher_event(
+                EventKind::Create(notify::event::CreateKind::File),
+                &["src/c.rs", "src/a.rs"],
+            ))
+            .unwrap();
+
+        assert_eq!(
+            burst
+                .into_paths()
+                .into_iter()
+                .map(|event| event.path)
+                .collect::<Vec<_>>(),
+            [
+                PathBuf::from("src/b.rs"),
+                PathBuf::from("src/a.rs"),
+                PathBuf::from("src/c.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn watcher_burst_preserves_directory_introduction() {
+        let mut burst = FsEventBurst::new(watcher_event(
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            &["vendor"],
+        ));
+        burst
+            .try_push(watcher_event(
+                EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::To,
+                )),
+                &["vendor"],
+            ))
+            .unwrap();
+        burst
+            .try_push(watcher_event(
+                EventKind::Modify(notify::event::ModifyKind::Metadata(
+                    notify::event::MetadataKind::Any,
+                )),
+                &["vendor"],
+            ))
+            .unwrap();
+
+        assert_eq!(
+            burst.into_paths(),
+            vec![CoalescedFsEvent {
+                path: PathBuf::from("vendor"),
+                introduces_dir: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn watcher_burst_stops_at_configured_bounds_without_losing_next_event() {
+        let mut event_limited = FsEventBurst::with_limits(
+            watcher_event(EventKind::Modify(notify::event::ModifyKind::Any), &["a.rs"]),
+            2,
+            10,
+        );
+        event_limited
+            .try_push(watcher_event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                &["b.rs"],
+            ))
+            .unwrap();
+        let rejected = event_limited
+            .try_push(watcher_event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                &["c.rs"],
+            ))
+            .unwrap_err();
+        assert_eq!(rejected.paths, vec![PathBuf::from("c.rs")]);
+        assert_eq!(event_limited.into_paths().len(), 2);
+
+        let mut path_limited = FsEventBurst::with_limits(
+            watcher_event(EventKind::Modify(notify::event::ModifyKind::Any), &["a.rs"]),
+            10,
+            2,
+        );
+        let rejected = path_limited
+            .try_push(watcher_event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                &["b.rs", "c.rs"],
+            ))
+            .unwrap_err();
+        assert_eq!(
+            rejected.paths,
+            [PathBuf::from("b.rs"), PathBuf::from("c.rs")]
+        );
+        assert_eq!(path_limited.into_paths().len(), 1);
+    }
 
     fn cached(len: usize) -> Arc<DecodedFile> {
         // `String::from_utf8` preserves the Vec's capacity, so `heap_bytes`

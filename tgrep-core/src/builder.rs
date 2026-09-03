@@ -403,7 +403,7 @@ impl Drop for OwnedReadPermit {
     }
 }
 
-type ExtractedFile = (String, trigram::TrigramMaskMap);
+type ExtractedFile = (String, trigram::TrigramMaskMap, meta::ContentId);
 
 /// Full-resolution identity used to validate that bytes came from one file
 /// version without changing the persisted [`meta::FileStamp`] format.
@@ -605,6 +605,9 @@ pub fn build_index_with_options_and_ignorecase(
         None => root.join(INDEX_DIR_NAME),
     };
     std::fs::create_dir_all(&index_dir)?;
+    // Evidence belongs to the complete core generation. Invalidate it before
+    // an in-place writer can truncate any core file.
+    meta::remove_file_evidence(&index_dir)?;
     // A failed in-place rebuild must not leave a valid-looking sidecar from a
     // previous generation. Its absence makes `--files` fall back to walking.
     path_index::remove_extra_paths(&index_dir)?;
@@ -647,6 +650,7 @@ pub fn build_index_with_options_and_ignorecase(
     // bounding each batch by cumulative bytes caps how much raw file content is
     // resident at once, since the whole batch is read concurrently.
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
+    let mut content_ids = HashMap::with_capacity(walk.files.len());
     let mut sink = match opts.strategy {
         IndexStrategy::InMemory => PostingSink::InMemory(Vec::new()),
         IndexStrategy::External => {
@@ -688,12 +692,14 @@ pub fn build_index_with_options_and_ignorecase(
                     .to_string_lossy()
                     .replace('\\', "/");
                 let per_tri = trigram::extract_merged_masks(&text);
-                Some((rel, per_tri))
+                let content_id = meta::ContentId::from_indexed_bytes(&text);
+                Some((rel, per_tri, content_id))
             })
             .collect();
 
-        for (path, per_tri) in batch_data {
+        for (path, per_tri, content_id) in batch_data {
             let file_id = file_id_map.len() as u32;
+            content_ids.insert(path.clone(), content_id);
             file_id_map.push((file_id, path));
             sink.push_file(file_id, per_tri)?;
         }
@@ -742,7 +748,9 @@ pub fn build_index_with_options_and_ignorecase(
     }
     let all_walked = walked_paths_for_stamps(&root, &walk.files, &raced_too_large);
     let stamps = meta::collect_filestamps(&root, &all_walked);
-    meta::write_filestamps(&stamps, &index_dir)?;
+    let mut evidence = meta::FileEvidence::from_stamps(stamps);
+    content_ids.retain(|path, _| evidence.stamps.contains_key(path));
+    evidence.content_ids = content_ids;
 
     let indexed_paths: HashSet<&str> = file_id_map.iter().map(|(_, path)| path.as_str()).collect();
     let mut extra_paths: Vec<String> = walk
@@ -754,6 +762,7 @@ pub fn build_index_with_options_and_ignorecase(
         .collect();
     extra_paths.sort_unstable();
     path_index::write_extra_paths(&index_dir, &extra_paths)?;
+    meta::write_file_evidence(&evidence, &index_dir)?;
     // `meta.json` remains the final publication marker for in-place builds.
     IndexMeta::load(&index_dir)?.save(&index_dir)?;
 
@@ -783,6 +792,8 @@ pub struct FileDeltaOutcome {
     /// Binary files are *not* listed here. They are skipped deliberately and
     /// permanently, so their stamps should be published as normal.
     pub unreadable: Vec<std::path::PathBuf>,
+    /// Identities of the decoded bytes that produced successful text entries.
+    pub content_ids: HashMap<String, meta::ContentId>,
 }
 
 /// Build an external-sort index for an exact list of absolute file paths.
@@ -812,6 +823,7 @@ pub fn build_index_for_files(
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(files.len());
     let mut sorter = ExternalSorter::new(index_dir, buffer_bytes);
     let mut unreadable: Vec<std::path::PathBuf> = Vec::new();
+    let mut content_ids = HashMap::with_capacity(files.len());
 
     for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
         let batch = &files[range.clone()];
@@ -838,12 +850,16 @@ pub fn build_index_for_files(
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                Some(Ok((rel, trigram::extract_merged_masks(&text))))
+                Some(Ok((
+                    rel,
+                    trigram::extract_merged_masks(&text),
+                    meta::ContentId::from_indexed_bytes(&text),
+                )))
             })
             .collect();
 
         for entry in batch_data {
-            let (path, per_tri) = match entry {
+            let (path, per_tri, content_id) = match entry {
                 Ok(extracted) => extracted,
                 Err(skipped) => {
                     unreadable.push(skipped);
@@ -853,6 +869,7 @@ pub fn build_index_for_files(
             let file_id = u32::try_from(file_id_map.len()).map_err(|_| {
                 Error::IndexCorrupted("file count exceeds the u32 file-id limit".into())
             })?;
+            content_ids.insert(path.clone(), content_id);
             file_id_map.push((file_id, path));
             sorter.push_file(file_id, per_tri)?;
         }
@@ -870,6 +887,7 @@ pub fn build_index_for_files(
     Ok(FileDeltaOutcome {
         indexed: file_id_map.len(),
         unreadable,
+        content_ids,
     })
 }
 
@@ -1551,6 +1569,67 @@ mod tests {
         assert_eq!(
             walked_paths_for_stamps(&root, &[kept, skipped], &excluded),
             vec!["kept.rs"]
+        );
+    }
+
+    #[test]
+    fn full_builder_records_exact_decoded_identity_for_text_only() {
+        let repo = tempfile::tempdir().unwrap();
+        let text_path = repo.path().join("text.rs");
+        let binary_path = repo.path().join("binary.rs");
+        let raw_text = b"fn decoded_identity() {}\n\xff";
+        std::fs::write(&text_path, raw_text).unwrap();
+        std::fs::write(&binary_path, b"text prefix\0binary tail").unwrap();
+
+        for strategy in [IndexStrategy::InMemory, IndexStrategy::External] {
+            let index = tempfile::tempdir().unwrap();
+            build_index_with_options(
+                repo.path(),
+                Some(index.path()),
+                &BuildOptions {
+                    strategy,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let evidence = meta::read_file_evidence(index.path()).unwrap();
+            let decoded = crate::encoding::decode_for_index(raw_text);
+            assert_eq!(
+                evidence.content_id("text.rs"),
+                Some(meta::ContentId::from_indexed_bytes(&decoded))
+            );
+            assert_eq!(evidence.content_id("binary.rs"), None);
+        }
+    }
+
+    #[test]
+    fn direct_rebuild_invalidates_old_evidence_before_core_writes() {
+        let repo = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("text.rs"), "fn text() {}\n").unwrap();
+        let mut old = meta::FileEvidence::default();
+        old.insert(
+            "old.rs".to_string(),
+            meta::FileStamp { mtime: 1, size: 2 },
+            Some(meta::ContentId::from_indexed_bytes(b"old")),
+        );
+        meta::write_file_evidence(&old, index.path()).unwrap();
+        std::fs::create_dir(index.path().join("index.bin")).unwrap();
+
+        let result = build_index_with_options(
+            repo.path(),
+            Some(index.path()),
+            &BuildOptions {
+                strategy: IndexStrategy::InMemory,
+                ..Default::default()
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(
+            !index.path().join("filestamps.json").exists(),
+            "old evidence must be gone before a core output can fail"
         );
     }
 
@@ -2317,6 +2396,10 @@ mod tests {
             "the readable file must still be indexed"
         );
         assert_eq!(outcome.unreadable, vec![missing]);
+        assert_eq!(
+            outcome.content_ids.get("present.txt"),
+            Some(&meta::ContentId::from_indexed_bytes(b"needle one\n"))
+        );
 
         // The delta is usable, not a half-written casualty of the failure.
         let reader = IndexReader::open(delta.path()).unwrap();
@@ -2344,6 +2427,7 @@ mod tests {
 
         assert_eq!(outcome.indexed, 0);
         assert!(outcome.unreadable.is_empty());
+        assert!(outcome.content_ids.is_empty());
     }
 
     #[test]

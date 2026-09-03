@@ -2045,10 +2045,6 @@ struct FsEventBurst {
 }
 
 impl FsEventBurst {
-    fn new(first: Event) -> Self {
-        Self::with_limits(first, WATCHER_BURST_EVENT_CAP, WATCHER_BURST_PATH_CAP)
-    }
-
     fn with_limits(first: Event, event_cap: usize, path_cap: usize) -> Self {
         let mut burst = Self {
             paths: Vec::new(),
@@ -2118,6 +2114,80 @@ fn event_introduces_dir(kind: &EventKind) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+struct WatcherReceiveOptions {
+    idle: Duration,
+    quiet: Duration,
+    max: Duration,
+    event_cap: usize,
+    path_cap: usize,
+}
+
+const WATCHER_RECEIVE_OPTIONS: WatcherReceiveOptions = WatcherReceiveOptions {
+    idle: WATCHER_IDLE_POLL,
+    quiet: WATCHER_BURST_QUIET,
+    max: WATCHER_BURST_MAX,
+    event_cap: WATCHER_BURST_EVENT_CAP,
+    path_cap: WATCHER_BURST_PATH_CAP,
+};
+
+#[derive(Debug, PartialEq, Eq)]
+enum WatcherReceive {
+    Idle,
+    Disconnected,
+    Burst {
+        paths: Vec<CoalescedFsEvent>,
+        disconnected: bool,
+    },
+}
+
+/// Receive one bounded native-event burst, preserving a cap-rejected event for
+/// the next call rather than dropping or reordering it.
+fn receive_watcher_burst(
+    rx: &std::sync::mpsc::Receiver<Event>,
+    pending_event: &mut Option<Event>,
+    options: WatcherReceiveOptions,
+) -> WatcherReceive {
+    let first = match pending_event.take() {
+        Some(event) => event,
+        None => match rx.recv_timeout(options.idle) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return WatcherReceive::Idle,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return WatcherReceive::Disconnected;
+            }
+        },
+    };
+
+    let started = Instant::now();
+    let mut burst = FsEventBurst::with_limits(first, options.event_cap, options.path_cap);
+    let mut disconnected = false;
+    loop {
+        let remaining = options.max.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(std::cmp::min(options.quiet, remaining)) {
+            Ok(event) => {
+                if let Err(event) = burst.try_push(event) {
+                    *pending_event = Some(event);
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+
+    WatcherReceive::Burst {
+        paths: burst.into_paths(),
+        disconnected,
+    }
+}
+
 fn recover_watcher_overflow(
     state: &Arc<ServerState>,
     root: &Path,
@@ -2140,7 +2210,7 @@ fn recover_watcher_overflow(
 }
 
 fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) -> bool {
-    use std::sync::mpsc::{RecvTimeoutError, TrySendError};
+    use std::sync::mpsc::TrySendError;
 
     let root_path = root.to_path_buf();
 
@@ -2263,38 +2333,12 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
                         );
                     }
                 }
-                let received = match pending_event.take() {
-                    Some(event) => Ok(event),
-                    None => rx.recv_timeout(WATCHER_IDLE_POLL),
-                };
-                match received {
-                    Ok(event) => {
-                        let started = Instant::now();
-                        let mut burst = FsEventBurst::new(event);
-                        let mut disconnected = false;
-                        // A quiet gap normally closes a save burst. The hard
-                        // deadline and collection caps ensure continuous or
-                        // high-cardinality traffic is processed in slices.
-                        loop {
-                            let remaining = WATCHER_BURST_MAX.saturating_sub(started.elapsed());
-                            if remaining.is_zero() {
-                                break;
-                            }
-                            match rx.recv_timeout(std::cmp::min(WATCHER_BURST_QUIET, remaining)) {
-                                Ok(event) => {
-                                    if let Err(event) = burst.try_push(event) {
-                                        pending_event = Some(event);
-                                        break;
-                                    }
-                                }
-                                Err(RecvTimeoutError::Timeout) => break,
-                                Err(RecvTimeoutError::Disconnected) => {
-                                    disconnected = true;
-                                    break;
-                                }
-                            }
-                        }
-                        for event in burst.into_paths() {
+                match receive_watcher_burst(&rx, &mut pending_event, WATCHER_RECEIVE_OPTIONS) {
+                    WatcherReceive::Burst {
+                        paths,
+                        disconnected,
+                    } => {
+                        for event in paths {
                             handle_fs_event(&worker_state, &worker_root, &event.into_event());
                         }
                         if disconnected {
@@ -2304,7 +2348,7 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
                     // A fully idle interval proves the queued backlog has
                     // drained. Recover only here so an overflowing burst causes
                     // one stale check, not one after every capped batch.
-                    Err(RecvTimeoutError::Timeout) => {
+                    WatcherReceive::Idle => {
                         recover_watcher_overflow(
                             &worker_state,
                             &worker_root,
@@ -2314,7 +2358,7 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
                         );
                     }
                     // The watcher was dropped, so the server is shutting down.
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    WatcherReceive::Disconnected => break,
                 }
             }
         })
@@ -7121,36 +7165,139 @@ mod tests {
         }
     }
 
+    fn watcher_receive_options(
+        max: Duration,
+        event_cap: usize,
+        path_cap: usize,
+    ) -> WatcherReceiveOptions {
+        WatcherReceiveOptions {
+            idle: Duration::ZERO,
+            quiet: Duration::ZERO,
+            max,
+            event_cap,
+            path_cap,
+        }
+    }
+
     #[test]
-    fn watcher_burst_coalesces_duplicate_paths() {
-        let mut burst = FsEventBurst::new(watcher_event(
+    fn watcher_receiver_coalesces_prequeued_duplicate_paths() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        tx.send(watcher_event(
             EventKind::Modify(notify::event::ModifyKind::Any),
             &["src/lib.rs"],
-        ));
-        burst
-            .try_push(watcher_event(
+        ))
+        .unwrap();
+        tx.send(watcher_event(
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            &["src/lib.rs"],
+        ))
+        .unwrap();
+
+        let mut pending = None;
+        assert_eq!(
+            receive_watcher_burst(
+                &rx,
+                &mut pending,
+                watcher_receive_options(Duration::from_secs(1), 10, 10),
+            ),
+            WatcherReceive::Burst {
+                paths: vec![CoalescedFsEvent {
+                    path: PathBuf::from("src/lib.rs"),
+                    introduces_dir: false,
+                }],
+                disconnected: false,
+            }
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn watcher_receiver_preserves_cap_rejection_for_next_call() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(3);
+        for path in ["a.rs", "b.rs", "c.rs"] {
+            tx.send(watcher_event(
                 EventKind::Modify(notify::event::ModifyKind::Data(
                     notify::event::DataChange::Content,
                 )),
-                &["src/lib.rs"],
+                &[path],
             ))
             .unwrap();
+        }
+        let options = watcher_receive_options(Duration::from_secs(1), 1, 10);
+        let mut pending = None;
 
         assert_eq!(
-            burst.into_paths(),
-            vec![CoalescedFsEvent {
-                path: PathBuf::from("src/lib.rs"),
-                introduces_dir: false,
-            }]
+            receive_watcher_burst(&rx, &mut pending, options),
+            WatcherReceive::Burst {
+                paths: vec![CoalescedFsEvent {
+                    path: PathBuf::from("a.rs"),
+                    introduces_dir: false,
+                }],
+                disconnected: false,
+            }
+        );
+        assert_eq!(pending.as_ref().unwrap().paths, [PathBuf::from("b.rs")]);
+        assert_eq!(
+            receive_watcher_burst(&rx, &mut pending, options),
+            WatcherReceive::Burst {
+                paths: vec![CoalescedFsEvent {
+                    path: PathBuf::from("b.rs"),
+                    introduces_dir: false,
+                }],
+                disconnected: false,
+            }
+        );
+        assert_eq!(pending.as_ref().unwrap().paths, [PathBuf::from("c.rs")]);
+    }
+
+    #[test]
+    fn watcher_receiver_zero_max_leaves_next_event_queued() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        for path in ["a.rs", "b.rs"] {
+            tx.send(watcher_event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                &[path],
+            ))
+            .unwrap();
+        }
+        let options = watcher_receive_options(Duration::ZERO, 10, 10);
+        let mut pending = None;
+
+        assert_eq!(
+            receive_watcher_burst(&rx, &mut pending, options),
+            WatcherReceive::Burst {
+                paths: vec![CoalescedFsEvent {
+                    path: PathBuf::from("a.rs"),
+                    introduces_dir: false,
+                }],
+                disconnected: false,
+            }
+        );
+        assert!(pending.is_none());
+        assert_eq!(
+            receive_watcher_burst(&rx, &mut pending, options),
+            WatcherReceive::Burst {
+                paths: vec![CoalescedFsEvent {
+                    path: PathBuf::from("b.rs"),
+                    introduces_dir: false,
+                }],
+                disconnected: false,
+            }
         );
     }
 
     #[test]
     fn watcher_burst_preserves_distinct_path_order() {
-        let mut burst = FsEventBurst::new(watcher_event(
-            EventKind::Modify(notify::event::ModifyKind::Any),
-            &["src/b.rs", "src/a.rs"],
-        ));
+        let mut burst = FsEventBurst::with_limits(
+            watcher_event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                &["src/b.rs", "src/a.rs"],
+            ),
+            WATCHER_BURST_EVENT_CAP,
+            WATCHER_BURST_PATH_CAP,
+        );
         burst
             .try_push(watcher_event(
                 EventKind::Create(notify::event::CreateKind::File),
@@ -7174,12 +7321,16 @@ mod tests {
 
     #[test]
     fn watcher_burst_preserves_directory_introduction() {
-        let mut burst = FsEventBurst::new(watcher_event(
-            EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Any,
-            )),
-            &["vendor"],
-        ));
+        let mut burst = FsEventBurst::with_limits(
+            watcher_event(
+                EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )),
+                &["vendor"],
+            ),
+            WATCHER_BURST_EVENT_CAP,
+            WATCHER_BURST_PATH_CAP,
+        );
         burst
             .try_push(watcher_event(
                 EventKind::Modify(notify::event::ModifyKind::Name(

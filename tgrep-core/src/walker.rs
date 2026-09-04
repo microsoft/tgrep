@@ -44,12 +44,12 @@ pub const DEFAULT_MAX_FILE_SIZE: Option<u64> = Some(64 * 1024 * 1024);
 
 /// Binary extensions that can be rejected without reading file content.
 const BINARY_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg", "tiff", "tif", "psd", "raw", "mp3",
-    "mp4", "avi", "mkv", "mov", "wav", "flac", "ogg", "wma", "aac", "m4a", "webm", "zip", "tar",
-    "gz", "bz2", "xz", "zst", "7z", "rar", "lz4", "lzma", "cab", "exe", "dll", "so", "dylib",
-    "obj", "o", "a", "lib", "pdb", "wasm", "class", "jar", "pyc", "pyo", "beam", "pdf", "doc",
-    "docx", "xls", "xlsx", "ppt", "pptx", "ttf", "otf", "woff", "woff2", "eot", "bin", "dat", "db",
-    "sqlite", "sqlite3",
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff", "tif", "psd", "mp3", "mp4", "avi",
+    "mkv", "mov", "wav", "flac", "ogg", "wma", "aac", "m4a", "webm", "zip", "tar", "gz", "bz2",
+    "xz", "zst", "7z", "rar", "lz4", "lzma", "cab", "exe", "dll", "so", "dylib", "obj", "o", "a",
+    "lib", "pdb", "wasm", "class", "jar", "pyc", "pyo", "beam", "pdf", "doc", "docx", "xls",
+    "xlsx", "ppt", "pptx", "ttf", "otf", "woff", "woff2", "eot", "bin", "dat", "db", "sqlite",
+    "sqlite3",
 ];
 
 /// Number of parallel walker threads (capped at 12 to avoid diminishing returns).

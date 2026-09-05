@@ -705,6 +705,79 @@ fn binary_flag_includes_extension_rejected_files() {
     );
 }
 
+// Extension is not a binary signal on its own. Verified against rg 15.2.0 in a
+// directory holding drawing.svg (XML), notes.raw (text) and photo.raw (NUL at
+// offset 6):
+//   rg needle .        -> drawing.svg and notes.raw match, photo.raw is silent
+//   rg -t svg needle . -> drawing.svg matches
+#[test]
+fn svg_and_raw_are_classified_by_content_on_both_search_paths() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("drawing.svg"),
+        "<svg><text>needle</text></svg>\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("notes.raw"), "needle in plain text\n").unwrap();
+    fs::write(
+        dir.path().join("photo.raw"),
+        b"needle\x00\x01binary\n".as_slice(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("image.png"),
+        "needle behind a binary extension\n",
+    )
+    .unwrap();
+
+    let idx = dir.path().join("idx").to_str().unwrap().to_string();
+    tgrep()
+        .args(["index", dir.path().to_str().unwrap(), "--index-path", &idx])
+        .assert()
+        .success();
+
+    let run = |mode: &[&str]| -> String {
+        let mut args: Vec<&str> = mode.to_vec();
+        args.extend_from_slice(&["--no-heading", "needle", "."]);
+        stdout_of(tgrep().current_dir(dir.path()).args(&args))
+    };
+
+    for (path, out) in [
+        ("brute force", run(&["--no-index"])),
+        ("index", run(&["--index-path", &idx])),
+    ] {
+        assert!(
+            out.contains("drawing.svg"),
+            "{path}: an SVG is XML and must be searched: {out:?}"
+        );
+        assert!(
+            out.contains("notes.raw"),
+            "{path}: text in a .raw file must be searched: {out:?}"
+        );
+        assert!(
+            !out.contains("photo.raw"),
+            "{path}: content detection must still hide a binary .raw: {out:?}"
+        );
+        assert!(
+            !out.contains("image.png"),
+            "{path}: extensions still on the list must stay rejected: {out:?}"
+        );
+    }
+
+    let typed = stdout_of(tgrep().current_dir(dir.path()).args([
+        "--no-index",
+        "--no-heading",
+        "-t",
+        "svg",
+        "needle",
+        ".",
+    ]));
+    assert!(
+        typed.contains("drawing.svg"),
+        "the builtin svg type must be able to match: {typed:?}"
+    );
+}
+
 #[test]
 fn indexed_and_brute_force_agree_on_binary_visibility() {
     let dir = binary_fixture();

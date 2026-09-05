@@ -765,6 +765,12 @@ cd tgrep
 cargo install --path tgrep-cli --locked
 ```
 
+### Homebrew (Linux, macOS)
+
+```bash
+brew install tgrep
+```
+
 ### Pre-built binaries
 
 Download from [GitHub Releases](https://github.com/microsoft/tgrep/releases)

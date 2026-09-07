@@ -496,9 +496,9 @@ fn simplify(plan: QueryPlan) -> QueryPlan {
             // retained query to avoid false negatives — we can't reliably
             // filter on the next byte if the trigram appears in multiple
             // contexts.
-            queries.dedup_by(|retained, duplicate| {
-                if retained.hash == duplicate.hash {
-                    if retained.expected_next != duplicate.expected_next {
+            queries.dedup_by(|removed, retained| {
+                if removed.hash == retained.hash {
+                    if retained.expected_next != removed.expected_next {
                         retained.expected_next = None;
                     }
                     true
@@ -1255,5 +1255,83 @@ mod tests {
             QueryPlan::Or(branches) => assert_eq!(branches.len(), 2),
             other => panic!("expected an OR, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn simplify_clears_next_byte_when_same_trigram_has_two_contexts() {
+        // `dedup_by` passes (removed, retained): the first argument is the
+        // element that gets dropped. Clearing must land on the survivor or
+        // the stale `Some(next)` filters out real matches downstream.
+        let hash = trigram::hash(b'a', b'b', b'c');
+        let plan = simplify(QueryPlan::And(vec![
+            TrigramQuery {
+                hash,
+                expected_next: Some(b'X'),
+            },
+            TrigramQuery {
+                hash,
+                expected_next: Some(b'Y'),
+            },
+        ]));
+        match plan {
+            QueryPlan::And(queries) => {
+                assert_eq!(queries.len(), 1);
+                assert_eq!(
+                    queries[0].expected_next, None,
+                    "same trigram in two contexts must not filter on either next byte"
+                );
+            }
+            other => panic!("expected an AND plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simplify_keeps_next_byte_when_contexts_agree() {
+        let hash = trigram::hash(b'a', b'b', b'c');
+        let plan = simplify(QueryPlan::And(vec![
+            TrigramQuery {
+                hash,
+                expected_next: Some(b'X'),
+            },
+            TrigramQuery {
+                hash,
+                expected_next: Some(b'X'),
+            },
+        ]));
+        match plan {
+            QueryPlan::And(queries) => {
+                assert_eq!(queries.len(), 1);
+                assert_eq!(queries[0].expected_next, Some(b'X'));
+            }
+            other => panic!("expected an AND plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_trigram_with_two_contexts_still_finds_the_file() {
+        // End to end through the masked path: the file only ever has `abc`
+        // followed by `Y`, so a plan that wrongly keeps `Some(b'X')` drops it.
+        let hash = trigram::hash(b'a', b'b', b'c');
+        let plan = simplify(QueryPlan::And(vec![
+            TrigramQuery {
+                hash,
+                expected_next: Some(b'X'),
+            },
+            TrigramQuery {
+                hash,
+                expected_next: Some(b'Y'),
+            },
+        ]));
+        let candidates = execute_plan_with_masks(&plan, &|_| {
+            vec![PostingEntry {
+                file_id: 0,
+                loc_mask: 0xFF,
+                next_mask: trigram::bloom_hash(b'Y'),
+            }]
+        });
+        assert!(
+            candidates.contains(&0),
+            "clearing expected_next must keep the file that matches either context"
+        );
     }
 }

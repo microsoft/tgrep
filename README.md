@@ -3,6 +3,9 @@
 Trigram-indexed grep with a client/server architecture for fast regex search
 in large codebases.
 
+**tgrep is integrated into [GitHub Copilot CLI](https://github.com/github/copilot-cli)
+to power fast grep searches across large repositories.**
+
 ## Why?
 
 Tools like `grep` and `ripgrep` scan every file on every search — O(total bytes)

@@ -779,10 +779,16 @@ brew install tgrep
 Download from [GitHub Releases](https://github.com/microsoft/tgrep/releases)
 for Linux, macOS (Intel & Apple Silicon), and Windows.
 
+The Linux archive is unpacked in a temporary directory so its directory metadata
+cannot affect the existing `~/.local/bin` directory.
+
 ```bash
 # Linux (x86_64)
-gh release download --repo microsoft/tgrep -p '*x86_64-unknown-linux-musl*' -D /tmp/tgrep-dl
-tar xzf /tmp/tgrep-dl/tgrep-*-x86_64-unknown-linux-musl.tar.gz -C ~/.local/bin
+tmpdir="$(mktemp -d)"
+gh release download --repo microsoft/tgrep -p '*x86_64-unknown-linux-musl*' -D "$tmpdir"
+tar xzf "$tmpdir"/tgrep-*-x86_64-unknown-linux-musl.tar.gz -C "$tmpdir"
+install -Dm755 "$tmpdir/tgrep" "$HOME/.local/bin/tgrep"
+rm -rf "$tmpdir"
 
 # macOS (Apple Silicon)
 gh release download --repo microsoft/tgrep -p '*aarch64-apple-darwin*' -D /tmp/tgrep-dl

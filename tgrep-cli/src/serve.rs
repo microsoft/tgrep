@@ -24,6 +24,10 @@ use tgrep_core::builder;
 use tgrep_core::hybrid::HybridIndex;
 use tgrep_core::query;
 
+#[cfg(test)]
+#[path = "serve/poll_tests.rs"]
+mod poll_tests;
+
 const CACHE_CAPACITY: usize = 50_000;
 /// Total decoded bytes the content cache may hold. The entry-count limit above
 /// says nothing about memory; without this a handful of large files can pin
@@ -112,6 +116,55 @@ const RECONCILE_QUIET_PERIOD: Duration = Duration::from_secs(120);
 /// queried steadily every minute would otherwise never see one, and would
 /// never reconcile at all — which is the failure this exists to prevent.
 const RECONCILE_DEADLINE: Duration = Duration::from_secs(4 * 3600);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum WatchMode {
+    #[default]
+    Auto,
+    Poll,
+}
+
+struct RefreshControl {
+    requested: WatchMode,
+    poll_interval: Duration,
+    watch_budget: usize,
+    polling: Arc<std::sync::atomic::AtomicBool>,
+    status: Mutex<ReconcileStatus>,
+    wake: std::sync::Condvar,
+}
+
+struct ReconcileStatus {
+    catch_up: bool,
+    finished: Instant,
+    last_success: Option<u64>,
+    duration_ms: Option<u64>,
+    error: Option<String>,
+    running: bool,
+    fallback_reason: Option<String>,
+}
+
+impl RefreshControl {
+    fn new(requested: WatchMode, poll_interval: Duration, watch_budget: usize) -> Self {
+        Self {
+            requested,
+            poll_interval,
+            watch_budget,
+            polling: Arc::new(std::sync::atomic::AtomicBool::new(
+                requested == WatchMode::Poll,
+            )),
+            status: Mutex::new(ReconcileStatus {
+                catch_up: requested == WatchMode::Poll,
+                finished: Instant::now(),
+                last_success: None,
+                duration_ms: None,
+                error: None,
+                running: false,
+                fallback_reason: None,
+            }),
+            wake: std::sync::Condvar::new(),
+        }
+    }
+}
 
 /// Server discovery info, written to `serve.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -509,6 +562,7 @@ struct ServerState {
     index_total: std::sync::atomic::AtomicU64,
     /// True when file watching is enabled for this server.
     watch_enabled: bool,
+    refresh: RefreshControl,
     /// The live watcher and the directories it is subscribed to.
     ///
     /// Held here rather than by `run` because the subscription set is not
@@ -705,6 +759,9 @@ impl SearchOpts {
 
 pub struct ServeOptions<'a> {
     pub no_watch: bool,
+    pub watch_mode: WatchMode,
+    pub poll_interval: Duration,
+    pub watch_budget: usize,
     pub exclude_dirs: &'a [String],
     pub memory_cap_bytes: u64,
     pub index_threads: usize,
@@ -722,6 +779,9 @@ pub struct ServeOptions<'a> {
 pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) -> Result<()> {
     let ServeOptions {
         no_watch,
+        watch_mode,
+        poll_interval,
+        watch_budget,
         exclude_dirs,
         memory_cap_bytes,
         index_threads,
@@ -831,6 +891,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         index_progress: std::sync::atomic::AtomicU64::new(0),
         index_total: std::sync::atomic::AtomicU64::new(0),
         watch_enabled: !no_watch,
+        refresh: RefreshControl::new(watch_mode, poll_interval, watch_budget),
         watch_registry: Mutex::new(None),
         exclude_dirs: exclude_dirs.to_vec(),
         no_ignore,
@@ -909,22 +970,17 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
             // during the gap: it compares the whole tree against the index,
             // so any edit that landed while the matcher was still building is
             // picked up here.
-            let mut retry_delay = Duration::from_secs(1);
-            while !background_refresh_stale(&stale_state, &stale_root, &stale_index_dir, false) {
-                eprintln!(
-                    "[trace] stale check: retrying in {:.0}s",
-                    retry_delay.as_secs_f64()
-                );
-                thread::sleep(retry_delay);
-                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
-            }
+            startup_refresh_stale(&stale_state, &stale_root, &stale_index_dir);
         });
     }
 
     // Start file watcher (unless --no-watch)
     if no_watch {
         eprintln!("[trace] file watcher disabled (--no-watch)");
+    } else if watch_mode == WatchMode::Poll {
+        eprintln!("[trace] refresh mode: poll (no native watcher), interval={poll_interval:?}");
     } else {
+        eprintln!("[trace] refresh mode: auto, native watch budget={watch_budget}");
         let watcher_state = Arc::clone(&state);
         let watcher_root = root.clone();
         start_file_watcher(watcher_state, &watcher_root, watcher_queue_cap);
@@ -1955,6 +2011,7 @@ fn collect_match_rows(
 }
 
 fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
+    let refresh = state.refresh.status.lock().unwrap();
     let index = state.index.read().unwrap();
     let cache = state.cache.read().unwrap();
     let indexing = state.indexing.load(Ordering::SeqCst);
@@ -1967,6 +2024,17 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
         "cache_bytes": cache.byte_len(),
         "cache_max_bytes": CACHE_MAX_BYTES,
         "watcher_active": state.watcher_active.load(std::sync::atomic::Ordering::Relaxed),
+        "watch_mode_requested": if !state.watch_enabled { "disabled" } else if state.refresh.requested == WatchMode::Poll { "poll" } else { "auto" },
+        "watch_mode_active": if !state.watch_enabled { "disabled" } else if state.refresh.polling.load(Ordering::SeqCst) { "poll" } else if state.watcher_active.load(Ordering::SeqCst) { "native" } else { "starting" },
+        "watch_fallback_reason": refresh.fallback_reason,
+        "watch_budget": state.refresh.watch_budget,
+        "poll_interval_secs": state.refresh.poll_interval.as_secs(),
+        "last_reconcile_at": refresh.last_success,
+        "last_reconcile_duration_ms": refresh.duration_ms,
+        "last_reconcile_error": refresh.error,
+        "reconcile_running": refresh.running,
+        "reconcile_pending": refresh.catch_up,
+        "reconcile_overdue": state.watch_enabled && (refresh.catch_up || refresh.finished.elapsed() >= if state.refresh.polling.load(Ordering::SeqCst) { state.refresh.poll_interval } else { RECONCILE_DEADLINE }),
         "indexing": indexing,
         "index_progress": state.index_progress.load(std::sync::atomic::Ordering::Relaxed),
         "index_total": state.index_total.load(std::sync::atomic::Ordering::Relaxed),
@@ -2092,7 +2160,7 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
     replay_deferred_events(state, &state.root);
     schedule_pending_ignore_refresh(state);
 
-    if !state.watch_enabled {
+    if !native_watching(state) {
         #[cfg(test)]
         if membership_changed {
             run_stale_refresh_hook(state, StaleRefreshPhase::BeforeWalk);
@@ -2108,7 +2176,7 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
         }
         membership_changed = tracked_membership_changed(state);
     }
-    if state.watch_enabled {
+    if native_watching(state) {
         spawn_recovery_scan(state, &state.root, newly_watched, since);
     }
     schedule_tracked_membership_correction(state, &state.root, membership_changed);
@@ -2319,7 +2387,8 @@ fn recover_watcher_overflow(
     overflowed: &std::sync::atomic::AtomicBool,
     queue_cap: usize,
 ) {
-    if state.indexing.load(Ordering::SeqCst)
+    if !native_watching(state)
+        || state.indexing.load(Ordering::SeqCst)
         || state.gitignore_pending.load(Ordering::SeqCst)
         || !overflowed.swap(false, Ordering::SeqCst)
     {
@@ -2333,9 +2402,82 @@ fn recover_watcher_overflow(
     }
 }
 
+fn native_watching(state: &ServerState) -> bool {
+    state.watch_enabled && !state.refresh.polling.load(Ordering::SeqCst)
+}
+
+fn request_polling(state: &ServerState, reason: String) {
+    if !state.watch_enabled {
+        return;
+    }
+    let mut status = state.refresh.status.lock().unwrap();
+    if state.refresh.polling.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    state.watcher_active.store(false, Ordering::SeqCst);
+    eprintln!(
+        "[trace] switching entirely to polling: {reason}; native watching will not be retried"
+    );
+    status.fallback_reason = Some(reason);
+    status.catch_up = true;
+    state.refresh.wake.notify_all();
+}
+
+fn stop_native_watcher(state: &ServerState) {
+    // Never destroy notify under the registry lock. Its callback only touches
+    // atomics/the bounded channel, so teardown also cannot wait on snapshot_gate.
+    let retired = state.watch_registry.lock().unwrap().take();
+    drop(retired);
+    state.watcher_active.store(false, Ordering::SeqCst);
+}
+
+fn native_capacity_error(error: &notify::Error) -> bool {
+    match &error.kind {
+        notify::ErrorKind::MaxFilesWatch => true,
+        notify::ErrorKind::Io(error) => {
+            #[cfg(unix)]
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOSPC | libc::EMFILE | libc::ENFILE | libc::ENOMEM)
+            ) {
+                return true;
+            }
+            #[cfg(windows)]
+            if matches!(error.raw_os_error(), Some(4 | 8 | 14 | 1450 | 1816)) {
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn watch_failure_reason(error: &notify::Error) -> String {
+    let kind = if native_capacity_error(error) {
+        "native watch capacity exhausted"
+    } else {
+        "native coverage unavailable"
+    };
+    format!("{kind}: {error}")
+}
+
 fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) -> bool {
+    start_file_watcher_using(state, root, queue_cap, notify::recommended_watcher)
+}
+
+fn start_file_watcher_using(
+    state: Arc<ServerState>,
+    root: &Path,
+    queue_cap: usize,
+    create_watcher: impl FnOnce(
+        Box<dyn FnMut(notify::Result<Event>) + Send>,
+    ) -> notify::Result<RecommendedWatcher>,
+) -> bool {
     use std::sync::mpsc::TrySendError;
 
+    if !native_watching(&state) {
+        return false;
+    }
     let root_path = root.to_path_buf();
 
     // Hand events to a worker thread instead of indexing inside the callback.
@@ -2349,45 +2491,54 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
 
     let callback_overflow = Arc::clone(&overflowed);
     let callback_state = Arc::clone(&state);
-    let mut watcher = match notify::recommended_watcher(
-        move |result: std::result::Result<Event, notify::Error>| match result {
-            Ok(event) => match tx.try_send(event) {
-                Ok(()) => {}
-                // Don't block the notification thread waiting for room —
-                // that's the stall this hand-off exists to avoid. Drop the
-                // event and note that we did; the worker reconciles with a
-                // stale check, which is cheaper and more reliable than
-                // trying to replay an unknown number of lost events.
-                Err(TrySendError::Full(_)) => {
+    let mut watcher = match create_watcher(Box::new(
+        move |result: std::result::Result<Event, notify::Error>| {
+            if !native_watching(&callback_state) {
+                return;
+            }
+            match result {
+                Ok(event) => match tx.try_send(event) {
+                    Ok(()) => {}
+                    // Don't block the notification thread waiting for room —
+                    // that's the stall this hand-off exists to avoid. Drop the
+                    // event and note that we did; the worker reconciles with a
+                    // stale check, which is cheaper and more reliable than
+                    // trying to replay an unknown number of lost events.
+                    Err(TrySendError::Full(_)) => {
+                        callback_overflow.store(true, Ordering::SeqCst);
+                        callback_state
+                            .watch_resubscribe
+                            .store(true, Ordering::SeqCst);
+                    }
+                    Err(TrySendError::Disconnected(_)) => {}
+                },
+                // A native drop is the same loss as a full channel, and the OS
+                // will not say what it lost — inotify's `IN_Q_OVERFLOW` and a
+                // dropped `ReadDirectoryChangesW` buffer both arrive here with no
+                // paths attached. Reconcile on them too: reporting without
+                // recovering left exactly one of the two overflow paths handled,
+                // and it was the one the kernel does not use.
+                //
+                // Surfaced as well. A dropped buffer looks exactly like "the
+                // watcher stopped working" from the outside, and silence makes it
+                // impossible to tell apart from a bug in our own filtering.
+                Err(e) => {
+                    eprintln!("[trace] warning: file watcher error: {e}");
+                    if native_capacity_error(&e) {
+                        request_polling(&callback_state, watch_failure_reason(&e));
+                        return;
+                    }
                     callback_overflow.store(true, Ordering::SeqCst);
                     callback_state
                         .watch_resubscribe
                         .store(true, Ordering::SeqCst);
                 }
-                Err(TrySendError::Disconnected(_)) => {}
-            },
-            // A native drop is the same loss as a full channel, and the OS
-            // will not say what it lost — inotify's `IN_Q_OVERFLOW` and a
-            // dropped `ReadDirectoryChangesW` buffer both arrive here with no
-            // paths attached. Reconcile on them too: reporting without
-            // recovering left exactly one of the two overflow paths handled,
-            // and it was the one the kernel does not use.
-            //
-            // Surfaced as well. A dropped buffer looks exactly like "the
-            // watcher stopped working" from the outside, and silence makes it
-            // impossible to tell apart from a bug in our own filtering.
-            Err(e) => {
-                eprintln!("[trace] warning: file watcher error: {e}");
-                callback_overflow.store(true, Ordering::SeqCst);
-                callback_state
-                    .watch_resubscribe
-                    .store(true, Ordering::SeqCst);
             }
         },
-    ) {
+    )) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("[trace] warning: failed to start file watcher: {e}");
+            request_polling(&state, watch_failure_reason(&e));
             return false;
         }
     };
@@ -2401,8 +2552,11 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
     } else {
         RecursiveMode::Recursive
     };
+    if !native_watching(&state) {
+        return false;
+    }
     if let Err(e) = watcher.watch(root, root_mode) {
-        eprintln!("[trace] warning: failed to watch directory: {e}");
+        request_polling(&state, watch_failure_reason(&e));
         return false;
     }
 
@@ -2410,6 +2564,11 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
         watcher,
         root: root.to_path_buf(),
         watched: std::iter::once(root.to_path_buf()).collect(),
+        budget: state.refresh.watch_budget,
+        failure: None,
+        #[cfg(test)]
+        fail_after: None,
+        polling: Arc::clone(&state.refresh.polling),
     });
 
     // Subscribing to the descendants needs the ignore matcher, and on a warm
@@ -2432,6 +2591,10 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
         spawn_recovery_scan(&state, root, newly_watched, since);
     }
 
+    if !native_watching(&state) {
+        stop_native_watcher(&state);
+        return false;
+    }
     let worker_state = Arc::clone(&state);
     let worker_root = root_path;
     let worker_index_dir = state.index_dir.clone();
@@ -2441,6 +2604,10 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
             let mut last_tracked_index_poll = Instant::now();
             let mut pending_event = None;
             loop {
+                if !native_watching(&worker_state) {
+                    stop_native_watcher(&worker_state);
+                    break;
+                }
                 if last_tracked_index_poll.elapsed() >= TRACKED_INDEX_POLL {
                     last_tracked_index_poll = Instant::now();
                     let changed = poll_tracked_membership_changed(&worker_state);
@@ -2488,17 +2655,17 @@ fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) ->
         })
         .is_err()
     {
-        eprintln!("[trace] warning: failed to start the watcher worker thread");
-        *state.watch_registry.lock().unwrap() = None;
+        request_polling(&state, "failed to start the watcher worker thread".into());
+        stop_native_watcher(&state);
         return false;
     }
 
-    state
-        .watcher_active
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    eprintln!("[trace] file watcher started");
-
-    true
+    let active = native_watching(&state)
+        && (!PER_DIRECTORY_WATCHES || !state.gitignore_pending.load(Ordering::SeqCst))
+        && state.watch_registry.lock().unwrap().is_some();
+    state.watcher_active.store(active, Ordering::SeqCst);
+    eprintln!("[trace] file watcher worker started (complete native coverage: {active})");
+    active
 }
 
 /// Detect a tracked-file exemption change without subscribing to `.git`.
@@ -2750,6 +2917,11 @@ struct WatchRegistry {
     /// [`WatchRegistry::contained`].
     root: PathBuf,
     watched: std::collections::HashSet<PathBuf>,
+    budget: usize,
+    failure: Option<String>,
+    #[cfg(test)]
+    fail_after: Option<usize>,
+    polling: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2784,11 +2956,8 @@ impl WatchRegistry {
     /// Subscribe to every directory in `desired` that is not already
     /// subscribed, leaving existing subscriptions alone.
     ///
-    /// Returns the directories that were newly subscribed to. A single
-    /// directory that cannot be subscribed is reported and skipped rather than
-    /// failing the whole call: the watcher is still useful for everything
-    /// else, and giving up on the entire tree is exactly the failure mode this
-    /// registration exists to avoid.
+    /// Returns newly subscribed directories. On failure registration stops;
+    /// the owner retires the entire registry and requests polling.
     fn add_all<'a>(&mut self, desired: impl IntoIterator<Item = &'a PathBuf>) -> Vec<PathBuf> {
         self.subscribe(desired, false)
     }
@@ -2838,18 +3007,48 @@ impl WatchRegistry {
         desired: impl IntoIterator<Item = &'a PathBuf>,
         force: bool,
     ) -> Vec<PathBuf> {
+        if self.failure.is_some() || self.polling.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        let desired: Vec<_> = desired.into_iter().collect();
+        let additional = desired
+            .iter()
+            .filter(|dir| !self.watched.contains(dir.as_path()))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if self.watched.len().saturating_add(additional) > self.budget {
+            self.failure = Some(format!(
+                "native watch budget {} exceeded ({} desired subscriptions)",
+                self.budget,
+                self.watched.len().saturating_add(additional)
+            ));
+            return Vec::new();
+        }
         let mut added = Vec::new();
-        let mut failures = 0;
         // Iterating `desired` and testing membership is deliberate: a
         // `difference` would be proportional to the whole watched set, and
         // this runs per newly created directory on repositories where that set
         // is tens of thousands of entries.
         for dir in desired {
+            if self.polling.load(Ordering::SeqCst) {
+                break;
+            }
             let known = self.watched.contains(dir);
             if known && !force {
                 continue;
             }
-            match self.watcher.watch(dir, RecursiveMode::NonRecursive) {
+            #[cfg(test)]
+            let result = if self.fail_after == Some(0) {
+                Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch))
+            } else {
+                if let Some(remaining) = self.fail_after.as_mut() {
+                    *remaining -= 1;
+                }
+                self.watcher.watch(dir, RecursiveMode::NonRecursive)
+            };
+            #[cfg(not(test))]
+            let result = self.watcher.watch(dir, RecursiveMode::NonRecursive);
+            match result {
                 Ok(()) => {
                     // notify's inotify backend registers without
                     // `IN_DONT_FOLLOW`, so the descriptor lands on whatever the
@@ -2891,21 +3090,11 @@ impl WatchRegistry {
                     if known {
                         self.watched.remove(dir);
                     }
-                    // One line per call, not per directory: exhausting the
-                    // inotify budget fails thousands of these at once.
-                    if failures == 0 {
-                        eprintln!(
-                            "[trace] warning: could not watch {}: {e} \
-                             (continuing with the directories that succeeded)",
-                            dir.display()
-                        );
-                    }
-                    failures += 1;
+                    self.failure =
+                        Some(format!("{} ({})", watch_failure_reason(&e), dir.display()));
+                    break;
                 }
             }
-        }
-        if failures > 1 {
-            eprintln!("[trace] warning: {failures} directories could not be watched");
         }
         added
     }
@@ -3132,15 +3321,15 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
     // Before the early returns as well as the walk: a caller that gets no
     // directories back still gets a usable bound.
     let since = SystemTime::now();
-    if !PER_DIRECTORY_WATCHES {
+    if !native_watching(state) || !PER_DIRECTORY_WATCHES {
         return (Vec::new(), since);
     }
-    let mut registry = state.watch_registry.lock().unwrap();
-    let Some(registry) = registry.as_mut() else {
+    let registry = state.watch_registry.lock().unwrap();
+    if registry.is_none() {
         // The watcher has not started yet. It syncs once as it comes up, so
         // there is nothing to do and nothing to remember.
         return (Vec::new(), since);
-    };
+    }
 
     let start = Instant::now();
     let mut desired = {
@@ -3151,11 +3340,59 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
         let sources = state.ignore_sources.read().unwrap();
         desired.dirs.extend(ignore_target_dirs(root, &sources));
     }
+    // Hold the registry through enumeration and application. Startup does not
+    // hold snapshot_gate, and an older complete scan must not prune watches
+    // established by a newer matcher publication or subtree registration.
+    (
+        apply_watch_registrations_locked(state, &desired, start, registry),
+        since,
+    )
+}
+
+#[cfg(test)]
+fn apply_watch_registrations(
+    state: &ServerState,
+    desired: &WatchableDirs,
+    start: Instant,
+) -> Vec<PathBuf> {
+    let registry = state.watch_registry.lock().unwrap();
+    apply_watch_registrations_locked(state, desired, start, registry)
+}
+
+fn apply_watch_registrations_locked(
+    state: &ServerState,
+    desired: &WatchableDirs,
+    start: Instant,
+    mut guard: std::sync::MutexGuard<'_, Option<WatchRegistry>>,
+) -> Vec<PathBuf> {
+    if !native_watching(state) {
+        drop(guard);
+        stop_native_watcher(state);
+        return Vec::new();
+    }
+    let Some(registry) = guard.as_mut() else {
+        return Vec::new();
+    };
     // An incomplete traversal cannot prove that omitted recorded watches are
     // live, so it does not get to consume the overflow repair request.
     let force = take_force_resubscribe(&state.watch_resubscribe, desired.completeness);
     let (added, removed) = registry.sync(&desired.dirs, desired.completeness, force);
     let total = registry.watched.len();
+    let failure = registry.failure.clone().or_else(|| {
+        (desired.completeness == TraversalCompleteness::Incomplete).then(|| {
+            "native coverage traversal was incomplete; some directories could not be inspected"
+                .into()
+        })
+    });
+    drop(guard);
+    if let Some(reason) = failure {
+        request_polling(state, reason);
+    }
+    if !native_watching(state) {
+        stop_native_watcher(state);
+        return Vec::new();
+    }
+    state.watcher_active.store(true, Ordering::SeqCst);
     if !added.is_empty() || removed > 0 {
         eprintln!(
             "[trace] watcher subscriptions: {total} directories \
@@ -3164,7 +3401,7 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
             start.elapsed().as_secs_f64() * 1000.0
         );
     }
-    (added, since)
+    added
 }
 
 /// The first ignore-rules file in `dirs` that the published matcher did not
@@ -3635,6 +3872,9 @@ fn sweep_removed_files(
 /// window is small but it is exactly the one a checkout or a build fills, and
 /// anything lost in it stays invisible until the hourly reconcile.
 fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
+    if !native_watching(state) {
+        return;
+    }
     // `is_dir` follows symlinks; the walker does not. Refuse a symlinked
     // directory here so we never subscribe to, or index, a tree the indexer
     // would not have walked into — and check every level, not just the last,
@@ -3669,8 +3909,8 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
         // exists to avoid — so only the enumeration below runs on those
         // platforms.
         if PER_DIRECTORY_WATCHES {
-            let mut registry = state.watch_registry.lock().unwrap();
-            let Some(registry) = registry.as_mut() else {
+            let mut guard = state.watch_registry.lock().unwrap();
+            let Some(registry) = guard.as_mut() else {
                 return;
             };
             // Additive, not a sync: this covers only the new subtree, and
@@ -3685,6 +3925,15 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
             // watched, but the kernel dropped its descriptor when the original
             // went away.
             registry.resubscribe_all(level.iter());
+            let failure = registry.failure.clone();
+            drop(guard);
+            if let Some(reason) = failure {
+                request_polling(state, reason);
+            }
+            if !native_watching(state) {
+                stop_native_watcher(state);
+                return;
+            }
         }
 
         // The registry lock is released before any `read_dir`, so a large
@@ -3773,6 +4022,11 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
 }
 
 fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
+    // Polling has one refresh authority. Rule churn or a failed native worker
+    // must not create a second, one-second retry loop after the handoff.
+    if state.refresh.polling.load(Ordering::SeqCst) {
+        return;
+    }
     if state
         .ignore_refresh_scheduled
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -3783,6 +4037,12 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
 
     thread::spawn(move || {
         loop {
+            if state.refresh.polling.load(Ordering::SeqCst) {
+                state
+                    .ignore_refresh_scheduled
+                    .store(false, Ordering::SeqCst);
+                break;
+            }
             if state.ignore_rules_dirty.swap(false, Ordering::SeqCst) {
                 // Wait out a build first. `background_index_build` publishes its
                 // matcher — and so reaches here — while it is still only
@@ -3798,6 +4058,12 @@ fn schedule_ignore_rules_refresh(state: Arc<ServerState>, root: PathBuf) {
                 // still walking the tree the refresh would walk.
                 while state.indexing.load(Ordering::SeqCst) {
                     thread::sleep(Duration::from_millis(200));
+                }
+                if state.refresh.polling.load(Ordering::SeqCst) {
+                    state
+                        .ignore_refresh_scheduled
+                        .store(false, Ordering::SeqCst);
+                    break;
                 }
                 // The stale refresh walks the tree anyway and republishes the
                 // matcher from that walk, so the reload costs one traversal
@@ -3907,6 +4173,9 @@ fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
         Ok(mut guard) => guard.replace(std::collections::HashMap::new()),
         Err(_) => return,
     };
+    if state.refresh.polling.load(Ordering::SeqCst) {
+        return;
+    }
     let Some(paths) = deferred else {
         // Overflowed. A stale refresh rewalks the tree and diffs it against the
         // index, which covers every path the replay would have, and it is what
@@ -4011,6 +4280,9 @@ fn spawn_recovery_scan(
     dirs: Vec<PathBuf>,
     since: SystemTime,
 ) {
+    if !native_watching(state) {
+        return;
+    }
     let state = Arc::clone(state);
     let root = root.to_path_buf();
     let spawned = thread::Builder::new()
@@ -4018,6 +4290,9 @@ fn spawn_recovery_scan(
         .spawn(move || {
             while state.indexing.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(200));
+            }
+            if !native_watching(&state) {
+                return;
             }
             // Before the gate, not under it: this takes `snapshot_gate` for
             // read itself, and std's `RwLock` may deadlock on a recursive read
@@ -4059,7 +4334,7 @@ fn spawn_recovery_scan(
 /// subdirectories would take exactly the per-directory watches that backend
 /// exists to avoid.
 fn recovery_scan_dirs(state: &ServerState, root: &Path, mut dirs: Vec<PathBuf>) -> Vec<PathBuf> {
-    if !PER_DIRECTORY_WATCHES || !state.watch_enabled {
+    if !PER_DIRECTORY_WATCHES || !native_watching(state) {
         return Vec::new();
     }
     if !dirs.iter().any(|d| d == root) {
@@ -4069,6 +4344,9 @@ fn recovery_scan_dirs(state: &ServerState, root: &Path, mut dirs: Vec<PathBuf>) 
 }
 
 fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
+    if state.refresh.polling.load(Ordering::SeqCst) {
+        return;
+    }
     let dominated_kinds = matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
@@ -4993,6 +5271,9 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         };
         let removed = extra.remove(rel_path);
         evidence.insert(rel_path.to_string(), current, content_id);
+        if force {
+            evidence.versions.insert(rel_path.to_string(), version);
+        }
         (removed, committed_overlay_id)
     };
     if removed_extra {
@@ -5045,38 +5326,85 @@ fn reconcile_due(since_last: Duration, quiet_for: Duration, busy: bool) -> bool 
 /// Periodically compare the whole tree against the index, so a change the
 /// watcher never heard about cannot stay wrong indefinitely.
 ///
-/// See [`RECONCILE_INTERVAL`] for why this is needed at all. It is deliberately
-/// unhurried: it defers to indexing, to flushing, and to a server that is
-/// being queried, and it does nothing at all on a tree that has not drifted —
-/// the walk finds no differences and returns without touching the index.
+/// Native safety checks retain their quiet-period policy. Polling ignores
+/// search traffic and uses its own completion-based interval; both defer to
+/// indexing/flushing and leave an unchanged index untouched.
 fn periodic_reconcile_loop(state: Arc<ServerState>, root: PathBuf, index_dir: PathBuf) {
-    let mut last = Instant::now();
     loop {
-        thread::sleep(RECONCILE_POLL);
+        scheduled_reconcile(&state, &root, &index_dir);
+        let status = state.refresh.status.lock().unwrap();
+        let busy = state.indexing.load(Ordering::SeqCst)
+            || state.flushing.load(Ordering::SeqCst)
+            || status.running;
+        let wait = if busy {
+            Duration::from_secs(1)
+        } else if status.catch_up {
+            Duration::ZERO
+        } else if state.refresh.polling.load(Ordering::SeqCst) {
+            state
+                .refresh
+                .poll_interval
+                .saturating_sub(status.finished.elapsed())
+        } else {
+            RECONCILE_POLL
+        };
+        // A completion-based cadence avoids overlapping work and catch-up
+        // storms when a scan/merge takes longer than its configured interval.
+        let _ = state
+            .refresh
+            .wake
+            .wait_timeout(status, wait.max(Duration::from_millis(10)))
+            .unwrap();
+    }
+}
 
-        let busy = state.indexing.load(Ordering::SeqCst) || state.flushing.load(Ordering::SeqCst);
-        if !reconcile_due(last.elapsed(), state.quiet_for(), busy) {
-            continue;
+fn scheduled_reconcile(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> Option<bool> {
+    if !state.watch_enabled {
+        return None;
+    }
+    if !native_watching(state) {
+        stop_native_watcher(state);
+    }
+    {
+        let mut status = state.refresh.status.lock().unwrap();
+        let busy = state.indexing.load(Ordering::SeqCst)
+            || state.flushing.load(Ordering::SeqCst)
+            || status.running;
+        let due = if state.refresh.polling.load(Ordering::SeqCst) {
+            !busy && (status.catch_up || status.finished.elapsed() >= state.refresh.poll_interval)
+        } else {
+            reconcile_due(status.finished.elapsed(), state.quiet_for(), busy)
+        };
+        if !due {
+            return None;
         }
+        status.catch_up = false;
+    }
+    Some(background_refresh_stale(state, root, index_dir, false))
+}
 
-        // Restart the interval before the walk rather than after it. On a large
-        // repository the reconcile itself takes a while, and timing from its
-        // completion would push each one further out than the last.
-        last = Instant::now();
-        eprintln!("[trace] periodic reconcile: looking for changes the watcher missed");
-        // Same comparison the startup check makes, and for the same reason: a
-        // lost event is a stamp that disagrees with the filesystem, a file with
-        // no stamp, or a stamp with no file, and all three fall out of that.
-        // Comparing index *membership* as well would additionally re-add any
-        // file whose stamp says indexed but which the reader does not hold —
-        // a publication bug rather than a lost event, and one that on an hourly
-        // timer would rebuild the whole index every hour if it ever misfired.
-        if !background_refresh_stale(&state, &root, &index_dir, false) {
-            // It declined — an unreadable directory, or a walk that raced a
-            // delete. The index is untouched and correct as far as it goes,
-            // and the next interval tries again.
-            eprintln!("[trace] periodic reconcile: declined, keeping the current index");
-        }
+fn record_reconcile(state: &ServerState, start: Instant, ok: bool) {
+    let mut status = state.refresh.status.lock().unwrap();
+    status.running = false;
+    status.finished = Instant::now();
+    status.duration_ms = Some(start.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+    if ok {
+        status.last_success = Some(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        status.error = None;
+    } else {
+        status.error = Some(
+            "reconciliation incomplete; see logs for filesystem or publication errors; will retry"
+                .into(),
+        );
+        eprintln!(
+            "[trace] reconciliation incomplete after {:.1}s; not marking the index fresh",
+            start.elapsed().as_secs_f64()
+        );
     }
 }
 
@@ -5447,6 +5775,27 @@ fn classify_file_changes(
     (changed, added, deleted)
 }
 
+fn classify_evidence_changes(
+    current_meta: &[tgrep_core::walker::FileMeta],
+    old: &tgrep_core::meta::FileEvidence,
+    indexed: &std::collections::HashSet<String>,
+    compare_index_membership: bool,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (mut changed, added, deleted) =
+        classify_file_changes(current_meta, &old.stamps, indexed, compare_index_membership);
+    let already_changed: std::collections::HashSet<_> =
+        changed.iter().chain(&added).cloned().collect();
+    for file in current_meta {
+        if !already_changed.contains(&file.relative_path)
+            && (file.version.is_none()
+                || old.versions.get(&file.relative_path) != file.version.as_ref())
+        {
+            changed.push(file.relative_path.clone());
+        }
+    }
+    (changed, added, deleted)
+}
+
 struct StaleMergePolicy<'a> {
     preserved: &'a std::collections::HashSet<String>,
     operation: &'a str,
@@ -5612,9 +5961,15 @@ fn stream_merge_stale_changes(
             );
         }
         for path in &candidates {
-            published_evidence.content_ids.remove(path);
+            published_evidence.remove(path);
         }
         published_evidence.content_ids.extend(outcome.content_ids);
+        for (path, version) in outcome.versions {
+            published_evidence
+                .stamps
+                .insert(path.clone(), version.stamp().clone());
+            published_evidence.versions.insert(path, version);
+        }
 
         let delta = tgrep_core::reader::IndexReader::open(&delta_dir)?;
         if delta.num_files() != delta_count {
@@ -5788,6 +6143,17 @@ fn background_refresh_stale(
     compare_index_membership: bool,
 ) -> bool {
     let refresh = state.stale_refresh_lock.lock().unwrap();
+    let attempt = Instant::now();
+    {
+        let mut status = state.refresh.status.lock().unwrap();
+        status.running = true;
+        if state.refresh.polling.load(Ordering::SeqCst) {
+            status.catch_up = false;
+        }
+    }
+    if state.refresh.polling.load(Ordering::SeqCst) {
+        state.ignore_rules_dirty.store(false, Ordering::SeqCst);
+    }
     // Keep watcher/auto-save mutations out for the complete walk → matcher →
     // merge → recovery cycle. Search queries do not take this gate and remain
     // available. Held here rather than inside so the recovery scan below is
@@ -5831,14 +6197,49 @@ fn background_refresh_stale(
     // this pass used A throughout, while A→B schedules exactly one coalesced
     // refresh. Content-only staging cannot create an immediate refresh loop.
     let membership_changed = tracked_membership_changed(state);
+    let complete = ok
+        && state.unreadable.read().unwrap().is_empty()
+        && !state.filename_index_dirty.load(Ordering::SeqCst);
+    record_reconcile(state, attempt, complete);
     drop(gate);
     drop(refresh);
     schedule_tracked_membership_correction(state, root, membership_changed);
-    ok
+    if state.refresh.polling.load(Ordering::SeqCst) {
+        complete
+    } else {
+        ok
+    }
+}
+
+fn startup_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        let ok = background_refresh_stale(state, root, index_dir, false);
+        if ok || state.refresh.polling.load(Ordering::SeqCst) {
+            return ok;
+        }
+        eprintln!(
+            "[trace] stale check: retrying in {:.0}s",
+            retry_delay.as_secs_f64()
+        );
+        thread::sleep(retry_delay);
+        if state.refresh.polling.load(Ordering::SeqCst) {
+            return false;
+        }
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+    }
 }
 
 fn catch_up_unwatched_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
     let refresh = state.stale_refresh_lock.lock().unwrap();
+    let attempt = Instant::now();
+    {
+        let mut status = state.refresh.status.lock().unwrap();
+        status.running = true;
+        if state.refresh.polling.load(Ordering::SeqCst) {
+            status.catch_up = false;
+        }
+    }
     let gate = state.snapshot_gate.write().unwrap();
     let ignorecase = frozen_tracked_membership(state, root);
     let mut ignored_watches = Vec::new();
@@ -5852,10 +6253,18 @@ fn catch_up_unwatched_build(state: &Arc<ServerState>, root: &Path, index_dir: &P
         false,
     );
     let membership_changed = tracked_membership_changed(state);
+    let complete = caught_up
+        && state.unreadable.read().unwrap().is_empty()
+        && !state.filename_index_dirty.load(Ordering::SeqCst);
+    record_reconcile(state, attempt, complete);
     drop(gate);
     drop(refresh);
     schedule_tracked_membership_correction(state, root, membership_changed);
-    caught_up
+    if state.refresh.polling.load(Ordering::SeqCst) {
+        complete
+    } else {
+        caught_up
+    }
 }
 
 fn refresh_stale_locked(
@@ -5931,6 +6340,16 @@ fn refresh_stale_locked(
     }
     let current_meta = &walk.files;
     let listed_files = &walk.listed_files;
+    {
+        let mut unreadable = state.unreadable.write().unwrap();
+        if !unreadable.is_empty() {
+            let present: std::collections::HashSet<_> = current_meta
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect();
+            unreadable.retain(|path, _| present.contains(path.as_str()));
+        }
+    }
 
     // Load stored per-file stamps from last index write
     let mut old_evidence = match meta::read_file_evidence(index_dir) {
@@ -5949,9 +6368,16 @@ fn refresh_stale_locked(
     // on-disk stamps nor the filesystem, so it would never be classified as
     // deleted and would linger in the index. The in-memory stamps are the
     // fresher record of what the index actually holds, so they win.
-    for (path, stamp) in &state.file_evidence.read().unwrap().stamps {
+    let current_evidence = state.file_evidence.read().unwrap();
+    for (path, stamp) in &current_evidence.stamps {
         old_evidence.stamps.insert(path.clone(), stamp.clone());
+        if let Some(version) = current_evidence.versions.get(path) {
+            old_evidence.versions.insert(path.clone(), version.clone());
+        } else {
+            old_evidence.versions.remove(path);
+        }
     }
+    drop(current_evidence);
     let indexed_paths = {
         let index = state.index.read().unwrap();
         let mut paths = index.reader_paths();
@@ -5964,9 +6390,9 @@ fn refresh_stale_locked(
         return true;
     }
 
-    let (mut changed, mut added, deleted) = classify_file_changes(
+    let (mut changed, mut added, deleted) = classify_evidence_changes(
         current_meta,
-        &old_evidence.stamps,
+        &old_evidence,
         &indexed_paths,
         compare_index_membership,
     );
@@ -5976,8 +6402,12 @@ fn refresh_stale_locked(
     // makes every scheduled reconcile rebuild the index. `deleted` is exempt —
     // a file that is gone needs no read to evict.
     let skipped_unreadable = {
-        let memo = state.unreadable.read().unwrap();
-        drop_memoized_failures(&memo, current_meta, &mut changed, &mut added)
+        if state.refresh.polling.load(Ordering::SeqCst) {
+            std::collections::HashSet::new()
+        } else {
+            let memo = state.unreadable.read().unwrap();
+            drop_memoized_failures(&memo, current_meta, &mut changed, &mut added)
+        }
     };
     if !skipped_unreadable.is_empty() {
         eprintln!(
@@ -6016,6 +6446,14 @@ fn refresh_stale_locked(
 
     let new_stamps = stamps_for_indexed(current_meta, &skipped_unreadable);
     let mut new_evidence = tgrep_core::meta::FileEvidence::from_stamps(new_stamps);
+    // Unchanged paths keep their prior read-bound evidence, not metadata from
+    // this newer scan. Changed paths are replaced with the delta's read versions.
+    new_evidence.versions.extend(
+        old_evidence
+            .versions
+            .into_iter()
+            .filter(|(path, _)| new_evidence.stamps.contains_key(path)),
+    );
     {
         let current_evidence = state.file_evidence.read().unwrap();
         new_evidence.content_ids.extend(
@@ -6359,6 +6797,15 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             .map(|(path, id)| (path.clone(), *id))
             .collect()
     };
+    let mut versions: std::collections::HashMap<String, builder::FileVersion> = state
+        .file_evidence
+        .read()
+        .unwrap()
+        .versions
+        .iter()
+        .filter(|(path, _)| skip_paths.contains(path.as_str()))
+        .map(|(path, version)| (path.clone(), version.clone()))
+        .collect();
 
     // Nothing indexed yet: build straight to disk with bounded memory instead
     // of accumulating the whole repo in the live overlay. Resuming a partial
@@ -6481,7 +6928,35 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             batch
                 .par_iter()
                 .filter_map(|path| {
-                    let data = std::fs::read(path).ok()?;
+                    let read = (|| -> Result<_> {
+                        let mut file = open_within_root(root, path)?;
+                        let version = builder::file_version(&file.metadata()?);
+                        let data = match read_within_limit(
+                            &mut file,
+                            state.max_file_size,
+                            version.stamp().size.min(1 << 20) as usize,
+                        ) {
+                            CappedRead::Data(data) => data,
+                            CappedRead::TooLarge => {
+                                anyhow::bail!("file grew past the configured size limit")
+                            }
+                            CappedRead::Failed => anyhow::bail!("file read failed"),
+                        };
+                        if !file_still_has_bytes(root, path, &version, &data)? {
+                            anyhow::bail!("file changed during indexing");
+                        }
+                        Ok((data, version))
+                    })();
+                    let (data, version) = match read {
+                        Ok(read) => read,
+                        Err(error) => {
+                            eprintln!(
+                                "[trace] warning: could not index {}: {error}",
+                                path.display()
+                            );
+                            return None;
+                        }
+                    };
                     let data = tgrep_core::encoding::decode_for_index(&data);
                     if tgrep_core::trigram::is_binary(&data) {
                         return None;
@@ -6498,12 +6973,11 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                         trigrams.extend(tgrep_core::trigram::extract(&lower));
                     }
                     let content_id = tgrep_core::meta::ContentId::from_indexed_bytes(&data);
-                    Some((rel_path, trigrams, content_id))
+                    Some((rel_path, trigrams, content_id, version))
                 })
-                .collect::<Vec<(String, Vec<u32>, tgrep_core::meta::ContentId)>>()
+                .collect::<Vec<_>>()
         };
-        let batch_results: Vec<(String, Vec<u32>, tgrep_core::meta::ContentId)> = match &index_pool
-        {
+        let batch_results = match &index_pool {
             Some(pool) => pool.install(extract),
             None => extract(),
         };
@@ -6511,8 +6985,9 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         // Sequential: insert into LiveIndex (brief write lock per batch)
         {
             let mut index = state.index.write().unwrap();
-            for (rel_path, trigrams, content_id) in batch_results {
+            for (rel_path, trigrams, content_id, version) in batch_results {
                 index.live.upsert_file_with_trigrams(&rel_path, trigrams);
+                versions.insert(rel_path.clone(), version);
                 content_ids.insert(rel_path, content_id);
             }
         }
@@ -6620,7 +7095,16 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         };
         stamps_for_index_members(walk_meta.files, &indexed)
     };
-    let evidence = complete_file_evidence(stamps, content_ids);
+    let mut evidence = complete_file_evidence(stamps, content_ids);
+    evidence.retain(|path, _| versions.contains_key(path));
+    for (path, version) in versions {
+        if evidence.stamps.contains_key(&path) {
+            evidence
+                .stamps
+                .insert(path.clone(), version.stamp().clone());
+            evidence.versions.insert(path, version);
+        }
+    }
 
     // The in-memory build is done — surface "complete" in status now even
     // though the final disk flush below can take minutes for very large
@@ -7771,10 +8255,111 @@ mod tests {
         assert_eq!(byte_limited.byte_len(), 0);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn subscription_snapshot_holds_registry_until_its_application() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        *state.watch_registry.lock().unwrap() = Some(WatchRegistry {
+            watcher: notify::recommended_watcher(|_: notify::Result<Event>| {}).unwrap(),
+            root: root.clone(),
+            watched: Default::default(),
+            budget: 8192,
+            failure: None,
+            fail_after: None,
+            polling: Arc::clone(&state.refresh.polling),
+        });
+        // Pause enumeration at its matcher read. The registry must remain
+        // locked so a newer subscription set cannot overtake this snapshot.
+        let matcher = state.gitignore.write().unwrap();
+        let worker_state = Arc::clone(&state);
+        let worker_root = root.clone();
+        let worker = thread::spawn(move || sync_watch_registrations(&worker_state, &worker_root));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut held = false;
+        while Instant::now() < deadline {
+            if matches!(
+                state.watch_registry.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ) {
+                held = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        drop(matcher);
+        worker.join().unwrap();
+        stop_native_watcher(&state);
+        assert!(
+            held,
+            "subscription enumeration released its registry snapshot"
+        );
+    }
+
+    #[test]
+    fn failed_polling_startup_hands_retries_to_the_configured_cadence() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("missing");
+        let index_dir = tmp.path().join("index");
+        let mut state = test_server_state(&root, &index_dir);
+        Arc::get_mut(&mut state).unwrap().refresh =
+            RefreshControl::new(WatchMode::Poll, Duration::from_secs(120), 8192);
+        let worker_state = Arc::clone(&state);
+        let worker_root = root.clone();
+        let worker_index = index_dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            tx.send(startup_refresh_stale(
+                &worker_state,
+                &worker_root,
+                &worker_index,
+            ))
+            .unwrap();
+        });
+        assert!(
+            !rx.recv_timeout(Duration::from_secs(5))
+                .expect("startup kept its own polling retry loop")
+        );
+        worker.join().unwrap();
+        assert!(state.refresh.status.lock().unwrap().error.is_some());
+        assert_eq!(scheduled_reconcile(&state, &root, &index_dir), None);
+    }
+
+    #[test]
+    fn a_complete_poll_forgets_an_unindexed_read_failure_that_disappeared() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let index_dir = root.join(".tgrep");
+        let mut state = test_server_state(&root, &index_dir);
+        Arc::get_mut(&mut state).unwrap().refresh =
+            RefreshControl::new(WatchMode::Poll, Duration::from_secs(120), 8192);
+        let vanished = root.join("vanished.rs");
+        std::fs::write(&vanished, "vanishing_poll_marker").unwrap();
+        let removed = std::sync::atomic::AtomicBool::new(false);
+        *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterMatcherPublish)
+                && !removed.swap(true, Ordering::SeqCst)
+            {
+                std::fs::remove_file(&vanished).unwrap();
+            }
+        }));
+        assert_eq!(scheduled_reconcile(&state, &root, &index_dir), Some(false));
+        assert!(state.unreadable.read().unwrap().contains_key("vanished.rs"));
+        *state.stale_refresh_hook.lock().unwrap() = None;
+        state.refresh.status.lock().unwrap().finished =
+            Instant::now() - state.refresh.poll_interval;
+        assert_eq!(scheduled_reconcile(&state, &root, &index_dir), Some(true));
+        assert!(state.unreadable.read().unwrap().is_empty());
+        let status = state.refresh.status.lock().unwrap();
+        assert!(status.error.is_none());
+        assert!(status.last_success.is_some());
+    }
+
     /// A `ServerState` over an empty index, for exercising the stale path
     /// directly. Mirrors the defaults `run` uses with a watcher and ignore
     /// rules enabled, which is the configuration `gitignore_pending` gates.
-    fn test_server_state(root: &Path, index_dir: &Path) -> Arc<ServerState> {
+    pub(super) fn test_server_state(root: &Path, index_dir: &Path) -> Arc<ServerState> {
         create_empty_index(index_dir).expect("create empty index");
         let hybrid = HybridIndex::open(index_dir, root).expect("open empty index");
         Arc::new(ServerState {
@@ -7809,6 +8394,7 @@ mod tests {
             index_progress: std::sync::atomic::AtomicU64::new(0),
             index_total: std::sync::atomic::AtomicU64::new(0),
             watch_enabled: true,
+            refresh: RefreshControl::new(WatchMode::Auto, Duration::from_secs(120), 8192),
             watch_registry: Mutex::new(None),
             exclude_dirs: Vec::new(),
             no_ignore: false,
@@ -8314,6 +8900,10 @@ mod tests {
             watcher,
             root: tmp.path().to_path_buf(),
             watched: std::collections::HashSet::new(),
+            budget: 8192,
+            failure: None,
+            fail_after: None,
+            polling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let added = registry.add_all(&[a.clone(), b.clone()]);
@@ -8387,6 +8977,10 @@ mod tests {
             watcher,
             root: tmp.path().to_path_buf(),
             watched: std::collections::HashSet::new(),
+            budget: 8192,
+            failure: None,
+            fail_after: None,
+            polling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         assert_eq!(registry.add_all(std::slice::from_ref(&a)).len(), 1);
 
@@ -8915,6 +9509,10 @@ mod tests {
                 watcher,
                 root: root.clone(),
                 watched: std::iter::once(root.clone()).collect(),
+                budget: 8192,
+                failure: None,
+                fail_after: None,
+                polling: Arc::clone(&state.refresh.polling),
             });
         }
 
@@ -9130,6 +9728,10 @@ mod tests {
                 watcher,
                 root: root.clone(),
                 watched: std::iter::once(root.clone()).collect(),
+                budget: 8192,
+                failure: None,
+                fail_after: None,
+                polling: Arc::clone(&state.refresh.polling),
             });
         }
 
@@ -10505,11 +11107,13 @@ mod tests {
                 relative_path: "kept.txt".to_string(),
                 mtime: 1,
                 size: 10,
+                version: None,
             },
             FileMeta {
                 relative_path: "newly-unignored.txt".to_string(),
                 mtime: 2,
                 size: 20,
+                version: None,
             },
         ];
         let stamps = HashMap::from([
@@ -10536,6 +11140,7 @@ mod tests {
             relative_path: "case.txt".to_string(),
             mtime: 1,
             size: 10,
+            version: None,
         }];
         let indexed = HashSet::from(["Case.txt".to_string(), "reader-only.txt".to_string()]);
 
@@ -10595,6 +11200,7 @@ mod tests {
                 relative_path: "locked.bin".to_string(),
                 mtime,
                 size,
+                version: None,
             }];
             let (mut changed, mut added, _) = classify_file_changes(
                 &current,
@@ -10635,11 +11241,13 @@ mod tests {
                 relative_path: "locked.bin".to_string(),
                 mtime: 100,
                 size: 5,
+                version: None,
             },
             FileMeta {
                 relative_path: "src/main.rs".to_string(),
                 mtime: 100,
                 size: 9,
+                version: None,
             },
         ];
         let memo = std::collections::HashMap::from([(
@@ -11901,6 +12509,10 @@ mod tests {
             watcher,
             root: root.clone(),
             watched: std::iter::once(root.clone()).collect(),
+            budget: 8192,
+            failure: None,
+            fail_after: None,
+            polling: Arc::clone(&state.refresh.polling),
         });
 
         let _gate = state.snapshot_gate.read().unwrap();
@@ -11929,11 +12541,13 @@ mod tests {
                 relative_path: "indexed.rs".to_string(),
                 mtime: 1,
                 size: 10,
+                version: None,
             },
             FileMeta {
                 relative_path: "arrived_between_the_walks.rs".to_string(),
                 mtime: 2,
                 size: 20,
+                version: None,
             },
         ];
         let indexed = std::iter::once("indexed.rs".to_string()).collect();
@@ -12101,6 +12715,10 @@ mod tests {
             watcher,
             root: root.clone(),
             watched: std::collections::HashSet::new(),
+            budget: 8192,
+            failure: None,
+            fail_after: None,
+            polling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let desired: std::collections::HashSet<PathBuf> = [
@@ -12139,6 +12757,10 @@ mod tests {
             watcher,
             root: root.clone(),
             watched: std::collections::HashSet::new(),
+            budget: 8192,
+            failure: None,
+            fail_after: None,
+            polling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         assert_eq!(registry.add_all(std::slice::from_ref(&gone)).len(), 1);
 
@@ -12180,6 +12802,10 @@ mod tests {
             watcher,
             root: root.clone(),
             watched: std::iter::once(root.clone()).collect(),
+            budget: 8192,
+            failure: None,
+            fail_after: None,
+            polling: Arc::clone(&state.refresh.polling),
         });
 
         // Built somewhere else and moved in, so no event ever described its

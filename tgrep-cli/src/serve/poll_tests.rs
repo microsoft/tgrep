@@ -1,0 +1,1050 @@
+use super::tests::test_server_state;
+use super::*;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Weak, mpsc};
+use tempfile::TempDir;
+
+struct Fixture {
+    state: Arc<ServerState>,
+    root: PathBuf,
+    _temp: TempDir,
+}
+
+impl Fixture {
+    fn new(mode: WatchMode, budget: usize) -> Self {
+        Self::with_interval(mode, budget, Duration::from_secs(120))
+    }
+
+    fn with_interval(mode: WatchMode, budget: usize, interval: Duration) -> Self {
+        let temp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        let unique = Arc::get_mut(&mut state).unwrap();
+        unique.refresh = RefreshControl::new(mode, interval, budget);
+        unique.no_require_git = true;
+        Self {
+            state,
+            root,
+            _temp: temp,
+        }
+    }
+
+    fn write(&self, relative: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
+        let path = self.root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn due(&self) {
+        let mut status = self.state.refresh.status.lock().unwrap();
+        status.finished = Instant::now()
+            .checked_sub(self.state.refresh.poll_interval)
+            .unwrap();
+    }
+
+    fn tick(&self) -> Option<bool> {
+        scheduled_reconcile(&self.state, &self.root, &self.state.index_dir)
+    }
+
+    fn poll(&self) {
+        self.due();
+        assert_eq!(self.tick(), Some(true));
+        self.assert_polling();
+    }
+
+    fn assert_polling(&self) {
+        assert!(self.state.watch_enabled);
+        assert!(self.state.refresh.polling.load(Ordering::SeqCst));
+        assert!(!native_watching(&self.state));
+        assert!(!self.state.watcher_active.load(Ordering::SeqCst));
+        assert!(self.state.watch_registry.lock().unwrap().is_none());
+    }
+
+    fn assert_files(&self, expected: &[&str]) {
+        let response = process_request(r#"{"jsonrpc":"2.0","method":"files","id":1}"#, &self.state);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let actual: BTreeSet<_> = value["result"]["files"]
+            .as_array()
+            .unwrap_or_else(|| panic!("files RPC failed: {response}"))
+            .iter()
+            .map(|path| path.as_str().unwrap())
+            .collect();
+        assert_eq!(actual, expected.iter().copied().collect());
+    }
+
+    fn assert_hit(&self, pattern: &str, expected_path: &str) {
+        let response = handle_search(None, &serde_json::json!({"pattern": pattern}), &self.state);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let matches = value["result"]["matches"]
+            .as_array()
+            .unwrap_or_else(|| panic!("search RPC failed: {response}"));
+        assert!(
+            matches.iter().any(|hit| {
+                hit["file"] == expected_path
+                    && hit["content"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(pattern))
+            }),
+            "missing {pattern} in {expected_path}: {response}"
+        );
+    }
+
+    fn desired(&self) -> WatchableDirs {
+        let matcher = self.state.gitignore.read().unwrap();
+        watchable_dirs(
+            &self.root,
+            &self.root,
+            &self.state.exclude_dirs,
+            matcher.as_ref(),
+        )
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Also break notify's callback -> state -> registry cycle on a panic.
+        self.state.refresh.polling.store(true, Ordering::SeqCst);
+        stop_native_watcher(&self.state);
+    }
+}
+
+fn disk_snapshot(index_dir: &Path) -> BTreeMap<String, (Vec<u8>, SystemTime)> {
+    std::fs::read_dir(index_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_type().unwrap().is_file())
+        .map(|entry| {
+            (
+                entry.file_name().into_string().unwrap(),
+                (
+                    std::fs::read(entry.path()).unwrap(),
+                    entry.metadata().unwrap().modified().unwrap(),
+                ),
+            )
+        })
+        .collect()
+}
+
+struct WatcherDropProbe {
+    state: Weak<ServerState>,
+    dropped: mpsc::Sender<bool>,
+}
+
+impl Drop for WatcherDropProbe {
+    fn drop(&mut self) {
+        let outside_registry_lock = self
+            .state
+            .upgrade()
+            .is_some_and(|state| state.watch_registry.try_lock().is_ok());
+        let _ = self.dropped.send(outside_registry_lock);
+    }
+}
+
+fn install_registry(fixture: &Fixture, fail_after: Option<usize>) -> mpsc::Receiver<bool> {
+    let (dropped, receive_drop) = mpsc::channel();
+    let probe = WatcherDropProbe {
+        state: Arc::downgrade(&fixture.state),
+        dropped,
+    };
+    let mut watcher = notify::recommended_watcher(move |_event: notify::Result<Event>| {
+        let _keep_probe_alive = &probe;
+    })
+    .unwrap();
+    watcher
+        .watch(&fixture.root, RecursiveMode::NonRecursive)
+        .unwrap();
+    *fixture.state.watch_registry.lock().unwrap() = Some(WatchRegistry {
+        watcher,
+        root: fixture.root.clone(),
+        watched: HashSet::from([fixture.root.clone()]),
+        budget: fixture.state.refresh.watch_budget,
+        failure: None,
+        fail_after,
+        polling: Arc::clone(&fixture.state.refresh.polling),
+    });
+    fixture.state.watcher_active.store(true, Ordering::SeqCst);
+    receive_drop
+}
+
+fn assert_retired(fixture: &Fixture, dropped: mpsc::Receiver<bool>, reason: &str) {
+    fixture.assert_polling();
+    assert!(
+        dropped.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "notify and its callback must be destroyed outside watch_registry's mutex"
+    );
+    let status = fixture.state.refresh.status.lock().unwrap();
+    assert!(
+        status.catch_up,
+        "fallback must request an immediate catch-up"
+    );
+    assert!(
+        status.fallback_reason.as_deref().unwrap().contains(reason),
+        "unexpected fallback: {:?}",
+        status.fallback_reason
+    );
+}
+
+#[test]
+fn a_small_eligible_tree_stays_native_and_ignored_trees_cost_no_budget() {
+    let fixture = Fixture::new(WatchMode::Auto, 2);
+    fixture.write("src/visible.rs", "fn visible_marker() {}\n");
+    fixture.write("ignored/deep/hidden.rs", "fn ignored_marker() {}\n");
+    fixture.write(".gitignore", "ignored/\n");
+    assert!(background_refresh_stale(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        false,
+    ));
+    let desired = fixture.desired();
+    assert_eq!(desired.completeness, TraversalCompleteness::Complete);
+    assert_eq!(
+        desired.dirs,
+        HashSet::from([fixture.root.clone(), fixture.root.join("src")])
+    );
+
+    let dropped = install_registry(&fixture, None);
+    let added = apply_watch_registrations(&fixture.state, &desired, Instant::now());
+    assert_eq!(added, vec![fixture.root.join("src")]);
+    assert!(native_watching(&fixture.state));
+    assert!(fixture.state.watcher_active.load(Ordering::SeqCst));
+    assert_eq!(
+        fixture
+            .state
+            .watch_registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .watched,
+        desired.dirs
+    );
+    assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    fixture.assert_files(&["src/visible.rs"]);
+    fixture.assert_hit("visible_marker", "src/visible.rs");
+}
+
+#[test]
+fn budget_preflight_releases_the_entire_registry_and_never_restarts_it() {
+    let fixture = Fixture::new(WatchMode::Auto, 2);
+    fixture.write("src/old.rs", "fn available_marker() {}\n");
+    assert!(background_refresh_stale(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        false,
+    ));
+    let dropped = install_registry(&fixture, None);
+    assert_eq!(
+        apply_watch_registrations(&fixture.state, &fixture.desired(), Instant::now()).len(),
+        1
+    );
+    fixture.write("added/new.rs", "fn catchup_marker() {}\n");
+    fixture
+        .state
+        .watch_registry
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .fail_after = Some(0);
+    assert!(
+        apply_watch_registrations(&fixture.state, &fixture.desired(), Instant::now()).is_empty()
+    );
+    assert_retired(&fixture, dropped, "budget");
+    fixture.assert_hit("available_marker", "src/old.rs");
+    assert_eq!(
+        fixture.tick(),
+        Some(true),
+        "fallback catch-up must not wait 120 seconds"
+    );
+    fixture.assert_hit("catchup_marker", "added/new.rs");
+
+    for _ in 0..2 {
+        assert!(
+            apply_watch_registrations(&fixture.state, &fixture.desired(), Instant::now())
+                .is_empty()
+        );
+        assert!(!start_file_watcher(
+            Arc::clone(&fixture.state),
+            &fixture.root,
+            4
+        ));
+        assert!(
+            sync_watch_registrations(&fixture.state, &fixture.root)
+                .0
+                .is_empty()
+        );
+        fixture.assert_polling();
+    }
+}
+
+#[test]
+fn capacity_failure_before_or_after_one_registration_releases_all_watches() {
+    for fail_after in [0, 1] {
+        let fixture = Fixture::new(WatchMode::Auto, 4);
+        fixture.write("first/a.rs", "fn first_marker() {}\n");
+        fixture.write("second/b.rs", "fn second_marker() {}\n");
+        let dropped = install_registry(&fixture, Some(fail_after));
+        assert!(
+            apply_watch_registrations(&fixture.state, &fixture.desired(), Instant::now())
+                .is_empty()
+        );
+        assert_retired(&fixture, dropped, "capacity");
+        assert_eq!(fixture.tick(), Some(true));
+        fixture.assert_files(&["first/a.rs", "second/b.rs"]);
+        fixture.assert_hit("second_marker", "second/b.rs");
+        assert!(!start_file_watcher(
+            Arc::clone(&fixture.state),
+            &fixture.root,
+            4
+        ));
+        assert!(
+            apply_watch_registrations(&fixture.state, &fixture.desired(), Instant::now())
+                .is_empty()
+        );
+        fixture.assert_polling();
+    }
+}
+
+#[test]
+fn registration_failure_is_sticky_even_if_the_injection_is_removed() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    for dir in ["first", "second", "third"] {
+        std::fs::create_dir(fixture.root.join(dir)).unwrap();
+    }
+    let _dropped = install_registry(&fixture, Some(1));
+    let mut guard = fixture.state.watch_registry.lock().unwrap();
+    let registry = guard.as_mut().unwrap();
+    let first = fixture.root.join("first");
+    let second = fixture.root.join("second");
+    let third = fixture.root.join("third");
+    assert_eq!(registry.add_all([&first, &second]), vec![first.clone()]);
+    assert!(registry.failure.is_some());
+    assert_eq!(
+        registry.watched,
+        HashSet::from([fixture.root.clone(), first])
+    );
+    let before = registry.watched.clone();
+    registry.fail_after = None;
+    assert!(registry.add_all([&third]).is_empty());
+    assert!(registry.resubscribe_all([&second]).is_empty());
+    assert_eq!(registry.watched, before);
+}
+
+#[test]
+fn a_callback_handoff_after_the_registration_entry_check_prevents_subscriptions() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    let first = fixture.root.join("first");
+    let second = fixture.root.join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let dropped = install_registry(&fixture, Some(1));
+    let mut guard = fixture.state.watch_registry.lock().unwrap();
+    let registry = guard.as_mut().unwrap();
+    assert!(Arc::ptr_eq(
+        &registry.polling,
+        &fixture.state.refresh.polling
+    ));
+    // Collection runs after subscribe's entry check but before its per-directory
+    // loop, placing the callback handoff in that window without OS-event timing.
+    let desired = [&first, &second].into_iter().inspect(|_| {
+        request_polling(&fixture.state, "injected callback capacity failure".into());
+    });
+    assert!(registry.add_all(desired).is_empty());
+    assert_eq!(
+        registry.fail_after,
+        Some(1),
+        "no native watch call should be attempted"
+    );
+    assert_eq!(registry.watched, HashSet::from([fixture.root.clone()]));
+    assert!(registry.failure.is_none());
+    drop(guard);
+    assert!(
+        apply_watch_registrations(&fixture.state, &fixture.desired(), Instant::now()).is_empty()
+    );
+    assert_retired(&fixture, dropped, "callback");
+}
+
+#[test]
+fn watcher_creation_capacity_failure_requests_polling_without_a_registry() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    fixture.write("source.rs", "fn creation_fallback_marker() {}\n");
+    let attempted = AtomicBool::new(false);
+    assert!(!start_file_watcher_using(
+        Arc::clone(&fixture.state),
+        &fixture.root,
+        4,
+        |_callback| {
+            attempted.store(true, Ordering::SeqCst);
+            Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch))
+        },
+    ));
+    assert!(attempted.load(Ordering::SeqCst));
+    fixture.assert_polling();
+    assert!(fixture.state.refresh.status.lock().unwrap().catch_up);
+    assert_eq!(fixture.tick(), Some(true));
+    fixture.assert_hit("creation_fallback_marker", "source.rs");
+}
+
+#[test]
+fn root_subscription_failure_drops_the_created_watcher_and_requests_catch_up() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    fixture.write("source.rs", "fn root_fallback_marker() {}\n");
+    let (dropped, receive_drop) = mpsc::channel();
+    let probe = WatcherDropProbe {
+        state: Arc::downgrade(&fixture.state),
+        dropped,
+    };
+    assert!(!start_file_watcher_using(
+        Arc::clone(&fixture.state),
+        &fixture.root.join("missing-root"),
+        4,
+        |mut callback| {
+            notify::recommended_watcher(move |event| {
+                let _keep_probe_alive = &probe;
+                callback(event);
+            })
+        },
+    ));
+    assert_retired(&fixture, receive_drop, "coverage");
+    assert_eq!(fixture.tick(), Some(true));
+    fixture.assert_hit("root_fallback_marker", "source.rs");
+}
+
+#[test]
+fn incomplete_registration_coverage_releases_watches_instead_of_claiming_native() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    fixture.write("src/source.rs", "fn incomplete_coverage_marker() {}\n");
+    let dropped = install_registry(&fixture, None);
+    let mut desired = fixture.desired();
+    desired.completeness = TraversalCompleteness::Incomplete;
+    assert!(apply_watch_registrations(&fixture.state, &desired, Instant::now()).is_empty());
+    assert_retired(&fixture, dropped, "incomplete");
+    assert_eq!(fixture.tick(), Some(true));
+    fixture.assert_hit("incomplete_coverage_marker", "src/source.rs");
+}
+
+#[test]
+fn queue_overflow_repairs_content_but_does_not_abandon_native_watching() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    fixture.write("source.rs", "fn before_overflow_marker() {}\n");
+    assert!(background_refresh_stale(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        false,
+    ));
+    let _dropped = install_registry(&fixture, None);
+    fixture.write("source.rs", "fn after_overflow_repaired_marker() {}\n");
+    let overflowed = AtomicBool::new(true);
+    fixture
+        .state
+        .watch_resubscribe
+        .store(true, Ordering::SeqCst);
+    recover_watcher_overflow(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        &overflowed,
+        1,
+    );
+    assert!(!overflowed.load(Ordering::SeqCst));
+    assert!(native_watching(&fixture.state));
+    assert!(fixture.state.watch_registry.lock().unwrap().is_some());
+    assert!(
+        fixture
+            .state
+            .refresh
+            .status
+            .lock()
+            .unwrap()
+            .fallback_reason
+            .is_none()
+    );
+    fixture.assert_hit("after_overflow_repaired_marker", "source.rs");
+}
+
+#[test]
+fn explicit_poll_never_creates_a_watcher_or_starts_native_recovery() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    fixture.write("src/source.rs", "fn polled_marker() {}\n");
+    let attempted = AtomicBool::new(false);
+    assert!(!start_file_watcher_using(
+        Arc::clone(&fixture.state),
+        &fixture.root,
+        4,
+        |_callback| {
+            attempted.store(true, Ordering::SeqCst);
+            Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch))
+        },
+    ));
+    assert!(!attempted.load(Ordering::SeqCst));
+    assert!(!start_file_watcher(
+        Arc::clone(&fixture.state),
+        &fixture.root,
+        4
+    ));
+    assert_eq!(
+        fixture.tick(),
+        Some(true),
+        "explicit poll starts with catch-up due"
+    );
+    fixture.assert_polling();
+    fixture.assert_hit("polled_marker", "src/source.rs");
+
+    let before = disk_snapshot(&fixture.state.index_dir);
+    let evidence = fixture.state.file_evidence.read().unwrap().clone();
+    let generation = fixture.state.cache_generation.load(Ordering::SeqCst);
+    fixture.write("arrived/new.rs", "fn next_poll_marker() {}\n");
+    watch_new_subtree(&fixture.state, &fixture.root, &fixture.root.join("arrived"));
+    spawn_recovery_scan(
+        &fixture.state,
+        &fixture.root,
+        vec![fixture.root.join("arrived")],
+        SystemTime::UNIX_EPOCH,
+    );
+    let overflowed = AtomicBool::new(true);
+    recover_watcher_overflow(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        &overflowed,
+        1,
+    );
+    fixture
+        .state
+        .ignore_rules_dirty
+        .store(true, Ordering::SeqCst);
+    schedule_ignore_rules_refresh(Arc::clone(&fixture.state), fixture.root.clone());
+    assert!(
+        !fixture
+            .state
+            .ignore_refresh_scheduled
+            .load(Ordering::SeqCst)
+    );
+    assert!(
+        sync_watch_registrations(&fixture.state, &fixture.root)
+            .0
+            .is_empty()
+    );
+    assert!(
+        apply_watch_registrations(&fixture.state, &fixture.desired(), Instant::now()).is_empty()
+    );
+    assert_eq!(fixture.tick(), None);
+    assert_eq!(*fixture.state.file_evidence.read().unwrap(), evidence);
+    assert_eq!(
+        fixture.state.cache_generation.load(Ordering::SeqCst),
+        generation
+    );
+    assert_eq!(disk_snapshot(&fixture.state.index_dir), before);
+    fixture.assert_polling();
+    fixture.poll();
+    fixture.assert_hit("next_poll_marker", "arrived/new.rs");
+}
+
+#[test]
+fn scheduled_polling_reconciles_add_modify_delete_rename_and_ignore_changes() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    fixture.write("source.rs", "fn initial_marker() {}\n");
+    let deleted = fixture.write("delete.rs", "fn removed_marker() {}\n");
+    let renamed = fixture.write("rename.rs", "fn renamed_marker() {}\n");
+    fixture.write("ignored/hidden.rs", "fn initially_hidden_marker() {}\n");
+    fixture.write(".gitignore", "ignored/\n");
+    fixture.poll();
+    fixture.assert_files(&["delete.rs", "rename.rs", "source.rs"]);
+    fixture.assert_hit("initial_marker", "source.rs");
+
+    fixture.write("source.rs", "fn modified_polling_marker() {}\n");
+    fixture.write("added.rs", "fn added_marker() {}\n");
+    fixture.write("asset.bin", [0, 1, 2, 3]);
+    std::fs::remove_file(deleted).unwrap();
+    std::fs::rename(renamed, fixture.root.join("renamed.rs")).unwrap();
+    fixture.poll();
+    fixture.assert_files(&["added.rs", "asset.bin", "renamed.rs", "source.rs"]);
+    fixture.assert_hit("modified_polling_marker", "source.rs");
+    fixture.assert_hit("renamed_marker", "renamed.rs");
+    assert!(
+        !fixture
+            .state
+            .index
+            .read()
+            .unwrap()
+            .reader_has_path("delete.rs")
+    );
+    assert!(
+        !fixture
+            .state
+            .index
+            .read()
+            .unwrap()
+            .reader_has_path("rename.rs")
+    );
+    assert!(
+        !fixture
+            .state
+            .file_evidence
+            .read()
+            .unwrap()
+            .stamps
+            .contains_key("delete.rs")
+    );
+
+    fixture.write(".gitignore", "source.rs\nasset.bin\n");
+    fixture.poll();
+    fixture.assert_files(&["added.rs", "ignored/hidden.rs", "renamed.rs"]);
+    fixture.assert_hit("initially_hidden_marker", "ignored/hidden.rs");
+    assert!(
+        !fixture
+            .state
+            .index
+            .read()
+            .unwrap()
+            .reader_has_path("source.rs")
+    );
+    std::fs::remove_file(fixture.root.join(".gitignore")).unwrap();
+    fixture.poll();
+    fixture.assert_files(&[
+        "added.rs",
+        "asset.bin",
+        "ignored/hidden.rs",
+        "renamed.rs",
+        "source.rs",
+    ]);
+    fixture.assert_hit("modified_polling_marker", "source.rs");
+}
+
+#[test]
+fn unchanged_scheduled_polls_preserve_evidence_index_bytes_mtimes_and_cache() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    fixture.write("source.rs", "fn unchanged_marker() {}\n");
+    fixture.write("asset.bin", [0, 1, 2]);
+    fixture.poll();
+    fixture.assert_hit("unchanged_marker", "source.rs");
+    let before = disk_snapshot(&fixture.state.index_dir);
+    assert!(before.contains_key("filestamps.json"));
+    assert!(before.contains_key("index.bin"));
+    let evidence = fixture.state.file_evidence.read().unwrap().clone();
+    assert_eq!(
+        evidence,
+        tgrep_core::meta::read_file_evidence(&fixture.state.index_dir).unwrap()
+    );
+    let reader = fixture.state.index.read().unwrap().reader_arc();
+    let generation = fixture.state.cache_generation.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        fixture.poll();
+        assert_eq!(disk_snapshot(&fixture.state.index_dir), before);
+        assert_eq!(*fixture.state.file_evidence.read().unwrap(), evidence);
+        assert!(Arc::ptr_eq(
+            &reader,
+            &fixture.state.index.read().unwrap().reader_arc()
+        ));
+        assert_eq!(
+            fixture.state.cache_generation.load(Ordering::SeqCst),
+            generation
+        );
+        assert!(
+            !fixture
+                .state
+                .index
+                .read()
+                .unwrap()
+                .live
+                .has_pending_changes()
+        );
+        assert_eq!(fixture.tick(), None);
+    }
+}
+
+#[test]
+fn indexing_and_flushing_preserve_catch_up_until_the_first_idle_tick() {
+    for indexing in [true, false] {
+        let fixture = Fixture::new(WatchMode::Poll, 4);
+        fixture.write("source.rs", "fn deferred_marker() {}\n");
+        let busy = if indexing {
+            &fixture.state.indexing
+        } else {
+            &fixture.state.flushing
+        };
+        busy.store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            assert_eq!(fixture.tick(), None);
+            let status = fixture.state.refresh.status.lock().unwrap();
+            assert!(status.catch_up);
+            assert!(!status.running);
+            assert!(status.last_success.is_none());
+        }
+        busy.store(false, Ordering::SeqCst);
+        assert_eq!(fixture.tick(), Some(true));
+        fixture.assert_hit("deferred_marker", "source.rs");
+        assert!(!fixture.state.refresh.status.lock().unwrap().catch_up);
+    }
+}
+
+#[test]
+fn a_fallback_requested_during_a_scan_retains_exactly_one_immediate_catch_up() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    fixture.write("source.rs", "fn original_marker() {}\n");
+    let hook_state = Arc::downgrade(&fixture.state);
+    let late = fixture.root.join("late.rs");
+    *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::AfterMatcherPublish) {
+            let state = hook_state.upgrade().unwrap();
+            assert!(state.refresh.status.lock().unwrap().running);
+            std::fs::write(&late, "fn catch_up_after_walk_marker() {}\n").unwrap();
+            request_polling(
+                &state,
+                "capacity failure during native reconciliation".into(),
+            );
+        }
+    }));
+    assert!(background_refresh_stale(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        false,
+    ));
+    *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+    fixture.assert_polling();
+    assert!(fixture.state.refresh.status.lock().unwrap().catch_up);
+    fixture.assert_files(&["source.rs"]);
+    assert_eq!(
+        fixture.tick(),
+        Some(true),
+        "catch-up must survive scan completion"
+    );
+    fixture.assert_hit("catch_up_after_walk_marker", "late.rs");
+    assert!(!fixture.state.refresh.status.lock().unwrap().catch_up);
+    assert_eq!(
+        fixture.tick(),
+        None,
+        "one handoff must cause only one catch-up"
+    );
+}
+
+#[test]
+fn sustained_searches_do_not_defer_due_polls() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    fixture.write("source.rs", "fn searchable_marker() {}\n");
+    fixture.poll();
+    for iteration in 0..3 {
+        fixture.assert_hit("searchable_marker", "source.rs");
+        fixture.state.note_search();
+        assert!(fixture.state.quiet_for() < RECONCILE_QUIET_PERIOD);
+        let name = format!("new{iteration}.rs");
+        fixture.write(&name, format!("fn arrival_{iteration}_marker() {{}}\n"));
+        fixture.poll();
+        fixture.assert_hit(&format!("arrival_{iteration}_marker"), &name);
+    }
+}
+
+#[test]
+fn a_running_production_refresh_rejects_a_second_tick_and_keeps_search_available() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    fixture.write("source.rs", "fn searchable_marker() {}\n");
+    fixture.poll();
+    let walks = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let resume_rx = Mutex::new(resume_rx);
+    let hook_walks = Arc::clone(&walks);
+    *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::BeforeWalk)
+            && hook_walks.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            entered_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+    }));
+    fixture.due();
+    let first_state = Arc::clone(&fixture.state);
+    let first = thread::spawn(move || {
+        scheduled_reconcile(&first_state, &first_state.root, &first_state.index_dir)
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(fixture.state.refresh.status.lock().unwrap().running);
+    fixture.assert_hit("searchable_marker", "source.rs");
+    let (second_tx, second_rx) = mpsc::channel();
+    let second_state = Arc::clone(&fixture.state);
+    let second = thread::spawn(move || {
+        second_tx
+            .send(scheduled_reconcile(
+                &second_state,
+                &second_state.root,
+                &second_state.index_dir,
+            ))
+            .unwrap();
+    });
+    let second_result = second_rx.recv_timeout(Duration::from_secs(2));
+    resume_tx.send(()).unwrap();
+    let first_result = first.join().unwrap();
+    second.join().unwrap();
+    *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+    assert_eq!(
+        second_result.unwrap(),
+        None,
+        "a second tick must not queue another walk"
+    );
+    assert_eq!(first_result, Some(true));
+    assert_eq!(walks.load(Ordering::SeqCst), 1);
+    assert!(!fixture.state.refresh.status.lock().unwrap().running);
+}
+
+#[test]
+fn a_scan_longer_than_the_interval_schedules_from_completion_not_start() {
+    let interval = Duration::from_secs(1);
+    let fixture = Fixture::with_interval(WatchMode::Poll, 4, interval);
+    fixture.write("source.rs", "fn slow_scan_marker() {}\n");
+    *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::BeforeWalk) {
+            thread::sleep(interval + Duration::from_millis(20));
+        }
+    }));
+    assert_eq!(fixture.tick(), Some(true));
+    *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+    let status = fixture.state.refresh.status.lock().unwrap();
+    assert!(status.duration_ms.unwrap() >= interval.as_millis() as u64);
+    assert!(status.last_success.is_some());
+    assert!(!status.catch_up);
+    assert!(!status.running);
+    assert!(status.error.is_none());
+    drop(status);
+    assert_eq!(
+        fixture.tick(),
+        None,
+        "a long scan must not trigger a catch-up storm"
+    );
+    fixture.poll();
+}
+
+#[test]
+fn a_failed_poll_preserves_last_success_and_retries_an_unchanged_failed_stamp() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    let path = fixture.write("source.rs", "fn original_marker() {}\n");
+    fixture.poll();
+    let last_success = fixture.state.refresh.status.lock().unwrap().last_success;
+    fixture.write("source.rs", "fn recovered_after_failure_marker() {}\n");
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let failed_stamp = tgrep_core::meta::file_stamp(&std::fs::metadata(&path).unwrap());
+    let hook_path = path.clone();
+    *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::AfterMatcherPublish) {
+            std::fs::remove_file(&hook_path).unwrap();
+        }
+    }));
+    fixture.due();
+    assert_eq!(fixture.tick(), Some(false));
+    *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+    assert!(
+        fixture
+            .state
+            .index
+            .read()
+            .unwrap()
+            .reader_has_path("source.rs")
+    );
+    assert_eq!(
+        fixture.state.unreadable.read().unwrap().get("source.rs"),
+        Some(&failed_stamp)
+    );
+    let status = fixture.state.refresh.status.lock().unwrap();
+    assert_eq!(status.last_success, last_success);
+    assert!(status.error.is_some());
+    assert!(status.duration_ms.is_some());
+    assert!(!status.running);
+    drop(status);
+    assert_eq!(
+        fixture.tick(),
+        None,
+        "failures also obey the completion-based retry interval"
+    );
+
+    fixture.write("source.rs", "fn recovered_after_failure_marker() {}\n");
+    set_modified(&path, modified);
+    assert_eq!(
+        tgrep_core::meta::file_stamp(&std::fs::metadata(&path).unwrap()),
+        failed_stamp
+    );
+    fixture.poll();
+    assert!(fixture.state.unreadable.read().unwrap().is_empty());
+    assert!(fixture.state.refresh.status.lock().unwrap().error.is_none());
+    fixture.assert_hit("recovered_after_failure_marker", "source.rs");
+}
+
+#[test]
+fn a_change_after_the_metadata_walk_is_reconciled_on_the_next_poll() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    let path = fixture.write("source.rs", "fn scanned_marker() {}\n");
+    fixture.poll();
+    let prior_evidence = fixture.state.file_evidence.read().unwrap().clone();
+    let hook_root = fixture.root.clone();
+    *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::AfterMatcherPublish) {
+            std::fs::write(&path, "fn changed_after_walk_marker() {}\n").unwrap();
+            std::fs::write(hook_root.join("late.rs"), "fn late_arrival_marker() {}\n").unwrap();
+        }
+    }));
+    fixture.poll();
+    *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+    assert_eq!(*fixture.state.file_evidence.read().unwrap(), prior_evidence);
+    fixture.poll();
+    fixture.assert_hit("changed_after_walk_marker", "source.rs");
+    fixture.assert_hit("late_arrival_marker", "late.rs");
+    fixture.assert_files(&["late.rs", "source.rs"]);
+}
+
+#[test]
+fn poll_build_paths_repair_post_extraction_changes_without_native_watches() {
+    enum Build {
+        Bootstrap,
+        Reload,
+        Resume,
+    }
+    for build in [Build::Bootstrap, Build::Reload, Build::Resume] {
+        let fixture = Fixture::new(WatchMode::Poll, 4);
+        if !matches!(build, Build::Bootstrap) {
+            fixture.write("seeded.rs", "fn seeded_marker() {}\n");
+            fixture.poll();
+        }
+        let path = fixture.write("source.rs", "fn before_build_marker() {}\n");
+        let writes = Arc::new(AtomicUsize::new(0));
+        let hook_writes = Arc::clone(&writes);
+        *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterBuildBeforeStampPublish)
+                && hook_writes.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                std::fs::write(&path, "fn after_build_final_marker() {}\n").unwrap();
+            }
+        }));
+        match build {
+            Build::Bootstrap => {
+                fixture.state.indexing.store(true, Ordering::SeqCst);
+                assert!(bootstrap_index_build(
+                    &fixture.state,
+                    &fixture.root,
+                    &fixture.state.index_dir
+                ));
+            }
+            Build::Reload => {
+                let response = handle_reload(None, &fixture.state);
+                let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(value["result"]["status"], "reloaded", "{response}");
+            }
+            Build::Resume => {
+                fixture.state.indexing.store(true, Ordering::SeqCst);
+                background_index_build(&fixture.state, &fixture.root, &fixture.state.index_dir);
+            }
+        }
+        *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+        assert!(writes.load(Ordering::SeqCst) >= 1);
+        fixture.assert_polling();
+        assert!(!fixture.state.indexing.load(Ordering::SeqCst));
+        assert!(!fixture.state.gitignore_pending.load(Ordering::SeqCst));
+        fixture.poll();
+        fixture.assert_hit("after_build_final_marker", "source.rs");
+    }
+}
+
+fn set_modified(path: &Path, modified: SystemTime) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+}
+
+#[test]
+fn legacy_evidence_without_metadata_versions_fails_open_and_converges() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    let path = fixture.write("source.rs", "fn old_legacy_marker() {}\n");
+    fixture.poll();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let legacy = tgrep_core::meta::FileEvidence::from_stamps(
+        fixture.state.file_evidence.read().unwrap().stamps.clone(),
+    );
+    tgrep_core::meta::write_file_evidence(&legacy, &fixture.state.index_dir).unwrap();
+    *fixture.state.file_evidence.write().unwrap() = legacy.clone();
+    fixture.write("source.rs", "fn new_legacy_marker() {}\n");
+    set_modified(&path, modified);
+    assert_eq!(
+        tgrep_core::meta::file_stamp(&std::fs::metadata(&path).unwrap()),
+        legacy.stamps["source.rs"]
+    );
+    fixture.poll();
+    fixture.assert_hit("new_legacy_marker", "source.rs");
+    let repaired = disk_snapshot(&fixture.state.index_dir);
+    fixture.poll();
+    assert_eq!(disk_snapshot(&fixture.state.index_dir), repaired);
+}
+
+#[cfg(unix)]
+#[test]
+fn equal_size_writes_with_restored_mtime_and_same_second_changes_are_polled() {
+    for preserve_mtime in [true, false] {
+        let fixture = Fixture::new(WatchMode::Poll, 4);
+        let path = fixture.write("source.rs", "fn old_precise_marker() {}\n");
+        let second = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let original_time = second + Duration::from_millis(100);
+        set_modified(&path, original_time);
+        fixture.poll();
+        fixture.assert_hit("old_precise_marker", "source.rs");
+        let old = fixture.state.file_evidence.read().unwrap().stamps["source.rs"].clone();
+        fixture.write("source.rs", "fn new_precise_marker() {}\n");
+        let new_time = if preserve_mtime {
+            original_time
+        } else {
+            second + Duration::from_millis(900)
+        };
+        set_modified(&path, new_time);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            new_time
+        );
+        assert_eq!(
+            tgrep_core::meta::file_stamp(&std::fs::metadata(&path).unwrap()),
+            old
+        );
+        fixture.poll();
+        fixture.assert_hit("new_precise_marker", "source.rs");
+        let settled = disk_snapshot(&fixture.state.index_dir);
+        fixture.poll();
+        assert_eq!(disk_snapshot(&fixture.state.index_dir), settled);
+    }
+}
+
+#[test]
+#[ignore = "bounded local polling measurement; run with --ignored --nocapture"]
+fn measure_polling_1000_files_and_20_file_change_batch() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    for file in 0..1000 {
+        fixture.write(
+            &format!("file{file:04}.rs"),
+            format!("fn fixture_{file:04}_marker() {{}}\n"),
+        );
+    }
+    fixture.poll();
+    let before = disk_snapshot(&fixture.state.index_dir);
+    let no_change_start = Instant::now();
+    fixture.poll();
+    let no_change = no_change_start.elapsed();
+    assert_eq!(disk_snapshot(&fixture.state.index_dir), before);
+    for file in 0..20 {
+        fixture.write(
+            &format!("file{file:04}.rs"),
+            format!("fn changed_{file:04}_batch_marker() {{}}\n"),
+        );
+    }
+    let changed_start = Instant::now();
+    fixture.poll();
+    let changed = changed_start.elapsed();
+    fixture.assert_hit("changed_0019_batch_marker", "file0019.rs");
+    assert_eq!(fixture.state.index.read().unwrap().num_files(), 1000);
+    eprintln!("polling fixture: 1000 files; no-change {no_change:?}; 20-file batch {changed:?}");
+}

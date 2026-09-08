@@ -5213,6 +5213,12 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     let Some(per_tri) = per_tri else {
         eprintln!("[trace] reindex: modified {rel_path}");
         mark_filename_only(state, rel_path);
+        state.file_evidence.write().unwrap().insert_verified(
+            rel_path.to_string(),
+            current,
+            None,
+            Some(version),
+        );
         return;
     };
 
@@ -5584,7 +5590,7 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Stamps for the walked files that are actually in the index.
+/// Stamps for walked files that were indexed or verified as content-binary.
 ///
 /// The build stamps its work from a *second* traversal, taken after the content
 /// walk that fed the index, so a file created between the two appears here and
@@ -6937,22 +6943,24 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                         }
                     };
                     let data = tgrep_core::encoding::decode_for_index(&data);
-                    if tgrep_core::trigram::is_binary(&data) {
-                        return None;
-                    }
                     let rel_path = path
                         .strip_prefix(root)
                         .unwrap_or(path)
                         .to_string_lossy()
                         .replace('\\', "/");
 
-                    let mut trigrams = tgrep_core::trigram::extract(&data);
-                    let lower = data.to_ascii_lowercase();
-                    if lower != *data {
-                        trigrams.extend(tgrep_core::trigram::extract(&lower));
-                    }
-                    let content_id = tgrep_core::meta::ContentId::from_indexed_bytes(&data);
-                    Some((rel_path, trigrams, content_id, version))
+                    let content = if tgrep_core::trigram::is_binary(&data) {
+                        None
+                    } else {
+                        let mut trigrams = tgrep_core::trigram::extract(&data);
+                        let lower = data.to_ascii_lowercase();
+                        if lower != *data {
+                            trigrams.extend(tgrep_core::trigram::extract(&lower));
+                        }
+                        let content_id = tgrep_core::meta::ContentId::from_indexed_bytes(&data);
+                        Some((trigrams, content_id))
+                    };
+                    Some((rel_path, content, version))
                 })
                 .collect::<Vec<_>>()
         };
@@ -6964,10 +6972,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         // Sequential: insert into LiveIndex (brief write lock per batch)
         {
             let mut index = state.index.write().unwrap();
-            for (rel_path, trigrams, content_id, version) in batch_results {
-                index.live.upsert_file_with_trigrams(&rel_path, trigrams);
+            for (rel_path, content, version) in batch_results {
                 versions.insert(rel_path.clone(), version);
-                content_ids.insert(rel_path, content_id);
+                if let Some((trigrams, content_id)) = content {
+                    index.live.upsert_file_with_trigrams(&rel_path, trigrams);
+                    content_ids.insert(rel_path, content_id);
+                }
             }
         }
 
@@ -7070,6 +7080,13 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
             let index = state.index.read().unwrap();
             let mut paths = index.reader_paths();
             paths.extend(index.live.overlay_paths());
+            // Verified binary classifications have evidence but no content postings.
+            paths.extend(
+                versions
+                    .keys()
+                    .filter(|path| !content_ids.contains_key(path.as_str()))
+                    .cloned(),
+            );
             paths
         };
         stamps_for_index_members(walk_meta.files, &indexed)

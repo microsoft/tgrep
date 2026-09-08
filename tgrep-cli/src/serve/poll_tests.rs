@@ -127,6 +127,272 @@ fn disk_snapshot(index_dir: &Path) -> BTreeMap<String, (Vec<u8>, SystemTime)> {
         .collect()
 }
 
+fn assert_binary_evidence(fixture: &Fixture, relative: &str) {
+    let version = builder::file_version(&std::fs::metadata(fixture.root.join(relative)).unwrap());
+    let evidence = fixture.state.file_evidence.read().unwrap();
+    assert_eq!(evidence.version(relative), Some(&version), "{relative}");
+    assert_eq!(evidence.content_id(relative), None, "{relative}");
+    drop(evidence);
+    assert!(
+        !fixture
+            .state
+            .index
+            .read()
+            .unwrap()
+            .has_active_path(relative),
+        "binary classification must not add content postings for {relative}"
+    );
+    assert!(
+        fixture
+            .state
+            .filename_extra_paths
+            .read()
+            .unwrap()
+            .contains(relative)
+    );
+}
+
+#[test]
+fn verified_binary_reindex_preserves_evidence_without_rewriting_the_index() {
+    for force in [false, true] {
+        let fixture = Fixture::new(WatchMode::Poll, 4);
+        fixture.write("seeded.rs", "fn seeded_marker() {}\n");
+        fixture.poll();
+        let binary = fixture.write("binary.rs", b"binary_marker\n\0");
+        {
+            let _gate = fixture.state.snapshot_gate.read().unwrap();
+            reindex_file(&fixture.state, &binary, "binary.rs", force);
+        }
+        assert_binary_evidence(&fixture, "binary.rs");
+        assert!(
+            !fixture
+                .state
+                .index
+                .read()
+                .unwrap()
+                .live
+                .has_pending_changes()
+        );
+        assert!(persist_pending_index_changes(&fixture.state));
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let hook_reads = Arc::clone(&reads);
+        *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterConcreteRead) {
+                hook_reads.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let before = disk_snapshot(&fixture.state.index_dir);
+        let evidence = fixture.state.file_evidence.read().unwrap().clone();
+        for _ in 0..2 {
+            {
+                let _gate = fixture.state.snapshot_gate.read().unwrap();
+                reindex_file(&fixture.state, &binary, "binary.rs", false);
+            }
+            fixture.poll();
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert_eq!(disk_snapshot(&fixture.state.index_dir), before);
+        assert_eq!(*fixture.state.file_evidence.read().unwrap(), evidence);
+        fixture.assert_files(&["binary.rs", "seeded.rs"]);
+    }
+}
+
+#[test]
+fn verified_binary_reindex_preserves_text_binary_text_transitions() {
+    for force in [false, true] {
+        let fixture = Fixture::new(WatchMode::Poll, 4);
+        let path = fixture.write("source.rs", "fn original_text_marker() {}\n");
+        fixture.poll();
+        fixture.assert_hit("original_text_marker", "source.rs");
+        fixture.write("source.rs", b"binary_content\n\0");
+        {
+            let _gate = fixture.state.snapshot_gate.read().unwrap();
+            reindex_file(&fixture.state, &path, "source.rs", force);
+        }
+        assert_binary_evidence(&fixture, "source.rs");
+        assert!(
+            fixture
+                .state
+                .cache
+                .read()
+                .unwrap()
+                .peek("source.rs")
+                .is_none()
+        );
+        assert!(persist_pending_index_changes(&fixture.state));
+        let persisted = tgrep_core::meta::read_file_evidence(&fixture.state.index_dir).unwrap();
+        assert_eq!(
+            persisted,
+            *fixture.state.file_evidence.read().unwrap(),
+            "the content eviction must publish the verified binary classification"
+        );
+        let before = disk_snapshot(&fixture.state.index_dir);
+        fixture.poll();
+        assert_eq!(disk_snapshot(&fixture.state.index_dir), before);
+
+        fixture.write("source.rs", "fn restored_text_marker() {}\n");
+        {
+            let _gate = fixture.state.snapshot_gate.read().unwrap();
+            reindex_file(&fixture.state, &path, "source.rs", force);
+        }
+        fixture.assert_hit("restored_text_marker", "source.rs");
+        assert!(
+            !fixture
+                .state
+                .filename_extra_paths
+                .read()
+                .unwrap()
+                .contains("source.rs")
+        );
+        assert!(
+            fixture
+                .state
+                .file_evidence
+                .read()
+                .unwrap()
+                .content_id("source.rs")
+                .is_some()
+        );
+        fixture.assert_files(&["source.rs"]);
+    }
+}
+
+#[test]
+fn verified_binary_reindex_rejects_raced_classification() {
+    for force in [false, true] {
+        let fixture = Fixture::new(WatchMode::Poll, 4);
+        let path = fixture.write("source.rs", "fn original_text_marker() {}\n");
+        fixture.poll();
+        fixture.write("source.rs", b"binary_content\n\0");
+        let hook_path = path.clone();
+        *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::BeforeConcreteCommit) {
+                std::fs::write(&hook_path, "fn latest_text_marker() {}\n").unwrap();
+            }
+        }));
+        {
+            let _gate = fixture.state.snapshot_gate.read().unwrap();
+            reindex_file(&fixture.state, &path, "source.rs", force);
+        }
+        assert!(
+            fixture
+                .state
+                .file_evidence
+                .read()
+                .unwrap()
+                .version("source.rs")
+                .is_none()
+        );
+        assert!(
+            fixture
+                .state
+                .index
+                .read()
+                .unwrap()
+                .has_active_path("source.rs")
+        );
+        assert!(
+            !fixture
+                .state
+                .filename_extra_paths
+                .read()
+                .unwrap()
+                .contains("source.rs")
+        );
+        *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+        fixture.poll();
+        fixture.assert_hit("latest_text_marker", "source.rs");
+    }
+}
+
+#[test]
+fn resumed_build_preserves_binary_evidence_across_batches_and_flushes() {
+    for force_flush in [false, true] {
+        let mut fixture = Fixture::new(WatchMode::Poll, 4);
+        if force_flush {
+            Arc::get_mut(&mut fixture.state).unwrap().memory_cap_bytes = 0;
+        }
+        fixture.write("seeded.rs", "fn seeded_marker() {}\n");
+        fixture.write("existing.rs", b"existing_binary\n\0");
+        fixture.poll();
+        let mut binaries = vec!["existing.rs".to_string()];
+        for number in 0..501 {
+            let name = format!("binary-{number:03}.rs");
+            fixture.write(&name, b"batch_binary\n\0");
+            binaries.push(name);
+        }
+        fixture.write("text.rs", "fn new_text_marker() {}\n");
+        fixture.state.indexing.store(true, Ordering::SeqCst);
+        background_index_build(&fixture.state, &fixture.root, &fixture.state.index_dir);
+        assert!(!fixture.state.indexing.load(Ordering::SeqCst));
+        assert!(!fixture.state.flushing.load(Ordering::SeqCst));
+        assert_eq!(fixture.state.index.read().unwrap().num_files(), 2);
+        fixture.assert_hit("new_text_marker", "text.rs");
+        for name in &binaries {
+            assert_binary_evidence(&fixture, name);
+        }
+        let persisted = tgrep_core::meta::read_file_evidence(&fixture.state.index_dir).unwrap();
+        assert_eq!(persisted, *fixture.state.file_evidence.read().unwrap());
+        assert_eq!(persisted.versions.len(), binaries.len() + 2);
+        let before = disk_snapshot(&fixture.state.index_dir);
+        fixture.poll();
+        fixture.poll();
+        assert_eq!(disk_snapshot(&fixture.state.index_dir), before);
+        let mut expected: Vec<_> = binaries.iter().map(String::as_str).collect();
+        expected.extend(["seeded.rs", "text.rs"]);
+        fixture.assert_files(&expected);
+    }
+}
+
+#[test]
+fn resumed_build_binary_evidence_describes_the_read_not_the_final_walk() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    fixture.write("seeded.rs", "fn seeded_marker() {}\n");
+    fixture.poll();
+    let path = fixture.write("raced.rs", b"original_binary\n\0");
+    let version = builder::file_version(&std::fs::metadata(&path).unwrap());
+    let hook_root = fixture.root.clone();
+    *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::AfterBuildBeforeStampPublish) {
+            std::fs::write(&path, "fn after_classification_marker() {}\n").unwrap();
+            std::fs::write(hook_root.join("late.rs"), "fn late_arrival_marker() {}\n").unwrap();
+        }
+    }));
+    fixture.state.indexing.store(true, Ordering::SeqCst);
+    background_index_build(&fixture.state, &fixture.root, &fixture.state.index_dir);
+    *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+    assert_eq!(
+        fixture
+            .state
+            .file_evidence
+            .read()
+            .unwrap()
+            .version("raced.rs"),
+        Some(&version)
+    );
+    assert!(
+        fixture
+            .state
+            .file_evidence
+            .read()
+            .unwrap()
+            .stamp("late.rs")
+            .is_none()
+    );
+    assert!(
+        !fixture
+            .state
+            .index
+            .read()
+            .unwrap()
+            .has_active_path("raced.rs")
+    );
+    fixture.poll();
+    fixture.assert_hit("after_classification_marker", "raced.rs");
+    fixture.assert_hit("late_arrival_marker", "late.rs");
+}
+
 struct WatcherDropProbe {
     state: Weak<ServerState>,
     dropped: mpsc::Sender<bool>,

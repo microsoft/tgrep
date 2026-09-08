@@ -6,7 +6,10 @@ use std::path::Path;
 
 use crate::external::{self, ExternalSorter, TrigramPosting};
 use crate::meta::{self, IndexMeta};
-use crate::ondisk::{self, LookupEntry, PostingEntry};
+use crate::ondisk::{
+    self, LOOKUP_WRITE_CHUNK_ENTRIES, LookupEntry, POSTING_WRITE_CHUNK_ENTRIES, PostingEntry,
+    flush_lookup_entries, write_lookup_entry, write_posting_entries,
+};
 use crate::path_index;
 use crate::reader::IndexReader;
 use crate::trigram::{self, TrigramMasks};
@@ -15,8 +18,6 @@ use crate::{Error, Result};
 
 const INDEX_DIR_NAME: &str = ".tgrep";
 const INDEX_BUILD_BATCH_SIZE: usize = 1024;
-const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
-const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 
 /// Cumulative bytes allowed in one extraction batch.
 ///
@@ -951,45 +952,6 @@ fn write_index_files<'a>(
         sorted_trigrams.len(),
         complete,
     )
-}
-
-fn write_posting_entries(
-    writer: &mut impl Write,
-    entries: &[PostingEntry],
-    scratch: &mut Vec<u8>,
-) -> Result<()> {
-    for chunk in entries.chunks(POSTING_WRITE_CHUNK_ENTRIES) {
-        scratch.clear();
-        for entry in chunk {
-            scratch.extend_from_slice(&entry.file_id.to_le_bytes());
-            scratch.push(entry.loc_mask);
-            scratch.push(entry.next_mask);
-        }
-        writer.write_all(scratch)?;
-    }
-    Ok(())
-}
-
-fn write_lookup_entry(
-    writer: &mut impl Write,
-    entry: LookupEntry,
-    scratch: &mut Vec<u8>,
-) -> Result<()> {
-    if scratch.len() == scratch.capacity() {
-        flush_lookup_entries(writer, scratch)?;
-    }
-    scratch.extend_from_slice(&entry.trigram.to_le_bytes());
-    scratch.extend_from_slice(&entry.offset.to_le_bytes());
-    scratch.extend_from_slice(&entry.length.to_le_bytes());
-    Ok(())
-}
-
-fn flush_lookup_entries(writer: &mut impl Write, scratch: &mut Vec<u8>) -> Result<()> {
-    if !scratch.is_empty() {
-        writer.write_all(scratch)?;
-        scratch.clear();
-    }
-    Ok(())
 }
 
 fn write_index_files_from_postings<'a>(

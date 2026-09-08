@@ -1223,6 +1223,33 @@ fn publish_ignore_matcher(
     newly_watched
 }
 
+/// Publish the sources collected by an index build or path walk, using the
+/// walk's tracked-membership snapshot. Build inside the before/after stamp
+/// checks in `publish_ignore_matcher`, not before them.
+#[must_use = "newly watched directories need a recovery scan or writes race the subscription"]
+fn publish_collected_ignore_matcher(
+    state: &Arc<ServerState>,
+    root: &Path,
+    gitignore_files: &[PathBuf],
+    ignore_files: &[PathBuf],
+    ignorecase: Option<Arc<tgrep_core::gitignore::CaseInsensitiveIgnore>>,
+) -> Vec<PathBuf> {
+    publish_ignore_matcher(
+        state,
+        root,
+        ignore_sources_of(root, gitignore_files, ignore_files, state.no_require_git),
+        || {
+            tgrep_core::walker::build_gitignore_matcher_from_files_with_ignorecase(
+                root,
+                gitignore_files,
+                ignore_files,
+                state.no_require_git,
+                ignorecase,
+            )
+        },
+    )
+}
+
 fn handle_connection(stream: TcpStream, state: &Arc<ServerState>) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -1296,16 +1323,19 @@ struct SearchRequest {
 /// Parse and validate all search parameters from a JSON-RPC request.
 /// Returns Err(String) with an error message suitable for json_rpc_error on failure.
 fn parse_search_params(params: &serde_json::Value) -> std::result::Result<SearchRequest, String> {
+    let str_array = |key: &str| -> Vec<String> {
+        params
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let pattern = params.get("pattern").and_then(|p| p.as_str()).unwrap_or("");
-    let extra_patterns: Vec<String> = params
-        .get("extra_patterns")
-        .and_then(|e| e.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let extra_patterns = str_array("extra_patterns");
     let case_insensitive = params
         .get("case_insensitive")
         .and_then(|c| c.as_bool())
@@ -1322,24 +1352,8 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .get("max_count")
         .and_then(|m| m.as_u64())
         .map(|m| m as usize);
-    let glob_filter_strs: Vec<String> = params
-        .get("glob")
-        .and_then(|g| g.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let iglob_strs: Vec<String> = params
-        .get("iglob")
-        .and_then(|g| g.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let glob_filter_strs = str_array("glob");
+    let iglob_strs = str_array("iglob");
     let glob_case_insensitive = params
         .get("glob_case_insensitive")
         .and_then(|g| g.as_bool())
@@ -1347,17 +1361,6 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
     let glob_filter =
         crate::glob_filter::GlobFilter::new(&glob_filter_strs, &iglob_strs, glob_case_insensitive)
             .map_err(|e| format!("{e}"))?;
-    let str_array = |key: &str| -> Vec<String> {
-        params
-            .get(key)
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
     // The client sends the raw `-t`/`-T`/`--type-add`/`--type-clear` values and
     // the server rebuilds the filter with the same shared helper, so both sides
     // are guaranteed to derive an identical definition table.
@@ -2071,24 +2074,12 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
     let newly_watched = if state.no_ignore {
         Vec::new()
     } else {
-        publish_ignore_matcher(
+        publish_collected_ignore_matcher(
             state,
             &state.root,
-            ignore_sources_of(
-                &state.root,
-                &outcome.gitignore_files,
-                &outcome.ignore_files,
-                state.no_require_git,
-            ),
-            || {
-                tgrep_core::walker::build_gitignore_matcher_from_files_with_ignorecase(
-                    &state.root,
-                    &outcome.gitignore_files,
-                    &outcome.ignore_files,
-                    state.no_require_git,
-                    ignorecase,
-                )
-            },
+            &outcome.gitignore_files,
+            &outcome.ignore_files,
+            ignorecase,
         )
     };
     #[cfg(test)]
@@ -6243,24 +6234,12 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         // than skipped: the scan waits out `indexing` and then costs one
         // `metadata` call per file, since the stamps this build just wrote
         // describe the index exactly.
-        newly_watched = publish_ignore_matcher(
+        newly_watched = publish_collected_ignore_matcher(
             state,
             root,
-            ignore_sources_of(
-                root,
-                &outcome.gitignore_files,
-                &outcome.ignore_files,
-                state.no_require_git,
-            ),
-            || {
-                tgrep_core::walker::build_gitignore_matcher_from_files_with_ignorecase(
-                    root,
-                    &outcome.gitignore_files,
-                    &outcome.ignore_files,
-                    state.no_require_git,
-                    ignorecase,
-                )
-            },
+            &outcome.gitignore_files,
+            &outcome.ignore_files,
+            ignorecase,
         );
         let found = state.gitignore.read().unwrap().is_some();
         eprintln!(
@@ -6418,24 +6397,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         // the build's results nor any event. The scan waits for the build to
         // finish before looking, because until then the stamps describe
         // nothing and every file would read as changed.
-        newly_watched = publish_ignore_matcher(
+        newly_watched = publish_collected_ignore_matcher(
             state,
             root,
-            ignore_sources_of(
-                root,
-                &walk.gitignore_files,
-                &walk.ignore_files,
-                state.no_require_git,
-            ),
-            || {
-                walker::build_gitignore_matcher_from_files_with_ignorecase(
-                    root,
-                    &walk.gitignore_files,
-                    &walk.ignore_files,
-                    state.no_require_git,
-                    ignorecase,
-                )
-            },
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            ignorecase,
         );
         let has_matcher = state.gitignore.read().unwrap().is_some();
         eprintln!(
@@ -11979,6 +11946,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collected_ignore_matcher_publishes_both_source_kinds() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut state = test_server_state(root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().no_require_git = true;
+        let gitignore = root.join(".gitignore");
+        let ignore = root.join(".ignore");
+        std::fs::write(&gitignore, "build/\n").unwrap();
+        std::fs::write(&ignore, "vendor/\n").unwrap();
+
+        let _gate = state.snapshot_gate.write().unwrap();
+        let newly_watched = publish_collected_ignore_matcher(
+            &state,
+            root,
+            std::slice::from_ref(&gitignore),
+            std::slice::from_ref(&ignore),
+            None,
+        );
+        assert!(newly_watched.is_empty());
+        assert!(!state.gitignore_pending.load(Ordering::SeqCst));
+        assert!(!state.ignore_rules_dirty.load(Ordering::SeqCst));
+        {
+            let sources = state.ignore_sources.read().unwrap();
+            assert!(sources.contains(&gitignore));
+            assert!(sources.contains(&ignore));
+        }
+        {
+            let stamps = state.ignore_source_stamps.read().unwrap();
+            assert_eq!(
+                stamps.get(".gitignore").copied(),
+                ignore_digest_of(&gitignore)
+            );
+            assert_eq!(stamps.get(".ignore").copied(), ignore_digest_of(&ignore));
+        }
+        let matcher = state.gitignore.read().unwrap();
+        let matcher = matcher
+            .as_ref()
+            .expect("collected rules should be published");
+        assert!(should_skip_watcher_path(
+            "build/output.rs",
+            &[],
+            Some(matcher)
+        ));
+        assert!(should_skip_watcher_path(
+            "vendor/dependency.rs",
+            &[],
+            Some(matcher)
+        ));
+        assert!(!should_skip_watcher_path("src/kept.rs", &[], Some(matcher)));
+    }
+
     /// The matcher reads its sources itself, inside the build. A replace that
     /// lands while it is reading leaves it enforcing the old rules, and stamps
     /// taken afterwards describe the new file — so pathname, timestamp and
@@ -12424,6 +12443,66 @@ mod tests {
             state.index.read().unwrap().live.is_deleted("grows.rs"),
             "content past the cap must not stay searchable"
         );
+    }
+
+    #[test]
+    fn search_params_string_arrays_keep_valid_entries_and_pattern_order() {
+        let request = parse_search_params(&serde_json::json!({
+            "pattern": "base",
+            "extra_patterns": [null, "a", 42, "ab", false, {}, ["nested"]],
+            "glob": ["*.rs", null, false, "!skip.rs", 42],
+            "iglob": [false, "*.TXT", {}],
+            "type_add": [null, "custom:*.special", false],
+            "type_clear": [42, "rust"],
+            "types": [null, "custom"],
+            "types_not": [false, "json"]
+        }))
+        .unwrap();
+
+        assert!(request.matcher.is_match("base").unwrap());
+        assert_eq!(request.matcher.find_first_span("ab").unwrap(), Some((0, 1)));
+        assert!(!request.matcher.is_match("42").unwrap());
+        assert!(!request.matcher.is_match("nested").unwrap());
+        assert!(request.glob_filter.matches("source.rs"));
+        assert!(!request.glob_filter.matches("skip.rs"));
+        assert!(request.glob_filter.matches("notes.txt"));
+        assert!(!request.glob_filter.matches("source.py"));
+        assert!(request.type_filter.matches("source.special"));
+        assert!(!request.type_filter.matches("source.rs"));
+        assert!(!request.type_filter.matches("data.json"));
+    }
+
+    #[test]
+    fn search_params_missing_or_non_array_string_options_are_empty() {
+        for value in [
+            None,
+            Some(serde_json::json!(null)),
+            Some(serde_json::json!(false)),
+            Some(serde_json::json!(42)),
+            Some(serde_json::json!("malformed[")),
+            Some(serde_json::json!({})),
+            Some(serde_json::json!([])),
+        ] {
+            let mut params = serde_json::json!({"pattern": "needle"});
+            if let Some(value) = value {
+                for key in [
+                    "extra_patterns",
+                    "glob",
+                    "iglob",
+                    "type_add",
+                    "type_clear",
+                    "types",
+                    "types_not",
+                ] {
+                    params[key] = value.clone();
+                }
+            }
+            let request = parse_search_params(&params).unwrap();
+            assert!(request.matcher.is_match("needle").unwrap());
+            assert!(!request.matcher.is_match("malformed").unwrap());
+            assert!(request.glob_filter.is_empty());
+            assert!(request.type_filter.is_empty());
+        }
     }
 
     #[test]

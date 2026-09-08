@@ -161,6 +161,30 @@ impl SortMode {
             paths.reverse();
         }
     }
+
+    /// Sort index-backed entries by search-relative paths, looking up metadata
+    /// at their actual locations. `PathBuf` keeps ordering component-wise, as
+    /// in the filesystem walk, rather than comparing raw path strings.
+    fn apply_indexed<T>(
+        &self,
+        entries: &mut [T],
+        index_root: &Path,
+        scope: &IndexScope,
+        relative_path: impl Fn(&T) -> &str,
+    ) {
+        entries.sort_by_cached_key(|entry| {
+            let rel = relative_path(entry);
+            let time = if self.key == SortKey::Path {
+                None
+            } else {
+                time_key(&scope.full_path(index_root, rel), self.key)
+            };
+            (time, PathBuf::from(rel))
+        });
+        if self.reverse {
+            entries.reverse();
+        }
+    }
 }
 
 /// Read the timestamp `--sort` selected, if the platform records it.
@@ -558,17 +582,7 @@ fn write_indexed_file_paths(
         .collect();
 
     if let Some(sort) = opts.sort {
-        paths.sort_by_cached_key(|path| {
-            let time = if sort.key == SortKey::Path {
-                None
-            } else {
-                time_key(&scope.full_path(index_root, path), sort.key)
-            };
-            (time, PathBuf::from(path))
-        });
-        if sort.reverse {
-            paths.reverse();
-        }
+        sort.apply_indexed(&mut paths, index_root, scope, String::as_str);
     }
 
     let mut writer = OutputWriter::new(opts.make_output_config());
@@ -904,7 +918,7 @@ fn search_via_server(
     let matches = match opts.sort {
         None => matches,
         Some(sort) => {
-            let mut ranked: Vec<(Option<std::time::SystemTime>, PathBuf, String)> = Vec::new();
+            let mut ranked = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for m in matches {
                 let Some(rel) = m.get("file").and_then(|f| f.as_str()) else {
@@ -913,21 +927,13 @@ fn search_via_server(
                 if !seen.insert(rel.to_string()) {
                     continue;
                 }
-                let t = if sort.key == SortKey::Path {
-                    None
-                } else {
-                    time_key(&scope.full_path(index_root, rel), sort.key)
-                };
-                ranked.push((t, PathBuf::from(rel), rel.to_string()));
+                ranked.push(rel.to_string());
             }
-            ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-            if sort.reverse {
-                ranked.reverse();
-            }
+            sort.apply_indexed(&mut ranked, index_root, scope, String::as_str);
             let rank: std::collections::HashMap<&str, usize> = ranked
                 .iter()
                 .enumerate()
-                .map(|(i, (_, _, f))| (f.as_str(), i))
+                .map(|(i, file)| (file.as_str(), i))
                 .collect();
 
             let mut rows = matches.clone();
@@ -1155,30 +1161,8 @@ fn search_local_index(
         })
         .collect();
 
-    // `--sort` has to apply here too, otherwise it would silently do nothing on
-    // the default (indexed) code path. The key is a `PathBuf` so the order
-    // matches the brute-force walk, which compares paths component-wise; a raw
-    // string compare would sort `src.rs` before `src/lib.rs`.
     if let Some(sort) = opts.sort {
-        let mut keyed: Vec<_> = candidates
-            .into_iter()
-            .map(|(fid, rel)| {
-                let t = if sort.key == SortKey::Path {
-                    None
-                } else {
-                    time_key(&scope.full_path(&index_root, &rel), sort.key)
-                };
-                (t, PathBuf::from(&rel), fid, rel)
-            })
-            .collect();
-        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        if sort.reverse {
-            keyed.reverse();
-        }
-        candidates = keyed
-            .into_iter()
-            .map(|(_, _, fid, rel)| (fid, rel))
-            .collect();
+        sort.apply_indexed(&mut candidates, &index_root, &scope, |(_, rel)| rel);
     }
 
     if opts.stats {
@@ -1209,26 +1193,11 @@ fn search_local_index(
             Err(_) => continue,
         };
 
-        let outcome = search_decoded_file(&read, &matcher, rel_path, opts, &mut *writer, explicit)?;
-        match outcome {
-            FileOutcome::Matched => {
-                if !opts.files_without_match {
-                    had_matches = true;
-                    if opts.quiet {
-                        break;
-                    }
-                }
+        if search_file(&read, &matcher, rel_path, opts, writer, explicit)? {
+            had_matches = true;
+            if opts.quiet {
+                break;
             }
-            FileOutcome::NoMatch if opts.files_without_match => {
-                if !opts.quiet {
-                    writer.write_file(rel_path)?;
-                }
-                had_matches = true;
-                if opts.quiet {
-                    break;
-                }
-            }
-            FileOutcome::NoMatch | FileOutcome::Skipped => {}
         }
     }
 
@@ -1339,22 +1308,7 @@ fn brute_force_search(
             && !exceeds_max_filesize(root, opts, true)
         {
             let read = read_text_lossy(root, opts.encoding)?;
-            let outcome =
-                search_decoded_file(&read, &matcher, &rel_path, opts, &mut *writer, true)?;
-            match outcome {
-                FileOutcome::Matched => {
-                    if !opts.files_without_match {
-                        had_matches = true;
-                    }
-                }
-                FileOutcome::NoMatch if opts.files_without_match => {
-                    if !opts.quiet {
-                        writer.write_file(&rel_path)?;
-                    }
-                    had_matches = true;
-                }
-                FileOutcome::NoMatch | FileOutcome::Skipped => {}
-            }
+            had_matches = search_file(&read, &matcher, &rel_path, opts, writer, true)?;
         }
 
         if opts.stats {
@@ -1390,26 +1344,11 @@ fn brute_force_search(
             Err(_) => continue,
         };
 
-        let outcome = search_decoded_file(&read, &matcher, &rel_path, opts, &mut *writer, false)?;
-        match outcome {
-            FileOutcome::Matched => {
-                if !opts.files_without_match {
-                    had_matches = true;
-                    if opts.quiet {
-                        break;
-                    }
-                }
+        if search_file(&read, &matcher, &rel_path, opts, writer, false)? {
+            had_matches = true;
+            if opts.quiet {
+                break;
             }
-            FileOutcome::NoMatch if opts.files_without_match => {
-                if !opts.quiet {
-                    writer.write_file(&rel_path)?;
-                }
-                had_matches = true;
-                if opts.quiet {
-                    break;
-                }
-            }
-            FileOutcome::NoMatch | FileOutcome::Skipped => {}
         }
     }
 
@@ -1664,6 +1603,28 @@ enum FileOutcome {
     Matched,
     NoMatch,
     Skipped,
+}
+
+/// Whether a searched file satisfies the requested mode. Skipped files are
+/// never selected, even by `--files-without-match`.
+fn search_file(
+    read: &FileRead,
+    matcher: &SearchMatcher,
+    rel_path: &str,
+    opts: &SearchOptions,
+    writer: &mut OutputWriter,
+    explicit: bool,
+) -> Result<bool> {
+    match search_decoded_file(read, matcher, rel_path, opts, writer, explicit)? {
+        FileOutcome::Matched => Ok(!opts.files_without_match),
+        FileOutcome::NoMatch if opts.files_without_match => {
+            if !opts.quiet {
+                writer.write_file(rel_path)?;
+            }
+            Ok(true)
+        }
+        FileOutcome::NoMatch | FileOutcome::Skipped => Ok(false),
+    }
 }
 
 /// Search one file's decoded text, mapping reported offsets back to the bytes
@@ -1922,6 +1883,107 @@ fn plan_summary(plan: &QueryPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_sort_preserves_entries_and_component_order() {
+        let entries = [
+            (1, "src.rs"),
+            (2, "src/lib.rs"),
+            (3, "a.rs"),
+            (4, "src/lib.rs"),
+        ];
+        for (reverse, expected) in [(false, [3, 2, 4, 1]), (true, [1, 4, 2, 3])] {
+            let mut sorted = entries;
+            SortMode {
+                key: SortKey::Path,
+                reverse,
+            }
+            .apply_indexed(
+                &mut sorted,
+                Path::new("unused-index-root"),
+                &IndexScope::Whole,
+                |(_, rel)| rel,
+            );
+            assert_eq!(sorted.map(|(id, _)| id), expected);
+        }
+    }
+
+    #[test]
+    fn indexed_sort_uses_scoped_timestamps_and_orders_missing_metadata() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let subtree = dir.path().join("nested");
+        std::fs::create_dir(&subtree).unwrap();
+        for (name, seconds) in [("new.txt", 60), ("z-old.txt", 0), ("a-old.txt", 0)] {
+            let time =
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + seconds);
+            std::fs::File::create(subtree.join(name))
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        }
+
+        for reverse in [false, true] {
+            let mut paths = ["new.txt", "z-old.txt", "missing.txt", "a-old.txt"];
+            SortMode {
+                key: SortKey::Modified,
+                reverse,
+            }
+            .apply_indexed(
+                &mut paths,
+                dir.path(),
+                &IndexScope::Subtree("nested/".to_string()),
+                |path| path,
+            );
+            let mut expected = ["missing.txt", "a-old.txt", "z-old.txt", "new.txt"];
+            if reverse {
+                expected.reverse();
+            }
+            assert_eq!(paths, expected);
+        }
+    }
+
+    #[test]
+    fn quiet_file_selection_distinguishes_nonmatching_and_skipped_files() {
+        let matcher = SearchMatcher::Standard(regex::Regex::new("needle").unwrap());
+        for (content, explicit, binary, matched, without_match) in [
+            ("needle\n", false, false, true, false),
+            ("other\n", false, false, false, true),
+            ("", false, false, false, true),
+            ("needle\0\n", false, false, false, false),
+            ("other\0\n", false, false, false, false),
+            ("needle\0\n", true, false, true, false),
+            ("other\0\n", true, false, false, true),
+            ("needle\0\n", false, true, true, false),
+            ("other\0\n", false, true, false, true),
+        ] {
+            let read = FileRead {
+                text: FileText::Owned(content.to_string()),
+                fixups: Default::default(),
+                first_nul: content.find('\0'),
+            };
+            for files_without_match in [false, true] {
+                let opts = SearchOptions {
+                    quiet: true,
+                    files_without_match,
+                    binary,
+                    ..Default::default()
+                };
+                let mut writer = new_writer(&opts);
+                let selected =
+                    search_file(&read, &matcher, "file.txt", &opts, &mut writer, explicit).unwrap();
+                let expected = if files_without_match {
+                    without_match
+                } else {
+                    matched
+                };
+                assert_eq!(
+                    selected, expected,
+                    "content={content:?}, explicit={explicit}, binary={binary}, \
+                     files_without_match={files_without_match}"
+                );
+            }
+        }
+    }
 
     // --- fused UTF-8 validation and NUL scan --------------------------------
     //

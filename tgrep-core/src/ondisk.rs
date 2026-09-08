@@ -20,6 +20,8 @@
 /// Variable-length records: `file_id(u32 LE) + path_len(u16 LE) + path_bytes`.
 pub(crate) const LOOKUP_ENTRY_SIZE: usize = 16; // 4 + 8 + 4
 pub(crate) const POSTING_ENTRY_SIZE: usize = 6; // 4 + 1 + 1
+pub(crate) const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
+pub(crate) const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 
 /// A single entry in `lookup.bin`.
 #[derive(Debug, Clone, Copy)]
@@ -75,6 +77,48 @@ impl LookupEntry {
             length: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
         }
     }
+}
+
+pub(crate) fn write_posting_entries(
+    writer: &mut impl std::io::Write,
+    entries: &[PostingEntry],
+    scratch: &mut Vec<u8>,
+) -> crate::Result<()> {
+    for chunk in entries.chunks(POSTING_WRITE_CHUNK_ENTRIES) {
+        scratch.clear();
+        for entry in chunk {
+            scratch.extend_from_slice(&entry.file_id.to_le_bytes());
+            scratch.push(entry.loc_mask);
+            scratch.push(entry.next_mask);
+        }
+        writer.write_all(scratch)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_lookup_entry(
+    writer: &mut impl std::io::Write,
+    entry: LookupEntry,
+    scratch: &mut Vec<u8>,
+) -> crate::Result<()> {
+    if scratch.len() == scratch.capacity() {
+        flush_lookup_entries(writer, scratch)?;
+    }
+    scratch.extend_from_slice(&entry.trigram.to_le_bytes());
+    scratch.extend_from_slice(&entry.offset.to_le_bytes());
+    scratch.extend_from_slice(&entry.length.to_le_bytes());
+    Ok(())
+}
+
+pub(crate) fn flush_lookup_entries(
+    writer: &mut impl std::io::Write,
+    scratch: &mut Vec<u8>,
+) -> crate::Result<()> {
+    if !scratch.is_empty() {
+        writer.write_all(scratch)?;
+        scratch.clear();
+    }
+    Ok(())
 }
 
 /// Maximum supported path length (in bytes) for entries in `files.bin`.
@@ -270,5 +314,109 @@ mod tests {
         assert_eq!(decoded.file_id, entry.file_id);
         assert_eq!(decoded.loc_mask, entry.loc_mask);
         assert_eq!(decoded.next_mask, entry.next_mask);
+    }
+
+    #[test]
+    fn test_write_posting_entries_preserves_chunked_encoding() {
+        for count in [
+            0,
+            1,
+            POSTING_WRITE_CHUNK_ENTRIES,
+            POSTING_WRITE_CHUNK_ENTRIES + 1,
+        ] {
+            let entries: Vec<PostingEntry> = (0..count)
+                .map(|id| PostingEntry {
+                    file_id: id as u32,
+                    loc_mask: id as u8,
+                    next_mask: !(id as u8),
+                })
+                .collect();
+            let expected: Vec<u8> = entries.iter().flat_map(PostingEntry::encode).collect();
+            let mut bytes = Vec::new();
+            let mut scratch = Vec::with_capacity(POSTING_WRITE_CHUNK_ENTRIES * POSTING_ENTRY_SIZE);
+            let capacity = scratch.capacity();
+
+            write_posting_entries(&mut bytes, &entries, &mut scratch).unwrap();
+
+            assert_eq!(bytes, expected);
+            assert_eq!(scratch.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn test_write_lookup_entries_flushes_at_capacity() {
+        let mut bytes = Vec::new();
+        let mut expected = Vec::new();
+        let mut scratch = Vec::with_capacity(LOOKUP_WRITE_CHUNK_ENTRIES * LOOKUP_ENTRY_SIZE);
+        let capacity = scratch.capacity();
+        for trigram in 0..LOOKUP_WRITE_CHUNK_ENTRIES as u32 {
+            let entry = LookupEntry {
+                trigram,
+                offset: u32::MAX as u64 + trigram as u64,
+                length: trigram + 1,
+            };
+            write_lookup_entry(&mut bytes, entry, &mut scratch).unwrap();
+            expected.extend_from_slice(&entry.encode());
+        }
+        assert!(bytes.is_empty());
+        assert_eq!(scratch.len(), capacity);
+
+        let next = LookupEntry {
+            trigram: LOOKUP_WRITE_CHUNK_ENTRIES as u32,
+            offset: u64::MAX,
+            length: u32::MAX,
+        };
+        write_lookup_entry(&mut bytes, next, &mut scratch).unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(scratch, next.encode());
+        assert_eq!(scratch.capacity(), capacity);
+
+        expected.extend_from_slice(&next.encode());
+        flush_lookup_entries(&mut bytes, &mut scratch).unwrap();
+        assert_eq!(bytes, expected);
+        assert!(scratch.is_empty());
+        flush_lookup_entries(&mut bytes, &mut scratch).unwrap();
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn test_buffered_writers_preserve_scratch_on_io_error() {
+        let mut writer: &mut [u8] = &mut [];
+        let posting = PostingEntry {
+            file_id: 42,
+            loc_mask: 0x12,
+            next_mask: 0x34,
+        };
+        let mut posting_scratch = Vec::new();
+        let err = write_posting_entries(&mut writer, &[posting], &mut posting_scratch).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Io(err) if err.kind() == std::io::ErrorKind::WriteZero
+        ));
+        assert_eq!(posting_scratch, posting.encode());
+
+        let lookup = LookupEntry {
+            trigram: 123,
+            offset: 456,
+            length: 789,
+        };
+        let mut lookup_scratch = lookup.encode().to_vec();
+        let err = flush_lookup_entries(&mut writer, &mut lookup_scratch).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Io(err) if err.kind() == std::io::ErrorKind::WriteZero
+        ));
+        assert_eq!(lookup_scratch, lookup.encode());
+
+        let next = LookupEntry {
+            trigram: 124,
+            ..lookup
+        };
+        let err = write_lookup_entry(&mut writer, next, &mut lookup_scratch).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Io(err) if err.kind() == std::io::ErrorKind::WriteZero
+        ));
+        assert_eq!(lookup_scratch, lookup.encode());
     }
 }

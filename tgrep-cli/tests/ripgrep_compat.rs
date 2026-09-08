@@ -586,6 +586,38 @@ fn files_without_match_with_glob() {
     assert!(!stdout.contains("notes.txt"));
 }
 
+#[test]
+fn files_without_match_handles_explicit_files_and_quiet_mode() {
+    let dir = setup_fixture();
+    let root = dir.path().join("testdata");
+    fs::write(root.join("empty.txt"), "").unwrap();
+    fs::write(root.join("binary.txt"), b"other\0text\n").unwrap();
+
+    for (name, code) in [
+        ("hello.rs", 1),
+        ("notes.txt", 0),
+        ("empty.txt", 0),
+        ("binary.txt", 0),
+    ] {
+        let path = root.join(name);
+        for quiet in [false, true] {
+            let mut command = tgrep();
+            command
+                .args(["--no-index", "--files-without-match", "fn"])
+                .arg(&path);
+            if quiet {
+                command.arg("--quiet");
+            }
+            let result = command.assert().code(code);
+            if quiet || code == 1 {
+                result.stdout(predicate::str::is_empty());
+            } else {
+                result.stdout(format!("{}\n", path.display()));
+            }
+        }
+    }
+}
+
 // ─── -q / --quiet ───────────────────────────────────────────────────
 
 #[test]

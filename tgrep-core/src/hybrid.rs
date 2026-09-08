@@ -119,25 +119,13 @@ impl HybridIndex {
     /// Look up candidate file IDs for a trigram, merging reader + overlay.
     pub fn lookup_trigram(&self, trigram: u32) -> Vec<u32> {
         let reader = self.reader();
-        let mut reader_ids = reader.lookup_trigram(trigram);
-        let live_ids = self.live.lookup_trigram(trigram);
-
-        reader_ids.retain(|&fid| self.reader_entry_active(&reader, fid));
-
-        reader_ids.extend(live_ids);
-        reader_ids
+        self.lookup_trigram_using_reader(trigram, &reader)
     }
 
     /// Look up candidate posting entries with masks, merging reader + overlay.
     pub fn lookup_trigram_with_masks(&self, trigram: u32) -> Vec<PostingEntry> {
         let reader = self.reader();
-        let mut reader_entries = reader.lookup_trigram_with_masks(trigram);
-        let live_entries = self.live.lookup_trigram_with_masks(trigram);
-
-        reader_entries.retain(|e| self.reader_entry_active(&reader, e.file_id));
-
-        reader_entries.extend(live_entries);
-        reader_entries
+        self.lookup_trigram_with_masks_using_reader(trigram, &reader)
     }
 
     /// Resolve a file ID to a path (works for both reader and overlay IDs).
@@ -155,13 +143,7 @@ impl HybridIndex {
     /// Get all file IDs from both layers (overlay takes precedence).
     pub fn all_file_ids(&self) -> Vec<u32> {
         let reader = self.reader();
-        let mut ids: Vec<u32> = reader
-            .all_file_ids()
-            .into_iter()
-            .filter(|&fid| self.reader_entry_active(&reader, fid))
-            .collect();
-        ids.extend(self.live.all_file_ids());
-        ids
+        self.all_file_ids_using(&reader)
     }
 
     /// Get every active content-indexed path from a consistent reader snapshot.

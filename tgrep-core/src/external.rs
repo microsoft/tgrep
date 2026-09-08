@@ -34,7 +34,10 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::ondisk::{self, LookupEntry, PostingEntry};
+use crate::ondisk::{
+    self, LOOKUP_WRITE_CHUNK_ENTRIES, LookupEntry, POSTING_WRITE_CHUNK_ENTRIES, PostingEntry,
+    flush_lookup_entries, write_lookup_entry, write_posting_entries,
+};
 use crate::{Error, Result};
 
 /// A single (trigram, posting) pair prior to grouping.
@@ -60,9 +63,6 @@ const MIN_SEGMENT_BUFFER_BYTES: usize = 4 * 1024;
 
 /// Longest possible LEB128 encoding of a `u64`.
 const MAX_VARINT_LEN: usize = 10;
-
-const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
-const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 
 /// Flush threshold for the encode scratch buffer while spilling a segment.
 const SPILL_SCRATCH_FLUSH_BYTES: usize = 128 * 1024;
@@ -334,32 +334,16 @@ impl IndexWriter {
             ))
         })?;
 
-        if self.lookup_scratch.len() == self.lookup_scratch.capacity() {
-            self.lookup.write_all(&self.lookup_scratch)?;
-            self.lookup_scratch.clear();
-        }
-        let lookup_entry = LookupEntry {
-            trigram,
-            offset: self.offset,
-            length,
-        };
-        self.lookup_scratch
-            .extend_from_slice(&lookup_entry.trigram.to_le_bytes());
-        self.lookup_scratch
-            .extend_from_slice(&lookup_entry.offset.to_le_bytes());
-        self.lookup_scratch
-            .extend_from_slice(&lookup_entry.length.to_le_bytes());
-
-        for chunk in entries.chunks(POSTING_WRITE_CHUNK_ENTRIES) {
-            self.posting_scratch.clear();
-            for entry in chunk {
-                self.posting_scratch
-                    .extend_from_slice(&entry.file_id.to_le_bytes());
-                self.posting_scratch.push(entry.loc_mask);
-                self.posting_scratch.push(entry.next_mask);
-            }
-            self.postings.write_all(&self.posting_scratch)?;
-        }
+        write_lookup_entry(
+            &mut self.lookup,
+            LookupEntry {
+                trigram,
+                offset: self.offset,
+                length,
+            },
+            &mut self.lookup_scratch,
+        )?;
+        write_posting_entries(&mut self.postings, entries, &mut self.posting_scratch)?;
 
         self.offset += length as u64 * ondisk::POSTING_ENTRY_SIZE as u64;
         self.trigram_count += 1;
@@ -367,10 +351,7 @@ impl IndexWriter {
     }
 
     fn finish(mut self) -> Result<usize> {
-        if !self.lookup_scratch.is_empty() {
-            self.lookup.write_all(&self.lookup_scratch)?;
-            self.lookup_scratch.clear();
-        }
+        flush_lookup_entries(&mut self.lookup, &mut self.lookup_scratch)?;
         self.postings.flush()?;
         self.lookup.flush()?;
         Ok(self.trigram_count)

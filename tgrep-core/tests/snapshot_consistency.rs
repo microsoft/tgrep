@@ -240,6 +240,61 @@ fn match_all_uses_consistent_snapshot() {
     }
 }
 
+#[test]
+fn direct_lookups_share_snapshot_overlay_precedence() {
+    let root = tempfile::tempdir().unwrap();
+    let index = build_test_index(
+        root.path(),
+        &[
+            ("kept.txt", b"abc"),
+            ("replaced.txt", b"abc"),
+            ("deleted.txt", b"abc"),
+            ("short.txt", b"a"),
+        ],
+    );
+    let mut hybrid = HybridIndex::open(index.path(), root.path()).unwrap();
+    hybrid.live.upsert_file("replaced.txt", b"xyz");
+    hybrid.live.delete_file("deleted.txt");
+    hybrid.live.upsert_file("new.txt", b"abc");
+    let new_id = hybrid.live.file_id_for_path("new.txt").unwrap();
+    let replacement_id = hybrid.live.file_id_for_path("replaced.txt").unwrap();
+    let tri = trigram::hash(b'a', b'b', b'c');
+
+    let ids = hybrid.lookup_trigram(tri);
+    assert_eq!(ids, vec![0, new_id]);
+    let entries = hybrid.lookup_trigram_with_masks(tri);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.file_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+
+    let plan = query::build_literal_plan("abc", false);
+    assert_eq!(hybrid.execute_query(&plan), ids);
+    let (query_ids, snapshot) = hybrid.execute_query_with_masks(&plan);
+    assert_eq!(query_ids, ids);
+    assert_eq!(
+        entries[0].encode(),
+        snapshot.lookup_trigram_with_masks(tri)[0].encode()
+    );
+    assert_eq!(
+        entries[1].encode(),
+        hybrid.live.lookup_trigram_with_masks(tri)[0].encode()
+    );
+
+    let all_ids = hybrid.all_file_ids();
+    let (snapshot_ids, _) = hybrid.execute_query_with_masks(&query::QueryPlan::MatchAll);
+    assert_eq!(all_ids, snapshot_ids);
+    assert_eq!(&all_ids[..2], &[0, 3]);
+    let mut sorted_ids = all_ids;
+    sorted_ids.sort_unstable();
+    let mut expected = vec![0, 3, replacement_id, new_id];
+    expected.sort_unstable();
+    assert_eq!(sorted_ids, expected);
+}
+
 /// Concurrent reader swap during query execution: demonstrates that the
 /// snapshot-based API is safe while the old API would fail.
 #[test]

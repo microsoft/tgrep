@@ -182,6 +182,80 @@ fn legacy_filename_index_falls_back_and_indexed_scope_still_filters() {
 }
 
 #[test]
+fn indexed_sort_agrees_for_scoped_search_and_file_listing() {
+    let (_temp, root, index) = fixture();
+    let subtree = root.join("src");
+    fs::write(subtree.join("lib.rs"), "fn lib() {}\n").unwrap();
+    fs::write(root.join("src.rs"), "fn outside() {}\n").unwrap();
+    for (name, seconds) in [("main.rs", 0), ("lib.rs", 60)] {
+        let time = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + seconds);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(subtree.join(name))
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+    build_index(&root, &index);
+
+    for via_server in [false, true] {
+        let _server = via_server.then(|| start_server(&root, &index));
+        for (key, names) in [
+            ("path", ["lib.rs", "main.rs"]),
+            ("modified", ["main.rs", "lib.rs"]),
+        ] {
+            for flag in ["--sort", "--sortr"] {
+                let mut expected: Vec<_> = names
+                    .iter()
+                    .map(|name| subtree.join(name).to_string_lossy().replace('\\', "/"))
+                    .collect();
+                if flag == "--sortr" {
+                    expected.reverse();
+                }
+
+                let listed = output_lines(tgrep().args([
+                    "--files",
+                    "-t",
+                    "rust",
+                    flag,
+                    key,
+                    subtree.to_str().unwrap(),
+                    "--index-path",
+                    index.to_str().unwrap(),
+                ]));
+                assert_eq!(listed, expected, "{flag} {key}, server={via_server}");
+
+                let output = tgrep()
+                    .args([
+                        "--stats",
+                        "-l",
+                        "-t",
+                        "rust",
+                        flag,
+                        key,
+                        "fn",
+                        subtree.to_str().unwrap(),
+                        "--index-path",
+                        index.to_str().unwrap(),
+                    ])
+                    .assert()
+                    .success()
+                    .get_output()
+                    .clone();
+                let searched: Vec<_> = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .map(|line| line.replace('\\', "/"))
+                    .collect();
+                assert_eq!(searched, expected, "{flag} {key}, server={via_server}");
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert_eq!(stderr.contains("(via server)"), via_server, "{stderr}");
+            }
+        }
+    }
+}
+
+#[test]
 fn files_uses_the_live_server_filename_index() {
     let (_temp, root, index) = fixture();
     build_index(&root, &index);

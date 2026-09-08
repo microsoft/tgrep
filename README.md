@@ -68,8 +68,9 @@ tgrep <pattern> ---TCP---> tgrep serve (multi-client)
 - **LiveIndex** — in-memory overlay for files modified after server start, or
   being built by the background indexer
 - **HybridIndex** — merges both layers; overlay takes precedence
-- **Background Indexer** — builds the index in parallel batches of 500 files
-  using rayon; queries are served immediately from partial data
+- **Background Indexer** — builds the index in parallel batches of 1,024 files 
+  (with additional byte-based splitting); a cold start serves an empty index until
+  the first build is published, while a resumed partial index is processed at 500 files
 - **Periodic Flush** — every 50K files or 5 minutes, the in-memory index is
   flushed to disk and the reader is swapped, keeping memory bounded
 - **Automatic refresh** — native `notify` subscriptions update LiveIndex in
@@ -285,9 +286,11 @@ tgrep serve . --no-watch              # disable all automatic refresh
 tgrep serve . --exclude node_modules   # exclude directories from indexing
 ```
 
-The server builds the index in the background if none exists, and serves
-queries immediately from partial data. Multiple clients can connect
-simultaneously.
+The server builds the index in the background if none exists. During that
+first build, queries are answered from an empty index and return nothing;
+`tgrep status` reports that indexing is in progress. When the server resumes a partial
+index instead, queries are answered from the files already indexed. Multiple
+clients can connect simultaneously.
 
 Resource use during that initial build can be tuned. These apply to both
 `tgrep serve` and `tgrep index`:
@@ -510,7 +513,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-L, --follow` | Follow symbolic links |
 | `--no-messages` | Suppress error messages about unreadable/missing paths |
 | `--no-index` | Skip index, grep all files |
-| `--exclude <DIR>` | Exclude directory from indexing (repeatable) |
+| `--exclude <DIR>` | Exclude directory from indexing (repeatable); `index` and `serve` only, not accepted by a search |
 | `--stats` | Print query plan and candidate stats |
 | `--index-path <DIR>` | Custom index directory |
 
@@ -764,9 +767,11 @@ exit code determined by the search alone. Suppress the message with
 
 3. **Serving** — `tgrep serve` wraps the index in a HybridIndex, watches for
    filesystem changes, and serves queries over TCP. If no index exists, it
-   builds one in the background (batches of 500 files, parallel extraction)
-   while serving queries from partial data. The index is flushed to disk
-   every 50K files or 5 minutes. Multiple clients connect simultaneously;
+   builds one in the background (batches of 1,024 files and may split sooner 
+   by byte budgets); queries see an empty index until that first build is published, 
+   and see partial data only when a partial index is being resumed. The index is 
+   after the initial build, pending changes are auto-saved when 5,000 content mutations accumulate by default, or on the first periodic check at least 10 minutes after startup or the last successful save. Multiple clients connect simultaneously;
+
    searches use read locks for zero contention.
 
 ## On-Disk Format
@@ -779,14 +784,6 @@ exit code determined by the search alone. Suppress the message with
 | `files-extra.bin` | Paths included by `--files` but absent from `files.bin` |
 | `meta.json` | Version, file/trigram counts, timestamps |
 | `serve.json` | Server PID and TCP port (for client discovery) |
-
-## Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Matches found |
-| 1 | No matches |
-| 2 | Error |
 
 ## Project Structure
 

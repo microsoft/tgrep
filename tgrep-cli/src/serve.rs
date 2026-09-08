@@ -28,6 +28,10 @@ use tgrep_core::query;
 #[path = "serve/poll_tests.rs"]
 mod poll_tests;
 
+#[cfg(test)]
+#[path = "serve/recovery_tests.rs"]
+mod recovery_tests;
+
 const CACHE_CAPACITY: usize = 50_000;
 /// Total decoded bytes the content cache may hold. The entry-count limit above
 /// says nothing about memory; without this a handful of large files can pin
@@ -3501,8 +3505,9 @@ fn changed_ignore_rules_in(
 /// dropping the ones that are gone, and subscribing to subdirectories that
 /// appeared while the subscriptions were being established.
 /// Used to close the gap between a walk and the subscriptions that follow it:
-/// [`reindex_file`] compares stamps first, so for a tree that did not change
-/// under us this costs one `metadata` call per file and indexes nothing.
+/// [`reindex_file`] compares verified file versions first, so a tree with
+/// unchanged, trusted evidence costs one `metadata` call per file and indexes
+/// nothing.
 ///
 /// `since` is when the walk behind `dirs` began — the start of the window this
 /// is closing. It is only consulted for ignore-rules files, where "did this
@@ -5009,8 +5014,9 @@ fn content_id_matches(
     decoded.is_some() && trusted == decoded
 }
 
-/// Read a file and merge it into the live index, unless its stamp says the
-/// content we already indexed is current.
+/// Read a file and merge it into the live index, unless its verified version
+/// says the content we already indexed is current. Concrete events force a
+/// read even when metadata matches; both paths validate bytes before publishing.
 ///
 /// The caller must hold `snapshot_gate`: the read, the commit, and the stamp
 /// update have to be atomic with respect to a flush or auto-save.
@@ -5042,16 +5048,12 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
             // because a build held the file open for a moment. The stale path
             // already treats unreadable files this way, keeping what it has and
             // retrying later, and the watcher should not disagree with it.
-            if force {
-                retry_failed_forced_reindex(state, rel_path, "the file could not be opened");
-            }
+            retry_failed_reindex(state, rel_path, "the file could not be opened");
             return;
         }
     };
     let Ok(meta) = file.metadata() else {
-        if force {
-            retry_failed_forced_reindex(state, rel_path, "the opened file could not be inspected");
-        }
+        retry_failed_reindex(state, rel_path, "the opened file could not be inspected");
         return;
     };
     let mut version = tgrep_core::builder::file_version(&meta);
@@ -5090,7 +5092,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         return;
     }
 
-    if !force && state.file_evidence.read().unwrap().stamp(rel_path) == Some(&current) {
+    if !force && state.file_evidence.read().unwrap().version(rel_path) == Some(&version) {
         return;
     }
 
@@ -5099,11 +5101,10 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     // on our file I/O and trigram parsing. Windows' SRWLock is
     // writer-preferring: a single waiting writer here would otherwise
     // stall every subsequent search request.
-    let data = if force {
-        // A concrete event is stronger evidence than the persisted stamp. The
-        // initial handle established eligibility, but its bytes need not be
-        // read: use one fresh, containment-safe handle as the indexing snapshot
-        // and retry only if full-resolution metadata changes during that read.
+    let data = {
+        // The initial handle established eligibility. Use a fresh, containment-safe
+        // snapshot for concrete events and recovery reads with changed or missing
+        // version evidence, retrying if full-resolution metadata changes mid-read.
         drop(file);
         let mut stable = None;
         for _ in 0..2 {
@@ -5114,7 +5115,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
                     return;
                 }
                 Err(_) => {
-                    retry_failed_forced_reindex(
+                    retry_failed_reindex(
                         state,
                         rel_path,
                         "the verification handle could not be opened",
@@ -5123,7 +5124,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
                 }
             };
             let Ok(meta) = verify.metadata() else {
-                retry_failed_forced_reindex(
+                retry_failed_reindex(
                     state,
                     rel_path,
                     "the verification handle could not be inspected",
@@ -5152,7 +5153,13 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
                     return;
                 }
                 CappedRead::Failed => {
-                    retry_failed_forced_reindex(state, rel_path, "the verification read failed");
+                    if !force {
+                        let already_indexed = state.index.read().unwrap().has_active_path(rel_path);
+                        if !already_indexed {
+                            mark_filename_only(state, rel_path);
+                        }
+                    }
+                    retry_failed_reindex(state, rel_path, "the verification read failed");
                     return;
                 }
             };
@@ -5166,34 +5173,12 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
             }
         }
         let Some(verified) = stable else {
-            retry_failed_forced_reindex(state, rel_path, "the file kept changing while read");
+            retry_failed_reindex(state, rel_path, "the file kept changing while read");
             return;
         };
         #[cfg(test)]
         run_stale_refresh_hook(state, StaleRefreshPhase::AfterConcreteRead);
         verified
-    } else {
-        // From the approved handle, not the path: re-opening here is what would
-        // let a symlink take the place of the file we just approved.
-        let mut file = file;
-        match read_within_limit(
-            &mut file,
-            state.max_file_size,
-            current.size.min(1 << 20) as usize,
-        ) {
-            CappedRead::Data(data) => data,
-            CappedRead::TooLarge => {
-                drop_indexed_file(state, rel_path, "grew past the size limit while being read");
-                return;
-            }
-            CappedRead::Failed => {
-                let already_indexed = state.index.read().unwrap().has_active_path(rel_path);
-                if !already_indexed {
-                    mark_filename_only(state, rel_path);
-                }
-                return;
-            }
-        }
     };
     let text = tgrep_core::encoding::decode_for_index(&data);
     let is_binary = tgrep_core::trigram::is_binary(&text);
@@ -5205,25 +5190,23 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     };
     #[cfg(test)]
     run_stale_refresh_hook(state, StaleRefreshPhase::BeforeConcreteCommit);
-    if force {
-        match file_still_has_bytes(&state.root, path, &version, &data) {
-            Ok(true) => {}
-            Ok(false) => {
-                if current_path_is_ineligible(state, path) {
-                    drop_indexed_file(state, rel_path, "no longer eligible");
-                } else {
-                    retry_failed_forced_reindex(state, rel_path, "the file changed before commit");
-                }
-                return;
-            }
-            Err(error) if proves_ineligible(&error) => {
+    match file_still_has_bytes(&state.root, path, &version, &data) {
+        Ok(true) => {}
+        Ok(false) => {
+            if current_path_is_ineligible(state, path) {
                 drop_indexed_file(state, rel_path, "no longer eligible");
-                return;
+            } else {
+                retry_failed_reindex(state, rel_path, "the file changed before commit");
             }
-            Err(_) => {
-                retry_failed_forced_reindex(state, rel_path, "the file changed before commit");
-                return;
-            }
+            return;
+        }
+        Err(error) if proves_ineligible(&error) => {
+            drop_indexed_file(state, rel_path, "no longer eligible");
+            return;
+        }
+        Err(_) => {
+            retry_failed_reindex(state, rel_path, "the file changed before commit");
+            return;
         }
     }
 
@@ -5253,8 +5236,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         // between the two verification reads.
         invalidate_cached_paths_locked(state, std::iter::once(rel_path));
         let mut evidence = state.file_evidence.write().unwrap();
-        let duplicate_reader = force
-            && !index.live.has_path(rel_path)
+        let duplicate_reader = !index.live.has_path(rel_path)
             && !index.live.is_deleted(rel_path)
             && index.reader_has_path(rel_path)
             && content_id_matches(evidence.content_id(rel_path), content_id);
@@ -5270,10 +5252,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
             )
         };
         let removed = extra.remove(rel_path);
-        evidence.insert(rel_path.to_string(), current, content_id);
-        if force {
-            evidence.versions.insert(rel_path.to_string(), version);
-        }
+        evidence.insert_verified(rel_path.to_string(), current, content_id, Some(version));
         (removed, committed_overlay_id)
     };
     if removed_extra {
@@ -5289,10 +5268,10 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     }
 }
 
-fn retry_failed_forced_reindex(state: &Arc<ServerState>, rel_path: &str, reason: &str) {
+fn retry_failed_reindex(state: &Arc<ServerState>, rel_path: &str, reason: &str) {
     // In-memory stamps override the persisted map during stale comparison.
     // A sentinel therefore records "this path must be read" without rewriting
-    // filestamps.json for a transient event failure.
+    // filestamps.json for a transient event or recovery-read failure.
     state.file_evidence.write().unwrap().insert(
         rel_path.to_string(),
         tgrep_core::meta::FileStamp {
@@ -10250,7 +10229,7 @@ mod tests {
     }
 
     #[test]
-    fn concrete_event_reindexes_equal_length_rewrite_with_matching_stamp() {
+    fn concrete_event_reindexes_equal_length_rewrite_with_matching_version() {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let path = root.join("same.rs");
@@ -10270,17 +10249,17 @@ mod tests {
             )
         };
         std::fs::write(&path, "fn new_marker() {}\n").unwrap();
-        let current = tgrep_core::meta::collect_filestamps(&root, &["same.rs".to_string()])
-            .remove("same.rs")
-            .unwrap();
-        state
-            .file_evidence
-            .write()
-            .unwrap()
-            .insert("same.rs".to_string(), current, None);
+        let version = builder::file_version(&std::fs::metadata(&path).unwrap());
+        let current = version.stamp().clone();
+        state.file_evidence.write().unwrap().insert_verified(
+            "same.rs".to_string(),
+            current,
+            None,
+            Some(version),
+        );
 
-        // Mutation control: the speculative path still trusts the persisted
-        // stamp and therefore leaves the old posting set in place.
+        // Deliberately pair current metadata with stale postings: a concrete
+        // event must force a read even when the trusted version matches.
         {
             let _gate = state.snapshot_gate.read().unwrap();
             reindex_file(&state, &path, "same.rs", false);
@@ -10288,7 +10267,7 @@ mod tests {
         let stale = handle_search(None, &serde_json::json!({"pattern": "new_marker"}), &state);
         assert!(
             !stale.contains("\"content\":\"fn new_marker"),
-            "the control must demonstrate that stamp-only filtering misses the rewrite"
+            "the control must demonstrate that metadata-only filtering misses the rewrite"
         );
 
         handle_fs_event(
@@ -10305,7 +10284,7 @@ mod tests {
         let repaired = handle_search(None, &serde_json::json!({"pattern": "new_marker"}), &state);
         assert!(
             repaired.contains("\"content\":\"fn new_marker"),
-            "a concrete event must bypass the coarse matching stamp: {repaired}"
+            "a concrete event must bypass the matching version: {repaired}"
         );
         let index = state.index.read().unwrap();
         assert_ne!(index.live.file_id_for_path("same.rs"), Some(old_id));

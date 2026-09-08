@@ -674,6 +674,7 @@ struct ServerState {
 #[cfg(test)]
 #[derive(Clone, Copy)]
 enum StaleRefreshPhase {
+    BeforeRefreshLock,
     BeforeWalk,
     AfterBuildBeforeStampPublish,
     AfterConcreteRead,
@@ -5343,6 +5344,17 @@ fn periodic_reconcile_loop(state: Arc<ServerState>, root: PathBuf, index_dir: Pa
     }
 }
 
+fn scheduled_reconcile_due(state: &ServerState, status: &ReconcileStatus) -> bool {
+    let busy = state.indexing.load(Ordering::SeqCst)
+        || state.flushing.load(Ordering::SeqCst)
+        || status.running;
+    if state.refresh.polling.load(Ordering::SeqCst) {
+        !busy && (status.catch_up || status.finished.elapsed() >= state.refresh.poll_interval)
+    } else {
+        reconcile_due(status.finished.elapsed(), state.quiet_for(), busy)
+    }
+}
+
 fn scheduled_reconcile(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> Option<bool> {
     if !state.watch_enabled {
         return None;
@@ -5351,21 +5363,23 @@ fn scheduled_reconcile(state: &Arc<ServerState>, root: &Path, index_dir: &Path) 
         stop_native_watcher(state);
     }
     {
-        let mut status = state.refresh.status.lock().unwrap();
-        let busy = state.indexing.load(Ordering::SeqCst)
-            || state.flushing.load(Ordering::SeqCst)
-            || status.running;
-        let due = if state.refresh.polling.load(Ordering::SeqCst) {
-            !busy && (status.catch_up || status.finished.elapsed() >= state.refresh.poll_interval)
-        } else {
-            reconcile_due(status.finished.elapsed(), state.quiet_for(), busy)
-        };
-        if !due {
+        let status = state.refresh.status.lock().unwrap();
+        if !scheduled_reconcile_due(state, &status) {
             return None;
         }
-        status.catch_up = false;
     }
-    Some(background_refresh_stale(state, root, index_dir, false))
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeRefreshLock);
+    let refresh = state.stale_refresh_lock.lock().unwrap();
+    let status = state.refresh.status.lock().unwrap();
+    // Startup or another refresh may have satisfied this tick while we waited.
+    // Keep both locks through the claim so catch-up is consumed only by a scan.
+    if !scheduled_reconcile_due(state, &status) {
+        return None;
+    }
+    Some(background_refresh_stale_locked(
+        state, root, index_dir, false, refresh, status,
+    ))
 }
 
 fn record_reconcile(state: &ServerState, start: Instant, ok: bool) {
@@ -6127,15 +6141,34 @@ fn background_refresh_stale(
     index_dir: &Path,
     compare_index_membership: bool,
 ) -> bool {
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeRefreshLock);
     let refresh = state.stale_refresh_lock.lock().unwrap();
+    let status = state.refresh.status.lock().unwrap();
+    background_refresh_stale_locked(
+        state,
+        root,
+        index_dir,
+        compare_index_membership,
+        refresh,
+        status,
+    )
+}
+
+fn background_refresh_stale_locked(
+    state: &Arc<ServerState>,
+    root: &Path,
+    index_dir: &Path,
+    compare_index_membership: bool,
+    refresh: std::sync::MutexGuard<'_, ()>,
+    mut status: std::sync::MutexGuard<'_, ReconcileStatus>,
+) -> bool {
     let attempt = Instant::now();
-    {
-        let mut status = state.refresh.status.lock().unwrap();
-        status.running = true;
-        if state.refresh.polling.load(Ordering::SeqCst) {
-            status.catch_up = false;
-        }
+    status.running = true;
+    if state.refresh.polling.load(Ordering::SeqCst) {
+        status.catch_up = false;
     }
+    drop(status);
     if state.refresh.polling.load(Ordering::SeqCst) {
         state.ignore_rules_dirty.store(false, Ordering::SeqCst);
     }
@@ -6199,7 +6232,22 @@ fn background_refresh_stale(
 fn startup_refresh_stale(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> bool {
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        let ok = background_refresh_stale(state, root, index_dir, false);
+        #[cfg(test)]
+        run_stale_refresh_hook(state, StaleRefreshPhase::BeforeRefreshLock);
+        let refresh = state.stale_refresh_lock.lock().unwrap();
+        let status = state.refresh.status.lock().unwrap();
+        if state.watch_enabled
+            && state.refresh.polling.load(Ordering::SeqCst)
+            && !scheduled_reconcile_due(state, &status)
+        {
+            // A previous polling attempt owns the retry cadence even if it
+            // failed. Do not report that failed or still-deferred work as fresh.
+            return !status.catch_up
+                && status.finished.elapsed() < state.refresh.poll_interval
+                && status.last_success.is_some()
+                && status.error.is_none();
+        }
+        let ok = background_refresh_stale_locked(state, root, index_dir, false, refresh, status);
         if ok || state.refresh.polling.load(Ordering::SeqCst) {
             return ok;
         }
@@ -9536,6 +9584,7 @@ mod tests {
                         after_publish_release.wait();
                     }
                 }
+                StaleRefreshPhase::BeforeRefreshLock => {}
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
                 StaleRefreshPhase::BeforeConcreteCommit => {}
@@ -9675,6 +9724,7 @@ mod tests {
                         test_git(&root, &["add", "--", "src/lib.rs"]);
                     }
                 }
+                StaleRefreshPhase::BeforeRefreshLock => {}
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
                 StaleRefreshPhase::BeforeConcreteCommit => {}
@@ -9848,6 +9898,7 @@ mod tests {
                         after_publish_release.wait();
                     }
                 }
+                StaleRefreshPhase::BeforeRefreshLock => {}
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
                 StaleRefreshPhase::BeforeConcreteCommit => {}

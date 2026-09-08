@@ -949,6 +949,280 @@ fn indexing_and_flushing_preserve_catch_up_until_the_first_idle_tick() {
     }
 }
 
+fn pause_first_refresh_before_lock(
+    state: &Arc<ServerState>,
+) -> (mpsc::Receiver<()>, mpsc::Sender<()>, Arc<AtomicUsize>) {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let resume_rx = Mutex::new(resume_rx);
+    let first = AtomicBool::new(true);
+    let walks = Arc::new(AtomicUsize::new(0));
+    let hook_walks = Arc::clone(&walks);
+    *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| match phase {
+        StaleRefreshPhase::BeforeRefreshLock if first.swap(false, Ordering::SeqCst) => {
+            entered_tx.send(()).unwrap();
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+        StaleRefreshPhase::BeforeWalk => {
+            hook_walks.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    }));
+    (entered_rx, resume_tx, walks)
+}
+
+fn assert_initial_poll_handoff(startup_waits: bool) {
+    for mode in [WatchMode::Poll, WatchMode::Auto] {
+        let fixture = Fixture::new(mode, 4);
+        fixture.write("source.rs", "fn startup_handoff_marker() {}\n");
+        if mode == WatchMode::Auto {
+            request_polling(&fixture.state, "startup watch capacity failure".into());
+        }
+        let (entered, resume, walks) = pause_first_refresh_before_lock(&fixture.state);
+        let waiting_state = Arc::clone(&fixture.state);
+        let waiting = thread::spawn(move || {
+            if startup_waits {
+                Some(startup_refresh_stale(
+                    &waiting_state,
+                    &waiting_state.root,
+                    &waiting_state.index_dir,
+                ))
+            } else {
+                scheduled_reconcile(
+                    &waiting_state,
+                    &waiting_state.root,
+                    &waiting_state.index_dir,
+                )
+            }
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let first_result = if startup_waits {
+            fixture.tick()
+        } else {
+            Some(startup_refresh_stale(
+                &fixture.state,
+                &fixture.root,
+                &fixture.state.index_dir,
+            ))
+        };
+        let finished = fixture.state.refresh.status.lock().unwrap().finished;
+        let disk = disk_snapshot(&fixture.state.index_dir);
+        resume.send(()).unwrap();
+        let waiting_result = waiting.join().unwrap();
+        *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+
+        assert_eq!(first_result, Some(true));
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            1,
+            "the initial poll must be shared by startup and the scheduler"
+        );
+        assert_eq!(
+            waiting_result,
+            if startup_waits { Some(true) } else { None }
+        );
+        let status = fixture.state.refresh.status.lock().unwrap();
+        assert_eq!(status.finished, finished, "skipping must not reset cadence");
+        assert!(!status.running);
+        assert!(!status.catch_up);
+        assert!(status.error.is_none());
+        drop(status);
+        assert_eq!(disk_snapshot(&fixture.state.index_dir), disk);
+        fixture.assert_hit("startup_handoff_marker", "source.rs");
+        assert_eq!(fixture.tick(), None);
+    }
+}
+
+#[test]
+fn polling_startup_skips_a_completed_scheduled_reconciliation() {
+    assert_initial_poll_handoff(true);
+}
+
+#[test]
+fn scheduled_poll_skips_a_completed_startup_reconciliation() {
+    assert_initial_poll_handoff(false);
+}
+
+#[test]
+fn scheduled_poll_rechecks_busy_state_before_claiming_catch_up() {
+    for indexing in [true, false] {
+        let fixture = Fixture::new(WatchMode::Poll, 4);
+        fixture.write("source.rs", "fn busy_handoff_marker() {}\n");
+        let (entered, resume, walks) = pause_first_refresh_before_lock(&fixture.state);
+        let waiting_state = Arc::clone(&fixture.state);
+        let waiting = thread::spawn(move || {
+            scheduled_reconcile(
+                &waiting_state,
+                &waiting_state.root,
+                &waiting_state.index_dir,
+            )
+        });
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let busy = if indexing {
+            &fixture.state.indexing
+        } else {
+            &fixture.state.flushing
+        };
+        busy.store(true, Ordering::SeqCst);
+        resume.send(()).unwrap();
+        let result = waiting.join().unwrap();
+        *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+        busy.store(false, Ordering::SeqCst);
+
+        assert_eq!(result, None);
+        assert_eq!(walks.load(Ordering::SeqCst), 0);
+        assert!(fixture.state.refresh.status.lock().unwrap().catch_up);
+        assert_eq!(fixture.tick(), Some(true));
+        fixture.assert_hit("busy_handoff_marker", "source.rs");
+    }
+}
+
+#[test]
+fn polling_startup_preserves_a_previous_failed_attempt_and_its_retry_cadence() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("missing");
+    let index_dir = temp.path().join("index");
+    let mut state = test_server_state(&root, &index_dir);
+    Arc::get_mut(&mut state).unwrap().refresh =
+        RefreshControl::new(WatchMode::Poll, Duration::from_secs(120), 4);
+    let walks = Arc::new(AtomicUsize::new(0));
+    let hook_walks = Arc::clone(&walks);
+    *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::BeforeWalk) {
+            hook_walks.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    assert_eq!(scheduled_reconcile(&state, &root, &index_dir), Some(false));
+    let finished = state.refresh.status.lock().unwrap().finished;
+    assert!(!startup_refresh_stale(&state, &root, &index_dir));
+    assert_eq!(walks.load(Ordering::SeqCst), 1);
+    let status = state.refresh.status.lock().unwrap();
+    assert_eq!(status.finished, finished);
+    assert!(status.last_success.is_none());
+    assert!(status.error.is_some());
+    drop(status);
+    assert_eq!(scheduled_reconcile(&state, &root, &index_dir), None);
+}
+
+#[test]
+fn polling_startup_does_not_claim_deferred_work_as_successful() {
+    for indexing in [true, false] {
+        for previously_reconciled in [true, false] {
+            let fixture = Fixture::new(WatchMode::Poll, 4);
+            if previously_reconciled {
+                fixture.poll();
+                fixture.due();
+            }
+            fixture.write("source.rs", "fn deferred_startup_marker() {}\n");
+            let busy = if indexing {
+                &fixture.state.indexing
+            } else {
+                &fixture.state.flushing
+            };
+            busy.store(true, Ordering::SeqCst);
+            let result =
+                startup_refresh_stale(&fixture.state, &fixture.root, &fixture.state.index_dir);
+            busy.store(false, Ordering::SeqCst);
+            assert!(!result);
+            assert_eq!(fixture.tick(), Some(true));
+            fixture.assert_hit("deferred_startup_marker", "source.rs");
+        }
+    }
+}
+
+#[test]
+fn native_and_unwatched_startup_refreshes_do_not_depend_on_the_poll_schedule() {
+    for (mode, watch_enabled) in [
+        (WatchMode::Auto, true),
+        (WatchMode::Auto, false),
+        (WatchMode::Poll, false),
+    ] {
+        let mut fixture = Fixture::new(mode, 4);
+        Arc::get_mut(&mut fixture.state).unwrap().watch_enabled = watch_enabled;
+        assert!(background_refresh_stale(
+            &fixture.state,
+            &fixture.root,
+            &fixture.state.index_dir,
+            false,
+        ));
+        fixture.write("source.rs", "fn mandatory_startup_marker() {}\n");
+        assert!(startup_refresh_stale(
+            &fixture.state,
+            &fixture.root,
+            &fixture.state.index_dir,
+        ));
+        fixture.assert_hit("mandatory_startup_marker", "source.rs");
+    }
+}
+
+#[test]
+fn polling_startup_runs_again_when_the_completion_interval_has_elapsed() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    fixture.poll();
+    fixture.write("source.rs", "fn overdue_startup_marker() {}\n");
+    fixture.due();
+    assert!(startup_refresh_stale(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+    ));
+    fixture.assert_hit("overdue_startup_marker", "source.rs");
+    assert_eq!(fixture.tick(), None);
+}
+
+#[test]
+fn polling_startup_retains_catch_up_requested_during_a_previous_scan() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    fixture.write("source.rs", "fn initial_native_marker() {}\n");
+    let hook_state = Arc::downgrade(&fixture.state);
+    let late = fixture.root.join("late.rs");
+    *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::AfterMatcherPublish) {
+            let state = hook_state.upgrade().unwrap();
+            std::fs::write(&late, "fn startup_catch_up_marker() {}\n").unwrap();
+            request_polling(&state, "capacity failure during a startup scan".into());
+        }
+    }));
+    assert!(background_refresh_stale(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        false,
+    ));
+    *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+    assert!(fixture.state.refresh.status.lock().unwrap().catch_up);
+    fixture.assert_files(&["source.rs"]);
+    assert!(startup_refresh_stale(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+    ));
+    fixture.assert_hit("startup_catch_up_marker", "late.rs");
+    assert!(!fixture.state.refresh.status.lock().unwrap().catch_up);
+    assert_eq!(fixture.tick(), None);
+}
+
+#[test]
+fn explicit_refreshes_do_not_depend_on_the_poll_schedule() {
+    let fixture = Fixture::new(WatchMode::Poll, 4);
+    fixture.poll();
+    for compare_index_membership in [false, true] {
+        let path = format!("forced_{compare_index_membership}.rs");
+        fixture.write(&path, "fn explicit_refresh_marker() {}\n");
+        assert!(background_refresh_stale(
+            &fixture.state,
+            &fixture.root,
+            &fixture.state.index_dir,
+            compare_index_membership,
+        ));
+        fixture.assert_hit("explicit_refresh_marker", &path);
+    }
+}
+
 #[test]
 fn a_fallback_requested_during_a_scan_retains_exactly_one_immediate_catch_up() {
     let fixture = Fixture::new(WatchMode::Auto, 4);

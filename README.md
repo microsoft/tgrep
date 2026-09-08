@@ -20,6 +20,8 @@ tgrep serve .            # start server (watches for file changes)
 tgrep "fn main" .        # instant — auto-connects to running server
 ```
 
+Using tgrep from an AI coding agent? See [AGENTS.md](AGENTS.md).
+
 See [full benchmark results](BENCHMARKS.md) — up to **52x faster** than ripgrep on large repos.
 
 ### Benchmark highlights (avg latency per query, index pre-built)

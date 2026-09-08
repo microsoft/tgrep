@@ -645,8 +645,7 @@ struct ServerState {
     /// save. Higher values reduce save frequency (and the pauses they cause)
     /// at the cost of more unsaved work if the process is killed.
     auto_save_mutations: u32,
-    /// Files a delta build could not read, and the metadata they had when it
-    /// tried.
+    /// Files a delta build could not read, and their preceding scan versions.
     ///
     /// A file that fails to read has its stamp withheld so the next reconcile
     /// retries it rather than recording it as indexed. That is right for a
@@ -655,12 +654,11 @@ struct ServerState {
     /// time, and with a reconcile on a timer it would rewrite the whole index
     /// once an hour forever to re-attempt a file that will fail again.
     ///
-    /// Remembering the metadata of the attempt separates the two. A file whose
-    /// mtime and size have not moved since it failed is not worth another
-    /// read; one that has changed gets a fresh look. The record lives in
-    /// memory, so restarting the server retries everything — which is the
-    /// escape hatch for a file made readable without being modified.
-    unreadable: RwLock<std::collections::HashMap<String, tgrep_core::meta::FileStamp>>,
+    /// Only a matching precise version suppresses another native read. Unknown
+    /// versions remain retryable; polling retries failures on every interval.
+    /// The record lives in memory, so a restart also retries files whose access
+    /// changed without changing their metadata.
+    unreadable: RwLock<std::collections::HashMap<String, Option<tgrep_core::meta::FileVersion>>>,
     /// Reference point for [`ServerState::quiet_for`], because an `Instant`
     /// cannot live in an atomic.
     started: Instant,
@@ -5425,6 +5423,7 @@ fn persist_pending_index_changes(state: &Arc<ServerState>) -> bool {
                 operation: "auto-save",
                 authoritative_membership: false,
                 authoritative_listed_files: None,
+                scanned_files: &[],
             },
         );
     }
@@ -5800,6 +5799,8 @@ struct StaleMergePolicy<'a> {
     operation: &'a str,
     authoritative_membership: bool,
     authoritative_listed_files: Option<&'a [String]>,
+    /// Pre-read scan metadata for failure memoization, never indexed evidence.
+    scanned_files: &'a [tgrep_core::walker::FileMeta],
 }
 
 /// Apply a stale diff without materializing the existing index in heap.
@@ -5829,6 +5830,7 @@ fn stream_merge_stale_changes(
         operation,
         authoritative_membership,
         authoritative_listed_files,
+        scanned_files,
     } = policy;
     let stamps = &evidence.stamps;
     let root = &state.root;
@@ -5921,14 +5923,13 @@ fn stream_merge_stale_changes(
         // would hide it from every later reconcile and make the miss permanent.
         // Dropping the stamp leaves it looking new, so the next pass retries it.
         //
-        // Record what the file looked like when it failed, so a permanent
-        // failure is retried when the file changes rather than on every pass.
-        // See `ServerState::unreadable`.
+        // Memoize the preceding scan version, not old indexed evidence or a
+        // later stat that could describe a file we never tried to read.
         let unreadable = {
             let mut memo = state.unreadable.write().unwrap();
             // Anything this delta was asked to build is settled: either it was
             // read, or it is in `outcome.unreadable` and re-recorded below.
-            for path in changed.iter().chain(added).chain(deleted) {
+            for path in &candidates {
                 memo.remove(path);
             }
             let mut unreadable = std::collections::HashSet::new();
@@ -5939,8 +5940,17 @@ fn stream_merge_stale_changes(
                     .to_string_lossy()
                     .replace('\\', "/");
                 unreadable.insert(rel.clone());
-                if let Some(stamp) = published_evidence.remove(&rel) {
-                    memo.insert(rel, stamp);
+                published_evidence.remove(&rel);
+                memo.insert(rel, None);
+            }
+            if !unreadable.is_empty() {
+                for file in scanned_files {
+                    if unreadable.contains(&file.relative_path) {
+                        memo.insert(
+                            file.relative_path.clone(),
+                            file.version.clone().filter(|version| version.is_trusted()),
+                        );
+                    }
                 }
             }
             unreadable
@@ -6079,7 +6089,7 @@ fn stream_merge_stale_changes(
 /// Returns the paths removed, which the caller must also keep out of the
 /// published stamps — see [`stamps_for_indexed`].
 fn drop_memoized_failures(
-    memo: &std::collections::HashMap<String, tgrep_core::meta::FileStamp>,
+    memo: &std::collections::HashMap<String, Option<tgrep_core::meta::FileVersion>>,
     current_meta: &[tgrep_core::walker::FileMeta],
     changed: &mut Vec<String>,
     added: &mut Vec<String>,
@@ -6092,8 +6102,12 @@ fn drop_memoized_failures(
     let still_failing: std::collections::HashSet<String> = current_meta
         .iter()
         .filter(|fm| {
-            memo.get(&fm.relative_path)
-                .is_some_and(|a| a.mtime == fm.mtime && a.size == fm.size)
+            fm.version
+                .as_ref()
+                .filter(|version| version.is_trusted())
+                .is_some_and(|version| {
+                    memo.get(&fm.relative_path).and_then(Option::as_ref) == Some(version)
+                })
         })
         .map(|fm| fm.relative_path.clone())
         .collect();
@@ -6509,6 +6523,7 @@ fn refresh_stale_locked(
             operation: "stale check",
             authoritative_membership: true,
             authoritative_listed_files: Some(listed_files),
+            scanned_files: current_meta,
         },
     ) {
         return false;
@@ -9276,6 +9291,7 @@ mod tests {
                     operation: "test stale check",
                     authoritative_membership: true,
                     authoritative_listed_files: Some(&listed_files),
+                    scanned_files: &[],
                 },
             ));
         }
@@ -9318,6 +9334,7 @@ mod tests {
                     operation: "test retry",
                     authoritative_membership: true,
                     authoritative_listed_files: None,
+                    scanned_files: &[],
                 },
             ));
         }
@@ -9400,6 +9417,7 @@ mod tests {
                     operation: "test evidence merge",
                     authoritative_membership: true,
                     authoritative_listed_files: None,
+                    scanned_files: &[],
                 },
             ));
         }
@@ -11223,6 +11241,16 @@ mod tests {
         assert!(!reconcile_due(RECONCILE_DEADLINE, long_quiet, true));
     }
 
+    fn file_meta_with_version(path: &Path, relative_path: &str) -> tgrep_core::walker::FileMeta {
+        let version = tgrep_core::meta::file_version(&std::fs::metadata(path).unwrap());
+        tgrep_core::walker::FileMeta {
+            relative_path: relative_path.to_string(),
+            mtime: version.stamp().mtime,
+            size: version.stamp().size,
+            version: Some(version),
+        }
+    }
+
     /// A file that cannot be read must not make every reconcile rebuild.
     ///
     /// Its stamp is deliberately withheld so it looks new and gets retried.
@@ -11231,24 +11259,18 @@ mod tests {
     /// hour, forever, to re-attempt a read that fails the same way each time.
     #[test]
     fn a_file_that_stays_unreadable_is_not_retried_until_it_changes() {
-        use tgrep_core::meta::FileStamp;
         use tgrep_core::walker::FileMeta;
 
-        let memo = std::collections::HashMap::from([(
-            "locked.bin".to_string(),
-            FileStamp {
-                mtime: 100,
-                size: 5,
-            },
-        )]);
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("locked.bin");
+        std::fs::write(&path, b"12345").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let initial = file_meta_with_version(&path, "locked.bin");
+        let memo =
+            std::collections::HashMap::from([("locked.bin".to_string(), initial.version.clone())]);
 
-        let retried = |mtime: u64, size: u64| {
-            let current = vec![FileMeta {
-                relative_path: "locked.bin".to_string(),
-                mtime,
-                size,
-                version: None,
-            }];
+        let retried = |file: FileMeta| {
+            let current = vec![file];
             let (mut changed, mut added, _) = classify_file_changes(
                 &current,
                 &std::collections::HashMap::new(),
@@ -11260,11 +11282,24 @@ mod tests {
         };
 
         // Unchanged since the failed read: leave it alone.
-        assert_eq!(retried(100, 5).0, 0);
+        assert_eq!(retried(initial).0, 0);
         // Touched: worth another look.
-        assert_eq!(retried(200, 5).0, 1);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified + Duration::from_secs(100)))
+            .unwrap();
+        assert_eq!(retried(file_meta_with_version(&path, "locked.bin")).0, 1);
         // Resized: likewise.
-        assert_eq!(retried(100, 6).0, 1);
+        std::fs::write(&path, b"123456").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(retried(file_meta_with_version(&path, "locked.bin")).0, 1);
     }
 
     /// Skipping a file must not also mark it indexed.
@@ -11280,29 +11315,19 @@ mod tests {
     /// deleting the index.
     #[test]
     fn a_skipped_file_is_left_unstamped_so_the_next_pass_still_sees_it() {
-        use tgrep_core::meta::FileStamp;
-        use tgrep_core::walker::FileMeta;
-
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("locked.bin"), b"12345").unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let source = root.join("src").join("main.rs");
+        std::fs::write(&source, b"fn main()").unwrap();
         let current = vec![
-            FileMeta {
-                relative_path: "locked.bin".to_string(),
-                mtime: 100,
-                size: 5,
-                version: None,
-            },
-            FileMeta {
-                relative_path: "src/main.rs".to_string(),
-                mtime: 100,
-                size: 9,
-                version: None,
-            },
+            file_meta_with_version(&root.join("locked.bin"), "locked.bin"),
+            file_meta_with_version(&source, "src/main.rs"),
         ];
         let memo = std::collections::HashMap::from([(
             "locked.bin".to_string(),
-            FileStamp {
-                mtime: 100,
-                size: 5,
-            },
+            current[0].version.clone(),
         )]);
 
         let (mut changed, mut added, _) = classify_file_changes(

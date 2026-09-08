@@ -54,6 +54,12 @@ impl Fixture {
         self.assert_polling();
     }
 
+    fn native_reconcile(&self) {
+        assert!(native_watching(&self.state));
+        self.state.refresh.status.lock().unwrap().finished = Instant::now() - RECONCILE_DEADLINE;
+        assert_eq!(self.tick(), Some(true));
+    }
+
     fn assert_polling(&self) {
         assert!(self.state.watch_enabled);
         assert!(self.state.refresh.polling.load(Ordering::SeqCst));
@@ -1371,7 +1377,8 @@ fn a_failed_poll_preserves_last_success_and_retries_an_unchanged_failed_stamp() 
     let last_success = fixture.state.refresh.status.lock().unwrap().last_success;
     fixture.write("source.rs", "fn recovered_after_failure_marker() {}\n");
     let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-    let failed_stamp = tgrep_core::meta::file_stamp(&std::fs::metadata(&path).unwrap());
+    let failed_version = builder::file_version(&std::fs::metadata(&path).unwrap());
+    let failed_stamp = failed_version.stamp().clone();
     let hook_path = path.clone();
     *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
         if matches!(phase, StaleRefreshPhase::AfterMatcherPublish) {
@@ -1391,7 +1398,7 @@ fn a_failed_poll_preserves_last_success_and_retries_an_unchanged_failed_stamp() 
     );
     assert_eq!(
         fixture.state.unreadable.read().unwrap().get("source.rs"),
-        Some(&failed_stamp)
+        Some(&Some(failed_version))
     );
     let status = fixture.state.refresh.status.lock().unwrap();
     assert_eq!(status.last_success, last_success);
@@ -1415,6 +1422,154 @@ fn a_failed_poll_preserves_last_success_and_retries_an_unchanged_failed_stamp() 
     assert!(fixture.state.unreadable.read().unwrap().is_empty());
     assert!(fixture.state.refresh.status.lock().unwrap().error.is_none());
     fixture.assert_hit("recovered_after_failure_marker", "source.rs");
+}
+
+fn assert_native_retry_after_failed_read(restore_mtime: bool) {
+    for previously_indexed in [true, false] {
+        let fixture = Fixture::new(WatchMode::Auto, 4);
+        let modified = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(1_700_000_000)
+            + Duration::from_millis(100);
+        if previously_indexed {
+            let path = fixture.write("source.rs", "fn old_memo_marker() {}\n");
+            set_modified(&path, modified - Duration::from_millis(100));
+            fixture.native_reconcile();
+            fixture.assert_hit("old_memo_marker", "source.rs");
+        }
+        let path = fixture.write("source.rs", "fn bad_memo_marker() {}\n");
+        set_modified(&path, modified);
+        let failed_version = builder::file_version(&std::fs::metadata(&path).unwrap());
+        let hook_path = path.clone();
+        *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+            if matches!(phase, StaleRefreshPhase::AfterMatcherPublish) {
+                std::fs::remove_file(&hook_path).unwrap();
+            }
+        }));
+        fixture.native_reconcile();
+        *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+        assert_eq!(
+            fixture.state.unreadable.read().unwrap().get("source.rs"),
+            Some(&Some(failed_version.clone())),
+            "failure evidence must come from the scan, not the old indexed read or a later stat"
+        );
+        assert!(fixture.state.refresh.status.lock().unwrap().error.is_some());
+        assert_eq!(
+            fixture
+                .state
+                .index
+                .read()
+                .unwrap()
+                .reader_has_path("source.rs"),
+            previously_indexed
+        );
+
+        fixture.write("source.rs", "fn new_memo_marker() {}\n");
+        set_modified(
+            &path,
+            if restore_mtime {
+                modified
+            } else {
+                modified + Duration::from_millis(100)
+            },
+        );
+        #[cfg(windows)]
+        if restore_mtime {
+            use std::os::windows::fs::FileTimesExt;
+            // NTFS can reuse a deleted name's creation time. Give the replacement
+            // distinct creation evidence while retaining the failed file's mtime.
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_created(modified))
+                .unwrap();
+        }
+        let recovered_version = builder::file_version(&std::fs::metadata(&path).unwrap());
+        assert_eq!(failed_version.stamp(), recovered_version.stamp());
+        assert_ne!(failed_version, recovered_version);
+        fixture.native_reconcile();
+        fixture.assert_hit("new_memo_marker", "source.rs");
+        assert!(fixture.state.unreadable.read().unwrap().is_empty());
+        assert!(fixture.state.refresh.status.lock().unwrap().error.is_none());
+        assert_eq!(
+            fixture
+                .state
+                .file_evidence
+                .read()
+                .unwrap()
+                .version("source.rs"),
+            Some(&recovered_version)
+        );
+        let disk = disk_snapshot(&fixture.state.index_dir);
+        fixture.native_reconcile();
+        assert_eq!(disk_snapshot(&fixture.state.index_dir), disk);
+    }
+}
+
+#[test]
+fn native_reconciliation_retries_failed_files_after_same_second_writes() {
+    assert_native_retry_after_failed_read(false);
+}
+
+#[test]
+fn native_reconciliation_retries_failed_replacements_with_restored_mtime() {
+    assert_native_retry_after_failed_read(true);
+}
+
+#[test]
+fn memoized_read_failures_with_missing_versions_remain_retryable() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    let path = fixture.write("source.rs", "fn unknown_version_marker() {}\n");
+    let version = builder::file_version(&std::fs::metadata(&path).unwrap());
+    for (memo_known, scan_known) in [(true, false), (false, true), (false, false)] {
+        let memo = std::collections::HashMap::from([(
+            "source.rs".to_string(),
+            memo_known.then_some(version.clone()),
+        )]);
+        let current = [tgrep_core::walker::FileMeta {
+            relative_path: "source.rs".into(),
+            mtime: version.stamp().mtime,
+            size: version.stamp().size,
+            version: scan_known.then_some(version.clone()),
+        }];
+        for was_indexed in [true, false] {
+            let mut changed = Vec::new();
+            let mut added = Vec::new();
+            if was_indexed {
+                changed.push("source.rs".to_string());
+            } else {
+                added.push("source.rs".to_string());
+            }
+            assert!(drop_memoized_failures(&memo, &current, &mut changed, &mut added).is_empty());
+            assert_eq!(changed.len() + added.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn auto_save_clears_a_recovered_unreadable_memo_entry() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    let path = fixture.write("source.rs", "fn before_auto_save_marker() {}\n");
+    {
+        let _gate = fixture.state.snapshot_gate.read().unwrap();
+        reindex_file(&fixture.state, &path, "source.rs", true);
+    }
+    std::fs::remove_file(&path).unwrap();
+    assert!(persist_pending_index_changes(&fixture.state));
+    assert_eq!(
+        fixture.state.unreadable.read().unwrap().get("source.rs"),
+        Some(&None),
+        "an auto-save has no preceding scan and must leave the failure retryable"
+    );
+
+    fixture.write("source.rs", "fn repaired_auto_save_marker() {}\n");
+    {
+        let _gate = fixture.state.snapshot_gate.read().unwrap();
+        reindex_file(&fixture.state, &path, "source.rs", true);
+    }
+    assert!(persist_pending_index_changes(&fixture.state));
+    assert!(fixture.state.unreadable.read().unwrap().is_empty());
+    fixture.assert_hit("repaired_auto_save_marker", "source.rs");
 }
 
 #[test]

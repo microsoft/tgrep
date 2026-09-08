@@ -1082,6 +1082,10 @@ fn search_via_server(
     if opts.stats
         && let Some(elapsed) = result.get("elapsed_ms").and_then(|e| e.as_f64())
     {
+        // Match output is buffered on stdout, while stats go straight to
+        // stderr. Flush first so a combined stdout/stderr stream reports the
+        // summary after the matches, as ripgrep does.
+        writer.flush()?;
         // Count the rows that survived scoping, not the server's `num_matches`.
         // The server searches the whole indexed tree and counts every row it
         // built, so that field includes files outside a subdirectory argument
@@ -1165,15 +1169,6 @@ fn search_local_index(
         sort.apply_indexed(&mut candidates, &index_root, &scope, |(_, rel)| rel);
     }
 
-    if opts.stats {
-        eprintln!(
-            "Query plan: {} (candidates: {}/{})",
-            plan_summary(&plan),
-            candidates.len(),
-            reader.num_files()
-        );
-    }
-
     let mut had_matches = false;
     // A single-file search root is a file the user named on the command line,
     // which is what makes binary files visible in ripgrep.
@@ -1203,6 +1198,16 @@ fn search_local_index(
 
     if opts.stats {
         let elapsed = start.elapsed();
+        // Match output is buffered on stdout, while stats go straight to
+        // stderr. Flush first so a combined stdout/stderr stream reports the
+        // summary after the matches, as ripgrep does.
+        writer.flush()?;
+        eprintln!(
+            "Query plan: {} (candidates: {}/{})",
+            plan_summary(&plan),
+            candidates.len(),
+            reader.num_files()
+        );
         eprintln!(
             "Search completed in {:.1}ms",
             elapsed.as_secs_f64() * 1000.0
@@ -1313,6 +1318,10 @@ fn brute_force_search(
 
         if opts.stats {
             let elapsed = start.elapsed();
+            // Match output is buffered on stdout, while stats go straight to
+            // stderr. Flush first so a combined stdout/stderr stream reports
+            // the summary after the matches, as ripgrep does.
+            writer.flush()?;
             eprintln!(
                 "Brute-force search completed in {:.1}ms (1 files)",
                 elapsed.as_secs_f64() * 1000.0,
@@ -1354,6 +1363,10 @@ fn brute_force_search(
 
     if opts.stats {
         let elapsed = start.elapsed();
+        // Match output is buffered on stdout, while stats go straight to
+        // stderr. Flush first so a combined stdout/stderr stream reports the
+        // summary after the matches, as ripgrep does.
+        writer.flush()?;
         eprintln!(
             "Brute-force search completed in {:.1}ms ({} files)",
             elapsed.as_secs_f64() * 1000.0,

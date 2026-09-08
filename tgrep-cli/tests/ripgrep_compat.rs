@@ -9,6 +9,7 @@ use predicates::prelude::*;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -160,6 +161,74 @@ fn missing_path_does_not_stop_remaining_paths() {
         .assert()
         .code(2)
         .stdout(predicate::str::contains("hello.rs"));
+}
+
+#[test]
+fn stats_follow_matches_on_a_combined_output_stream() {
+    let dir = setup_fixture();
+    let merged_path = dir.path().join("merged-output.txt");
+    let merged = fs::File::create(&merged_path).unwrap();
+    let stdout = merged.try_clone().unwrap();
+
+    let status = ProcessCommand::new(env!("CARGO_BIN_EXE_tgrep"))
+        .args([
+            "--no-index",
+            "--stats",
+            "--no-heading",
+            "fn main",
+            &fixture_path(&dir),
+        ])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(merged))
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let output = fs::read_to_string(merged_path).unwrap();
+    let match_at = output
+        .find("fn main()")
+        .expect("search result should be present");
+    let stats_at = output
+        .find("Brute-force search completed")
+        .expect("stats should be present");
+    assert!(
+        match_at < stats_at,
+        "stats must follow buffered matches on a combined stream: {output:?}"
+    );
+}
+
+#[test]
+fn indexed_stats_follow_matches_on_a_combined_output_stream() {
+    let dir = setup_fixture();
+    let root = fixture_path(&dir);
+    tgrep().args(["index", &root]).assert().success();
+
+    let merged_path = dir.path().join("merged-indexed-output.txt");
+    let merged = fs::File::create(&merged_path).unwrap();
+    let stdout = merged.try_clone().unwrap();
+
+    let status = ProcessCommand::new(env!("CARGO_BIN_EXE_tgrep"))
+        .args(["--stats", "--no-heading", "fn main", &root])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(merged))
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let output = fs::read_to_string(merged_path).unwrap();
+    let match_at = output
+        .find("fn main()")
+        .expect("search result should be present");
+    let plan_at = output
+        .find("Query plan:")
+        .expect("query plan stats should be present");
+    let elapsed_at = output
+        .find("Search completed")
+        .expect("elapsed stats should be present");
+    assert!(
+        match_at < plan_at && plan_at < elapsed_at,
+        "stats must follow buffered matches on a combined stream: {output:?}"
+    );
 }
 
 #[test]

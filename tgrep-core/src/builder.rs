@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::external::{self, ExternalSorter, TrigramPosting};
 use crate::meta::{self, IndexMeta};
+pub use crate::meta::{FileVersion, file_version};
 use crate::ondisk::{
     self, LOOKUP_WRITE_CHUNK_ENTRIES, LookupEntry, POSTING_WRITE_CHUNK_ENTRIES, PostingEntry,
     flush_lookup_entries, write_lookup_entry, write_posting_entries,
@@ -154,6 +155,9 @@ impl PostingSink {
 pub struct BuildOutcome {
     /// Number of files written to the index.
     pub num_files: usize,
+    /// Versions validated around the reads that produced indexed text or
+    /// binary classifications. Missing entries must be treated as unverified.
+    pub versions: HashMap<String, FileVersion>,
     /// Absolute `.gitignore` paths seen during the walk, when
     /// [`BuildOptions::collect_gitignore_files`] was set; empty otherwise.
     ///
@@ -404,48 +408,81 @@ impl Drop for OwnedReadPermit {
     }
 }
 
-type ExtractedFile = (String, trigram::TrigramMaskMap, meta::ContentId);
-
-/// Full-resolution identity used to validate that bytes came from one file
-/// version without changing the persisted [`meta::FileStamp`] format.
-#[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileVersion {
-    stamp: meta::FileStamp,
-    modified: Option<std::time::SystemTime>,
-    created: Option<std::time::SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_seconds: i64,
-    #[cfg(unix)]
-    change_nanos: i64,
+struct ExtractedFile {
+    path: String,
+    trigrams: Option<trigram::TrigramMaskMap>,
+    content_id: Option<meta::ContentId>,
+    version: Option<FileVersion>,
 }
 
-impl FileVersion {
-    pub fn stamp(&self) -> &meta::FileStamp {
-        &self.stamp
+struct IndexRead {
+    bytes: FileBytes,
+    file: std::fs::File,
+    version: Option<FileVersion>,
+}
+
+impl IndexRead {
+    fn open(
+        path: &Path,
+        read: impl FnOnce(&mut std::fs::File) -> std::io::Result<FileBytes>,
+    ) -> std::io::Result<Self> {
+        let mut file = std::fs::File::open(path)?;
+        let version = file.metadata().ok().map(|metadata| file_version(&metadata));
+        let bytes = read(&mut file)?;
+        Ok(Self {
+            bytes,
+            file,
+            version,
+        })
+    }
+
+    /// Call after decoding, classification, and extraction: mapped bytes can
+    /// change even after the initial read/map has completed.
+    fn verified_version(&self) -> Option<FileVersion> {
+        let version = self
+            .version
+            .as_ref()
+            .filter(|version| version.is_trusted())?;
+        (self.bytes.len() as u64 == version.stamp().size
+            && self
+                .file
+                .metadata()
+                .is_ok_and(|metadata| file_version(&metadata) == *version))
+        .then(|| version.clone())
     }
 }
 
-#[doc(hidden)]
-pub fn file_version(metadata: &std::fs::Metadata) -> FileVersion {
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
-    FileVersion {
-        stamp: meta::file_stamp(metadata),
-        modified: metadata.modified().ok(),
-        created: metadata.created().ok(),
-        #[cfg(unix)]
-        device: metadata.dev(),
-        #[cfg(unix)]
-        inode: metadata.ino(),
-        #[cfg(unix)]
-        change_seconds: metadata.ctime(),
-        #[cfg(unix)]
-        change_nanos: metadata.ctime_nsec(),
+impl std::ops::Deref for IndexRead {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn extract_indexed_file(path: String, data: &IndexRead) -> ExtractedFile {
+    let text = crate::encoding::decode_for_index(data);
+    let (trigrams, content_id) = if trigram::is_binary(&text) {
+        (None, None)
+    } else {
+        (
+            Some(trigram::extract_merged_masks(&text)),
+            Some(meta::ContentId::from_indexed_bytes(&text)),
+        )
+    };
+    let version = data.verified_version();
+    // Unlike owned bytes, a raced map may have changed between extracting
+    // postings and hashing. Its identity cannot safely deduplicate a retry.
+    let content_id = if version.is_none() && matches!(data.bytes, FileBytes::Mapped(_)) {
+        None
+    } else {
+        content_id
+    };
+    ExtractedFile {
+        path,
+        trigrams,
+        content_id,
+        version,
     }
 }
 
@@ -471,7 +508,7 @@ fn read_for_index(
     size: u64,
     owned_budget: &std::sync::Arc<OwnedReadBudget>,
     configured_limit: Option<u64>,
-) -> std::io::Result<FileBytes> {
+) -> std::io::Result<IndexRead> {
     let owned_limit = configured_limit.unwrap_or(u64::MAX);
     if size > owned_limit {
         return Err(std::io::Error::new(
@@ -485,54 +522,59 @@ fn read_for_index(
         // truncation would be undefined behaviour; that is inherent to mapping
         // a file being indexed, and is the same exposure the search path
         // accepts.
-        let mapped =
-            std::fs::File::open(path).and_then(|file| unsafe { memmap2::Mmap::map(&file) });
-        if let Ok(map) = mapped
-            && map.len() as u64 <= owned_limit
+        let mapped = IndexRead::open(path, |file| {
+            unsafe { memmap2::Mmap::map(&*file) }.map(FileBytes::Mapped)
+        });
+        if let Ok(data) = mapped
+            && data.len() as u64 <= owned_limit
         {
-            return Ok(FileBytes::Mapped(map));
+            return Ok(data);
         }
         // The file grew between the walk's stat and the map. Do not let a
         // successful mmap bypass a caller-supplied max-file-size limit.
     }
     let permit = owned_budget.acquire(size);
-    match read_owned_for_index(path, size, owned_limit) {
-        Ok(bytes) => Ok(FileBytes::Read {
+    match IndexRead::open(path, |file| {
+        read_owned_for_index(file, size, owned_limit).map(|bytes| FileBytes::Read {
             bytes,
             _permit: permit,
-        }),
+        })
+    }) {
+        Ok(data) => Ok(data),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             // The file grew after it was stat'd. Release the smaller claim
             // before waiting for the retry allowance so concurrent growers
             // cannot deadlock while each holds part of the batch budget.
-            drop(permit);
             match configured_limit {
                 Some(limit) => {
                     let permit = owned_budget.acquire(limit);
-                    read_owned_for_index(path, limit, limit)
-                        .map(|bytes| FileBytes::Read {
+                    IndexRead::open(path, |file| {
+                        read_owned_for_index(file, limit, limit).map(|bytes| FileBytes::Read {
                             bytes,
                             _permit: permit,
                         })
-                        .map_err(|retry| {
-                            if retry.kind() == std::io::ErrorKind::WouldBlock {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    format!("file exceeds the configured {} byte limit", limit),
-                                )
-                            } else {
-                                retry
-                            }
-                        })
+                    })
+                    .map_err(|retry| {
+                        if retry.kind() == std::io::ErrorKind::WouldBlock {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("file exceeds the configured {} byte limit", limit),
+                            )
+                        } else {
+                            retry
+                        }
+                    })
                 }
                 None => {
                     // No caller limit means no implicit fallback limit either.
                     // Claiming more than the budget takes it exclusively, so
                     // this unbounded read cannot overlap another owned buffer.
                     let permit = owned_budget.acquire(u64::MAX);
-                    read_owned_unbounded(path, size).map(|bytes| FileBytes::Read {
-                        bytes,
-                        _permit: permit,
+                    IndexRead::open(path, |file| {
+                        read_owned_unbounded(file, size).map(|bytes| FileBytes::Read {
+                            bytes,
+                            _permit: permit,
+                        })
                     })
                 }
             }
@@ -541,7 +583,11 @@ fn read_for_index(
     }
 }
 
-fn read_owned_for_index(path: &Path, size: u64, owned_limit: u64) -> std::io::Result<Vec<u8>> {
+fn read_owned_for_index(
+    file: &mut std::fs::File,
+    size: u64,
+    owned_limit: u64,
+) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
 
     if size > owned_limit {
@@ -550,9 +596,8 @@ fn read_owned_for_index(path: &Path, size: u64, owned_limit: u64) -> std::io::Re
             format!("file exceeds the configured {} byte limit", owned_limit),
         ));
     }
-    let mut file = std::fs::File::open(path)?;
     let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
-    std::io::Read::by_ref(&mut file)
+    std::io::Read::by_ref(file)
         .take(size)
         .read_to_end(&mut bytes)?;
     let mut extra = [0u8; 1];
@@ -565,10 +610,9 @@ fn read_owned_for_index(path: &Path, size: u64, owned_limit: u64) -> std::io::Re
     Ok(bytes)
 }
 
-fn read_owned_unbounded(path: &Path, expected_size: u64) -> std::io::Result<Vec<u8>> {
+fn read_owned_unbounded(file: &mut std::fs::File, expected_size: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(path)?;
     let initial_capacity = expected_size.min(MAX_OWNED_FILE_BYTES);
     let mut bytes = Vec::with_capacity(usize::try_from(initial_capacity).unwrap_or(0));
     file.read_to_end(&mut bytes)?;
@@ -652,6 +696,7 @@ pub fn build_index_with_options_and_ignorecase(
     // resident at once, since the whole batch is read concurrently.
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
     let mut content_ids = HashMap::with_capacity(walk.files.len());
+    let mut versions = HashMap::with_capacity(walk.files.len());
     let mut sink = match opts.strategy {
         IndexStrategy::InMemory => PostingSink::InMemory(Vec::new()),
         IndexStrategy::External => {
@@ -682,25 +727,28 @@ pub fn build_index_with_options_and_ignorecase(
                         return None;
                     }
                 };
-                let text = crate::encoding::decode_for_index(&data);
-                if trigram::is_binary(&text) {
-                    binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return None;
-                }
                 let rel = path
                     .strip_prefix(&root)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                let per_tri = trigram::extract_merged_masks(&text);
-                let content_id = meta::ContentId::from_indexed_bytes(&text);
-                Some((rel, per_tri, content_id))
+                Some(extract_indexed_file(rel, &data))
             })
             .collect();
 
-        for (path, per_tri, content_id) in batch_data {
+        for extracted in batch_data {
+            let path = extracted.path;
+            if let Some(version) = extracted.version {
+                versions.insert(path.clone(), version);
+            }
+            let Some(per_tri) = extracted.trigrams else {
+                binary_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            };
             let file_id = file_id_map.len() as u32;
-            content_ids.insert(path.clone(), content_id);
+            if let Some(content_id) = extracted.content_id {
+                content_ids.insert(path.clone(), content_id);
+            }
             file_id_map.push((file_id, path));
             sink.push_file(file_id, per_tri)?;
         }
@@ -737,9 +785,8 @@ pub fn build_index_with_options_and_ignorecase(
         }
     }
 
-    // Write per-file stamps for walked files, including those later rejected
-    // as binary-by-content. A file that raced past max-file-size is different:
-    // withholding its stamp leaves it eligible for a later retry.
+    // Publish only read-bound stamps, including verified binary classifications.
+    // A later stat must never make an unreadable or raced read look current.
     let raced_too_large = raced_too_large.into_inner().unwrap();
     if !raced_too_large.is_empty() {
         eprintln!(
@@ -747,11 +794,11 @@ pub fn build_index_with_options_and_ignorecase(
             raced_too_large.len()
         );
     }
-    let all_walked = walked_paths_for_stamps(&root, &walk.files, &raced_too_large);
-    let stamps = meta::collect_filestamps(&root, &all_walked);
-    let mut evidence = meta::FileEvidence::from_stamps(stamps);
-    content_ids.retain(|path, _| evidence.stamps.contains_key(path));
-    evidence.content_ids = content_ids;
+    let evidence = evidence_for_indexed_reads(
+        walked_paths_for_stamps(&root, &walk.files, &raced_too_large),
+        versions,
+        content_ids,
+    );
 
     let indexed_paths: HashSet<&str> = file_id_map.iter().map(|(_, path)| path.as_str()).collect();
     let mut extra_paths: Vec<String> = walk
@@ -770,9 +817,25 @@ pub fn build_index_with_options_and_ignorecase(
     eprintln!("Index built successfully at {}", index_dir.display());
     Ok(BuildOutcome {
         num_files: file_id_map.len(),
+        versions: evidence.versions,
         gitignore_files,
         ignore_files,
     })
+}
+
+fn evidence_for_indexed_reads(
+    paths: Vec<String>,
+    mut versions: HashMap<String, FileVersion>,
+    mut content_ids: HashMap<String, meta::ContentId>,
+) -> meta::FileEvidence {
+    let mut evidence = meta::FileEvidence::default();
+    for path in paths {
+        if let Some(version) = versions.remove(&path) {
+            let content_id = content_ids.remove(&path);
+            evidence.insert_verified(path, version.stamp().clone(), content_id, Some(version));
+        }
+    }
+    evidence
 }
 
 /// Outcome of [`build_index_for_files`].
@@ -780,7 +843,8 @@ pub fn build_index_with_options_and_ignorecase(
 pub struct FileDeltaOutcome {
     /// Number of text files written into the delta index.
     pub indexed: usize,
-    /// Paths that could not be read, and are therefore absent from the delta.
+    /// Paths that could not be read at a verified version, and are therefore
+    /// absent from the delta.
     ///
     /// The caller must drop these from the filestamp set it publishes. A stamp
     /// asserts "this file is indexed at this version"; publishing one for a
@@ -795,6 +859,9 @@ pub struct FileDeltaOutcome {
     pub unreadable: Vec<std::path::PathBuf>,
     /// Identities of the decoded bytes that produced successful text entries.
     pub content_ids: HashMap<String, meta::ContentId>,
+    /// Read-bound versions, including successful binary classifications.
+    /// A missing version must not be replaced with a later filesystem stat.
+    pub versions: HashMap<String, FileVersion>,
 }
 
 /// Build an external-sort index for an exact list of absolute file paths.
@@ -825,6 +892,7 @@ pub fn build_index_for_files(
     let mut sorter = ExternalSorter::new(index_dir, buffer_bytes);
     let mut unreadable: Vec<std::path::PathBuf> = Vec::new();
     let mut content_ids = HashMap::with_capacity(files.len());
+    let mut versions = HashMap::with_capacity(files.len());
 
     for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
         let batch = &files[range.clone()];
@@ -833,44 +901,53 @@ pub fn build_index_for_files(
         let batch_data: Vec<std::result::Result<ExtractedFile, std::path::PathBuf>> = batch
             .par_iter()
             .zip(batch_sizes.par_iter())
-            .filter_map(|(path, &size)| {
+            .map(|(path, &size)| {
                 let data = match read_for_index(path, size, &owned_budget, None) {
                     Ok(data) => data,
                     Err(error) => {
                         eprintln!("tgrep: skipping {}: {error}", path.display());
-                        return Some(Err(path.clone()));
+                        return Err(path.clone());
                     }
                 };
-                let text = crate::encoding::decode_for_index(&data);
-                if trigram::is_binary(&text) {
-                    return None;
-                }
                 let rel = path
                     .strip_prefix(&root)
                     .or_else(|_| path.strip_prefix(input_root))
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                Some(Ok((
-                    rel,
-                    trigram::extract_merged_masks(&text),
-                    meta::ContentId::from_indexed_bytes(&text),
-                )))
+                let extracted = extract_indexed_file(rel, &data);
+                if extracted.version.is_none() {
+                    eprintln!(
+                        "tgrep: skipping {}: file changed during extraction or precise metadata is unavailable",
+                        path.display()
+                    );
+                    return Err(path.clone());
+                }
+                Ok(extracted)
             })
             .collect();
 
         for entry in batch_data {
-            let (path, per_tri, content_id) = match entry {
+            let extracted = match entry {
                 Ok(extracted) => extracted,
                 Err(skipped) => {
                     unreadable.push(skipped);
                     continue;
                 }
             };
+            let path = extracted.path;
+            if let Some(version) = extracted.version {
+                versions.insert(path.clone(), version);
+            }
+            let Some(per_tri) = extracted.trigrams else {
+                continue;
+            };
             let file_id = u32::try_from(file_id_map.len()).map_err(|_| {
                 Error::IndexCorrupted("file count exceeds the u32 file-id limit".into())
             })?;
-            content_ids.insert(path.clone(), content_id);
+            if let Some(content_id) = extracted.content_id {
+                content_ids.insert(path.clone(), content_id);
+            }
             file_id_map.push((file_id, path));
             sorter.push_file(file_id, per_tri)?;
         }
@@ -889,6 +966,7 @@ pub fn build_index_for_files(
         indexed: file_id_map.len(),
         unreadable,
         content_ids,
+        versions,
     })
 }
 
@@ -1535,6 +1613,27 @@ mod tests {
     }
 
     #[test]
+    fn publication_never_stamps_a_missing_read_version_from_current_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join("source.rs");
+        std::fs::write(&path, b"old text").unwrap();
+        let version = file_version(&std::fs::metadata(&path).unwrap());
+        std::fs::write(&path, b"newer longer text").unwrap();
+        let evidence = evidence_for_indexed_reads(
+            vec!["source.rs".into(), "unverified.rs".into()],
+            HashMap::from([("source.rs".into(), version.clone())]),
+            HashMap::new(),
+        );
+        assert_eq!(evidence.stamp("source.rs"), Some(version.stamp()));
+        assert_ne!(
+            evidence.stamp("source.rs"),
+            Some(&meta::file_stamp(&std::fs::metadata(path).unwrap()))
+        );
+        assert!(evidence.stamp("unverified.rs").is_none());
+        assert!(evidence.version("unverified.rs").is_none());
+    }
+
+    #[test]
     fn full_builder_records_exact_decoded_identity_for_text_only() {
         let repo = tempfile::tempdir().unwrap();
         let text_path = repo.path().join("text.rs");
@@ -1545,7 +1644,7 @@ mod tests {
 
         for strategy in [IndexStrategy::InMemory, IndexStrategy::External] {
             let index = tempfile::tempdir().unwrap();
-            build_index_with_options(
+            let outcome = build_index_with_options(
                 repo.path(),
                 Some(index.path()),
                 &BuildOptions {
@@ -1562,6 +1661,13 @@ mod tests {
                 Some(meta::ContentId::from_indexed_bytes(&decoded))
             );
             assert_eq!(evidence.content_id("binary.rs"), None);
+            assert_eq!(outcome.versions, evidence.versions);
+            for (path, full_path) in [("text.rs", &text_path), ("binary.rs", &binary_path)] {
+                assert_eq!(
+                    evidence.version(path),
+                    Some(&file_version(&std::fs::metadata(full_path).unwrap()))
+                );
+            }
         }
     }
 
@@ -1677,8 +1783,12 @@ mod tests {
             .set_len(MAX_OWNED_FILE_BYTES + 1)
             .unwrap();
 
-        let error = read_owned_for_index(&path, MAX_OWNED_FILE_BYTES + 1, MAX_OWNED_FILE_BYTES)
-            .unwrap_err();
+        let error = read_owned_for_index(
+            &mut std::fs::File::open(&path).unwrap(),
+            MAX_OWNED_FILE_BYTES + 1,
+            MAX_OWNED_FILE_BYTES,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -1705,7 +1815,8 @@ mod tests {
         let path = tmp.path().join("growing.txt");
         std::fs::write(&path, b"four").unwrap();
 
-        let error = read_owned_for_index(&path, 2, 2).unwrap_err();
+        let error =
+            read_owned_for_index(&mut std::fs::File::open(&path).unwrap(), 2, 2).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
     }
 
@@ -1718,6 +1829,10 @@ mod tests {
 
         let bytes = read_for_index(&path, 2, &budget, None).unwrap();
         assert_eq!(&*bytes, b"four");
+        assert_eq!(
+            bytes.verified_version(),
+            Some(file_version(&std::fs::metadata(&path).unwrap()))
+        );
     }
 
     #[test]
@@ -1766,29 +1881,115 @@ mod tests {
     }
 
     #[test]
-    fn file_version_distinguishes_subsecond_modified_times() {
-        let stamp = meta::FileStamp { mtime: 1, size: 10 };
-        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
-        let first = FileVersion {
-            stamp: stamp.clone(),
-            modified: Some(base + std::time::Duration::from_nanos(100)),
-            created: Some(base),
-            #[cfg(unix)]
-            device: 1,
-            #[cfg(unix)]
-            inode: 2,
-            #[cfg(unix)]
-            change_seconds: 1,
-            #[cfg(unix)]
-            change_nanos: 0,
-        };
-        let second = FileVersion {
-            modified: Some(base + std::time::Duration::from_nanos(200)),
-            ..first.clone()
-        };
+    fn indexed_read_race_withholds_version_without_changing_decoded_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join("race.rs");
+        let original = b"old decoded text\xff";
+        std::fs::write(&path, original).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        file.set_modified(old_time).unwrap();
+        drop(file);
+        let budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
+        let data = read_for_index(&path, original.len() as u64, &budget, None).unwrap();
 
-        assert_ne!(first, second);
-        assert_eq!(first.stamp, second.stamp);
+        std::fs::write(&path, b"new decoded text\xff").unwrap();
+        let extracted = extract_indexed_file("race.rs".into(), &data);
+        assert_eq!(
+            extracted.content_id,
+            Some(meta::ContentId::from_indexed_bytes(
+                &crate::encoding::decode_for_index(original)
+            ))
+        );
+        assert!(extracted.version.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_read_mtime_restore_race_withholds_version() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join("restored.rs");
+        std::fs::write(&path, b"old text").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
+        let data = read_for_index(&path, 8, &budget, None).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"new text").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            meta::file_stamp(&before),
+            meta::file_stamp(&std::fs::metadata(&path).unwrap())
+        );
+        let extracted = extract_indexed_file("restored.rs".into(), &data);
+        assert_eq!(
+            extracted.content_id,
+            Some(meta::ContentId::from_indexed_bytes(b"old text"))
+        );
+        assert!(extracted.version.is_none());
+    }
+
+    #[test]
+    fn indexed_version_is_not_replaced_by_metadata_after_extraction() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join("race.rs");
+        std::fs::write(&path, b"old text").unwrap();
+        let budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
+        let data = read_for_index(&path, 8, &budget, None).unwrap();
+        let extracted = extract_indexed_file("race.rs".into(), &data);
+        let indexed_version = extracted.version.unwrap();
+        drop(data);
+
+        std::fs::write(&path, b"changed text").unwrap();
+        let current = file_version(&std::fs::metadata(&path).unwrap());
+        assert_ne!(indexed_version, current);
+        assert_eq!(indexed_version.stamp().size, 8);
+    }
+
+    #[test]
+    fn mapped_indexed_read_verifies_version_after_extraction() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join("mapped.rs");
+        std::fs::write(&path, vec![b'a'; MMAP_MIN_BYTES as usize]).unwrap();
+        let budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
+        let data = read_for_index(&path, MMAP_MIN_BYTES, &budget, None).unwrap();
+        assert!(matches!(data.bytes, FileBytes::Mapped(_)));
+        assert!(
+            extract_indexed_file("mapped.rs".into(), &data)
+                .version
+                .is_some()
+        );
+
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_all(b"b").unwrap();
+        writer
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        drop(writer);
+        let raced = extract_indexed_file("mapped.rs".into(), &data);
+        assert!(raced.version.is_none());
+        assert!(raced.content_id.is_none());
+    }
+
+    #[test]
+    fn indexed_read_without_pre_read_metadata_cannot_gain_trust_after_read() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path().join("unverified.rs");
+        std::fs::write(&path, b"text").unwrap();
+        let budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
+        let mut data = read_for_index(&path, 4, &budget, None).unwrap();
+        data.version = None;
+        assert!(
+            extract_indexed_file("unverified.rs".into(), &data)
+                .version
+                .is_none()
+        );
     }
 
     fn write_test_git_index(root: &Path, tracked: &[&str]) {
@@ -2362,6 +2563,13 @@ mod tests {
             outcome.content_ids.get("present.txt"),
             Some(&meta::ContentId::from_indexed_bytes(b"needle one\n"))
         );
+        assert_eq!(outcome.versions.len(), 1);
+        assert_eq!(
+            outcome.versions.get("present.txt"),
+            Some(&file_version(
+                &std::fs::metadata(repo.path().join("present.txt")).unwrap()
+            ))
+        );
 
         // The delta is usable, not a half-written casualty of the failure.
         let reader = IndexReader::open(delta.path()).unwrap();
@@ -2390,6 +2598,13 @@ mod tests {
         assert_eq!(outcome.indexed, 0);
         assert!(outcome.unreadable.is_empty());
         assert!(outcome.content_ids.is_empty());
+        assert_eq!(outcome.versions.len(), 1);
+        assert_eq!(
+            outcome.versions.get("blob.bin"),
+            Some(&file_version(
+                &std::fs::metadata(repo.path().join("blob.bin")).unwrap()
+            ))
+        );
     }
 
     #[test]

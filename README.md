@@ -70,8 +70,8 @@ tgrep <pattern> ---TCP---> tgrep serve (multi-client)
   using rayon; queries are served immediately from partial data
 - **Periodic Flush** — every 50K files or 5 minutes, the in-memory index is
   flushed to disk and the reader is swapped, keeping memory bounded
-- **File Watcher** — `notify` crate watches the repo; updates LiveIndex in
-  real time
+- **Automatic refresh** — native `notify` subscriptions update LiveIndex in
+  real time when available; budget or registration failures switch to polling
 - **Filename Index** — `--files` unions content-index paths with a compact
   sidecar containing only admitted paths that have no searchable content
 - **TCP Server** — JSON-RPC 2.0 over newline-delimited TCP; each connection
@@ -276,7 +276,10 @@ unaffected.
 ```bash
 tgrep serve .                          # start server (auto-builds index if missing)
 tgrep serve . --index-path /tmp/idx    # custom index location
-tgrep serve . --no-watch               # skip file watcher (saves memory)
+tgrep serve . --watch-mode poll        # poll without any native subscriptions
+tgrep serve . --poll-interval 60       # polling cadence after fallback
+tgrep serve . --watch-budget 4096      # lower this process's native watch ceiling
+tgrep serve . --no-watch              # disable all automatic refresh
 tgrep serve . --exclude node_modules   # exclude directories from indexing
 ```
 
@@ -296,20 +299,63 @@ Resource use during that initial build can be tuned. These apply to both
 
 #### Staying in step with the filesystem
 
-Once the index is built, everything that changes it arrives as an OS
-notification, and a notification can go missing — a queue overflow, a network
-or virtualised filesystem that declines to report a change, a tree replaced
-wholesale by a branch switch or a build. Overflow is detected and repaired at
-once; the rest is silent, and nothing else in the server revisits a file it
-believes it already knows. A missed change would otherwise last until that
-file happened to change again, which for a deleted file is never.
+Automatic refresh has two modes, configured on `tgrep serve`:
 
-So a watching server also reconciles on a timer: about once an hour it walks
-the tree and compares it against the index, which finds any drift regardless
-of what the watcher heard. It waits for a two-minute gap in queries first, and
-gives up waiting after four hours so a continuously busy server still
-reconciles. On an unchanged tree it finds nothing and leaves the index alone.
-`--no-watch` turns it off along with the watcher.
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--watch-mode <auto\|poll>` | `auto` | Prefer native notifications with polling fallback, or use polling only |
+| `--poll-interval <SECONDS>` | `120` | Wait after each polling reconciliation completes; range 1-86400 |
+| `--watch-budget <N>` | `8192` | Conservative process-local native watch ceiling; range 1-4294967295 |
+| `--no-watch` | off | Disable all automatic refresh: native watching, polling, and periodic reconciliation |
+
+In `auto` mode, exceeding the watch budget, exhausting OS watch capacity, or
+another error preventing complete native coverage switches the **whole
+process** to polling. Status retains the specific fallback reason. This fallback
+is sticky until the server restarts: it releases only this process's native watches and
+does not keep retrying native registration. `poll` mode starts with **zero
+native subscriptions**, including on Linux. It uses tgrep's metadata
+reconciliation, not a second native watcher or `notify::PollWatcher`.
+
+The default budget of 8192 is a conservative ceiling, **not an estimate of
+free per-user capacity**. On Linux the inotify quota is shared with other
+processes running as the same user; they may consume capacity before this
+server reaches its budget. Raising the budget does not raise that shared quota.
+tgrep does not probe the configured Linux quota: it uses this fixed ceiling
+and authoritative OS registration errors. The budget counts one subscription
+per admitted directory on Linux/Android; recursive backends count their single
+root subscription as one.
+
+The event buffer controlled by `--watcher-queue-cap` is separate: queue overflow
+triggers recovery reconciliation, not watch-budget fallback.
+
+Polling walks the admitted tree and checks metadata for additions, changes,
+and deletions. Its default cadence is completion-based: the next poll waits
+120 seconds after the previous reconciliation finishes. Actual freshness also
+includes scan/update time (and any in-progress indexing or save); it is not a
+120-second hard freshness guarantee. Searches do not defer polling, and slow
+scans do not cause overlapping polls or catch-up storms.
+Fallback does not hide failures: a failed polling reconciliation or unreadable
+input remains unhealthy and is reported in status.
+
+Native notifications can also go missing, for example on a network or
+virtualised filesystem. Native mode therefore retains its safety
+reconciliation: about once an hour it walks the tree and compares it against
+the index, waiting for a two-minute gap in queries and deferring no longer than
+four hours. `--poll-interval` sets the polling cadence, not this native safety
+cadence.
+
+No-change metadata scans leave the index untouched; they do not rewrite it.
+A changed delta merge may still rewrite the whole on-disk index. On Linux,
+nanosecond mtime and ctime plus file identity detect ordinary writes even when
+the modification timestamp is restored. Other OS/filesystem metadata
+limitations remain: changes that preserve all available evidence may be
+missed. A scan and its updates do not provide an atomic filesystem snapshot.
+
+`--no-watch` still permits the initial build/startup reconciliation, but turns
+off all subsequent automatic refresh. It cannot be combined explicitly with
+`--watch-mode`, `--poll-interval`, or `--watch-budget`. Explicit
+`--watch-mode poll` also rejects `--watch-budget`, since polling uses no native
+watches. Inherited default values do not cause conflicts.
 
 On Linux and Android, tgrep registers only the non-ignored directories with
 inotify, avoiding watch-descriptor growth beneath ignored trees. This guarantee
@@ -375,8 +421,26 @@ Server status for /src/my-monorepo
   Trigrams:   12265
   Cache:      2/50000
   Watcher:    active
+  Watch mode: native (requested: auto)
+  Watch budget: 8192
+  Poll interval: 120s (after completion)
+  Reconcile:  idle
+  Last successful reconcile: 2m ago
+  Reconcile pending: no
+  Reconcile overdue: no
+  Last reconcile duration: 42ms
   Indexing:   complete
 ```
+
+Status retains the native `Watcher` indicator and reports the requested mode
+(`auto`, `poll`, or `disabled`) and active mode (`native`, `poll`, `disabled`,
+or `starting`). A polling server normally shows an inactive native watcher.
+Fallback reasons, the last successful reconciliation, the latest attempt's
+duration/error, and whether reconciliation is running, pending, or overdue help
+distinguish a healthy polling server from one that has stopped refreshing.
+Pending means catch-up work is requested; overdue means that work is pending
+or the polling interval/native safety deadline has elapsed since completion.
+Older servers without these fields still display their existing status.
 
 ### Count files
 

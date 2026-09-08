@@ -146,6 +146,118 @@ fn wait_for_server(index_dir: &Path) -> (u32, u16) {
     }
 }
 
+fn server_status(port: u16) -> serde_json::Value {
+    let response = send_request(port, r#"{"jsonrpc":"2.0","method":"status","id":1}"#).unwrap();
+    serde_json::from_str::<serde_json::Value>(&response).unwrap()["result"].clone()
+}
+
+fn assert_polling_server_refreshes(mode_args: &[&str]) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let index_dir = root.join(".tgrep");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("excluded")).unwrap();
+    fs::write(root.join(".ignore"), "excluded/\n").unwrap();
+    fs::write(root.join("src").join("old.txt"), "poll_original_marker\n").unwrap();
+    fs::write(
+        root.join("excluded").join("hidden.txt"),
+        "poll_unignored_marker\n",
+    )
+    .unwrap();
+    let child = Command::new(tgrep_bin())
+        .arg("serve")
+        .args(mode_args)
+        .args(["--poll-interval", "1", "--index-path"])
+        .arg(&index_dir)
+        .arg(root)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server = ServerGuard { child };
+    let (_pid, port) = wait_for_server(&index_dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = server_status(port);
+        if status["indexing"] == false && status["last_reconcile_at"].is_u64() {
+            assert_eq!(status["watch_mode_active"], "poll");
+            assert_eq!(status["watcher_active"], false);
+            assert!(status["last_reconcile_error"].is_null());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "poll bootstrap stalled: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    #[cfg(target_os = "linux")]
+    assert_eq!(inotify_watch_count(_pid), 0);
+    assert_eq!(search_matches(port, "poll_original_marker"), 1);
+    assert_eq!(search_matches(port, "poll_unignored_marker"), 0);
+
+    fs::write(root.join("src").join("old.txt"), "poll_modified_marker\n").unwrap();
+    fs::create_dir_all(root.join("new").join("nested")).unwrap();
+    fs::write(
+        root.join("new").join("nested").join("added.txt"),
+        "poll_added_marker\n",
+    )
+    .unwrap();
+    // Repeated searches intentionally deny the native safety loop's quiet
+    // period. They must not defer the polling cadence.
+    assert!(wait_for_match(
+        port,
+        "poll_modified_marker",
+        Duration::from_secs(15)
+    ));
+    assert!(wait_for_match(
+        port,
+        "poll_added_marker",
+        Duration::from_secs(15)
+    ));
+    fs::write(root.join(".ignore"), "").unwrap();
+    assert!(wait_for_match(
+        port,
+        "poll_unignored_marker",
+        Duration::from_secs(15)
+    ));
+
+    fs::rename(root.join("src").join("old.txt"), root.join("renamed.txt")).unwrap();
+    fs::remove_file(root.join("new").join("nested").join("added.txt")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let evidence = tgrep_core::meta::read_file_evidence(&index_dir).unwrap();
+        if evidence.stamps.contains_key("renamed.txt")
+            && !evidence.stamps.contains_key("src/old.txt")
+            && !evidence.stamps.contains_key("new/nested/added.txt")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "poll did not reconcile rename/deletion"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(search_matches(port, "poll_modified_marker"), 1);
+    assert_eq!(search_matches(port, "poll_added_marker"), 0);
+    let status = server_status(port);
+    assert_eq!(status["watch_mode_active"], "poll");
+    assert!(status["last_reconcile_error"].is_null());
+    #[cfg(target_os = "linux")]
+    assert_eq!(inotify_watch_count(_pid), 0);
+}
+
+#[test]
+fn explicit_polling_bootstraps_and_refreshes_without_native_watches() {
+    assert_polling_server_refreshes(&["--watch-mode", "poll"]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tiny_native_budget_falls_back_and_finishes_bootstrap() {
+    assert_polling_server_refreshes(&["--watch-budget", "1"]);
+}
+
 /// Total inotify watch descriptors held by `pid`.
 ///
 /// Each inotify file descriptor's `fdinfo` lists one `inotify wd:` line per

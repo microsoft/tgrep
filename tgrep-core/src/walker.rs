@@ -472,6 +472,9 @@ pub struct FileMeta {
     pub relative_path: String,
     pub mtime: u64,
     pub size: u64,
+    /// Precise scan metadata, not evidence of an indexed read. Unknown or
+    /// unsupported metadata must leave the path eligible for reindexing.
+    pub version: Option<crate::meta::FileVersion>,
 }
 
 /// Result of [`walk_file_metadata`]: per-file metadata plus the `.gitignore` /
@@ -660,10 +663,12 @@ pub fn walk_file_metadata_with_ignorecase(
             }
             listed_files.lock().unwrap().push(rel_path.clone());
             let stamp = crate::meta::file_stamp(&meta);
+            let version = crate::meta::file_version(&meta);
             results.lock().unwrap().push(FileMeta {
                 relative_path: rel_path,
                 mtime: stamp.mtime,
                 size: stamp.size,
+                version: version.is_trusted().then_some(version),
             });
 
             ignore::WalkState::Continue
@@ -682,6 +687,68 @@ pub fn walk_file_metadata_with_ignorecase(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_walk_reports_precise_same_second_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same-second.rs");
+        std::fs::write(&path, b"old text").unwrap();
+        let base = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let set_modified = |time| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        set_modified(base + std::time::Duration::from_millis(100));
+        let before = walk_file_metadata(dir.path(), &MetaWalkOptions::default());
+        std::fs::write(&path, b"new text").unwrap();
+        set_modified(base + std::time::Duration::from_millis(200));
+        let after = walk_file_metadata(dir.path(), &MetaWalkOptions::default());
+        assert_eq!(before.files.len(), 1);
+        assert_eq!(after.files.len(), 1);
+        let before = &before.files[0];
+        let after = &after.files[0];
+        assert_eq!((before.mtime, before.size), (after.mtime, after.size));
+        assert!(before.version.is_some());
+        assert_ne!(before.version, after.version);
+        assert_eq!(
+            after.version,
+            Some(crate::meta::file_version(&std::fs::metadata(path).unwrap()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_walk_detects_same_size_write_with_restored_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restored.rs");
+        std::fs::write(&path, b"old text").unwrap();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let before = walk_file_metadata(dir.path(), &MetaWalkOptions::default());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"new text").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+        let after = walk_file_metadata(dir.path(), &MetaWalkOptions::default());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            original_mtime
+        );
+        assert_eq!(before.files.len(), 1);
+        assert_eq!(after.files.len(), 1);
+        let before = &before.files[0];
+        let after = &after.files[0];
+        assert_eq!((before.mtime, before.size), (after.mtime, after.size));
+        assert!(before.version.is_some());
+        assert_ne!(before.version, after.version);
+    }
     use std::fs;
     use tempfile::TempDir;
 

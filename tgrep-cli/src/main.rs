@@ -19,9 +19,10 @@ mod walkcount;
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use output::ColorMode;
 use tgrep_core::builder;
 
@@ -618,9 +619,31 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
 
-        /// Disable the file system watcher (saves memory on large repos).
-        #[arg(long)]
+        /// Disable all automatic refresh, including watching and polling.
+        #[arg(long, conflicts_with_all = ["watch_mode", "poll_interval", "watch_budget"])]
         no_watch: bool,
+
+        /// Use native notifications with automatic polling fallback, or polling only.
+        #[arg(long, value_enum, default_value = "auto", value_name = "MODE")]
+        watch_mode: serve::WatchMode,
+
+        /// Seconds to wait after a polling reconciliation completes (1-86400).
+        #[arg(
+            long,
+            default_value_t = 120,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(1..=86400)
+        )]
+        poll_interval: u64,
+
+        /// Process-local native watch ceiling, not available shared OS capacity.
+        #[arg(
+            long,
+            default_value_t = 8192,
+            value_name = "N",
+            value_parser = clap::value_parser!(u32).range(1..)
+        )]
+        watch_budget: u32,
 
         /// Maximum memory budget in megabytes for the in-memory index built
         /// during the initial scan. When the indexer's working set exceeds
@@ -693,6 +716,30 @@ enum Command {
 }
 
 impl Cli {
+    fn try_parse_args_from<I, T>(args: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut command = Self::command();
+        let matches = command.try_get_matches_from_mut(args)?;
+        // Clap conflicts are unconditional; this one depends on the mode's
+        // value and must not treat the inherited budget as an explicit flag.
+        if let Some(("serve", serve)) = matches.subcommand()
+            && serve.get_one::<serve::WatchMode>("watch_mode") == Some(&serve::WatchMode::Poll)
+            && serve.value_source("watch_budget") == Some(clap::parser::ValueSource::CommandLine)
+        {
+            return Err(command
+                .find_subcommand_mut("serve")
+                .expect("serve subcommand exists")
+                .error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--watch-budget cannot be used with --watch-mode poll",
+                ));
+        }
+        Self::from_arg_matches(&matches)
+    }
+
     /// Resolve `--max-filesize` once, so a malformed value is reported instead
     /// of silently falling back to a different limit than the user asked for.
     ///
@@ -1010,7 +1057,7 @@ fn main() {
 }
 
 fn run_cli() {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse_args_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let no_ignore = cli.no_ignore || cli.unrestricted >= 1;
 
     // Handle --type-list. It reflects --type-add/--type-clear so users can
@@ -1091,6 +1138,9 @@ fn run_cli() {
         Some(Command::Serve {
             path,
             no_watch,
+            watch_mode,
+            poll_interval,
+            watch_budget,
             max_memory_mb,
             max_cpu_percent,
             exclude,
@@ -1106,6 +1156,9 @@ fn run_cli() {
                 cli.index_path.as_deref(),
                 serve::ServeOptions {
                     no_watch,
+                    watch_mode,
+                    poll_interval: Duration::from_secs(poll_interval),
+                    watch_budget: watch_budget as usize,
                     exclude_dirs: &exclude,
                     memory_cap_bytes: memory_cap,
                     index_threads,
@@ -1328,4 +1381,137 @@ fn run_search(
         process::exit(2);
     }
     process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        let args: Vec<String> = std::iter::once("tgrep")
+            .chain(args.iter().copied())
+            .map(String::from)
+            .collect();
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_args_from(args))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn refresh_defaults_and_explicit_modes() {
+        for (args, expected_mode, expected_no_watch) in [
+            (vec!["serve"], serve::WatchMode::Auto, false),
+            (
+                vec!["serve", "--watch-mode", "auto"],
+                serve::WatchMode::Auto,
+                false,
+            ),
+            (
+                vec!["serve", "--watch-mode", "poll"],
+                serve::WatchMode::Poll,
+                false,
+            ),
+            (vec!["serve", "--no-watch"], serve::WatchMode::Auto, true),
+        ] {
+            let Some(Command::Serve {
+                no_watch,
+                watch_mode,
+                poll_interval,
+                watch_budget,
+                ..
+            }) = parse(&args).unwrap().command
+            else {
+                panic!("expected serve");
+            };
+            assert_eq!(no_watch, expected_no_watch);
+            assert_eq!(watch_mode, expected_mode);
+            assert_eq!(poll_interval, 120);
+            assert_eq!(watch_budget, 8192);
+        }
+    }
+
+    #[test]
+    fn refresh_explicit_values_and_boundaries() {
+        for (interval, budget) in [("1", "1"), ("120", "8192"), ("86400", "4294967295")] {
+            let Some(Command::Serve {
+                poll_interval,
+                watch_budget,
+                ..
+            }) = parse(&[
+                "serve",
+                "--poll-interval",
+                interval,
+                "--watch-budget",
+                budget,
+            ])
+            .unwrap()
+            .command
+            else {
+                panic!("expected serve");
+            };
+            assert_eq!(poll_interval, interval.parse::<u64>().unwrap());
+            assert_eq!(watch_budget, budget.parse::<u32>().unwrap());
+        }
+        assert!(parse(&["serve", "--watch-mode", "auto", "--watch-budget", "8192"]).is_ok());
+        assert!(parse(&["serve", "--watch-mode", "poll", "--poll-interval", "1"]).is_ok());
+        assert!(parse(&["serve", "--no-watch", "--watcher-queue-cap", "1"]).is_ok());
+    }
+
+    #[test]
+    fn refresh_explicit_conflicts_include_default_values() {
+        for args in [
+            vec!["--watch-mode", "auto"],
+            vec!["--watch-mode", "poll"],
+            vec!["--poll-interval", "120"],
+            vec!["--poll-interval", "1"],
+            vec!["--watch-budget", "8192"],
+            vec!["--watch-budget", "1"],
+        ] {
+            for no_watch_first in [true, false] {
+                let mut command = vec!["serve"];
+                if no_watch_first {
+                    command.push("--no-watch");
+                }
+                command.extend(&args);
+                if !no_watch_first {
+                    command.push("--no-watch");
+                }
+                let error = parse(&command).err().expect("explicit flags conflict");
+                assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            }
+        }
+        for args in [
+            ["serve", "--watch-mode", "poll", "--watch-budget", "8192"],
+            ["serve", "--watch-budget", "1", "--watch-mode", "poll"],
+        ] {
+            let error = parse(&args)
+                .err()
+                .expect("poll does not use native watches");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert!(error.to_string().contains("--watch-budget"));
+        }
+    }
+
+    #[test]
+    fn refresh_rejects_invalid_values() {
+        for (flag, values) in [
+            ("--watch-mode", vec!["native", "disabled", "AUTO", ""]),
+            ("--poll-interval", vec!["0", "86401", "-1", "1.5", "bad"]),
+            (
+                "--watch-budget",
+                vec!["0", "4294967296", "-1", "1.5", "bad"],
+            ),
+        ] {
+            for value in values {
+                assert!(
+                    parse(&["serve", &format!("{flag}={value}")]).is_err(),
+                    "{flag}={value} should be rejected"
+                );
+            }
+            assert!(parse(&["serve", flag]).is_err());
+        }
+    }
 }

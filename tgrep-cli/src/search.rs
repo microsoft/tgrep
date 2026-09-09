@@ -2,7 +2,7 @@
 ///
 /// If a running server is detected (via serve.json), the search is delegated
 /// over TCP. Otherwise, the on-disk index is loaded directly.
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -128,6 +128,14 @@ pub enum SortKey {
     Modified,
     Accessed,
     Created,
+}
+
+fn flush_before_stats(writer: &mut OutputWriter) -> Result<()> {
+    match writer.flush() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl SortKey {
@@ -1082,6 +1090,10 @@ fn search_via_server(
     if opts.stats
         && let Some(elapsed) = result.get("elapsed_ms").and_then(|e| e.as_f64())
     {
+        // Match output is buffered on stdout, while stats go straight to
+        // stderr. Flush first so a combined stdout/stderr stream reports the
+        // summary after the matches, as ripgrep does.
+        flush_before_stats(writer)?;
         // Count the rows that survived scoping, not the server's `num_matches`.
         // The server searches the whole indexed tree and counts every row it
         // built, so that field includes files outside a subdirectory argument
@@ -1165,15 +1177,6 @@ fn search_local_index(
         sort.apply_indexed(&mut candidates, &index_root, &scope, |(_, rel)| rel);
     }
 
-    if opts.stats {
-        eprintln!(
-            "Query plan: {} (candidates: {}/{})",
-            plan_summary(&plan),
-            candidates.len(),
-            reader.num_files()
-        );
-    }
-
     let mut had_matches = false;
     // A single-file search root is a file the user named on the command line,
     // which is what makes binary files visible in ripgrep.
@@ -1203,6 +1206,16 @@ fn search_local_index(
 
     if opts.stats {
         let elapsed = start.elapsed();
+        // Match output is buffered on stdout, while stats go straight to
+        // stderr. Flush first so a combined stdout/stderr stream reports the
+        // summary after the matches, as ripgrep does.
+        flush_before_stats(writer)?;
+        eprintln!(
+            "Query plan: {} (candidates: {}/{})",
+            plan_summary(&plan),
+            candidates.len(),
+            reader.num_files()
+        );
         eprintln!(
             "Search completed in {:.1}ms",
             elapsed.as_secs_f64() * 1000.0
@@ -1313,8 +1326,12 @@ fn brute_force_search(
 
         if opts.stats {
             let elapsed = start.elapsed();
+            // Match output is buffered on stdout, while stats go straight to
+            // stderr. Flush first so a combined stdout/stderr stream reports
+            // the summary after the matches, as ripgrep does.
+            flush_before_stats(writer)?;
             eprintln!(
-                "Brute-force search completed in {:.1}ms (1 files)",
+                "Brute-force search completed in {:.1}ms (1 file)",
                 elapsed.as_secs_f64() * 1000.0,
             );
         }
@@ -1354,6 +1371,10 @@ fn brute_force_search(
 
     if opts.stats {
         let elapsed = start.elapsed();
+        // Match output is buffered on stdout, while stats go straight to
+        // stderr. Flush first so a combined stdout/stderr stream reports the
+        // summary after the matches, as ripgrep does.
+        flush_before_stats(writer)?;
         eprintln!(
             "Brute-force search completed in {:.1}ms ({} files)",
             elapsed.as_secs_f64() * 1000.0,

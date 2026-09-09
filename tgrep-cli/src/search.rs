@@ -2,7 +2,7 @@
 ///
 /// If a running server is detected (via serve.json), the search is delegated
 /// over TCP. Otherwise, the on-disk index is loaded directly.
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -128,6 +128,14 @@ pub enum SortKey {
     Modified,
     Accessed,
     Created,
+}
+
+fn flush_before_stats(writer: &mut OutputWriter) -> Result<()> {
+    match writer.flush() {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl SortKey {
@@ -1085,7 +1093,7 @@ fn search_via_server(
         // Match output is buffered on stdout, while stats go straight to
         // stderr. Flush first so a combined stdout/stderr stream reports the
         // summary after the matches, as ripgrep does.
-        writer.flush()?;
+        flush_before_stats(writer)?;
         // Count the rows that survived scoping, not the server's `num_matches`.
         // The server searches the whole indexed tree and counts every row it
         // built, so that field includes files outside a subdirectory argument
@@ -1201,7 +1209,7 @@ fn search_local_index(
         // Match output is buffered on stdout, while stats go straight to
         // stderr. Flush first so a combined stdout/stderr stream reports the
         // summary after the matches, as ripgrep does.
-        writer.flush()?;
+        flush_before_stats(writer)?;
         eprintln!(
             "Query plan: {} (candidates: {}/{})",
             plan_summary(&plan),
@@ -1321,7 +1329,7 @@ fn brute_force_search(
             // Match output is buffered on stdout, while stats go straight to
             // stderr. Flush first so a combined stdout/stderr stream reports
             // the summary after the matches, as ripgrep does.
-            writer.flush()?;
+            flush_before_stats(writer)?;
             eprintln!(
                 "Brute-force search completed in {:.1}ms (1 file)",
                 elapsed.as_secs_f64() * 1000.0,
@@ -1366,7 +1374,7 @@ fn brute_force_search(
         // Match output is buffered on stdout, while stats go straight to
         // stderr. Flush first so a combined stdout/stderr stream reports the
         // summary after the matches, as ripgrep does.
-        writer.flush()?;
+        flush_before_stats(writer)?;
         eprintln!(
             "Brute-force search completed in {:.1}ms ({} files)",
             elapsed.as_secs_f64() * 1000.0,

@@ -566,7 +566,7 @@ impl OutputWriter {
             self.total_matched_lines += 1;
             self.last_counted_match = Some((m.file.clone(), m.line_number));
         }
-        self.total_matches += spans.len() as u64;
+        self.total_matches += m.spans.len() as u64;
         match self.config.format {
             OutputFormat::Heading | OutputFormat::Flat => {
                 if !self.config.no_filename {

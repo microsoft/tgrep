@@ -201,14 +201,20 @@ fn stats_follow_matches_on_a_combined_output_stream() {
 fn indexed_stats_follow_matches_on_a_combined_output_stream() {
     let dir = setup_fixture();
     let root = fixture_path(&dir);
-    tgrep().args(["index", &root]).assert().success();
+
+    let idx = dir.path().join("idx");
+    let idx_str = idx.to_str().unwrap();
+    tgrep()
+        .args(["index", &root, "--index-path", idx_str])
+        .assert()
+        .success();
 
     let merged_path = dir.path().join("merged-indexed-output.txt");
     let merged = fs::File::create(&merged_path).unwrap();
     let stdout = merged.try_clone().unwrap();
 
     let status = ProcessCommand::new(env!("CARGO_BIN_EXE_tgrep"))
-        .args(["--stats", "--no-heading", "fn main", &root])
+        .args(["--stats", "--no-heading", "--index-path", idx_str, "fn main", &root])
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(merged))
         .status()

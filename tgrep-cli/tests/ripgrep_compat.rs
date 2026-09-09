@@ -214,7 +214,14 @@ fn indexed_stats_follow_matches_on_a_combined_output_stream() {
     let stdout = merged.try_clone().unwrap();
 
     let status = ProcessCommand::new(env!("CARGO_BIN_EXE_tgrep"))
-        .args(["--stats", "--no-heading", "--index-path", idx_str, "fn main", &root])
+        .args([
+            "--stats",
+            "--no-heading",
+            "--index-path",
+            idx_str,
+            "fn main",
+            &root,
+        ])
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(merged))
         .status()

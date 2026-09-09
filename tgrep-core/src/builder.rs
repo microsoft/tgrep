@@ -491,8 +491,8 @@ impl std::ops::Deref for FileBytes {
 
     fn deref(&self) -> &[u8] {
         match self {
-            FileBytes::Read { bytes, .. } => bytes,
-            FileBytes::Mapped(map) => map,
+            Self::Read { bytes, .. } => bytes,
+            Self::Mapped(map) => map,
         }
     }
 }

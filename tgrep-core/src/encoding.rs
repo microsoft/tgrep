@@ -31,15 +31,15 @@ impl EncodingMode {
     /// ones that produced the postings. Callers use this to fall back to
     /// scanning every candidate.
     pub fn may_differ_from_index(self) -> bool {
-        self != EncodingMode::Auto
+        self != Self::Auto
     }
 
     /// The label this mode was built from, for diagnostics.
     pub fn label(self) -> &'static str {
         match self {
-            EncodingMode::Auto => "auto",
-            EncodingMode::None => "none",
-            EncodingMode::Explicit(enc) => enc.name(),
+            Self::Auto => "auto",
+            Self::None => "none",
+            Self::Explicit(enc) => enc.name(),
         }
     }
 }

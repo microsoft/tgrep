@@ -267,7 +267,7 @@ pub enum SearchMatcher {
 
 impl SearchMatcher {
     pub fn is_standard(&self) -> bool {
-        matches!(self, SearchMatcher::Standard(_))
+        matches!(self, Self::Standard(_))
     }
 
     /// Whether the prefilter has already ruled this haystack out.
@@ -280,8 +280,8 @@ impl SearchMatcher {
 
     pub fn is_match(&self, hay: &str) -> Result<bool> {
         match self {
-            SearchMatcher::Standard(re) => Ok(re.is_match(hay)),
-            SearchMatcher::Fancy { re, prefilter } => {
+            Self::Standard(re) => Ok(re.is_match(hay)),
+            Self::Fancy { re, prefilter } => {
                 if Self::ruled_out(prefilter, hay) {
                     return Ok(false);
                 }
@@ -295,12 +295,12 @@ impl SearchMatcher {
     pub fn find_spans(&self, hay: &str) -> Result<Vec<(usize, usize)>> {
         let mut spans: Vec<(usize, usize)> = Vec::new();
         match self {
-            SearchMatcher::Standard(re) => {
+            Self::Standard(re) => {
                 for m in re.find_iter(hay) {
                     spans.push((m.start(), m.end()));
                 }
             }
-            SearchMatcher::Fancy { re, prefilter } => {
+            Self::Fancy { re, prefilter } => {
                 if Self::ruled_out(prefilter, hay) {
                     return Ok(spans);
                 }
@@ -319,8 +319,8 @@ impl SearchMatcher {
     /// that only need to know whether the line matched and where it starts.
     pub fn find_first_span(&self, hay: &str) -> Result<Option<(usize, usize)>> {
         match self {
-            SearchMatcher::Standard(re) => Ok(re.find(hay).map(|m| (m.start(), m.end()))),
-            SearchMatcher::Fancy { re, prefilter } => {
+            Self::Standard(re) => Ok(re.find(hay).map(|m| (m.start(), m.end()))),
+            Self::Fancy { re, prefilter } => {
                 if Self::ruled_out(prefilter, hay) {
                     return Ok(None);
                 }
@@ -359,7 +359,7 @@ impl SearchMatcher {
     fn expansions(&self, hay: &str, replacement: &str) -> Result<Vec<(usize, usize, String)>> {
         let mut out = Vec::new();
         match self {
-            SearchMatcher::Standard(re) => {
+            Self::Standard(re) => {
                 for caps in re.captures_iter(hay) {
                     let m = caps.get(0).expect("group 0 always participates");
                     let mut dst = String::new();
@@ -367,7 +367,7 @@ impl SearchMatcher {
                     out.push((m.start(), m.end(), dst));
                 }
             }
-            SearchMatcher::Fancy { re, prefilter } => {
+            Self::Fancy { re, prefilter } => {
                 if Self::ruled_out(prefilter, hay) {
                     return Ok(out);
                 }

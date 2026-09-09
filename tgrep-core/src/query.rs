@@ -27,14 +27,14 @@ pub enum QueryPlan {
     /// All trigrams must match (intersection of posting lists).
     And(Vec<TrigramQuery>),
     /// Any branch can match (union of results).
-    Or(Vec<QueryPlan>),
+    Or(Vec<Self>),
     /// No trigrams could be extracted — must scan all files.
     MatchAll,
 }
 
 impl QueryPlan {
     pub fn is_match_all(&self) -> bool {
-        matches!(self, QueryPlan::MatchAll)
+        matches!(self, Self::MatchAll)
     }
 }
 

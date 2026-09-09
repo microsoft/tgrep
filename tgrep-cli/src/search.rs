@@ -1216,8 +1216,9 @@ fn search_local_index(
             candidates.len(),
             reader.num_files()
         );
+        let (matches, matched_lines) = writer.match_totals();
         eprintln!(
-            "Search completed in {:.1}ms",
+            "Search completed in {:.1}ms: {matches} matches ({matched_lines} matched lines)",
             elapsed.as_secs_f64() * 1000.0
         );
     }
@@ -1330,8 +1331,9 @@ fn brute_force_search(
             // stderr. Flush first so a combined stdout/stderr stream reports
             // the summary after the matches, as ripgrep does.
             flush_before_stats(writer)?;
+            let (matches, matched_lines) = writer.match_totals();
             eprintln!(
-                "Brute-force search completed in {:.1}ms (1 file)",
+                "Brute-force search completed in {:.1}ms (1 file): {matches} matches ({matched_lines} matched lines)",
                 elapsed.as_secs_f64() * 1000.0,
             );
         }
@@ -1375,8 +1377,9 @@ fn brute_force_search(
         // stderr. Flush first so a combined stdout/stderr stream reports the
         // summary after the matches, as ripgrep does.
         flush_before_stats(writer)?;
+        let (matches, matched_lines) = writer.match_totals();
         eprintln!(
-            "Brute-force search completed in {:.1}ms ({} files)",
+            "Brute-force search completed in {:.1}ms ({} files): {matches} matches ({matched_lines} matched lines)",
             elapsed.as_secs_f64() * 1000.0,
             walk.files.len()
         );

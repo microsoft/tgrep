@@ -167,22 +167,24 @@ fn missing_path_does_not_stop_remaining_paths() {
 fn stats_follow_matches_on_a_combined_output_stream() {
     let dir = setup_fixture();
     let merged_path = dir.path().join("merged-output.txt");
-    let merged = fs::File::create(&merged_path).unwrap();
-    let stdout = merged.try_clone().unwrap();
+    {
+        let merged = fs::File::create(&merged_path).unwrap();
+        let stdout = merged.try_clone().unwrap();
 
-    let status = ProcessCommand::new(env!("CARGO_BIN_EXE_tgrep"))
-        .args([
-            "--no-index",
-            "--stats",
-            "--no-heading",
-            "fn main",
-            &fixture_path(&dir),
-        ])
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(merged))
-        .status()
-        .unwrap();
-    assert!(status.success());
+        let status = ProcessCommand::new(env!("CARGO_BIN_EXE_tgrep"))
+            .args([
+                "--no-index",
+                "--stats",
+                "--no-heading",
+                "fn main",
+                &fixture_path(&dir),
+            ])
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(merged))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     let output = fs::read_to_string(merged_path).unwrap();
     let match_at = output
@@ -210,16 +212,25 @@ fn indexed_stats_follow_matches_on_a_combined_output_stream() {
         .success();
 
     let merged_path = dir.path().join("merged-indexed-output.txt");
-    let merged = fs::File::create(&merged_path).unwrap();
-    let stdout = merged.try_clone().unwrap();
+    {
+        let merged = fs::File::create(&merged_path).unwrap();
+        let stdout = merged.try_clone().unwrap();
 
-    let status = ProcessCommand::new(env!("CARGO_BIN_EXE_tgrep"))
-        .args(["--stats", "--no-heading", "--index-path", idx_str, "fn main", &root])
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(merged))
-        .status()
-        .unwrap();
-    assert!(status.success());
+        let status = ProcessCommand::new(env!("CARGO_BIN_EXE_tgrep"))
+            .args([
+                "--stats",
+                "--no-heading",
+                "--index-path",
+                idx_str,
+                "fn main",
+                &root,
+            ])
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(merged))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     let output = fs::read_to_string(merged_path).unwrap();
     let match_at = output

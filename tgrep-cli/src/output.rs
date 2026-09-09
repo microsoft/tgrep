@@ -61,9 +61,9 @@ impl ColorMode {
     /// ahead of time whether match spans are going to be used for anything.
     pub fn is_enabled(self) -> bool {
         match self {
-            ColorMode::Auto => atty_check(),
-            ColorMode::Always => true,
-            ColorMode::Never => false,
+            Self::Auto => atty_check(),
+            Self::Always => true,
+            Self::Never => false,
         }
     }
 
@@ -184,7 +184,7 @@ struct Stats {
 }
 
 impl Stats {
-    fn add(&mut self, other: &Stats) {
+    fn add(&mut self, other: &Self) {
         self.searches += other.searches;
         self.searches_with_match += other.searches_with_match;
         self.bytes_searched += other.bytes_searched;

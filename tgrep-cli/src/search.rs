@@ -1244,11 +1244,11 @@ impl IndexScope {
         let rel = search_root.strip_prefix(index_root).ok()?;
         let rel = rel.to_string_lossy().replace('\\', "/");
         if rel.is_empty() {
-            Some(IndexScope::Whole)
+            Some(Self::Whole)
         } else if search_root.is_file() {
-            Some(IndexScope::File(rel))
+            Some(Self::File(rel))
         } else {
-            Some(IndexScope::Subtree(format!("{rel}/")))
+            Some(Self::Subtree(format!("{rel}/")))
         }
     }
 
@@ -1256,21 +1256,21 @@ impl IndexScope {
     /// when the file is outside it.
     fn relativize(&self, indexed: &str, search_root: &Path) -> Option<String> {
         match self {
-            IndexScope::Whole => Some(indexed.to_string()),
-            IndexScope::Subtree(prefix) => indexed.strip_prefix(prefix).map(str::to_string),
+            Self::Whole => Some(indexed.to_string()),
+            Self::Subtree(prefix) => indexed.strip_prefix(prefix).map(str::to_string),
             // A named file prints as the user reached it, exactly as the
             // brute-force path does.
-            IndexScope::File(f) => (f == indexed).then(|| explicit_file_display_path(search_root)),
+            Self::File(f) => (f == indexed).then(|| explicit_file_display_path(search_root)),
         }
     }
 
     fn full_path(&self, index_root: &Path, rel: &str) -> PathBuf {
         let indexed = match self {
-            IndexScope::Whole => rel.to_string(),
-            IndexScope::Subtree(prefix) => format!("{prefix}{rel}"),
+            Self::Whole => rel.to_string(),
+            Self::Subtree(prefix) => format!("{prefix}{rel}"),
             // `rel` is the path as the user typed it, so go back to the one the
             // index stores.
-            IndexScope::File(f) => f.clone(),
+            Self::File(f) => f.clone(),
         };
         index_root.join(indexed.replace('/', std::path::MAIN_SEPARATOR_STR))
     }
@@ -1416,13 +1416,13 @@ enum FileText {
 impl FileText {
     fn as_str(&self) -> &str {
         match self {
-            FileText::Owned(text) => text,
+            Self::Owned(text) => text,
             // SAFETY: `Mapped` is only constructed by `try_map_text`, which
             // validates the entire mapping with `str::from_utf8` first, so the
             // bytes were UTF-8 when the map was taken. A concurrent writer
             // could still invalidate them, which is the same exposure ripgrep
             // accepts when it maps a file it is searching.
-            FileText::Mapped(map) => unsafe { std::str::from_utf8_unchecked(map) },
+            Self::Mapped(map) => unsafe { std::str::from_utf8_unchecked(map) },
         }
     }
 }

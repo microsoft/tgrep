@@ -27,7 +27,7 @@ impl GlobFilter {
     /// `case_insensitive` applies to `globs` only — `iglobs` are always
     /// case-insensitive. Returns an error if any pattern fails to compile.
     pub fn new(globs: &[String], iglobs: &[String], case_insensitive: bool) -> Result<Self> {
-        let mut filter = GlobFilter::default();
+        let mut filter = Self::default();
         filter.push_all(globs, case_insensitive)?;
         filter.push_all(iglobs, true)?;
         Ok(filter)

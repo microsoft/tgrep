@@ -1323,7 +1323,7 @@ fn brute_force_search(
             // the summary after the matches, as ripgrep does.
             writer.flush()?;
             eprintln!(
-                "Brute-force search completed in {:.1}ms (1 files)",
+                "Brute-force search completed in {:.1}ms (1 file)",
                 elapsed.as_secs_f64() * 1000.0,
             );
         }

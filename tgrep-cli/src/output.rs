@@ -258,6 +258,8 @@ pub struct OutputWriter {
     current_binary_offset: Option<u64>,
     all_bytes_searched: u64,
     all_searches: u64,
+    total_matches: u64,
+    total_matched_lines: u64,
 }
 
 impl OutputWriter {
@@ -292,7 +294,24 @@ impl OutputWriter {
             current_binary_offset: None,
             all_bytes_searched: 0,
             all_searches: 0,
+            total_matches: 0,
+            total_matched_lines: 0,
         }
+    }
+
+    pub fn match_totals(&self) -> (u64, u64) {
+        (self.total_matches, self.total_matched_lines)
+    }
+
+    /// Text stats are per search root; JSON stats still span the invocation.
+    pub fn reset_match_totals(&mut self) {
+        self.total_matches = 0;
+        self.total_matched_lines = 0;
+    }
+
+    pub fn note_matches(&mut self, matches: u64, matched_lines: u64) {
+        self.total_matches += matches;
+        self.total_matched_lines += matched_lines;
     }
 
     pub fn is_json(&self) -> bool {

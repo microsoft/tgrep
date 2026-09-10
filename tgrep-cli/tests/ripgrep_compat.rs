@@ -248,6 +248,441 @@ fn indexed_stats_follow_matches_on_a_combined_output_stream() {
     );
 }
 
+fn with_stats_backends(
+    root: &std::path::Path,
+    index_dir: &std::path::Path,
+    mut check: impl FnMut(&[&str], &str),
+) {
+    check(&["--no-index"], "Brute-force search completed");
+    let index = index_dir.to_str().unwrap();
+    tgrep()
+        .args(["index", root.to_str().unwrap(), "--index-path", index])
+        .assert()
+        .success();
+    check(&["--index-path", index], "Search completed");
+    let _server = start_passthru_server(root, index_dir);
+    check(&["--index-path", index], "(via server)");
+}
+
+fn stats_totals(stderr: &[u8]) -> Vec<(u64, u64)> {
+    let stderr = String::from_utf8_lossy(stderr);
+    regex::Regex::new(r"(\d+) matches \((\d+) matched lines\)")
+        .unwrap()
+        .captures_iter(&stderr)
+        .map(|c| (c[1].parse().unwrap(), c[2].parse().unwrap()))
+        .collect()
+}
+
+fn stable_json_output(stdout: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(|line| {
+            let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(stats) = event["data"]["stats"].as_object_mut() {
+                stats.remove("elapsed");
+                stats.remove("bytes_printed");
+            }
+            event["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove("elapsed_total");
+            event
+        })
+        .collect()
+}
+
+#[test]
+fn stats_count_matches_independently_of_count_and_file_output() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("counts.txt"), "hello hello\nhello\nbye\n").unwrap();
+
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, expected, stdout) in [
+            (vec!["-c"], (3, 2), Some("2")),
+            (vec!["--count-matches"], (3, 2), Some("3")),
+            (vec!["-l"], (3, 2), None),
+            (vec!["-q"], (2, 1), Some("")),
+            (vec!["-c", "-v"], (0, 1), Some("1")),
+            (vec!["--count-matches", "-v"], (0, 1), Some("1")),
+            (vec!["-l", "-v"], (0, 1), None),
+            (vec!["-c", "-m", "1"], (2, 1), Some("1")),
+            (vec!["--count-matches", "-m", "1"], (2, 1), Some("2")),
+            (vec!["-l", "-m", "1"], (2, 1), None),
+        ] {
+            let output = tgrep()
+                .args(backend)
+                .args(["--stats", "--no-filename", "--color", "never"])
+                .args(&flags)
+                .args(["--", "hello", root.to_str().unwrap()])
+                .assert()
+                .success()
+                .stderr(predicate::str::contains(marker))
+                .get_output()
+                .clone();
+            assert_eq!(
+                stats_totals(&output.stderr),
+                [expected],
+                "{backend:?} {flags:?}"
+            );
+            if let Some(stdout) = stdout {
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), stdout);
+            } else {
+                assert!(String::from_utf8_lossy(&output.stdout).contains("counts.txt"));
+            }
+        }
+
+        // This mode deliberately bypasses the server and stops after one hit
+        // in each file, even though matching files produce no output.
+        let output = tgrep()
+            .args(backend)
+            .args(["--stats", "--files-without-match", "--", "hello"])
+            .arg(&root)
+            .assert()
+            .code(1)
+            .stdout("")
+            .get_output()
+            .clone();
+        assert_eq!(stats_totals(&output.stderr), [(2, 1)]);
+    });
+}
+
+#[test]
+fn stats_files_only_server_rpc_returns_one_marker_per_file() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("many.txt"), "hello hello\n".repeat(4096)).unwrap();
+    fs::write(root.join("none.txt"), "goodbye\n").unwrap();
+    let index_dir = dir.path().join("idx");
+    let _server = start_passthru_server(&root, &index_dir);
+    let info: serde_json::Value =
+        serde_json::from_slice(&fs::read(index_dir.join("serve.json")).unwrap()).unwrap();
+    let port = info["port"].as_u64().unwrap() as u16;
+    for (limit, matches, lines) in [(None, 8192, 4096), (Some(1), 2, 1), (Some(0), 0, 0)] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "search",
+            "params": {
+                "pattern": "hello",
+                "files_only": true,
+                "stats": true,
+                "detail": true,
+                "max_count": limit,
+            },
+            "id": 1,
+        });
+        let response = send_rpc_request(port, &request.to_string()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        let result = &response["result"];
+        if matches == 0 {
+            assert_eq!(result["matches"], serde_json::json!([]));
+            assert_eq!(result["file_stats"], serde_json::json!([]));
+        } else {
+            assert_eq!(
+                result["matches"],
+                serde_json::json!([{"type": "match", "file": "many.txt"}])
+            );
+            assert_eq!(
+                result["file_stats"],
+                serde_json::json!([{
+                    "file": "many.txt",
+                    "matches": matches,
+                    "matched_lines": lines,
+                }])
+            );
+        }
+        assert_eq!(result["num_matches"], if matches == 0 { 0 } else { 1 });
+    }
+    tgrep()
+        .args(["--index-path", index_dir.to_str().unwrap(), "-l", "--stats"])
+        .args(["--", "hello", root.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(format!("{}\n", root.join("many.txt").display()))
+        .stderr(predicate::str::contains(
+            "8192 matches (4096 matched lines)",
+        ))
+        .stderr(predicate::str::contains("(via server)"));
+}
+
+#[test]
+fn stats_binary_file_counts_matches_on_both_sides_of_nul() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("binary.txt");
+    fs::write(&file, b"hello\0hello").unwrap();
+    // ripgrep 15.2.0 reports both matches for a memory-mapped explicit file,
+    // even though its JSON bytes_searched reports the NUL offset (5).
+    for flags in [
+        vec![],
+        vec!["--count-matches"],
+        vec!["--json"],
+        vec!["--text"],
+    ] {
+        let output = tgrep()
+            .args(["--no-index", "--stats"])
+            .args(&flags)
+            .args(["--", "hello"])
+            .arg(&file)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert_eq!(stats_totals(&output.stderr), [(2, 1)], "{flags:?}");
+    }
+}
+
+#[test]
+fn stats_explicit_files_and_binary_notes_count_unrendered_matches() {
+    let dir = TempDir::new().unwrap();
+    for (name, contents) in [
+        ("counts.txt", "hello hello\nhello\n"),
+        ("binary.txt", "hello hello\nhello\n\0tail\n"),
+    ] {
+        let file = dir.path().join(name);
+        fs::write(&file, contents).unwrap();
+        for (flags, expected) in [
+            (vec![], (3, 2)),
+            (vec!["-c"], (3, 2)),
+            (vec!["--count-matches"], (3, 2)),
+            (vec!["-l"], (3, 2)),
+            (vec!["-q"], (2, 1)),
+            (vec!["--json"], (3, 2)),
+        ] {
+            let output = tgrep()
+                .args(["--no-index", "--stats"])
+                .args(&flags)
+                .args(["--", "hello"])
+                .arg(&file)
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            assert_eq!(stats_totals(&output.stderr), [expected], "{name} {flags:?}");
+            if name == "binary.txt" && flags.is_empty() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(stdout.contains("binary file matches"));
+                assert!(!stdout.contains("hello"));
+            }
+        }
+    }
+}
+
+#[test]
+fn stats_are_scoped_to_each_root_without_colliding_relative_paths() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    for (name, contents) in [
+        ("one", "hello\n"),
+        ("two", "hello\n"),
+        ("empty", "goodbye\n"),
+    ] {
+        fs::create_dir_all(root.join(name)).unwrap();
+        fs::write(root.join(name).join("a.txt"), contents).unwrap();
+    }
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for json in [false, true] {
+            let mut cmd = tgrep();
+            cmd.args(backend).args(["--stats", "--color", "never"]);
+            if json {
+                cmd.arg("--json");
+            }
+            let output = cmd
+                .args(["--", "hello"])
+                .arg(root.join("one"))
+                .arg(root.join("two"))
+                .arg(root.join("empty"))
+                .assert()
+                .success()
+                .stderr(predicate::str::contains(marker))
+                .get_output()
+                .clone();
+            assert_eq!(stats_totals(&output.stderr), [(1, 1), (1, 1), (0, 0)]);
+            if json {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let events: Vec<serde_json::Value> = stdout
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let summaries: Vec<_> = events.iter().filter(|e| e["type"] == "summary").collect();
+                assert_eq!(summaries.len(), 1, "{stdout}");
+                assert_eq!(events.last().unwrap()["type"], "summary");
+                assert_eq!(summaries[0]["data"]["stats"]["matches"], 2);
+                assert_eq!(summaries[0]["data"]["stats"]["matched_lines"], 2);
+            }
+        }
+    });
+}
+
+#[test]
+fn stats_multiline_counts_original_matches_before_rendering() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("multiline.txt"),
+        "hello\nworld hello\nworld\nmiss\nhello\nworld\n",
+    )
+    .unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, expected) in [
+            (vec![], (3, 5)),
+            (vec!["-o"], (3, 5)),
+            (vec!["--json"], (3, 5)),
+            (vec!["--vimgrep"], (3, 5)),
+            (vec!["--replace", ""], (3, 5)),
+            (vec!["--trim"], (3, 5)),
+            (vec!["-C", "1"], (3, 5)),
+            (vec!["-m", "1", "-C", "2"], (2, 3)),
+            (vec!["-m", "1", "--vimgrep"], (2, 3)),
+            (vec!["-c"], (3, 5)),
+            (vec!["--count-matches"], (3, 5)),
+            (vec!["-l"], (3, 5)),
+            (vec!["-q"], (2, 3)),
+        ] {
+            let output = tgrep()
+                .args(backend)
+                .args(["--stats", "-U", "--color", "never"])
+                .args(&flags)
+                .args(["--", r"hello\r?\nworld", root.to_str().unwrap()])
+                .assert()
+                .success()
+                .stderr(predicate::str::contains(marker))
+                .get_output()
+                .clone();
+            assert_eq!(
+                stats_totals(&output.stderr),
+                [expected],
+                "{backend:?} {flags:?}"
+            );
+            let without_stats = tgrep()
+                .args(backend)
+                .args(["-U", "--color", "never"])
+                .args(&flags)
+                .args(["--", r"hello\r?\nworld", root.to_str().unwrap()])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            if flags.contains(&"--json") {
+                assert_eq!(
+                    stable_json_output(&output.stdout),
+                    stable_json_output(&without_stats)
+                );
+            } else {
+                assert_eq!(output.stdout, without_stats, "{backend:?} {flags:?}");
+            }
+        }
+        let output = tgrep()
+            .args(backend)
+            .args(["--stats", "-U", "-m", "0", "--", r"hello\r?\nworld"])
+            .arg(&root)
+            .assert()
+            .code(1)
+            .stdout("")
+            .get_output()
+            .clone();
+        assert_eq!(stats_totals(&output.stderr), [(0, 0)]);
+    });
+}
+
+#[test]
+fn stats_scope_depth_filters_and_quiet_early_exit_apply_to_server_totals() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    let scope = root.join("scope");
+    fs::create_dir_all(scope.join("nested")).unwrap();
+    fs::write(scope.join("a.txt"), "hello hello\nbye\nhello\n").unwrap();
+    fs::write(scope.join("b.txt"), "hello\n").unwrap();
+    fs::write(scope.join("zero.txt"), "bye\n").unwrap();
+    fs::write(scope.join("nested").join("deep.txt"), "hello\n").unwrap();
+    fs::write(root.join("outside.txt"), "hello\n").unwrap();
+    fs::write(scope.join("binary.txt"), "hello\0hello\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, expected) in [
+            (vec!["--max-depth", "1"], (4, 3)),
+            (vec!["--max-depth", "1", "-q"], (2, 1)),
+            (vec!["-g", "a.txt", "--stop-on-nonmatch"], (2, 1)),
+            (vec!["-g", "zero.txt"], (0, 0)),
+        ] {
+            let output = tgrep()
+                .args(backend)
+                .args(["--stats", "--sort", "path", "--color", "never"])
+                .args(&flags)
+                .args(["--", "hello"])
+                .arg(&scope)
+                .assert()
+                .code(if expected.1 == 0 { 1 } else { 0 })
+                .stderr(predicate::str::contains(marker))
+                .get_output()
+                .clone();
+            assert_eq!(
+                stats_totals(&output.stderr),
+                [expected],
+                "{backend:?} {flags:?}"
+            );
+        }
+        // `--include-zero` deliberately bypasses the server.
+        let output = tgrep()
+            .args(backend)
+            .args([
+                "--stats",
+                "-c",
+                "--include-zero",
+                "-g",
+                "zero.txt",
+                "--",
+                "hello",
+            ])
+            .arg(&scope)
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains("zero.txt:0"))
+            .get_output()
+            .clone();
+        assert_eq!(stats_totals(&output.stderr), [(0, 0)]);
+    });
+}
+
+#[test]
+fn stats_ignore_trim_replacement_and_adjacent_span_merging() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("spans.txt"), "  hello hello\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (pattern, flags, expected) in [
+            (" +", vec!["--trim"], (2, 1)),
+            (" +", vec!["--trim", "--json"], (2, 1)),
+            ("hello", vec!["-o", "--replace", ""], (2, 1)),
+            ("hello", vec!["--replace", ""], (2, 1)),
+            ("hello", vec!["--max-columns", "1"], (2, 1)),
+            ("l", vec!["-U"], (4, 1)),
+            ("l", vec!["-U", "-o"], (4, 1)),
+            ("l", vec!["-U", "--vimgrep"], (4, 1)),
+        ] {
+            let output = tgrep()
+                .args(backend)
+                .args(["--stats", "--color", "never"])
+                .args(&flags)
+                .args(["--", pattern, root.to_str().unwrap()])
+                .assert()
+                .success()
+                .stderr(predicate::str::contains(marker))
+                .get_output()
+                .clone();
+            assert_eq!(
+                stats_totals(&output.stderr),
+                [expected],
+                "{backend:?} {flags:?}"
+            );
+        }
+    });
+}
+
 #[test]
 fn supports_negative_lookahead_fallback() {
     let dir = setup_fixture();

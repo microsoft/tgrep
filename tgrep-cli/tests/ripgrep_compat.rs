@@ -349,6 +349,92 @@ fn stats_count_matches_independently_of_count_and_file_output() {
 }
 
 #[test]
+fn stats_files_only_server_rpc_returns_one_marker_per_file() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("many.txt"), "hello hello\n".repeat(4096)).unwrap();
+    fs::write(root.join("none.txt"), "goodbye\n").unwrap();
+    let index_dir = dir.path().join("idx");
+    let _server = start_passthru_server(&root, &index_dir);
+    let info: serde_json::Value =
+        serde_json::from_slice(&fs::read(index_dir.join("serve.json")).unwrap()).unwrap();
+    let port = info["port"].as_u64().unwrap() as u16;
+    for (limit, matches, lines) in [(None, 8192, 4096), (Some(1), 2, 1), (Some(0), 0, 0)] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "search",
+            "params": {
+                "pattern": "hello",
+                "files_only": true,
+                "stats": true,
+                "detail": true,
+                "max_count": limit,
+            },
+            "id": 1,
+        });
+        let response = send_rpc_request(port, &request.to_string()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        let result = &response["result"];
+        if matches == 0 {
+            assert_eq!(result["matches"], serde_json::json!([]));
+            assert_eq!(result["file_stats"], serde_json::json!([]));
+        } else {
+            assert_eq!(
+                result["matches"],
+                serde_json::json!([{"type": "match", "file": "many.txt"}])
+            );
+            assert_eq!(
+                result["file_stats"],
+                serde_json::json!([{
+                    "file": "many.txt",
+                    "matches": matches,
+                    "matched_lines": lines,
+                }])
+            );
+        }
+        assert_eq!(result["num_matches"], if matches == 0 { 0 } else { 1 });
+    }
+    tgrep()
+        .args(["--index-path", index_dir.to_str().unwrap(), "-l", "--stats"])
+        .args(["--", "hello", root.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(format!("{}\n", root.join("many.txt").display()))
+        .stderr(predicate::str::contains(
+            "8192 matches (4096 matched lines)",
+        ))
+        .stderr(predicate::str::contains("(via server)"));
+}
+
+#[test]
+fn stats_binary_file_counts_matches_on_both_sides_of_nul() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("binary.txt");
+    fs::write(&file, b"hello\0hello").unwrap();
+    // ripgrep 15.2.0 reports both matches for a memory-mapped explicit file,
+    // even though its JSON bytes_searched reports the NUL offset (5).
+    for flags in [
+        vec![],
+        vec!["--count-matches"],
+        vec!["--json"],
+        vec!["--text"],
+    ] {
+        let output = tgrep()
+            .args(["--no-index", "--stats"])
+            .args(&flags)
+            .args(["--", "hello"])
+            .arg(&file)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert_eq!(stats_totals(&output.stderr), [(2, 1)], "{flags:?}");
+    }
+}
+
+#[test]
 fn stats_explicit_files_and_binary_notes_count_unrendered_matches() {
     let dir = TempDir::new().unwrap();
     for (name, contents) in [

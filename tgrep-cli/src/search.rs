@@ -1713,9 +1713,9 @@ fn search_decoded_file(
         return Ok(FileOutcome::Skipped);
     }
 
-    // ripgrep's searcher quits at the NUL byte, so it reports only the bytes it
-    // got through rather than the file's full length. Both are counted on disk,
-    // so the whole-file case needs the same mapping the offset just got.
+    // Binary bytes_searched reports the detection offset, not a regex cutoff:
+    // ripgrep with memory-mapped input can count matches beyond the NUL while
+    // reporting that offset. Both byte counts refer to the source on disk.
     writer.note_bytes_searched(
         binary_offset.unwrap_or_else(|| fixups.to_source_offset(content.len())) as u64,
     );

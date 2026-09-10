@@ -1942,9 +1942,20 @@ fn search_file_matches(
         // `--json` reports binary matches as ordinary match events carrying a
         // `binary_offset`, so those clients ask for the lines as well.
         result.rows.push(marker);
-        if !opts.binary_lines {
+        if !opts.binary_lines || (opts.files_only && opts.stats) {
             return Ok(result);
         }
+    }
+
+    if opts.files_only && opts.stats {
+        // Totals need the full search, but files-only clients consume just the
+        // path. Avoid rendering content or span arrays proportional to hits.
+        // Keep legacy replies unchanged when per-file stats were not requested.
+        result.rows.push(serde_json::json!({
+            "type": "match",
+            "file": rel_path,
+        }));
+        return Ok(result);
     }
 
     result.rows.extend(collect_match_rows(
@@ -8803,6 +8814,54 @@ mod tests {
     }
 
     #[test]
+    fn stats_files_only_reply_is_constant_size_per_file() {
+        let matcher = crate::matching::build_search_matcher(
+            &["hello".to_string()],
+            &crate::matching::MatcherConfig::default(),
+        )
+        .unwrap();
+        for repeats in [1, 4096] {
+            for terminator in [" ", "\n"] {
+                let file = DecodedFile::new(
+                    format!("hello hello{terminator}")
+                        .repeat(repeats)
+                        .into_bytes(),
+                    tgrep_core::encoding::EncodingMode::Auto,
+                );
+                let result = search_file_matches(
+                    "many.txt",
+                    &file,
+                    &matcher,
+                    &SearchOpts {
+                        files_only: true,
+                        stats: true,
+                        detail: true,
+                        positions: true,
+                        only_matching: true,
+                        replace: Some("replacement".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    result.rows,
+                    [serde_json::json!({"type": "match", "file": "many.txt"})]
+                );
+                let stats = result.stats.unwrap();
+                assert_eq!(stats.matches, (2 * repeats) as u64);
+                assert_eq!(
+                    stats.matched_lines,
+                    if terminator == "\n" {
+                        repeats as u64
+                    } else {
+                        1
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stats_binary_totals_are_independent_of_marker_and_match_rows() {
         let file = DecodedFile::new(
             b"hello hello\nhello\n\0tail\n".to_vec(),
@@ -8815,25 +8874,31 @@ mod tests {
         .unwrap();
         for binary_lines in [false, true] {
             for invert_match in [false, true] {
-                let result = search_file_matches(
-                    "binary.txt",
-                    &file,
-                    &matcher,
-                    &SearchOpts {
-                        stats: true,
-                        binary_lines,
-                        invert_match,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-                let stats = result.stats.unwrap();
-                assert_eq!(
-                    (stats.matches, stats.matched_lines),
-                    if invert_match { (0, 1) } else { (3, 2) }
-                );
-                assert_eq!(result.rows[0]["type"], "binary");
-                assert_eq!(result.rows.len() > 1, binary_lines);
+                for files_only in [false, true] {
+                    let result = search_file_matches(
+                        "binary.txt",
+                        &file,
+                        &matcher,
+                        &SearchOpts {
+                            stats: true,
+                            binary_lines,
+                            invert_match,
+                            files_only,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    let stats = result.stats.unwrap();
+                    assert_eq!(
+                        (stats.matches, stats.matched_lines),
+                        if invert_match { (0, 1) } else { (3, 2) }
+                    );
+                    assert_eq!(result.rows[0]["type"], "binary");
+                    assert_eq!(result.rows.len() > 1, binary_lines && !files_only);
+                    if files_only {
+                        assert_eq!(result.rows.len(), 1);
+                    }
+                }
             }
         }
     }

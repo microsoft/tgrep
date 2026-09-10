@@ -735,6 +735,8 @@ struct SearchOpts {
     ///
     /// Only `-b/--byte-offset` and `-M/--max-columns` look at them.
     positions: bool,
+    /// Return original per-file match totals independently of rendered rows.
+    stats: bool,
 }
 
 impl SearchOpts {
@@ -746,7 +748,7 @@ impl SearchOpts {
             only_matching: self.only_matching,
             before_context: self.before_context,
             after_context: self.after_context,
-            max_count: if self.files_only {
+            max_count: if self.files_only && !self.stats {
                 Some(1)
             } else {
                 self.max_count
@@ -755,7 +757,7 @@ impl SearchOpts {
             replace: self.replace.clone(),
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
-            all_spans: self.detail,
+            all_spans: self.detail || self.stats,
         }
     }
 }
@@ -1596,6 +1598,10 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             vimgrep,
             detail,
             positions,
+            stats: params
+                .get("stats")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
     })
 }
@@ -1777,16 +1783,22 @@ fn handle_search(
 
     // Parallel regex matching across candidate files
     let t_search = Instant::now();
-    let per_file: std::result::Result<Vec<Vec<serde_json::Value>>, String> = candidate_contents
+    let per_file: std::result::Result<Vec<FileSearchResult>, String> = candidate_contents
         .par_iter()
         .map(|(rel_path, content)| {
             search_file_matches(rel_path, content, &matcher, &opts).map_err(|e| format!("{e}"))
         })
         .collect();
-    let matches: Vec<serde_json::Value> = match per_file {
-        Ok(per_file) => per_file.into_iter().flatten().collect(),
+    let per_file = match per_file {
+        Ok(per_file) => per_file,
         Err(e) => return json_rpc_error(id, -32603, &e),
     };
+    let mut matches = Vec::new();
+    let mut file_stats = Vec::new();
+    for file in per_file {
+        matches.extend(file.rows);
+        file_stats.extend(file.stats);
+    }
 
     let search_ms = t_search.elapsed().as_secs_f64() * 1000.0;
     let elapsed = start.elapsed();
@@ -1805,15 +1817,18 @@ fn handle_search(
         search_ms,
     );
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "matches": matches,
         // The number of rows in `matches`, which is not a ripgrep-style match
         // count: it spans the whole indexed tree (the client applies any
-        // subdirectory argument to the reply) and includes context rows. A
-        // client reporting `--stats` has to count the rows it actually prints.
+        // subdirectory argument to the reply) and includes context rows.
+        // `file_stats`, when requested, carries the original match totals.
         "num_matches": matches.len(),
         "elapsed_ms": elapsed_ms,
     });
+    if opts.stats {
+        result["file_stats"] = serde_json::json!(file_stats);
+    }
 
     json_rpc_result(id, result)
 }
@@ -1861,12 +1876,18 @@ fn invalidate_cached_paths_locked<'a>(
     }
 }
 
+#[derive(Default)]
+struct FileSearchResult {
+    rows: Vec<serde_json::Value>,
+    stats: Option<crate::search::FileMatchStats>,
+}
+
 fn search_file_matches(
     rel_path: &str,
     file: &DecodedFile,
     matcher: &crate::matching::SearchMatcher,
     opts: &SearchOpts,
-) -> anyhow::Result<Vec<serde_json::Value>> {
+) -> anyhow::Result<FileSearchResult> {
     use crate::matching::FileMatches;
 
     let content = file.text.as_str();
@@ -1892,8 +1913,19 @@ fn search_file_matches(
 
     let found = FileMatches::find(content, matcher, &match_opts)?;
     if found.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FileSearchResult::default());
     }
+    let mut result = FileSearchResult {
+        rows: Vec::new(),
+        stats: opts.stats.then(|| {
+            let (matches, matched_lines) = found.match_totals();
+            crate::search::FileMatchStats {
+                file: rel_path.to_string(),
+                matches,
+                matched_lines,
+            }
+        }),
+    };
 
     // Never stream raw binary back to the client; report a note instead, the
     // same way the local path does. Emitted for `-l`/`-c` too so the client can
@@ -1909,23 +1941,13 @@ fn search_file_matches(
         });
         // `--json` reports binary matches as ordinary match events carrying a
         // `binary_offset`, so those clients ask for the lines as well.
+        result.rows.push(marker);
         if !opts.binary_lines {
-            return Ok(vec![marker]);
+            return Ok(result);
         }
-        let mut results = vec![marker];
-        results.extend(collect_match_rows(
-            &found,
-            &match_opts,
-            matcher,
-            rel_path,
-            fixups,
-            opts.detail,
-            opts.positions,
-        )?);
-        return Ok(results);
     }
 
-    collect_match_rows(
+    result.rows.extend(collect_match_rows(
         &found,
         &match_opts,
         matcher,
@@ -1933,7 +1955,8 @@ fn search_file_matches(
         fixups,
         opts.detail,
         opts.positions,
-    )
+    )?);
+    Ok(result)
 }
 
 /// Turn a file's matches into the protocol's `match`/`context` rows.
@@ -8764,9 +8787,10 @@ mod tests {
         )
         .unwrap();
 
-        let rows = search_file_matches("f.txt", &file, &matcher, &SearchOpts::default()).unwrap();
+        let result = search_file_matches("f.txt", &file, &matcher, &SearchOpts::default()).unwrap();
 
-        let marker = rows
+        let marker = result
+            .rows
             .iter()
             .find(|r| r["type"] == "binary")
             .expect("a file containing a NUL is reported as binary");
@@ -8776,6 +8800,42 @@ mod tests {
             "offset must be the byte on disk (9), not the decoded position \
              (13): {marker}"
         );
+    }
+
+    #[test]
+    fn stats_binary_totals_are_independent_of_marker_and_match_rows() {
+        let file = DecodedFile::new(
+            b"hello hello\nhello\n\0tail\n".to_vec(),
+            tgrep_core::encoding::EncodingMode::Auto,
+        );
+        let matcher = crate::matching::build_search_matcher(
+            &["hello".to_string()],
+            &crate::matching::MatcherConfig::default(),
+        )
+        .unwrap();
+        for binary_lines in [false, true] {
+            for invert_match in [false, true] {
+                let result = search_file_matches(
+                    "binary.txt",
+                    &file,
+                    &matcher,
+                    &SearchOpts {
+                        stats: true,
+                        binary_lines,
+                        invert_match,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let stats = result.stats.unwrap();
+                assert_eq!(
+                    (stats.matches, stats.matched_lines),
+                    if invert_match { (0, 1) } else { (3, 2) }
+                );
+                assert_eq!(result.rows[0]["type"], "binary");
+                assert_eq!(result.rows.len() > 1, binary_lines);
+            }
+        }
     }
 
     /// `reset_to_empty_index` runs after a failed build, when the index

@@ -626,21 +626,51 @@ pub enum Emit<'a> {
 pub struct FileMatches<'a> {
     index: LineIndex<'a>,
     hits: Vec<LineHit>,
+    match_totals: (u64, u64),
 }
 
 impl<'a> FileMatches<'a> {
     pub fn find(content: &'a str, matcher: &SearchMatcher, opts: &MatchOptions) -> Result<Self> {
         let index = LineIndex::new(content);
-        let hits = if opts.max_count == Some(0) {
-            Vec::new()
+        let (hits, match_totals) = if opts.max_count == Some(0) {
+            (Vec::new(), (0, 0))
+        } else if opts.multiline && !opts.invert_match {
+            // Count original matches after the search limit, but before
+            // splitting, merging or clipping their spans for presentation.
+            let spans = matcher.find_spans(content)?;
+            let spans = limit_to_line_blocks(&index, &spans, opts.max_count);
+            let hits = group_spans_by_line(&index, &spans);
+            let totals = (spans.len() as u64, hits.len() as u64);
+            let hits = if opts.vimgrep {
+                group_spans_by_line(&index, &clip_spans_to_start_line(&index, &spans))
+            } else {
+                hits
+            };
+            (hits, totals)
         } else {
-            collect_hits(content, &index, matcher, opts)?
+            let hits = collect_hits(content, &index, matcher, opts)?;
+            let totals = (
+                hits.iter().map(|h| h.spans.len() as u64).sum(),
+                hits.len() as u64,
+            );
+            (hits, totals)
         };
-        Ok(Self { index, hits })
+        Ok(Self {
+            index,
+            hits,
+            match_totals,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
         self.hits.is_empty()
+    }
+
+    /// Original regex matches and selected physical lines, before rendering.
+    /// Inverted lines contribute no regex matches. Requires `all_spans` for
+    /// complete match counts in line-oriented mode.
+    pub fn match_totals(&self) -> (u64, u64) {
+        self.match_totals
     }
 
     /// Number of matching lines, which is what `-c/--count` reports.
@@ -900,7 +930,7 @@ fn candidate_lines<'a>(
     )
 }
 
-/// Find every matching line together with the match ranges inside it.
+/// Find selected lines and their spans in line-oriented or inverted mode.
 fn collect_hits(
     content: &str,
     index: &LineIndex<'_>,
@@ -926,33 +956,6 @@ fn collect_hits(
             }
         }
         return Ok(out);
-    }
-
-    if opts.multiline {
-        // Match against the whole buffer so a single match can cross lines.
-        //
-        // ripgrep counts *matching lines* here rather than match spans: its
-        // multiline searcher reports one unit per contiguous block of lines
-        // that matches cover, and everything inside that block comes with it.
-        // So three matches on one line are a single unit under `-m 1` (all
-        // three are reported, which `--vimgrep` shows as three rows), and a
-        // match spanning two lines is also one unit (both lines print).
-        //
-        // Limiting the spans themselves would under-report the first case, and
-        // truncating the grouped lines would print a partial match — output
-        // that doesn't actually match the pattern, with its spans clipped.
-        let spans = matcher.find_spans(content)?;
-        let spans = limit_to_line_blocks(index, &spans, max);
-        if opts.vimgrep {
-            // `--vimgrep` wants one jump target per match, so a match that runs
-            // past the end of its line is reported only on the line it starts
-            // on rather than once per line it touches.
-            return Ok(group_spans_by_line(
-                index,
-                &clip_spans_to_start_line(index, &spans),
-            ));
-        }
-        return Ok(group_spans_by_line(index, &spans));
     }
 
     // Line-oriented mode: match each line separately so `^` and `$` anchor
@@ -1000,6 +1003,26 @@ fn collect_hits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_keep_original_multiline_matches_and_physical_lines() {
+        let matcher = SearchMatcher::Standard(regex::Regex::new(r"hello\nworld").unwrap());
+        for vimgrep in [false, true] {
+            let found = FileMatches::find(
+                "hello\nworld\n",
+                &matcher,
+                &MatchOptions {
+                    multiline: true,
+                    vimgrep,
+                    all_spans: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(found.match_totals(), (1, 2));
+            assert_eq!(found.matched_lines(), if vimgrep { 1 } else { 2 });
+        }
+    }
 
     // -----------------------------------------------------------------------
     // The whole-buffer line prescan

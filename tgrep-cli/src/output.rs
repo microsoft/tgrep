@@ -260,7 +260,6 @@ pub struct OutputWriter {
     all_searches: u64,
     total_matches: u64,
     total_matched_lines: u64,
-    last_counted_match: Option<(String, usize)>,
 }
 
 impl OutputWriter {
@@ -297,12 +296,22 @@ impl OutputWriter {
             all_searches: 0,
             total_matches: 0,
             total_matched_lines: 0,
-            last_counted_match: None,
         }
     }
 
     pub fn match_totals(&self) -> (u64, u64) {
         (self.total_matches, self.total_matched_lines)
+    }
+
+    /// Text stats are per search root; JSON stats still span the invocation.
+    pub fn reset_match_totals(&mut self) {
+        self.total_matches = 0;
+        self.total_matched_lines = 0;
+    }
+
+    pub fn note_matches(&mut self, matches: u64, matched_lines: u64) {
+        self.total_matches += matches;
+        self.total_matched_lines += matched_lines;
     }
 
     pub fn is_json(&self) -> bool {
@@ -558,15 +567,6 @@ impl OutputWriter {
     pub fn write_match(&mut self, m: &Match) -> io::Result<()> {
         let (content, spans) = self.trim_adjust(&m.content, &m.spans);
         let content = content.to_string();
-        let already_counted = self
-            .last_counted_match
-            .as_ref()
-            .is_some_and(|(f, l)| f == &m.file && *l == m.line_number);
-        if !already_counted {
-            self.total_matched_lines += 1;
-            self.last_counted_match = Some((m.file.clone(), m.line_number));
-        }
-        self.total_matches += m.spans.len() as u64;
         match self.config.format {
             OutputFormat::Heading | OutputFormat::Flat => {
                 if !self.config.no_filename {

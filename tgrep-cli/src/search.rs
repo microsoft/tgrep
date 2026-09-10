@@ -653,6 +653,7 @@ pub fn run(
     opts: &SearchOptions,
     writer: &mut OutputWriter,
 ) -> Result<bool> {
+    writer.reset_match_totals();
     let root = match std::fs::canonicalize(root) {
         Ok(root) => root,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -844,6 +845,7 @@ fn search_via_server(
             "vimgrep": opts.vimgrep,
             "detail": detail,
             "positions": positions,
+            "stats": opts.stats,
         },
         "id": 1,
     });
@@ -959,11 +961,8 @@ fn search_via_server(
     let had_matches = !matches.is_empty();
 
     if opts.quiet {
-        writer.flush()?;
-        return Ok(had_matches);
-    }
-
-    if opts.files_only {
+        // No output, but still report stats for the first matching file.
+    } else if opts.files_only {
         let mut seen = std::collections::HashSet::new();
         for m in matches {
             if let Some(file) = m.get("file").and_then(|f| f.as_str())
@@ -1094,11 +1093,34 @@ fn search_via_server(
         // stderr. Flush first so a combined stdout/stderr stream reports the
         // summary after the matches, as ripgrep does.
         flush_before_stats(writer)?;
-        // Count the rows that survived scoping, not the server's `num_matches`.
-        // The server searches the whole indexed tree and counts every row it
-        // built, so that field includes files outside a subdirectory argument
-        // and counts context lines as matches.
-        let (num, lines) = count_reported_matches(matches);
+        // Apply the same scope to per-file totals as to output rows. The
+        // server's `num_matches` includes context and out-of-scope rows, and
+        // rendered spans can split or merge the original matches.
+        let (num, lines) = if let Some(stats) = result.get("file_stats") {
+            let stats: Vec<FileMatchStats> = serde_json::from_value(stats.clone())?;
+            let first_file = matches
+                .first()
+                .and_then(|m| m.get("file"))
+                .and_then(|f| f.as_str());
+            stats
+                .iter()
+                .filter_map(|s| {
+                    if dropped_binary_files.contains(s.file.as_str()) {
+                        return None;
+                    }
+                    let rel = scope.relativize(&s.file, root)?;
+                    if !within_max_depth(&rel, opts)
+                        || (opts.quiet && first_file != Some(rel.as_str()))
+                    {
+                        return None;
+                    }
+                    Some((s.matches, s.matched_lines))
+                })
+                .fold((0, 0), |(m, l), (fm, fl)| (m + fm, l + fl))
+        } else {
+            // Older servers only provide rendered rows.
+            count_reported_matches(matches)
+        };
         eprintln!("{num} matches ({lines} matched lines) in {elapsed:.1}ms (via server)");
     }
 
@@ -1700,6 +1722,10 @@ fn search_decoded_file(
 
     let match_opts = opts.match_options();
     let found = crate::matching::FileMatches::find(content, matcher, &match_opts)?;
+    if opts.stats {
+        let (matches, matched_lines) = found.match_totals();
+        writer.note_matches(matches, matched_lines);
+    }
 
     let has_matches = !found.is_empty();
     if !has_matches {
@@ -1851,7 +1877,15 @@ pub fn build_type_filter(
     defs.build_filter(types, types_not)
 }
 
-/// Match and matched-line totals for `--stats`, counted from the rows the
+/// Optional per-file RPC metadata, independent of rendered match/context rows.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileMatchStats {
+    pub file: String,
+    pub matches: u64,
+    pub matched_lines: u64,
+}
+
+/// Legacy match and matched-line totals for `--stats`, counted from the rows the
 /// client is actually going to print.
 ///
 /// ripgrep reports these two numbers separately and neither of them counts

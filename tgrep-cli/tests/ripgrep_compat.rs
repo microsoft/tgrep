@@ -264,6 +264,248 @@ fn with_stats_backends(
     check(&["--index-path", index], "(via server)");
 }
 
+#[test]
+fn indexed_hidden_copilot_modes_keep_visibility_and_ignore_parity() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    let prefix = format!("{}/", root.to_string_lossy().replace('\\', "/"));
+    let normalize = |path: &str| {
+        let path = path.replace('\\', "/");
+        path.strip_prefix(&prefix).unwrap().to_string()
+    };
+    for path in [".git", ".github/.nested", "ignored-dir"] {
+        fs::create_dir_all(root.join(path)).unwrap();
+    }
+    fs::write(
+        root.join(".gitignore"),
+        "ignored.txt\n.ignored.txt\nignored-dir/\n",
+    )
+    .unwrap();
+    let included = [
+        "visible.txt",
+        ".secret.txt",
+        ".github/settings.txt",
+        ".github/.nested/inner.txt",
+    ];
+    for path in
+        included
+            .iter()
+            .copied()
+            .chain(["ignored.txt", ".ignored.txt", "ignored-dir/child.txt"])
+    {
+        fs::write(root.join(path), "needle\n").unwrap();
+    }
+
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for hidden in [false, true] {
+            for mode in [
+                "content",
+                "--files-with-matches",
+                "--count",
+                "--json",
+                "--files",
+            ] {
+                let mut cmd = tgrep();
+                cmd.current_dir(&root).args(backend).args([
+                    "--stats",
+                    "--glob",
+                    "!.git",
+                    "--with-filename",
+                    "--no-heading",
+                    "--color",
+                    "never",
+                ]);
+                if hidden {
+                    cmd.arg("--hidden");
+                }
+                if mode != "content" {
+                    cmd.arg(mode);
+                }
+                cmd.arg("--");
+                if mode != "--files" {
+                    cmd.arg("needle");
+                }
+                let output = cmd.arg(&root).assert().success().get_output().clone();
+                let diagnostic = if mode == "--files" {
+                    match marker {
+                        "Search completed" => "(via local index)",
+                        "(via server)" => "(via server)",
+                        _ => "(via filesystem walk)",
+                    }
+                } else {
+                    marker
+                };
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains(diagnostic), "{backend:?} {mode}: {stderr}");
+                if marker == "Search completed" && mode != "--files" {
+                    assert!(stderr.contains("Query plan:"), "{stderr}");
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut actual: Vec<String> = if mode == "--json" {
+                    stdout
+                        .lines()
+                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                        .filter(|row| row["type"] == "match")
+                        .map(|row| normalize(row["data"]["path"]["text"].as_str().unwrap()))
+                        .collect()
+                } else {
+                    stdout.lines().map(normalize).collect()
+                };
+                let mut expected: Vec<String> = included
+                    .iter()
+                    .filter(|path| hidden || **path == "visible.txt")
+                    .map(|path| match mode {
+                        "content" => format!("{path}:needle"),
+                        "--count" => format!("{path}:1"),
+                        _ => path.to_string(),
+                    })
+                    .collect();
+                if hidden && mode == "--files" {
+                    expected.push(".gitignore".to_string());
+                }
+                actual.sort();
+                expected.sort();
+                assert_eq!(actual, expected, "{backend:?} {mode}, hidden={hidden}");
+            }
+        }
+    });
+}
+
+#[test]
+fn indexed_hidden_legacy_and_partial_coverage_scan_until_server_upgrade() {
+    let dir = setup_fixture();
+    let root = dir.path().join("testdata");
+    let prefix = format!("{}/", root.to_string_lossy().replace('\\', "/"));
+    let normalize = |path: &str| {
+        let path = path.replace('\\', "/");
+        path.strip_prefix(&prefix).unwrap().to_string()
+    };
+    let index = dir.path().join("idx");
+    fs::write(root.join("visible.txt"), "needle\n").unwrap();
+    tgrep()
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let meta_path = index.join("meta.json");
+    let original: serde_json::Value =
+        serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    assert_eq!(original["hidden_complete"], true);
+    fs::write(root.join(".late.txt"), "needle\n").unwrap();
+
+    for coverage in ["mismatched", "missing", "false", "partial"] {
+        let mut meta = original.clone();
+        match coverage {
+            "mismatched" => {
+                meta["file_table_id"] = serde_json::to_value([0u8; 32]).unwrap();
+            }
+            "missing" => {
+                meta.as_object_mut().unwrap().remove("hidden_complete");
+                meta.as_object_mut().unwrap().remove("visibility");
+            }
+            "false" => meta["hidden_complete"] = serde_json::json!(false),
+            _ => meta["complete"] = serde_json::json!(false),
+        }
+        fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let output = tgrep()
+            .args(["--index-path", index.to_str().unwrap()])
+            .args([
+                "--files-with-matches",
+                "--hidden",
+                "--glob",
+                "!.git",
+                "--with-filename",
+                "--stats",
+                "--",
+                "needle",
+            ])
+            .arg(&root)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("Brute-force search completed"))
+            .get_output()
+            .clone();
+        let mut paths: Vec<_> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(normalize)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, [".late.txt", "visible.txt"], "{coverage}");
+        tgrep()
+            .args(["--index-path", index.to_str().unwrap()])
+            .args(["--files", "--hidden", "--glob", "!.git", "--stats", "--"])
+            .arg(&root)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(".late.txt"))
+            .stderr(predicate::str::contains("(via filesystem walk)"));
+    }
+
+    let server = start_passthru_server(&root, &index);
+    let info: serde_json::Value =
+        serde_json::from_slice(&fs::read(index.join("serve.json")).unwrap()).unwrap();
+    let port = info["port"].as_u64().unwrap() as u16;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response =
+            send_rpc_request(port, r#"{"jsonrpc":"2.0","method":"status","id":0}"#).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&response).unwrap();
+        if status["result"]["hidden_complete"] == true {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "coverage did not upgrade: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut server = Some(server);
+    for marker in ["(via server)", "Query plan:"] {
+        if marker == "Query plan:" {
+            drop(server.take());
+        }
+        let output = tgrep()
+            .args(["--index-path", index.to_str().unwrap()])
+            .args([
+                "--files-with-matches",
+                "--hidden",
+                "--glob",
+                "!.git",
+                "--with-filename",
+                "--sort",
+                "path",
+                "--stats",
+                "--",
+                "needle",
+            ])
+            .arg(&root)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(marker))
+            .stderr(predicate::str::contains("Brute-force search completed").not())
+            .get_output()
+            .clone();
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(normalize)
+                .collect::<Vec<_>>(),
+            [".late.txt", "visible.txt"]
+        );
+    }
+    let upgraded: serde_json::Value =
+        serde_json::from_slice(&fs::read(meta_path).unwrap()).unwrap();
+    assert_eq!(upgraded["complete"], true);
+    assert_eq!(upgraded["hidden_complete"], true);
+}
+
 fn stats_totals(stderr: &[u8]) -> Vec<(u64, u64)> {
     let stderr = String::from_utf8_lossy(stderr);
     regex::Regex::new(r"(\d+) matches \((\d+) matched lines\)")
@@ -605,8 +847,33 @@ fn stats_scope_depth_filters_and_quiet_early_exit_apply_to_server_totals() {
         for (flags, expected) in [
             (vec!["--max-depth", "1"], (4, 3)),
             (vec!["--max-depth", "1", "-q"], (2, 1)),
-            (vec!["-g", "a.txt", "--stop-on-nonmatch"], (2, 1)),
-            (vec!["-g", "zero.txt"], (0, 0)),
+            (
+                vec![
+                    "-g",
+                    "!b.txt",
+                    "-g",
+                    "!zero.txt",
+                    "-g",
+                    "!nested",
+                    "-g",
+                    "!binary.txt",
+                    "--stop-on-nonmatch",
+                ],
+                (2, 1),
+            ),
+            (
+                vec![
+                    "-g",
+                    "!a.txt",
+                    "-g",
+                    "!b.txt",
+                    "-g",
+                    "!nested",
+                    "-g",
+                    "!binary.txt",
+                ],
+                (0, 0),
+            ),
         ] {
             let output = tgrep()
                 .args(backend)
@@ -3146,7 +3413,11 @@ fn indexed_passthru_prints_no_match_and_exits_one() {
             "--passthru",
             "--stats",
             "-g",
-            "hello.rs",
+            "!lib.rs",
+            "-g",
+            "!*.toml",
+            "-g",
+            "!*.txt",
             "does-not-exist",
             &indexed_fixture_path(&dir),
         ])
@@ -3313,7 +3584,11 @@ fn passthru_max_count_zero_matches_ripgrep_across_search_paths() {
             "--passthru",
             "--stats",
             "-g",
-            "hello.rs",
+            "!lib.rs",
+            "-g",
+            "!*.toml",
+            "-g",
+            "!*.txt",
             "-m",
             "0",
             pattern,
@@ -5975,9 +6250,8 @@ fn index_is_git_gated_by_default_like_ripgrep() {
     let dir = non_git_enlistment();
     let idx = dir.path().join("idx");
     let n = indexed_file_count(&indexed_fixture_path(&dir), idx.to_str().unwrap(), &[]);
-    // src/main.rs + build/gen.rs + out.log. `.gitignore` is dot-prefixed and so
-    // is filtered by the walk's hidden rule regardless of the git gate.
-    assert_eq!(n, 3, "no `.git`, so `.gitignore` must not apply by default");
+    // src/main.rs + build/gen.rs + out.log + the nonignored .gitignore source.
+    assert_eq!(n, 4, "no `.git`, so `.gitignore` must not apply by default");
 }
 
 #[test]
@@ -5989,9 +6263,9 @@ fn index_honours_no_require_git() {
         idx.to_str().unwrap(),
         &["--no-require-git"],
     );
-    // Only src/main.rs survives; `.gitignore` is dot-prefixed and hidden anyway.
+    // src/main.rs and the nonignored .gitignore source survive.
     assert_eq!(
-        n, 1,
+        n, 2,
         "`--no-require-git` must reach the indexing walk, not just search"
     );
 }

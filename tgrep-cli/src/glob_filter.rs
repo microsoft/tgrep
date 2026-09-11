@@ -1,23 +1,21 @@
-/// Compiled glob filter backed by the `globset` crate (same engine as ripgrep).
-///
-/// Glob patterns are compiled once at construction time and reused for all
-/// subsequent matches. Supports include/exclude semantics:
-/// - Patterns prefixed with `!` act as exclusions
-/// - Other patterns act as inclusions
-/// - If only exclusions exist, paths pass unless they match an exclusion
-/// - If inclusions exist, a path must match at least one inclusion AND
-///   must not match any exclusion
-///
-/// Matching is case-sensitive by default, as in ripgrep. `--glob-case-insensitive`
-/// flips that for every `-g` pattern, and `--iglob` patterns are always
-/// case-insensitive regardless.
-use anyhow::Result;
-use globset::{GlobBuilder, GlobMatcher};
+/// Ripgrep-style glob overrides, shared by indexed filtering and full walks.
+use std::path::Path;
 
-#[derive(Default)]
+use anyhow::Result;
+use tgrep_core::walker::{Override, OverrideBuilder};
+
 pub struct GlobFilter {
-    includes: Vec<GlobMatcher>,
-    excludes: Vec<GlobMatcher>,
+    overrides: Override,
+    globs: Vec<(String, bool)>,
+}
+
+impl Default for GlobFilter {
+    fn default() -> Self {
+        Self {
+            overrides: Override::empty(),
+            globs: Vec::new(),
+        }
+    }
 }
 
 impl GlobFilter {
@@ -27,26 +25,34 @@ impl GlobFilter {
     /// `case_insensitive` applies to `globs` only — `iglobs` are always
     /// case-insensitive. Returns an error if any pattern fails to compile.
     pub fn new(globs: &[String], iglobs: &[String], case_insensitive: bool) -> Result<Self> {
-        let mut filter = Self::default();
-        filter.push_all(globs, case_insensitive)?;
-        filter.push_all(iglobs, true)?;
+        let mut filter = Self {
+            globs: globs
+                .iter()
+                .map(|glob| (glob.replace('\\', "/"), case_insensitive))
+                .chain(iglobs.iter().map(|glob| (glob.replace('\\', "/"), true)))
+                .collect(),
+            ..Default::default()
+        };
+        filter.overrides = filter.walk_overrides(Path::new(""))?;
         Ok(filter)
     }
 
-    fn push_all(&mut self, globs: &[String], case_insensitive: bool) -> Result<()> {
-        for g in globs {
-            if let Some(neg) = g.strip_prefix('!') {
-                self.excludes.push(compile_glob(neg, case_insensitive)?);
-            } else {
-                self.includes.push(compile_glob(g, case_insensitive)?);
-            }
+    pub fn walk_overrides(&self, root: &Path) -> Result<Override> {
+        let mut builder = OverrideBuilder::new(root);
+        for (glob, case_insensitive) in &self.globs {
+            builder.case_insensitive(*case_insensitive)?.add(glob)?;
         }
-        Ok(())
+        Ok(builder.build()?)
+    }
+
+    /// Positive overrides may reinclude ignored files absent from the index.
+    pub fn has_includes(&self) -> bool {
+        self.overrides.num_whitelists() > 0
     }
 
     /// Returns true if the glob list is empty (no filtering needed).
     pub fn is_empty(&self) -> bool {
-        self.includes.is_empty() && self.excludes.is_empty()
+        self.overrides.is_empty()
     }
 
     /// Check if a path passes this glob filter.
@@ -62,34 +68,14 @@ impl GlobFilter {
         } else {
             path
         };
-        for m in &self.excludes {
-            if m.is_match(path) {
+        // A directory exclusion prunes its whole subtree in a filesystem walk.
+        for (end, _) in path.match_indices('/') {
+            if self.overrides.matched(&path[..end], true).is_ignore() {
                 return false;
             }
         }
-        if self.includes.is_empty() {
-            return true;
-        }
-        self.includes.iter().any(|m| m.is_match(path))
+        !self.overrides.matched(path, false).is_ignore()
     }
-}
-
-/// Compile a single glob pattern into a `GlobMatcher`.
-fn compile_glob(pattern: &str, case_insensitive: bool) -> Result<GlobMatcher> {
-    // Normalize backslashes so Windows-style globs work uniformly
-    let pattern = pattern.replace('\\', "/");
-    // Patterns without a path separator should match at any depth,
-    // e.g. "*.rs" behaves like "**/*.rs" (consistent with ripgrep --glob)
-    let pattern = if !pattern.contains('/') {
-        format!("**/{pattern}")
-    } else {
-        pattern
-    };
-    let glob = GlobBuilder::new(&pattern)
-        .case_insensitive(case_insensitive)
-        .literal_separator(true)
-        .build()?;
-    Ok(glob.compile_matcher())
 }
 
 #[cfg(test)]

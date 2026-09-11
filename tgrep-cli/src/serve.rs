@@ -34,6 +34,10 @@ mod poll_tests;
 #[path = "serve/recovery_tests.rs"]
 mod recovery_tests;
 
+#[cfg(test)]
+#[path = "serve/hidden_tests.rs"]
+mod hidden_tests;
+
 const CACHE_CAPACITY: usize = 50_000;
 /// Total decoded bytes the content cache may hold. The entry-count limit above
 /// says nothing about memory; without this a handful of large files can pin
@@ -88,8 +92,8 @@ const WATCHER_BURST_MAX: Duration = Duration::from_millis(100);
 const WATCHER_BURST_EVENT_CAP: usize = 1024;
 const WATCHER_BURST_PATH_CAP: usize = 4096;
 
-/// Git's index is hidden from the repository watcher. Poll its metadata only
-/// when the case-insensitive tracked-file exemption is active.
+/// Git's index may be excluded or outside the watched worktree. Poll its
+/// metadata only when the case-insensitive tracked-file exemption is active.
 const TRACKED_INDEX_POLL: Duration = Duration::from_secs(2);
 
 /// How long a file the watcher never heard about can stay wrong in the index.
@@ -232,7 +236,7 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
 ///   2. `gitignore`     — guards the watcher matcher; drop before file/index work
 ///   3. `publish_lock`  — serializes on-disk index publication
 ///   4. `index`         — guards the in-memory HybridIndex (read-heavy)
-///   5. `filename_extra_paths` — guards paths omitted from the content index
+///   5. `visibility`, then `filename_extra_paths` — guards path discovery metadata
 ///   6. `cache`         — guards the file content LRU cache
 ///   7. `file_evidence` — guards per-file stamps and content identities
 ///   8. `recent_reindexes` — guards exact duplicate evidence
@@ -447,6 +451,10 @@ impl RecentReindexCache {
 
 struct ServerState {
     index: RwLock<HybridIndex>,
+    /// Read under the index lock so visibility and content change together at
+    /// publication. Native events update it using metadata they already read.
+    visibility: RwLock<tgrep_core::visibility::PathVisibility>,
+    hidden_complete: std::sync::atomic::AtomicBool,
     /// Paths admitted by traversal but deliberately absent from the content
     /// index. Unioning these with `HybridIndex::all_paths` answers `--files`
     /// without duplicating every searchable path in memory.
@@ -454,8 +462,8 @@ struct ServerState {
     /// False for legacy/partial indexes until a complete filesystem walk has
     /// established the extra-path set.
     filename_index_ready: std::sync::atomic::AtomicBool,
-    /// The in-memory extra-path set differs from the last sidecar successfully
-    /// published to disk. Authoritative walks retry while this remains set.
+    /// Filename membership or visibility differs from its persisted snapshot.
+    /// Authoritative walks retry while this remains set.
     filename_index_dirty: std::sync::atomic::AtomicBool,
     cache: RwLock<ContentCache>,
     cache_generation: std::sync::atomic::AtomicU64,
@@ -634,7 +642,7 @@ struct ServerState {
     /// Built asynchronously after the server starts so large repos don't block
     /// `serve ready` on a full-tree `.gitignore` discovery walk. `None` while
     /// loading or if no matcher could be built; during that window the watcher
-    /// falls back to hidden / exclude filtering.
+    /// falls back to storage / exclude filtering.
     gitignore: RwLock<Option<tgrep_core::gitignore::IgnoreMatcher>>,
     /// Maximum RSS budget (bytes). When the process exceeds this during the
     /// initial build, the indexer flushes the overlay to disk and continues so
@@ -677,6 +685,8 @@ enum StaleRefreshPhase {
     BeforeRefreshLock,
     BeforeWalk,
     AfterBuildBeforeStampPublish,
+    BeforeCoverageReconcile,
+    AfterFilenameSidecarPublish,
     AfterConcreteRead,
     BeforeConcreteCommit,
     AfterMatcherPublish,
@@ -809,6 +819,11 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     // Ensure only one server runs per index directory.
     // The lock file is held for the lifetime of the server and released on exit.
     let _lock_file = try_acquire_server_lock(&index_dir)?;
+    let index_dir = std::fs::canonicalize(&index_dir)?;
+    anyhow::ensure!(
+        !root.starts_with(&index_dir),
+        "index directory must not contain the source root"
+    );
     index_cleanup::cleanup_retired(&index_dir);
 
     let has_index = index_dir.join("lookup.bin").exists();
@@ -835,21 +850,10 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     let existing_files = hybrid.num_files();
 
     // Check meta.json complete flag to decide whether to rebuild
-    let index_complete = tgrep_core::meta::IndexMeta::load(&index_dir)
-        .map(|m| m.complete)
-        .unwrap_or(false);
-    let (filename_extra_paths, filename_index_ready) = if index_complete {
-        match tgrep_core::path_index::read_extra_paths(&index_dir) {
-            Ok(Some(paths)) => (paths.into_iter().collect(), true),
-            Ok(None) => (std::collections::HashSet::new(), false),
-            Err(error) => {
-                eprintln!("[trace] filename index failed to load ({error}); rebuilding");
-                (std::collections::HashSet::new(), false)
-            }
-        }
-    } else {
-        (std::collections::HashSet::new(), false)
-    };
+    let index_meta = tgrep_core::meta::IndexMeta::load(&index_dir).ok();
+    let index_complete = index_meta.as_ref().is_some_and(|meta| meta.complete);
+    let discovery =
+        StartupDiscovery::load(&index_dir, index_meta, hybrid.reader_arc().file_table_id());
 
     let needs_build = needs_build || !index_complete;
 
@@ -867,8 +871,10 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
 
     let state = Arc::new(ServerState {
         index: RwLock::new(hybrid),
-        filename_extra_paths: RwLock::new(filename_extra_paths),
-        filename_index_ready: std::sync::atomic::AtomicBool::new(filename_index_ready),
+        visibility: RwLock::new(discovery.visibility),
+        hidden_complete: std::sync::atomic::AtomicBool::new(discovery.hidden_complete),
+        filename_extra_paths: RwLock::new(discovery.filename_extra_paths),
+        filename_index_ready: std::sync::atomic::AtomicBool::new(discovery.filename_index_ready),
         filename_index_dirty: std::sync::atomic::AtomicBool::new(false),
         cache: RwLock::new(ContentCache::new(
             CACHE_CAPACITY,
@@ -1035,6 +1041,59 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct StartupDiscovery {
+    visibility: tgrep_core::visibility::PathVisibility,
+    hidden_complete: bool,
+    filename_extra_paths: std::collections::HashSet<String>,
+    filename_index_ready: bool,
+}
+
+impl StartupDiscovery {
+    fn load(
+        index_dir: &Path,
+        meta: Option<tgrep_core::meta::IndexMeta>,
+        file_table_id: tgrep_core::meta::FileTableId,
+    ) -> Self {
+        let Some(meta) = meta else {
+            return Self::default();
+        };
+        let mut discovery = Self {
+            visibility: meta.visibility,
+            hidden_complete: meta.complete
+                && meta.hidden_complete
+                && meta.version == tgrep_core::meta::INDEX_FORMAT_VERSION
+                && meta.file_table_id == Some(file_table_id),
+            ..Default::default()
+        };
+        if meta.complete {
+            match tgrep_core::path_index::read_filename_index(index_dir) {
+                Ok(Some(index)) => {
+                    if let Some(visibility) = index.visibility
+                        && visibility.file_table_id == file_table_id
+                    {
+                        // The sidecar can be newer than meta.json after an
+                        // interrupted filename-only publication. Keep its
+                        // membership and visibility together on restart too.
+                        discovery.visibility = visibility.paths;
+                        discovery.filename_extra_paths = index.paths.into_iter().collect();
+                        discovery.filename_index_ready = true;
+                    } else {
+                        eprintln!(
+                            "[trace] filename visibility unavailable or mismatched; rebuilding"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("[trace] filename index failed to load ({error}); rebuilding");
+                }
+            }
+        }
+        discovery
+    }
 }
 
 /// Build the ignore matcher used by the watcher from files discovered by a walk
@@ -1346,30 +1405,95 @@ fn process_request(request: &str, state: &Arc<ServerState>) -> String {
 
     match method {
         "search" => handle_search(id, &params, state),
-        "files" => handle_files(id, state),
+        "files" => handle_files(id, &params, state),
         "status" => handle_status(id, state),
         "reload" => handle_reload(id, state),
         _ => json_rpc_error(id, -32601, &format!("Method not found: {method}")),
     }
 }
 
-fn handle_files(id: Option<serde_json::Value>, state: &ServerState) -> String {
+fn handle_files(
+    id: Option<serde_json::Value>,
+    params: &serde_json::Value,
+    state: &ServerState,
+) -> String {
     state.note_search();
-    if state.indexing.load(Ordering::SeqCst) || !state.filename_index_ready.load(Ordering::SeqCst) {
-        return json_rpc_error(id, -32001, "filename index is not ready");
-    }
+    let scope = match SearchScope::parse(params) {
+        Ok(scope) => scope,
+        Err(error) => return json_rpc_error(id, -32602, &error),
+    };
 
     let mut files = {
         // Keep the documented index -> filename lock order.
         let index = state.index.read().unwrap();
+        if state.indexing.load(Ordering::SeqCst)
+            || !state.hidden_complete.load(Ordering::SeqCst)
+            || !state.filename_index_ready.load(Ordering::SeqCst)
+        {
+            return json_rpc_error(id, -32001, "filename index is not ready");
+        }
+        let visibility = state.visibility.read().unwrap();
         let extra = state.filename_extra_paths.read().unwrap();
         let mut files = index.all_paths();
         files.extend(extra.iter().cloned());
+        files.retain(|path| {
+            scope.relative(path).is_some()
+                && visibility.is_visible(path, &scope.prefix, scope.hidden)
+        });
         files
     };
     files.sort_unstable();
     files.dedup();
-    json_rpc_result(id, serde_json::json!({ "files": files }))
+    json_rpc_result(
+        id,
+        serde_json::json!({ "files": files, "hidden_complete": true }),
+    )
+}
+
+#[derive(Default)]
+struct SearchScope {
+    prefix: String,
+    hidden: bool,
+    max_depth: Option<usize>,
+}
+
+impl SearchScope {
+    fn parse(params: &serde_json::Value) -> std::result::Result<Self, String> {
+        let prefix = params
+            .get("scope")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if prefix.starts_with('/')
+            || prefix.contains('\\')
+            || prefix.split('/').any(|part| matches!(part, "." | ".."))
+        {
+            return Err("scope must be an index-relative directory".to_string());
+        }
+        let prefix = prefix.trim_end_matches('/');
+        Ok(Self {
+            prefix: if prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}/")
+            },
+            // Absence means ordinary ripgrep visibility, including old clients.
+            hidden: params
+                .get("hidden")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+            max_depth: params
+                .get("max_depth")
+                .and_then(|value| value.as_u64())
+                .map(|depth| usize::try_from(depth).unwrap_or(usize::MAX)),
+        })
+    }
+
+    fn relative<'a>(&self, indexed: &'a str) -> Option<&'a str> {
+        let relative = indexed.strip_prefix(&self.prefix)?;
+        self.max_depth
+            .is_none_or(|max| relative.matches('/').count() < max)
+            .then_some(relative)
+    }
 }
 
 /// Parsed and validated search request parameters.
@@ -1382,6 +1506,7 @@ struct SearchRequest {
     type_filter: tgrep_core::filetypes::TypeFilter,
     encoding: tgrep_core::encoding::EncodingMode,
     opts: SearchOpts,
+    scope: SearchScope,
 }
 
 /// Parse and validate all search parameters from a JSON-RPC request.
@@ -1584,6 +1709,7 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         glob_filter,
         type_filter,
         encoding,
+        scope: SearchScope::parse(params)?,
         opts: SearchOpts {
             files_only,
             invert_match,
@@ -1632,6 +1758,7 @@ fn handle_search(
     let opts = req.opts;
     let pattern = req.pattern;
     let case_insensitive = req.case_insensitive;
+    let scope = req.scope;
 
     // The index build already dropped everything above the server's own cap, so
     // re-checking a query cap that is no stricter can never reject a candidate
@@ -1647,6 +1774,11 @@ fn handle_search(
     let t_index = Instant::now();
     let (candidate_info, raw_candidate_count): (Vec<(String, PathBuf)>, usize) = {
         let index = state.index.read().unwrap();
+        // Check the same generation whose candidates and visibility we read.
+        if state.indexing.load(Ordering::SeqCst) || !state.hidden_complete.load(Ordering::SeqCst) {
+            return json_rpc_error(id, -32001, "hidden-inclusive index coverage is not ready");
+        }
+        let visibility = state.visibility.read().unwrap();
 
         // The reader snapshot is returned alongside the file IDs so that
         // path resolution below uses the *same* reader that produced the
@@ -1672,11 +1804,15 @@ fn handle_search(
                         return None;
                     }
                 };
-                if !type_filter.matches(&rel_path) {
+                let scoped = scope.relative(&rel_path)?;
+                if !visibility.is_visible(&rel_path, &scope.prefix, scope.hidden) {
+                    return None;
+                }
+                if !type_filter.matches(scoped) {
                     type_filtered_count += 1;
                     return None;
                 }
-                if !glob_filter.is_empty() && !glob_filter.matches(&rel_path) {
+                if !glob_filter.is_empty() && !glob_filter.matches(scoped) {
                     glob_filtered_count += 1;
                     if first_glob_rejected.is_none() {
                         first_glob_rejected = Some(rel_path);
@@ -1828,6 +1964,7 @@ fn handle_search(
         // `file_stats`, when requested, carries the original match totals.
         "num_matches": matches.len(),
         "elapsed_ms": elapsed_ms,
+        "hidden_complete": true,
     });
     if opts.stats {
         result["file_stats"] = serde_json::json!(file_stats);
@@ -2076,6 +2213,7 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
         "reconcile_pending": refresh.catch_up,
         "reconcile_overdue": state.watch_enabled && (refresh.catch_up || refresh.finished.elapsed() >= if state.refresh.polling.load(Ordering::SeqCst) { state.refresh.poll_interval } else { RECONCILE_DEADLINE }),
         "indexing": indexing,
+        "hidden_complete": state.hidden_complete.load(Ordering::SeqCst) && !indexing,
         "index_progress": state.index_progress.load(std::sync::atomic::Ordering::Relaxed),
         "index_total": state.index_total.load(std::sync::atomic::Ordering::Relaxed),
     });
@@ -2115,6 +2253,7 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
             exclude_dirs: state.exclude_dirs.clone(),
+            exclude_paths: vec![state.index_dir.clone()],
             collect_gitignore_files: !state.no_ignore,
             ..Default::default()
         },
@@ -2570,12 +2709,19 @@ fn start_file_watcher_using(
                 return;
             }
             match result {
-                Ok(event) => enqueue_watcher_event(
-                    &tx,
-                    &callback_overflow,
-                    &callback_state.watch_resubscribe,
-                    event,
-                ),
+                Ok(mut event) => {
+                    event
+                        .paths
+                        .retain(|path| !path.starts_with(&callback_state.index_dir));
+                    if !event.paths.is_empty() || event.need_rescan() {
+                        enqueue_watcher_event(
+                            &tx,
+                            &callback_overflow,
+                            &callback_state.watch_resubscribe,
+                            event,
+                        );
+                    }
+                }
                 // Some backends report native event loss as an error rather
                 // than a rescan event. Both need the same repair as a full queue.
                 //
@@ -2788,11 +2934,9 @@ fn run_stale_refresh_hook(state: &ServerState, phase: StaleRefreshPhase) {
 
 /// Decide whether the file watcher should skip a path entirely.
 ///
-/// Mirrors the file walker's hidden-path, `--exclude` directory filtering,
+/// Mirrors the file walker's `--exclude` directory filtering,
 /// and `.gitignore` rules so the watcher does not reindex files that the
 /// initial walk would never have indexed for those reasons:
-///   * any path component starting with `.` (matches `WalkBuilder::hidden(true)`),
-///     including the file name itself (e.g. `.envrc`).
 ///   * any *ancestor directory* component matching one of the configured
 ///     `--exclude` names. The walker only treats `--exclude` names as
 ///     directory subtree filters (it skips the whole subtree when the entry
@@ -2840,8 +2984,7 @@ fn should_skip_watcher_entry(
     is_dir: bool,
 ) -> bool {
     // Single streaming pass over path components — no Vec allocation
-    // on the hot watcher path. The hidden-component check applies to
-    // every segment (including the basename); the exclude_dirs check
+    // on the hot watcher path. The exclude_dirs check
     // applies only to *ancestor* directory components, so we test
     // "is there a next segment?" via Peekable to skip the basename.
     let mut segments = rel_path
@@ -2850,9 +2993,6 @@ fn should_skip_watcher_entry(
         .peekable();
 
     while let Some(seg) = segments.next() {
-        if seg.starts_with('.') {
-            return true;
-        }
         // An ancestor is always a directory; the final segment is one only
         // when the caller says so.
         let segment_is_dir = segments.peek().is_some() || is_dir;
@@ -3274,9 +3414,16 @@ fn watchable_dirs(
     start: &Path,
     exclude_dirs: &[String],
     gitignore: Option<&tgrep_core::gitignore::IgnoreMatcher>,
+    index_dir: &Path,
 ) -> WatchableDirs {
     let mut found = std::collections::HashSet::new();
     let mut completeness = TraversalCompleteness::Complete;
+    if start.starts_with(index_dir) {
+        return WatchableDirs {
+            dirs: found,
+            completeness,
+        };
+    }
     found.insert(start.to_path_buf());
 
     let mut stack = vec![start.to_path_buf()];
@@ -3300,6 +3447,9 @@ fn watchable_dirs(
                 continue;
             }
             let path = entry.path();
+            if path.starts_with(index_dir) {
+                continue;
+            }
             let Ok(rel) = path.strip_prefix(root) else {
                 completeness = TraversalCompleteness::Incomplete;
                 continue;
@@ -3394,12 +3544,21 @@ fn sync_watch_registrations(state: &ServerState, root: &Path) -> (Vec<PathBuf>, 
     let start = Instant::now();
     let mut desired = {
         let gitignore = state.gitignore.read().unwrap();
-        watchable_dirs(root, root, &state.exclude_dirs, gitignore.as_ref())
+        watchable_dirs(
+            root,
+            root,
+            &state.exclude_dirs,
+            gitignore.as_ref(),
+            &state.index_dir,
+        )
     };
     if !state.no_ignore {
         let sources = state.ignore_sources.read().unwrap();
         desired.dirs.extend(ignore_target_dirs(root, &sources));
     }
+    desired
+        .dirs
+        .retain(|path| !path.starts_with(&state.index_dir));
     // Hold the registry through enumeration and application. Startup does not
     // hold snapshot_gate, and an older complete scan must not prune watches
     // established by a newer matcher publication or subtree registration.
@@ -3566,10 +3725,9 @@ fn changed_ignore_rules_in(
 /// nothing.
 ///
 /// `since` is when the walk behind `dirs` began — the start of the window this
-/// is closing. It is only consulted for ignore-rules files, where "did this
-/// arrive after the matcher was decided" cannot be answered from the stamps:
-/// the dot-prefixed ones are hidden, so they are never indexed and never have
-/// one. The opposite case — one that was *deleted* in the window — is handled
+/// is closing. It is only consulted for ignore-rules files, where content
+/// stamps do not prove which version the published matcher used. The opposite
+/// case — one that was *deleted* in the window — is handled
 /// separately, from `state.ignore_sources`, since a deleted file leaves nothing
 /// to stat.
 ///
@@ -3650,10 +3808,16 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
     let mut unreadable_dirs: Vec<String> = Vec::new();
 
     for dir in dirs {
+        if dir.starts_with(&state.index_dir) {
+            continue;
+        }
         let Ok(rel_dir) = dir.strip_prefix(root) else {
             continue;
         };
         let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
+        if let Ok(metadata) = std::fs::metadata(dir) {
+            record_path_visibility(state, &rel_dir, &metadata);
+        }
         let Ok(entries) = std::fs::read_dir(dir) else {
             // No listing means no evidence, and the sweep below must not treat
             // silence as absence. Whether the directory is gone or merely
@@ -3674,6 +3838,9 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
                 continue;
             };
             let path = entry.path();
+            if path.starts_with(&state.index_dir) {
+                continue;
+            }
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
@@ -3933,7 +4100,7 @@ fn sweep_removed_files(
 /// window is small but it is exactly the one a checkout or a build fills, and
 /// anything lost in it stays invisible until the hourly reconcile.
 fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
-    if !native_watching(state) {
+    if !native_watching(state) || dir.starts_with(&state.index_dir) {
         return;
     }
     // `is_dir` follows symlinks; the walker does not. Refuse a symlinked
@@ -4004,6 +4171,15 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
             if !seen.insert(subdir.clone()) {
                 continue;
             }
+            if let Ok(metadata) = std::fs::metadata(&subdir)
+                && let Ok(relative) = subdir.strip_prefix(root)
+            {
+                record_path_visibility(
+                    state,
+                    &relative.to_string_lossy().replace('\\', "/"),
+                    &metadata,
+                );
+            }
             let Ok(entries) = std::fs::read_dir(&subdir) else {
                 continue;
             };
@@ -4012,15 +4188,16 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
                     continue;
                 };
                 let path = entry.path();
+                if path.starts_with(&state.index_dir) {
+                    continue;
+                }
                 let Ok(rel) = path.strip_prefix(root) else {
                     continue;
                 };
                 let rel = rel.to_string_lossy().replace('\\', "/");
                 // A subtree that arrives whole — a clone, a `mv`, a branch
-                // switch — can carry its own ignore rules. Those files are
-                // dot-prefixed, so the scan below would silently drop them and
-                // index the rest of the subtree against rules that do not know
-                // about them.
+                // switch — can carry its own ignore rules. Refresh the matcher
+                // before indexing the rest of the subtree against stale rules.
                 //
                 // Ahead of the type dispatch, and following links: the walker
                 // collects rule files with `Path::is_file`, which resolves
@@ -4204,6 +4381,9 @@ fn defer_events_during_build(state: &ServerState, event: &Event) -> bool {
     // trigger a subtree walk on replay. See `ServerState::deferred_events`.
     let introduces_dir = event_introduces_dir(&event.kind);
     for path in &event.paths {
+        if path.starts_with(&state.index_dir) {
+            continue;
+        }
         // A path seen both ways keeps the stronger claim: a directory that was
         // created and then chmod'd still needs its subtree picked up.
         let entry = paths.entry(path.clone()).or_insert(false);
@@ -4271,18 +4451,7 @@ fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
         if !is_real_dir(&path)
             && path.strip_prefix(root).is_ok_and(|rel| {
                 let rel = rel.to_string_lossy().replace('\\', "/");
-                let has_content_descendant = {
-                    let index = state.index.read().unwrap();
-                    index.reader_has_descendant_path(&rel) || index.live.has_descendant_path(&rel)
-                };
-                let prefix = format!("{rel}/");
-                has_content_descendant
-                    || state
-                        .filename_extra_paths
-                        .read()
-                        .unwrap()
-                        .iter()
-                        .any(|path| path.starts_with(&prefix))
+                has_indexed_descendant(state, &rel)
             })
         {
             // A single directory removal/rename event names no descendants.
@@ -4404,6 +4573,20 @@ fn recovery_scan_dirs(state: &ServerState, root: &Path, mut dirs: Vec<PathBuf>) 
     dirs
 }
 
+fn has_indexed_descendant(state: &ServerState, relative: &str) -> bool {
+    let index = state.index.read().unwrap();
+    if index.reader_has_descendant_path(relative) || index.live.has_descendant_path(relative) {
+        return true;
+    }
+    let prefix = format!("{relative}/");
+    state
+        .filename_extra_paths
+        .read()
+        .unwrap()
+        .iter()
+        .any(|path| path.starts_with(&prefix))
+}
+
 fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     if state.refresh.polling.load(Ordering::SeqCst) {
         return;
@@ -4431,10 +4614,11 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     let ignore_rules_changed = !state.no_ignore && {
         let stamps = state.ignore_source_stamps.read().unwrap();
         event.paths.iter().any(|path| {
-            is_ignore_rules_file(root, path)
-                || path
-                    .strip_prefix(root)
-                    .is_ok_and(|rel| stamps.contains_key(&rel.to_string_lossy().replace('\\', "/")))
+            !path.starts_with(&state.index_dir)
+                && (is_ignore_rules_file(root, path)
+                    || path.strip_prefix(root).is_ok_and(|rel| {
+                        stamps.contains_key(&rel.to_string_lossy().replace('\\', "/"))
+                    }))
         })
     };
     if ignore_rules_changed {
@@ -4477,10 +4661,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
 
     for path in &event.paths {
         // Skip the index directory itself
-        if path
-            .to_string_lossy()
-            .contains(&format!("{}.tgrep", std::path::MAIN_SEPARATOR))
-        {
+        if path.starts_with(&state.index_dir) {
             continue;
         }
 
@@ -4490,9 +4671,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         };
 
         // Mirror the walker's filtering so the watcher does not reindex
-        // files the initial walk would have skipped — most notably
-        // hidden directories like `.git/`, which fire frequent
-        // `index.lock`/HEAD/refs writes during normal git operations.
+        // files the initial walk would have skipped.
         let should_skip = {
             let gitignore = state.gitignore.read().unwrap();
             should_skip_watcher_path(&rel_path, &state.exclude_dirs, gitignore.as_ref())
@@ -4509,7 +4688,11 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         // that was still perfectly valid. `reindex_file` deliberately preserves
         // entries through exactly those failures, but it never got the chance:
         // the drop happens here, before it is ever called.
-        let target = classify_event_target(&std::fs::metadata(path));
+        let metadata = std::fs::metadata(path);
+        let target = classify_event_target(&metadata);
+        if let Ok(metadata) = &metadata {
+            record_path_visibility(state, &rel_path, metadata);
+        }
         if target == EventTarget::Unknown {
             // Unreadable right now is not proof of anything. Leave what is
             // indexed alone; the stale path keeps such files and retries them.
@@ -4519,6 +4702,13 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
         let is_remove = matches!(event.kind, EventKind::Remove(_)) || target == EventTarget::Gone;
 
         if is_remove {
+            if has_indexed_descendant(state, &rel_path) {
+                // Directory renames/removals can name only the directory,
+                // not its children. Reuse the coalesced recovery path to
+                // reconcile descendants, ignore sources and subscriptions.
+                state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+                schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
+            }
             // A watched directory that disappears takes its descriptor with
             // it, but not its entry in the registry. Clearing that entry is
             // what lets the path be subscribed again if it comes back — and
@@ -5073,6 +5263,9 @@ fn content_id_matches(
 /// The caller must hold `snapshot_gate`: the read, the commit, and the stamp
 /// update have to be atomic with respect to a flush or auto-save.
 fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bool) {
+    if path.starts_with(&state.index_dir) {
+        return;
+    }
     // Against other indexers, not against searches. The gate above is held for
     // read, so without this a recovery scan and the watcher worker can both be
     // here for the same path, both read, and the one that read the *older*
@@ -5108,6 +5301,9 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         retry_failed_reindex(state, rel_path, "the opened file could not be inspected");
         return;
     };
+    // Attribute-only changes must update visibility even if version/content
+    // evidence lets the rest of this reindex return early.
+    record_path_visibility(state, rel_path, &meta);
     let mut version = tgrep_core::builder::file_version(&meta);
     let mut current = version.stamp().clone();
 
@@ -5476,6 +5672,7 @@ fn persist_pending_index_changes(state: &Arc<ServerState>) -> bool {
                 operation: "auto-save",
                 authoritative_membership: false,
                 authoritative_listed_files: None,
+                visibility: None,
                 scanned_files: &[],
             },
         );
@@ -5535,15 +5732,6 @@ fn auto_save_loop(state: Arc<ServerState>) {
     }
 }
 
-/// Check whether `path` passes the glob filter list.
-///
-/// Glob semantics:
-/// - Patterns starting with `!` are **exclusion** patterns (path must NOT match).
-/// - All other patterns are **inclusion** patterns (path must match at least one).
-/// - If only exclusion patterns are present, the path passes unless it matches
-///   an exclusion.
-/// - If inclusion patterns are present, the path must match at least one AND
-///   must not match any exclusion.
 fn json_rpc_result(id: Option<serde_json::Value>, result: serde_json::Value) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -5568,22 +5756,28 @@ fn json_rpc_error(id: Option<serde_json::Value>, code: i32, message: &str) -> St
 /// Replace the filename-only delta from an authoritative filesystem path set.
 ///
 /// Returns whether the delta changed and therefore needs to be persisted.
-fn replace_filename_extra_paths(state: &ServerState, listed_files: &[String]) -> bool {
-    let content_paths: std::collections::HashSet<String> = state
-        .index
-        .read()
-        .unwrap()
-        .all_paths()
-        .into_iter()
-        .collect();
+fn replace_filename_extra_paths(
+    state: &ServerState,
+    listed_files: &[String],
+    visibility: &tgrep_core::visibility::PathVisibility,
+) -> bool {
+    // Queries take index before both leaf locks, so the exclusive guard makes
+    // membership and visibility one snapshot without changing content.
+    #[allow(clippy::readonly_write_lock)]
+    let index = state.index.write().unwrap();
+    let content_paths: std::collections::HashSet<String> = index.all_paths().into_iter().collect();
     let next: std::collections::HashSet<String> = listed_files
         .iter()
         .filter(|path| !content_paths.contains(path.as_str()))
         .cloned()
         .collect();
+    let mut current_visibility = state.visibility.write().unwrap();
     let mut current = state.filename_extra_paths.write().unwrap();
-    let changed = *current != next || !state.filename_index_ready.load(Ordering::SeqCst);
+    let changed = *current != next
+        || *current_visibility != *visibility
+        || !state.filename_index_ready.load(Ordering::SeqCst);
     if changed {
+        *current_visibility = visibility.clone();
         *current = next;
         state.filename_index_dirty.store(true, Ordering::SeqCst);
     }
@@ -5591,7 +5785,12 @@ fn replace_filename_extra_paths(state: &ServerState, listed_files: &[String]) ->
     changed
 }
 
-fn stage_filename_extra_paths(state: &ServerState, staging_dir: &Path) -> Result<()> {
+fn stage_filename_extra_paths(
+    state: &ServerState,
+    staging_dir: &Path,
+    visibility: &tgrep_core::visibility::PathVisibility,
+    file_table_id: tgrep_core::meta::FileTableId,
+) -> Result<()> {
     let mut paths: Vec<String> = state
         .filename_extra_paths
         .read()
@@ -5600,45 +5799,122 @@ fn stage_filename_extra_paths(state: &ServerState, staging_dir: &Path) -> Result
         .cloned()
         .collect();
     paths.sort_unstable();
-    tgrep_core::path_index::write_extra_paths(staging_dir, &paths)?;
+    tgrep_core::path_index::write_extra_paths_with_visibility(
+        staging_dir,
+        &paths,
+        visibility,
+        file_table_id,
+    )?;
     Ok(())
 }
 
 /// Publish just the filename sidecar after an authoritative walk that did not
 /// otherwise need to rewrite the content index.
 fn persist_filename_extra_paths(state: &ServerState, index_dir: &Path) -> bool {
-    let staging_dir = index_dir.join(".filename-index-staging");
-    index_cleanup::cleanup_staging(&staging_dir);
-    if let Err(error) = stage_filename_extra_paths(state, &staging_dir) {
-        eprintln!("[trace] warning: could not stage filename index: {error}");
-        index_cleanup::cleanup_staging(&staging_dir);
-        return false;
-    }
-
-    let published = {
-        let _publish = state.publish_lock.lock().unwrap();
-        let src = staging_dir.join(tgrep_core::path_index::EXTRA_PATHS_FILENAME);
-        let dst = index_dir.join(tgrep_core::path_index::EXTRA_PATHS_FILENAME);
-        match publish_file(&src, &dst) {
-            Ok(()) => true,
-            Err(error) => {
-                eprintln!("[trace] warning: could not publish filename index: {error}");
-                false
-            }
-        }
-    };
-    index_cleanup::cleanup_staging(&staging_dir);
-    if published {
-        state.filename_index_dirty.store(false, Ordering::SeqCst);
-    }
-    published
+    persist_filename_discovery(state, index_dir, None)
 }
 
-fn refresh_filename_index(state: &ServerState, index_dir: &Path, listed_files: &[String]) {
-    let changed = replace_filename_extra_paths(state, listed_files);
-    if changed || state.filename_index_dirty.load(Ordering::SeqCst) {
-        persist_filename_extra_paths(state, index_dir);
+fn persist_filename_discovery(
+    state: &ServerState,
+    index_dir: &Path,
+    authoritative_coverage: Option<bool>,
+) -> bool {
+    let staging_dir = index_dir.join(".filename-index-staging");
+    index_cleanup::cleanup_staging(&staging_dir);
+    let staged = (|| -> Result<tgrep_core::meta::IndexMeta> {
+        let mut meta = tgrep_core::meta::IndexMeta::load(index_dir)?;
+        let upgraded = builder::stage_file_table_upgrade(index_dir, &staging_dir)?;
+        let file_table_id =
+            tgrep_core::meta::read_file_table_id(if upgraded { &staging_dir } else { index_dir })?;
+        meta.version = tgrep_core::meta::INDEX_FORMAT_VERSION;
+        meta.file_table_id = Some(file_table_id);
+        meta.visibility = state.visibility.read().unwrap().clone();
+        if let Some(complete) = authoritative_coverage {
+            meta.complete = true;
+            meta.hidden_complete = complete;
+        } else {
+            meta.hidden_complete = meta.complete && state.hidden_complete.load(Ordering::SeqCst);
+        }
+        stage_filename_extra_paths(state, &staging_dir, &meta.visibility, file_table_id)?;
+        meta.save(&staging_dir)?;
+        Ok(meta)
+    })();
+    let meta = match staged {
+        Ok(meta) => meta,
+        Err(error) => {
+            eprintln!("[trace] warning: could not stage filename visibility: {error}");
+            index_cleanup::cleanup_staging(&staging_dir);
+            return false;
+        }
+    };
+
+    let published = (|| -> Result<()> {
+        let _publish = state.publish_lock.lock().unwrap();
+        let files = staging_dir.join("files.bin");
+        if files.exists() {
+            // Only the header changes; files.bin is read into memory, not mapped.
+            publish_file(&files, &index_dir.join("files.bin"))?;
+        }
+        let src = staging_dir.join(tgrep_core::path_index::EXTRA_PATHS_FILENAME);
+        let dst = index_dir.join(tgrep_core::path_index::EXTRA_PATHS_FILENAME);
+        publish_file(&src, &dst)?;
+        #[cfg(test)]
+        run_stale_refresh_hook(state, StaleRefreshPhase::AfterFilenameSidecarPublish);
+        publish_file(&staging_dir.join("meta.json"), &index_dir.join("meta.json"))?;
+        let _index = state.index.write().unwrap();
+        state
+            .hidden_complete
+            .store(meta.hidden_complete, Ordering::SeqCst);
+        state.filename_index_dirty.store(false, Ordering::SeqCst);
+        Ok(())
+    })();
+    index_cleanup::cleanup_staging(&staging_dir);
+    if let Err(error) = published {
+        eprintln!("[trace] warning: could not publish filename index: {error}");
+        return false;
     }
+    true
+}
+
+fn refresh_filename_index(
+    state: &ServerState,
+    index_dir: &Path,
+    listed_files: &[String],
+    visibility: &tgrep_core::visibility::PathVisibility,
+) -> bool {
+    let changed = replace_filename_extra_paths(state, listed_files, visibility);
+    let hidden_complete = state.unreadable.read().unwrap().is_empty();
+    if changed
+        || state.filename_index_dirty.load(Ordering::SeqCst)
+        || state.hidden_complete.load(Ordering::SeqCst) != hidden_complete
+    {
+        return persist_filename_discovery(state, index_dir, Some(hidden_complete));
+    }
+    true
+}
+
+fn record_path_visibility(state: &ServerState, relative: &str, metadata: &std::fs::Metadata) {
+    let ignore = state.gitignore.read().unwrap();
+    if state.visibility.write().unwrap().record(
+        relative,
+        metadata.is_dir(),
+        Some(metadata),
+        ignore.as_ref(),
+    ) {
+        state.filename_index_dirty.store(true, Ordering::SeqCst);
+    }
+}
+
+fn stage_index_visibility(
+    index_dir: &Path,
+    visibility: &tgrep_core::visibility::PathVisibility,
+    hidden_complete: bool,
+) -> Result<tgrep_core::meta::IndexMeta> {
+    let mut meta = tgrep_core::meta::IndexMeta::load(index_dir)?;
+    meta.visibility = visibility.clone();
+    meta.hidden_complete = meta.complete && hidden_complete;
+    meta.save(index_dir)?;
+    Ok(meta)
 }
 
 /// Create a minimal empty on-disk index so HybridIndex::open() succeeds.
@@ -5857,6 +6133,7 @@ struct StaleMergePolicy<'a> {
     operation: &'a str,
     authoritative_membership: bool,
     authoritative_listed_files: Option<&'a [String]>,
+    visibility: Option<&'a tgrep_core::visibility::PathVisibility>,
     /// Pre-read scan metadata for failure memoization, never indexed evidence.
     scanned_files: &'a [tgrep_core::walker::FileMeta],
 }
@@ -5888,6 +6165,7 @@ fn stream_merge_stale_changes(
         operation,
         authoritative_membership,
         authoritative_listed_files,
+        visibility,
         scanned_files,
     } = policy;
     let stamps = &evidence.stamps;
@@ -6047,6 +6325,12 @@ fn stream_merge_stale_changes(
         }
 
         builder::merge_index_with_delta(root, &staging_dir, &reader, &delta, &removed, true)?;
+        let hidden_complete = state.hidden_complete.load(Ordering::SeqCst)
+            || (visibility.is_some() && unreadable.is_empty() && preserved.is_empty());
+        let visibility = visibility
+            .cloned()
+            .unwrap_or_else(|| state.visibility.read().unwrap().clone());
+        stage_index_visibility(&staging_dir, &visibility, hidden_complete)?;
         tgrep_core::meta::write_file_evidence(&published_evidence, &staging_dir)?;
         let removed_reader_files = reader
             .all_paths()
@@ -6398,6 +6682,7 @@ fn refresh_stale_locked(
         root,
         &walker::MetaWalkOptions {
             exclude_dirs: state.exclude_dirs.clone(),
+            exclude_paths: vec![state.index_dir.clone()],
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
@@ -6494,9 +6779,8 @@ fn refresh_stale_locked(
         paths
     };
     if old_evidence.stamps.is_empty() && indexed_paths.is_empty() && current_meta.is_empty() {
-        refresh_filename_index(state, index_dir, listed_files);
         eprintln!("[trace] stale check: no indexed files or filesystem files, skipping");
-        return true;
+        return refresh_filename_index(state, index_dir, listed_files, &walk.visibility);
     }
 
     let (mut changed, mut added, deleted) = classify_evidence_changes(
@@ -6529,13 +6813,12 @@ fn refresh_stale_locked(
     let total_changes = changed.len() + added.len() + deleted.len();
     let live_pending = state.index.read().unwrap().live.has_pending_changes();
     if total_changes == 0 && !live_pending {
-        refresh_filename_index(state, index_dir, listed_files);
         eprintln!(
             "[trace] stale check: index is up-to-date ({} files checked in {}ms)",
             current_meta.len(),
             walk_ms
         );
-        return true;
+        return refresh_filename_index(state, index_dir, listed_files, &walk.visibility);
     }
 
     if total_changes == 0 {
@@ -6585,6 +6868,7 @@ fn refresh_stale_locked(
             operation: "stale check",
             authoritative_membership: true,
             authoritative_listed_files: Some(listed_files),
+            visibility: Some(&walk.visibility),
             scanned_files: current_meta,
         },
     ) {
@@ -6600,6 +6884,7 @@ fn refresh_stale_locked(
 /// partway through can leave truncated files that the currently mmap'd reader
 /// no longer matches. Resetting gives the fallback build a clean base.
 fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
+    state.hidden_complete.store(false, Ordering::SeqCst);
     state.file_evidence.write().unwrap().clear();
     if let Err(e) = create_empty_index(index_dir) {
         eprintln!("[trace] warning: could not reset the index directory ({e})");
@@ -6608,6 +6893,7 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
     match HybridIndex::open(index_dir, root) {
         Ok(empty) => {
             let mut index = state.index.write().unwrap();
+            *state.visibility.write().unwrap() = Default::default();
             let mut extra = state.filename_extra_paths.write().unwrap();
             let mut cache = state.cache.write().unwrap();
             *index = empty;
@@ -6631,10 +6917,9 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
 /// memory to the arena budget instead, and is also faster, because it writes
 /// the index once rather than growing an overlay and then flushing it.
 ///
-/// The trade-off is that queries see an empty index until the build finishes
-/// rather than a growing partial one. That is deliberate: results from a
-/// fraction of the repository are misleading, and `status` already reports
-/// that indexing is in progress.
+/// Clients scan until complete coverage is published. Results from a fraction
+/// of the repository would be misleading, and `status` reports that indexing
+/// is in progress.
 ///
 /// Only used when nothing has been indexed yet. Resuming a partial index still
 /// takes the incremental path, which can skip the files already on disk.
@@ -6661,15 +6946,12 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         root,
         Some(index_dir),
         &builder::BuildOptions {
-            include_hidden: false,
+            include_hidden: true,
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
             exclude_dirs: state.exclude_dirs.clone(),
-            // Match the walk `background_index_build` would have run, and the
-            // dot-prefix rule `should_skip_watcher_path` applies, so the
-            // watcher can maintain every file this build indexes. Also makes
-            // the walk hand back the .gitignore paths for the matcher below.
+            exclude_paths: vec![state.index_dir.clone()],
             collect_gitignore_files: true,
             strategy: builder::IndexStrategy::External,
             buffer_bytes: builder::DEFAULT_INDEX_BUFFER_BYTES,
@@ -6682,6 +6964,14 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
                 "[trace] warning: external bootstrap build failed ({e}); \
                  falling back to the in-heap build"
             );
+            reset_to_empty_index(state, root, index_dir);
+            return false;
+        }
+    };
+    let meta = match tgrep_core::meta::IndexMeta::load(index_dir) {
+        Ok(meta) => meta,
+        Err(error) => {
+            eprintln!("[trace] warning: bootstrapped coverage failed to load: {error}");
             reset_to_empty_index(state, root, index_dir);
             return false;
         }
@@ -6723,6 +7013,10 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         let mut extra = state.filename_extra_paths.write().unwrap();
         let mut cache = state.cache.write().unwrap();
         *index = opened;
+        *state.visibility.write().unwrap() = meta.visibility;
+        state
+            .hidden_complete
+            .store(meta.complete && meta.hidden_complete, Ordering::SeqCst);
         forget_recent_reindexes(state);
         if let Some(paths) = filename_extra_paths {
             *extra = paths;
@@ -6935,12 +7229,13 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     let walk = walker::walk_dir_with_ignorecase(
         root,
         &WalkOptions {
-            include_hidden: false,
+            include_hidden: true,
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
             collect_gitignore_files: !state.no_ignore,
             exclude_dirs: state.exclude_dirs.clone(),
+            exclude_paths: vec![state.index_dir.clone()],
             ..Default::default()
         },
         ignorecase.clone(),
@@ -7174,12 +7469,18 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         root,
         &tgrep_core::walker::MetaWalkOptions {
             exclude_dirs: state.exclude_dirs.clone(),
+            exclude_paths: vec![state.index_dir.clone()],
             no_ignore: state.no_ignore,
             no_require_git: state.no_require_git,
             max_file_size: state.max_file_size,
         },
     );
     let metadata_errors = walk_meta.skipped_error;
+    let visibility = if metadata_errors == 0 {
+        walk_meta.visibility
+    } else {
+        walk.visibility
+    };
     let listed_files = complete_background_listed_files(
         root,
         walk.listed_files,
@@ -7243,8 +7544,13 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     // (not skip) until the flush publishes, after which it applies safely to
     // the newly published reader; no event is lost.
     let gate = state.snapshot_gate.write().unwrap();
+    // Seeded entries may be stale or no longer eligible. A successful final
+    // reconciliation, not merely appending the missing files, proves coverage.
+    state.hidden_complete.store(false, Ordering::SeqCst);
     if let Some(listed_files) = &listed_files {
-        replace_filename_extra_paths(state, listed_files);
+        replace_filename_extra_paths(state, listed_files, &visibility);
+    } else {
+        *state.visibility.write().unwrap() = visibility;
     }
     state.flushing.store(true, Ordering::SeqCst);
 
@@ -7288,16 +7594,16 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
     drop(gate);
 
     state.flushing.store(false, Ordering::SeqCst);
-    if !state.watch_enabled {
-        if !catch_up_unwatched_build(state, root, index_dir) {
-            state.ignore_rules_dirty.store(true, Ordering::SeqCst);
-            eprintln!(
-                "[trace] warning: unwatched background-build catch-up was incomplete; \
-                 leaving stamps invalid for the scheduled stale check"
-            );
-        }
-        state.indexing.store(false, Ordering::SeqCst);
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeCoverageReconcile);
+    if !catch_up_unwatched_build(state, root, index_dir) {
+        state.ignore_rules_dirty.store(true, Ordering::SeqCst);
+        eprintln!(
+            "[trace] warning: background-build catch-up was incomplete; \
+             hidden searches will scan until coverage is established"
+        );
     }
+    state.indexing.store(false, Ordering::SeqCst);
 
     // Reclaim memory held by the indexing-time live overlay — but only when
     // the flush actually completed and `prune_persisted_entries` ran. If the
@@ -7372,7 +7678,7 @@ fn flush_append_only_overlay_locked(
     }
     let num_files = reader.num_files() + overlay_paths.len();
 
-    let staging_dir = index_dir.with_file_name(".tgrep_flush_staging");
+    let staging_dir = index_dir.join(".flush-staging");
     index_cleanup::cleanup_staging(&staging_dir);
 
     // Stream-merge overlay onto the existing on-disk index. Incremental
@@ -7391,6 +7697,15 @@ fn flush_append_only_overlay_locked(
         return false;
     }
     drop(reader);
+    if let Err(error) = stage_index_visibility(
+        &staging_dir,
+        &state.visibility.read().unwrap(),
+        state.hidden_complete.load(Ordering::SeqCst),
+    ) {
+        eprintln!("[trace] warning: could not stage hidden-file coverage: {error}");
+        index_cleanup::cleanup_staging(&staging_dir);
+        return false;
+    }
 
     // Stage filestamps alongside the final complete index. If this fails we
     // still publish the index: losing incremental stale-check state on next
@@ -7452,14 +7767,33 @@ fn publish_staged_index(
     preserve_overlay_paths: &std::collections::HashSet<String>,
     filename_extra_paths: Option<&std::collections::HashSet<String>>,
 ) -> PublishStatus {
+    let meta = match tgrep_core::meta::IndexMeta::load(staging_dir) {
+        Ok(meta) => meta,
+        Err(error) => {
+            eprintln!("[trace] warning: could not read staged coverage: {error}");
+            index_cleanup::cleanup_staging(staging_dir);
+            return PublishStatus::Failed;
+        }
+    };
     let stage_filename_index =
         filename_extra_paths.is_some() || state.filename_index_ready.load(Ordering::SeqCst);
+    let Some(file_table_id) = meta.file_table_id else {
+        eprintln!("[trace] warning: staged index has no file-table identity");
+        index_cleanup::cleanup_staging(staging_dir);
+        return PublishStatus::Failed;
+    };
     let filename_stage_result = if let Some(paths) = filename_extra_paths {
         let mut paths: Vec<String> = paths.iter().cloned().collect();
         paths.sort_unstable();
-        tgrep_core::path_index::write_extra_paths(staging_dir, &paths).map_err(Into::into)
+        tgrep_core::path_index::write_extra_paths_with_visibility(
+            staging_dir,
+            &paths,
+            &meta.visibility,
+            file_table_id,
+        )
+        .map_err(Into::into)
     } else if state.filename_index_ready.load(Ordering::SeqCst) {
-        stage_filename_extra_paths(state, staging_dir)
+        stage_filename_extra_paths(state, staging_dir, &meta.visibility, file_table_id)
     } else {
         Ok(())
     };
@@ -7504,6 +7838,10 @@ fn publish_staged_index(
     // observe the new posting set with bytes from the old cache generation.
     {
         let mut index = state.index.write().unwrap();
+        *state.visibility.write().unwrap() = meta.visibility;
+        state
+            .hidden_complete
+            .store(meta.hidden_complete, Ordering::SeqCst);
         if let Some(paths) = filename_extra_paths {
             *state.filename_extra_paths.write().unwrap() = paths.clone();
             state.filename_index_ready.store(true, Ordering::SeqCst);
@@ -7543,6 +7881,14 @@ fn publish_reloaded_index(
     staging_dir: &Path,
     num_files: usize,
 ) -> bool {
+    let meta = match tgrep_core::meta::IndexMeta::load(staging_dir) {
+        Ok(meta) => meta,
+        Err(error) => {
+            eprintln!("[trace] warning: could not read reloaded coverage: {error}");
+            index_cleanup::cleanup_staging(staging_dir);
+            return false;
+        }
+    };
     let filename_extra_paths = match tgrep_core::path_index::read_extra_paths(staging_dir) {
         Ok(Some(paths)) => paths.into_iter().collect(),
         Ok(None) => {
@@ -7583,6 +7929,10 @@ fn publish_reloaded_index(
     // both in that order makes the complete reload visible as one generation.
     {
         let mut index = state.index.write().unwrap();
+        *state.visibility.write().unwrap() = meta.visibility;
+        state
+            .hidden_complete
+            .store(meta.hidden_complete, Ordering::SeqCst);
         *state.filename_extra_paths.write().unwrap() = filename_extra_paths;
         state.filename_index_ready.store(true, Ordering::SeqCst);
         state.filename_index_dirty.store(false, Ordering::SeqCst);
@@ -8642,6 +8992,8 @@ mod tests {
         let hybrid = HybridIndex::open(index_dir, root).expect("open empty index");
         Arc::new(ServerState {
             index: RwLock::new(hybrid),
+            visibility: RwLock::new(Default::default()),
+            hidden_complete: std::sync::atomic::AtomicBool::new(true),
             filename_extra_paths: RwLock::new(Default::default()),
             filename_index_ready: std::sync::atomic::AtomicBool::new(false),
             filename_index_dirty: std::sync::atomic::AtomicBool::new(false),
@@ -8829,7 +9181,7 @@ mod tests {
         assert_eq!(value.pointer("/result/status").unwrap(), "reloaded");
         assert!(state.filename_index_ready.load(Ordering::SeqCst));
 
-        let response = handle_files(Some(serde_json::json!(2)), &state);
+        let response = handle_files(Some(serde_json::json!(2)), &serde_json::Value::Null, &state);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(
             value.pointer("/result/files").unwrap(),
@@ -8899,7 +9251,12 @@ mod tests {
         state.filename_index_dirty.store(true, Ordering::SeqCst);
         tgrep_core::path_index::write_extra_paths(&index_dir, &[]).unwrap();
 
-        refresh_filename_index(state.as_ref(), &index_dir, &["asset.bin".to_string()]);
+        refresh_filename_index(
+            state.as_ref(),
+            &index_dir,
+            &["asset.bin".to_string()],
+            &Default::default(),
+        );
 
         assert_eq!(
             tgrep_core::path_index::read_extra_paths(&index_dir).unwrap(),
@@ -9129,29 +9486,32 @@ mod tests {
     }
 
     #[test]
-    fn skip_watcher_path_skips_dot_components() {
+    fn skip_watcher_path_keeps_nonignored_dot_components() {
         let no_exclude: Vec<String> = Vec::new();
-        // A leading dot dir is the canonical case (.git, .hg, .svn, ...).
-        assert!(should_skip_watcher_path(
+        assert!(!should_skip_watcher_path(
             ".git/index.lock",
             &no_exclude,
             None
         ));
-        assert!(should_skip_watcher_path(".git/HEAD", &no_exclude, None));
-        assert!(should_skip_watcher_path(
+        assert!(!should_skip_watcher_path(".git/HEAD", &no_exclude, None));
+        assert!(!should_skip_watcher_path(
             ".hg/store/data",
             &no_exclude,
             None
         ));
-        // A dot component anywhere in the path skips, not just the leading one.
-        assert!(should_skip_watcher_path(
+        assert!(!should_skip_watcher_path(
             "src/.cache/build.tmp",
             &no_exclude,
             None
         ));
-        assert!(should_skip_watcher_path(
+        assert!(!should_skip_watcher_path(
             "a/b/.hidden/c.txt",
             &no_exclude,
+            None
+        ));
+        assert!(should_skip_watcher_path(
+            ".git/HEAD",
+            &[".git".to_string()],
             None
         ));
     }
@@ -9405,7 +9765,7 @@ mod tests {
     }
 
     #[test]
-    fn watchable_dirs_prunes_ignored_and_hidden_subtrees() {
+    fn watchable_dirs_prunes_ignored_and_storage_subtrees() {
         // The point of the subscription set: an ignored directory costs one
         // inotify watch descriptor per directory inside it, so pruning has to
         // happen before the subtree is walked, not after its events arrive.
@@ -9421,6 +9781,8 @@ mod tests {
             "build/a",
             "build/a/deep",
             ".git/objects",
+            ".github/workflows",
+            "custom-index/.retired/generation-1",
             "vendor",
             "vendor/pkg",
         ] {
@@ -9429,7 +9791,7 @@ mod tests {
 
         let gi = tgrep_core::gitignore::build_matcher(root).expect("matcher should build");
         let exclude = vec!["vendor".to_string()];
-        let dirs = watchable_dirs(root, root, &exclude, Some(&gi));
+        let dirs = watchable_dirs(root, root, &exclude, Some(&gi), &root.join("custom-index"));
 
         let rel: std::collections::HashSet<String> = dirs
             .dirs
@@ -9456,9 +9818,11 @@ mod tests {
         assert!(!rel.contains("build/a"));
         assert!(!rel.contains("build/a/deep"));
 
-        // Hidden directories, which the walker skips too.
-        assert!(!rel.contains(".git"));
-        assert!(!rel.contains(".git/objects"));
+        assert!(rel.contains(".git"));
+        assert!(rel.contains(".git/objects"));
+        assert!(rel.contains(".github/workflows"));
+        assert!(!rel.contains("custom-index"));
+        assert!(!rel.contains("custom-index/.retired/generation-1"));
 
         // `--exclude` names prune the directory itself, not just its children.
         assert!(!rel.contains("vendor"), "excluded dir was watched: {rel:?}");
@@ -9468,14 +9832,14 @@ mod tests {
     #[test]
     fn watchable_dirs_without_a_matcher_keeps_everything_visible() {
         // `--no-ignore` publishes no matcher. The subscription set must then
-        // be the whole tree minus hidden paths, matching what the walk indexes;
+        // be the whole tree minus storage, matching what the walk indexes;
         // silently narrowing it would drop events for files that ARE indexed.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("build/a")).unwrap();
         std::fs::create_dir_all(root.join(".hidden")).unwrap();
 
-        let dirs = watchable_dirs(root, root, &[], None);
+        let dirs = watchable_dirs(root, root, &[], None, &root.join(".tgrep"));
         let rel: std::collections::HashSet<String> = dirs
             .dirs
             .iter()
@@ -9489,7 +9853,7 @@ mod tests {
 
         assert!(rel.contains("build"));
         assert!(rel.contains("build/a"));
-        assert!(!rel.contains(".hidden"));
+        assert!(rel.contains(".hidden"));
     }
 
     #[test]
@@ -9508,7 +9872,13 @@ mod tests {
         }
 
         let gi = tgrep_core::gitignore::build_matcher(root).expect("matcher should build");
-        let dirs = watchable_dirs(root, &root.join("src/fresh"), &[], Some(&gi));
+        let dirs = watchable_dirs(
+            root,
+            &root.join("src/fresh"),
+            &[],
+            Some(&gi),
+            &root.join(".tgrep"),
+        );
         let rel: std::collections::HashSet<String> = dirs
             .dirs
             .iter()
@@ -9601,6 +9971,7 @@ mod tests {
                     operation: "test stale check",
                     authoritative_membership: true,
                     authoritative_listed_files: Some(&listed_files),
+                    visibility: None,
                     scanned_files: &[],
                 },
             ));
@@ -9644,6 +10015,7 @@ mod tests {
                     operation: "test retry",
                     authoritative_membership: true,
                     authoritative_listed_files: None,
+                    visibility: None,
                     scanned_files: &[],
                 },
             ));
@@ -9727,6 +10099,7 @@ mod tests {
                     operation: "test evidence merge",
                     authoritative_membership: true,
                     authoritative_listed_files: None,
+                    visibility: None,
                     scanned_files: &[],
                 },
             ));
@@ -9915,7 +10288,9 @@ mod tests {
                 StaleRefreshPhase::BeforeRefreshLock => {}
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
-                StaleRefreshPhase::BeforeConcreteCommit => {}
+                StaleRefreshPhase::BeforeConcreteCommit
+                | StaleRefreshPhase::BeforeCoverageReconcile
+                | StaleRefreshPhase::AfterFilenameSidecarPublish => {}
             })
         };
         *state.stale_refresh_hook.lock().unwrap() = Some(hook);
@@ -10055,7 +10430,9 @@ mod tests {
                 StaleRefreshPhase::BeforeRefreshLock => {}
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
-                StaleRefreshPhase::BeforeConcreteCommit => {}
+                StaleRefreshPhase::BeforeConcreteCommit
+                | StaleRefreshPhase::BeforeCoverageReconcile
+                | StaleRefreshPhase::AfterFilenameSidecarPublish => {}
             })
         };
         *state.stale_refresh_hook.lock().unwrap() = Some(hook);
@@ -10229,7 +10606,9 @@ mod tests {
                 StaleRefreshPhase::BeforeRefreshLock => {}
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
-                StaleRefreshPhase::BeforeConcreteCommit => {}
+                StaleRefreshPhase::BeforeConcreteCommit
+                | StaleRefreshPhase::BeforeCoverageReconcile
+                | StaleRefreshPhase::AfterFilenameSidecarPublish => {}
             })
         };
         *state.stale_refresh_hook.lock().unwrap() = Some(hook);
@@ -10561,7 +10940,7 @@ mod tests {
 
         let response = handle_reload(None, &state);
         assert!(response.contains("\"status\":\"reloaded\""), "{response}");
-        let response = handle_files(None, &state);
+        let response = handle_files(None, &serde_json::Value::Null, &state);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(
             value.pointer("/result/files").unwrap(),
@@ -11049,6 +11428,9 @@ mod tests {
         assert_eq!(index.live.file_id_for_path("recycled.rs"), Some(first_id));
         assert_eq!(index.live.dirty_count(), 1);
         drop(index);
+        assert!(!state.hidden_complete.load(Ordering::SeqCst));
+        // The synthetic one-file corpus is now fully restored.
+        state.hidden_complete.store(true, Ordering::SeqCst);
         let found = handle_search(
             None,
             &serde_json::json!({"pattern": "recycled_marker"}),
@@ -13729,6 +14111,9 @@ mod tests {
         );
         let old_bytes = std::fs::read(index_dir.join("index.bin")).unwrap();
         create_empty_index(&staging).unwrap();
+        let mut staged_meta = tgrep_core::meta::IndexMeta::load(&staging).unwrap();
+        staged_meta.file_table_id = Some(tgrep_core::meta::read_file_table_id(&staging).unwrap());
+        staged_meta.save(&staging).unwrap();
 
         assert_eq!(
             publish_staged_index(

@@ -45,6 +45,10 @@ pub fn run(root: &Path, index_path: Option<&Path>) -> Result<()> {
         } else {
             println!("  Indexing:   complete");
         }
+        println!(
+            "  Hidden coverage: {}",
+            coverage_label(status.hidden_complete.unwrap_or(false))
+        );
         return Ok(());
     }
 
@@ -57,6 +61,10 @@ pub fn run(root: &Path, index_path: Option<&Path>) -> Result<()> {
             println!("  Created:    {}", format_timestamp(meta.created_at));
             println!("  Updated:    {}", format_timestamp(meta.updated_at));
             println!("  Server:     not running");
+            println!(
+                "  Hidden coverage: {}",
+                coverage_label(meta.complete && meta.hidden_complete)
+            );
         }
         Err(_) => {
             println!("No index found at {}", index_dir.display());
@@ -92,6 +100,15 @@ struct StatusResult {
     index_progress: u64,
     #[serde(default)]
     index_total: u64,
+    hidden_complete: Option<bool>,
+}
+
+fn coverage_label(complete: bool) -> &'static str {
+    if complete {
+        "complete"
+    } else {
+        "unavailable (queries scan)"
+    }
 }
 
 fn write_refresh_status(writer: &mut impl Write, status: &StatusResult) -> std::io::Result<()> {
@@ -225,6 +242,7 @@ mod tests {
         let status: StatusResult = serde_json::from_value(legacy_status()).unwrap();
         assert!(status.watcher_active);
         assert!(!status.indexing);
+        assert!(status.hidden_complete.is_none());
         assert!(!status.reconcile_running);
         assert!(status.watch_mode_requested.is_none());
         assert!(status.watch_mode_active.is_none());

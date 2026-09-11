@@ -68,9 +68,9 @@ tgrep <pattern> ---TCP---> tgrep serve (multi-client)
 - **LiveIndex** — in-memory overlay for files modified after server start, or
   being built by the background indexer
 - **HybridIndex** — merges both layers; overlay takes precedence
-- **Background Indexer** — builds the index in parallel batches of 1,024 files 
-  (with additional byte-based splitting); a cold start serves an empty index until
-  the first build is published, while a resumed partial index is processed at 500 files
+- **Background Indexer** — builds the index in parallel batches of 1,024 files
+  (with additional byte-based splitting); resumed partial indexes use batches of
+  500 files. Clients scan until complete hidden-file coverage is published
 - **Periodic Flush** — every 50K files or 5 minutes, the in-memory index is
   flushed to disk and the reader is swapped, keeping memory bounded
 - **Automatic refresh** — native `notify` subscriptions update LiveIndex in
@@ -96,8 +96,8 @@ tgrep is designed to be significantly faster than ripgrep on large repos:
   (`--no-max-filesize` removes it)
 - **Lock-free reads** — `RwLock<HashMap>` cache allows concurrent reads
   without contention
-- **Hot serving** — queries work immediately during background index building;
-  no need to wait for full index
+- **Hot serving** — queries work immediately during background index building,
+  falling back to filesystem scans until the index is ready
 
 See [BENCHMARKS.md](BENCHMARKS.md) for end-to-end large-repo benchmarks and
 Criterion microbenchmarks for query execution, trigram extraction, and index
@@ -270,9 +270,9 @@ other. See
 `tgrep serve` uses the same bounded builder when it has to create an index from
 scratch, so starting a server on an unindexed repo costs the same memory as
 `tgrep index` (**148.6 MiB** rather than 1.6 GiB on the Linux kernel, and 2.6x
-faster). While that first build runs the server answers from an empty index
-rather than a partial one; incremental updates after it completes are
-unaffected.
+faster). While that first build runs, clients fall back to filesystem scans
+rather than returning partial results; incremental updates after it completes
+are unaffected.
 
 ### Start the server
 
@@ -286,11 +286,11 @@ tgrep serve . --no-watch              # disable all automatic refresh
 tgrep serve . --exclude node_modules   # exclude directories from indexing
 ```
 
-The server builds the index in the background if none exists. During that
-first build, queries are answered from an empty index and return nothing;
-`tgrep status` reports that indexing is in progress. When the server resumes a partial
-index instead, queries are answered from the files already indexed. Multiple
-clients can connect simultaneously.
+The server builds the index in the background if none exists and resumes
+incomplete builds. Clients scan the filesystem until the full corpus is ready;
+`tgrep status` reports indexing progress and hidden-file coverage. Legacy
+indexes are upgraded by startup reconciliation. Multiple clients can connect
+simultaneously.
 
 On Windows, replaced index generations remain under the index directory's
 `.retired` folder while readers still have them memory-mapped. Cleanup uses
@@ -683,11 +683,38 @@ restriction, and `--files` never applies it.
 
 ### Flags that bypass the index
 
-The index is built over text files only, skipping hidden and ignored ones, so
-flags that widen or re-interpret that set are answered by walking the tree
-instead: `-E/--encoding`, `-a/--text`, `--binary`, `-./--hidden`, and every
-`--no-ignore*` variant. Naming a single file also skips the index, since
-reading one file directly is cheaper than loading one.
+`index` and `serve` include hidden, **non-ignored** files by default.
+`--hidden` is accepted on either command but is redundant. Ordinary queries
+still hide hidden files and directories; `-./--hidden` includes them using the
+index or server, for content searches and `--files`. Visibility is relative to
+the requested search root and includes Windows hidden attributes. Ignore rules
+inside hidden directories remain active. The configured index directory,
+including its staging and retired generations, is always excluded from indexing.
+
+Flags that widen or re-interpret the indexed corpus still walk the tree:
+`-E/--encoding`, `-a/--text`, `--binary`, every `--no-ignore*` variant, and
+positive `--glob`/`--iglob` overrides, which can explicitly reinclude ignored
+files. Negative-only globs, such as `--glob '!.git'`, remain index-compatible
+and exclude entire matching directory subtrees. `--hidden` never disables
+ignore rules. Naming a single file also skips the index, since reading one
+file directly is cheaper than loading one.
+
+Legacy indexes without proven hidden-file coverage and incomplete builds fall
+back to a filesystem scan, rather than returning partial results. Run
+`tgrep index` to rebuild, or start a current `tgrep serve` to reconcile and
+upgrade an existing index automatically. Queries keep scanning until coverage
+is established. A current client also falls back when an older server cannot
+confirm that capability. As before, a completed on-disk index is a snapshot,
+not a guarantee that later filesystem changes have been indexed.
+
+New indexes use a versioned file table and filename sidecar so older clients
+cannot silently expose hidden files by ignoring visibility metadata. Older
+binaries reject the new local content index; filename listing can fall back to
+walking. New binaries still read older formats to migrate them. To downgrade,
+rebuild with the older binary, preferably at a separate `--index-path`.
+Visibility is bound to the path table, and filename-only membership is
+published together with its visibility; mismatched generations fall back to
+scanning rather than guessing.
 
 ### Invalid UTF-8
 
@@ -779,9 +806,9 @@ exit code determined by the search alone. Suppress the message with
 
 3. **Serving** — `tgrep serve` wraps the index in a HybridIndex, watches for
    filesystem changes, and serves queries over TCP. If no index exists, it
-   builds one in the background (batches of 1,024 files and may split sooner 
-   by byte budgets); queries see an empty index until that first build is published, 
-   and see partial data only when a partial index is being resumed. The index is 
+   builds one in the background (batches of 1,024 files, split sooner by byte
+   budgets); clients scan until complete coverage is published, including when
+   resuming a partial index;
    after the initial build, pending changes are auto-saved when 5,000 content mutations accumulate by default, or on the first periodic check at least 10 minutes after startup or the last successful save. Multiple clients connect simultaneously;
 
    searches use read locks for zero contention.
@@ -792,9 +819,9 @@ exit code determined by the search alone. Suppress the message with
 |------|-------------|
 | `lookup.bin` | Sorted 16-byte entries: `trigram(u32) + offset(u64) + length(u32)` |
 | `index.bin` | Concatenated posting lists: `file_id(u32)` per entry |
-| `files.bin` | File ID→path mapping: `file_id(u32) + path_len(u16) + path_bytes` |
-| `files-extra.bin` | Paths included by `--files` but absent from `files.bin` |
-| `meta.json` | Version, file/trigram counts, timestamps |
+| `files.bin` | Version 3 header, then `file_id(u32) + path_len(u16) + path_bytes`; legacy headerless tables remain readable |
+| `files-extra.bin` | Version 2 filename-only paths, visibility, and file-table identity |
+| `meta.json` | Version, file/trigram counts, timestamps, coverage, visibility, and file-table identity |
 | `serve.json` | Server PID and TCP port (for client discovery) |
 
 ## Project Structure

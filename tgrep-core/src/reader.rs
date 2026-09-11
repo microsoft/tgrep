@@ -14,6 +14,7 @@ pub struct IndexReader {
     lookup: Option<Mmap>,
     postings: Option<Mmap>,
     file_paths: Vec<String>,
+    file_table_id: crate::meta::FileTableId,
     /// File IDs sorted by path, for exact membership checks without duplicating
     /// every path string in a second collection.
     path_order: Vec<usize>,
@@ -94,7 +95,8 @@ impl IndexReader {
         // Load file paths. A truncated files.bin used to be silently accepted,
         // resulting in queries that returned empty file paths for high IDs.
         let files_data = std::fs::read(&files_path)?;
-        let file_entries = ondisk::decode_file_entries(&files_data)?;
+        let file_table_id = crate::meta::file_table_id(&files_data);
+        let file_entries = ondisk::decode_file_entries(ondisk::file_table_body(&files_data)?)?;
 
         // Validate that file IDs are dense (0..N) with no duplicates.
         // Without this, a corrupted files.bin declaring an id like
@@ -130,6 +132,7 @@ impl IndexReader {
             lookup,
             postings,
             file_paths,
+            file_table_id,
             path_order,
             num_entries,
         })
@@ -143,6 +146,7 @@ impl IndexReader {
             lookup: None,
             postings: None,
             file_paths: Vec::new(),
+            file_table_id: crate::meta::file_table_id(&[]),
             path_order: Vec::new(),
             num_entries: 0,
         }
@@ -221,6 +225,10 @@ impl IndexReader {
     /// Total number of indexed files.
     pub fn num_files(&self) -> usize {
         self.file_paths.len()
+    }
+
+    pub fn file_table_id(&self) -> crate::meta::FileTableId {
+        self.file_table_id
     }
 
     /// Total number of unique trigrams.
@@ -609,6 +617,7 @@ mod tests {
             lookup: opened.lookup,
             postings: opened.postings,
             file_paths: opened.file_paths,
+            file_table_id: opened.file_table_id,
             path_order: opened.path_order,
             num_entries: 0,
         };

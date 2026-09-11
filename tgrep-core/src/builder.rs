@@ -82,17 +82,10 @@ pub struct BuildOptions {
     /// output. This opts out of that gate.
     pub no_require_git: bool,
     pub exclude_dirs: Vec<String>,
-    /// Apply leading-dot ("hidden") filtering in the walk instead of the
-    /// platform's native hidden check, and treat `.gitignore` files as
-    /// hidden.
-    ///
-    /// The two differ on Windows, where the native check reads the
-    /// `FILE_ATTRIBUTE_HIDDEN` bit that git does not set on dotfiles, so a
-    /// default walk indexes `.gitignore`, `.mailmap`, and friends there but
-    /// not on Unix. `tgrep serve` walks with leading-dot semantics on every
-    /// platform, and its file watcher skips dot-prefixed paths outright, so a
-    /// build destined for a server must opt in — otherwise the server would
-    /// index dotfiles it can never afterwards update or remove.
+    /// Additional storage paths to exclude when building into a staging
+    /// directory. The output directory itself is always excluded.
+    pub exclude_paths: Vec<std::path::PathBuf>,
+    /// Return ignore-file paths for the server's watcher matcher.
     pub collect_gitignore_files: bool,
     pub strategy: IndexStrategy,
     /// Arena budget in bytes for [`IndexStrategy::External`]. Ignored by
@@ -105,10 +98,11 @@ pub struct BuildOptions {
 impl Default for BuildOptions {
     fn default() -> Self {
         Self {
-            include_hidden: false,
+            include_hidden: true,
             no_ignore: false,
             no_require_git: false,
             exclude_dirs: Vec::new(),
+            exclude_paths: Vec::new(),
             collect_gitignore_files: false,
             strategy: IndexStrategy::default(),
             buffer_bytes: external::DEFAULT_BUFFER_BYTES,
@@ -650,6 +644,19 @@ pub fn build_index_with_options_and_ignorecase(
         None => root.join(INDEX_DIR_NAME),
     };
     std::fs::create_dir_all(&index_dir)?;
+    let storage_path = std::fs::canonicalize(&index_dir)?;
+    if root.starts_with(&storage_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "index directory must not contain the source root",
+        )
+        .into());
+    }
+    let mut exclude_paths = opts.exclude_paths.clone();
+    exclude_paths.push(storage_path);
+    let mut building_meta = IndexMeta::new(&root.to_string_lossy(), 0, 0);
+    building_meta.complete = false;
+    building_meta.save(&index_dir)?;
     // Evidence belongs to the complete core generation. Invalidate it before
     // an in-place writer can truncate any core file.
     meta::remove_file_evidence(&index_dir)?;
@@ -667,8 +674,11 @@ pub fn build_index_with_options_and_ignorecase(
             include_hidden,
             no_ignore,
             no_require_git: opts.no_require_git,
-            collect_gitignore_files: opts.collect_gitignore_files,
+            // Visibility must retain hidden entries admitted by ignore-file
+            // whitelists, even for a build without a watcher.
+            collect_gitignore_files: true,
             exclude_dirs: exclude_dirs.to_vec(),
+            exclude_paths,
             max_file_size: opts.max_file_size,
             ..Default::default()
         },
@@ -689,6 +699,7 @@ pub fn build_index_with_options_and_ignorecase(
     // 8KB read per file — we're already reading the full file anyway.
     eprintln!("Extracting trigrams...");
     let binary_skipped = std::sync::atomic::AtomicUsize::new(0);
+    let read_errors = std::sync::atomic::AtomicUsize::new(0);
 
     // Assign file IDs and collect posting entries. Batching avoids
     // retaining every file's per-trigram HashMap at once for large repos, and
@@ -723,6 +734,8 @@ pub fn build_index_with_options_and_ignorecase(
                     Err(error) => {
                         if error.kind() == std::io::ErrorKind::InvalidData {
                             raced_too_large.lock().unwrap().insert(path.clone());
+                        } else {
+                            read_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         return None;
                     }
@@ -809,17 +822,37 @@ pub fn build_index_with_options_and_ignorecase(
         .filter(|path| !indexed_paths.contains(path.as_str()))
         .collect();
     extra_paths.sort_unstable();
-    path_index::write_extra_paths(&index_dir, &extra_paths)?;
+    let mut meta = IndexMeta::load(&index_dir)?;
+    let file_table_id = meta
+        .file_table_id
+        .ok_or_else(|| Error::IndexCorrupted("built index has no file-table identity".into()))?;
+    path_index::write_extra_paths_with_visibility(
+        &index_dir,
+        &extra_paths,
+        &walk.visibility,
+        file_table_id,
+    )?;
     meta::write_file_evidence(&evidence, &index_dir)?;
     // `meta.json` remains the final publication marker for in-place builds.
-    IndexMeta::load(&index_dir)?.save(&index_dir)?;
+    meta.hidden_complete =
+        include_hidden && walk.skipped_error == 0 && read_errors.into_inner() == 0;
+    meta.visibility = walk.visibility;
+    meta.save(&index_dir)?;
 
     eprintln!("Index built successfully at {}", index_dir.display());
     Ok(BuildOutcome {
         num_files: file_id_map.len(),
         versions: evidence.versions,
-        gitignore_files,
-        ignore_files,
+        gitignore_files: if opts.collect_gitignore_files {
+            gitignore_files
+        } else {
+            Vec::new()
+        },
+        ignore_files: if opts.collect_gitignore_files {
+            ignore_files
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -1116,6 +1149,7 @@ fn write_files_and_meta<'a>(
 ) -> Result<()> {
     let mut files_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
+    ondisk::write_file_table_header(&mut files_file)?;
     for (id, path) in paths.into_iter().enumerate() {
         ondisk::write_file_entry(&mut files_file, id as u32, path)?;
     }
@@ -1130,9 +1164,32 @@ fn write_files_and_meta<'a>(
     if let Some(c) = complete {
         meta.complete = c;
     }
+    meta.file_table_id = Some(meta::read_file_table_id(index_dir)?);
     meta.save(index_dir)?;
 
     Ok(())
+}
+
+/// Stage only the format boundary when a legacy index needs no content merge.
+/// The table is streamed, preserving IDs and avoiding a copy of its path set.
+pub fn stage_file_table_upgrade(index_dir: &Path, staging_dir: &Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut source = std::fs::File::open(index_dir.join("files.bin"))?;
+    let mut header = Vec::with_capacity(ondisk::FILE_TABLE_HEADER_LEN);
+    (&mut source)
+        .take(ondisk::FILE_TABLE_HEADER_LEN as u64)
+        .read_to_end(&mut header)?;
+    if ondisk::file_table_body(&header)?.len() != header.len() {
+        return Ok(false);
+    }
+    source.seek(SeekFrom::Start(0))?;
+    std::fs::create_dir_all(staging_dir)?;
+    let mut target = std::io::BufWriter::new(std::fs::File::create(staging_dir.join("files.bin"))?);
+    ondisk::write_file_table_header(&mut target)?;
+    std::io::copy(&mut source, &mut target)?;
+    target.flush()?;
+    Ok(true)
 }
 
 /// Preserves mask data (loc_mask/next_mask) from the snapshot so Bloom-filter
@@ -2133,13 +2190,8 @@ mod tests {
         assert_eq!(BuildOptions::default().strategy, IndexStrategy::External);
     }
 
-    // `tgrep serve` walks with leading-dot hidden semantics and its watcher
-    // skips dot-prefixed paths, so a build that feeds a server must exclude
-    // dotfiles. On Windows the default walk keeps them (the native hidden
-    // check reads an attribute git never sets), which would leave the server
-    // holding entries it can never update or delete.
     #[test]
-    fn collect_gitignore_files_excludes_dotfiles_from_the_index() {
+    fn default_build_includes_dotfiles_and_records_query_visibility() {
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -2163,13 +2215,60 @@ mod tests {
         .unwrap();
 
         let reader = IndexReader::open(for_serve.path()).unwrap();
-        let indexed: Vec<String> = (0..reader.num_files() as u32)
+        let mut indexed: Vec<String> = (0..reader.num_files() as u32)
             .filter_map(|id| reader.file_path(id).map(|p| p.to_string()))
             .collect();
+        indexed.sort();
         assert_eq!(
             indexed,
-            vec!["src/main.rs".to_string()],
-            "a build destined for the server must skip dot-prefixed files"
+            vec![".gitignore", ".mailmap", "src/main.rs"],
+            "index and serve must cover nonignored hidden files by default"
+        );
+        let meta = IndexMeta::load(for_serve.path()).unwrap();
+        assert!(meta.complete && meta.hidden_complete);
+        assert!(!meta.visibility.is_visible(".mailmap", "", false));
+        assert!(meta.visibility.is_visible("src/main.rs", "", false));
+    }
+
+    #[test]
+    fn default_build_never_indexes_its_custom_storage() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::write(root.join("visible.txt"), "needle visible").unwrap();
+        std::fs::write(root.join(".secret"), "needle hidden").unwrap();
+        let storage = root.join("custom-index");
+        std::fs::create_dir_all(storage.join(".retired/generation-1")).unwrap();
+        std::fs::write(
+            storage.join(".retired/generation-1/source.txt"),
+            "needle storage",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            build_index_with_options(root, Some(&storage), &BuildOptions::default()).unwrap();
+            let reader = IndexReader::open(&storage).unwrap();
+            let mut paths = reader.all_paths().to_vec();
+            paths.sort();
+            assert_eq!(paths, [".secret", "visible.txt"]);
+            assert!(IndexMeta::load(&storage).unwrap().hidden_complete);
+        }
+    }
+
+    #[test]
+    fn storage_cannot_cover_the_source_root() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::write(root.join("visible.txt"), "needle").unwrap();
+        let error =
+            build_index_with_options(root, Some(root), &BuildOptions::default()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("index directory must not contain the source root")
+        );
+        assert!(!root.join("meta.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("visible.txt")).unwrap(),
+            "needle"
         );
     }
 

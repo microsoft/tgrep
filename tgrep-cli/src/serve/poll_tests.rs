@@ -104,6 +104,7 @@ impl Fixture {
             &self.root,
             &self.state.exclude_dirs,
             matcher.as_ref(),
+            &self.state.index_dir,
         )
     }
 }
@@ -359,42 +360,38 @@ fn resumed_build_binary_evidence_describes_the_read_not_the_final_walk() {
     let path = fixture.write("raced.rs", b"original_binary\n\0");
     let version = builder::file_version(&std::fs::metadata(&path).unwrap());
     let hook_root = fixture.root.clone();
+    let hook_state = Arc::downgrade(&fixture.state);
+    let observed_checkpoint = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_observed = Arc::clone(&observed_checkpoint);
     *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
         if matches!(phase, StaleRefreshPhase::AfterBuildBeforeStampPublish) {
             std::fs::write(&path, "fn after_classification_marker() {}\n").unwrap();
             std::fs::write(hook_root.join("late.rs"), "fn late_arrival_marker() {}\n").unwrap();
+        } else if matches!(phase, StaleRefreshPhase::BeforeCoverageReconcile) {
+            let state = hook_state.upgrade().unwrap();
+            let evidence = state.file_evidence.read().unwrap();
+            assert_eq!(evidence.version("raced.rs"), Some(&version));
+            assert!(evidence.stamp("late.rs").is_none());
+            assert!(!state.index.read().unwrap().has_active_path("raced.rs"));
+            assert!(!state.hidden_complete.load(Ordering::SeqCst));
+            assert!(
+                !tgrep_core::meta::IndexMeta::load(&state.index_dir)
+                    .unwrap()
+                    .hidden_complete
+            );
+            hook_observed.store(true, Ordering::SeqCst);
         }
     }));
     fixture.state.indexing.store(true, Ordering::SeqCst);
     background_index_build(&fixture.state, &fixture.root, &fixture.state.index_dir);
     *fixture.state.stale_refresh_hook.lock().unwrap() = None;
-    assert_eq!(
-        fixture
-            .state
-            .file_evidence
-            .read()
-            .unwrap()
-            .version("raced.rs"),
-        Some(&version)
-    );
+    assert!(observed_checkpoint.load(Ordering::SeqCst));
+    assert!(fixture.state.hidden_complete.load(Ordering::SeqCst));
     assert!(
-        fixture
-            .state
-            .file_evidence
-            .read()
+        tgrep_core::meta::IndexMeta::load(&fixture.state.index_dir)
             .unwrap()
-            .stamp("late.rs")
-            .is_none()
+            .hidden_complete
     );
-    assert!(
-        !fixture
-            .state
-            .index
-            .read()
-            .unwrap()
-            .has_active_path("raced.rs")
-    );
-    fixture.poll();
     fixture.assert_hit("after_classification_marker", "raced.rs");
     fixture.assert_hit("late_arrival_marker", "late.rs");
 }

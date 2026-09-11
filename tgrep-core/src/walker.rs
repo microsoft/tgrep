@@ -2,6 +2,8 @@
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
+pub use ignore::overrides::{Override, OverrideBuilder};
+
 /// The size limit a walk applies when the caller does not name one.
 ///
 /// 64 MiB, which is a deliberate divergence from ripgrep's "no limit". The
@@ -90,6 +92,7 @@ pub struct WalkResult {
     /// `gitignore_files` so a matcher can apply them last, giving them
     /// precedence over `.gitignore` — the `ignore` crate's own ordering.
     pub ignore_files: Vec<PathBuf>,
+    pub visibility: crate::visibility::PathVisibility,
     pub skipped_binary: usize,
     pub skipped_error: usize,
     /// Files rejected only because they exceeded `WalkOptions::max_file_size`.
@@ -114,6 +117,10 @@ pub struct WalkOptions {
     pub collect_gitignore_files: bool,
     /// Directory names to exclude from walking (e.g., "vendor", "third_party").
     pub exclude_dirs: Vec<String>,
+    /// Absolute storage paths to prune, including custom index directories.
+    pub exclude_paths: Vec<PathBuf>,
+    /// Explicit search globs, which override ignore and hidden-file rules.
+    pub overrides: Option<Override>,
     /// `--max-depth`: descend at most this many directories below each root.
     pub max_depth: Option<usize>,
     /// `--one-file-system`: don't cross file system boundaries.
@@ -154,6 +161,8 @@ impl Default for WalkOptions {
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             collect_gitignore_files: false,
             exclude_dirs: Vec::new(),
+            exclude_paths: Vec::new(),
+            overrides: None,
             max_depth: None,
             same_file_system: false,
             ignore_files: Vec::new(),
@@ -273,6 +282,8 @@ pub fn walk_dir_with_ignorecase(
     let listed_files = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
+    let visibility = std::sync::Mutex::new(crate::visibility::PathVisibility::default());
+    let visibility_ignorecase = ignorecase.clone();
     let skipped_binary = std::sync::atomic::AtomicUsize::new(0);
     let skipped_error = std::sync::atomic::AtomicUsize::new(0);
     let skipped_too_large = std::sync::atomic::AtomicUsize::new(0);
@@ -288,6 +299,8 @@ pub fn walk_dir_with_ignorecase(
         .flatten()
         .map(std::sync::Arc::new);
     let p4ignore_root = root.clone();
+    let exclude_paths = opts.exclude_paths.clone();
+    let overrides = opts.overrides.clone();
     let mut builder = WalkBuilder::new(&root);
     builder
         .hidden(!include_hidden)
@@ -302,10 +315,22 @@ pub fn walk_dir_with_ignorecase(
         .git_exclude(!opts.no_ignore && !opts.no_ignore_exclude)
         .ignore_case_insensitive(opts.ignore_files_case_insensitive)
         .filter_entry(move |entry| {
+            if exclude_paths
+                .iter()
+                .any(|path| entry.path().starts_with(path))
+            {
+                return false;
+            }
             if entry.file_name() == ".gitignore" {
                 return true;
             }
             let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if overrides
+                .as_ref()
+                .is_some_and(|overrides| overrides.matched(entry.path(), is_dir).is_whitelist())
+            {
+                return true;
+            }
             if let Some(ignorecase) = &ignorecase
                 && ignorecase.excludes(entry.path(), is_dir)
             {
@@ -320,6 +345,9 @@ pub fn walk_dir_with_ignorecase(
             !matcher.is_ignored(relative, is_dir)
         })
         .threads(opts.threads.unwrap_or_else(walker_thread_count).max(1));
+    if let Some(overrides) = &opts.overrides {
+        builder.overrides(overrides.clone());
+    }
     // `--ignore-file` is applied even under `--no-ignore`: the user asked for
     // these rules explicitly, so only `--no-ignore-files` turns them off.
     for path in &opts.ignore_files {
@@ -339,6 +367,7 @@ pub fn walk_dir_with_ignorecase(
         let listed_files = &listed_files;
         let gitignore_files = &gitignore_files;
         let ignore_files = &ignore_files;
+        let visibility = &visibility;
         let skipped_binary = &skipped_binary;
         let skipped_error = &skipped_error;
         let skipped_too_large = &skipped_too_large;
@@ -370,6 +399,7 @@ pub fn walk_dir_with_ignorecase(
                 // any ignore file matched by its own rules. See
                 // `gitignore::ignore_files_in`.
                 if collect_gitignore_files {
+                    record_visibility(visibility, walk_root, &entry);
                     let (gitignore, dot_ignore) = crate::gitignore::ignore_files_in(entry.path());
                     if let Some(path) = gitignore {
                         gitignore_files.lock().unwrap().push(path);
@@ -386,6 +416,9 @@ pub fn walk_dir_with_ignorecase(
             }
 
             let path = entry.path();
+            if collect_gitignore_files {
+                record_visibility(visibility, walk_root, &entry);
+            }
 
             let binary_extension = !search_binary && is_binary_extension(path);
             let too_large =
@@ -419,15 +452,71 @@ pub fn walk_dir_with_ignorecase(
         })
     });
 
+    let gitignore_files = gitignore_files.into_inner().unwrap();
+    let ignore_files = ignore_files.into_inner().unwrap();
+    let visibility = finish_visibility(
+        &root,
+        opts.no_ignore,
+        opts.no_require_git,
+        &gitignore_files,
+        &ignore_files,
+        visibility.into_inner().unwrap(),
+        visibility_ignorecase,
+    );
     WalkResult {
         files: files.into_inner().unwrap(),
         listed_files: listed_files.into_inner().unwrap(),
-        gitignore_files: gitignore_files.into_inner().unwrap(),
-        ignore_files: ignore_files.into_inner().unwrap(),
+        gitignore_files,
+        ignore_files,
+        visibility,
         skipped_binary: skipped_binary.into_inner(),
         skipped_error: skipped_error.into_inner(),
         skipped_too_large: skipped_too_large.into_inner(),
     }
+}
+
+fn record_visibility(
+    visibility: &std::sync::Mutex<crate::visibility::PathVisibility>,
+    root: &Path,
+    entry: &ignore::DirEntry,
+) {
+    #[cfg(windows)]
+    let metadata = entry.metadata().ok();
+    #[cfg(not(windows))]
+    let metadata = None;
+    if !crate::visibility::is_hidden(entry.path(), metadata.as_ref()) {
+        return;
+    }
+    if let Ok(relative) = entry.path().strip_prefix(root) {
+        visibility.lock().unwrap().record(
+            &relative.to_string_lossy().replace('\\', "/"),
+            entry.file_type().is_some_and(|kind| kind.is_dir()),
+            metadata.as_ref(),
+            None,
+        );
+    }
+}
+
+fn finish_visibility(
+    root: &Path,
+    no_ignore: bool,
+    no_require_git: bool,
+    gitignore_files: &[PathBuf],
+    ignore_files: &[PathBuf],
+    mut visibility: crate::visibility::PathVisibility,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+) -> crate::visibility::PathVisibility {
+    if !no_ignore && !visibility.is_empty() {
+        let matcher = build_gitignore_matcher_from_files_with_ignorecase(
+            root,
+            gitignore_files,
+            ignore_files,
+            no_require_git,
+            ignorecase,
+        );
+        visibility.apply_ignore_rules(matcher.as_ref());
+    }
+    visibility
 }
 
 /// Build a point-query ignore matcher from `.gitignore` and `.ignore` files
@@ -487,6 +576,7 @@ pub struct MetaWalkResult {
     pub listed_files: Vec<String>,
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
+    pub visibility: crate::visibility::PathVisibility,
     /// Entries or metadata reads the walk could not inspect.
     pub skipped_error: usize,
 }
@@ -500,6 +590,7 @@ pub struct MetaWalkResult {
 pub struct MetaWalkOptions {
     /// Directory names to prune from the walk.
     pub exclude_dirs: Vec<String>,
+    pub exclude_paths: Vec<PathBuf>,
     /// `--no-ignore`: don't respect any ignore files.
     pub no_ignore: bool,
     /// `--no-require-git`: respect gitignore rules outside a git repository.
@@ -525,6 +616,7 @@ impl Default for MetaWalkOptions {
     fn default() -> Self {
         Self {
             exclude_dirs: Vec::new(),
+            exclude_paths: Vec::new(),
             no_ignore: false,
             no_require_git: false,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
@@ -536,8 +628,8 @@ impl Default for MetaWalkOptions {
 /// `.gitignore` / `.ignore` files encountered. No file content is read — this
 /// is used for stale file detection on startup.
 ///
-/// Hidden entries are skipped, matching the indexing walk. Ignore files are
-/// still found because every directory the walk descends into is probed
+/// Hidden entries are included, matching the indexing walk. Ignore files are
+/// found because every directory the walk descends into is probed
 /// explicitly via [`crate::gitignore::ignore_files_in`], which also catches
 /// ignore files that their own rules would have filtered out of the walk.
 pub fn walk_file_metadata(root: &Path, opts: &MetaWalkOptions) -> MetaWalkResult {
@@ -558,6 +650,8 @@ pub fn walk_file_metadata_with_ignorecase(
     let listed_files = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
+    let visibility = std::sync::Mutex::new(crate::visibility::PathVisibility::default());
+    let visibility_ignorecase = ignorecase.clone();
     let skipped_error = std::sync::atomic::AtomicUsize::new(0);
     let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(opts.exclude_dirs.clone());
     let p4ignore = (!no_ignore)
@@ -566,14 +660,23 @@ pub fn walk_file_metadata_with_ignorecase(
         .map(std::sync::Arc::new);
     let match_root = root.to_path_buf();
     let root = root.to_path_buf();
+    let exclude_paths = opts.exclude_paths.clone();
 
     let walker = WalkBuilder::new(&root)
-        .hidden(true)
+        .hidden(false)
+        .ignore(!no_ignore)
+        .parents(!no_ignore)
         .require_git(!opts.no_require_git)
         .git_ignore(!no_ignore)
         .git_global(!no_ignore)
         .git_exclude(!no_ignore)
         .filter_entry(move |entry| {
+            if exclude_paths
+                .iter()
+                .any(|path| entry.path().starts_with(path))
+            {
+                return false;
+            }
             let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
             if let Some(ignorecase) = &ignorecase
                 && ignorecase.excludes(entry.path(), is_dir)
@@ -598,6 +701,7 @@ pub fn walk_file_metadata_with_ignorecase(
         let listed_files = &listed_files;
         let gitignore_files = &gitignore_files;
         let ignore_files = &ignore_files;
+        let visibility = &visibility;
         let skipped_error = &skipped_error;
         Box::new(move |entry| {
             let entry = match entry {
@@ -612,9 +716,9 @@ pub fn walk_file_metadata_with_ignorecase(
                 if should_skip_dir(&entry, &exclude) {
                     return ignore::WalkState::Skip;
                 }
+                record_visibility(visibility, &root, &entry);
                 // Probing each descended directory finds ignore files the walk
-                // itself filters out; see `gitignore::ignore_files_in`. It also
-                // keeps `hidden(true)` intact, so the metadata set is unchanged.
+                // itself filters out; see `gitignore::ignore_files_in`.
                 let (gitignore, dot_ignore) = crate::gitignore::ignore_files_in(entry.path());
                 if let Some(path) = gitignore {
                     gitignore_files.lock().unwrap().push(path);
@@ -630,6 +734,7 @@ pub fn walk_file_metadata_with_ignorecase(
             }
 
             let path = entry.path();
+            record_visibility(visibility, &root, &entry);
             let rel_path = match path.strip_prefix(&root) {
                 Ok(p) => p.to_string_lossy().replace('\\', "/"),
                 Err(_) => return ignore::WalkState::Continue,
@@ -675,11 +780,23 @@ pub fn walk_file_metadata_with_ignorecase(
         })
     });
 
+    let gitignore_files = gitignore_files.into_inner().unwrap();
+    let ignore_files = ignore_files.into_inner().unwrap();
+    let visibility = finish_visibility(
+        &root,
+        opts.no_ignore,
+        opts.no_require_git,
+        &gitignore_files,
+        &ignore_files,
+        visibility.into_inner().unwrap(),
+        visibility_ignorecase,
+    );
     MetaWalkResult {
         files: results.into_inner().unwrap(),
         listed_files: listed_files.into_inner().unwrap(),
-        gitignore_files: gitignore_files.into_inner().unwrap(),
-        ignore_files: ignore_files.into_inner().unwrap(),
+        gitignore_files,
+        ignore_files,
+        visibility,
         skipped_error: skipped_error.into_inner(),
     }
 }
@@ -1174,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn walk_file_metadata_collects_ignore_files_but_omits_them_from_metadata() {
+    fn walk_file_metadata_includes_nonignored_ignore_sources() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("testdata");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -1185,14 +1302,17 @@ mod tests {
 
         let result = walk_file_metadata(&root, &MetaWalkOptions::default());
 
-        // The dot-files themselves stay out of the metadata set, exactly as
-        // they did under the previous `hidden(true)` walk.
-        let names: Vec<_> = result
+        let mut names: Vec<_> = result
             .files
             .iter()
             .map(|f| f.relative_path.as_str())
             .collect();
-        assert_eq!(names, vec!["src/main.rs"]);
+        names.sort();
+        assert_eq!(
+            names,
+            vec![".gitignore", ".ignore", "src/.ignore", "src/main.rs"]
+        );
+        assert!(!result.visibility.is_visible(".ignore", "", false));
 
         let rel = |v: &[PathBuf]| {
             let mut out: Vec<_> = v
@@ -1377,7 +1497,7 @@ mod tests {
             "default stays git-gated: {gated:?}"
         );
 
-        let lifted: Vec<_> = walk_file_metadata(
+        let mut lifted: Vec<_> = walk_file_metadata(
             root,
             &MetaWalkOptions {
                 no_require_git: true,
@@ -1388,7 +1508,8 @@ mod tests {
         .into_iter()
         .map(|f| f.relative_path)
         .collect();
-        assert_eq!(lifted, vec!["src/main.rs".to_string()]);
+        lifted.sort();
+        assert_eq!(lifted, vec![".gitignore", "src/main.rs"]);
     }
 
     #[test]
@@ -1862,7 +1983,19 @@ mod tests {
         // walk decides what is missing from it. If they disagree, every build
         // indexes a file the next stale check evicts.
         let dir = ignorecase_fixture(true, &["src/main.rs", "src/Kept.TXT"]);
-        let indexed = sorted_filenames(&walk_dir(dir.path(), &WalkOptions::default()), dir.path());
+        let indexed = sorted_filenames(
+            &walk_dir(
+                dir.path(),
+                &WalkOptions {
+                    include_hidden: true,
+                    ..Default::default()
+                },
+            ),
+            dir.path(),
+        )
+        .into_iter()
+        .filter(|p| !p.starts_with(".git/"))
+        .collect::<Vec<_>>();
         let mut seen: Vec<String> = walk_file_metadata(dir.path(), &MetaWalkOptions::default())
             .files
             .iter()
@@ -1871,5 +2004,64 @@ mod tests {
             .collect();
         seen.sort();
         assert_eq!(indexed, seen);
+    }
+
+    #[test]
+    fn hidden_visibility_matches_walks_with_ignore_whitelists_and_scoped_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join(".github/.nested")).unwrap();
+        fs::create_dir_all(root.join(".public-dir")).unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "!.public.txt\n!.public-dir/\nignored.txt\n.ignored\n",
+        )
+        .unwrap();
+        fs::write(root.join(".github/.ignore"), "blocked.txt\n").unwrap();
+        for name in [
+            "visible.txt",
+            ".secret.txt",
+            ".public.txt",
+            ".public-dir/visible.txt",
+            ".public-dir/.secret",
+            ".github/open.txt",
+            ".github/blocked.txt",
+            ".github/.nested/visible.txt",
+            "ignored.txt",
+            ".ignored",
+        ] {
+            fs::write(root.join(name), "needle").unwrap();
+        }
+        let broad = walk_dir(
+            root,
+            &WalkOptions {
+                include_hidden: true,
+                collect_gitignore_files: true,
+                ..Default::default()
+            },
+        );
+        let indexed = sorted_filenames(&broad, root);
+        assert!(indexed.contains(&".secret.txt".to_string()));
+        assert!(indexed.contains(&".github/open.txt".to_string()));
+        for excluded in ["ignored.txt", ".ignored", ".github/blocked.txt"] {
+            assert!(
+                !indexed.iter().any(|path| path == excluded),
+                "{excluded}: {indexed:?}"
+            );
+        }
+        for prefix in ["", ".github/"] {
+            let scoped_root = root.join(prefix);
+            let expected = sorted_filenames(
+                &walk_dir(&scoped_root, &WalkOptions::default()),
+                &scoped_root,
+            );
+            let actual: Vec<_> = indexed
+                .iter()
+                .filter(|path| broad.visibility.is_visible(path, prefix, false))
+                .filter_map(|path| path.strip_prefix(prefix).map(str::to_string))
+                .collect();
+            assert_eq!(actual, expected, "scope {prefix:?}");
+        }
     }
 }

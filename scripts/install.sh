@@ -61,7 +61,17 @@ pick_install_dir() {
     fi
 }
 
-main() {
+# Keep the temporary directory in scope for the EXIT trap.
+main() (
+    local -a checksum_cmd
+    if command -v sha256sum >/dev/null 2>&1; then
+        checksum_cmd=(sha256sum)
+    elif command -v shasum >/dev/null 2>&1; then
+        checksum_cmd=(shasum -a 256)
+    else
+        error "Checksum verification requires sha256sum or shasum; install one and try again"
+    fi
+
     local target version dir
     target="$(detect_target)"
     version="$(resolve_version)"
@@ -83,8 +93,26 @@ main() {
     curl -fsSL "${base_url}/${checksums}" -o "${tmpdir}/${checksums}"
 
     info "Verifying checksum..."
-    (cd "$tmpdir" && grep "${archive}" "${checksums}" | sha256sum -c --quiet) \
-        || error "Checksum verification failed"
+    (
+        cd "$tmpdir" || exit 1
+        local checksum_line="" line digest filename
+        while IFS= read -r line || [ -n "$line" ]; do
+            digest="${line%% *}"
+            filename="${line#* }"
+            case "$filename" in
+                " $archive"|"*$archive") ;;
+                *) continue ;;
+            esac
+            # Validate exactly one entry: not all verifiers support --strict.
+            if [ -n "$checksum_line" ] || [ "${#digest}" -ne 64 ] \
+                || [[ "$digest" == *[!0-9a-fA-F]* ]]; then
+                exit 1
+            fi
+            checksum_line="$line"
+        done < "$checksums"
+        [ -n "$checksum_line" ] || exit 1
+        printf '%s\n' "$checksum_line" | "${checksum_cmd[@]}" -c - >/dev/null
+    ) || error "Checksum verification failed"
 
     info "Extracting..."
     tar xzf "${tmpdir}/${archive}" -C "${tmpdir}"
@@ -97,6 +125,6 @@ main() {
         info "Installed tgrep to ${dir}/tgrep"
         info "Make sure ${dir} is in your PATH"
     fi
-}
+)
 
 main "$@"

@@ -29,6 +29,7 @@ pub struct FilenameIndex {
 pub struct FilenameVisibility {
     pub paths: PathVisibility,
     pub file_table_id: crate::meta::FileTableId,
+    pub hidden_complete: bool,
 }
 
 /// Write a legacy filename-only path set without visibility evidence.
@@ -42,6 +43,7 @@ pub fn write_extra_paths_with_visibility(
     paths: &[String],
     visibility: &PathVisibility,
     file_table_id: crate::meta::FileTableId,
+    hidden_complete: bool,
 ) -> Result<()> {
     write_paths(
         index_dir,
@@ -49,6 +51,7 @@ pub fn write_extra_paths_with_visibility(
         Some(&FilenameVisibility {
             paths: visibility.clone(),
             file_table_id,
+            hidden_complete,
         }),
     )
 }
@@ -208,14 +211,15 @@ mod tests {
         let paths = vec![".secret.png".to_string(), "visible.png".to_string()];
         let mut visibility = PathVisibility::default();
         visibility.record(".secret.png", false, None, None);
-        write_extra_paths_with_visibility(dir.path(), &paths, &visibility, [7; 32]).unwrap();
+        write_extra_paths_with_visibility(dir.path(), &paths, &visibility, [7; 32], true).unwrap();
         let decoded = read_filename_index(dir.path()).unwrap().unwrap();
         assert_eq!(decoded.paths, paths);
         assert_eq!(
             decoded.visibility,
             Some(FilenameVisibility {
                 paths: visibility,
-                file_table_id: [7; 32]
+                file_table_id: [7; 32],
+                hidden_complete: true,
             })
         );
         let data = std::fs::read(dir.path().join(EXTRA_PATHS_FILENAME)).unwrap();

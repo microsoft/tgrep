@@ -267,6 +267,22 @@ fn hidden_filename_publication_is_coherent_even_when_metadata_publish_fails() {
         .collect();
     visible.sort();
     assert_eq!(visible, ["visible.png", "visible.txt"]);
+    let incomplete_sidecar = index_dir.join("incomplete-sidecar");
+    tgrep_core::path_index::write_extra_paths_with_visibility(
+        &incomplete_sidecar,
+        &[".secret.png".to_string()],
+        &Default::default(),
+        reader.file_table_id(),
+        false,
+    )
+    .unwrap();
+    let incomplete = StartupDiscovery::load(
+        &incomplete_sidecar,
+        Some(old_meta.clone()),
+        reader.file_table_id(),
+    );
+    assert!(!incomplete.hidden_complete && incomplete.filename_index_ready);
+
     let mut mismatched_meta = old_meta.clone();
     mismatched_meta.file_table_id = Some([0; 32]);
     assert!(
@@ -279,10 +295,11 @@ fn hidden_filename_publication_is_coherent_even_when_metadata_publish_fails() {
         &[".secret.png".to_string()],
         &Default::default(),
         [0; 32],
+        true,
     )
     .unwrap();
     let mismatched = StartupDiscovery::load(&bad_sidecar, Some(old_meta), reader.file_table_id());
-    assert!(mismatched.hidden_complete && !mismatched.filename_index_ready);
+    assert!(!mismatched.hidden_complete && !mismatched.filename_index_ready);
     *state.stale_refresh_hook.lock().unwrap() = None;
     assert!(background_refresh_stale(&state, &root, &index_dir, false));
     assert!(!state.filename_index_dirty.load(Ordering::SeqCst));

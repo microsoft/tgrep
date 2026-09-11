@@ -1060,12 +1060,12 @@ impl StartupDiscovery {
         let Some(meta) = meta else {
             return Self::default();
         };
+        let metadata_hidden_complete = meta.complete
+            && meta.hidden_complete
+            && meta.version == tgrep_core::meta::INDEX_FORMAT_VERSION
+            && meta.file_table_id == Some(file_table_id);
         let mut discovery = Self {
             visibility: meta.visibility,
-            hidden_complete: meta.complete
-                && meta.hidden_complete
-                && meta.version == tgrep_core::meta::INDEX_FORMAT_VERSION
-                && meta.file_table_id == Some(file_table_id),
             ..Default::default()
         };
         if meta.complete {
@@ -1076,7 +1076,11 @@ impl StartupDiscovery {
                     {
                         // The sidecar can be newer than meta.json after an
                         // interrupted filename-only publication. Keep its
-                        // membership and visibility together on restart too.
+                        // membership, visibility, and coverage together on
+                        // restart so stale metadata cannot advertise a partial
+                        // filename snapshot as complete.
+                        discovery.hidden_complete =
+                            metadata_hidden_complete && visibility.hidden_complete;
                         discovery.visibility = visibility.paths;
                         discovery.filename_extra_paths = index.paths.into_iter().collect();
                         discovery.filename_index_ready = true;
@@ -5790,6 +5794,7 @@ fn stage_filename_extra_paths(
     staging_dir: &Path,
     visibility: &tgrep_core::visibility::PathVisibility,
     file_table_id: tgrep_core::meta::FileTableId,
+    hidden_complete: bool,
 ) -> Result<()> {
     let mut paths: Vec<String> = state
         .filename_extra_paths
@@ -5804,6 +5809,7 @@ fn stage_filename_extra_paths(
         &paths,
         visibility,
         file_table_id,
+        hidden_complete,
     )?;
     Ok(())
 }
@@ -5835,7 +5841,13 @@ fn persist_filename_discovery(
         } else {
             meta.hidden_complete = meta.complete && state.hidden_complete.load(Ordering::SeqCst);
         }
-        stage_filename_extra_paths(state, &staging_dir, &meta.visibility, file_table_id)?;
+        stage_filename_extra_paths(
+            state,
+            &staging_dir,
+            &meta.visibility,
+            file_table_id,
+            meta.hidden_complete,
+        )?;
         meta.save(&staging_dir)?;
         Ok(meta)
     })();
@@ -7790,10 +7802,17 @@ fn publish_staged_index(
             &paths,
             &meta.visibility,
             file_table_id,
+            meta.hidden_complete,
         )
         .map_err(Into::into)
     } else if state.filename_index_ready.load(Ordering::SeqCst) {
-        stage_filename_extra_paths(state, staging_dir, &meta.visibility, file_table_id)
+        stage_filename_extra_paths(
+            state,
+            staging_dir,
+            &meta.visibility,
+            file_table_id,
+            meta.hidden_complete,
+        )
     } else {
         Ok(())
     };

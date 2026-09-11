@@ -583,15 +583,16 @@ fn load_indexed_file_paths(
     if !index_dir.join("lookup.bin").exists() {
         return Ok(None);
     }
-    let Some(filename_index) = tgrep_core::path_index::read_filename_index(index_dir)? else {
-        return Ok(None);
+    let filename_index = match tgrep_core::path_index::read_filename_index(index_dir) {
+        Ok(Some(index)) => index,
+        Ok(None) | Err(_) => return Ok(None),
     };
     let Some(visibility) = filename_index.visibility else {
         return Ok(None);
     };
     let mut extra_paths = filename_index.paths;
     let meta = IndexMeta::load(index_dir)?;
-    if !meta.complete || !meta.hidden_complete {
+    if !meta.complete || !meta.hidden_complete || !visibility.hidden_complete {
         return Ok(None);
     }
 
@@ -1227,12 +1228,28 @@ fn search_local_index(
         return brute_force_search(root, opts, ci, writer);
     }
     let reader = IndexReader::open(index_dir)?;
-    if meta.file_table_id != Some(reader.file_table_id()) {
+    let filename_visibility = match tgrep_core::path_index::read_filename_index(index_dir) {
+        Ok(Some(index)) => index.visibility,
+        Ok(None) | Err(_) => None,
+    };
+    let Some(filename_visibility) = filename_visibility else {
         if !opts.quiet && !opts.no_messages {
-            eprintln!("warning: index visibility and path table differ - scanning filesystem");
+            eprintln!("warning: atomic index visibility unavailable - scanning filesystem");
+        }
+        return brute_force_search(root, opts, ci, writer);
+    };
+    if meta.file_table_id != Some(reader.file_table_id())
+        || filename_visibility.file_table_id != reader.file_table_id()
+        || !filename_visibility.hidden_complete
+    {
+        if !opts.quiet && !opts.no_messages {
+            eprintln!(
+                "warning: index visibility, coverage, and path table differ - scanning filesystem"
+            );
         }
         return brute_force_search(root, opts, ci, writer);
     }
+    let visibility = filename_visibility.paths;
 
     // Index paths are relative to the root the index was built for, which is
     // not necessarily the directory being searched. Without translating between
@@ -1285,7 +1302,7 @@ fn search_local_index(
         .iter()
         .filter_map(|&fid| {
             let indexed = reader.file_path(fid)?;
-            meta.visibility
+            visibility
                 .is_visible(indexed, scope.prefix(), opts.hidden)
                 .then_some(())?;
             let rel = scope.relativize(indexed, root)?;

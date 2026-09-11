@@ -826,16 +826,18 @@ pub fn build_index_with_options_and_ignorecase(
     let file_table_id = meta
         .file_table_id
         .ok_or_else(|| Error::IndexCorrupted("built index has no file-table identity".into()))?;
+    let hidden_complete =
+        include_hidden && walk.skipped_error == 0 && read_errors.into_inner() == 0;
     path_index::write_extra_paths_with_visibility(
         &index_dir,
         &extra_paths,
         &walk.visibility,
         file_table_id,
+        hidden_complete,
     )?;
     meta::write_file_evidence(&evidence, &index_dir)?;
     // `meta.json` remains the final publication marker for in-place builds.
-    meta.hidden_complete =
-        include_hidden && walk.skipped_error == 0 && read_errors.into_inner() == 0;
+    meta.hidden_complete = hidden_complete;
     meta.visibility = walk.visibility;
     meta.save(&index_dir)?;
 

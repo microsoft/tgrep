@@ -61,7 +61,17 @@ pick_install_dir() {
     fi
 }
 
-main() {
+# Keep the temporary directory in scope for the EXIT trap.
+main() (
+    local -a checksum_cmd
+    if command -v sha256sum >/dev/null 2>&1; then
+        checksum_cmd=(sha256sum)
+    elif command -v shasum >/dev/null 2>&1; then
+        checksum_cmd=(shasum -a 256)
+    else
+        error "Checksum verification requires sha256sum or shasum; install one and try again"
+    fi
+
     local target version dir
     target="$(detect_target)"
     version="$(resolve_version)"
@@ -83,7 +93,7 @@ main() {
     curl -fsSL "${base_url}/${checksums}" -o "${tmpdir}/${checksums}"
 
     info "Verifying checksum..."
-    (cd "$tmpdir" && grep "${archive}" "${checksums}" | sha256sum -c --quiet) \
+    (cd "$tmpdir" && grep "${archive}" "${checksums}" | "${checksum_cmd[@]}" -c --quiet) \
         || error "Checksum verification failed"
 
     info "Extracting..."
@@ -97,6 +107,6 @@ main() {
         info "Installed tgrep to ${dir}/tgrep"
         info "Make sure ${dir} is in your PATH"
     fi
-}
+)
 
 main "$@"

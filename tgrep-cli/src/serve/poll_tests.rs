@@ -740,6 +740,43 @@ fn queue_overflow_repairs_content_but_does_not_abandon_native_watching() {
 }
 
 #[test]
+fn watcher_overflow_during_recovery_remains_pending() {
+    let fixture = Fixture::new(WatchMode::Auto, 4);
+    fixture.write("source.rs", "fn recovery_marker() {}\n");
+    assert!(background_refresh_stale(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        false,
+    ));
+    let overflowed = Arc::new(AtomicBool::new(true));
+    let during_walk = Arc::clone(&overflowed);
+    *fixture.state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::BeforeWalk) {
+            during_walk.store(true, Ordering::SeqCst);
+        }
+    }));
+    recover_watcher_overflow(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        &overflowed,
+        1,
+    );
+    assert!(overflowed.load(Ordering::SeqCst));
+    *fixture.state.stale_refresh_hook.lock().unwrap() = None;
+    recover_watcher_overflow(
+        &fixture.state,
+        &fixture.root,
+        &fixture.state.index_dir,
+        &overflowed,
+        1,
+    );
+    assert!(!overflowed.load(Ordering::SeqCst));
+    fixture.assert_hit("recovery_marker", "source.rs");
+}
+
+#[test]
 fn explicit_poll_never_creates_a_watcher_or_starts_native_recovery() {
     let fixture = Fixture::new(WatchMode::Poll, 4);
     fixture.write("src/source.rs", "fn polled_marker() {}\n");

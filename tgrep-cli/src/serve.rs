@@ -2294,10 +2294,7 @@ impl FsEventBurst {
 
     fn push(&mut self, event: Event) {
         self.event_count += 1;
-        if !matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        ) {
+        if !event_changes_index(&event.kind) {
             return;
         }
 
@@ -2319,6 +2316,13 @@ impl FsEventBurst {
     fn into_paths(self) -> Vec<CoalescedFsEvent> {
         self.paths
     }
+}
+
+fn event_changes_index(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    )
 }
 
 fn event_introduces_dir(kind: &EventKind) -> bool {
@@ -2424,6 +2428,8 @@ fn recover_watcher_overflow(
     overflowed: &std::sync::atomic::AtomicBool,
     queue_cap: usize,
 ) {
+    // Clear before reconciling: real changes lost during the walk must be
+    // allowed to request another recovery.
     if !native_watching(state)
         || state.indexing.load(Ordering::SeqCst)
         || state.gitignore_pending.load(Ordering::SeqCst)
@@ -2498,6 +2504,35 @@ fn watch_failure_reason(error: &notify::Error) -> String {
     format!("{kind}: {error}")
 }
 
+fn enqueue_watcher_event(
+    tx: &std::sync::mpsc::SyncSender<Event>,
+    overflowed: &std::sync::atomic::AtomicBool,
+    watch_resubscribe: &std::sync::atomic::AtomicBool,
+    event: Event,
+) {
+    // Rescan flags report native event loss, even on otherwise ignored kinds
+    // (inotify uses Any with no paths). Handle them before filtering.
+    let lost_events = if event.need_rescan() {
+        true
+    } else {
+        // Linux reports Access(Open) for our own tree walks. Letting those
+        // fill the queue makes overflow recovery trigger its own next overflow.
+        if !event_changes_index(&event.kind) {
+            return;
+        }
+        // Never block the notification thread. A full queue needs a stale
+        // check rather than an attempt to replay an unknown set of lost events.
+        matches!(
+            tx.try_send(event),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        )
+    };
+    if lost_events {
+        overflowed.store(true, Ordering::SeqCst);
+        watch_resubscribe.store(true, Ordering::SeqCst);
+    }
+}
+
 fn start_file_watcher(state: Arc<ServerState>, root: &Path, queue_cap: usize) -> bool {
     start_file_watcher_using(state, root, queue_cap, notify::recommended_watcher)
 }
@@ -2510,8 +2545,6 @@ fn start_file_watcher_using(
         Box<dyn FnMut(notify::Result<Event>) + Send>,
     ) -> notify::Result<RecommendedWatcher>,
 ) -> bool {
-    use std::sync::mpsc::TrySendError;
-
     if !native_watching(&state) {
         return false;
     }
@@ -2534,27 +2567,14 @@ fn start_file_watcher_using(
                 return;
             }
             match result {
-                Ok(event) => match tx.try_send(event) {
-                    Ok(()) => {}
-                    // Don't block the notification thread waiting for room —
-                    // that's the stall this hand-off exists to avoid. Drop the
-                    // event and note that we did; the worker reconciles with a
-                    // stale check, which is cheaper and more reliable than
-                    // trying to replay an unknown number of lost events.
-                    Err(TrySendError::Full(_)) => {
-                        callback_overflow.store(true, Ordering::SeqCst);
-                        callback_state
-                            .watch_resubscribe
-                            .store(true, Ordering::SeqCst);
-                    }
-                    Err(TrySendError::Disconnected(_)) => {}
-                },
-                // A native drop is the same loss as a full channel, and the OS
-                // will not say what it lost — inotify's `IN_Q_OVERFLOW` and a
-                // dropped `ReadDirectoryChangesW` buffer both arrive here with no
-                // paths attached. Reconcile on them too: reporting without
-                // recovering left exactly one of the two overflow paths handled,
-                // and it was the one the kernel does not use.
+                Ok(event) => enqueue_watcher_event(
+                    &tx,
+                    &callback_overflow,
+                    &callback_state.watch_resubscribe,
+                    event,
+                ),
+                // Some backends report native event loss as an error rather
+                // than a rescan event. Both need the same repair as a full queue.
                 //
                 // Surfaced as well. A dropped buffer looks exactly like "the
                 // watcher stopped working" from the outside, and silence makes it
@@ -4385,11 +4405,7 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
     if state.refresh.polling.load(Ordering::SeqCst) {
         return;
     }
-    let dominated_kinds = matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    );
-    if !dominated_kinds {
+    if !event_changes_index(&event.kind) {
         return;
     }
 
@@ -7961,6 +7977,7 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     fn watcher_event(kind: EventKind, paths: &[&str]) -> Event {
@@ -7968,6 +7985,124 @@ mod tests {
             kind,
             paths: paths.iter().map(PathBuf::from).collect(),
             attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn watcher_queue_filters_read_only_events_before_the_bounded_channel() {
+        use notify::event::{AccessKind, AccessMode};
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let overflowed = AtomicBool::new(false);
+        let resubscribe = AtomicBool::new(false);
+        let change = watcher_event(
+            EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            &["source.rs"],
+        );
+        for queue_full in [false, true] {
+            if queue_full {
+                enqueue_watcher_event(&tx, &overflowed, &resubscribe, change.clone());
+            }
+            for _ in 0..64 {
+                for kind in [
+                    EventKind::Access(AccessKind::Any),
+                    EventKind::Access(AccessKind::Read),
+                    EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                    EventKind::Access(AccessKind::Close(AccessMode::Read)),
+                    EventKind::Access(AccessKind::Close(AccessMode::Write)),
+                    EventKind::Access(AccessKind::Other),
+                    EventKind::Any,
+                    EventKind::Other,
+                ] {
+                    enqueue_watcher_event(
+                        &tx,
+                        &overflowed,
+                        &resubscribe,
+                        watcher_event(kind, &["src"]),
+                    );
+                }
+            }
+            assert!(!overflowed.load(Ordering::SeqCst));
+            assert!(!resubscribe.load(Ordering::SeqCst));
+            if queue_full {
+                assert_eq!(rx.try_recv().unwrap(), change);
+            }
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
+    fn watcher_queue_preserves_changes_and_reports_real_overflow() {
+        use notify::event::{
+            CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode,
+        };
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let overflowed = AtomicBool::new(false);
+        let resubscribe = AtomicBool::new(false);
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Remove(RemoveKind::Folder),
+        ] {
+            let event = watcher_event(kind, &["before.rs", "after.rs"]);
+            enqueue_watcher_event(&tx, &overflowed, &resubscribe, event.clone());
+            assert_eq!(rx.try_recv().unwrap(), event);
+            assert!(!overflowed.load(Ordering::SeqCst));
+            assert!(!resubscribe.load(Ordering::SeqCst));
+
+            enqueue_watcher_event(&tx, &overflowed, &resubscribe, event.clone());
+            enqueue_watcher_event(&tx, &overflowed, &resubscribe, event.clone());
+            assert!(overflowed.swap(false, Ordering::SeqCst));
+            assert!(resubscribe.swap(false, Ordering::SeqCst));
+            assert_eq!(rx.try_recv().unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn watcher_queue_rescan_bypasses_kind_filter_and_channel_capacity() {
+        use notify::event::{AccessKind, AccessMode, Flag, ModifyKind};
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let overflowed = AtomicBool::new(false);
+        let resubscribe = AtomicBool::new(false);
+        let change = watcher_event(EventKind::Modify(ModifyKind::Any), &["source.rs"]);
+        for queue_full in [false, true] {
+            if queue_full {
+                enqueue_watcher_event(&tx, &overflowed, &resubscribe, change.clone());
+            }
+            for kind in [
+                EventKind::Any,
+                EventKind::Other,
+                EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                EventKind::Modify(ModifyKind::Any),
+            ] {
+                enqueue_watcher_event(
+                    &tx,
+                    &overflowed,
+                    &resubscribe,
+                    Event::new(kind).set_flag(Flag::Rescan),
+                );
+                assert!(overflowed.swap(false, Ordering::SeqCst));
+                assert!(resubscribe.swap(false, Ordering::SeqCst));
+            }
+            if queue_full {
+                assert_eq!(rx.try_recv().unwrap(), change);
+            }
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
         }
     }
 

@@ -285,6 +285,96 @@ fn inotify_watch_count(pid: u32) -> usize {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn watcher_read_only_walks_do_not_overflow_the_queue() {
+    const DIRS: usize = 128;
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    // Keep index and log writes outside the watched tree so only reads occur.
+    let output = TempDir::new().unwrap();
+    let index_dir = output.path().join("index");
+    let log_path = output.path().join("serve.log");
+    fs::create_dir(root.join(".git")).unwrap();
+    for i in 0..DIRS {
+        let sub = root.join(format!("pkg{i}"));
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("source.txt"), "read_only_walk_marker\n").unwrap();
+    }
+    assert!(
+        Command::new(tgrep_bin())
+            .arg("index")
+            .arg(root)
+            .arg("--index-path")
+            .arg(&index_dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let child = Command::new(tgrep_bin())
+        .args(["serve", "--watcher-queue-cap", "8"])
+        .arg("--index-path")
+        .arg(&index_dir)
+        .arg(root)
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&log_path).unwrap())
+        .spawn()
+        .unwrap();
+    let _server = ServerGuard { child };
+    let (pid, port) = wait_for_server(&index_dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = server_status(port);
+        if status["watcher_active"] == true
+            && status["indexing"] == false
+            && status["reconcile_running"] == false
+            && status["last_reconcile_at"].is_u64()
+            && inotify_watch_count(pid) > DIRS
+        {
+            assert_eq!(status["watch_mode_active"], "native");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watcher did not finish startup: {status}\n{}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(search_matches(port, "read_only_walk_marker"), DIRS as u64);
+
+    // Reproduce directory opens from stale checks and subscription recovery.
+    // Each inotify watch sees opens on itself and on its children.
+    for _ in 0..4 {
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            for file in fs::read_dir(path).unwrap() {
+                fs::read(file.unwrap().path()).unwrap();
+            }
+        }
+    }
+    // Allow several worker idle intervals, including time for a bad recovery
+    // walk to generate the next overflow.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !log.contains("watcher queue overflowed"),
+            "read-only walks triggered overflow recovery:\n{log}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    fs::write(root.join("pkg0").join("source.txt"), "actual_edit_marker\n").unwrap();
+    assert!(
+        wait_for_match(port, "actual_edit_marker", Duration::from_secs(15)),
+        "filtering read-only events must not suppress real edits"
+    );
+    let status = server_status(port);
+    assert_eq!(status["watch_mode_active"], "native");
+    assert_eq!(status["watcher_active"], true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn watcher_does_not_subscribe_to_gitignored_directories() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();

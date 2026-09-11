@@ -331,7 +331,10 @@ per admitted directory on Linux/Android; recursive backends count their single
 root subscription as one.
 
 The event buffer controlled by `--watcher-queue-cap` is separate: queue overflow
-triggers recovery reconciliation, not watch-budget fallback.
+triggers recovery reconciliation, not watch-budget fallback. Only create,
+modify, and remove events enter this buffer; read-only access notifications
+(including Linux directory-open events from tgrep's own walks) are discarded
+before queueing. Native rescan notifications still trigger recovery.
 
 Polling walks the admitted tree and checks metadata for additions, changes,
 and deletions. Its default cadence is completion-based: the next poll waits

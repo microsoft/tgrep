@@ -93,7 +93,8 @@ main() (
     curl -fsSL "${base_url}/${checksums}" -o "${tmpdir}/${checksums}"
 
     info "Verifying checksum..."
-    (cd "$tmpdir" && grep "${archive}" "${checksums}" | "${checksum_cmd[@]}" -c --quiet) \
+    # Some non-GNU sha256sum implementations do not support --quiet.
+    (cd "$tmpdir" && grep "${archive}" "${checksums}" | "${checksum_cmd[@]}" -c >/dev/null) \
         || error "Checksum verification failed"
 
     info "Extracting..."

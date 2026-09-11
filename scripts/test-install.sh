@@ -62,8 +62,8 @@ run_case() (
     for tool in $tools; do
         [ "$tool" != none ] || continue
         case "$tool" in
-            sha256sum) expected_args="-c --quiet" ;;
-            shasum) expected_args="-a 256 -c --quiet" ;;
+            sha256sum) expected_args="-c" ;;
+            shasum) expected_args="-a 256 -c" ;;
         esac
         backend=("${verifier[@]}")
         if command -v "$tool" >/dev/null 2>&1; then
@@ -79,7 +79,7 @@ run_case() (
             printf '[ "$*" = %q ] || exit 2\n' "$expected_args"
             printf 'exec '
             printf '%q ' "${backend[@]}"
-            printf '%s\n' '-c --quiet'
+            printf '%s\n' '-c'
         } > "$case_dir/bin/$tool"
         chmod +x "$case_dir/bin/$tool"
     done

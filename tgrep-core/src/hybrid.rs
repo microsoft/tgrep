@@ -72,9 +72,10 @@ impl HybridIndex {
     /// turn means concurrent search queries are not blocked during a flush.
     /// The previous reader's mmap is released when the last in-flight query
     /// drops its `Arc<IndexReader>` — Rust's `File::open` on Windows uses
-    /// `FILE_SHARE_DELETE` by default, so renaming the underlying files
-    /// before the old mmap is dropped is safe (the old section keeps the
-    /// orphaned file content alive until refs drain).
+    /// `FILE_SHARE_DELETE` by default, so the underlying files may be renamed
+    /// while mapped. Callers must retain the old generation under a unique
+    /// name and defer deletion on Windows rather than force a POSIX unlink of
+    /// mapped files, which can strand their storage in NTFS's deleted namespace.
     pub fn swap_reader(&self, new_reader: IndexReader) {
         *self.reader.write().unwrap() = Arc::new(new_reader);
     }

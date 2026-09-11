@@ -292,6 +292,15 @@ first build, queries are answered from an empty index and return nothing;
 index instead, queries are answered from the files already indexed. Multiple
 clients can connect simultaneously.
 
+On Windows, replaced index generations remain under the index directory's
+`.retired` folder while readers still have them memory-mapped. Cleanup uses
+non-POSIX deletion so mapped files are not unlinked into NTFS's `$Deleted`
+namespace. The server retries cleanup after publication, every minute even
+when idle, and on startup. Only generations with a committed marker are
+automatically removed; uncommitted backups are preserved for recovery.
+This prevents new orphaned generations; it does not reclaim storage already
+stranded in `$Deleted` by an older version.
+
 Resource use during that initial build can be tuned. These apply to both
 `tgrep serve` and `tgrep index`:
 

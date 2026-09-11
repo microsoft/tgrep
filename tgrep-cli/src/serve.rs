@@ -24,6 +24,8 @@ use tgrep_core::builder;
 use tgrep_core::hybrid::HybridIndex;
 use tgrep_core::query;
 
+mod index_cleanup;
+
 #[cfg(test)]
 #[path = "serve/poll_tests.rs"]
 mod poll_tests;
@@ -807,6 +809,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     // Ensure only one server runs per index directory.
     // The lock file is held for the lifetime of the server and released on exit.
     let _lock_file = try_acquire_server_lock(&index_dir)?;
+    index_cleanup::cleanup_retired(&index_dir);
 
     let has_index = index_dir.join("lookup.bin").exists();
     let mut needs_build = !has_index;
@@ -2103,7 +2106,7 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
     // membership. The snapshot gate keeps watcher/auto-save mutations out until
     // both are published.
     let staging_dir = index_dir.join(".reload-build");
-    let _ = std::fs::remove_dir_all(&staging_dir);
+    index_cleanup::cleanup_staging(&staging_dir);
     let outcome = match builder::build_index_with_options_and_ignorecase(
         &state.root,
         Some(&staging_dir),
@@ -2119,7 +2122,7 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
     ) {
         Ok(outcome) => outcome,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging_dir);
+            index_cleanup::cleanup_staging(&staging_dir);
             state.indexing.store(false, Ordering::SeqCst);
             drop(gate);
             drop(refresh);
@@ -2153,7 +2156,7 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
         }
     };
     if let Err(e) = tgrep_core::meta::write_file_evidence(&evidence, &staging_dir) {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        index_cleanup::cleanup_staging(&staging_dir);
         state.indexing.store(false, Ordering::SeqCst);
         drop(deferred);
         drop(gate);
@@ -5491,6 +5494,11 @@ fn auto_save_loop(state: Arc<ServerState>) {
     loop {
         thread::sleep(Duration::from_secs(60));
 
+        {
+            let _publish = state.publish_lock.lock().unwrap();
+            index_cleanup::cleanup_retired(&state.index_dir);
+        }
+
         // Don't auto-save while background indexing or a bulk flush is
         // active — those paths handle their own publication and an
         // auto-save fired in parallel would just snapshot the same
@@ -5600,10 +5608,10 @@ fn stage_filename_extra_paths(state: &ServerState, staging_dir: &Path) -> Result
 /// otherwise need to rewrite the content index.
 fn persist_filename_extra_paths(state: &ServerState, index_dir: &Path) -> bool {
     let staging_dir = index_dir.join(".filename-index-staging");
-    let _ = std::fs::remove_dir_all(&staging_dir);
+    index_cleanup::cleanup_staging(&staging_dir);
     if let Err(error) = stage_filename_extra_paths(state, &staging_dir) {
         eprintln!("[trace] warning: could not stage filename index: {error}");
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        index_cleanup::cleanup_staging(&staging_dir);
         return false;
     }
 
@@ -5619,7 +5627,7 @@ fn persist_filename_extra_paths(state: &ServerState, index_dir: &Path) -> bool {
             }
         }
     };
-    let _ = std::fs::remove_dir_all(&staging_dir);
+    index_cleanup::cleanup_staging(&staging_dir);
     if published {
         state.filename_index_dirty.store(false, Ordering::SeqCst);
     }
@@ -5908,8 +5916,8 @@ fn stream_merge_stale_changes(
     // collide when two independent indexes share a parent directory.
     let delta_dir = index_dir.join(".stale-delta");
     let staging_dir = index_dir.join(".stale-merge");
-    let _ = std::fs::remove_dir_all(&delta_dir);
-    let _ = std::fs::remove_dir_all(&staging_dir);
+    index_cleanup::cleanup_staging(&delta_dir);
+    index_cleanup::cleanup_staging(&staging_dir);
 
     // Fold in every live mutation. A stale walk also treats its exact path set
     // as authoritative, removing reader entries missing from the walk; an
@@ -6068,6 +6076,10 @@ fn stream_merge_stale_changes(
                 .cloned()
                 .collect::<std::collections::HashSet<_>>()
         });
+        // The merge is finished. Do not keep its mappings alive through
+        // publication and the retired-generation cleanup that follows.
+        drop(delta);
+        drop(reader);
         let published = publish_staged_index(
             state,
             index_dir,
@@ -6098,9 +6110,9 @@ fn stream_merge_stale_changes(
         Ok(published)
     })();
 
-    let _ = std::fs::remove_dir_all(&delta_dir);
+    index_cleanup::cleanup_staging(&delta_dir);
     if !matches!(&result, Ok(PublishStatus::RollbackFailed)) {
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        index_cleanup::cleanup_staging(&staging_dir);
     } else {
         eprintln!("[trace] warning: preserving {staging_dir:?} after rollback failure");
     }
@@ -7361,7 +7373,7 @@ fn flush_append_only_overlay_locked(
     let num_files = reader.num_files() + overlay_paths.len();
 
     let staging_dir = index_dir.with_file_name(".tgrep_flush_staging");
-    let _ = std::fs::remove_dir_all(&staging_dir);
+    index_cleanup::cleanup_staging(&staging_dir);
 
     // Stream-merge overlay onto the existing on-disk index. Incremental
     // checkpoint flushes publish `complete = false`; the final bulk-build flush
@@ -7375,9 +7387,10 @@ fn flush_append_only_overlay_locked(
         complete,
     ) {
         eprintln!("[trace] warning: append-only flush write failed: {e}");
-        let _ = std::fs::remove_dir_all(&staging_dir);
+        index_cleanup::cleanup_staging(&staging_dir);
         return false;
     }
+    drop(reader);
 
     // Stage filestamps alongside the final complete index. If this fails we
     // still publish the index: losing incremental stale-check state on next
@@ -7428,8 +7441,8 @@ impl PublishStatus {
     }
 }
 
-/// Returns the publication outcome. A rollback failure preserves the staging
-/// directory so its backups remain available for recovery.
+/// Returns the publication outcome. A rollback failure preserves staging and
+/// the uncommitted backup directory for recovery.
 fn publish_staged_index(
     state: &ServerState,
     index_dir: &Path,
@@ -7452,7 +7465,7 @@ fn publish_staged_index(
     };
     if let Err(error) = filename_stage_result {
         eprintln!("[trace] warning: filename index staging failed: {error}");
-        let _ = std::fs::remove_dir_all(staging_dir);
+        index_cleanup::cleanup_staging(staging_dir);
         return PublishStatus::Failed;
     }
 
@@ -7476,7 +7489,7 @@ fn publish_staged_index(
     else {
         return match moved.rollback() {
             Ok(()) => {
-                let _ = std::fs::remove_dir_all(staging_dir);
+                index_cleanup::cleanup_staging(staging_dir);
                 PublishStatus::Failed
             }
             Err(e) => {
@@ -7509,12 +7522,18 @@ fn publish_staged_index(
             state.cache_generation.fetch_add(1, Ordering::SeqCst);
         }
     }
-    moved.commit();
+    if let Err(error) = moved.commit() {
+        eprintln!(
+            "[trace] warning: index published but backups remain in {}: {error}",
+            moved.backup.path().display()
+        );
+    }
+    index_cleanup::cleanup_retired(index_dir);
     eprintln!(
         "[trace] flush: reader reopened ({reader_files} files, \
          {reader_trigrams} trigrams), overlay pruned"
     );
-    let _ = std::fs::remove_dir_all(staging_dir);
+    index_cleanup::cleanup_staging(staging_dir);
     PublishStatus::Published
 }
 
@@ -7528,12 +7547,12 @@ fn publish_reloaded_index(
         Ok(Some(paths)) => paths.into_iter().collect(),
         Ok(None) => {
             eprintln!("[trace] warning: reloaded index has no filename sidecar");
-            let _ = std::fs::remove_dir_all(staging_dir);
+            index_cleanup::cleanup_staging(staging_dir);
             return false;
         }
         Err(error) => {
             eprintln!("[trace] warning: reloaded filename index failed to open: {error}");
-            let _ = std::fs::remove_dir_all(staging_dir);
+            index_cleanup::cleanup_staging(staging_dir);
             return false;
         }
     };
@@ -7550,7 +7569,7 @@ fn publish_reloaded_index(
     else {
         match moved.rollback() {
             Ok(()) => {
-                let _ = std::fs::remove_dir_all(staging_dir);
+                index_cleanup::cleanup_staging(staging_dir);
             }
             Err(e) => {
                 moved.preserve();
@@ -7576,12 +7595,18 @@ fn publish_reloaded_index(
         cache.clear();
         state.cache_generation.fetch_add(1, Ordering::SeqCst);
     }
-    moved.commit();
+    if let Err(error) = moved.commit() {
+        eprintln!(
+            "[trace] warning: index reloaded but backups remain in {}: {error}",
+            moved.backup.path().display()
+        );
+    }
+    index_cleanup::cleanup_retired(index_dir);
     eprintln!(
         "[trace] reload: reader reopened ({reader_files} files, \
          {reader_trigrams} trigrams), overlay and cache cleared"
     );
-    let _ = std::fs::remove_dir_all(staging_dir);
+    index_cleanup::cleanup_staging(staging_dir);
     true
 }
 
@@ -7654,7 +7679,7 @@ fn staged_publish_order() -> impl Iterator<Item = &'static str> {
 }
 
 struct StagedFileMove {
-    staging: PathBuf,
+    backup: index_cleanup::BackupDir,
     target: PathBuf,
     backed_up: Vec<&'static str>,
     published: Vec<&'static str>,
@@ -7663,7 +7688,7 @@ struct StagedFileMove {
 
 impl StagedFileMove {
     fn backup_path(&self, name: &str) -> PathBuf {
-        self.staging.join(format!(".previous-{name}"))
+        self.backup.path().join(name)
     }
 
     fn rollback(&mut self) -> std::io::Result<()> {
@@ -7674,7 +7699,7 @@ impl StagedFileMove {
         let mut pending_published = Vec::new();
         for name in std::mem::take(&mut self.published).into_iter().rev() {
             let published = self.target.join(name);
-            if let Err(e) = std::fs::remove_file(&published)
+            if let Err(e) = index_cleanup::remove_file(&published)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 if first_error.is_none() {
@@ -7688,6 +7713,13 @@ impl StagedFileMove {
 
         let mut pending_backups = Vec::new();
         for name in std::mem::take(&mut self.backed_up).into_iter().rev() {
+            // A failed delete may mean an independent reader has the rejected
+            // generation mapped. Renaming over it would let std use a POSIX
+            // replacement and orphan the same file we just refused to unlink.
+            if self.published.contains(&name) {
+                pending_backups.push(name);
+                continue;
+            }
             match publish_file(&self.backup_path(name), &self.target.join(name)) {
                 Ok(()) => self.published.retain(|published| *published != name),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -7707,17 +7739,28 @@ impl StagedFileMove {
             return Err(e);
         }
         self.finished = true;
+        if let Err(error) = std::fs::remove_dir(self.backup.path()) {
+            eprintln!(
+                "[trace] warning: rolled back index but could not remove empty backup {}: {error}",
+                self.backup.path().display()
+            );
+        }
         Ok(())
     }
 
-    fn commit(&mut self) {
+    fn commit(&mut self) -> std::io::Result<()> {
         self.finished = true;
+        self.backup.commit()
     }
 
     fn preserve(&mut self) {
         // Leave every remaining backup and published file exactly where the
         // failed rollback left it so an operator or later recovery can use it.
         self.finished = true;
+        eprintln!(
+            "[trace] preserving index publication backups in {}",
+            self.backup.path().display()
+        );
     }
 
     fn fail(mut self, publish: std::io::Error) -> MoveStagedFilesError {
@@ -7769,8 +7812,10 @@ impl std::error::Error for MoveStagedFilesError {
 /// until the caller validates and commits the new reader.
 ///
 /// Files are published in a fixed order, with `meta.json` last. Existing files
-/// are retained in staging until reader validation succeeds, so dropping the
-/// returned transaction rolls back a partial or rejected publication.
+/// are retained in a unique backup directory until reader validation succeeds,
+/// so dropping the transaction rolls back a partial or rejected publication.
+/// Committed backups are retired independently of staging: Windows refuses to
+/// delete them while mapped, and later publications must not replace them.
 ///
 /// Performance note: this function runs under the server's `publish_lock`
 /// (which serializes concurrent publishers) but does NOT take the
@@ -7790,8 +7835,13 @@ fn move_staged_files(
         publish,
         rollback: None,
     })?;
+    let backup =
+        index_cleanup::BackupDir::create(target).map_err(|publish| MoveStagedFilesError {
+            publish,
+            rollback: None,
+        })?;
     let mut moved = StagedFileMove {
-        staging: staging.to_path_buf(),
+        backup,
         target: target.to_path_buf(),
         backed_up: Vec::new(),
         published: Vec::new(),
@@ -13540,6 +13590,172 @@ mod tests {
         std::fs::write(path, content).expect("write_file");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn publish_keeps_mapped_index_generation_named() {
+        for reload in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("root");
+            let index_dir = tmp.path().join("index");
+            std::fs::create_dir_all(&root).unwrap();
+            let state = test_server_state(&root, &index_dir);
+            install_reader_file(
+                &state,
+                &root,
+                &index_dir,
+                "old.rs",
+                b"fn old_generation() {}\n",
+            );
+            let snapshot = state.index.read().unwrap().reader_arc();
+            let independent_reader = tgrep_core::reader::IndexReader::open(&index_dir).unwrap();
+            let old_file = File::open(index_dir.join("index.bin")).unwrap();
+            let old_bytes = std::fs::read(index_dir.join("index.bin")).unwrap();
+            let new_bytes = b"fn new_generation() {}\n";
+            std::fs::write(root.join("new.rs"), new_bytes).unwrap();
+            state
+                .index
+                .write()
+                .unwrap()
+                .live
+                .upsert_file("new.rs", new_bytes);
+
+            if reload {
+                let response = handle_reload(Some(serde_json::json!(1)), &state);
+                let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(response.pointer("/result/status").unwrap(), "reloaded");
+            } else {
+                assert!(flush_append_only_overlay(&state, &index_dir, true, None));
+            }
+            let plan = query::build_literal_plan("old_generation", false);
+            assert_eq!(
+                query::execute_plan(&plan, &|tri| snapshot.lookup_trigram(tri)),
+                vec![0]
+            );
+            let old_path = final_path_of(&old_file).unwrap();
+            assert!(
+                old_path.is_file(),
+                "a mapped generation must stay named on disk, not be unlinked into NTFS $Deleted: {}",
+                old_path.display()
+            );
+            assert!(
+                old_path.starts_with(std::fs::canonicalize(index_dir.join(".retired")).unwrap())
+            );
+            assert_eq!(std::fs::read(&old_path).unwrap(), old_bytes);
+
+            drop(snapshot);
+            index_cleanup::cleanup_retired(&index_dir);
+            assert!(
+                old_path.is_file(),
+                "an independent reader, not just the server's Arc, must prevent deletion"
+            );
+            assert_eq!(
+                query::execute_plan(&plan, &|tri| independent_reader.lookup_trigram(tri)),
+                vec![0]
+            );
+            drop(independent_reader);
+            drop(old_file);
+            index_cleanup::cleanup_retired(&index_dir);
+            assert!(!old_path.exists());
+            assert_eq!(
+                std::fs::read_dir(index_dir.join(".retired"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn publish_releases_merge_readers_before_cleanup() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        let index_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = test_server_state(&root, &index_dir);
+        install_reader_file(
+            &state,
+            &root,
+            &index_dir,
+            "old.rs",
+            b"fn old_generation() {}\n",
+        );
+
+        for generation in 0..3 {
+            let path = format!("new-{generation}.rs");
+            let bytes = format!("fn generation_{generation}() {{}}\n");
+            std::fs::write(root.join(&path), bytes.as_bytes()).unwrap();
+            state
+                .index
+                .write()
+                .unwrap()
+                .live
+                .upsert_file(&path, bytes.as_bytes());
+            assert!(flush_append_only_overlay(&state, &index_dir, true, None));
+            assert_eq!(
+                std::fs::read_dir(index_dir.join(".retired"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+
+        std::fs::write(root.join("old.rs"), b"fn replacement_generation() {}\n").unwrap();
+        reindex_file(&state, &root.join("old.rs"), "old.rs", true);
+        assert!(persist_pending_index_changes(&state));
+        assert_eq!(
+            std::fs::read_dir(index_dir.join(".retired"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let plan = query::build_literal_plan("replacement_generation", false);
+        assert_eq!(state.index.read().unwrap().execute_query(&plan).len(), 1);
+    }
+
+    #[test]
+    fn publish_rejected_generation_restores_live_reader() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        let index_dir = tmp.path().join("index");
+        let staging = index_dir.join("staging");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = test_server_state(&root, &index_dir);
+        install_reader_file(
+            &state,
+            &root,
+            &index_dir,
+            "old.rs",
+            b"fn old_generation() {}\n",
+        );
+        let old_bytes = std::fs::read(index_dir.join("index.bin")).unwrap();
+        create_empty_index(&staging).unwrap();
+
+        assert_eq!(
+            publish_staged_index(
+                &state,
+                &index_dir,
+                &staging,
+                1,
+                &[],
+                &Default::default(),
+                None,
+            ),
+            PublishStatus::Failed
+        );
+        assert_eq!(
+            std::fs::read(index_dir.join("index.bin")).unwrap(),
+            old_bytes
+        );
+        let plan = query::build_literal_plan("old_generation", false);
+        assert_eq!(state.index.read().unwrap().execute_query(&plan), vec![0]);
+        assert_eq!(
+            std::fs::read_dir(index_dir.join(".retired"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
     #[test]
     fn publish_file_renames_when_target_missing() {
         let tmp = TempDir::new().unwrap();
@@ -13626,7 +13842,7 @@ mod tests {
         }
         write_file(&staging.join("ignored.txt"), b"nope");
         let mut moved = move_staged_files(&staging, &target).unwrap();
-        moved.commit();
+        moved.commit().unwrap();
         for name in [
             "index.bin",
             "lookup.bin",
@@ -13677,7 +13893,7 @@ mod tests {
         write_file(&target.join(EVIDENCE_FILE_NAME), b"old evidence");
 
         let mut moved = move_staged_files(&staging, &target).unwrap();
-        moved.commit();
+        moved.commit().unwrap();
 
         assert_eq!(std::fs::read(target.join("index.bin")).unwrap(), b"new");
         assert!(
@@ -13712,6 +13928,42 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn rollback_does_not_replace_a_mapped_rejected_generation() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join("staging");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        write_file(&staging.join("index.bin"), b"new generation");
+        write_file(&target.join("index.bin"), b"old generation");
+        let mut moved = move_staged_files(&staging, &target).unwrap();
+        let backup_path = moved.backup_path("index.bin");
+        let file = File::open(target.join("index.bin")).unwrap();
+        // SAFETY: rollback must refuse to remove or replace a mapped file.
+        let mapping = unsafe { memmap2::Mmap::map(&file).unwrap() };
+
+        assert!(moved.rollback().is_err());
+        index_cleanup::cleanup_retired(&target);
+        assert_eq!(std::fs::read(&backup_path).unwrap(), b"old generation");
+        assert_eq!(
+            std::fs::read(target.join("index.bin")).unwrap(),
+            b"new generation"
+        );
+        assert_eq!(&mapping[..], b"new generation");
+        assert!(final_path_of(&file).unwrap().is_file());
+
+        drop(mapping);
+        drop(file);
+        moved.rollback().unwrap();
+        assert_eq!(
+            std::fs::read(target.join("index.bin")).unwrap(),
+            b"old generation"
+        );
+        assert!(!backup_path.exists());
+    }
+
     #[test]
     fn rollback_restores_backup_when_published_target_is_already_missing() {
         let tmp = TempDir::new().unwrap();
@@ -13732,14 +13984,13 @@ mod tests {
     #[test]
     fn rollback_restores_backup_when_replacement_was_never_published() {
         let tmp = TempDir::new().unwrap();
-        let staging = tmp.path().join("staging");
         let target = tmp.path().join("target");
-        std::fs::create_dir_all(&staging).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        write_file(&staging.join(".previous-index.bin"), b"old");
+        let backup = index_cleanup::BackupDir::create(&target).unwrap();
+        write_file(&backup.path().join("index.bin"), b"old");
 
         let mut moved = StagedFileMove {
-            staging,
+            backup,
             target: target.clone(),
             backed_up: vec!["index.bin"],
             published: Vec::new(),
@@ -13753,15 +14004,15 @@ mod tests {
     #[test]
     fn move_failure_reports_rollback_failure_and_preserves_backups() {
         let tmp = TempDir::new().unwrap();
-        let staging = tmp.path().join("staging");
         let target = tmp.path().join("target");
-        std::fs::create_dir_all(&staging).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        write_file(&staging.join(".previous-index.bin"), b"old-index");
+        let backup = index_cleanup::BackupDir::create(&target).unwrap();
+        let backup_path = backup.path().join("index.bin");
+        write_file(&backup_path, b"old-index");
         std::fs::create_dir(target.join("index.bin")).unwrap();
 
         let moved = StagedFileMove {
-            staging: staging.clone(),
+            backup,
             target,
             backed_up: vec!["index.bin"],
             published: vec!["index.bin"],
@@ -13770,26 +14021,22 @@ mod tests {
         let error = moved.fail(std::io::Error::other("publish failed"));
 
         assert!(error.rollback_failed());
-        assert_eq!(
-            std::fs::read(staging.join(".previous-index.bin")).unwrap(),
-            b"old-index"
-        );
+        assert_eq!(std::fs::read(backup_path).unwrap(), b"old-index");
     }
 
     #[test]
     fn rollback_retry_does_not_delete_an_already_restored_backup() {
         let tmp = TempDir::new().unwrap();
-        let staging = tmp.path().join("staging");
         let target = tmp.path().join("target");
-        std::fs::create_dir_all(&staging).unwrap();
         std::fs::create_dir_all(&target).unwrap();
-        write_file(&staging.join(".previous-index.bin"), b"old-index");
-        write_file(&staging.join(".previous-lookup.bin"), b"old-lookup");
+        let backup = index_cleanup::BackupDir::create(&target).unwrap();
+        write_file(&backup.path().join("index.bin"), b"old-index");
+        write_file(&backup.path().join("lookup.bin"), b"old-lookup");
         write_file(&target.join("index.bin"), b"new-index");
         std::fs::create_dir(target.join("lookup.bin")).unwrap();
 
         let mut moved = StagedFileMove {
-            staging,
+            backup,
             target: target.clone(),
             backed_up: vec!["index.bin", "lookup.bin"],
             published: vec!["index.bin", "lookup.bin"],

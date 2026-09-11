@@ -22,6 +22,7 @@ archive="tgrep-v0.0.0-aarch64-apple-darwin.tar.gz"
 printf '#!%s\nprintf "tgrep 0.0.0\\n"\n' "$bash_bin" > "$tmpdir/fixture/tgrep"
 tar czf "$tmpdir/fixture/$archive" -C "$tmpdir/fixture" tgrep
 (cd "$tmpdir/fixture" && "${verifier[@]}" "$archive") > "$tmpdir/fixture/checksums.txt"
+read -r digest _ < "$tmpdir/fixture/checksums.txt"
 printf '%064d  unrelated.tar.gz\n' 0 >> "$tmpdir/fixture/checksums.txt"
 
 # An isolated PATH makes the cases independent of the host's installed tools.
@@ -49,6 +50,14 @@ case "$2:$SCENARIO" in
     *.tar.gz:corrupt) printf 'corruption\n' >> "$4" ;;
     */checksums.txt:missing) printf '%064d  unrelated.tar.gz\n' 0 > "$4" ;;
     */checksums.txt:malformed) printf 'invalid  %s\n' "$ARCHIVE" > "$4" ;;
+    */checksums.txt:bad-hex) printf 'g%s  %s\n' "${DIGEST:1}" "$ARCHIVE" > "$4" ;;
+    */checksums.txt:short-hash) printf '%s  %s\n' "${DIGEST%?}" "$ARCHIVE" > "$4" ;;
+    */checksums.txt:duplicate) printf '%s  %s\n' "$DIGEST" "$ARCHIVE" >> "$4" ;;
+    */checksums.txt:mixed-malformed) printf 'invalid  %s\n' "$ARCHIVE" >> "$4" ;;
+    */checksums.txt:binary) printf '%s *%s\n' "$DIGEST" "$ARCHIVE" > "$4" ;;
+    */checksums.txt:no-newline) printf '%s  %s' "$DIGEST" "$ARCHIVE" > "$4" ;;
+    */checksums.txt:suffix-only) printf '%s  %s.extra\n' "$DIGEST" "$ARCHIVE" > "$4" ;;
+    */checksums.txt:suffix-extra) printf '%s  %s.extra\n' "$DIGEST" "$ARCHIVE" >> "$4" ;;
 esac
 EOF
 } > "$tmpdir/tools/curl"
@@ -59,11 +68,15 @@ run_case() (
     scenario="$2"
     case_dir="$tmpdir/${tools// /-}-$scenario"
     mkdir -p "$case_dir/bin" "$case_dir/install" "$case_dir/tmp"
-    for tool in $tools; do
+    checksum_tools="$tools"
+    if [ "$tools" = busybox ]; then
+        checksum_tools=sha256sum
+    fi
+    for tool in $checksum_tools; do
         [ "$tool" != none ] || continue
         case "$tool" in
-            sha256sum) expected_args="-c --strict -" ;;
-            shasum) expected_args="-a 256 -c --strict -" ;;
+            sha256sum) expected_args="-c -" ;;
+            shasum) expected_args="-a 256 -c -" ;;
         esac
         backend=("${verifier[@]}")
         if command -v "$tool" >/dev/null 2>&1; then
@@ -72,14 +85,17 @@ run_case() (
                 backend+=(-a 256)
             fi
         fi
-        # Check the selected command and flags, then use a real SHA-256 backend.
+        if [ "$tools" = busybox ] && command -v busybox >/dev/null 2>&1; then
+            backend=("$(command -v busybox)" sha256sum)
+        fi
+        # Enforce BusyBox-compatible flags even when the real applet is unavailable.
         {
             printf '#!%s\n' "$bash_bin"
             printf 'printf "%%s\\n" %q >> "$CHECKSUM_CALLS"\n' "$tool"
             printf '[ "$*" = %q ] || exit 2\n' "$expected_args"
             printf 'exec '
             printf '%q ' "${backend[@]}"
-            printf '%s\n' '-c --strict -'
+            printf '%s\n' '-c -'
         } > "$case_dir/bin/$tool"
         chmod +x "$case_dir/bin/$tool"
     done
@@ -89,6 +105,7 @@ run_case() (
         TMPDIR="$case_dir/tmp" \
         FIXTURE="$tmpdir/fixture" \
         ARCHIVE="$archive" \
+        DIGEST="$digest" \
         SCENARIO="$scenario" \
         DOWNLOADS="$case_dir/downloads" \
         CHECKSUM_CALLS="$case_dir/checksum-calls" \
@@ -96,7 +113,17 @@ run_case() (
         TGREP_INSTALL_DIR="$case_dir/install" \
         "$bash_bin" "$installer" > "$case_dir/output" 2>&1 || status=$?
 
-    if [ "$scenario" = valid ] && [ "$tools" != none ]; then
+    case "$scenario" in
+        valid|binary|no-newline|suffix-extra) expect_success=true; expect_verifier=true ;;
+        corrupt) expect_success=false; expect_verifier=true ;;
+        *) expect_success=false; expect_verifier=false ;;
+    esac
+    if [ "$tools" = none ]; then
+        expect_success=false
+        expect_verifier=false
+    fi
+
+    if "$expect_success"; then
         if [ "$status" -ne 0 ] || [ ! -x "$case_dir/install/tgrep" ]; then
             cat "$case_dir/output"
             fail "$tools/$scenario: installation did not succeed"
@@ -118,8 +145,10 @@ run_case() (
             grep -q 'Checksum verification failed' "$case_dir/output" || fail "Missing checksum failure diagnostic"
         fi
     fi
-    if [ "$tools" != none ]; then
-        [ "$(cat "$case_dir/checksum-calls")" = "${tools%% *}" ] || fail "Wrong checksum tool selected"
+    if "$expect_verifier"; then
+        [ "$(cat "$case_dir/checksum-calls")" = "${checksum_tools%% *}" ] || fail "Wrong checksum tool selected"
+    else
+        [ ! -e "$case_dir/checksum-calls" ] || fail "Passed invalid checksum entries to the verifier"
     fi
     for leftover in "$case_dir/tmp/"*; do
         [ ! -e "$leftover" ] || fail "$tools/$scenario: temporary files were not cleaned up"
@@ -127,8 +156,8 @@ run_case() (
     printf 'PASS: %s/%s\n' "$tools" "$scenario"
 )
 
-for tools in shasum sha256sum "sha256sum shasum"; do
-    for scenario in valid corrupt missing malformed; do
+for tools in busybox shasum sha256sum "sha256sum shasum"; do
+    for scenario in valid corrupt missing malformed bad-hex short-hash duplicate mixed-malformed binary no-newline suffix-only suffix-extra; do
         run_case "$tools" "$scenario"
     done
 done

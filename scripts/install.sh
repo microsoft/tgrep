@@ -93,9 +93,26 @@ main() (
     curl -fsSL "${base_url}/${checksums}" -o "${tmpdir}/${checksums}"
 
     info "Verifying checksum..."
-    # BSD sha256sum needs explicit stdin and --strict to reject malformed entries.
-    (cd "$tmpdir" && grep "${archive}" "${checksums}" | "${checksum_cmd[@]}" -c --strict - >/dev/null) \
-        || error "Checksum verification failed"
+    (
+        cd "$tmpdir" || exit 1
+        local checksum_line="" line digest filename
+        while IFS= read -r line || [ -n "$line" ]; do
+            digest="${line%% *}"
+            filename="${line#* }"
+            case "$filename" in
+                " $archive"|"*$archive") ;;
+                *) continue ;;
+            esac
+            # Validate exactly one entry: not all verifiers support --strict.
+            if [ -n "$checksum_line" ] || [ "${#digest}" -ne 64 ] \
+                || [[ "$digest" == *[!0-9a-fA-F]* ]]; then
+                exit 1
+            fi
+            checksum_line="$line"
+        done < "$checksums"
+        [ -n "$checksum_line" ] || exit 1
+        printf '%s\n' "$checksum_line" | "${checksum_cmd[@]}" -c - >/dev/null
+    ) || error "Checksum verification failed"
 
     info "Extracting..."
     tar xzf "${tmpdir}/${archive}" -C "${tmpdir}"

@@ -93,8 +93,8 @@ main() (
     curl -fsSL "${base_url}/${checksums}" -o "${tmpdir}/${checksums}"
 
     info "Verifying checksum..."
-    # Some non-GNU sha256sum implementations do not support --quiet.
-    (cd "$tmpdir" && grep "${archive}" "${checksums}" | "${checksum_cmd[@]}" -c >/dev/null) \
+    # BSD sha256sum needs explicit stdin and --strict to reject malformed entries.
+    (cd "$tmpdir" && grep "${archive}" "${checksums}" | "${checksum_cmd[@]}" -c --strict - >/dev/null) \
         || error "Checksum verification failed"
 
     info "Extracting..."

@@ -6,6 +6,8 @@ use std::path::Path;
 use anyhow::Result;
 use tgrep_core::builder;
 use tgrep_core::meta::IndexMeta;
+use tgrep_core::path_index;
+use tgrep_core::reader::IndexReader;
 
 use crate::serve::ServerInfo;
 
@@ -45,18 +47,30 @@ pub fn run(root: &Path, index_path: Option<&Path>) -> Result<()> {
         } else {
             println!("  Indexing:   complete");
         }
+        println!(
+            "  Hidden coverage: {}",
+            coverage_label(status.hidden_complete.unwrap_or(false))
+        );
         return Ok(());
     }
 
     // Fall back to on-disk metadata
     match IndexMeta::load(&index_dir) {
         Ok(meta) => {
+            let hidden_complete = match local_hidden_coverage(&index_dir, &meta) {
+                Ok(complete) => complete,
+                Err(error) => {
+                    eprintln!("warning: index coverage unavailable ({error})");
+                    false
+                }
+            };
             println!("Index status for {}", root.display());
             println!("  Files:      {}", meta.num_files);
             println!("  Trigrams:   {}", meta.num_trigrams);
             println!("  Created:    {}", format_timestamp(meta.created_at));
             println!("  Updated:    {}", format_timestamp(meta.updated_at));
             println!("  Server:     not running");
+            println!("  Hidden coverage: {}", coverage_label(hidden_complete));
         }
         Err(_) => {
             println!("No index found at {}", index_dir.display());
@@ -65,6 +79,17 @@ pub fn run(root: &Path, index_path: Option<&Path>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn local_hidden_coverage(index_dir: &Path, meta: &IndexMeta) -> Result<bool> {
+    let Some(index) = path_index::read_filename_index(index_dir)? else {
+        return Ok(false);
+    };
+    let Some(visibility) = index.visibility else {
+        return Ok(false);
+    };
+    let reader = IndexReader::open(index_dir)?;
+    Ok(visibility.covers_index(meta, reader.file_table_id()))
 }
 
 #[derive(serde::Deserialize)]
@@ -92,6 +117,15 @@ struct StatusResult {
     index_progress: u64,
     #[serde(default)]
     index_total: u64,
+    hidden_complete: Option<bool>,
+}
+
+fn coverage_label(complete: bool) -> &'static str {
+    if complete {
+        "complete"
+    } else {
+        "unavailable (queries scan)"
+    }
 }
 
 fn write_refresh_status(writer: &mut impl Write, status: &StatusResult) -> std::io::Result<()> {
@@ -225,6 +259,7 @@ mod tests {
         let status: StatusResult = serde_json::from_value(legacy_status()).unwrap();
         assert!(status.watcher_active);
         assert!(!status.indexing);
+        assert!(status.hidden_complete.is_none());
         assert!(!status.reconcile_running);
         assert!(status.watch_mode_requested.is_none());
         assert!(status.watch_mode_active.is_none());

@@ -197,6 +197,45 @@ impl IgnoreMatcher {
     }
 
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        if self.standard_decision(path, is_dir, true) == Some(true) {
+            return true;
+        }
+        if self.local_is_filter
+            && self
+                .local
+                .matched_path_or_any_parents(path, is_dir)
+                .is_ignore()
+        {
+            return true;
+        }
+        // The walk applies this narrowing even to whitelisted paths.
+        self.ignorecase.as_ref().is_some_and(|ignorecase| {
+            let relative = path.to_string_lossy().replace('\\', "/");
+            let relative = relative.trim_start_matches("./").trim_start_matches('/');
+            ignorecase.excludes(&self.root.join(relative), is_dir)
+        })
+    }
+
+    /// Whether an explicit standard ignore-file whitelist admits this entry
+    /// through the walker's hidden filter. Parent-directory matches are not
+    /// inherited here: the walker makes the hidden decision for each entry.
+    pub fn is_whitelisted(&self, path: &Path, is_dir: bool) -> bool {
+        self.standard_decision(path, is_dir, false) == Some(false)
+    }
+
+    fn standard_decision(&self, path: &Path, is_dir: bool, parents: bool) -> Option<bool> {
+        let matched = |matcher: &Gitignore, path: &Path| {
+            let result = if parents {
+                matcher.matched_path_or_any_parents(path, is_dir)
+            } else {
+                matcher.matched(path, is_dir)
+            };
+            match result {
+                Match::Ignore(_) => Some(true),
+                Match::Whitelist(_) => Some(false),
+                Match::None => None,
+            }
+        };
         let rel = path.to_string_lossy().replace('\\', "/");
         let rel = rel.trim_start_matches("./").trim_start_matches('/');
 
@@ -211,19 +250,9 @@ impl IgnoreMatcher {
                 let Some(under) = strip_dir_prefix(rel, &entry.dir) else {
                     continue;
                 };
-                match entry
-                    .matcher
-                    .matched_path_or_any_parents(Path::new(under), is_dir)
-                {
-                    Match::Ignore(_) => {
-                        standard_decision = Some(true);
-                        break;
-                    }
-                    Match::Whitelist(_) => {
-                        standard_decision = Some(false);
-                        break;
-                    }
-                    Match::None => {}
+                if let Some(decision) = matched(&entry.matcher, Path::new(under)) {
+                    standard_decision = Some(decision);
+                    break;
                 }
             }
             if standard_decision.is_some() {
@@ -236,19 +265,9 @@ impl IgnoreMatcher {
                 } else {
                     format!("{}/{rel}", entry.prefix)
                 };
-                match entry
-                    .matcher
-                    .matched_path_or_any_parents(Path::new(&path), is_dir)
-                {
-                    Match::Ignore(_) => {
-                        standard_decision = Some(true);
-                        break;
-                    }
-                    Match::Whitelist(_) => {
-                        standard_decision = Some(false);
-                        break;
-                    }
-                    Match::None => {}
+                if let Some(decision) = matched(&entry.matcher, Path::new(&path)) {
+                    standard_decision = Some(decision);
+                    break;
                 }
             }
             if standard_decision.is_some() {
@@ -259,11 +278,7 @@ impl IgnoreMatcher {
         // `with_nested` historically takes an already-combined root matcher;
         // nested files must retain their deeper-path precedence over it.
         if standard_decision.is_none() && !self.local_is_filter {
-            standard_decision = match self.local.matched_path_or_any_parents(path, is_dir) {
-                Match::Ignore(_) => Some(true),
-                Match::Whitelist(_) => Some(false),
-                Match::None => None,
-            };
+            standard_decision = matched(&self.local, path);
         }
 
         if standard_decision.is_none()
@@ -274,39 +289,13 @@ impl IgnoreMatcher {
             } else {
                 format!("{prefix}/{rel}")
             };
-            match matcher.matched_path_or_any_parents(Path::new(&path), is_dir) {
-                Match::Ignore(_) => standard_decision = Some(true),
-                Match::Whitelist(_) => standard_decision = Some(false),
-                Match::None => {}
-            }
+            standard_decision = matched(matcher, Path::new(&path));
         }
 
         if standard_decision.is_none() {
-            standard_decision = match self.global.matched_path_or_any_parents(path, is_dir) {
-                Match::Ignore(_) => Some(true),
-                Match::Whitelist(_) => Some(false),
-                Match::None => None,
-            };
+            standard_decision = matched(&self.global, path);
         }
-
-        if standard_decision == Some(true) {
-            return true;
-        }
-        if self.local_is_filter
-            && self
-                .local
-                .matched_path_or_any_parents(path, is_dir)
-                .is_ignore()
-        {
-            return true;
-        }
-        // Applied last, and to whitelisted paths too, because that is where the
-        // indexing walk applies it: a `filter_entry` rejection is not undone by
-        // a whitelist rule. Both passes must agree on what the tree contains,
-        // or the watcher indexes a file the stale check immediately evicts.
-        self.ignorecase
-            .as_ref()
-            .is_some_and(|ignorecase| ignorecase.excludes(&self.root.join(rel), is_dir))
+        standard_decision
     }
 
     /// Fingerprint of the tracked paths behind the tracked-file exemption.
@@ -951,27 +940,16 @@ pub fn build_matcher(root: &Path) -> Option<IgnoreMatcher> {
     let p4ignore = build_p4ignore_matcher(root).map(std::sync::Arc::new);
     let match_root = root.to_path_buf();
 
-    // Walk to find every `.gitignore` file. We can't use `hidden(true)`
-    // because `.gitignore` itself starts with `.` and would be filtered.
-    // Instead, walk with hidden=false and use `filter_entry` to skip
-    // all dot-prefixed *directories* (`.git`, `.tgrep`, `.vscode`, …) —
-    // this avoids unnecessary I/O into hidden subtrees while still
-    // letting dot-prefixed *files* like `.gitignore` through, since
-    // `filter_entry` only controls directory descent for directories.
+    let index_dir = crate::builder::default_index_dir(root);
+    // Hidden subtrees carry ordinary ignore rules too. Prune storage, not
+    // arbitrary dot-prefixed directories.
     let walker = WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .filter_entry(move |entry| {
-            // Allow files (we only care about .gitignore among them).
-            // For directories, skip any that start with '.'.
-            if entry.file_type().is_some_and(|ft| ft.is_dir())
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with('.'))
-            {
+            if entry.path().starts_with(&index_dir) {
                 return false;
             }
             if entry.file_name() == ".gitignore" || entry.file_name() == ".ignore" {

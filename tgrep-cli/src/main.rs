@@ -982,14 +982,11 @@ impl Cli {
     /// `tgrep search` over the same tree. That is indistinguishable from a
     /// corpus with no matches, so the only safe answer is to refuse.
     ///
-    /// `--hidden` is honoured by `index` but not by `serve`, hence the
-    /// parameter. `--threads` is excluded deliberately: it is documented as
+    /// Both builders include hidden files by default, so `--hidden` is accepted
+    /// as a redundant flag. `--threads` is excluded deliberately: it is documented as
     /// accepted-for-compatibility and ignored everywhere, not just here.
-    fn unsupported_discovery_flags(&self, hidden_supported: bool) -> Vec<&'static str> {
+    fn unsupported_discovery_flags(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
-        if self.hidden && !hidden_supported {
-            out.push("--hidden");
-        }
         if self.follow {
             out.push("--follow");
         }
@@ -1029,8 +1026,8 @@ impl Cli {
 
 /// Exit with a clear error rather than building an index under settings the
 /// caller did not ask for. See [`Cli::unsupported_discovery_flags`].
-fn reject_unsupported_discovery_flags(cli: &Cli, subcommand: &str, hidden_supported: bool) {
-    let unsupported = cli.unsupported_discovery_flags(hidden_supported);
+fn reject_unsupported_discovery_flags(cli: &Cli, subcommand: &str) {
+    let unsupported = cli.unsupported_discovery_flags();
     if unsupported.is_empty() {
         return;
     }
@@ -1108,8 +1105,8 @@ fn run_cli() {
     // Refuse discovery flags the index-building subcommands can't honour. Done
     // before the match so the arms keep consuming `cli.command` by value.
     match &cli.command {
-        Some(Command::Index { .. }) => reject_unsupported_discovery_flags(&cli, "index", true),
-        Some(Command::Serve { .. }) => reject_unsupported_discovery_flags(&cli, "serve", false),
+        Some(Command::Index { .. }) => reject_unsupported_discovery_flags(&cli, "index"),
+        Some(Command::Serve { .. }) => reject_unsupported_discovery_flags(&cli, "serve"),
         _ => {}
     }
 
@@ -1124,7 +1121,7 @@ fn run_cli() {
             index::run(index::RunOptions {
                 root: &path,
                 index_path: cli.index_path.as_deref(),
-                include_hidden: cli.hidden,
+                include_hidden: true,
                 no_ignore,
                 no_require_git: cli.no_require_git,
                 exclude_dirs: &exclude,

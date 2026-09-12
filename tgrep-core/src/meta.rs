@@ -7,6 +7,8 @@ use crate::Result;
 
 const META_FILENAME: &str = "meta.json";
 const FILESTAMPS_FILENAME: &str = "filestamps.json";
+pub const INDEX_FORMAT_VERSION: u32 = crate::ondisk::INDEX_FORMAT_VERSION;
+pub type FileTableId = [u8; 32];
 const CONTENT_ID_DOMAIN: &[u8] =
     b"tgrep/content-id/v1\0decode_for_index-output\0binary-and-posting-semantics-v2";
 
@@ -22,6 +24,15 @@ pub struct IndexMeta {
     /// stopped during background indexing and the index is partial.
     #[serde(default = "default_complete")]
     pub complete: bool,
+    /// Proven coverage of otherwise eligible hidden files. Missing on legacy
+    /// indexes; neither `complete` alone nor a partial build proves coverage.
+    #[serde(default)]
+    pub hidden_complete: bool,
+    #[serde(default)]
+    pub visibility: crate::visibility::PathVisibility,
+    /// Binds visibility to the exact path table across multi-file publication.
+    #[serde(default)]
+    pub file_table_id: Option<FileTableId>,
 }
 
 fn default_complete() -> bool {
@@ -35,13 +46,16 @@ impl IndexMeta {
             .unwrap_or_default()
             .as_secs();
         Self {
-            version: 2,
+            version: INDEX_FORMAT_VERSION,
             num_files,
             num_trigrams,
             created_at: now,
             updated_at: now,
             root_path: root_path.to_string(),
             complete: true,
+            hidden_complete: false,
+            visibility: Default::default(),
+            file_table_id: None,
         }
     }
 
@@ -60,6 +74,25 @@ impl IndexMeta {
         let data = std::fs::read_to_string(path)?;
         let meta: Self = serde_json::from_str(&data)?;
         Ok(meta)
+    }
+}
+
+pub fn file_table_id(data: &[u8]) -> FileTableId {
+    *blake3::hash(data).as_bytes()
+}
+
+pub fn read_file_table_id(index_dir: &Path) -> Result<FileTableId> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(index_dir.join("files.bin"))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(*hasher.finalize().as_bytes());
+        }
+        hasher.update(&buffer[..read]);
     }
 }
 
@@ -526,6 +559,16 @@ pub fn collect_filestamps(root: &Path, paths: &[String]) -> HashMap<String, File
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_metadata_does_not_prove_hidden_coverage() {
+        let mut value = serde_json::to_value(super::IndexMeta::new("root", 1, 2)).unwrap();
+        value.as_object_mut().unwrap().remove("hidden_complete");
+        value.as_object_mut().unwrap().remove("visibility");
+        let meta: super::IndexMeta = serde_json::from_value(value).unwrap();
+        assert!(meta.complete);
+        assert!(!meta.hidden_complete);
+    }
+
     use super::*;
 
     #[test]

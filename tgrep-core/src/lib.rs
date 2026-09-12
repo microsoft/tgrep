@@ -13,6 +13,7 @@ pub mod path_index;
 pub mod query;
 pub mod reader;
 pub mod trigram;
+pub mod visibility;
 pub mod walker;
 
 pub use error::{Error, Result};

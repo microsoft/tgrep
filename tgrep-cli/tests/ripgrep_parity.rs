@@ -447,16 +447,20 @@ fn indexed_search_honors_max_depth() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. --hidden / --no-ignore must bypass the index
+// 7. Legacy hidden coverage / --no-ignore must bypass the index
 //
-// The index is built skipping hidden and ignored files, so answering these
-// flags from the index would silently under-report.
+// Missing coverage metadata cannot prove an old index contains hidden files.
+// Ignored files remain outside the default index.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hidden_flag_bypasses_the_index() {
+fn hidden_flag_bypasses_an_index_without_coverage_metadata() {
     let (dir, idx) = indexed_fixture();
-    // Written after indexing, and hidden, so only a bypassing search sees it.
+    let meta_path = std::path::Path::new(&idx).join("meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    meta.as_object_mut().unwrap().remove("hidden_complete");
+    fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
     fs::write(dir.path().join(".secret.txt"), "needle hidden\n").unwrap();
 
     let out = stdout_of(tgrep().current_dir(dir.path()).args([
@@ -469,7 +473,7 @@ fn hidden_flag_bypasses_the_index() {
     ]));
     assert!(
         out.contains("needle hidden"),
-        "--hidden must bypass the index: {out:?}"
+        "--hidden must bypass an index with unknown coverage: {out:?}"
     );
 }
 

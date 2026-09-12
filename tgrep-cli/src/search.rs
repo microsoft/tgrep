@@ -444,6 +444,7 @@ pub fn new_writer(opts: &SearchOptions) -> OutputWriter {
 
 /// List files that would be searched (`--files` mode).
 pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Result<()> {
+    let start = Instant::now();
     let root = match std::fs::canonicalize(root) {
         Ok(root) => root,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -451,13 +452,6 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
     };
     let glob_filter = opts.glob_filter()?;
     let type_filter = opts.type_filter()?;
-
-    // `--files` lists what would be searched without reading anything, so it
-    // must not drop files on an extension guess the way a search does.
-    let walk_opts = walker::WalkOptions {
-        search_binary: true,
-        ..opts.walk_options()
-    };
 
     if root.is_file() {
         let rel_path = explicit_file_display_path(&root);
@@ -474,34 +468,50 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         .map(Path::to_path_buf)
         .unwrap_or_else(|| builder::default_index_dir(&root));
 
-    if filename_index_compatible(opts) {
+    if filename_index_compatible(opts) && !glob_filter.has_includes() {
         if let Ok(info) = ServerInfo::load(&index_dir)
             && let Some((index_root, scope)) = resolve_scope(&index_dir, &root)
-            && let Ok(paths) = list_files_via_server(&info)
+            && let Ok(paths) = list_files_via_server(&info, &scope, opts)
         {
-            return write_indexed_file_paths(
+            write_indexed_file_paths(
                 &index_root,
                 &root,
                 &scope,
                 paths,
+                None,
                 &glob_filter,
                 &type_filter,
                 opts,
-            );
+            )?;
+            if opts.stats {
+                eprintln!(
+                    "Filename search completed in {:.1}ms (via server)",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            return Ok(());
         }
 
         match load_indexed_file_paths(&index_dir) {
-            Ok(Some(paths)) => {
+            Ok(Some((paths, visibility))) => {
                 if let Some((index_root, scope)) = resolve_scope(&index_dir, &root) {
-                    return write_indexed_file_paths(
+                    write_indexed_file_paths(
                         &index_root,
                         &root,
                         &scope,
                         paths,
+                        Some(&visibility),
                         &glob_filter,
                         &type_filter,
                         opts,
-                    );
+                    )?;
+                    if opts.stats {
+                        eprintln!(
+                            "Filename search completed in {:.1}ms (via local index)",
+                            start.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+                    return Ok(());
                 }
             }
             Ok(None) => {}
@@ -513,6 +523,14 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         }
     }
 
+    // `--files` lists what would be searched without reading anything, so it
+    // must not drop files on an extension guess the way a search does.
+    let walk_opts = walker::WalkOptions {
+        search_binary: true,
+        exclude_paths: index_storage_exclusions(&index_dir)?,
+        overrides: Some(glob_filter.walk_overrides(&root)?),
+        ..opts.walk_options()
+    };
     let walk = walker::walk_dir(&root, &walk_opts);
     let paths = walk.files.iter().map(|path| {
         path.strip_prefix(&root)
@@ -525,17 +543,24 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         &root,
         &IndexScope::Whole,
         paths,
+        None,
         &glob_filter,
         &type_filter,
         opts,
-    )
+    )?;
+    if opts.stats {
+        eprintln!(
+            "Filename search completed in {:.1}ms (via filesystem walk)",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Ok(())
 }
 
 /// Whether an existing index was built under traversal rules that can answer
 /// this invocation without silently omitting files.
 fn filename_index_compatible(opts: &SearchOptions) -> bool {
     !opts.no_index
-        && !opts.hidden
         && !opts.no_ignore
         && !opts.no_ignore_dot
         && !opts.no_ignore_exclude
@@ -552,30 +577,47 @@ fn filename_index_compatible(opts: &SearchOptions) -> bool {
 
 /// Load a complete local filename index, including the paths deliberately
 /// omitted from the content index.
-fn load_indexed_file_paths(index_dir: &Path) -> Result<Option<Vec<String>>> {
+fn load_indexed_file_paths(
+    index_dir: &Path,
+) -> Result<Option<(Vec<String>, tgrep_core::visibility::PathVisibility)>> {
     if !index_dir.join("lookup.bin").exists() {
         return Ok(None);
     }
-    let Some(mut extra_paths) = tgrep_core::path_index::read_extra_paths(index_dir)? else {
+    let filename_index = match tgrep_core::path_index::read_filename_index(index_dir) {
+        Ok(Some(index)) => index,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    let Some(visibility) = filename_index.visibility else {
         return Ok(None);
     };
-    if !IndexMeta::load(index_dir)?.complete {
+    let mut extra_paths = filename_index.paths;
+    let meta = IndexMeta::load(index_dir)?;
+    if !meta.complete
+        || !meta.hidden_complete
+        || meta.version != tgrep_core::meta::INDEX_FORMAT_VERSION
+        || !visibility.hidden_complete
+    {
         return Ok(None);
     }
 
     let reader = IndexReader::open(index_dir)?;
+    if !visibility.covers_index(&meta, reader.file_table_id()) {
+        return Ok(None);
+    }
     let mut paths = Vec::with_capacity(reader.num_files() + extra_paths.len());
     paths.extend(reader.all_paths().iter().cloned());
     paths.append(&mut extra_paths);
-    Ok(Some(paths))
+    Ok(Some((paths, visibility.paths)))
 }
 
 /// Apply search-root scoping and CLI filters to index-root-relative paths.
+#[allow(clippy::too_many_arguments)]
 fn write_indexed_file_paths(
     index_root: &Path,
     search_root: &Path,
     scope: &IndexScope,
     paths: impl IntoIterator<Item = String>,
+    visibility: Option<&tgrep_core::visibility::PathVisibility>,
     glob_filter: &crate::glob_filter::GlobFilter,
     type_filter: &filetypes::TypeFilter,
     opts: &SearchOptions,
@@ -584,6 +626,10 @@ fn write_indexed_file_paths(
     let mut paths: Vec<String> = paths
         .into_iter()
         .filter(|path| seen.insert(path.clone()))
+        .filter(|path| {
+            visibility
+                .is_none_or(|visibility| visibility.is_visible(path, scope.prefix(), opts.hidden))
+        })
         .filter_map(|path| scope.relativize(&path, search_root))
         .filter(|path| within_max_depth(path, opts))
         .filter(|path| passes_filters(path, glob_filter, type_filter))
@@ -601,7 +647,11 @@ fn write_indexed_file_paths(
     Ok(())
 }
 
-fn list_files_via_server(info: &ServerInfo) -> Result<Vec<String>> {
+fn list_files_via_server(
+    info: &ServerInfo,
+    scope: &IndexScope,
+    opts: &SearchOptions,
+) -> Result<Vec<String>> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
     writeln!(
@@ -610,6 +660,7 @@ fn list_files_via_server(info: &ServerInfo) -> Result<Vec<String>> {
         serde_json::json!({
             "jsonrpc": "2.0",
             "method": "files",
+            "params": { "hidden": opts.hidden, "scope": scope.prefix() },
             "id": 1,
         })
     )?;
@@ -627,9 +678,12 @@ fn list_files_via_server(info: &ServerInfo) -> Result<Vec<String>> {
         anyhow::bail!("server error: {message}");
     }
 
-    response
+    let result = response
         .get("result")
-        .and_then(|result| result.get("files"))
+        .ok_or_else(|| anyhow::anyhow!("server response did not contain a result"))?;
+    require_server_coverage(result)?;
+    result
+        .get("files")
         .and_then(|files| files.as_array())
         .ok_or_else(|| anyhow::anyhow!("server response did not contain files"))?
         .iter()
@@ -639,6 +693,17 @@ fn list_files_via_server(info: &ServerInfo) -> Result<Vec<String>> {
                 .ok_or_else(|| anyhow::anyhow!("server returned a non-string file path"))
         })
         .collect()
+}
+
+fn require_server_coverage(result: &serde_json::Value) -> Result<()> {
+    if result
+        .get("hidden_complete")
+        .and_then(|value| value.as_bool())
+        != Some(true)
+    {
+        anyhow::bail!("server does not support complete hidden-file coverage");
+    }
+    Ok(())
 }
 
 /// Run one search path's worth of work, writing through the caller's `writer`.
@@ -670,9 +735,9 @@ pub fn run(
     // nothing but NUL-interleaved bytes) is absent from the index entirely, so
     // even a full-scan plan cannot reach it. The only way `-E` means the same
     // thing with and without an index is to walk the tree. `-a`/`--binary` are
-    // the same story, as is anything that widens the walk: the index was built
-    // skipping hidden and ignored files, so `--hidden`/`--no-ignore` can only
-    // find them by walking.
+    // the same story, as is anything that widens the walk into ignored files.
+    // Positive globs can explicitly reinclude those files, unlike --hidden,
+    // which only selects visibility within the normally eligible corpus.
     //
     // A single named file is bypassed too. The index deliberately omits binary
     // and ignored files, but naming one explicitly is exactly how ripgrep asks
@@ -681,7 +746,7 @@ pub fn run(
         || opts.encoding.may_differ_from_index()
         || opts.text
         || opts.binary
-        || opts.hidden
+        || opts.glob_filter()?.has_includes()
         || opts.no_ignore
         || opts.no_ignore_dot
         || opts.no_ignore_exclude
@@ -706,16 +771,16 @@ pub fn run(
         {
             return Ok(had_matches);
         }
-        eprintln!("Server unreachable, falling back to local index");
+        eprintln!("Server unavailable or index coverage not ready, falling back to local index");
     }
 
     // No server — use on-disk index directly (or brute force)
     if opts.no_index || bypass_index {
-        return brute_force_search(&root, opts, ci, writer);
+        return brute_force_search(&root, &index_dir, opts, ci, writer);
     }
     if !index_dir.join("lookup.bin").exists() {
         warn_missing_index(&index_dir, index_path.is_some(), opts.quiet);
-        return brute_force_search(&root, opts, ci, writer);
+        return brute_force_search(&root, &index_dir, opts, ci, writer);
     }
 
     search_local_index(&root, &index_dir, opts, ci, writer)
@@ -802,7 +867,7 @@ fn search_via_server(
     let detail = opts.wants_match_detail();
     let positions = opts.wants_position_detail();
 
-    let request = serde_json::json!({
+    let mut request = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "search",
         "params": {
@@ -849,6 +914,9 @@ fn search_via_server(
         },
         "id": 1,
     });
+    request["params"]["hidden"] = serde_json::json!(opts.hidden);
+    request["params"]["scope"] = serde_json::json!(scope.prefix());
+    request["params"]["max_depth"] = serde_json::json!(opts.max_depth);
     writeln!(stream, "{}", request)?;
     stream.flush()?;
 
@@ -869,6 +937,9 @@ fn search_via_server(
     let result = response
         .get("result")
         .ok_or_else(|| anyhow::anyhow!("no result in response"))?;
+    // Older servers ignore unknown request fields. Validate before writing any
+    // rows, so an old/partial server can never silently answer --hidden.
+    require_server_coverage(result)?;
 
     let empty_vec = Vec::new();
     let matches = result
@@ -876,9 +947,9 @@ fn search_via_server(
         .and_then(|m| m.as_array())
         .unwrap_or(&empty_vec);
 
-    // The server always searches its whole indexed tree and reports paths
-    // relative to the index root, so a subdirectory argument and `--max-depth`
-    // have to be applied to the reply.
+    // The server scopes candidates before searching but still reports paths
+    // relative to the index root. Translate those paths for output and apply
+    // the same scope defensively to all reply rows.
     //
     // ripgrep only surfaces a binary file when the user named it explicitly, so
     // `binary` rows for anything reached by traversal are dropped here — along
@@ -1094,7 +1165,7 @@ fn search_via_server(
         // summary after the matches, as ripgrep does.
         flush_before_stats(writer)?;
         // Apply the same scope to per-file totals as to output rows. The
-        // server's `num_matches` includes context and out-of-scope rows, and
+        // server's `num_matches` includes context rows, and
         // rendered spans can split or merge the original matches.
         let (num, lines) = if let Some(stats) = result.get("file_stats") {
             let stats: Vec<FileMatchStats> = serde_json::from_value(stats.clone())?;
@@ -1136,7 +1207,48 @@ fn search_local_index(
     writer: &mut OutputWriter,
 ) -> Result<bool> {
     let start = Instant::now();
+    let meta = match IndexMeta::load(index_dir) {
+        Ok(meta) => meta,
+        Err(error) => {
+            if !opts.quiet && !opts.no_messages {
+                eprintln!(
+                    "warning: index coverage metadata unavailable ({error}) - scanning filesystem"
+                );
+            }
+            return brute_force_search(root, index_dir, opts, ci, writer);
+        }
+    };
+    if !meta.complete
+        || !meta.hidden_complete
+        || meta.version != tgrep_core::meta::INDEX_FORMAT_VERSION
+    {
+        if !opts.quiet && !opts.no_messages {
+            eprintln!(
+                "warning: index lacks complete hidden-file coverage - scanning filesystem; rebuild with `tgrep index` or upgrade with `tgrep serve`"
+            );
+        }
+        return brute_force_search(root, index_dir, opts, ci, writer);
+    }
     let reader = IndexReader::open(index_dir)?;
+    let filename_visibility = match tgrep_core::path_index::read_filename_index(index_dir) {
+        Ok(Some(index)) => index.visibility,
+        Ok(None) | Err(_) => None,
+    };
+    let Some(filename_visibility) = filename_visibility else {
+        if !opts.quiet && !opts.no_messages {
+            eprintln!("warning: atomic index visibility unavailable - scanning filesystem");
+        }
+        return brute_force_search(root, index_dir, opts, ci, writer);
+    };
+    if !filename_visibility.covers_index(&meta, reader.file_table_id()) {
+        if !opts.quiet && !opts.no_messages {
+            eprintln!(
+                "warning: index visibility, coverage, and path table differ - scanning filesystem"
+            );
+        }
+        return brute_force_search(root, index_dir, opts, ci, writer);
+    }
+    let visibility = filename_visibility.paths;
 
     // Index paths are relative to the root the index was built for, which is
     // not necessarily the directory being searched. Without translating between
@@ -1144,7 +1256,7 @@ fn search_local_index(
     // silently reports nothing.
     let Some((index_root, scope)) = resolve_scope(index_dir, root) else {
         // The index covers an unrelated tree, so it cannot answer this search.
-        return brute_force_search(root, opts, ci, writer);
+        return brute_force_search(root, index_dir, opts, ci, writer);
     };
 
     let glob_filter = opts.glob_filter()?;
@@ -1189,6 +1301,9 @@ fn search_local_index(
         .iter()
         .filter_map(|&fid| {
             let indexed = reader.file_path(fid)?;
+            visibility
+                .is_visible(indexed, scope.prefix(), opts.hidden)
+                .then_some(())?;
             let rel = scope.relativize(indexed, root)?;
             within_max_depth(&rel, opts).then_some(())?;
             Some((fid, rel))
@@ -1261,6 +1376,13 @@ enum IndexScope {
 }
 
 impl IndexScope {
+    fn prefix(&self) -> &str {
+        match self {
+            Self::Subtree(prefix) => prefix,
+            Self::Whole | Self::File(_) => "",
+        }
+    }
+
     /// `None` when `search_root` lies outside the indexed tree, which means the
     /// index cannot answer the search at all.
     fn resolve(index_root: &Path, search_root: &Path) -> Option<Self> {
@@ -1324,8 +1446,17 @@ fn within_max_depth(rel: &str, opts: &SearchOptions) -> bool {
     }
 }
 
+fn index_storage_exclusions(index_dir: &Path) -> Result<Vec<PathBuf>> {
+    match std::fs::canonicalize(index_dir) {
+        Ok(path) => Ok(vec![path]),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn brute_force_search(
     root: &Path,
+    index_dir: &Path,
     opts: &SearchOptions,
     ci: bool,
     writer: &mut OutputWriter,
@@ -1364,7 +1495,14 @@ fn brute_force_search(
         return Ok(had_matches);
     }
 
-    let mut walk = walker::walk_dir(root, &opts.walk_options());
+    let mut walk = walker::walk_dir(
+        root,
+        &walker::WalkOptions {
+            exclude_paths: index_storage_exclusions(index_dir)?,
+            overrides: Some(glob_filter.walk_overrides(root)?),
+            ..opts.walk_options()
+        },
+    );
     if let Some(sort) = opts.sort {
         sort.apply(&mut walk.files);
     }
@@ -2142,7 +2280,7 @@ mod tests {
     // --- `--stats` counting -------------------------------------------------
     //
     // These pin the reply-row semantics that `--stats` reports over the server.
-    // The server counts every row it built across the whole indexed tree, so
+    // The server counts every row it built, so
     // reporting its `num_matches` made `--stats` disagree with both the printed
     // output and ripgrep. Verified against ripgrep 15.2.0.
 
@@ -2153,6 +2291,18 @@ mod tests {
             "line": line,
             "spans": (0..spans).map(|i| serde_json::json!([i, i + 1])).collect::<Vec<_>>(),
         })
+    }
+
+    #[test]
+    fn server_response_requires_explicit_complete_hidden_coverage() {
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"hidden_complete": false}),
+            serde_json::json!({"hidden_complete": null}),
+        ] {
+            assert!(require_server_coverage(&response).is_err());
+        }
+        assert!(require_server_coverage(&serde_json::json!({"hidden_complete": true})).is_ok());
     }
 
     #[test]

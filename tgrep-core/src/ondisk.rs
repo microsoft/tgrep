@@ -17,11 +17,39 @@
 /// Each entry is 6 bytes: `file_id(u32) + loc_mask(u8) + next_mask(u8)`.
 ///
 /// ## `files.bin` — file ID → path mapping
-/// Variable-length records: `file_id(u32 LE) + path_len(u16 LE) + path_bytes`.
+/// A versioned header followed by variable-length records:
+/// `file_id(u32 LE) + path_len(u16 LE) + path_bytes`.
 pub(crate) const LOOKUP_ENTRY_SIZE: usize = 16; // 4 + 8 + 4
 pub(crate) const POSTING_ENTRY_SIZE: usize = 6; // 4 + 1 + 1
 pub(crate) const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
 pub(crate) const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
+pub(crate) const INDEX_FORMAT_VERSION: u32 = 3;
+// Two duplicate reserved IDs make old dense-ID readers reject the table,
+// rather than exposing a hidden-inclusive corpus without visibility filtering.
+const FILE_TABLE_MAGIC: &[u8; 12] = b"\xff\xff\xff\xff\0\0\xff\xff\xff\xff\0\0";
+pub(crate) const FILE_TABLE_HEADER_LEN: usize = FILE_TABLE_MAGIC.len() + size_of::<u32>();
+
+pub(crate) fn write_file_table_header(writer: &mut impl std::io::Write) -> crate::Result<()> {
+    writer.write_all(FILE_TABLE_MAGIC)?;
+    writer.write_all(&INDEX_FORMAT_VERSION.to_le_bytes())?;
+    Ok(())
+}
+
+pub(crate) fn file_table_body(data: &[u8]) -> crate::Result<&[u8]> {
+    if !data.starts_with(FILE_TABLE_MAGIC) {
+        return Ok(data);
+    }
+    let version = data
+        .get(FILE_TABLE_MAGIC.len()..FILE_TABLE_HEADER_LEN)
+        .ok_or_else(|| crate::Error::IndexCorrupted("files.bin header is truncated".into()))?;
+    let version = u32::from_le_bytes(version.try_into().unwrap());
+    if version != INDEX_FORMAT_VERSION {
+        return Err(crate::Error::IndexCorrupted(format!(
+            "unsupported files.bin format version {version}"
+        )));
+    }
+    Ok(&data[FILE_TABLE_HEADER_LEN..])
+}
 
 /// A single entry in `lookup.bin`.
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +244,28 @@ pub(crate) fn decode_file_entries(data: &[u8]) -> crate::Result<Vec<(u32, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versioned_file_table_rejects_legacy_readers() {
+        let mut bytes = Vec::new();
+        write_file_table_header(&mut bytes).unwrap();
+        write_file_entry(&mut bytes, 0, ".secret.txt").unwrap();
+        let entries = decode_file_entries(file_table_body(&bytes).unwrap()).unwrap();
+        assert_eq!(entries, [(0, ".secret.txt".to_string())]);
+
+        // The v1/v2 parser either rejects the header as malformed or reaches
+        // the unchanged dense/unique-ID validation with duplicate reserved IDs.
+        if let Ok(legacy) = decode_file_entries(&bytes) {
+            let mut ids = std::collections::HashSet::new();
+            assert!(
+                legacy
+                    .iter()
+                    .any(|(id, _)| *id as usize >= legacy.len() || !ids.insert(*id))
+            );
+        }
+        bytes[FILE_TABLE_MAGIC.len()..FILE_TABLE_HEADER_LEN].copy_from_slice(&99u32.to_le_bytes());
+        assert!(file_table_body(&bytes).is_err());
+    }
 
     #[test]
     fn test_lookup_roundtrip() {

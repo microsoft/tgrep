@@ -22,19 +22,18 @@ A search resolves in this order:
    notification is repaired only by periodic reconciliation (scheduled hourly
    and deferrable for up to four hours while queried); `--no-watch` disables it.
 2. **On-disk index** but no server: read `.tgrep/` directly. Fast, but only as
-   fresh as the last successful index publication. If a `serve` was interrupted
-   during its first build, an index marked incomplete can remain on disk, and a
-   search may still try to use it without warning even though it can be empty or
-   partial. Rebuild with `tgrep index .` or resume `tgrep serve .` before an exhaustive search.
+   fresh as the last successful index publication. Legacy indexes without
+   hidden-file coverage metadata and incomplete builds fall back to scanning.
+   Rebuild with `tgrep index .` or resume `tgrep serve .` to enable indexed queries.
 3. **No index**: scan every file, like grep. Correct but slow on large trees.
    tgrep prints a warning on stderr when this happens.
 
 An agent never has to choose between these; the command is the same. Results
 can differ, though. An on-disk index omits changes since its last build. A
-server started with no index at all answers from an empty index, so every
-search returns nothing, until the first build completes. A server resuming a
-partial index answers from what it has so far. `tgrep status .` shows
-`Indexing: complete` once the initial build is done. Do not read it as a
+server started with no index, a partial index, or legacy hidden-file coverage
+lets clients fall back to scanning until it establishes the full corpus.
+`tgrep status .` shows `Hidden coverage: complete` once indexed queries are
+available, and `Indexing: complete` once the initial build is done. Do not read either as a
 freshness signal: a server that starts on an existing index reconciles it
 against the filesystem in the background while already reporting complete,
 and it never covers watcher events missed later. When a search must reflect current file
@@ -98,8 +97,9 @@ Rules of thumb for agents:
   the pattern and paths, so all flags must come before it.
 - **Prefer `-F`** when the query is a symbol or a string the user typed. It
   avoids regex-escaping mistakes.
-- **Narrow with `-t` or `-g`** before adding `-m`. The index makes scoping
-  cheap; `-m` only trims output.
+- **Narrow with `-t`** before adding `-m`. Negative `-g` filters stay indexed;
+  positive glob overrides may widen the corpus and require a full scan.
+  `-m` only trims output.
 - **Use `-l` first** on a broad query, then search the specific files. This
   keeps output small.
 - **Use `-C 2` or `-C 3`** when you need to read the surrounding code.
@@ -147,12 +147,31 @@ as ripgrep.
 These fall back to a full scan even with a server running, because they widen
 the file set the index was built over:
 
-- `--hidden`, `--no-ignore` and variants, `-u`/`-uu`/`-uuu`
+- `--no-ignore` and variants, `-u`/`-uu`/`-uuu`
+- positive `--glob`/`--iglob` overrides (they can reinclude ignored files)
 - `-a`/`--text`, `--binary`, `-E`/`--encoding`
 - `--no-index` (explicit)
 - naming a single file instead of a directory
 
 Avoid these on large repositories unless you need them.
+
+`index` and `serve` include hidden, non-ignored files by default; passing
+`--hidden` to either is redundant. Queries without `--hidden` still apply normal
+hidden-file filtering, including Windows hidden attributes. `--hidden` searches
+and `--files --hidden` use compatible local/server indexes without disabling
+ignore rules. Negative-only globs such as `--glob '!.git'` also stay indexed.
+The configured index directory and all its staging/retired generations are
+excluded from indexing, watcher processing, and query filesystem walks, even
+with a custom path.
+
+Legacy or incomplete indexes, and older servers that cannot confirm hidden-file
+coverage, fall back to scanning. A current server upgrades legacy coverage by
+reconciling the tree; `tgrep index .` can rebuild it explicitly.
+
+New indexes have a format boundary that older local readers reject instead of
+exposing hidden paths without filtering. Downgrading requires rebuilding with
+the older binary, preferably using a separate `--index-path`. New readers retain
+legacy-format support for migration.
 
 ## Freshness
 

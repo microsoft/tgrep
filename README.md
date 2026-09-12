@@ -689,7 +689,8 @@ still hide hidden files and directories; `-./--hidden` includes them using the
 index or server, for content searches and `--files`. Visibility is relative to
 the requested search root and includes Windows hidden attributes. Ignore rules
 inside hidden directories remain active. The configured index directory,
-including its staging and retired generations, is always excluded from indexing.
+including its staging and retired generations, is always excluded from indexing
+and query filesystem walks.
 
 Flags that widen or re-interpret the indexed corpus still walk the tree:
 `-E/--encoding`, `-a/--text`, `--binary`, every `--no-ignore*` variant, and

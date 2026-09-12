@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::{NamedTempFile, TempDir};
 use tgrep_core::meta::IndexMeta;
+use tgrep_core::path_index::{self, EXTRA_PATHS_FILENAME};
 
 const NEEDLE: &str = "needle";
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1079,5 +1080,210 @@ fn custom_index_inside_source_is_excluded_from_build_rebuild_and_reload() {
         wait_for_snapshot(&fixture, &mut server, &corpus);
         server.stop();
         assert_snapshot(&fixture, &corpus, Backend::Local);
+    }
+}
+
+#[test]
+fn hidden_fallback_walks_exclude_custom_index_storage() {
+    for name in ["custom-index", ".custom-index"] {
+        let mut fixture = Fixture::new();
+        fixture.index = fixture.root.join(name);
+        fixture.write(&format!("{name}-sibling/visible.txt"), "needle sibling\n");
+        let query = |mode: OutputMode, hidden: bool, args: &[&str]| {
+            let mut command = Command::cargo_bin("tgrep").unwrap();
+            command
+                .current_dir(&fixture.root)
+                .timeout(WAIT_TIMEOUT)
+                .arg("--index-path")
+                .arg(Path::new("nested").join("..").join(name))
+                .args(["--with-filename", "--stats"])
+                .arg(mode.flag().unwrap())
+                .args(args);
+            if hidden {
+                command.arg("--hidden");
+            }
+            command.arg("--");
+            if mode != OutputMode::Files {
+                command.arg(NEEDLE);
+            }
+            command.arg(&fixture.root).output().unwrap()
+        };
+
+        // Capture the eligible source corpus before any storage exists, including
+        // the ignored files that a positive glob can explicitly reinclude.
+        let mut baselines = Vec::new();
+        for args in [&[][..], &["--no-index"][..], &["--glob", "*.txt"][..]] {
+            for hidden in [false, true] {
+                for mode in [OutputMode::FilesWithMatches, OutputMode::Files] {
+                    let output = query(mode, hidden, args);
+                    assert!(output.status.success(), "{output:?}");
+                    let paths = parsed_output(&fixture, mode, &output);
+                    assert!(paths.contains_key("visible.txt"), "{paths:?}");
+                    baselines.push((args, hidden, mode, paths));
+                }
+            }
+        }
+
+        fixture.build(false);
+        for path in [
+            "visible.txt",
+            ".secret.txt",
+            ".staging/visible.txt",
+            ".retired/generation/visible.txt",
+        ] {
+            write_file(&fixture.index, path, "needle index_output_must_not_leak\n");
+        }
+        let sidecar_path = fixture.index.join(EXTRA_PATHS_FILENAME);
+        let original_sidecar = fs::read(&sidecar_path).unwrap();
+        let filename_index = path_index::read_filename_index(&fixture.index)
+            .unwrap()
+            .unwrap();
+        let visibility = filename_index.visibility.unwrap();
+        for coverage in ["complete", "missing", "mismatched"] {
+            fs::write(&sidecar_path, &original_sidecar).unwrap();
+            match coverage {
+                "missing" => fs::remove_file(&sidecar_path).unwrap(),
+                "mismatched" => path_index::write_extra_paths_with_visibility(
+                    &fixture.index,
+                    &filename_index.paths,
+                    &visibility.paths,
+                    [0; 32],
+                    true,
+                )
+                .unwrap(),
+                _ => {}
+            }
+            for (args, hidden, mode, expected) in &baselines {
+                let output = query(*mode, *hidden, args);
+                let diagnostic =
+                    format!("{name}, {coverage}, {args:?}, hidden={hidden}: {output:?}");
+                assert!(output.status.success(), "{diagnostic}");
+                let backend = if coverage == "complete" && args.is_empty() {
+                    Backend::Local
+                } else {
+                    Backend::Fallback
+                };
+                assert!(backend.matches(*mode, &output), "{diagnostic}");
+                assert_eq!(
+                    parsed_output(&fixture, *mode, &output),
+                    *expected,
+                    "{diagnostic}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hidden_local_status_requires_coherent_index_coverage() {
+    let fixture = Fixture::new();
+    fixture.build(false);
+    let original_meta = IndexMeta::load(&fixture.index).unwrap();
+    let sidecar_path = fixture.index.join(EXTRA_PATHS_FILENAME);
+    let original_sidecar = fs::read(&sidecar_path).unwrap();
+    let file_table_path = fixture.index.join("files.bin");
+    let original_file_table = fs::read(&file_table_path).unwrap();
+    let filename_index = path_index::read_filename_index(&fixture.index)
+        .unwrap()
+        .unwrap();
+    let visibility = filename_index.visibility.unwrap();
+    let indexed_corpus = Corpus::initial();
+    let mut live_corpus = Corpus::initial();
+    fixture.write(".late.txt", "needle added_after_the_index\n");
+    live_corpus.add(".late.txt", 1);
+
+    for coverage in [
+        "complete",
+        "partial",
+        "hidden-incomplete",
+        "legacy-format",
+        "missing-metadata-id",
+        "mismatched-metadata-id",
+        "missing-sidecar",
+        "legacy-sidecar",
+        "malformed-sidecar",
+        "incomplete-sidecar",
+        "mismatched-sidecar",
+        "missing-file-table",
+        "malformed-file-table",
+        "restored",
+    ] {
+        let mut meta = original_meta.clone();
+        fs::write(&sidecar_path, &original_sidecar).unwrap();
+        fs::write(&file_table_path, &original_file_table).unwrap();
+        match coverage {
+            "partial" => meta.complete = false,
+            "hidden-incomplete" => meta.hidden_complete = false,
+            "legacy-format" => meta.version -= 1,
+            "missing-metadata-id" => meta.file_table_id = None,
+            "mismatched-metadata-id" => meta.file_table_id = Some([0; 32]),
+            "missing-sidecar" => fs::remove_file(&sidecar_path).unwrap(),
+            "legacy-sidecar" => {
+                path_index::write_extra_paths(&fixture.index, &filename_index.paths).unwrap();
+            }
+            "malformed-sidecar" => fs::write(&sidecar_path, b"invalid sidecar").unwrap(),
+            "incomplete-sidecar" | "mismatched-sidecar" => {
+                path_index::write_extra_paths_with_visibility(
+                    &fixture.index,
+                    &filename_index.paths,
+                    &visibility.paths,
+                    if coverage == "mismatched-sidecar" {
+                        [0; 32]
+                    } else {
+                        visibility.file_table_id
+                    },
+                    coverage != "incomplete-sidecar",
+                )
+                .unwrap();
+            }
+            "missing-file-table" => fs::remove_file(&file_table_path).unwrap(),
+            "malformed-file-table" => {
+                fs::write(&file_table_path, b"invalid file table").unwrap();
+            }
+            _ => {}
+        }
+        meta.save(&fixture.index).unwrap();
+        let complete = matches!(coverage, "complete" | "restored");
+        let expected_label = if complete {
+            "Hidden coverage: complete"
+        } else {
+            "Hidden coverage: unavailable (queries scan)"
+        };
+        let output = Command::cargo_bin("tgrep")
+            .unwrap()
+            .timeout(WAIT_TIMEOUT)
+            .arg("status")
+            .arg(&fixture.root)
+            .arg("--index-path")
+            .arg(&fixture.index)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{coverage}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected_label),
+            "{coverage}: {output:?}"
+        );
+        // A damaged core index is an error, not a coverage-driven scan fallback.
+        if matches!(coverage, "missing-file-table" | "malformed-file-table") {
+            continue;
+        }
+        for mode in [OutputMode::FilesWithMatches, OutputMode::Files] {
+            assert_query(
+                &fixture,
+                if complete {
+                    &indexed_corpus
+                } else {
+                    &live_corpus
+                },
+                "",
+                true,
+                mode,
+                if complete {
+                    Backend::Local
+                } else {
+                    Backend::Fallback
+                },
+            );
+        }
     }
 }

@@ -453,14 +453,6 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
     let glob_filter = opts.glob_filter()?;
     let type_filter = opts.type_filter()?;
 
-    // `--files` lists what would be searched without reading anything, so it
-    // must not drop files on an extension guess the way a search does.
-    let walk_opts = walker::WalkOptions {
-        search_binary: true,
-        overrides: Some(glob_filter.walk_overrides(&root)?),
-        ..opts.walk_options()
-    };
-
     if root.is_file() {
         let rel_path = explicit_file_display_path(&root);
 
@@ -531,6 +523,14 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         }
     }
 
+    // `--files` lists what would be searched without reading anything, so it
+    // must not drop files on an extension guess the way a search does.
+    let walk_opts = walker::WalkOptions {
+        search_binary: true,
+        exclude_paths: index_storage_exclusions(&index_dir)?,
+        overrides: Some(glob_filter.walk_overrides(&root)?),
+        ..opts.walk_options()
+    };
     let walk = walker::walk_dir(&root, &walk_opts);
     let paths = walk.files.iter().map(|path| {
         path.strip_prefix(&root)
@@ -592,14 +592,16 @@ fn load_indexed_file_paths(
     };
     let mut extra_paths = filename_index.paths;
     let meta = IndexMeta::load(index_dir)?;
-    if !meta.complete || !meta.hidden_complete || !visibility.hidden_complete {
+    if !meta.complete
+        || !meta.hidden_complete
+        || meta.version != tgrep_core::meta::INDEX_FORMAT_VERSION
+        || !visibility.hidden_complete
+    {
         return Ok(None);
     }
 
     let reader = IndexReader::open(index_dir)?;
-    if meta.file_table_id != Some(reader.file_table_id())
-        || visibility.file_table_id != reader.file_table_id()
-    {
+    if !visibility.covers_index(&meta, reader.file_table_id()) {
         return Ok(None);
     }
     let mut paths = Vec::with_capacity(reader.num_files() + extra_paths.len());
@@ -774,11 +776,11 @@ pub fn run(
 
     // No server — use on-disk index directly (or brute force)
     if opts.no_index || bypass_index {
-        return brute_force_search(&root, opts, ci, writer);
+        return brute_force_search(&root, &index_dir, opts, ci, writer);
     }
     if !index_dir.join("lookup.bin").exists() {
         warn_missing_index(&index_dir, index_path.is_some(), opts.quiet);
-        return brute_force_search(&root, opts, ci, writer);
+        return brute_force_search(&root, &index_dir, opts, ci, writer);
     }
 
     search_local_index(&root, &index_dir, opts, ci, writer)
@@ -1213,7 +1215,7 @@ fn search_local_index(
                     "warning: index coverage metadata unavailable ({error}) - scanning filesystem"
                 );
             }
-            return brute_force_search(root, opts, ci, writer);
+            return brute_force_search(root, index_dir, opts, ci, writer);
         }
     };
     if !meta.complete
@@ -1225,7 +1227,7 @@ fn search_local_index(
                 "warning: index lacks complete hidden-file coverage - scanning filesystem; rebuild with `tgrep index` or upgrade with `tgrep serve`"
             );
         }
-        return brute_force_search(root, opts, ci, writer);
+        return brute_force_search(root, index_dir, opts, ci, writer);
     }
     let reader = IndexReader::open(index_dir)?;
     let filename_visibility = match tgrep_core::path_index::read_filename_index(index_dir) {
@@ -1236,18 +1238,15 @@ fn search_local_index(
         if !opts.quiet && !opts.no_messages {
             eprintln!("warning: atomic index visibility unavailable - scanning filesystem");
         }
-        return brute_force_search(root, opts, ci, writer);
+        return brute_force_search(root, index_dir, opts, ci, writer);
     };
-    if meta.file_table_id != Some(reader.file_table_id())
-        || filename_visibility.file_table_id != reader.file_table_id()
-        || !filename_visibility.hidden_complete
-    {
+    if !filename_visibility.covers_index(&meta, reader.file_table_id()) {
         if !opts.quiet && !opts.no_messages {
             eprintln!(
                 "warning: index visibility, coverage, and path table differ - scanning filesystem"
             );
         }
-        return brute_force_search(root, opts, ci, writer);
+        return brute_force_search(root, index_dir, opts, ci, writer);
     }
     let visibility = filename_visibility.paths;
 
@@ -1257,7 +1256,7 @@ fn search_local_index(
     // silently reports nothing.
     let Some((index_root, scope)) = resolve_scope(index_dir, root) else {
         // The index covers an unrelated tree, so it cannot answer this search.
-        return brute_force_search(root, opts, ci, writer);
+        return brute_force_search(root, index_dir, opts, ci, writer);
     };
 
     let glob_filter = opts.glob_filter()?;
@@ -1447,8 +1446,17 @@ fn within_max_depth(rel: &str, opts: &SearchOptions) -> bool {
     }
 }
 
+fn index_storage_exclusions(index_dir: &Path) -> Result<Vec<PathBuf>> {
+    match std::fs::canonicalize(index_dir) {
+        Ok(path) => Ok(vec![path]),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn brute_force_search(
     root: &Path,
+    index_dir: &Path,
     opts: &SearchOptions,
     ci: bool,
     writer: &mut OutputWriter,
@@ -1490,6 +1498,7 @@ fn brute_force_search(
     let mut walk = walker::walk_dir(
         root,
         &walker::WalkOptions {
+            exclude_paths: index_storage_exclusions(index_dir)?,
             overrides: Some(glob_filter.walk_overrides(root)?),
             ..opts.walk_options()
         },

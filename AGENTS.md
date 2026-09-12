@@ -161,7 +161,8 @@ hidden-file filtering, including Windows hidden attributes. `--hidden` searches
 and `--files --hidden` use compatible local/server indexes without disabling
 ignore rules. Negative-only globs such as `--glob '!.git'` also stay indexed.
 The configured index directory and all its staging/retired generations are
-excluded from indexing and watcher processing, even with a custom path.
+excluded from indexing, watcher processing, and query filesystem walks, even
+with a custom path.
 
 Legacy or incomplete indexes, and older servers that cannot confirm hidden-file
 coverage, fall back to scanning. A current server upgrades legacy coverage by

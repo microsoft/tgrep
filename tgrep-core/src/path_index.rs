@@ -32,6 +32,22 @@ pub struct FilenameVisibility {
     pub hidden_complete: bool,
 }
 
+impl FilenameVisibility {
+    /// Whether metadata and this atomic snapshot prove coverage of the opened index.
+    pub fn covers_index(
+        &self,
+        meta: &crate::meta::IndexMeta,
+        file_table_id: crate::meta::FileTableId,
+    ) -> bool {
+        meta.complete
+            && meta.hidden_complete
+            && meta.version == crate::meta::INDEX_FORMAT_VERSION
+            && meta.file_table_id == Some(file_table_id)
+            && self.hidden_complete
+            && self.file_table_id == file_table_id
+    }
+}
+
 /// Write a legacy filename-only path set without visibility evidence.
 pub fn write_extra_paths(index_dir: &Path, paths: &[String]) -> Result<()> {
     write_paths(index_dir, paths, None)

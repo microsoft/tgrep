@@ -686,6 +686,7 @@ enum StaleRefreshPhase {
     BeforeWalk,
     AfterBuildBeforeStampPublish,
     BeforeCoverageReconcile,
+    PreparingFilenamePaths,
     AfterFilenameSidecarPublish,
     AfterConcreteRead,
     BeforeConcreteCommit,
@@ -5759,34 +5760,51 @@ fn json_rpc_error(id: Option<serde_json::Value>, code: i32, message: &str) -> St
 
 /// Replace the filename-only delta from an authoritative filesystem path set.
 ///
+/// The caller holds `snapshot_gate` for write, keeping content, reader swaps,
+/// visibility and filename mutations stable through preparation and publication.
 /// Returns whether the delta changed and therefore needs to be persisted.
 fn replace_filename_extra_paths(
     state: &ServerState,
     listed_files: &[String],
     visibility: &tgrep_core::visibility::PathVisibility,
 ) -> bool {
-    // Queries take index before both leaf locks, so the exclusive guard makes
-    // membership and visibility one snapshot without changing content.
-    #[allow(clippy::readonly_write_lock)]
-    let index = state.index.write().unwrap();
-    let content_paths: std::collections::HashSet<String> = index.all_paths().into_iter().collect();
-    let next: std::collections::HashSet<String> = listed_files
-        .iter()
-        .filter(|path| !content_paths.contains(path.as_str()))
-        .cloned()
-        .collect();
-    let mut current_visibility = state.visibility.write().unwrap();
-    let mut current = state.filename_extra_paths.write().unwrap();
-    let changed = *current != next
-        || *current_visibility != *visibility
-        || !state.filename_index_ready.load(Ordering::SeqCst);
-    if changed {
-        *current_visibility = visibility.clone();
-        *current = next;
-        state.filename_index_dirty.store(true, Ordering::SeqCst);
+    let next: std::collections::HashSet<String> = {
+        let index = state.index.read().unwrap();
+        #[cfg(test)]
+        run_stale_refresh_hook(state, StaleRefreshPhase::PreparingFilenamePaths);
+        let content_paths: std::collections::HashSet<String> =
+            index.all_paths().into_iter().collect();
+        listed_files
+            .iter()
+            .filter(|path| !content_paths.contains(path.as_str()))
+            .cloned()
+            .collect()
+    };
+    let visibility_changed = *state.visibility.read().unwrap() != *visibility;
+    let paths_changed = *state.filename_extra_paths.read().unwrap() != next;
+    let changed =
+        paths_changed || visibility_changed || !state.filename_index_ready.load(Ordering::SeqCst);
+    if !changed {
+        return false;
     }
-    state.filename_index_ready.store(true, Ordering::SeqCst);
-    changed
+    let next_visibility = visibility.clone();
+    let retired = {
+        // Queries take index before both leaf locks. Only the publication
+        // needs its exclusive guard, not corpus scans, comparisons or drops.
+        #[allow(clippy::readonly_write_lock)]
+        let _index = state.index.write().unwrap();
+        let mut current_visibility = state.visibility.write().unwrap();
+        let mut current = state.filename_extra_paths.write().unwrap();
+        let retired = (
+            std::mem::replace(&mut *current_visibility, next_visibility),
+            std::mem::replace(&mut *current, next),
+        );
+        state.filename_index_dirty.store(true, Ordering::SeqCst);
+        state.filename_index_ready.store(true, Ordering::SeqCst);
+        retired
+    };
+    drop(retired);
+    true
 }
 
 fn stage_filename_extra_paths(
@@ -5888,6 +5906,7 @@ fn persist_filename_discovery(
     true
 }
 
+/// The caller holds `snapshot_gate` for write through discovery publication.
 fn refresh_filename_index(
     state: &ServerState,
     index_dir: &Path,
@@ -10309,6 +10328,7 @@ mod tests {
                 StaleRefreshPhase::AfterConcreteRead => {}
                 StaleRefreshPhase::BeforeConcreteCommit
                 | StaleRefreshPhase::BeforeCoverageReconcile
+                | StaleRefreshPhase::PreparingFilenamePaths
                 | StaleRefreshPhase::AfterFilenameSidecarPublish => {}
             })
         };
@@ -10451,6 +10471,7 @@ mod tests {
                 StaleRefreshPhase::AfterConcreteRead => {}
                 StaleRefreshPhase::BeforeConcreteCommit
                 | StaleRefreshPhase::BeforeCoverageReconcile
+                | StaleRefreshPhase::PreparingFilenamePaths
                 | StaleRefreshPhase::AfterFilenameSidecarPublish => {}
             })
         };
@@ -10627,6 +10648,7 @@ mod tests {
                 StaleRefreshPhase::AfterConcreteRead => {}
                 StaleRefreshPhase::BeforeConcreteCommit
                 | StaleRefreshPhase::BeforeCoverageReconcile
+                | StaleRefreshPhase::PreparingFilenamePaths
                 | StaleRefreshPhase::AfterFilenameSidecarPublish => {}
             })
         };

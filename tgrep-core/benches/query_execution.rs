@@ -146,5 +146,43 @@ fn bench_query_execution(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_query_execution);
+fn bench_path_visibility(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path_visibility");
+    let count = 10_000;
+    group.throughput(criterion::Throughput::Elements(count));
+    for depth in [1, 4, 12] {
+        for scoped in [false, true] {
+            let prefix = if scoped { ".github/" } else { "" };
+            let mut visibility = tgrep_core::visibility::PathVisibility::default();
+            visibility.record(".github", true, None, None);
+            let mut paths = Vec::new();
+            for i in 0..count {
+                let parent = format!("{prefix}dir_{i:05}/{}", "sub/".repeat(depth - 1));
+                visibility.record(&format!("{parent}.hidden"), true, None, None);
+                paths.push(if i % 8 == 0 {
+                    format!("{parent}.hidden/file.rs")
+                } else {
+                    format!("{parent}file.rs")
+                });
+            }
+            group.bench_with_input(
+                BenchmarkId::new(if scoped { "scoped" } else { "whole_root" }, depth),
+                &paths,
+                |b, paths| {
+                    b.iter(|| {
+                        paths
+                            .iter()
+                            .filter(|path| {
+                                visibility.is_visible(black_box(path), black_box(prefix), false)
+                            })
+                            .count()
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_query_execution, bench_path_visibility);
 criterion_main!(benches);

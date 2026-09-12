@@ -13,7 +13,7 @@ const CONTENT_ID_DOMAIN: &[u8] =
     b"tgrep/content-id/v1\0decode_for_index-output\0binary-and-posting-semantics-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexMeta {
+pub struct IndexMeta<V = crate::visibility::PathVisibility> {
     pub version: u32,
     pub num_files: u64,
     pub num_trigrams: u64,
@@ -29,7 +29,7 @@ pub struct IndexMeta {
     #[serde(default)]
     pub hidden_complete: bool,
     #[serde(default)]
-    pub visibility: crate::visibility::PathVisibility,
+    pub visibility: V,
     /// Binds visibility to the exact path table across multi-file publication.
     #[serde(default)]
     pub file_table_id: Option<FileTableId>,
@@ -67,13 +67,84 @@ impl IndexMeta {
     }
 
     pub fn load(index_dir: &Path) -> Result<Self> {
-        let path = index_dir.join(META_FILENAME);
-        if !path.exists() {
-            return Err(crate::Error::IndexNotFound(index_dir.display().to_string()));
+        load_metadata(index_dir)
+    }
+
+    /// Locate the indexed root without materializing the visibility map. This
+    /// validates the same metadata shape as `load`, but does not establish
+    /// coverage or file-table identity for an indexed query.
+    pub fn load_root(index_dir: &Path) -> Result<String> {
+        let meta: IndexMeta<SkippedVisibility> = load_metadata(index_dir)?;
+        Ok(meta.root_path)
+    }
+}
+
+fn load_metadata<T: serde::de::DeserializeOwned>(index_dir: &Path) -> Result<T> {
+    let path = index_dir.join(META_FILENAME);
+    if !path.exists() {
+        return Err(crate::Error::IndexNotFound(index_dir.display().to_string()));
+    }
+    let data = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&data)?)
+}
+
+#[derive(Default, Deserialize)]
+struct SkippedVisibility {
+    #[serde(rename = "hidden")]
+    _hidden: SkippedHiddenEntries,
+}
+
+#[derive(Default)]
+struct SkippedHiddenEntries;
+
+impl<'de> Deserialize<'de> for SkippedHiddenEntries {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct HiddenVisitor;
+        impl<'de> serde::de::Visitor<'de> for HiddenVisitor {
+            type Value = SkippedHiddenEntries;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                while map.next_entry::<SkippedPath, bool>()?.is_some() {}
+                Ok(SkippedHiddenEntries)
+            }
         }
-        let data = std::fs::read_to_string(path)?;
-        let meta: Self = serde_json::from_str(&data)?;
-        Ok(meta)
+        deserializer.deserialize_map(HiddenVisitor)
+    }
+}
+
+struct SkippedPath;
+
+impl<'de> Deserialize<'de> for SkippedPath {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct PathVisitor;
+        impl serde::de::Visitor<'_> for PathVisitor {
+            type Value = SkippedPath;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                _: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(SkippedPath)
+            }
+        }
+        // Unlike IgnoredAny, this still rejects malformed Unicode escapes.
+        // Unescaped keys are borrowed; escaped keys reuse serde_json's scratch.
+        deserializer.deserialize_str(PathVisitor)
     }
 }
 
@@ -559,6 +630,70 @@ pub fn collect_filestamps(root: &Path, paths: &[String]) -> HashMap<String, File
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn root_projection_preserves_metadata_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut original = serde_json::to_value(super::IndexMeta::new("root", 1, 2)).unwrap();
+        original["visibility"] = serde_json::json!({
+            "hidden": {".github": true, "attribute-hidden.txt": false, "escaped\\name": true}
+        });
+        let assert_projection = |value: &serde_json::Value| {
+            std::fs::write(
+                dir.path().join(super::META_FILENAME),
+                serde_json::to_vec(value).unwrap(),
+            )
+            .unwrap();
+            let full = super::IndexMeta::load(dir.path());
+            let root = super::IndexMeta::load_root(dir.path());
+            assert_eq!(full.is_ok(), root.is_ok(), "{value}");
+            if let Ok(full) = full {
+                assert_eq!(root.unwrap(), full.root_path);
+            }
+        };
+        assert_projection(&original);
+        for key in original.as_object().unwrap().keys() {
+            let mut missing = original.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert_projection(&missing);
+            for invalid in [serde_json::Value::Null, serde_json::json!({"wrong": []})] {
+                let mut changed = original.clone();
+                changed[key] = invalid;
+                assert_projection(&changed);
+            }
+        }
+        for visibility in [
+            serde_json::json!({}),
+            serde_json::json!({"hidden": []}),
+            serde_json::json!({"hidden": {".secret": 1}}),
+            serde_json::json!({"hidden": {".secret": null}}),
+            serde_json::json!({"hidden": {}, "unknown": [null]}),
+        ] {
+            let mut changed = original.clone();
+            changed["visibility"] = visibility;
+            assert_projection(&changed);
+        }
+        for malformed in [
+            "{".to_string(),
+            r#"{"root_path":"root","visibility":{"hidden":{"#.to_string(),
+            "{} false".to_string(),
+            serde_json::to_string(&original)
+                .unwrap()
+                .replace(r#""escaped\\name""#, r#""\uD800""#),
+            serde_json::to_string(&original)
+                .unwrap()
+                .replace(r#""escaped\\name""#, r#""\x01""#),
+        ] {
+            std::fs::write(dir.path().join(super::META_FILENAME), malformed).unwrap();
+            assert!(super::IndexMeta::load(dir.path()).is_err());
+            assert!(super::IndexMeta::load_root(dir.path()).is_err());
+        }
+        std::fs::remove_file(dir.path().join(super::META_FILENAME)).unwrap();
+        assert!(matches!(
+            super::IndexMeta::load_root(dir.path()),
+            Err(crate::Error::IndexNotFound(_))
+        ));
+    }
+
     #[test]
     fn legacy_metadata_does_not_prove_hidden_coverage() {
         let mut value = serde_json::to_value(super::IndexMeta::new("root", 1, 2)).unwrap();

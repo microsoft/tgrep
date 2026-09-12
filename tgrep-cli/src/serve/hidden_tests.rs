@@ -13,6 +13,102 @@ fn matched_paths(response: &str) -> std::collections::BTreeSet<String> {
 }
 
 #[test]
+fn filename_preparation_allows_queries_and_publishes_visibility_with_membership() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temporary.path()).unwrap();
+    let index_dir = root.join("custom-index");
+    let state = test_server_state(&root, &index_dir);
+    for path in ["disk.txt", "removed.txt"] {
+        std::fs::write(root.join(path), "needle\n").unwrap();
+    }
+    builder::build_index(&root, Some(&index_dir), false, false, &[]).unwrap();
+    {
+        let mut index = state.index.write().unwrap();
+        *index = HybridIndex::open(&index_dir, &root).unwrap();
+        index.live.upsert_file("overlay.txt", b"needle\n");
+        index.live.delete_file("removed.txt");
+    }
+    state
+        .filename_extra_paths
+        .write()
+        .unwrap()
+        .insert("old.bin".into());
+    state.filename_index_ready.store(true, Ordering::SeqCst);
+    let weak = Arc::downgrade(&state);
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_observed = Arc::clone(&observed);
+    *state.stale_refresh_hook.lock().unwrap() = Some(Arc::new(move |phase| {
+        if matches!(phase, StaleRefreshPhase::PreparingFilenamePaths) {
+            let state = weak.upgrade().unwrap();
+            let reader = state
+                .index
+                .try_read()
+                .expect("filename preparation excluded queries");
+            drop(reader);
+            let response: serde_json::Value =
+                serde_json::from_str(&handle_files(None, &serde_json::Value::Null, &state))
+                    .unwrap();
+            assert_eq!(
+                response["result"]["files"],
+                serde_json::json!(["disk.txt", "old.bin", "overlay.txt"])
+            );
+            hook_observed.store(true, Ordering::SeqCst);
+        }
+    }));
+    let listed: Vec<String> = [
+        "disk.txt",
+        "overlay.txt",
+        "removed.txt",
+        ".new.bin",
+        "plain.bin",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let mut visibility = tgrep_core::visibility::PathVisibility::default();
+    visibility.record(".new.bin", false, None, None);
+    let _gate = state.snapshot_gate.write().unwrap();
+    assert!(replace_filename_extra_paths(&state, &listed, &visibility));
+    *state.stale_refresh_hook.lock().unwrap() = None;
+    assert!(observed.load(Ordering::SeqCst));
+    assert_eq!(
+        *state.filename_extra_paths.read().unwrap(),
+        std::collections::HashSet::from([
+            "removed.txt".into(),
+            ".new.bin".into(),
+            "plain.bin".into()
+        ])
+    );
+    for (hidden, expected) in [
+        (
+            false,
+            serde_json::json!(["disk.txt", "overlay.txt", "plain.bin", "removed.txt"]),
+        ),
+        (
+            true,
+            serde_json::json!([
+                ".new.bin",
+                "disk.txt",
+                "overlay.txt",
+                "plain.bin",
+                "removed.txt"
+            ]),
+        ),
+    ] {
+        let response: serde_json::Value = serde_json::from_str(&handle_files(
+            None,
+            &serde_json::json!({"hidden": hidden}),
+            &state,
+        ))
+        .unwrap();
+        assert_eq!(response["result"]["files"], expected);
+    }
+    state.filename_index_dirty.store(false, Ordering::SeqCst);
+    assert!(!replace_filename_extra_paths(&state, &listed, &visibility));
+    assert!(!state.filename_index_dirty.load(Ordering::SeqCst));
+}
+
+#[test]
 fn legacy_hidden_coverage_is_published_only_after_reconciliation() {
     let temporary = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(temporary.path()).unwrap();

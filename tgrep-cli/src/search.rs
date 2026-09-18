@@ -1424,9 +1424,9 @@ impl IndexScope {
 /// The slice of the index at `index_dir` that covers `root`, with the absolute
 /// root the index was built for.
 fn resolve_scope(index_dir: &Path, root: &Path) -> Option<(PathBuf, IndexScope)> {
-    let index_root = IndexMeta::load(index_dir)
+    let index_root = IndexMeta::load_root(index_dir)
         .ok()
-        .and_then(|m| std::fs::canonicalize(m.root_path).ok())
+        .and_then(|path| std::fs::canonicalize(path).ok())
         .unwrap_or_else(|| root.to_path_buf());
     let scope = IndexScope::resolve(&index_root, root)?;
     Some((index_root, scope))

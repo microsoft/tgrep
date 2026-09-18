@@ -913,6 +913,42 @@ fn windows_hidden_attributes_retain_visibility_and_respect_explicit_roots() {
     assert_scopes(&live_corpus, Backend::Local);
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_attribute_changes_update_native_watcher_visibility() {
+    let fixture = Fixture::new();
+    let mut corpus = Corpus::initial();
+    for path in ["attribute-secret.txt", "attribute-directory/visible.txt"] {
+        fixture.write(path, "needle native_attribute_change\n");
+        corpus.add(path, 1);
+    }
+    fixture.build(false);
+    let mut server = ServerGuard::start(&fixture, &corpus, WatchMode::Native, false);
+    for hidden in [true, false, true, false] {
+        for path in ["attribute-secret.txt", "attribute-directory"] {
+            set_hidden_attribute(&fixture.root, path, hidden);
+            if hidden {
+                corpus.hidden_attributes.insert(path.to_owned());
+            } else {
+                corpus.hidden_attributes.remove(path);
+            }
+        }
+        wait_for_snapshot(&fixture, &mut server, &corpus);
+        for include_hidden in [false, true] {
+            for mode in [OutputMode::FilesWithMatches, OutputMode::Files] {
+                assert_query(
+                    &fixture,
+                    &corpus,
+                    "attribute-directory",
+                    include_hidden,
+                    mode,
+                    Backend::Server,
+                );
+            }
+        }
+    }
+}
+
 fn exercise_hidden_updates(mode: WatchMode) {
     let fixture = Fixture::new();
     let mut corpus = Corpus::initial();

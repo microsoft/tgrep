@@ -698,12 +698,17 @@ including its staging and retired generations, is always excluded from indexing
 and query filesystem walks.
 
 Flags that widen or re-interpret the indexed corpus still walk the tree:
-`-E/--encoding`, `-a/--text`, `--binary`, every `--no-ignore*` variant, and
-positive `--glob`/`--iglob` overrides, which can explicitly reinclude ignored
-files. Negative-only globs, such as `--glob '!.git'`, remain index-compatible
-and exclude entire matching directory subtrees. `--hidden` never disables
-ignore rules. Naming a single file also skips the index, since reading one
-file directly is cheaper than loading one.
+non-`auto` `-E/--encoding`, `-a/--text`, `--binary`, and ignore-disabling flags
+such as `--no-ignore`. Naming a single file also skips the index, since reading
+one file directly is cheaper than loading one.
+
+Both positive and negative `--glob`/`--iglob` patterns filter the indexed corpus
+when a compatible index or server is available, for content searches and
+`--files`. Positive globs such as `--glob '*.ts'` do not reinclude ignored files
+in indexed mode. Use `--no-index` when those matches are needed: filesystem
+scans retain ripgrep-style glob overrides, which can reinclude ignored files.
+Negative globs, such as `--glob '!.git'`, exclude entire matching directory
+subtrees. `--hidden` never disables ignore rules.
 
 Legacy indexes without proven hidden-file coverage and incomplete builds fall
 back to a filesystem scan, rather than returning partial results. Run

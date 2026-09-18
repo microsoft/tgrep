@@ -468,7 +468,7 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         .map(Path::to_path_buf)
         .unwrap_or_else(|| builder::default_index_dir(&root));
 
-    if filename_index_compatible(opts) && !glob_filter.has_includes() {
+    if filename_index_compatible(opts) {
         if let Ok(info) = ServerInfo::load(&index_dir)
             && let Some((index_root, scope)) = resolve_scope(&index_dir, &root)
             && let Ok(paths) = list_files_via_server(&info, &scope, opts)
@@ -735,9 +735,9 @@ pub fn run(
     // nothing but NUL-interleaved bytes) is absent from the index entirely, so
     // even a full-scan plan cannot reach it. The only way `-E` means the same
     // thing with and without an index is to walk the tree. `-a`/`--binary` are
-    // the same story, as is anything that widens the walk into ignored files.
-    // Positive globs can explicitly reinclude those files, unlike --hidden,
-    // which only selects visibility within the normally eligible corpus.
+    // the same story, as is explicitly disabling ignore rules.
+    // Globs and --hidden only filter the indexed corpus. Use --no-index for
+    // positive glob overrides that reinclude ignored files.
     //
     // A single named file is bypassed too. The index deliberately omits binary
     // and ignored files, but naming one explicitly is exactly how ripgrep asks
@@ -746,7 +746,6 @@ pub fn run(
         || opts.encoding.may_differ_from_index()
         || opts.text
         || opts.binary
-        || opts.glob_filter()?.has_includes()
         || opts.no_ignore
         || opts.no_ignore_dot
         || opts.no_ignore_exclude

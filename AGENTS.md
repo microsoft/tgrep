@@ -97,8 +97,8 @@ Rules of thumb for agents:
   the pattern and paths, so all flags must come before it.
 - **Prefer `-F`** when the query is a symbol or a string the user typed. It
   avoids regex-escaping mistakes.
-- **Narrow with `-t`** before adding `-m`. Negative `-g` filters stay indexed;
-  positive glob overrides may widen the corpus and require a full scan.
+- **Narrow with `-t` or `-g`** before adding `-m`. Both keep compatible indexes
+  in use; globs filter the indexed corpus rather than reinclude ignored files.
   `-m` only trims output.
 - **Use `-l` first** on a broad query, then search the specific files. This
   keeps output small.
@@ -144,12 +144,10 @@ as ripgrep.
 
 ## When the index is not used
 
-These fall back to a full scan even with a server running, because they widen
-the file set the index was built over:
+These fall back to a full scan even with a server running:
 
 - `--no-ignore` and variants, `-u`/`-uu`/`-uuu`
-- positive `--glob`/`--iglob` overrides (they can reinclude ignored files)
-- `-a`/`--text`, `--binary`, `-E`/`--encoding`
+- `-a`/`--text`, `--binary`, non-`auto` `-E`/`--encoding`
 - `--no-index` (explicit)
 - naming a single file instead of a directory
 
@@ -159,7 +157,12 @@ Avoid these on large repositories unless you need them.
 `--hidden` to either is redundant. Queries without `--hidden` still apply normal
 hidden-file filtering, including Windows hidden attributes. `--hidden` searches
 and `--files --hidden` use compatible local/server indexes without disabling
-ignore rules. Negative-only globs such as `--glob '!.git'` also stay indexed.
+ignore rules. Positive and negative `--glob`/`--iglob` patterns also stay
+indexed, for both content searches and `--files`. They filter the indexed
+corpus only, so a positive glob does not reinclude ignored files in indexed
+mode. Use `--no-index` when those matches are needed; filesystem scans retain
+ripgrep-style glob overrides. Negative globs such as `--glob '!.git'` exclude
+entire matching directory subtrees.
 The configured index directory and all its staging/retired generations are
 excluded from indexing, watcher processing, and query filesystem walks, even
 with a custom path.

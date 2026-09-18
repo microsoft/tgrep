@@ -120,6 +120,9 @@ struct Cli {
 
     // ── Filtering ────────────────────────────────────
     /// Filter files by glob pattern (can be specified multiple times).
+    ///
+    /// With an index, globs filter the indexed corpus. Use --no-index to let
+    /// positive globs reinclude ignored files.
     #[arg(short = 'g', long = "glob", global = true, action = clap::ArgAction::Append)]
     glob: Vec<String>,
 

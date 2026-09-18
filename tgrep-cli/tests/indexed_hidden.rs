@@ -1,7 +1,7 @@
 //! Hidden-file coverage must not change ignore rules or ordinary query visibility.
 //! Indexed assertions also check the route, so a full scan cannot hide an
-//! incomplete index or a watcher that never delivered an update. Positive glob
-//! overrides are compared by results because they can widen the indexed corpus.
+//! incomplete index or a watcher that never delivered an update. Positive globs
+//! filter the indexed corpus; filesystem scans retain their override semantics.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -165,6 +165,23 @@ impl Fixture {
         hidden: bool,
         no_index: bool,
     ) -> Output {
+        self.query_with_args(
+            scope,
+            pattern,
+            mode,
+            hidden,
+            if no_index { &["--no-index"] } else { &[] },
+        )
+    }
+
+    fn query_with_args(
+        &self,
+        scope: &str,
+        pattern: &str,
+        mode: OutputMode,
+        hidden: bool,
+        args: &[&str],
+    ) -> Output {
         let mut command = Command::cargo_bin("tgrep").unwrap();
         command
             .current_dir(&self.root)
@@ -179,10 +196,7 @@ impl Fixture {
         }
         // Preserve the Copilot argv shape, including the negative-only glob.
         command.args(["--glob", "!.git", "--with-filename", "--stats"]);
-        if no_index {
-            command.arg("--no-index");
-        }
-        command.arg("--");
+        command.args(args).arg("--");
         if mode != OutputMode::Files {
             command.arg(pattern);
         }
@@ -757,6 +771,80 @@ fn ready_server_serves_hidden_formats_and_accepts_redundant_hidden_flag() {
 }
 
 #[test]
+fn positive_globs_filter_local_and_server_indexed_corpora() {
+    let fixture = Fixture::new();
+    let corpus = Corpus::initial();
+    fixture.build(false);
+
+    let assert_globs = |backend: Backend| {
+        for (args, exclude_nested) in [
+            (&["--glob", "*.txt"][..], false),
+            (&["--iglob", "*.TXT"][..], false),
+            (&["--glob", "*.TXT", "--glob-case-insensitive"][..], false),
+            (&["--glob", "*.txt", "--iglob", "!NESTED"][..], true),
+        ] {
+            for hidden in [false, true] {
+                for &mode in OUTPUT_MODES {
+                    let output = fixture.query_with_args("", NEEDLE, mode, hidden, args);
+                    let mut expected = corpus.expected("", hidden, mode);
+                    expected.retain(|path, _| {
+                        path.ends_with(".txt") && (!exclude_nested || !path.starts_with("nested/"))
+                    });
+                    let diagnostic =
+                        format!("{backend:?}, {mode:?}, {args:?}, hidden={hidden}\n{output:?}");
+                    assert_eq!(
+                        output.status.code(),
+                        Some(expected_exit(mode, &expected)),
+                        "{diagnostic}"
+                    );
+                    assert!(backend.matches(mode, &output), "{diagnostic}");
+                    assert_eq!(
+                        parsed_output(&fixture, mode, &output),
+                        expected,
+                        "{diagnostic}"
+                    );
+                }
+            }
+        }
+
+        for (glob, pattern) in [("--glob", "ignored.txt"), ("--iglob", "IGNORED.TXT")] {
+            for bypass in [None, Some("--no-index"), Some("--no-ignore")] {
+                let mut args = vec![glob, pattern];
+                let (expected_backend, expected) = if let Some(flag) = bypass {
+                    args.push(flag);
+                    (
+                        Backend::BruteForce,
+                        BTreeMap::from([("ignored.txt".to_owned(), 1)]),
+                    )
+                } else {
+                    (backend, BTreeMap::new())
+                };
+                for mode in [OutputMode::Content, OutputMode::Files] {
+                    let output = fixture.query_with_args("", NEEDLE, mode, false, &args);
+                    let diagnostic = format!("{backend:?}, {mode:?}, {args:?}\n{output:?}");
+                    assert_eq!(
+                        output.status.code(),
+                        Some(expected_exit(mode, &expected)),
+                        "{diagnostic}"
+                    );
+                    assert!(expected_backend.matches(mode, &output), "{diagnostic}");
+                    assert_eq!(
+                        parsed_output(&fixture, mode, &output),
+                        expected,
+                        "{diagnostic}"
+                    );
+                }
+            }
+        }
+    };
+
+    assert_globs(Backend::Local);
+    let server = ServerGuard::start(&fixture, &corpus, WatchMode::Disabled, false);
+    assert_globs(Backend::Server);
+    server.stop();
+}
+
+#[test]
 fn unproven_indexes_scan_scoped_hidden_roots_until_server_upgrade() {
     let fixture = Fixture::new();
     let mut corpus = Corpus::initial();
@@ -1088,7 +1176,12 @@ fn hidden_fallback_walks_exclude_custom_index_storage() {
     for name in ["custom-index", ".custom-index"] {
         let mut fixture = Fixture::new();
         fixture.index = fixture.root.join(name);
-        fixture.write(&format!("{name}-sibling/visible.txt"), "needle sibling\n");
+        let sibling = format!("{name}-sibling/visible.txt");
+        fixture.write(&sibling, "needle sibling\n");
+        let mut corpus = Corpus::initial();
+        corpus.add(&sibling, 1);
+        // This query does not add Fixture::query's !.git exclusion.
+        corpus.add(".git/private.txt", 1);
         let query = |mode: OutputMode, hidden: bool, args: &[&str]| {
             let mut command = Command::cargo_bin("tgrep").unwrap();
             command
@@ -1119,7 +1212,11 @@ fn hidden_fallback_walks_exclude_custom_index_storage() {
                     assert!(output.status.success(), "{output:?}");
                     let paths = parsed_output(&fixture, mode, &output);
                     assert!(paths.contains_key("visible.txt"), "{paths:?}");
-                    baselines.push((args, hidden, mode, paths));
+                    let mut indexed_paths = corpus.expected("", hidden, mode);
+                    if args.contains(&"--glob") {
+                        indexed_paths.retain(|path, _| path.ends_with(".txt"));
+                    }
+                    baselines.push((args, hidden, mode, paths, indexed_paths));
                 }
             }
         }
@@ -1153,15 +1250,20 @@ fn hidden_fallback_walks_exclude_custom_index_storage() {
                 .unwrap(),
                 _ => {}
             }
-            for (args, hidden, mode, expected) in &baselines {
+            for (args, hidden, mode, scanned_paths, indexed_paths) in &baselines {
                 let output = query(*mode, *hidden, args);
                 let diagnostic =
                     format!("{name}, {coverage}, {args:?}, hidden={hidden}: {output:?}");
                 assert!(output.status.success(), "{diagnostic}");
-                let backend = if coverage == "complete" && args.is_empty() {
+                let backend = if coverage == "complete" && !args.contains(&"--no-index") {
                     Backend::Local
                 } else {
                     Backend::Fallback
+                };
+                let expected = if backend == Backend::Local {
+                    indexed_paths
+                } else {
+                    scanned_paths
                 };
                 assert!(backend.matches(*mode, &output), "{diagnostic}");
                 assert_eq!(

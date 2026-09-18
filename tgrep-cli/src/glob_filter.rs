@@ -45,11 +45,6 @@ impl GlobFilter {
         Ok(builder.build()?)
     }
 
-    /// Positive overrides may reinclude ignored files absent from the index.
-    pub fn has_includes(&self) -> bool {
-        self.overrides.num_whitelists() > 0
-    }
-
     /// Returns true if the glob list is empty (no filtering needed).
     pub fn is_empty(&self) -> bool {
         self.overrides.is_empty()

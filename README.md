@@ -22,6 +22,11 @@ tgrep "fn main" .        # instant — auto-connects to running server
 
 Using tgrep from an AI coding agent? See [AGENTS.md](AGENTS.md).
 
+Install MCP search tools and startup hooks for Codex or pi with
+`bash install-agent.sh` from this checkout. See the
+[agent integration guide](scripts/agent/README.md) for install, doctor, repair
+and uninstall commands (Linux/macOS, Python 3.11+).
+
 See [full benchmark results](BENCHMARKS.md) — up to **52x faster** than ripgrep on large repos.
 
 ### Benchmark highlights (avg latency per query, index pre-built)

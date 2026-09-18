@@ -38,5 +38,8 @@ jobs:
         if: runner.os != 'Windows'
         run: bash scripts/test-install.sh
       - run: cargo build --workspace --verbose
+      - name: Test agent integrations
+        if: runner.os != 'Windows'
+        run: python3 -B -m unittest discover -s scripts/agent -p 'test_*.py' -v
       - run: cargo build --workspace --benches --verbose
       - run: cargo test --workspace --verbose

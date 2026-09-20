@@ -77,6 +77,9 @@ revisions, rather than comparing independent hosted runs. Dispatch
 `benchmark-chromium.yml` on the candidate branch with `paired=true`, a full
 `baseline_sha`, and a full `chromium_sha`. The baseline must be an ancestor of
 the candidate. Leaving `paired` unset retains the ordinary Linux/macOS workflow.
+The workflow checks out only the dispatched revision, then exports the verified
+baseline ancestor from that checkout's Git history; it does not check out an
+input-selected revision with Actions credentials.
 
 Both binaries are built with `cargo build --release --locked -p tgrep-cli` on
 one Linux runner. The harness uses one clean, pinned Chromium checkout and one

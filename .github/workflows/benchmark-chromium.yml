@@ -17,6 +17,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   benchmark:
     if: ${{ !inputs.paired }}
@@ -79,19 +82,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.baseline_sha }}
-          path: baseline
-          persist-credentials: false
-
-      - name: Check ancestry and record build environment
+      - name: Export trusted ancestor and record build environment
         shell: bash
         run: |
           set -euo pipefail
-          git -C candidate merge-base --is-ancestor "$BASELINE_SHA" HEAD
-          test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
           test "$(git -C candidate rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C candidate cat-file -t "$BASELINE_SHA")" = commit
+          git -C candidate merge-base --is-ancestor "$BASELINE_SHA" "$GITHUB_SHA"
+          mkdir baseline
+          git -C candidate archive --format=tar "$BASELINE_SHA" | tar -x -C baseline
           {
             echo "Baseline: $BASELINE_SHA"
             echo "Candidate: $GITHUB_SHA"

@@ -1776,7 +1776,7 @@ fn handle_search(
 
     // Collect candidates and their paths/full_paths while holding the index lock briefly
     let t_index = Instant::now();
-    let (candidate_info, raw_candidate_count): (Vec<(String, PathBuf)>, usize) = {
+    let (candidate_info, raw_candidate_count, total_files) = {
         let index = state.index.read().unwrap();
         // Check the same generation whose candidates and visibility we read.
         if state.indexing.load(Ordering::SeqCst) || !state.hidden_complete.load(Ordering::SeqCst) {
@@ -1791,6 +1791,7 @@ fn handle_search(
         // candidate whose ID does not exist in the new reader.
         let (candidates, reader_snapshot) = index.execute_query_with_masks(&plan);
         let raw_count = candidates.len();
+        let total_files = opts.stats.then(|| index.num_files_using(&reader_snapshot));
 
         // Diagnostic counters for filter stages
         let mut no_path_count: usize = 0;
@@ -1845,7 +1846,7 @@ fn handle_search(
             );
         }
 
-        (filtered, raw_count)
+        (filtered, raw_count, total_files)
     }; // index lock released here
     let index_ms = t_index.elapsed().as_secs_f64() * 1000.0;
 
@@ -1970,8 +1971,14 @@ fn handle_search(
         "elapsed_ms": elapsed_ms,
         "hidden_complete": true,
     });
-    if opts.stats {
+    if let Some(total_files) = total_files {
         result["file_stats"] = serde_json::json!(file_stats);
+        result["index_stats"] = serde_json::json!({
+            "query_plan": crate::search::plan_summary(&plan),
+            "raw_candidates": raw_candidate_count,
+            "candidates": candidate_info.len(),
+            "total_files": total_files,
+        });
     }
 
     json_rpc_result(id, result)

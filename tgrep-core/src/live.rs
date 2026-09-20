@@ -236,6 +236,14 @@ impl LiveIndex {
         !self.path_to_id.is_empty() || !self.deleted_paths.is_empty()
     }
 
+    /// Paths whose reader entries are replaced or deleted by this overlay.
+    pub(crate) fn shadowed_paths(&self) -> impl Iterator<Item = &str> {
+        self.path_to_id
+            .keys()
+            .chain(self.deleted_paths.iter())
+            .map(String::as_str)
+    }
+
     /// Reset the dirty counter (e.g., after saving).
     pub fn reset_dirty_count(&mut self) {
         self.dirty_count = 0;

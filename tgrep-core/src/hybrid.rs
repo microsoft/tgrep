@@ -271,7 +271,18 @@ impl HybridIndex {
 
     /// Total number of files across both layers.
     pub fn num_files(&self) -> usize {
-        self.all_file_ids().len()
+        self.num_files_using(&self.reader())
+    }
+
+    /// Count active files using the same reader snapshot as a query, without
+    /// walking the entire corpus just to report candidate statistics.
+    pub fn num_files_using(&self, reader: &IndexReader) -> usize {
+        let shadowed = self
+            .live
+            .shadowed_paths()
+            .filter(|path| reader.contains_path(path))
+            .count();
+        reader.num_files() - shadowed + self.live.num_files()
     }
 
     /// Total unique trigrams across both reader and live overlay.

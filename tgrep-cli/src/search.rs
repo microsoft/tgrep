@@ -1191,7 +1191,21 @@ fn search_via_server(
             // Older servers only provide rendered rows.
             count_reported_matches(matches)
         };
-        eprintln!("{num} matches ({lines} matched lines) in {elapsed:.1}ms (via server)");
+        let mut narrowing_note = "";
+        if let Some(stats) = result.get("index_stats")
+            && let (Some(plan), Some(raw), Some(candidates), Some(total)) = (
+                stats.get("query_plan").and_then(|v| v.as_str()),
+                stats.get("raw_candidates").and_then(|v| v.as_u64()),
+                stats.get("candidates").and_then(|v| v.as_u64()),
+                stats.get("total_files").and_then(|v| v.as_u64()),
+            )
+        {
+            print_index_stats(plan, raw, candidates, total);
+            narrowing_note = index_narrowing_note(raw, total);
+        }
+        eprintln!(
+            "{num} matches ({lines} matched lines) in {elapsed:.1}ms (via server){narrowing_note}"
+        );
     }
 
     writer.flush()?;
@@ -1305,6 +1319,7 @@ fn search_local_index(
                 .then_some(())?;
             let rel = scope.relativize(indexed, root)?;
             within_max_depth(&rel, opts).then_some(())?;
+            passes_filters(&rel, &glob_filter, &type_filter).then_some(())?;
             Some((fid, rel))
         })
         .collect();
@@ -1319,10 +1334,6 @@ fn search_local_index(
     let explicit = matches!(scope, IndexScope::File(_));
 
     for (_, rel_path) in &candidates {
-        if !passes_filters(rel_path, &glob_filter, &type_filter) {
-            continue;
-        }
-
         let full_path = scope.full_path(&index_root, rel_path);
         if exceeds_max_filesize(&full_path, opts, explicit) {
             continue;
@@ -1346,15 +1357,13 @@ fn search_local_index(
         // stderr. Flush first so a combined stdout/stderr stream reports the
         // summary after the matches, as ripgrep does.
         flush_before_stats(writer)?;
-        eprintln!(
-            "Query plan: {} (candidates: {}/{})",
-            plan_summary(&plan),
-            candidates.len(),
-            reader.num_files()
-        );
+        let raw = candidate_ids.len() as u64;
+        let total = reader.num_files() as u64;
+        print_index_stats(&plan_summary(&plan), raw, candidates.len() as u64, total);
+        let narrowing_note = index_narrowing_note(raw, total);
         let (matches, matched_lines) = writer.match_totals();
         eprintln!(
-            "Search completed in {:.1}ms: {matches} matches ({matched_lines} matched lines)",
+            "Search completed in {:.1}ms: {matches} matches ({matched_lines} matched lines){narrowing_note}",
             elapsed.as_secs_f64() * 1000.0
         );
     }
@@ -2064,7 +2073,21 @@ fn count_reported_matches(rows: &[serde_json::Value]) -> (u64, u64) {
     (matches, lines.len() as u64 + binary_lines)
 }
 
-fn plan_summary(plan: &QueryPlan) -> String {
+fn print_index_stats(plan: &str, raw: u64, candidates: u64, total: u64) {
+    eprintln!(
+        "Query plan: {plan} (candidates: {candidates}/{total}; raw candidates: {raw}/{total})"
+    );
+}
+
+fn index_narrowing_note(raw: u64, total: u64) -> &'static str {
+    if total > 0 && raw == total {
+        " (no index narrowing)"
+    } else {
+        ""
+    }
+}
+
+pub(crate) fn plan_summary(plan: &QueryPlan) -> String {
     match plan {
         QueryPlan::And(queries) => format!("AND({} trigrams)", queries.len()),
         QueryPlan::Or(plans) => {
@@ -2078,6 +2101,14 @@ fn plan_summary(plan: &QueryPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_nonempty_full_corpus_gets_a_no_narrowing_note() {
+        assert_eq!(index_narrowing_note(2, 2), " (no index narrowing)");
+        assert_eq!(index_narrowing_note(1, 2), "");
+        assert_eq!(index_narrowing_note(0, 2), "");
+        assert_eq!(index_narrowing_note(0, 0), "");
+    }
 
     #[test]
     fn indexed_sort_preserves_entries_and_component_order() {

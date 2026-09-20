@@ -608,6 +608,20 @@ file), and `--colors <SPEC>` (colors are not yet configurable) are accepted and
 ignored so ripgrep command lines keep working. `--debug`/`--trace` imply
 `--stats`.
 
+For indexed content searches, `--stats` reports the query plan and candidate
+counts with or without a server. **Raw candidates** are the files selected by
+the trigram index before path, visibility, glob, and type filtering. If that
+set covers the entire nonempty index, the summary says **`no index narrowing`**,
+even when a usable trigram plan exists. **`(via server)`** describes transport,
+not whether the index reduced the search. Older servers that do not return
+candidate statistics retain the transport-only summary.
+
+Inline case flags such as `(?i)needle` and `(?i:needle)` participate in trigram
+planning just like `-i`, including with `-P`. Scoped `(?-i:...)` still controls
+matching. Only classes with a single ASCII-folded byte are combined into
+literal runs; Unicode case-fold alternatives and other classes conservatively
+break those runs so indexed searches do not lose matches.
+
 `-z/--search-zip` is **not** supported and exits with code `2` rather than
 silently reporting no matches in compressed files.
 

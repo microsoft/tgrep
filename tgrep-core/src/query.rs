@@ -40,8 +40,12 @@ impl QueryPlan {
 
 /// Parse a regex pattern and produce a query plan for trigram lookups.
 pub fn build_query_plan(pattern: &str, case_insensitive: bool) -> Result<QueryPlan, String> {
-    let hir = regex_syntax::parse(pattern).map_err(|e| format!("regex parse error: {e}"))?;
-    let plan = decompose_hir(&hir, case_insensitive);
+    let hir = regex_syntax::ParserBuilder::new()
+        .case_insensitive(case_insensitive)
+        .build()
+        .parse(pattern)
+        .map_err(|e| format!("regex parse error: {e}"))?;
+    let plan = decompose_hir(&hir);
     Ok(simplify(plan))
 }
 
@@ -399,41 +403,70 @@ fn literals_to_query_plan(bytes: &[u8]) -> QueryPlan {
     QueryPlan::And(queries)
 }
 
-fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
-    match hir.kind() {
-        HirKind::Literal(Literal(bytes)) => {
-            let text = if case_insensitive {
-                String::from_utf8_lossy(bytes).to_lowercase()
-            } else {
-                String::from_utf8_lossy(bytes).into_owned()
-            };
-            literals_to_query_plan(text.as_bytes())
+/// Collapse a class only when every member has the same ASCII-folded byte.
+/// The index stores ASCII-lowercased content, not Unicode case folding: classes
+/// such as [KkK] must break a literal run rather than exclude the non-ASCII hit.
+fn ascii_class_literal(class: &Class) -> Option<u8> {
+    let mut folded = None;
+    let mut add_range = |start: u32, end: u32| {
+        if start != end || start > 0x7f {
+            return None;
         }
+        let byte = (start as u8).to_ascii_lowercase();
+        if folded.is_some_and(|previous| previous != byte) {
+            return None;
+        }
+        folded = Some(byte);
+        Some(())
+    };
+    match class {
+        Class::Unicode(ranges) => {
+            for range in ranges.iter() {
+                add_range(u32::from(range.start()), u32::from(range.end()))?;
+            }
+        }
+        Class::Bytes(ranges) => {
+            for range in ranges.iter() {
+                add_range(u32::from(range.start()), u32::from(range.end()))?;
+            }
+        }
+    }
+    folded
+}
+
+fn decompose_hir(hir: &Hir) -> QueryPlan {
+    match hir.kind() {
+        HirKind::Literal(Literal(bytes)) => literals_to_query_plan(bytes),
         HirKind::Concat(subs) => {
-            // Collect all literals from concat children into a single string,
-            // then extract trigrams. Non-literal children break the chain.
             let mut all_queries = Vec::new();
-            let mut current_literal = String::new();
+            let mut current_literal = Vec::new();
+            let mut fold_run = false;
+            let flush =
+                |literal: &mut Vec<u8>, fold: &mut bool, queries: &mut Vec<TrigramQuery>| {
+                    // Fold the entire run, including case-sensitive neighbours,
+                    // so trigrams and next-byte masks refer to the same index text.
+                    if *fold {
+                        literal.make_ascii_lowercase();
+                    }
+                    if let QueryPlan::And(run) = literals_to_query_plan(literal) {
+                        queries.extend(run);
+                    }
+                    literal.clear();
+                    *fold = false;
+                };
 
             for sub in subs {
                 if let HirKind::Literal(Literal(bytes)) = sub.kind() {
-                    let s = String::from_utf8_lossy(bytes);
-                    current_literal.push_str(&s);
+                    current_literal.extend_from_slice(bytes);
+                } else if let HirKind::Class(class) = sub.kind()
+                    && let Some(byte) = ascii_class_literal(class)
+                {
+                    current_literal.push(byte);
+                    fold_run = true;
                 } else {
-                    // Flush the current literal run
-                    if !current_literal.is_empty() {
-                        let text = if case_insensitive {
-                            current_literal.to_lowercase()
-                        } else {
-                            current_literal.clone()
-                        };
-                        if let QueryPlan::And(queries) = literals_to_query_plan(text.as_bytes()) {
-                            all_queries.extend(queries);
-                        }
-                        current_literal.clear();
-                    }
+                    flush(&mut current_literal, &mut fold_run, &mut all_queries);
                     // Recurse into the non-literal child
-                    let sub_plan = decompose_hir(sub, case_insensitive);
+                    let sub_plan = decompose_hir(sub);
                     if let QueryPlan::And(queries) = sub_plan {
                         all_queries.extend(queries);
                     }
@@ -441,17 +474,7 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
                 }
             }
 
-            // Flush remaining literal
-            if !current_literal.is_empty() {
-                let text = if case_insensitive {
-                    current_literal.to_lowercase()
-                } else {
-                    current_literal
-                };
-                if let QueryPlan::And(queries) = literals_to_query_plan(text.as_bytes()) {
-                    all_queries.extend(queries);
-                }
-            }
+            flush(&mut current_literal, &mut fold_run, &mut all_queries);
 
             if all_queries.is_empty() {
                 QueryPlan::MatchAll
@@ -460,10 +483,7 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
             }
         }
         HirKind::Alternation(alts) => {
-            let plans: Vec<QueryPlan> = alts
-                .iter()
-                .map(|a| decompose_hir(a, case_insensitive))
-                .collect();
+            let plans: Vec<QueryPlan> = alts.iter().map(decompose_hir).collect();
             // If any branch is MatchAll, the whole alternation is MatchAll
             if plans.iter().any(|p| p.is_match_all()) {
                 QueryPlan::MatchAll
@@ -473,13 +493,13 @@ fn decompose_hir(hir: &Hir, case_insensitive: bool) -> QueryPlan {
         }
         HirKind::Repetition(rep) => {
             if rep.min >= 1 {
-                decompose_hir(&rep.sub, case_insensitive)
+                decompose_hir(&rep.sub)
             } else {
                 // min=0 means the pattern is optional → can match anything
                 QueryPlan::MatchAll
             }
         }
-        HirKind::Capture(cap) => decompose_hir(&cap.sub, case_insensitive),
+        HirKind::Capture(cap) => decompose_hir(&cap.sub),
         HirKind::Class(Class::Unicode(_)) | HirKind::Class(Class::Bytes(_)) => QueryPlan::MatchAll,
         HirKind::Look(_) | HirKind::Empty => QueryPlan::MatchAll,
     }
@@ -1101,18 +1121,133 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_regex_plan() {
-        // Same test but via regex parser path
+        // Unicode case folds of S include non-ASCII bytes, so only the
+        // unambiguous ASCII runs can be required by the index.
         let plan = build_query_plan("class AlertSchema", true).unwrap();
         match &plan {
             QueryPlan::And(queries) => {
                 assert!(!queries.is_empty(), "should have trigrams");
-                let expected = trigram::extract_from_literal("class alertschema");
+                let expected = trigram::extract_from_literal("alert");
                 let hashes: Vec<TrigramHash> = queries.iter().map(|q| q.hash).collect();
                 for tri in &expected {
                     assert!(hashes.contains(tri), "missing trigram {tri:#010x}");
                 }
             }
             _ => panic!("expected And plan, got {plan:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_case_flags_narrow_candidates_without_losing_matches() {
+        let contents = [
+            "SHELLSHOCK",
+            "BaShDoOr",
+            "\u{17f}hell\u{17f}hoc\u{212a}",
+            "ba\u{17f}hdoor",
+            "PREFIXhelloSUFFIX",
+            "prefixHELLOsuffix",
+            "HELLO",
+            "hello",
+            "prefix\u{c9}suffix",
+            "prefix\u{e9}suffix",
+            "AbC",
+            "aBC",
+            "unrelated decoy",
+        ];
+        let mut inverted = std::collections::HashMap::<u32, Vec<PostingEntry>>::new();
+        for (file_id, content) in contents.iter().enumerate() {
+            let mut masks = std::collections::HashMap::<u32, trigram::TrigramMasks>::new();
+            for bytes in [
+                content.as_bytes().to_vec(),
+                content.as_bytes().to_ascii_lowercase(),
+            ] {
+                for (tri, mask) in trigram::extract_with_masks(&bytes) {
+                    let entry = masks.entry(tri).or_default();
+                    entry.loc_mask |= mask.loc_mask;
+                    entry.next_mask |= mask.next_mask;
+                }
+            }
+            for (tri, mask) in masks {
+                inverted.entry(tri).or_default().push(PostingEntry {
+                    file_id: file_id as u32,
+                    loc_mask: mask.loc_mask,
+                    next_mask: mask.next_mask,
+                });
+            }
+        }
+        let lookup = |tri| inverted.get(&tri).cloned().unwrap_or_default();
+        let cases = [
+            ("(?i)shellshock|bashdoor", false),
+            ("shellshock|bashdoor", true),
+            ("(?i:shellshock)|(?i:bashdoor)", false),
+            ("(?im)^shellshock|bashdoor", false),
+            ("PREFIX(?i:hello)SUFFIX", false),
+            ("(?i)prefix(?-i:HELLO)suffix", false),
+            ("(?-i)HELLO", true),
+            ("(?i-u:hello)", false),
+            ("[Hh][Ee][Ll][Ll][Oo]", false),
+            ("(?i)prefix\u{e9}suffix", false),
+            ("A(?i:bc)", false),
+            ("(?i:ab)C", false),
+        ];
+        for (pattern, ci) in cases {
+            let plan = build_query_plan(pattern, ci).unwrap();
+            assert!(!plan.is_match_all(), "{pattern:?} must narrow candidates");
+            let candidates = execute_plan_with_masks(&plan, &lookup);
+            assert!(
+                candidates.len() < contents.len(),
+                "{pattern:?}: {candidates:?}"
+            );
+            let matcher = regex::RegexBuilder::new(pattern)
+                .case_insensitive(ci)
+                .build()
+                .unwrap();
+            let mut hits = 0;
+            for (id, content) in contents.iter().enumerate() {
+                if matcher.is_match(content) {
+                    hits += 1;
+                    assert!(
+                        candidates.contains(&(id as u32)),
+                        "{pattern:?} lost {content:?}: {plan:?}"
+                    );
+                }
+            }
+            assert!(hits > 0, "fixture must exercise {pattern:?}");
+        }
+        let inline = build_query_plan("(?i)shellshock|bashdoor", false).unwrap();
+        let flag = build_query_plan("shellshock|bashdoor", true).unwrap();
+        assert_eq!(
+            execute_plan_with_masks(&inline, &lookup),
+            execute_plan_with_masks(&flag, &lookup)
+        );
+        let relaxed = build_relaxed_multi_pattern_plan(
+            &["(?i)(?<!//)shellshock|bashdoor".to_string()],
+            false,
+        );
+        assert!(!relaxed.is_match_all());
+        assert_eq!(
+            execute_plan_with_masks(&inline, &lookup),
+            execute_plan_with_masks(&relaxed, &lookup)
+        );
+    }
+
+    #[test]
+    fn ambiguous_classes_and_optional_runs_do_not_require_trigrams() {
+        for pattern in [
+            "(?i)k",
+            "(?i)\u{212a}",
+            "(?i)\u{e9}",
+            "(?i)hello?",
+            "(?i)hello|.",
+            "(?i:hello)?",
+            "[A-Z][a-z][0-9]",
+        ] {
+            let plan = build_query_plan(pattern, false).unwrap();
+            if pattern == "(?i)hello?" {
+                assert!(!plan.is_match_all(), "mandatory hell remains usable");
+            } else {
+                assert!(plan.is_match_all(), "{pattern}: {plan:?}");
+            }
         }
     }
 

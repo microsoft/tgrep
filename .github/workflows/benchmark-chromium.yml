@@ -2,12 +2,24 @@ name: Benchmark Chromium (Linux/macOS)
 
 on:
   workflow_dispatch:
+    inputs:
+      paired:
+        description: Compare baseline and candidate on one pinned Linux corpus
+        type: boolean
+        default: false
+      baseline_sha:
+        description: Full baseline tgrep commit SHA (required for paired mode)
+        type: string
+      chromium_sha:
+        description: Full Chromium commit SHA (required for paired mode)
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   benchmark:
+    if: ${{ !inputs.paired }}
     name: Benchmark Chromium (${{ matrix.os }})
     timeout-minutes: 180
     strategy:
@@ -42,3 +54,121 @@ jobs:
         with:
           name: benchmark-chromium-${{ matrix.os }}
           path: benchmark-results.md
+
+  paired:
+    if: ${{ inputs.paired }}
+    name: Paired Chromium (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      BASELINE_SHA: ${{ inputs.baseline_sha }}
+      CHROMIUM_SHA: ${{ inputs.chromium_sha }}
+    steps:
+      - name: Validate pinned revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "baseline_sha must be a full commit SHA" >&2; exit 1; }
+          [[ "$CHROMIUM_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "chromium_sha must be a full commit SHA" >&2; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.baseline_sha }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Check ancestry and record build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C candidate merge-base --is-ancestor "$BASELINE_SHA" HEAD
+          test "$(git -C baseline rev-parse HEAD)" = "$BASELINE_SHA"
+          test "$(git -C candidate rev-parse HEAD)" = "$GITHUB_SHA"
+          {
+            echo "Baseline: $BASELINE_SHA"
+            echo "Candidate: $GITHUB_SHA"
+            echo "Chromium: $CHROMIUM_SHA"
+            echo "Build: cargo build --release --locked -p tgrep-cli (separate target directories)"
+            rustc -Vv
+            cargo -V
+            git --version
+            python3 --version
+            sort --version
+            date -u --iso-8601=seconds
+            echo "Runner image: $ImageOS $ImageVersion"
+            uname -a
+            lscpu
+            df -h
+          } > "$RUNNER_TEMP/paired-environment.log"
+
+      - name: Validate paired benchmark harness
+        working-directory: candidate
+        run: python3 -m unittest discover -s scripts -p test_benchmark_paired.py
+
+      - name: Build both release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p tgrep-cli --manifest-path baseline/Cargo.toml
+          cargo build --release --locked -p tgrep-cli --manifest-path candidate/Cargo.toml
+
+      - name: Make room for the Chromium checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = "github-hosted"
+          sudo rm -rf -- /usr/share/dotnet /usr/local/lib/android
+          df -h
+
+      - name: Check out one fixed Chromium revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init "$RUNNER_TEMP/chromium-paired"
+          git -C "$RUNNER_TEMP/chromium-paired" remote add origin https://github.com/chromium/chromium.git
+          git -C "$RUNNER_TEMP/chromium-paired" fetch --no-tags --depth=1 origin "$CHROMIUM_SHA"
+          git -C "$RUNNER_TEMP/chromium-paired" -c core.autocrlf=false checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/chromium-paired" rev-parse HEAD)" = "$CHROMIUM_SHA"
+
+      - name: Run paired warm-server comparison
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 candidate/scripts/benchmark-paired.py \
+            --baseline "$GITHUB_WORKSPACE/baseline/target/release/tgrep" \
+            --candidate "$GITHUB_WORKSPACE/candidate/target/release/tgrep" \
+            --baseline-sha "$BASELINE_SHA" \
+            --candidate-sha "$GITHUB_SHA" \
+            --repo-path "$RUNNER_TEMP/chromium-paired" \
+            --corpus-sha "$CHROMIUM_SHA" \
+            --queries candidate/scripts/benchmark-queries-chromium.json \
+            --work "$RUNNER_TEMP/tgrep-paired" \
+            --blocks abba-baab --repeats 5
+
+      - name: Publish comparison summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if test -f "$RUNNER_TEMP/tgrep-paired/comparison.md"; then
+            cat "$RUNNER_TEMP/tgrep-paired/comparison.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload measurements and diagnostic logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chromium-paired-linux
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/paired-environment.log
+            ${{ runner.temp }}/tgrep-paired/comparison.json
+            ${{ runner.temp }}/tgrep-paired/comparison.md
+            ${{ runner.temp }}/tgrep-paired/logs/*.log

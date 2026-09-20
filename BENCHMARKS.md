@@ -70,6 +70,51 @@ largest here is Chromium at 504K files and 2.6 GB of index, which builds in unde
 
 ---
 
+## Controlled branch comparisons
+
+The Chromium workflow has an opt-in `paired` mode for comparing two tgrep
+revisions, rather than comparing independent hosted runs. Dispatch
+`benchmark-chromium.yml` on the candidate branch with `paired=true`, a full
+`baseline_sha`, and a full `chromium_sha`. The baseline must be an ancestor of
+the candidate. Leaving `paired` unset retains the ordinary Linux/macOS workflow.
+
+Both binaries are built with `cargo build --release --locked -p tgrep-cli` on
+one Linux runner. The harness uses one clean, pinned Chromium checkout and one
+baseline-built index shared sequentially by both binaries, so file IDs and
+posting layout are identical. This requires compatible index formats: it is
+not suitable for comparing format migrations or index-building improvements.
+The index is outside the corpus; its core and visibility files are fingerprinted
+and must remain unchanged throughout the comparison.
+
+Eight server blocks run in `ABBA BAAB` order. Every server starts with
+`--no-watch`, and timing waits for successful startup reconciliation, complete
+hidden coverage and no active indexing/reconciliation. Each block checks output
+and exit-code parity for every query, warms the same shuffled query sequence,
+then runs five repeated suites with matched shuffled order. Each query therefore
+has 20 samples per binary, grouped into four server blocks rather than 20
+independent trials. Use the block-level variation alongside the pooled medians.
+Timed calls use a fresh CLI process and discard stdout;
+they include client startup, TCP, matching and rendering, but exclude startup
+reconciliation and parity hashing. Query errors, stderr, unexpected exit codes,
+timeouts, server fallback or index changes fail the comparison instead of
+silently contributing a timing. Completed content-search traces must account
+for every query; scan-fallback queries are not mixed into indexed-path results.
+
+The `chromium-paired-linux` artifact contains raw samples, per-query and
+per-block summaries, suite totals, binary/corpus fingerprints, environment
+information and server logs. `comparison.md` is also published in the run
+summary. These are warm-server measurements on one corpus and one host, not
+cold-cache measurements or a guarantee for other platforms.
+
+For a small local smoke test or an existing fixed checkout, invoke
+`python scripts/benchmark-paired.py --help`. The harness uses only Python's
+standard library and, on Linux, GNU `sort` for bounded-memory output
+canonicalization. Run its tests with:
+
+```text
+python -m unittest discover -s scripts -p test_benchmark_paired.py
+```
+
 ## Core Criterion benchmarks
 
 Local Criterion run on Windows from the `perf-benchmarks` branch. The short

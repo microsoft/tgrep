@@ -103,6 +103,8 @@ Output is capped at approximately 48 KB of result records, plus metadata. An
 oversized individual line may produce a truncated response with no records;
 narrow the query or use files/count output. Queries time out after 30 seconds
 (plus bounded service startup); cancellation terminates the query subprocess.
+Queries that finish during cleanup are reaped normally; other termination
+failures remain errors.
 No-match is success, while invalid queries and unreadable paths are errors.
 The response identifies truncation and the mode `current_scan` or
 `indexed_or_scan`. The latter intentionally does not claim that the index was

@@ -410,17 +410,46 @@ class RuntimeTests(unittest.TestCase):
 
     def test_exit_race_does_not_mask_truncated_result(self):
         actual_kill = os.killpg
-        def disappeared(pid, sig):
-            actual_kill(pid, sig)
-            raise ProcessLookupError("already exited")
-        # A producer that cannot exit before truncation triggers cleanup.
-        fake = self.directory / "producer"
-        fake.write_text(f"#!{sys.executable}\nimport time\nprint('a\\0b\\0', end='', flush=True)\ntime.sleep(60)\n")
-        fake.chmod(0o755)
-        self.runtime.binary = str(fake)
-        with patch.object(runtime.os, "killpg", side_effect=disappeared):
-            result = self.search("find_files", max_results=1)
-        self.assertTrue(result["truncated"])
+        for error in (ProcessLookupError, PermissionError):
+            with self.subTest(error=error.__name__), self.truncating_query() as proc:
+                def disappeared(pid, sig):
+                    self.assertEqual(pid, proc.pid)
+                    actual_kill(pid, sig)
+                    proc.wait(timeout=5)
+                    raise error("already exited")
+                with patch.object(runtime.os, "killpg", side_effect=disappeared):
+                    result = self.search("find_files", max_results=1)
+                self.assertTrue(result["truncated"])
+                self.assertEqual(result["results"], [{"path": "a"}])
+                self.assertIsNotNone(proc.returncode)
+                self.assertTrue(proc.stdout.closed)
+                self.assertTrue(proc.stderr.closed)
+
+    def test_permission_error_for_live_query_is_not_ignored(self):
+        with self.truncating_query() as proc:
+            with patch.object(runtime.os, "killpg", side_effect=PermissionError("signal denied")):
+                with self.assertRaisesRegex(PermissionError, "signal denied"):
+                    self.search("find_files", max_results=1)
+            self.assertIsNone(proc.poll())
+            self.assertTrue(proc.stdout.closed)
+            self.assertTrue(proc.stderr.closed)
+
+    @contextlib.contextmanager
+    def truncating_query(self):
+        # Keep the producer alive until cleanup so the exit race is deterministic.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; print('a\\0b\\0', end='', flush=True); time.sleep(60)"],
+            cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        try:
+            with patch.object(runtime.subprocess, "Popen", return_value=proc):
+                yield proc
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+            proc.stdout.close()
+            proc.stderr.close()
 
     def test_doctor_exercises_installed_mcp(self):
         with patch.object(sys, "argv", ["install.py", "install", "--agent", "codex", "--root", str(self.root), "--binary", str(BINARY)]), contextlib.redirect_stdout(io.StringIO()):

@@ -316,14 +316,21 @@ class Runtime:
                 if code not in (0, 1):
                     raise ValueError(warnings.decode(errors="replace") or f"tgrep exited with {code}")
         finally:
-            if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            proc.wait()
-            proc.stdout.close()
-            proc.stderr.close()
+            try:
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        # macOS can return EPERM for an exited process group.
+                        # Ignore it only if our child really finished in the race.
+                        if proc.poll() is None:
+                            raise
+                proc.wait()
+            finally:
+                proc.stdout.close()
+                proc.stderr.close()
         payload = {"root": str(self.root), "results": records, "truncated": truncated,
                    "search_mode": mode, "warnings": warnings.decode(errors="replace")}
         if truncated:

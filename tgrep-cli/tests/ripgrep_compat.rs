@@ -375,6 +375,78 @@ fn indexed_stats_distinguish_full_corpus_candidates_from_server_transport() {
 }
 
 #[test]
+fn indexed_candidate_stats_precede_query_size_limit() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    let scope = root.join("scope");
+    fs::create_dir_all(scope.join("nested")).unwrap();
+    for path in [
+        root.join("outside.rs"),
+        scope.join("small.rs"),
+        scope.join("excluded.rs"),
+        scope.join("wrong.txt"),
+        scope.join(".hidden.rs"),
+        scope.join("nested").join("deep.rs"),
+    ] {
+        fs::write(path, "needle\n").unwrap();
+    }
+    fs::write(scope.join("large.rs"), "needle\n".repeat(8)).unwrap();
+    fs::write(scope.join("decoy.rs"), "haystack\n").unwrap();
+
+    let cases: &[(&[&str], u64, usize)] = &[
+        (&["--no-max-filesize"], 9, 2),
+        (&["--max-filesize", "7"], 1, 1),
+        (&["--max-filesize", "1"], 0, 0),
+    ];
+    let mut direct = Vec::new();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (i, &(size_flags, matched_lines, matched_files)) in cases.iter().enumerate() {
+            let output = tgrep()
+                .args(backend)
+                .args(size_flags)
+                .args([
+                    "--stats",
+                    "--sort",
+                    "path",
+                    "--color",
+                    "never",
+                    "-c",
+                    "-t",
+                    "rust",
+                    "--glob",
+                    "!excluded.rs",
+                    "--max-depth",
+                    "1",
+                ])
+                .args(["--", "needle", scope.to_str().unwrap()])
+                .assert()
+                .code(if matched_files == 0 { 1 } else { 0 })
+                .get_output()
+                .clone();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(marker), "{size_flags:?}: {stderr}");
+            assert_eq!(
+                stats_totals(&output.stderr),
+                [(matched_lines, matched_lines)]
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).lines().count(),
+                matched_files
+            );
+            if backend == ["--no-index"] {
+                direct.push(output.stdout);
+            } else {
+                assert_eq!(output.stdout, direct[i], "{backend:?} {size_flags:?}");
+                assert!(
+                    stderr.contains("(candidates: 2/8; raw candidates: 7/8)"),
+                    "{backend:?} {size_flags:?}: {stderr}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
 fn indexed_server_returns_candidate_stats_only_when_requested() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");

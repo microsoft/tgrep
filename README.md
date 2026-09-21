@@ -610,8 +610,10 @@ ignored so ripgrep command lines keep working. `--debug`/`--trace` imply
 
 For indexed content searches, `--stats` reports the query plan and candidate
 counts with or without a server. **Raw candidates** are the files selected by
-the trigram index before path, visibility, glob, and type filtering. If that
-set covers the entire nonempty index, the summary says **`no index narrowing`**,
+the trigram index before path, visibility, glob, and type filtering.
+**Candidates** counts the files remaining after those filters, but before
+`--max-filesize` checks, file reads, or matching, on both local and server searches.
+If the raw set covers the entire nonempty index, the summary says **`no index narrowing`**,
 even when a usable trigram plan exists. **`(via server)`** describes transport,
 not whether the index reduced the search. Older servers that do not return
 candidate statistics retain the transport-only summary.

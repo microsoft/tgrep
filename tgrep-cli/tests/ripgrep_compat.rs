@@ -265,6 +265,223 @@ fn with_stats_backends(
 }
 
 #[test]
+fn indexed_inline_case_flags_keep_candidates_selective() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("alpha.txt"),
+        "SHELLSHOCK\n\u{17f}hell\u{17f}hoc\u{212a}\nPREFIXhelloSUFFIX\nprefixHELLOsuffix\n(?i)HeLLo\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("beta.txt"),
+        "BaShDoOr\nba\u{17f}hdoor\nprefix\u{c9}suffix\nprefix\u{e9}suffix\n",
+    )
+    .unwrap();
+    for i in 0..256 {
+        fs::write(root.join(format!("decoy-{i}.txt")), "unrelated content\n").unwrap();
+    }
+    let cases: &[(&[&str], &str, usize)] = &[
+        (&[], "(?i)shellshock|bashdoor", 2),
+        (&["-i"], "shellshock|bashdoor", 2),
+        (&["-P"], "(?i)shellshock|bashdoor", 2),
+        (&["-i", "-P"], "shellshock|bashdoor", 2),
+        (&["-P"], "(?i)(?<!//)shellshock|bashdoor", 2),
+        (&[], "(?im)^shellshock|bashdoor", 2),
+        (&[], "(?i:shellshock)|(?i:bashdoor)", 2),
+        (&[], "PREFIX(?i:hello)SUFFIX", 1),
+        (&[], "(?i)prefix(?-i:HELLO)suffix", 1),
+        (&["-i"], "(?-i)HELLO", 1),
+        (&[], "(?i)prefix\u{e9}suffix", 2),
+        (&["-F"], "(?i)HeLLo", 1),
+    ];
+    let mut direct = Vec::new();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (i, &(flags, pattern, candidates)) in cases.iter().enumerate() {
+            let output = tgrep()
+                .args(backend)
+                .args(flags)
+                .args(["--stats", "--sort", "path", "--color", "never", "-c"])
+                .args(["--", pattern, root.to_str().unwrap()])
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains(marker), "{flags:?} {pattern}: {stderr}");
+            if backend == ["--no-index"] {
+                direct.push(output.stdout);
+            } else {
+                assert_eq!(output.stdout, direct[i], "{flags:?} {pattern}");
+                // At most two of 258 files: exercise actual posting lookup and
+                // masks, not just the existence of a non-MatchAll plan.
+                assert!(
+                    stderr.contains(&format!("raw candidates: {candidates}/258")),
+                    "{flags:?} {pattern}: {stderr}"
+                );
+                assert!(!stderr.contains("no index narrowing"), "{stderr}");
+            }
+        }
+    });
+}
+
+#[test]
+fn indexed_stats_distinguish_full_corpus_candidates_from_server_transport() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("one.txt"), "common needle\n").unwrap();
+    fs::write(root.join("two.txt"), "common haystack\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        if backend == ["--no-index"] {
+            return;
+        }
+        for (pattern, raw, no_narrowing) in [
+            (".", 2, true),
+            ("common", 2, true),
+            ("needle", 1, false),
+            ("absent", 0, false),
+        ] {
+            for flags in [&[][..], &["-g", "one.txt"][..]] {
+                let output = tgrep()
+                    .args(backend)
+                    .args(flags)
+                    .args(["--stats", "--", pattern, root.to_str().unwrap()])
+                    .assert()
+                    .code(if raw == 0 { 1 } else { 0 })
+                    .get_output()
+                    .clone();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(stderr.contains(marker), "{stderr}");
+                assert!(
+                    stderr.contains(&format!("raw candidates: {raw}/2")),
+                    "{stderr}"
+                );
+                assert_eq!(
+                    stderr.contains("no index narrowing"),
+                    no_narrowing,
+                    "{stderr}"
+                );
+            }
+        }
+        tgrep()
+            .args(backend)
+            .args(["--", ".", root.to_str().unwrap()])
+            .assert()
+            .success()
+            .stderr("");
+    });
+}
+
+#[test]
+fn indexed_candidate_stats_precede_query_size_limit() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    let scope = root.join("scope");
+    fs::create_dir_all(scope.join("nested")).unwrap();
+    for path in [
+        root.join("outside.rs"),
+        scope.join("small.rs"),
+        scope.join("excluded.rs"),
+        scope.join("wrong.txt"),
+        scope.join(".hidden.rs"),
+        scope.join("nested").join("deep.rs"),
+    ] {
+        fs::write(path, "needle\n").unwrap();
+    }
+    fs::write(scope.join("large.rs"), "needle\n".repeat(8)).unwrap();
+    fs::write(scope.join("decoy.rs"), "haystack\n").unwrap();
+
+    let cases: &[(&[&str], u64, usize)] = &[
+        (&["--no-max-filesize"], 9, 2),
+        (&["--max-filesize", "7"], 1, 1),
+        (&["--max-filesize", "1"], 0, 0),
+    ];
+    let mut direct = Vec::new();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (i, &(size_flags, matched_lines, matched_files)) in cases.iter().enumerate() {
+            let output = tgrep()
+                .args(backend)
+                .args(size_flags)
+                .args([
+                    "--stats",
+                    "--sort",
+                    "path",
+                    "--color",
+                    "never",
+                    "-c",
+                    "-t",
+                    "rust",
+                    "--glob",
+                    "!excluded.rs",
+                    "--max-depth",
+                    "1",
+                ])
+                .args(["--", "needle", scope.to_str().unwrap()])
+                .assert()
+                .code(if matched_files == 0 { 1 } else { 0 })
+                .get_output()
+                .clone();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(marker), "{size_flags:?}: {stderr}");
+            assert_eq!(
+                stats_totals(&output.stderr),
+                [(matched_lines, matched_lines)]
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).lines().count(),
+                matched_files
+            );
+            if backend == ["--no-index"] {
+                direct.push(output.stdout);
+            } else {
+                assert_eq!(output.stdout, direct[i], "{backend:?} {size_flags:?}");
+                assert!(
+                    stderr.contains("(candidates: 2/8; raw candidates: 7/8)"),
+                    "{backend:?} {size_flags:?}: {stderr}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn indexed_server_returns_candidate_stats_only_when_requested() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("hit.txt"), "HeLLo\n").unwrap();
+    fs::write(root.join("decoy.txt"), "unrelated\n").unwrap();
+    let index_dir = dir.path().join("idx");
+    let _server = start_passthru_server(&root, &index_dir);
+    let info: serde_json::Value =
+        serde_json::from_slice(&fs::read(index_dir.join("serve.json")).unwrap()).unwrap();
+    let port = info["port"].as_u64().unwrap() as u16;
+    for stats in [false, true] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "search",
+            "params": { "pattern": "(?i)hello", "stats": stats },
+            "id": 1,
+        });
+        let response = send_rpc_request(port, &request.to_string()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        let result = &response["result"];
+        assert_eq!(result["num_matches"], 1);
+        if stats {
+            assert_eq!(result["index_stats"]["raw_candidates"], 1);
+            assert_eq!(result["index_stats"]["candidates"], 1);
+            assert_eq!(result["index_stats"]["total_files"], 2);
+            assert_eq!(result["index_stats"]["query_plan"], "AND(3 trigrams)");
+        } else {
+            assert!(result.get("index_stats").is_none(), "{result}");
+        }
+    }
+}
+
+#[test]
 fn indexed_hidden_copilot_modes_keep_visibility_and_ignore_parity() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");

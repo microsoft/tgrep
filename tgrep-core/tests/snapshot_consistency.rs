@@ -44,6 +44,37 @@ fn build_test_index(root: &Path, files: &[(&str, &[u8])]) -> tempfile::TempDir {
     tmp
 }
 
+#[test]
+fn candidate_totals_account_for_overlay_and_reader_snapshot() {
+    let root = tempfile::TempDir::new().unwrap();
+    let index_dir = build_test_index(
+        root.path(),
+        &[
+            ("a.txt", b"hello"),
+            ("b.txt", b"hello"),
+            ("c.txt", b"hello"),
+        ],
+    );
+    let mut hybrid = HybridIndex::open(index_dir.path(), root.path()).unwrap();
+    assert_eq!(hybrid.num_files(), 3);
+    hybrid.live.upsert_file("a.txt", b"changed");
+    hybrid.live.upsert_file("new.txt", b"hello");
+    hybrid.live.delete_file("b.txt");
+    hybrid.live.delete_file("absent.txt");
+    let (ids, snapshot) = hybrid.execute_query_with_masks(&query::QueryPlan::MatchAll);
+    assert_eq!(ids.len(), 3);
+    assert_eq!(hybrid.num_files(), ids.len());
+    assert_eq!(hybrid.num_files_using(&snapshot), ids.len());
+
+    hybrid.swap_reader(tgrep_core::reader::IndexReader::empty());
+    assert_eq!(hybrid.num_files(), 2);
+    assert_eq!(hybrid.num_files_using(&snapshot), 3);
+    hybrid.live.upsert_file("b.txt", b"restored");
+    assert_eq!(hybrid.num_files_using(&snapshot), 4);
+    hybrid.live.delete_file("new.txt");
+    assert_eq!(hybrid.num_files_using(&snapshot), 3);
+}
+
 /// Every file ID returned by execute_query_with_masks must resolve via the
 /// returned reader snapshot — even without any concurrent swap.
 #[test]

@@ -160,10 +160,14 @@ These tuning options apply only to `tgrep serve`:
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--max-memory <MB>` | 50% of RAM (512 MiB–16 GiB) | Memory threshold for flushing the overlay while resuming a partial build; not a process-wide hard limit |
-| `--max-cpu <PERCENT>` | `50` | Size the indexing worker pool as a share of logical cores, with at least one worker |
+| `--max-memory <MB>` | 50% of RAM (512 MiB–16 GiB) | Overlay flush threshold for resumed partial builds and fallback in-memory builds; not a process-wide hard limit |
+| `--max-cpu <PERCENT>` | `50` | Size the worker pool for resumed/fallback builds and stale-delta builds as a share of logical cores, with at least one worker |
 | `--auto-save-mutations <N>` | `5000` | Pending content mutations that trigger a background save |
 | `--watcher-queue-cap <N>` | `16384` | Buffered filesystem events; overflow triggers reconciliation |
+
+Fresh external builds use the default 64 MiB posting buffer and global Rayon
+pool, not `--max-memory` or `--max-cpu`. If external bootstrap fails, the server
+falls back to an in-memory build where these settings apply.
 
 The server checks for pending saves once a minute. It saves at the mutation
 threshold, when filename-only membership changes, or when content changes
@@ -510,8 +514,9 @@ A file is treated as binary if its decoded content contains a NUL byte:
   offset rather than counting the whole file.
 
 tgrep also skips known binary extensions during directory content searches
-and indexing, unlike ripgrep. `--binary` and `-a` lift this restriction;
-`--files` lists binary paths too.
+and indexing, unlike ripgrep. For searches, `--binary` and `-a` lift this
+restriction and bypass the index; they do not change what `index` or `serve`
+indexes. `--files` lists binary paths too.
 
 ### Flags that bypass the index
 
@@ -528,10 +533,10 @@ Flags that widen or re-interpret the indexed corpus still walk the tree:
 non-`auto` `-E/--encoding`, `-a/--text`, `--binary`, and ignore-disabling flags
 such as `--no-ignore`. Explicit file arguments also bypass the index.
 
-For content searches, `--follow`, `--one-file-system`, and `--ignore-file`
-(including its case-insensitive option) only take effect on a filesystem
-scan; pair them with `--no-index`. `--files` falls back to walking for these
-options automatically. `index` and `serve` reject these traversal options,
+For content searches, `--follow`, `--one-file-system`, `--ignore-file`, and
+`--ignore-file-case-insensitive` do **not** trigger fallback: indexed searches
+ignore them. Add `--no-index` to apply them. `--files` falls back to walking
+for these options automatically. `index` and `serve` reject these traversal options,
 `--max-depth`, and individual `--no-ignore-*` discovery switches.
 
 Both positive and negative `--glob`/`--iglob` patterns filter the indexed corpus

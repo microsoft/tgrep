@@ -6,289 +6,143 @@ in large codebases.
 **tgrep is integrated into [GitHub Copilot CLI](https://github.com/github/copilot-cli)
 to power fast grep searches across large repositories.**
 
-## Why?
+## Quick start
 
-Tools like `grep` and `ripgrep` scan every file on every search — O(total bytes)
-per query. In a 100k+ file monorepo, that's painfully slow. tgrep pre-builds a
-trigram index so searches only touch the small set of files that could match.
-
-**Start a server once, search instantly forever.**
+[Install tgrep](#installation), then start a server:
 
 ```bash
-tgrep index .            # build the trigram index
-tgrep serve .            # start server (watches for file changes)
-tgrep "fn main" .        # instant — auto-connects to running server
+tgrep serve .           # builds the index if needed; runs in the foreground
 ```
 
-Using tgrep from an AI coding agent? See [AGENTS.md](AGENTS.md).
+In another terminal:
 
-Install MCP search tools and startup hooks for Codex or pi with
-`bash install-agent.sh` from this checkout. See the
-[agent integration guide](scripts/agent/README.md) for install, doctor, repair
-and uninstall commands (Linux/macOS, Python 3.11+).
-
-See [full benchmark results](BENCHMARKS.md) — up to **52x faster** than ripgrep on large repos.
-
-### Benchmark highlights (avg latency per query, index pre-built)
-
-| Repo | Files | Platform | ripgrep | tgrep | Speedup |
-| --- | ---: | --- | ---: | ---: | ---: |
-| gecko-dev | 388K | macOS arm64 | 33,402ms | 643ms | **51.9x** |
-| gecko-dev | 388K | Windows | 17,841ms | 463ms | **38.6x** |
-| gecko-dev | 388K | Linux | 1,195ms | 162ms | **7.36x** |
-| chromium | 504K | macOS arm64 | 41,806ms | 2,643ms | **15.8x** |
-| chromium | 504K | Windows | 24,576ms | 1,396ms | **17.6x** |
-| chromium | 504K | Linux | 2,404ms | 631ms | **3.81x** |
-| go | 16K | Windows | 592ms | 79ms | **7.53x** |
-| rust | 62K | Windows | 1,489ms | 194ms | **7.69x** |
-| kubernetes | 31K | Windows | 1,342ms | 190ms | **7.08x** |
-| linux | 96K | macOS arm64 | 5,390ms | 256ms | **21.0x** |
-| linux | 96K | Windows | 3,280ms | 94ms | **34.8x** |
-| linux | 96K | Linux | 427ms | 46ms | **9.38x** |
-
-tgrep wins 17 of the 18 measured cells; the exception is Kubernetes on Linux, a
-near-tie at 0.93x. The margin depends on repo size and on how many matches a query
-returns — a search that returns tens of thousands of matches spends more on
-delivering them than the index saves on finding them. See
-[What decides the margin](BENCHMARKS.md#what-decides-the-margin).
-
-## Architecture
-
-```
-tgrep <pattern> ---TCP---> tgrep serve (multi-client)
-    (client)                   |
-                          HybridIndex
-                          /         \
-                   IndexReader    LiveIndex
-                   (mmap disk)   (in-memory overlay)
-                        ^              ^
-                        |              |
-                  Periodic Flush  File Watcher (notify)
-                  (50K files /    Background Indexer
-                   5 min)         (rayon parallel)
+```bash
+tgrep -- "fn main" .    # automatically connects to the server
+tgrep status .          # show indexing and refresh status
 ```
 
-- **IndexReader** — mmap'd on-disk index (zero-copy, binary search on sorted
-  trigram lookup table)
-- **LiveIndex** — in-memory overlay for files modified after server start, or
-  being built by the background indexer
-- **HybridIndex** — merges both layers; overlay takes precedence
-- **Background Indexer** — builds the index in parallel batches of 1,024 files
-  (with additional byte-based splitting); resumed partial indexes use batches of
-  500 files. Clients scan until complete hidden-file coverage is published
-- **Periodic Flush** — every 50K files or 5 minutes, the in-memory index is
-  flushed to disk and the reader is swapped, keeping memory bounded
-- **Automatic refresh** — native `notify` subscriptions update LiveIndex in
-  real time when available; budget or registration failures switch to polling
-- **Filename Index** — `--files` unions content-index paths with a compact
-  sidecar containing only admitted paths that have no searchable content
-- **TCP Server** — JSON-RPC 2.0 over newline-delimited TCP; each connection
-  handled in a separate thread; multiple clients can connect simultaneously
-- **File Cache** — 50K-entry content cache with RwLock for lock-free reads
+Without a server, run `tgrep index .` to build an on-disk index. Searches use
+the server when available, then the local index, or scan the filesystem if no
+usable index exists. Indexes are stored in `.tgrep/` by default; add this
+directory to `.gitignore`.
+
+**Indexes can lag filesystem changes.** The server updates asynchronously;
+without a server, rerun `tgrep index .` after changes. Use `--no-index` when a
+search must read the current files. Queries scan during an initial build until
+complete coverage is available.
+
+For coding agents, see [AGENTS.md](AGENTS.md). To install MCP search tools and
+startup hooks for Codex or pi, run `bash install-agent.sh` from this checkout
+(Linux/macOS, Python 3.11+). See the
+[agent integration guide](scripts/agent/README.md).
 
 ## Performance
 
-tgrep is designed to be significantly faster than ripgrep on large repos:
+A trigram index narrows each query to files that could match, then verifies
+those files with the regex engine in parallel. Patterns without useful
+trigrams may still require searching every indexed file.
 
-- **Parallel search** — candidate files are searched in parallel using rayon
-- **Fast query planning** — sorted posting lists are intersected/unioned without
-  unnecessary resorting, and on-disk posting lists skip redundant deduplication
-- **Memory-efficient full builds** — index builds batch extraction and stream
-  sorted postings, file entries, and lookup entries instead of retaining the full
-  inverted index in memory
-- **Smart file walking** — extension-based binary rejection (50+ formats) and an
-  8KB content check, with a 64 MiB size cap on both indexing and searching
-  (`--no-max-filesize` removes it)
-- **Lock-free reads** — `RwLock<HashMap>` cache allows concurrent reads
-  without contention
-- **Hot serving** — queries work immediately during background index building,
-  falling back to filesystem scans until the index is ready
-
-See [BENCHMARKS.md](BENCHMARKS.md) for end-to-end large-repo benchmarks and
-Criterion microbenchmarks for query execution, trigram extraction, and index
-building.
+In the August 24, 2026 benchmark sweep, tgrep was faster than ripgrep in 17 of
+18 repo/platform combinations, with speedups from 0.93x to 51.9x. These measure
+client/server search latency with the index already built, not indexing time.
+Results depend on the query, repository, storage, and match volume. See
+[BENCHMARKS.md](BENCHMARKS.md) for measurements and methodology.
 
 ## Usage
 
 ### Build the index
 
 ```bash
-tgrep index .                          # index current directory
+tgrep index .                        # index current directory
 tgrep index /path/to/repo             # index a specific repo
-tgrep index . --index-path /tmp/idx   # custom index location
+tgrep index . --index-path /tmp/idx    # custom index location
 tgrep index . --exclude vendor --exclude third_party  # skip directories
 ```
 
-Each build reports its elapsed time and peak memory when it finishes:
+Each build reports elapsed time and, where available, peak memory:
 
 ```
 Index built successfully at /tmp/idx
 Indexed in 22.6s using external strategy (peak memory 160.1 MiB)
 ```
 
-The peak is the memory the process itself holds — private/committed bytes, not
-resident set. The two differ once large files are memory-mapped: mapped pages are
-file-backed and reclaimable, so counting them would report the size of the files
-being indexed rather than tgrep's own use. Indexing a single 2 GiB file holds
-77.8 MiB while its working set reaches 1.99 GiB. When the working set is
-substantially larger it is named alongside, so nothing is hidden:
-
-```
-Indexed in 46.1s using external strategy (peak memory 77.8 MiB private, 1.99 GiB working set incl. memory-mapped files)
-```
+Windows reports peak private committed bytes; Linux samples anonymous resident
+memory. Both exclude file-backed mappings and report the working set separately
+when it is substantially larger. macOS reports resident memory instead.
 
 #### Repositories without a `.git` directory
 
-`.gitignore` files only take effect inside a git repository. This matches
-ripgrep, which gates them the same way, but it surprises people indexing a
-Perforce, Source Depot, or plain-directory enlistment: the root `.gitignore` is
-read by nothing, and the only symptom is an index far larger than expected.
-
-tgrep says so rather than leaving you to guess:
-
-```
-Walking /src/enlistment...
-warning: /src/enlistment has a .gitignore but is not a git repository, so it is
-not applied (this matches ripgrep). Pass --no-require-git to apply it.
-Found 290018 text files (2893 binary skipped, 0 too large, 0 errors)
-```
-
-`--no-require-git` applies the rules anyway, and works on `index`, `serve`, and
-search alike, so the index and your queries agree on which files exist:
+Like ripgrep, tgrep applies `.gitignore` only inside a Git repository. It warns
+when a root `.gitignore` is present but not applied. Use `--no-require-git` on
+indexing, serving, and searching to apply those rules outside Git:
 
 ```bash
 tgrep index . --no-require-git
-tgrep serve --no-require-git
+tgrep serve . --no-require-git
+tgrep --no-require-git -- "pattern" .
 ```
 
 #### Case-insensitive repositories
 
-When git clones onto a filesystem that does not distinguish case — which on
-Windows is every clone — it sets `core.ignorecase` and stops distinguishing case
-when it matches ignore rules. A rule spelled `QLogs` then hides a directory
-named `qlogs`.
+When Git's `core.ignorecase` is enabled, tgrep applies an additional
+case-insensitive exclusion pass for the repository's root `.gitignore` and
+`.git/info/exclude`. Git-tracked paths are exempt from this additional pass,
+but not from ordinary traversal, binary, or size filtering.
 
-Most tools, ripgrep included, always match ignore rules case-sensitively, so
-that directory is walked, read and indexed even though `git status` never
-mentions it. On one Windows enlistment that was a single 13.4 GiB build
-artifact, 71% of the corpus, adding about 16 seconds to *every* query.
-
-tgrep reads `core.ignorecase` and matches the way the repository itself does.
-Files git **tracks** are exempt, which is git's own rule — ignore rules only
-decide the fate of files git does not already know about. Without that
-exemption the same change would have hidden 273 tracked `.JPG`, `.PNG` and
-`.RLL` files caught by rules written in lower case.
-
-On that enlistment the walk went from listing one file more than
-`git ls-files --cached --others --exclude-standard` to matching it exactly, at a
-cost of roughly 0.4 s on a 293k-file walk. `--no-ignore` turns it off along with
-every other ignore source, and repositories that distinguish case are unaffected
-and pay nothing.
-
-Only the repository's own root `.gitignore` and `.git/info/exclude` are matched
-this way. Rules in nested `.gitignore` files are not, because the walk does not
-know they exist until it reaches their directory. Missing one only leaves a file
-visible that git would hide, which is what every other tool does anyway.
+Nested `.gitignore` files and global ignore rules do not get this additional
+pass. `--no-ignore` disables it along with the normal ignore rules.
 
 #### Keep `index` and `serve` flags in step
 
-Flags that decide *which files belong in the index* — `--no-require-git`,
-`--no-ignore`, `--max-filesize`, `--exclude` — must match between the `tgrep
-index` that built an index and the `tgrep serve` that serves it.
+Use the same `--no-require-git`, `--no-ignore`, `--max-filesize` (or
+`--no-max-filesize`), and `--exclude` settings for `index` and `serve`.
+Startup reconciliation removes indexed files excluded by the server's current
+settings. For example, serving an uncapped index with `--max-filesize 8M`
+removes files larger than 8 MiB from that index.
 
-The server compares the index against the filesystem at startup and treats an
-indexed file it cannot see as deleted. So serving an index built without a cap
-under a `--max-filesize 8M` server drops every file above 8 MiB from that index,
-permanently. Both sides default to 64 MiB, so this only bites when one side
-names a limit; pass the same flags to both:
+Pass the same size policy, `--no-require-git`, and any custom `--index-path`
+to searches too. `--exclude` is only available on `index` and `serve`;
+`--no-ignore` on a search forces a filesystem scan.
 
 ```bash
 tgrep index . --max-filesize 8M
-tgrep serve   --max-filesize 8M
+tgrep serve . --max-filesize 8M
+tgrep --max-filesize 8M -- "pattern" .
 ```
 
 #### Memory use on very large repos
 
-Builds default to `--index-strategy=external`, which bounds peak memory with an
-external merge sort: postings accumulate in a fixed-size arena that spills
-sorted, compact segments to disk when full, and the segments are k-way merged
-straight into the index. Peak memory is roughly flat in repo size rather than
-linear.
-
-If the arena never fills, nothing is spilled and the build takes exactly the
-in-memory path, so small and mid-size repos pay nothing for this default.
+`tgrep index` defaults to an external merge sort with a 64 MiB posting buffer.
+When the buffer fills, sorted segments spill to disk and are merged into the
+index. This bounds posting-buffer memory, not total process memory: file
+tables, worker buffers, and decoded content also consume memory.
 
 ```bash
-tgrep index .                                 # external, 64 MB arena
-tgrep index . --index-buffer 16               # smaller arena, lower peak
-tgrep index . --index-strategy=memory         # opt out: sort entirely in RAM
+tgrep index .                          # external, 64 MiB posting buffer
+tgrep index . --index-buffer 16        # smaller buffer, lower peak
+tgrep index . --index-strategy=memory  # sort entirely in RAM
 ```
 
-On the Linux kernel (94,634 files, 990 MiB index), measured under the 1 MiB
-indexing cap that was the default at the time, the default strategy is a **~17x
-reduction in peak memory, and no slower**:
+`--index-buffer` is in MiB and applies only to the external strategy.
+`--index-strategy=memory` avoids temporary spill files but holds all postings
+in RAM. Both strategies still need a writable index directory.
 
-| Strategy | Spill segments | Peak working set | Build |
-| --- | ---: | ---: | ---: |
-| `external` (default, 64 MiB arena) | 31 | **160.1 MiB** | 22.6 s |
-| `external --index-buffer 16` | 122 | 109.6 MiB | ~23 s |
-| `memory` | - | 2.20 - 3.76 GiB | 23 - 32 s |
-
-`--index-buffer` trades peak memory against merge fan-in. Bounded memory is also
-*predictable* memory — the `memory` row varied by over a gigabyte across
-identical runs because `Vec` growth doubles and both buffers are briefly
-resident during the final reallocation, while `external` varied by 8 MiB.
-
-The 1 MiB indexing cap those rows were measured under is now 64 MiB, and files
-past 1 MiB are memory-mapped rather than read onto the heap. On the same repo the
-`external` build now settles at roughly **152 MiB of private memory in 27 s**,
-against 197-200 MiB and 41-42 s when every admitted file was read onto the heap.
-The arena bound is unchanged; what changed is that a handful of 20 MB generated
-headers no longer cost their full size in heap in every worker that touches one.
-The 152 MiB figure was taken with no cap at all, and the 64 MiB default excludes
-only files *above* 64 MiB, so it leaves these numbers alone here: the largest file
-in the kernel tree is a 22.9 MiB generated AMD register header, and nothing in its
-95,862 files reaches the cap.
-
-Two caveats on reading those numbers. The peak tgrep prints is *private bytes*,
-which excludes mapped file pages, so it reports what the process actually holds
-rather than the size of the files it is reading — the same build is 152 MiB
-private against ~192 MiB resident, and the working set is named alongside only
-when it is substantially larger, as in [Build the index](#build-the-index).
-macOS is the exception: `libc` does not surface the Mach counter that separates
-the two, so it still reports resident set there. And a very large file that is
-neither valid UTF-8 nor detectably binary still costs about its own size, because
-the index has to hold the same repaired bytes a search will match against; a
-135 MB Latin-1 file indexes at roughly 205 MiB.
-
-Pass `--max-filesize` if a build has to fit a tighter budget, or
-`--no-max-filesize` to lift the 64 MiB default entirely.
-
-`--index-strategy=memory` remains available as an escape hatch for environments
-where spilling is undesirable or impossible, such as a read-only or full index
-volume. Both strategies produce byte-identical indexes from the same walk —
-note that file IDs follow walk order, which the parallel walker does not fix
-between runs, so two builds of the same tree need not be byte-identical to each
-other. See
-[BENCHMARKS.md](BENCHMARKS.md#index-build-strategies) for full numbers.
-
-`tgrep serve` uses the same bounded builder when it has to create an index from
-scratch, so starting a server on an unindexed repo costs the same memory as
-`tgrep index` (**148.6 MiB** rather than 1.6 GiB on the Linux kernel, and 2.6x
-faster). While that first build runs, clients fall back to filesystem scans
-rather than returning partial results; incremental updates after it completes
-are unaffected.
+`tgrep serve` uses the external builder with the default buffer for new
+indexes; it does not accept `--index-strategy` or `--index-buffer`.
+Large files can be memory-mapped, but files needing decoding or UTF-8 repair
+require heap buffers. Use `--max-filesize` to limit admitted file sizes.
+See [index-build benchmarks](BENCHMARKS.md#index-build-strategies).
 
 ### Start the server
 
 ```bash
-tgrep serve .                          # start server (auto-builds index if missing)
-tgrep serve . --index-path /tmp/idx    # custom index location
-tgrep serve . --watch-mode poll        # poll without any native subscriptions
-tgrep serve . --poll-interval 60       # polling cadence after fallback
-tgrep serve . --watch-budget 4096      # lower this process's native watch ceiling
+tgrep serve .                         # auto-build index if missing
+tgrep serve . --index-path /tmp/idx   # custom index location
+tgrep serve . --watch-mode poll       # poll without native subscriptions
+tgrep serve . --poll-interval 60      # polling cadence after fallback
+tgrep serve . --watch-budget 4096     # lower this process's native watch ceiling
 tgrep serve . --no-watch              # disable all automatic refresh
-tgrep serve . --exclude node_modules   # exclude directories from indexing
+tgrep serve . --exclude node_modules  # exclude directories from indexing
 ```
 
 The server builds the index in the background if none exists and resumes
@@ -297,24 +151,28 @@ incomplete builds. Clients scan the filesystem until the full corpus is ready;
 indexes are upgraded by startup reconciliation. Multiple clients can connect
 simultaneously.
 
-On Windows, replaced index generations remain under the index directory's
-`.retired` folder while readers still have them memory-mapped. Cleanup uses
-non-POSIX deletion so mapped files are not unlinked into NTFS's `$Deleted`
-namespace. The server retries cleanup after publication, every minute even
-when idle, and on startup. Only generations with a committed marker are
-automatically removed; uncommitted backups are preserved for recovery.
-This prevents new orphaned generations; it does not reclaim storage already
-stranded in `$Deleted` by an older version.
+On Windows, replaced index generations stay in `.retired` while readers have
+them memory-mapped. Cleanup retries after publication, every minute, and on
+startup; uncommitted backups are preserved for recovery. This does not reclaim
+storage already stranded in NTFS's `$Deleted` namespace by older versions.
 
-Resource use during that initial build can be tuned. These apply to both
-`tgrep serve` and `tgrep index`:
+These tuning options apply only to `tgrep serve`:
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--max-memory <MB>` | 50% of RAM (512 MB–16 GB) | Flush to disk once the in-memory index exceeds this, bounding peak memory |
-| `--max-cpu <PERCENT>` | `50` | Confine parallel reading and trigram extraction to this share of logical cores |
-| `--auto-save-mutations <N>` | `5000` | Accumulated index changes that trigger a background save; higher means fewer pauses but more to redo if killed |
-| `--watcher-queue-cap <N>` | `16384` | Filesystem events buffered between the OS watcher and the indexing worker; raise it if bulk changes log watcher queue overflows, since each overflow forces a full stale check |
+| `--max-memory <MB>` | 50% of RAM (512 MiB–16 GiB) | Overlay flush threshold for resumed partial builds and fallback in-memory builds; not a process-wide hard limit |
+| `--max-cpu <PERCENT>` | `50` | Size the worker pool for resumed/fallback builds and stale-delta builds as a share of logical cores, with at least one worker |
+| `--auto-save-mutations <N>` | `5000` | Pending content mutations that trigger a background save |
+| `--watcher-queue-cap <N>` | `16384` | Buffered filesystem events; overflow triggers reconciliation |
+
+Fresh external builds use the default 64 MiB posting buffer and global Rayon
+pool, not `--max-memory` or `--max-cpu`. If external bootstrap fails, the server
+falls back to an in-memory build where these settings apply.
+
+The server checks for pending saves once a minute. It saves at the mutation
+threshold, when filename-only membership changes, or when content changes
+remain unsaved for at least ten minutes since startup or the last successful
+save. Active builds and flushes defer this check.
 
 #### Staying in step with the filesystem
 
@@ -327,101 +185,60 @@ Automatic refresh has two modes, configured on `tgrep serve`:
 | `--watch-budget <N>` | `8192` | Conservative process-local native watch ceiling; range 1-4294967295 |
 | `--no-watch` | off | Disable all automatic refresh: native watching, polling, and periodic reconciliation |
 
-In `auto` mode, exceeding the watch budget, exhausting OS watch capacity, or
-another error preventing complete native coverage switches the **whole
-process** to polling. Status retains the specific fallback reason. This fallback
-is sticky until the server restarts: it releases only this process's native watches and
-does not keep retrying native registration. `poll` mode starts with **zero
-native subscriptions**, including on Linux. It uses tgrep's metadata
-reconciliation, not a second native watcher or `notify::PollWatcher`.
+In `auto` mode, a watch-budget or native-registration failure releases this
+process's watches and switches it to polling until restart. Status reports the
+reason. Explicit `poll` mode creates no native subscriptions.
 
-The default budget of 8192 is a conservative ceiling, **not an estimate of
-free per-user capacity**. On Linux the inotify quota is shared with other
-processes running as the same user; they may consume capacity before this
-server reaches its budget. Raising the budget does not raise that shared quota.
-tgrep does not probe the configured Linux quota: it uses this fixed ceiling
-and authoritative OS registration errors. The budget counts one subscription
-per admitted directory on Linux/Android; recursive backends count their single
-root subscription as one.
+On Linux/Android, the budget counts admitted directories; ignored subtrees do
+not consume watches. The OS inotify quota is shared with other processes, so
+registration can fail before this budget is reached. Raising `--watch-budget`
+does not raise the OS quota. Windows and macOS use one recursive root
+subscription and filter ignored events after delivery.
 
-The event buffer controlled by `--watcher-queue-cap` is separate: queue overflow
-triggers recovery reconciliation, not watch-budget fallback. Only create,
-modify, and remove events enter this buffer; read-only access notifications
-(including Linux directory-open events from tgrep's own walks) are discarded
-before queueing. Native rescan notifications still trigger recovery.
+Polling checks filesystem metadata for additions, changes, and deletions.
+The next poll waits `--poll-interval` seconds after the previous reconciliation
+finishes; scan time and ongoing builds/saves add to the delay. Queries do not
+defer polling. Queue overflows and native rescan notifications also request
+reconciliation; read-only access events are discarded.
 
-Polling walks the admitted tree and checks metadata for additions, changes,
-and deletions. Its default cadence is completion-based: the next poll waits
-120 seconds after the previous reconciliation finishes. Actual freshness also
-includes scan/update time (and any in-progress indexing or save); it is not a
-120-second hard freshness guarantee. Searches do not defer polling, and slow
-scans do not cause overlapping polls or catch-up storms.
-Fallback does not hide failures: a failed polling reconciliation or unreadable
-input remains unhealthy and is reported in status.
+Native mode reconciles about once an hour to recover missed notifications.
+It waits for a two-minute gap in queries, deferring no longer than four hours.
+`--poll-interval` does not change this native safety cadence.
 
-Native notifications can also go missing, for example on a network or
-virtualised filesystem. Native mode therefore retains its safety
-reconciliation: about once an hour it walks the tree and compares it against
-the index, waiting for a two-minute gap in queries and deferring no longer than
-four hours. `--poll-interval` sets the polling cadence, not this native safety
-cadence.
+No-change scans do not rewrite the index; changed merges may rewrite it.
+Metadata-preserving changes can be missed, and reconciliation is not an atomic
+filesystem snapshot. Failures appear in status. Use `--no-index` for current
+file contents.
 
-No-change metadata scans leave the index untouched; they do not rewrite it.
-A changed delta merge may still rewrite the whole on-disk index. On Linux,
-nanosecond mtime and ctime plus file identity detect ordinary writes even when
-the modification timestamp is restored. Other OS/filesystem metadata
-limitations remain: changes that preserve all available evidence may be
-missed. A scan and its updates do not provide an atomic filesystem snapshot.
-
-`--no-watch` still permits the initial build/startup reconciliation, but turns
-off all subsequent automatic refresh. It cannot be combined explicitly with
-`--watch-mode`, `--poll-interval`, or `--watch-budget`. Explicit
-`--watch-mode poll` also rejects `--watch-budget`, since polling uses no native
-watches. Inherited default values do not cause conflicts.
-
-On Linux and Android, tgrep registers only the non-ignored directories with
-inotify, avoiding watch-descriptor growth beneath ignored trees. This guarantee
-is backend-specific: the implementation intentionally keeps one recursive
-`ReadDirectoryChangesW` root subscription on Windows and one root FSEvents
-stream on macOS, where ignored events are filtered after delivery and ignored
-descendants remain watched. kqueue and `PollWatcher` are not covered.
+`--no-watch` permits the initial build/startup reconciliation but disables later
+refresh. It conflicts with explicitly supplied `--watch-mode`, `--poll-interval`,
+and `--watch-budget`. `--watch-mode poll` also rejects an explicit
+`--watch-budget`.
 
 ### Search
 
 ```bash
-tgrep "pattern" .                 # basic regex search
-tgrep "pattern" file1.rs file2.rs # search multiple files/paths
-tgrep "TODO|FIXME" .              # alternations
-tgrep '\w+(?!_test)' .            # PCRE-style lookahead fallback
-tgrep "error" . -i                # case-insensitive
-tgrep "error" . -S                # smart-case (auto if all lowercase)
-tgrep -F "Vec<T>" .               # literal string
-tgrep "MyStruct" . -l             # filenames only
-tgrep "pattern" . -c              # count per file
-tgrep "pattern" . -o              # only matching text
-tgrep "pattern" . -w              # whole word
-tgrep "pattern" . -v              # invert match
-tgrep "pattern" . -m 5            # max 5 matches per file
-tgrep "pattern" . -g "*.rs"       # glob filter
-tgrep "pattern" . -g "*.rs" -g "*.toml"  # multiple globs (OR)
-tgrep "pattern" . -t rust         # type filter
-tgrep "pattern" . -e "also_this"  # multiple patterns
-tgrep "pattern" . -A 3            # 3 lines after match
-tgrep "pattern" . -B 2            # 2 lines before match
-tgrep "pattern" . -C 3            # 3 lines before & after
-tgrep "pattern" . --json          # ripgrep-compatible JSON stream
-tgrep "pattern" . --vimgrep       # vim-compatible output
-tgrep "pattern" . --stats         # show query plan & timing
-tgrep "pattern" . --no-index      # brute-force (skip index)
-tgrep "pattern" . -U              # multiline matching
-tgrep "pattern" . -q              # quiet: exit code only
-tgrep "pattern" . --files-without-match  # files that DON'T match
-tgrep "pattern" . --no-filename   # suppress filenames
-tgrep "pattern" . -N              # suppress line numbers
-tgrep --files .                   # list searchable files
-tgrep --files src/main.rs         # list a single file if searchable
-tgrep --files -t rust .           # list Rust files only
-tgrep --type-list                 # show all file types
+tgrep -- "pattern" .                    # regex search
+tgrep -- "pattern" file1.rs file2.rs     # multiple files/paths
+tgrep -- "TODO|FIXME" .                 # alternation
+tgrep -- '\w+(?!_test)' .               # backtracking-engine fallback
+tgrep -i -- "error" .                   # case-insensitive
+tgrep -F -- "Vec<T>" .                  # literal string
+tgrep -l -- "MyStruct" .                # filenames only
+tgrep -c -- "pattern" .                 # matching lines per file
+tgrep -m 5 -- "pattern" .               # at most 5 matching lines per file
+tgrep -g "*.rs" -g "*.toml" -- "pattern" .  # multiple globs (OR)
+tgrep -t rust -C 3 -- "pattern" .       # Rust files, 3 lines of context
+tgrep -e "pattern" -e "also_this" .     # multiple patterns (OR)
+tgrep --json -- "pattern" .             # JSON stream
+tgrep --vimgrep -- "pattern" .          # editor jump targets
+tgrep --stats -- "pattern" .            # query plan and timing
+tgrep --no-index -- "pattern" .         # read current files, bypass index
+tgrep -U -- 'first\nsecond' .           # multiline match
+tgrep -q -- "pattern" .                 # exit code only
+tgrep --files .                        # list admitted paths, including binary files
+tgrep --files -t rust .                # list Rust files
+tgrep --type-list                      # show file types
 ```
 
 With the default traversal rules, `--files` reads the live server or the local
@@ -452,33 +269,38 @@ Server status for /src/my-monorepo
   Reconcile overdue: no
   Last reconcile duration: 42ms
   Indexing:   complete
+  Hidden coverage: complete
 ```
 
-Status retains the native `Watcher` indicator and reports the requested mode
-(`auto`, `poll`, or `disabled`) and active mode (`native`, `poll`, `disabled`,
-or `starting`). A polling server normally shows an inactive native watcher.
-Fallback reasons, the last successful reconciliation, the latest attempt's
-duration/error, and whether reconciliation is running, pending, or overdue help
-distinguish a healthy polling server from one that has stopped refreshing.
-Pending means catch-up work is requested; overdue means that work is pending
-or the polling interval/native safety deadline has elapsed since completion.
-Older servers without these fields still display their existing status.
+`Watcher` refers to native notifications, so it is normally inactive in polling
+mode. Refresh fields report fallback reasons, errors, pending work, and elapsed
+deadlines. Older servers may omit these fields.
+
+`Indexing: complete` and `Hidden coverage: complete` describe index readiness,
+not freshness. An existing index can be queried while startup reconciliation
+is still running. Without a server, `status` shows on-disk metadata.
 
 ### Count files
 
 ```bash
-tgrep count-files .              # count text files (no server needed)
+tgrep count-files .              # count candidate text files (no server needed)
 tgrep count-files /path/to/repo  # scan a specific repo
 ```
 
-Prints the count to stdout (scriptable) and details to stderr:
+Counts files admitted by the walk's ignore, visibility, extension, and default
+size rules, without reading their contents. The reported "text files" can
+therefore include files containing NUL bytes. Prints the count to stdout and
+details to stderr:
 
 ```
 284957
-284957 text files (47516 binary skipped, 0 errors) in 1200ms
+284957 text files (47516 binary skipped, 0 too large, 0 errors) in 1200ms
 ```
 
 ## CLI Flags
+
+These tables describe search flags. Use `tgrep index --help` and
+`tgrep serve --help` for subcommand options.
 
 | Flag | Description |
 |------|-------------|
@@ -495,11 +317,11 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `--multiline-dotall` | Make `.` match `\n`; implies `-U` |
 | `-n, --line-number` | Show line numbers (default: on when stdout is a terminal) |
 | `-N, --no-line-number` | Suppress line numbers |
-| `-c, --count` | Print match count per file |
+| `-c, --count` | Count matching lines per file |
 | `-l, --files-with-matches` | Print only filenames |
 | `--files-without-match` | Print files that do NOT match |
 | `-q, --quiet` | Suppress output; exit code only |
-| `-m, --max-count <N>` | Limit matches per file |
+| `-m, --max-count <N>` | Limit matching lines per file (see [Match limits](#match-limits)) |
 | `-g, --glob <GLOB>` | Filter files by glob pattern, case-sensitive (repeatable) |
 | `--iglob <GLOB>` | Case-insensitive glob filter (repeatable) |
 | `--glob-case-insensitive` | Treat all `-g` globs as case-insensitive |
@@ -508,7 +330,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `--type-add <SPEC>` | Add/extend a type, e.g. `--type-add 'web:*.html'` |
 | `--type-clear <TYPE>` | Remove a type's definitions |
 | `--type-list` | Print all supported file types (reflects `--type-add`/`--type-clear`) |
-| `--files` | List files that would be searched |
+| `--files` | List admitted paths without content checks; includes binary files |
 | `-A, --after-context <N>` | Lines of context after match |
 | `-B, --before-context <N>` | Lines of context before match |
 | `-C, --context <N>` | Lines of context before and after |
@@ -529,7 +351,7 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `--no-max-filesize` | Apply no size limit, as ripgrep does |
 | `-L, --follow` | Follow symbolic links |
 | `--no-messages` | Suppress error messages about unreadable/missing paths |
-| `--no-index` | Skip index, grep all files |
+| `--no-index` | Read files from disk, bypassing the server and index; normal filters still apply |
 | `--exclude <DIR>` | Exclude directory from indexing (repeatable); `index` and `serve` only, not accepted by a search |
 | `--stats` | Print query plan and candidate stats |
 | `--index-path <DIR>` | Custom index directory |
@@ -548,6 +370,11 @@ Prints the count to stdout (scriptable) and details to stderr:
 | `-r, --replace <TEXT>` | Replace each match; `$1`/`${name}` expand capture groups |
 | `--passthru` | Print every line, matching or not |
 | `--stop-on-nonmatch` | Stop searching a file at its first non-matching line |
+
+`--engine auto` (the default) uses Rust's `regex` crate, with fallback to
+`fancy-regex` for lookaround and backreferences. `-P` and `--engine pcre2`
+select `fancy-regex`, not the PCRE2 library; they do not promise full PCRE2
+syntax compatibility.
 
 **Output formatting**
 
@@ -573,14 +400,13 @@ Prints the count to stdout (scriptable) and details to stderr:
 
 | Flag | Description |
 |------|-------------|
-| `-E, --encoding <LABEL>` | Decode files as `LABEL` (e.g. `utf-16le`, `latin1`, `sjis`), or `none` for raw bytes |
+| `-E, --encoding <LABEL>` | Decode as `LABEL` (e.g. `utf-16le`, `latin1`, `sjis`); `none` disables BOM sniffing and transcoding |
 | `--no-encoding` | Restore BOM-sniffing auto-detection |
 
-By default tgrep sniffs a UTF-8/UTF-16LE/UTF-16BE BOM and decodes accordingly,
-so BOM-marked UTF-16 files are searched as text rather than reported as binary.
-A BOM always wins over `-E`, matching ripgrep. Because the index is built with
-auto-detection, an explicit `-E` bypasses the index and server and searches
-files directly, so results stay correct.
+By default, a UTF-8/UTF-16LE/UTF-16BE BOM selects decoding; otherwise files are
+treated as UTF-8. A BOM overrides a named encoding, but not `-E none`.
+Any non-`auto` encoding bypasses the index and server. Invalid UTF-8 is still
+repaired, including with `-E none`; this is not raw-byte matching.
 
 **File walking**
 
@@ -589,7 +415,7 @@ files directly, so results stay correct.
 | `--max-depth <N>` | Limit directory recursion depth |
 | `--one-file-system` | Don't cross file-system boundaries |
 | `--ignore-file <FILE>` | Read extra ignore rules from `FILE` (repeatable) |
-| `--ignore-file-case-insensitive` | Match ignore rules case-insensitively |
+| `--ignore-file-case-insensitive` | Match `--ignore-file` rules case-insensitively |
 | `--no-ignore-dot` | Ignore `.ignore` files |
 | `--no-ignore-exclude` | Ignore `.git/info/exclude` |
 | `--no-ignore-files` | Ignore any `--ignore-file` arguments |
@@ -598,31 +424,21 @@ files directly, so results stay correct.
 | `--no-ignore-vcs` | Ignore `.gitignore` files |
 | `--no-ignore-messages` | Suppress errors about malformed ignore files |
 | `--no-require-git` | Apply git ignore rules outside a git repository |
-| `-j, --threads <N>` | Number of search threads |
+| `-j, --threads <N>` | Filesystem walker threads; does not set the regex-search or server worker pool |
 
 **Accepted for compatibility**
 
-`--mmap`/`--no-mmap` (tgrep always reads files directly), `--crlf`/`--no-crlf`
+`--mmap`/`--no-mmap` (tgrep chooses memory mapping automatically), `--crlf`/`--no-crlf`
 (a trailing `\r` is always stripped), `--no-config` (tgrep reads no config
 file), and `--colors <SPEC>` (colors are not yet configurable) are accepted and
 ignored so ripgrep command lines keep working. `--debug`/`--trace` imply
 `--stats`.
 
-For indexed content searches, `--stats` reports the query plan and candidate
-counts with or without a server. **Raw candidates** are the files selected by
-the trigram index before path, visibility, glob, and type filtering.
-**Candidates** counts the files remaining after those filters, but before
-`--max-filesize` checks, file reads, or matching, on both local and server searches.
-If the raw set covers the entire nonempty index, the summary says **`no index narrowing`**,
-even when a usable trigram plan exists. **`(via server)`** describes transport,
-not whether the index reduced the search. Older servers that do not return
-candidate statistics retain the transport-only summary.
-
-Inline case flags such as `(?i)needle` and `(?i:needle)` participate in trigram
-planning just like `-i`, including with `-P`. Scoped `(?-i:...)` still controls
-matching. Only classes with a single ASCII-folded byte are combined into
-literal runs; Unicode case-fold alternatives and other classes conservatively
-break those runs so indexed searches do not lose matches.
+For indexed content searches, `--stats` reports **Raw candidates** before
+path, visibility, glob, and type filters, and **Candidates** after those filters
+but before size checks, reads, or matching. **`no index narrowing`** means the
+raw set covers the entire nonempty index. **`(via server)`** describes transport,
+not index effectiveness. Older servers may omit candidate statistics.
 
 `-z/--search-zip` is **not** supported and exits with code `2` rather than
 silently reporting no matches in compressed files.
@@ -639,6 +455,14 @@ a path, matching ripgrep:
 ```bash
 tgrep -e needle .            # searches for "needle" under .
 tgrep -e needle -e other .   # both patterns, still just one path
+```
+
+Use `--` before a positional pattern that starts with `-` or is a subcommand
+name, such as `serve` or `index`. Quoting alone does not prevent subcommand
+parsing. Put all flags before `--`:
+
+```bash
+tgrep -F -- serve .
 ```
 
 ### Output defaults
@@ -658,32 +482,23 @@ tgrep matches ripgrep's context-dependent defaults rather than fixed ones:
 
 ### Match limits
 
-`-m/--max-count` limits matching *lines*, as ripgrep does, not individual
-matches. A line holding several matches spends one unit of the budget and all
-of its matches are still reported, so `tgrep -m1 --vimgrep foo` prints one row
-per match on the first matching line. Under `-U/--multiline` the unit is the
-contiguous block of lines a match covers, which keeps a match that straddles a
-line boundary whole instead of truncating it mid-pattern.
+`-m/--max-count` limits matching lines, not individual matches. All matches
+on an admitted line are reported. With `-U`, the unit is a contiguous block
+of lines covered by matches, so a multiline match is not cut short.
 
-One divergence: ripgrep stops reading a file once the limit is reached, so its
-`--stats` `bytes_searched` is lower than tgrep's, which searches from a
-whole-file buffer. The match counts themselves agree.
+tgrep reads a whole-file buffer even with `-m`; its `bytes_searched` statistic
+can therefore exceed ripgrep's.
 
 ### Multiline matches
 
-`-U/--multiline` lets a match cross line boundaries, and every line a match
-covers is printed. `--vimgrep` is the exception: it reports one row per match
-so editors get one jump target each, so a match spanning several lines is
-reported only on the line it starts on.
-
-Two divergences, both cases where ripgrep names a column that doesn't exist on
-the line it prints — `rg -U --column` reports the same column for every line of
-a match, and `rg -U --vimgrep -o` can report column 19 of a 7-character line.
-tgrep reports the real match position instead.
+`-U/--multiline` allows matches across line boundaries and prints every covered
+line. `--vimgrep` reports one row per match, on its starting line.
+Unlike ripgrep, tgrep reports columns relative to each printed line rather
+than repeating the starting column on continuation lines.
 
 ### Binary files
 
-A file is binary if it contains a NUL byte. Following ripgrep:
+A file is treated as binary if its decoded content contains a NUL byte:
 
 - Binary files found by walking a directory are **skipped silently** — they
   appear in neither the output, `-l`, `-c`, nor `--files-without-match`.
@@ -698,9 +513,10 @@ A file is binary if it contains a NUL byte. Following ripgrep:
   a binary hit apart from a text one. `stats.bytes_searched` stops at that
   offset rather than counting the whole file.
 
-tgrep additionally rejects ~65 binary file *extensions* during the walk to keep
-indexing cheap, which ripgrep does not do. `--binary` and `-a` also lift that
-restriction, and `--files` never applies it.
+tgrep also skips known binary extensions during directory content searches
+and indexing, unlike ripgrep. For searches, `--binary` and `-a` lift this
+restriction and bypass the index; they do not change what `index` or `serve`
+indexes. `--files` lists binary paths too.
 
 ### Flags that bypass the index
 
@@ -715,8 +531,13 @@ and query filesystem walks.
 
 Flags that widen or re-interpret the indexed corpus still walk the tree:
 non-`auto` `-E/--encoding`, `-a/--text`, `--binary`, and ignore-disabling flags
-such as `--no-ignore`. Naming a single file also skips the index, since reading
-one file directly is cheaper than loading one.
+such as `--no-ignore`. Explicit file arguments also bypass the index.
+
+For content searches, `--follow`, `--one-file-system`, `--ignore-file`, and
+`--ignore-file-case-insensitive` do **not** trigger fallback: indexed searches
+ignore them. Add `--no-index` to apply them. `--files` falls back to walking
+for these options automatically. `index` and `serve` reject these traversal options,
+`--max-depth`, and individual `--no-ignore-*` discovery switches.
 
 Both positive and negative `--glob`/`--iglob` patterns filter the indexed corpus
 when a compatible index or server is available, for content searches and
@@ -726,77 +547,39 @@ scans retain ripgrep-style glob overrides, which can reinclude ignored files.
 Negative globs, such as `--glob '!.git'`, exclude entire matching directory
 subtrees. `--hidden` never disables ignore rules.
 
-Legacy indexes without proven hidden-file coverage and incomplete builds fall
-back to a filesystem scan, rather than returning partial results. Run
-`tgrep index` to rebuild, or start a current `tgrep serve` to reconcile and
-upgrade an existing index automatically. Queries keep scanning until coverage
-is established. A current client also falls back when an older server cannot
-confirm that capability. As before, a completed on-disk index is a snapshot,
-not a guarantee that later filesystem changes have been indexed.
+Incomplete indexes and legacy indexes without hidden-file coverage fall back
+to scanning. Rebuild with `tgrep index .` or let a current server reconcile
+them. Older servers without coverage support also cause fallback.
 
-New indexes use a versioned file table and filename sidecar so older clients
-cannot silently expose hidden files by ignoring visibility metadata. Older
-binaries reject the new local content index; filename listing can fall back to
-walking. New binaries still read older formats to migrate them. To downgrade,
-rebuild with the older binary, preferably at a separate `--index-path`.
-Visibility is bound to the path table, and filename-only membership is
-published together with its visibility; mismatched generations fall back to
-scanning rather than guessing.
+Older binaries reject the new content-index format. To downgrade, rebuild
+with the older binary, preferably at a separate `--index-path`.
 
 ### Invalid UTF-8
 
-ripgrep searches raw bytes. tgrep decodes first, repairing any undecodable byte
-into a `U+FFFD`, which is what makes the trigram index possible. Reported
-positions are mapped back, so `--column`, `-b`, `--vimgrep` and `-r` all report
-the byte offsets on disk exactly as ripgrep does. Two differences remain on
-lines that are not valid UTF-8:
+ripgrep can search raw bytes; tgrep searches decoded text, replacing invalid
+UTF-8 sequences with `U+FFFD`. A pattern can match those replacement characters.
+For UTF-8 repair, text-output columns and byte offsets are mapped back to the
+source bytes.
 
-- A pattern can match the substituted `U+FFFD`; ripgrep, seeing raw bytes, never
-  matches there. So `tgrep '.' ` finds one more match per repaired byte.
-- `--json` always reports `lines.text` with the substitutions in place, and
-  submatch offsets that index it. ripgrep instead emits `lines.bytes` as base64
-  and reports source offsets. `absolute_offset` is a real file offset either
-  way.
+JSON output uses `lines.text` with replacements and submatch offsets into that
+text. ripgrep instead emits base64 `lines.bytes` for invalid UTF-8.
+Transcoded encodings use decoded-text offsets rather than original byte
+positions; offsets also exclude stripped BOM bytes.
 
 ### File size limits
 
-Searching and indexing both skip files larger than **64 MiB** by default. This
-is a deliberate divergence from ripgrep, which has no default limit.
+Directory searches and indexing skip files larger than **64 MiB** by default;
+ripgrep has no default limit. These files are absent from the index and its
+filename listing, so their matches will not appear.
 
-The divergence is affordable because tgrep is not a one-shot scanner. A file a
-walk picks up is also a file the index carries and re-reads on every query whose
-trigrams make it a candidate, so an outlier's cost is paid repeatedly rather
-than once. On a 292,911-file enlistment where one 13.41 GiB generated build
-artifact was 71% of all searchable bytes, the cap cut a cold index build from
-214.5 s to 64.2 s and a warm query from 21.30 s to 0.55 s — a 39x difference —
-at the cost of one match in one generated file, and it excluded 2 files out of
-292,911.
+Use `--max-filesize` to choose another bound, or `--no-max-filesize` to remove
+it. Rebuild or serve the index with the same setting; an uncapped query cannot
+recover paths that a capped index never recorded. Use
+`--no-index --no-max-filesize` to scan without either restriction.
 
-The cost is real: an oversized file is counted but its path is never recorded,
-so a match inside one is reported as no match. Two rules keep that from being
-silent:
-
-- `--no-max-filesize` restores the uncapped, ripgrep-identical behaviour, and
-  `--max-filesize` sets a different bound.
-- A file named directly on the command line is never dropped by the *inherited*
-  default, only by a limit you passed. `tgrep pattern ./huge.log` searches
-  `huge.log`.
-
-The limit is resolved once, before the walk and the search diverge, so an index
-and the queries against it always agree on which files exist. A walk that capped
-where the search did not would be indistinguishable from "this file contains no
-match".
-
-The cap is not what bounds memory. Files past 1 MiB are memory-mapped during
-both indexing and searching, so their pages are file-backed and reclaimable, and
-mapped files are batched by what they actually put on the heap rather than by
-their length — so a build over large files fills its worker pool instead of
-running two files at a time. Combined with a faster trigram extractor, that made
-indexing a tree of 32 MiB source files about 14x faster. Nor is size a good
-proxy for *index* cost: oversized files are overwhelmingly generated and
-therefore repetitive, contributing far fewer distinct trigrams per byte than
-ordinary source. What the cap buys is bounded *scan* time. See
-[BENCHMARKS.md](BENCHMARKS.md).
+A directly named file ignores the inherited cap, but respects an explicit
+`--max-filesize`: `tgrep -- pattern ./huge.log` searches that file regardless
+of its size.
 
 ### Exit codes
 
@@ -817,74 +600,53 @@ exit code determined by the search alone. Suppress the message with
 
 ## How It Works
 
-1. **Indexing** — walks the repo (respecting `.gitignore` and root-level
-   `p4ignore.ini`), skips binary files
-   by extension (50+ formats) and content check (first 8KB), extracts all
-   overlapping 3-byte trigrams from each text file in parallel (rayon), and
-   writes a compact binary inverted index. Full builds stream sorted posting
-   groups directly to disk to keep peak memory bounded.
+1. **Indexing** walks the repository with ignore rules, including root-level
+   `p4ignore.ini`, and filters by size and binary extension. It decodes files,
+   checks the first 8 KiB for NUL bytes, and extracts overlapping three-byte
+   trigrams in parallel. Sorted postings map trigrams to candidate files.
+2. **Querying** decomposes regex literals into trigram lookups, intersects or
+   unions posting lists, and verifies candidates with the full regex engine.
+   Inline case flags participate in planning; unsupported constructs use
+   conservative plans rather than excluding possible matches.
+3. **Serving** combines a memory-mapped `IndexReader` with a mutable `LiveIndex`
+   overlay in `HybridIndex`. Updates take precedence over disk entries.
+   Clients use JSON-RPC 2.0 over newline-delimited TCP on loopback, with one
+   thread per connection. Shared read locks allow concurrent queries but can
+   contend with writers.
 
-2. **Querying** — the regex is parsed with `regex-syntax`, decomposed into
-   literal fragments, converted to trigram hashes, and looked up via binary
-   search in the mmap'd index. Posting lists are intersected (AND) or
-   unioned (OR) to find candidate files, reusing sorted posting-list order when
-   possible. Only those candidates are verified with the full regex engine in
-   parallel (rayon).
-
-3. **Serving** — `tgrep serve` wraps the index in a HybridIndex, watches for
-   filesystem changes, and serves queries over TCP. If no index exists, it
-   builds one in the background (batches of 1,024 files, split sooner by byte
-   budgets); clients scan until complete coverage is published, including when
-   resuming a partial index;
-   after the initial build, pending changes are auto-saved when 5,000 content mutations accumulate by default, or on the first periodic check at least 10 minutes after startup or the last successful save. Multiple clients connect simultaneously;
-
-   searches use read locks for zero contention.
+The server's content cache is limited to 50,000 entries and 1 GiB of decoded
+content, with a 64 MiB per-entry limit. `--files` combines content-index paths
+with a filename-only sidecar for admitted paths without searchable content.
 
 ## On-Disk Format
 
 | File | Description |
 |------|-------------|
 | `lookup.bin` | Sorted 16-byte entries: `trigram(u32) + offset(u64) + length(u32)` |
-| `index.bin` | Concatenated posting lists: `file_id(u32)` per entry |
+| `index.bin` | Concatenated 6-byte postings: `file_id(u32) + loc_mask(u8) + next_mask(u8)` |
 | `files.bin` | Version 3 header, then `file_id(u32) + path_len(u16) + path_bytes`; legacy headerless tables remain readable |
 | `files-extra.bin` | Version 2 filename-only paths, visibility, and file-table identity |
 | `meta.json` | Version, file/trigram counts, timestamps, coverage, visibility, and file-table identity |
+| `filestamps.json` | Per-file metadata, content identities, and version evidence for reconciliation |
 | `serve.json` | Server PID and TCP port (for client discovery) |
+| `serve.lock` | Exclusive lock preventing multiple servers from owning the same index |
 
 ## Project Structure
 
-```
-tgrep/
-├── tgrep-core/               # Library crate
-│   └── src/
-│       ├── trigram.rs            # Trigram extraction & hashing
-│       ├── filetypes.rs          # File type definitions (rust, py, js, …)
-│       ├── walker.rs             # Git/Perforce ignore-aware file traversal
-│       ├── ondisk.rs             # On-disk binary format
-│       ├── builder.rs            # Index construction (parallel via rayon)
-│       ├── reader.rs             # Mmap'd index reader
-│       ├── path_index.rs         # Filename-only path sidecar
-│       ├── query.rs              # Regex → trigram query decomposition
-│       ├── live.rs               # LiveIndex (in-memory mutable overlay)
-│       ├── hybrid.rs             # HybridIndex (reader + live overlay)
-│       ├── meta.rs               # Index metadata
-│       └── error.rs              # Error types
-└── tgrep-cli/                # Binary crate
-    └── src/
-        ├── main.rs               # CLI entry (clap)
-        ├── index.rs              # `tgrep index`
-        ├── search.rs             # `tgrep <pattern>` with server delegation
-        ├── serve.rs              # `tgrep serve` (TCP JSON-RPC + file watcher)
-        ├── status.rs             # `tgrep status`
-        └── output.rs             # Output formatting
-```
+| Directory | Contents |
+|-----------|----------|
+| `tgrep-core/` | Traversal, decoding, trigram extraction, index storage, and query planning |
+| `tgrep-cli/` | CLI parsing, matching, output, server, and integration tests |
+| `scripts/` | Benchmarks, agent integration, and development utilities |
+| `fuzz/` | Fuzz targets for index reading and query/trigram parsing |
 
 ## Building
 
 ```bash
-cargo build --release    # build optimized binary
-make check               # run fmt + clippy + tests
-make install             # install to ~/.cargo/bin
+cargo build --release --locked  # build optimized binary
+cargo test --workspace          # run tests
+make check                      # check formatting and run clippy
+make install                    # install to ~/.cargo/bin (Unix)
 ```
 
 ## Installation
@@ -908,31 +670,39 @@ brew install tgrep
 Download from [GitHub Releases](https://github.com/microsoft/tgrep/releases)
 for Linux, macOS (Intel & Apple Silicon), and Windows.
 
-The Linux archive is unpacked in a temporary directory so its directory metadata
-cannot affect the existing `~/.local/bin` directory.
+Download the archive for your architecture, extract it to a temporary
+directory, then copy the executable into a directory on `PATH`.
 
 ```bash
 # Linux (x86_64)
 tmpdir="$(mktemp -d)"
-gh release download --repo microsoft/tgrep -p '*x86_64-unknown-linux-musl*' -D "$tmpdir"
+gh release download --repo microsoft/tgrep -p '*x86_64-unknown-linux-musl.tar.gz' -D "$tmpdir"
 tar xzf "$tmpdir"/tgrep-*-x86_64-unknown-linux-musl.tar.gz -C "$tmpdir"
 install -Dm755 "$tmpdir/tgrep" "$HOME/.local/bin/tgrep"
 rm -rf "$tmpdir"
 
 # macOS (Apple Silicon)
-gh release download --repo microsoft/tgrep -p '*aarch64-apple-darwin*' -D /tmp/tgrep-dl
-tar xzf /tmp/tgrep-dl/tgrep-*-aarch64-apple-darwin.tar.gz -C /usr/local/bin
-
-# macOS (Intel)
-gh release download --repo microsoft/tgrep -p '*x86_64-apple-darwin*' -D /tmp/tgrep-dl
-tar xzf /tmp/tgrep-dl/tgrep-*-x86_64-apple-darwin.tar.gz -C /usr/local/bin
+# For Intel, replace aarch64 with x86_64.
+tmpdir="$(mktemp -d)"
+gh release download --repo microsoft/tgrep -p '*aarch64-apple-darwin.tar.gz' -D "$tmpdir"
+tar xzf "$tmpdir"/tgrep-*-aarch64-apple-darwin.tar.gz -C "$tmpdir"
+mkdir -p "$HOME/.local/bin"
+install -m755 "$tmpdir/tgrep" "$HOME/.local/bin/tgrep"
+rm -rf "$tmpdir"
 ```
 
 ```powershell
-# Windows (PowerShell)
-gh release download --repo microsoft/tgrep -p '*windows*' -D $env:TEMP\tgrep-dl
-Expand-Archive $env:TEMP\tgrep-dl\tgrep-*-windows*.zip -DestinationPath $HOME\.cargo\bin -Force
+# Windows x64 (PowerShell); for ARM64, replace x86_64 with aarch64.
+$download = Join-Path $env:TEMP ("tgrep-dl-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $download | Out-Null
+gh release download --repo microsoft/tgrep -p '*x86_64-pc-windows-msvc.zip' -D $download
+Get-ChildItem $download -Filter '*.zip' | ForEach-Object {
+    Expand-Archive -LiteralPath $_.FullName -DestinationPath "$HOME\.cargo\bin" -Force
+}
+Remove-Item -LiteralPath $download -Recurse
 ```
+
+Ensure `$HOME/.local/bin` (Unix) or `$HOME\.cargo\bin` (Windows) is on `PATH`.
 
 ## Contributing
 

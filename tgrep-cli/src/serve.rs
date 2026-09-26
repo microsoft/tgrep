@@ -10573,6 +10573,14 @@ mod tests {
         let root = tmp.path().to_path_buf();
         test_git(&root, &["init", "--quiet"]);
         test_git(&root, &["config", "core.ignorecase", "true"]);
+        // Git templates may stamp this file at init time. Keep that unrelated
+        // ignore source outside the recovery window so only membership changes
+        // can schedule the corrective pass counted below.
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::File::create(root.join(".git/info/exclude"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
         std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
         let ignored = root.join("ignored");
         std::fs::create_dir_all(&ignored).unwrap();

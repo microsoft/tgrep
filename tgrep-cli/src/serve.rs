@@ -3483,32 +3483,23 @@ fn watchable_dirs(
     }
 }
 
-/// The directories that must be subscribed to for the ignore sources
-/// themselves to be observable, beyond the ones the rules allow.
+/// Watch ignore sources even when their directories are outside the indexed
+/// corpus, such as `.git/info/exclude`. Subscribe only to their parents, not
+/// whole subtrees; ordinary file events still pass through the index filters.
 ///
-/// A `.gitignore` symlinked to `build/shared-rules` contributes the *target's*
-/// contents, and [`handle_fs_event`] already recognises an event naming that
-/// target rather than a name rules usually go by. But only if one arrives: on a
-/// per-directory backend nothing subscribes to `build/` when the rules hide it,
-/// so the edit that changes what the matcher enforces produces no event at all,
-/// and the matcher stays stale until the hourly reconcile — the one case where
-/// the source of the rules is invisible to the rules' own watcher.
-///
-/// One watch on the target's own directory, not its subtree: this is about
-/// seeing a single file that the matcher was built from, not about indexing
-/// anything under it. `should_skip_watcher_path` still discards everything else
-/// delivered from there, and the target itself is matched by path against the
-/// recorded stamps before any of that filtering runs.
-///
-/// Targets outside `root` are deliberately not covered. Watching them would
-/// mean subscribing outside the tree the server was asked to serve, and the
-/// periodic reconcile remains the backstop there.
+/// For symlinks, watch both the link's parent (replacement/removal) and the
+/// target's parent (content edits). Neither may escape the served root.
 fn ignore_target_dirs(root: &Path, sources: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
     let mut dirs = std::collections::HashSet::new();
     let Ok(canonical_root) = std::fs::canonicalize(root) else {
         return dirs;
     };
     for source in sources {
+        if let Some(parent) = source.parent()
+            && is_contained_dir(root, parent)
+        {
+            dirs.insert(parent.to_path_buf());
+        }
         if !std::fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_symlink()) {
             continue;
         }
@@ -11968,24 +11959,38 @@ mod tests {
         );
     }
 
-    /// A source that is a plain file needs nothing extra, and one whose target
-    /// is outside the root must not pull a subscription outside the tree the
-    /// server was asked to serve.
+    /// Ordinary sources need parent watches too, even when the indexing walk
+    /// excludes that directory. Outside sources and targets remain out of scope.
     #[test]
-    fn ordinary_and_outside_rule_files_add_no_subscriptions() {
+    fn ordinary_rule_parents_are_watched_without_subscribing_outside_the_root() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
-        assert!(ignore_target_dirs(root, &[root.join(".gitignore")]).is_empty());
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        let exclude = root.join(".git/info/exclude");
+        std::fs::write(&exclude, "ignored.txt\n").unwrap();
+        let sources = [root.join(".gitignore"), exclude.clone()];
+        let expected = [root.to_path_buf(), root.join(".git/info")]
+            .into_iter()
+            .collect();
+        assert_eq!(ignore_target_dirs(root, &sources), expected);
+        std::fs::remove_file(exclude).unwrap();
+        assert_eq!(
+            ignore_target_dirs(root, &sources),
+            expected,
+            "keep the parent watch so a removed source can be recreated"
+        );
 
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("rules"), "target/\n").unwrap();
+        assert!(ignore_target_dirs(root, &[outside.path().join("rules")]).is_empty());
         if !try_symlink(&outside.path().join("rules"), &root.join(".ignore")) {
             return;
         }
-        assert!(
-            ignore_target_dirs(root, &[root.join(".ignore")]).is_empty(),
-            "a target outside the root must not be subscribed to"
+        assert_eq!(
+            ignore_target_dirs(root, &[root.join(".ignore")]),
+            [root.to_path_buf()].into_iter().collect(),
+            "watch the link itself but not its outside target"
         );
     }
 

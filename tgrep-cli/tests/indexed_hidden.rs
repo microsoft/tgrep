@@ -1139,8 +1139,9 @@ fn exercise_hidden_updates(mode: WatchMode) {
 fn git_metadata_stays_out_of_native_and_persisted_indexes() {
     for warm_start in [false, true] {
         let fixture = Fixture::new();
-        fixture.write(".git/info/exclude", "# initial exclude rules\n");
+        fs::create_dir_all(fixture.root.join(".git/info")).unwrap();
         if warm_start {
+            fixture.write(".git/info/exclude", "# initial exclude rules\n");
             // Simulate an older index that admitted Git internals.
             Command::cargo_bin("tgrep")
                 .unwrap()
@@ -1184,6 +1185,17 @@ fn git_metadata_stays_out_of_native_and_persisted_indexes() {
         assert_without_git_glob(Backend::Server, &corpus);
 
         // Excluding Git internals from the corpus must not disable ignore updates.
+        fixture.write(".git/info/exclude", "notes.txt\n");
+        corpus.remove("notes.txt");
+        wait_for_snapshot(&fixture, &mut server, &corpus);
+        assert_without_git_glob(Backend::Server, &corpus);
+
+        fixture.remove(".git/info/exclude");
+        corpus.files.insert("notes.txt".to_string());
+        wait_for_snapshot(&fixture, &mut server, &corpus);
+        // Finish a publication with no exclude source before recreating it.
+        server.rpc("reload");
+        wait_for_snapshot(&fixture, &mut server, &corpus);
         fixture.write(".git/info/exclude", "notes.txt\n");
         corpus.remove("notes.txt");
         wait_for_snapshot(&fixture, &mut server, &corpus);

@@ -3048,6 +3048,18 @@ fn is_ignore_rules_file(root: &Path, path: &Path) -> bool {
         Some(tgrep_core::gitignore::GITIGNORE_FILENAME)
             | Some(tgrep_core::gitignore::DOT_IGNORE_FILENAME)
     ) || path == root.join(tgrep_core::gitignore::P4IGNORE_FILENAME)
+        || (name == Some("exclude") && repo_exclude_watch_path(root).as_deref() == Some(path))
+}
+
+/// Normalize Git's pointer chain without requiring `exclude` itself to exist.
+/// Only in-tree directories can receive native subscriptions.
+fn repo_exclude_watch_path(root: &Path) -> Option<PathBuf> {
+    let candidate = tgrep_core::gitignore::repo_exclude_candidate(root)?;
+    let parent = std::fs::canonicalize(candidate.parent()?).ok()?;
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let relative = parent.strip_prefix(&canonical_root).ok()?;
+    let parent = root.join(relative);
+    is_contained_dir(root, &parent).then(|| parent.join("exclude"))
 }
 
 /// Whether this platform's `notify` backend takes one OS subscription per
@@ -3489,12 +3501,15 @@ fn watchable_dirs(
 ///
 /// For symlinks, watch both the link's parent (replacement/removal) and the
 /// target's parent (content edits). Neither may escape the served root.
+/// Keep Git's resolved `info` directory watched even when `exclude` is absent
+/// from the published sources, so deletion does not hide its later recreation.
 fn ignore_target_dirs(root: &Path, sources: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
     let mut dirs = std::collections::HashSet::new();
     let Ok(canonical_root) = std::fs::canonicalize(root) else {
         return dirs;
     };
-    for source in sources {
+    let exclude = repo_exclude_watch_path(root);
+    for source in sources.iter().chain(exclude.iter()) {
         if let Some(parent) = source.parent()
             && is_contained_dir(root, parent)
         {
@@ -3684,6 +3699,7 @@ fn changed_ignore_rules_in(
 ) -> Option<(String, &'static str)> {
     let since = since.checked_sub(MTIME_GRANULARITY).unwrap_or(since);
     let mut probed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let exclude = repo_exclude_watch_path(root);
     for dir in dirs {
         let mut candidates = vec![
             dir.join(tgrep_core::gitignore::GITIGNORE_FILENAME),
@@ -3692,6 +3708,11 @@ fn changed_ignore_rules_in(
         // Root-scoped, mirroring the walker, which only reads the root file.
         if dir == root {
             candidates.push(root.join(tgrep_core::gitignore::P4IGNORE_FILENAME));
+        }
+        if let Some(exclude) = &exclude
+            && exclude.parent() == Some(dir.as_path())
+        {
+            candidates.push(exclude.clone());
         }
         for candidate in candidates {
             if !probed.insert(candidate.clone()) || !candidate.is_file() {
@@ -11983,15 +12004,50 @@ mod tests {
 
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("rules"), "target/\n").unwrap();
-        assert!(ignore_target_dirs(root, &[outside.path().join("rules")]).is_empty());
+        assert_eq!(
+            ignore_target_dirs(root, &[outside.path().join("rules")]),
+            [root.join(".git/info")].into_iter().collect()
+        );
         if !try_symlink(&outside.path().join("rules"), &root.join(".ignore")) {
             return;
         }
         assert_eq!(
             ignore_target_dirs(root, &[root.join(".ignore")]),
-            [root.to_path_buf()].into_iter().collect(),
+            expected,
             "watch the link itself but not its outside target"
         );
+    }
+
+    #[test]
+    fn absent_repo_exclude_remains_watchable_and_is_recognized_on_recreation() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let info = root.join(".git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        assert!(tgrep_core::gitignore::repo_exclude_path(&root).is_none());
+        assert!(!ignore_sources_of(&root, &[], &[], false).contains(&exclude));
+        assert!(ignore_target_dirs(&root, &[]).contains(&info));
+        assert!(is_ignore_rules_file(&root, &exclude));
+        assert!(!is_ignore_rules_file(
+            &root,
+            &root.join(".git/objects/exclude")
+        ));
+
+        std::fs::write(&exclude, "ignored.txt\n").unwrap();
+        assert_eq!(
+            changed_ignore_rules_in(
+                &root,
+                std::slice::from_ref(&info),
+                &IgnoreStamps::new(),
+                SystemTime::now(),
+            ),
+            Some((".git/info/exclude".to_string(), "not a known source"))
+        );
+        std::fs::remove_file(&exclude).unwrap();
+        let sources = ignore_sources_of(&root, &[], &[], false);
+        assert!(!sources.contains(&exclude));
+        assert!(ignore_target_dirs(&root, &sources).contains(&info));
     }
 
     #[test]

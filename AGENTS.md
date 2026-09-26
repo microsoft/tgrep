@@ -157,7 +157,11 @@ Avoid these on large repositories unless you need them.
 `--hidden` to either is redundant. Queries without `--hidden` still apply normal
 hidden-file filtering, including Windows hidden attributes. `--hidden` searches
 and `--files --hidden` use compatible local/server indexes without disabling
-ignore rules. Positive and negative `--glob`/`--iglob` patterns also stay
+ignore rules. Git's `.git` directory subtrees are excluded from indexes by
+default, even with `--hidden`; use `--no-ignore` consistently on `index` and
+`serve` to include them. Explicit `--no-index` scans retain normal hidden and
+ignore behavior and can inspect Git internals without rebuilding the index.
+Positive and negative `--glob`/`--iglob` patterns also stay
 indexed, for both content searches and `--files`. They filter the indexed
 corpus only, so a positive glob does not reinclude ignored files in indexed
 mode. Use `--no-index` when those matches are needed; filesystem scans retain

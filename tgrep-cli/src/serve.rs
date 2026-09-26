@@ -907,7 +907,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         watch_enabled: !no_watch,
         refresh: RefreshControl::new(watch_mode, poll_interval, watch_budget),
         watch_registry: Mutex::new(None),
-        exclude_dirs: exclude_dirs.to_vec(),
+        exclude_dirs: builder::index_exclude_dirs(exclude_dirs, no_ignore),
         no_ignore,
         no_require_git,
         max_file_size,
@@ -3048,6 +3048,18 @@ fn is_ignore_rules_file(root: &Path, path: &Path) -> bool {
         Some(tgrep_core::gitignore::GITIGNORE_FILENAME)
             | Some(tgrep_core::gitignore::DOT_IGNORE_FILENAME)
     ) || path == root.join(tgrep_core::gitignore::P4IGNORE_FILENAME)
+        || (name == Some("exclude") && repo_exclude_watch_path(root).as_deref() == Some(path))
+}
+
+/// Normalize Git's pointer chain without requiring `exclude` itself to exist.
+/// Only in-tree directories can receive native subscriptions.
+fn repo_exclude_watch_path(root: &Path) -> Option<PathBuf> {
+    let candidate = tgrep_core::gitignore::repo_exclude_candidate(root)?;
+    let parent = std::fs::canonicalize(candidate.parent()?).ok()?;
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let relative = parent.strip_prefix(&canonical_root).ok()?;
+    let parent = root.join(relative);
+    is_contained_dir(root, &parent).then(|| parent.join("exclude"))
 }
 
 /// Whether this platform's `notify` backend takes one OS subscription per
@@ -3483,32 +3495,26 @@ fn watchable_dirs(
     }
 }
 
-/// The directories that must be subscribed to for the ignore sources
-/// themselves to be observable, beyond the ones the rules allow.
+/// Watch ignore sources even when their directories are outside the indexed
+/// corpus, such as `.git/info/exclude`. Subscribe only to their parents, not
+/// whole subtrees; ordinary file events still pass through the index filters.
 ///
-/// A `.gitignore` symlinked to `build/shared-rules` contributes the *target's*
-/// contents, and [`handle_fs_event`] already recognises an event naming that
-/// target rather than a name rules usually go by. But only if one arrives: on a
-/// per-directory backend nothing subscribes to `build/` when the rules hide it,
-/// so the edit that changes what the matcher enforces produces no event at all,
-/// and the matcher stays stale until the hourly reconcile — the one case where
-/// the source of the rules is invisible to the rules' own watcher.
-///
-/// One watch on the target's own directory, not its subtree: this is about
-/// seeing a single file that the matcher was built from, not about indexing
-/// anything under it. `should_skip_watcher_path` still discards everything else
-/// delivered from there, and the target itself is matched by path against the
-/// recorded stamps before any of that filtering runs.
-///
-/// Targets outside `root` are deliberately not covered. Watching them would
-/// mean subscribing outside the tree the server was asked to serve, and the
-/// periodic reconcile remains the backstop there.
+/// For symlinks, watch both the link's parent (replacement/removal) and the
+/// target's parent (content edits). Neither may escape the served root.
+/// Keep Git's resolved `info` directory watched even when `exclude` is absent
+/// from the published sources, so deletion does not hide its later recreation.
 fn ignore_target_dirs(root: &Path, sources: &[PathBuf]) -> std::collections::HashSet<PathBuf> {
     let mut dirs = std::collections::HashSet::new();
     let Ok(canonical_root) = std::fs::canonicalize(root) else {
         return dirs;
     };
-    for source in sources {
+    let exclude = repo_exclude_watch_path(root);
+    for source in sources.iter().chain(exclude.iter()) {
+        if let Some(parent) = source.parent()
+            && is_contained_dir(root, parent)
+        {
+            dirs.insert(parent.to_path_buf());
+        }
         if !std::fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_symlink()) {
             continue;
         }
@@ -3693,6 +3699,7 @@ fn changed_ignore_rules_in(
 ) -> Option<(String, &'static str)> {
     let since = since.checked_sub(MTIME_GRANULARITY).unwrap_or(since);
     let mut probed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let exclude = repo_exclude_watch_path(root);
     for dir in dirs {
         let mut candidates = vec![
             dir.join(tgrep_core::gitignore::GITIGNORE_FILENAME),
@@ -3701,6 +3708,11 @@ fn changed_ignore_rules_in(
         // Root-scoped, mirroring the walker, which only reads the root file.
         if dir == root {
             candidates.push(root.join(tgrep_core::gitignore::P4IGNORE_FILENAME));
+        }
+        if let Some(exclude) = &exclude
+            && exclude.parent() == Some(dir.as_path())
+        {
+            candidates.push(exclude.clone());
         }
         for candidate in candidates {
             if !probed.insert(candidate.clone()) || !candidate.is_file() {
@@ -4387,7 +4399,7 @@ fn defer_events_during_build(state: &ServerState, event: &Event) -> bool {
     if paths.len().saturating_add(event.paths.len()) > MAX_DEFERRED {
         *deferred = None;
         eprintln!(
-            "[trace] warning: too many file changes during the initial index build to replay \
+            "[trace] warning: too many filesystem notifications during the index build to replay \
              individually; a full reconcile will run instead"
         );
         return true;
@@ -4436,7 +4448,9 @@ fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
         // Overflowed. A stale refresh rewalks the tree and diffs it against the
         // index, which covers every path the replay would have, and it is what
         // already runs when ignore rules change mid-build.
-        eprintln!("[trace] watcher: reconciling after too many changes during the initial build");
+        eprintln!(
+            "[trace] watcher: reconciling after too many notifications during the index build"
+        );
         let state = Arc::clone(state);
         let root = root.to_path_buf();
         if thread::Builder::new()
@@ -4498,7 +4512,7 @@ fn replay_deferred_events(state: &Arc<ServerState>, root: &Path) {
         schedule_ignore_rules_refresh(Arc::clone(state), root.to_path_buf());
     }
     eprintln!(
-        "[trace] watcher: replayed {count} change(s) deferred during the initial build in {:.1}ms",
+        "[trace] watcher: replayed notifications for {count} path(s) deferred during the index build in {:.1}ms",
         start.elapsed().as_secs_f64() * 1000.0
     );
 }
@@ -5474,7 +5488,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     }
 
     let Some(per_tri) = per_tri else {
-        eprintln!("[trace] reindex: modified {rel_path}");
+        eprintln!("[trace] reindex: classified as binary (filename only) {rel_path}");
         mark_filename_only(state, rel_path);
         state.file_evidence.write().unwrap().insert_verified(
             rel_path.to_string(),
@@ -5528,7 +5542,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         state.filename_index_dirty.store(true, Ordering::SeqCst);
     }
     if let Some(overlay_id) = committed_overlay_id {
-        eprintln!("[trace] reindex: modified {rel_path}");
+        eprintln!("[trace] reindex: updated content index for {rel_path}");
         state
             .recent_reindexes
             .lock()
@@ -6000,7 +6014,7 @@ fn complete_file_evidence(
     evidence
 }
 
-/// Drop the stamps the build has no right to publish, because an event for
+/// Drop the metadata evidence the build has no right to publish, because an event for
 /// those paths arrived while it ran.
 ///
 /// The stamp map describes what the index holds, and the build derives it from
@@ -6016,6 +6030,8 @@ fn complete_file_evidence(
 /// The deferred buffer already names those paths — it is what replay is about
 /// to walk — so withholding their stamps costs one map lookup each and makes
 /// the replay do the read it was deferred for.
+/// Content IDs still describe the indexed bytes, not filesystem freshness.
+/// Keep them so replay can verify unchanged content without an overlay mutation.
 ///
 /// When the buffer overflowed it names nothing, and nothing distinguishes the
 /// files that changed from the ones that did not, so no stamp from this build
@@ -6045,10 +6061,12 @@ fn withhold_evidence_for_deferred_snapshot(
 ) -> tgrep_core::meta::FileEvidence {
     let Some(paths) = paths else {
         eprintln!(
-            "[trace] warning: too many changes during the initial build to say which files the \
+            "[trace] warning: too many notifications during the index build to say which files the \
              walk raced; publishing no stamps so the reconcile re-reads them"
         );
-        return tgrep_core::meta::FileEvidence::default();
+        evidence.stamps.clear();
+        evidence.versions.clear();
+        return evidence;
     };
     let mut exact = std::collections::HashSet::new();
     let mut directories = std::collections::HashSet::new();
@@ -6063,11 +6081,11 @@ fn withhold_evidence_for_deferred_snapshot(
         }
     }
     let before = evidence.stamps.len();
-    evidence.retain(|rel, _| {
+    evidence.stamps.retain(|rel, _| {
         if exact.contains(rel) {
             return false;
         }
-        let mut ancestor = rel;
+        let mut ancestor = rel.as_str();
         while let Some((parent, _)) = ancestor.rsplit_once('/') {
             if directories.contains(parent) {
                 return false;
@@ -6076,11 +6094,14 @@ fn withhold_evidence_for_deferred_snapshot(
         }
         true
     });
+    evidence
+        .versions
+        .retain(|path, _| evidence.stamps.contains_key(path));
     let withheld = before - evidence.stamps.len();
     if withheld > 0 {
         eprintln!(
-            "[trace] watcher: {withheld} file(s) changed during the initial build; their stamps \
-             are withheld so the replay re-reads them"
+            "[trace] watcher: notifications received for {withheld} indexed file(s) during the \
+             index build; metadata evidence withheld so replay verifies their contents"
         );
     }
     evidence
@@ -6205,14 +6226,6 @@ fn stream_merge_stale_changes(
 
     state.flushing.store(true, Ordering::SeqCst);
     let start = Instant::now();
-    eprintln!(
-        "[trace] {operation}: building a memory-bounded delta \
-         ({} changed, {} new, {} deleted)...",
-        changed.len(),
-        added.len(),
-        deleted.len()
-    );
-
     // Keep work directories inside the locked index directory. Sibling names
     // collide when two independent indexes share a parent directory.
     let delta_dir = index_dir.join(".stale-delta");
@@ -6245,6 +6258,16 @@ fn stream_merge_stale_changes(
                 .cloned(),
         );
     }
+    eprintln!(
+        "[trace] {operation}: building a memory-bounded delta for {} candidate path(s) \
+         (scan: {} changed, {} new, {} deleted; live: {} upserts, {} deletions)...",
+        candidates.len(),
+        changed.len(),
+        added.len(),
+        deleted.len(),
+        overlay_paths.len(),
+        tombstone_paths.len()
+    );
     let desired_paths: Vec<String> = candidates
         .iter()
         .filter(|path| stamps.contains_key(path.as_str()))
@@ -6430,7 +6453,7 @@ fn stream_merge_stale_changes(
     match result {
         Ok(PublishStatus::Published) => {
             eprintln!(
-                "[trace] {operation}: streamed {} changes into the index in {:.1}s",
+                "[trace] {operation}: published {} candidate path(s) into the index in {:.1}s",
                 candidates.len(),
                 start.elapsed().as_secs_f64()
             );
@@ -9056,7 +9079,7 @@ mod tests {
             watch_enabled: true,
             refresh: RefreshControl::new(WatchMode::Auto, Duration::from_secs(120), 8192),
             watch_registry: Mutex::new(None),
-            exclude_dirs: Vec::new(),
+            exclude_dirs: builder::index_exclude_dirs(&[], false),
             no_ignore: false,
             no_require_git: false,
             max_file_size: None,
@@ -9513,6 +9536,61 @@ mod tests {
             0
         );
         HybridIndex::open(&index_dir, tmp.path()).expect("reset index should reopen cleanly");
+    }
+
+    #[test]
+    fn watcher_git_metadata_filter_matches_index_build_options() {
+        for no_ignore in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let index_dir = root.join(".tgrep");
+            let mut state = test_server_state(&root, &index_dir);
+            let config = Arc::get_mut(&mut state).unwrap();
+            config.no_ignore = no_ignore;
+            config.exclude_dirs = builder::index_exclude_dirs(&[], no_ignore);
+            state.gitignore_pending.store(false, Ordering::SeqCst);
+
+            for (path, bytes) in [
+                (".git/HEAD", &b"ref: refs/heads/main\n"[..]),
+                (".git/objects/pack/tmp_pack", &b"binary\0object"[..]),
+                ("nested/.git/HEAD", &b"ref: refs/heads/main\n"[..]),
+                (".github/config", &b"hidden source marker\n"[..]),
+            ] {
+                let full = root.join(path);
+                std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+                std::fs::write(&full, bytes).unwrap();
+                handle_fs_event(
+                    &state,
+                    &root,
+                    &Event {
+                        kind: EventKind::Modify(notify::event::ModifyKind::Any),
+                        paths: vec![full],
+                        attrs: Default::default(),
+                    },
+                );
+            }
+            let index = state.index.read().unwrap();
+            assert_eq!(index.live.has_path(".git/HEAD"), no_ignore);
+            assert_eq!(index.live.has_path("nested/.git/HEAD"), no_ignore);
+            assert!(index.live.has_path(".github/config"));
+            assert_eq!(
+                state
+                    .filename_extra_paths
+                    .read()
+                    .unwrap()
+                    .contains(".git/objects/pack/tmp_pack"),
+                no_ignore
+            );
+            drop(index);
+
+            let dirs = watchable_dirs(&root, &root, &state.exclude_dirs, None, &index_dir);
+            assert_eq!(
+                dirs.dirs.contains(&root.join(".git/objects/pack")),
+                no_ignore
+            );
+            assert_eq!(dirs.dirs.contains(&root.join("nested/.git")), no_ignore);
+            assert!(dirs.dirs.contains(&root.join(".github")));
+        }
     }
 
     #[test]
@@ -10495,6 +10573,14 @@ mod tests {
         let root = tmp.path().to_path_buf();
         test_git(&root, &["init", "--quiet"]);
         test_git(&root, &["config", "core.ignorecase", "true"]);
+        // Git templates may stamp this file at init time. Keep that unrelated
+        // ignore source outside the recovery window so only membership changes
+        // can schedule the corrective pass counted below.
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::File::create(root.join(".git/info/exclude"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+            .unwrap();
         std::fs::write(root.join(".gitignore"), "IGNORED/\n").unwrap();
         let ignored = root.join("ignored");
         std::fs::create_dir_all(&ignored).unwrap();
@@ -11094,6 +11180,103 @@ mod tests {
         let index = state.index.read().unwrap();
         assert_ne!(index.live.file_id_for_path("same.rs"), Some(old_id));
         assert_eq!(index.live.dirty_count(), old_dirty + 1);
+    }
+
+    #[test]
+    fn deferred_notifications_verify_content_before_recording_mutations() {
+        for changed in [false, true] {
+            for directory_event in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let root = std::fs::canonicalize(tmp.path()).unwrap();
+                let index_dir = root.join(".tgrep");
+                let state = test_server_state(&root, &index_dir);
+                state.gitignore_pending.store(false, Ordering::SeqCst);
+                if PER_DIRECTORY_WATCHES && directory_event {
+                    *state.watch_registry.lock().unwrap() = Some(WatchRegistry {
+                        watcher: notify::recommended_watcher(|_: notify::Result<Event>| {})
+                            .unwrap(),
+                        root: root.clone(),
+                        watched: Default::default(),
+                        budget: 8192,
+                        failure: None,
+                        fail_after: None,
+                        polling: Arc::clone(&state.refresh.polling),
+                    });
+                }
+                let rel = "src/reader.rs";
+                let original = b"fn original_marker() {}\n";
+                let original_id = install_reader_file(&state, &root, &index_dir, rel, original);
+                let path = root.join(rel);
+                let metadata = std::fs::metadata(&path).unwrap();
+                let modified = metadata.modified().unwrap();
+                state.file_evidence.write().unwrap().versions.insert(
+                    rel.to_string(),
+                    tgrep_core::builder::file_version(&metadata),
+                );
+                if changed {
+                    std::fs::write(&path, b"fn replaced_marker() {}\n").unwrap();
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&path)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(modified))
+                        .unwrap();
+                }
+
+                state.indexing.store(true, Ordering::SeqCst);
+                handle_fs_event(
+                    &state,
+                    &root,
+                    &Event {
+                        kind: if directory_event {
+                            EventKind::Create(notify::event::CreateKind::Folder)
+                        } else {
+                            EventKind::Modify(notify::event::ModifyKind::Metadata(
+                                notify::event::MetadataKind::Any,
+                            ))
+                        },
+                        paths: vec![if directory_event {
+                            root.join("src")
+                        } else {
+                            path
+                        }],
+                        attrs: Default::default(),
+                    },
+                );
+                let evidence = state.file_evidence.read().unwrap().clone();
+                let withheld = withhold_evidence_for_deferred(&state, &root, evidence);
+                assert!(withheld.stamp(rel).is_none());
+                assert!(withheld.version(rel).is_none());
+                assert_eq!(withheld.content_id(rel), Some(original_id));
+                *state.file_evidence.write().unwrap() = withheld;
+                state.indexing.store(false, Ordering::SeqCst);
+                replay_deferred_events(&state, &root);
+
+                let index = state.index.read().unwrap();
+                assert_eq!(index.live.dirty_count(), u32::from(changed));
+                assert_eq!(index.live.has_path(rel), changed);
+                let marker = if changed {
+                    "replaced_marker"
+                } else {
+                    "original_marker"
+                };
+                assert_eq!(
+                    index
+                        .execute_query(&query::build_literal_plan(marker, false))
+                        .len(),
+                    1
+                );
+                drop(index);
+                assert!(state.file_evidence.read().unwrap().version(rel).is_some());
+                assert!(!state.filename_index_dirty.load(Ordering::SeqCst));
+                if changed {
+                    assert!(persist_pending_index_changes(&state));
+                    assert_eq!(state.index.read().unwrap().live.dirty_count(), 0);
+                    let reader = tgrep_core::reader::IndexReader::open(&index_dir).unwrap();
+                    assert_eq!(reader.num_files(), 1);
+                }
+            }
+        }
     }
 
     #[test]
@@ -11805,25 +11988,74 @@ mod tests {
         );
     }
 
-    /// A source that is a plain file needs nothing extra, and one whose target
-    /// is outside the root must not pull a subscription outside the tree the
-    /// server was asked to serve.
+    /// Ordinary sources need parent watches too, even when the indexing walk
+    /// excludes that directory. Outside sources and targets remain out of scope.
     #[test]
-    fn ordinary_and_outside_rule_files_add_no_subscriptions() {
+    fn ordinary_rule_parents_are_watched_without_subscribing_outside_the_root() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
-        assert!(ignore_target_dirs(root, &[root.join(".gitignore")]).is_empty());
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        let exclude = root.join(".git/info/exclude");
+        std::fs::write(&exclude, "ignored.txt\n").unwrap();
+        let sources = [root.join(".gitignore"), exclude.clone()];
+        let expected = [root.to_path_buf(), root.join(".git/info")]
+            .into_iter()
+            .collect();
+        assert_eq!(ignore_target_dirs(root, &sources), expected);
+        std::fs::remove_file(exclude).unwrap();
+        assert_eq!(
+            ignore_target_dirs(root, &sources),
+            expected,
+            "keep the parent watch so a removed source can be recreated"
+        );
 
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("rules"), "target/\n").unwrap();
+        assert_eq!(
+            ignore_target_dirs(root, &[outside.path().join("rules")]),
+            [root.join(".git/info")].into_iter().collect()
+        );
         if !try_symlink(&outside.path().join("rules"), &root.join(".ignore")) {
             return;
         }
-        assert!(
-            ignore_target_dirs(root, &[root.join(".ignore")]).is_empty(),
-            "a target outside the root must not be subscribed to"
+        assert_eq!(
+            ignore_target_dirs(root, &[root.join(".ignore")]),
+            expected,
+            "watch the link itself but not its outside target"
         );
+    }
+
+    #[test]
+    fn absent_repo_exclude_remains_watchable_and_is_recognized_on_recreation() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let info = root.join(".git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        let exclude = info.join("exclude");
+        assert!(tgrep_core::gitignore::repo_exclude_path(&root).is_none());
+        assert!(!ignore_sources_of(&root, &[], &[], false).contains(&exclude));
+        assert!(ignore_target_dirs(&root, &[]).contains(&info));
+        assert!(is_ignore_rules_file(&root, &exclude));
+        assert!(!is_ignore_rules_file(
+            &root,
+            &root.join(".git/objects/exclude")
+        ));
+
+        std::fs::write(&exclude, "ignored.txt\n").unwrap();
+        assert_eq!(
+            changed_ignore_rules_in(
+                &root,
+                std::slice::from_ref(&info),
+                &IgnoreStamps::new(),
+                SystemTime::now(),
+            ),
+            Some((".git/info/exclude".to_string(), "not a known source"))
+        );
+        std::fs::remove_file(&exclude).unwrap();
+        let sources = ignore_sources_of(&root, &[], &[], false);
+        assert!(!sources.contains(&exclude));
+        assert!(ignore_target_dirs(&root, &sources).contains(&info));
     }
 
     #[test]
@@ -13771,12 +14003,13 @@ mod tests {
         );
         assert_eq!(published.content_id("quiet.rs"), Some(id));
         assert!(
-            !published.stamps.contains_key("racy.rs") && published.content_id("racy.rs").is_none(),
+            !published.stamps.contains_key("racy.rs")
+                && published.content_id("racy.rs") == Some(id),
             "a file whose event is waiting to be replayed must not be stamped as indexed"
         );
         assert!(
             !published.stamps.contains_key("moved/deep.rs")
-                && published.content_id("moved/deep.rs").is_none(),
+                && published.content_id("moved/deep.rs") == Some(id),
             "a directory event must withhold stamps for every descendant the subtree replay covers"
         );
         assert!(
@@ -13787,16 +14020,12 @@ mod tests {
         // Overflowed: the buffer names nothing, so nothing in the map can be
         // told apart from what changed underneath it.
         *state.deferred_events.lock().unwrap() = None;
+        let overflowed = withhold_evidence_for_deferred(&state, &root, published);
         assert!(
-            withhold_evidence_for_deferred(
-                &state,
-                &root,
-                tgrep_core::meta::FileEvidence::from_stamps(stamps),
-            )
-            .stamps
-            .is_empty(),
+            overflowed.stamps.is_empty() && overflowed.versions.is_empty(),
             "with the buffer overflowed no stamp from this build can be trusted"
         );
+        assert_eq!(overflowed.content_ids.len(), stamps.len());
     }
 
     /// A file that grows in between must not be read into memory without

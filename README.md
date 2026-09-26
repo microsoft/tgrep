@@ -151,6 +151,12 @@ incomplete builds. Clients scan the filesystem until the full corpus is ready;
 indexes are upgraded by startup reconciliation. Multiple clients can connect
 simultaneously.
 
+Index builds and server refreshes exclude `.git` directory subtrees by default,
+including nested repositories' Git internals. `--hidden` does not override this;
+use `--no-ignore` consistently on `index` and `serve` to include them. Explicit
+filesystem scans (`--no-index`) retain ripgrep-style hidden and ignore behavior.
+Git metadata needed for ignore rules and tracked-file detection is still read.
+
 On Windows, replaced index generations stay in `.retired` while readers have
 them memory-mapped. Cleanup retries after publication, every minute, and on
 startup; uncommitted backups are preserved for recovery. This does not reclaim
@@ -173,6 +179,12 @@ The server checks for pending saves once a minute. It saves at the mutation
 threshold, when filename-only membership changes, or when content changes
 remain unsaved for at least ten minutes since startup or the last successful
 save. Active builds and flushes defer this check.
+
+Startup watcher traces count filesystem notifications, not confirmed content
+edits. Replay re-reads notified files and avoids content-index mutations when
+their decoded contents match the indexed fingerprint. Delta-save traces report
+the unique candidate paths plus separate scan and live-overlay counts; these
+inputs can overlap and do not represent a count of user edits.
 
 #### Staying in step with the filesystem
 

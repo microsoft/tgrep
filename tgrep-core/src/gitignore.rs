@@ -737,10 +737,16 @@ fn git_repo_root(root: &Path) -> Option<&Path> {
 /// exactly the layouts where the two differ, and the watcher would index a file
 /// the next stale check evicts.
 pub fn repo_exclude_path(root: &Path) -> Option<PathBuf> {
+    let path = repo_exclude_candidate(root)?;
+    path.is_file().then_some(path)
+}
+
+/// Resolve the repository's ignore-file location even when the file is absent,
+/// so watchers can observe its creation without treating it as a read source.
+pub fn repo_exclude_candidate(root: &Path) -> Option<PathBuf> {
     let git_dir = crate::git_index::git_dir(git_repo_root(root)?)?;
     let common = crate::git_index::common_git_dir(&git_dir);
-    let path = common.join("info").join("exclude");
-    path.is_file().then_some(path)
+    Some(common.join("info").join("exclude"))
 }
 
 /// The parent-directory `.ignore` / `.gitignore` files that apply to `root`,
@@ -1165,6 +1171,12 @@ mod tests {
             .expect("the exclude file supplies rules");
         assert!(matcher.is_ignored(Path::new("keys.secret"), false));
         assert!(!matcher.is_ignored(Path::new("main.rs"), false));
+        std::fs::remove_file(common.join("info/exclude")).unwrap();
+        assert!(repo_exclude_path(&worktree).is_none());
+        assert_eq!(
+            repo_exclude_candidate(&worktree),
+            Some(common.join("info/exclude"))
+        );
     }
 
     #[test]
@@ -1193,6 +1205,9 @@ mod tests {
                 == std::fs::canonicalize(common.join("info").join("exclude")).unwrap(),
             "got {found:?}"
         );
+        std::fs::remove_file(&found).unwrap();
+        assert!(repo_exclude_path(&worktree).is_none());
+        assert_eq!(repo_exclude_candidate(&worktree), Some(found));
     }
 
     #[test]

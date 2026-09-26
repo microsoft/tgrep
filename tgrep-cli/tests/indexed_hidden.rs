@@ -580,7 +580,7 @@ impl ServerGuard {
         loop {
             server.assert_running();
             let status = server.rpc("status");
-            let refresh_ready = (!warm_start && mode == WatchMode::Disabled)
+            let refresh_ready = !warm_start
                 || (status["last_reconcile_at"].is_u64() && status["reconcile_running"] == false);
             if has_complete_coverage(&status)
                 && status["watch_mode_active"] == mode.active_name()
@@ -1136,6 +1136,73 @@ fn exercise_hidden_updates(mode: WatchMode) {
 }
 
 #[test]
+fn git_metadata_stays_out_of_native_and_persisted_indexes() {
+    for warm_start in [false, true] {
+        let fixture = Fixture::new();
+        fixture.write(".git/info/exclude", "# initial exclude rules\n");
+        if warm_start {
+            // Simulate an older index that admitted Git internals.
+            Command::cargo_bin("tgrep")
+                .unwrap()
+                .args(["index", "--no-ignore", "--index-path"])
+                .arg(&fixture.index)
+                .arg(&fixture.root)
+                .assert()
+                .success();
+        }
+        let mut corpus = Corpus::initial();
+        let mut server = ServerGuard::start(&fixture, &corpus, WatchMode::Native, false);
+        let assert_without_git_glob = |backend: Backend, corpus: &Corpus| {
+            for mode in [OutputMode::Files, OutputMode::FilesWithMatches] {
+                let mut command = Command::cargo_bin("tgrep").unwrap();
+                command
+                    .args(["--hidden", "--with-filename", "--stats", "--index-path"])
+                    .arg(&fixture.index)
+                    .arg(mode.flag().unwrap())
+                    .arg("--");
+                if mode != OutputMode::Files {
+                    command.arg(NEEDLE);
+                }
+                let output = command.arg(&fixture.root).output().unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert!(backend.matches(mode, &output), "{output:?}");
+                assert_eq!(
+                    parsed_output(&fixture, mode, &output),
+                    corpus.expected("", true, mode),
+                    "{output:?}"
+                );
+            }
+        };
+        assert_without_git_glob(Backend::Server, &corpus);
+
+        fixture.write(".git/objects/new-object", "needle Git object\n");
+        fixture.write(".git/objects/pack/tmp_pack", "needle\0binary object\n");
+        fixture.write("nested/.git/HEAD", "needle nested Git metadata\n");
+        fixture.write(".github/new.txt", "needle hidden positive control\n");
+        corpus.add(".github/new.txt", 1);
+        wait_for_snapshot(&fixture, &mut server, &corpus);
+        assert_without_git_glob(Backend::Server, &corpus);
+
+        // Excluding Git internals from the corpus must not disable ignore updates.
+        fixture.write(".git/info/exclude", "notes.txt\n");
+        corpus.remove("notes.txt");
+        wait_for_snapshot(&fixture, &mut server, &corpus);
+        assert_without_git_glob(Backend::Server, &corpus);
+        assert!(
+            !server
+                .logs()
+                .lines()
+                .any(|line| { line.contains("reindex:") && line.contains(".git/") }),
+            "{}",
+            server.logs()
+        );
+        server.rpc("reload");
+        server.stop();
+        assert_without_git_glob(Backend::Local, &corpus);
+    }
+}
+
+#[test]
 fn native_watcher_tracks_hidden_updates_ignore_transitions_and_restart() {
     exercise_hidden_updates(WatchMode::Native);
 }
@@ -1180,8 +1247,7 @@ fn hidden_fallback_walks_exclude_custom_index_storage() {
         fixture.write(&sibling, "needle sibling\n");
         let mut corpus = Corpus::initial();
         corpus.add(&sibling, 1);
-        // This query does not add Fixture::query's !.git exclusion.
-        corpus.add(".git/private.txt", 1);
+        // Scans include .git with --hidden; the indexed corpus excludes it.
         let query = |mode: OutputMode, hidden: bool, args: &[&str]| {
             let mut command = Command::cargo_bin("tgrep").unwrap();
             command

@@ -111,6 +111,16 @@ impl Default for BuildOptions {
     }
 }
 
+/// Exclude Git's internal directories from the indexed corpus by default.
+/// Filesystem searches retain their normal hidden-file and ignore semantics.
+pub fn index_exclude_dirs(exclude_dirs: &[String], no_ignore: bool) -> Vec<String> {
+    let mut dirs = exclude_dirs.to_vec();
+    if !no_ignore && !dirs.iter().any(|dir| dir == ".git") {
+        dirs.push(".git".to_string());
+    }
+    dirs
+}
+
 /// Destination for postings as files are processed.
 enum PostingSink {
     InMemory(Vec<TrigramPosting>),
@@ -637,7 +647,7 @@ pub fn build_index_with_options_and_ignorecase(
 ) -> Result<BuildOutcome> {
     let include_hidden = opts.include_hidden;
     let no_ignore = opts.no_ignore;
-    let exclude_dirs = opts.exclude_dirs.as_slice();
+    let exclude_dirs = index_exclude_dirs(&opts.exclude_dirs, opts.no_ignore);
     let root = std::fs::canonicalize(root)?;
     let index_dir = match index_dir {
         Some(d) => d.to_path_buf(),
@@ -677,7 +687,7 @@ pub fn build_index_with_options_and_ignorecase(
             // Visibility must retain hidden entries admitted by ignore-file
             // whitelists, even for a build without a watcher.
             collect_gitignore_files: true,
-            exclude_dirs: exclude_dirs.to_vec(),
+            exclude_dirs,
             exclude_paths,
             max_file_size: opts.max_file_size,
             ..Default::default()
@@ -2230,6 +2240,65 @@ mod tests {
         assert!(meta.complete && meta.hidden_complete);
         assert!(!meta.visibility.is_visible(".mailmap", "", false));
         assert!(meta.visibility.is_visible("src/main.rs", "", false));
+    }
+
+    #[test]
+    fn git_metadata_is_excluded_unless_ignore_rules_are_disabled() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        for dir in [".git/objects", "nested/.git", ".github"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for path in [
+            ".git/HEAD",
+            "nested/.git/HEAD",
+            ".github/config",
+            "source.rs",
+        ] {
+            std::fs::write(root.join(path), b"indexed marker\n").unwrap();
+        }
+        std::fs::write(root.join(".git/objects/binary"), b"binary\0object").unwrap();
+
+        for strategy in [IndexStrategy::External, IndexStrategy::InMemory] {
+            for no_ignore in [false, true] {
+                let output = tempfile::tempdir().unwrap();
+                build_index_with_options(
+                    root,
+                    Some(output.path()),
+                    &BuildOptions {
+                        strategy,
+                        no_ignore,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let reader = IndexReader::open(output.path()).unwrap();
+                let paths = reader.all_paths();
+                assert!(paths.iter().any(|path| path == ".github/config"));
+                assert!(paths.iter().any(|path| path == "source.rs"));
+                for path in [".git/HEAD", "nested/.git/HEAD"] {
+                    assert_eq!(paths.iter().any(|indexed| indexed == path), no_ignore);
+                }
+                let filenames = path_index::read_filename_index(output.path())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    filenames
+                        .paths
+                        .iter()
+                        .any(|path| path == ".git/objects/binary"),
+                    no_ignore
+                );
+            }
+        }
+        assert_eq!(
+            index_exclude_dirs(&[".git".to_string(), "vendor".to_string()], false),
+            vec![".git", "vendor"]
+        );
+        assert_eq!(
+            index_exclude_dirs(&[".git".to_string()], true),
+            vec![".git"]
+        );
     }
 
     #[test]

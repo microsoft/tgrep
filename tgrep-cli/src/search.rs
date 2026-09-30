@@ -2404,6 +2404,7 @@ mod tests {
     fn stats_requests_match_detail_so_spans_are_available_to_count() {
         let mut opts = SearchOptions {
             stats: true,
+            color: ColorMode::Never,
             ..Default::default()
         };
         assert!(

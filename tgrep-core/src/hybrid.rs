@@ -28,6 +28,10 @@ pub struct HybridIndex {
 
 impl HybridIndex {
     pub fn open(index_dir: &Path, root: &Path) -> Result<Self> {
+        Ok(Self::from_reader(Self::open_reader(index_dir)?, root))
+    }
+
+    pub(crate) fn open_reader(index_dir: &Path) -> Result<Arc<IndexReader>> {
         let reader = IndexReader::open(index_dir)?;
         // Reject structurally inconsistent readers (mmap sections present but
         // counters say zero entries). This catches stale-metadata corruption
@@ -44,11 +48,15 @@ impl HybridIndex {
         if let Err(msg) = reader.validate_lookup() {
             return Err(crate::Error::IndexCorrupted(msg));
         }
-        Ok(Self {
-            reader: RwLock::new(Arc::new(reader)),
+        Ok(Arc::new(reader))
+    }
+
+    pub(crate) fn from_reader(reader: Arc<IndexReader>, root: &Path) -> Self {
+        Self {
+            reader: RwLock::new(reader),
             live: LiveIndex::new(),
             root: root.to_path_buf(),
-        })
+        }
     }
 
     /// Snapshot the current on-disk reader. Cheap (clones an `Arc`).

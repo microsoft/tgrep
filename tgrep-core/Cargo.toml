@@ -22,10 +22,10 @@ rayon = "1"
 ignore = "0.4"
 globset = "0.4.18"
 encoding_rs = "0.8"
+tempfile = "3"
 
 [dev-dependencies]
 criterion = "0.5"
-tempfile = "3"
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus"] }

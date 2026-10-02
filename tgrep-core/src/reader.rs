@@ -231,6 +231,22 @@ impl IndexReader {
         self.file_table_id
     }
 
+    /// Identity of the path table, lookup table and postings, independent of
+    /// their storage directory. Computed once when opening a shared base.
+    pub(crate) fn snapshot_id(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tgrep/shared-base/v1\0");
+        hasher.update(&self.file_table_id);
+        for bytes in [
+            self.lookup.as_deref().unwrap_or_default(),
+            self.postings.as_deref().unwrap_or_default(),
+        ] {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     /// Total number of unique trigrams.
     pub fn num_trigrams(&self) -> usize {
         self.num_entries

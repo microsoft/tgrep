@@ -630,6 +630,44 @@ The server's content cache is limited to 50,000 entries and 1 GiB of decoded
 content, with a 64 MiB per-entry limit. `--files` combines content-index paths
 with a filename-only sidecar for admitted paths without searchable content.
 
+### Shared worktree indexes (core API)
+
+`tgrep-core::shared::SharedBase` is the first building block for sharing one
+content index across worktrees. Open a complete, current-format index in an
+**immutable snapshot directory** once, then call `create_worktree(root)` for
+each worktree. The returned `HybridIndex` instances share the same
+`Arc<IndexReader>` (including the path table), but have independent roots,
+live postings, and deletion tombstones. Cloning `SharedBase` does not copy the
+base index.
+
+The caller must populate each overlay before exposing it to searches:
+index whole changed/new files using `view.live.upsert_file`, and hide deleted
+or ineligible base paths using `view.live.delete_file`. Include committed
+branch differences, staged and unstaged edits, and eligible untracked files,
+not just `git diff HEAD`. Only reuse base postings when their decoded content
+matches the worktree's indexing semantics; Git checkout filters, encoding,
+and line-ending conversion can change that content. Clear a path's override
+with `clear_reconciled_paths` only after proving it matches the base again.
+
+`save_overlay(&view, checkpoint_path)` atomically saves only the worktree's
+live postings, masks, and tombstones. It never merges changes into the base.
+`restore_worktree(root, checkpoint_path)` checks the checkpoint version,
+canonical root, and a fingerprint of the base's path table, lookup table,
+and postings. Wrong-base, wrong-root, missing, and malformed checkpoints
+return errors rather than silently revealing base entries. Opening the base
+computes its fingerprint once; attaching more worktrees does not rescan it.
+Checkpoint parent directories must already exist and be outside the base
+snapshot directory.
+
+This API does **not yet** discover Git deltas, watch worktrees, share content
+caches, or provide multi-worktree CLI/server registration. Callers must
+reconcile restored overlays and maintain worktree-specific ignore rules,
+visibility, filename-only paths for `--files`, and caches separately.
+The existing CLI, RPC protocol, index format, and single-root server are
+unchanged. Do not point existing servers at a common `--index-path`: their
+publication path still writes a complete index. Keep shared base files
+immutable for the lifetime of every view or query holding their reader.
+
 ## On-Disk Format
 
 | File | Description |

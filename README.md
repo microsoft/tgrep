@@ -632,6 +632,10 @@ with a filename-only sidecar for admitted paths without searchable content.
 
 ### Shared worktree indexes (core API)
 
+See the [shared worktree index design](SHARED_WORKTREE_INDEXES.md) for
+architecture diagrams, the agent runtime boundary, base-generation lifecycle,
+and the staged implementation plan.
+
 `tgrep-core::shared::SharedBase` is the first building block for sharing one
 content index across worktrees. Open a complete, current-format index in an
 **immutable snapshot directory** once, then call `create_worktree(root)` for

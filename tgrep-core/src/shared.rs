@@ -458,6 +458,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn non_unicode_unix_root_encoding_preserves_exact_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_vec(vec![b'/', b'a', 0xfe]));
+        let second = PathBuf::from(OsString::from_vec(vec![b'/', b'a', 0xff]));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+        let encoded = CheckpointRoot::from_path(&first).unwrap();
+        let value = serde_json::to_value(&encoded).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"encoding": "unix-bytes", "units": [47, 97, 254]})
+        );
+        let restored: CheckpointRoot = serde_json::from_value(value).unwrap();
+        assert!(restored == encoded);
+        assert!(restored != CheckpointRoot::from_path(&second).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn retargeting_parent_alias_does_not_redirect_checkpoint_into_base() {
         use std::os::unix::fs::symlink;
 

@@ -633,7 +633,9 @@ fn unicode_root_checkpoint_retains_legacy_string_representation() {
     assert!(base.restore_worktree(root.path(), &checkpoint).is_ok());
 }
 
-#[cfg(any(unix, windows))]
+// Native macOS filesystems reject these names; the encoding itself is covered
+// without filesystem I/O in the shared module's Unix unit tests.
+#[cfg(any(target_os = "linux", windows))]
 #[test]
 fn non_unicode_roots_roundtrip_without_lossy_identity_collisions() {
     use std::ffi::OsString;

@@ -23,6 +23,20 @@ pub struct IndexReader {
 
 impl IndexReader {
     pub fn open(index_dir: &Path) -> Result<Self> {
+        Self::open_impl(index_dir, false)
+    }
+
+    /// Open every section needed to identify an immutable snapshot. Ordinary
+    /// readers retain their legacy empty-section handling.
+    pub(crate) fn open_for_snapshot(index_dir: &Path) -> Result<Self> {
+        let reader = Self::open_impl(index_dir, true)?;
+        reader
+            .validate_lookup()
+            .map_err(crate::Error::IndexCorrupted)?;
+        Ok(reader)
+    }
+
+    fn open_impl(index_dir: &Path, require_complete_sections: bool) -> Result<Self> {
         let lookup_path = index_dir.join("lookup.bin");
         let postings_path = index_dir.join("index.bin");
         let files_path = index_dir.join("files.bin");
@@ -54,6 +68,12 @@ impl IndexReader {
 
         let lookup_len_u64 = lookup_file.seek(SeekFrom::End(0))?;
         let postings_len_u64 = postings_file.seek(SeekFrom::End(0))?;
+
+        if require_complete_sections && ((lookup_len_u64 == 0) != (postings_len_u64 == 0)) {
+            return Err(crate::Error::IndexCorrupted(
+                "shared base has mismatched empty lookup.bin and index.bin sections".to_string(),
+            ));
+        }
 
         let (lookup, postings, num_entries) = if lookup_len_u64 == 0 || postings_len_u64 == 0 {
             (None, None, 0)

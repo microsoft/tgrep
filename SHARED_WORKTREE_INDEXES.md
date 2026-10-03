@@ -265,6 +265,13 @@ indexing:
 | [`Regression coverage`](tgrep-core/tests/shared_worktrees.rs) | Sharing/isolation, masks, tombstones, restoration, compatibility, repeated saves, and Windows failure recovery |
 | Generation management, Git discovery, daemon routing | Proposed follow-up work |
 
+Shared-base validation rejects mismatched empty lookup/posting sections and
+metadata counts inconsistent with the opened sections, while allowing empty
+indexes and short files. Checkpoint staging and replacement use the same
+validated canonical parent. Root identities preserve the existing JSON string
+encoding for Unicode paths and use tagged platform-native units for non-Unicode
+Unix/Windows paths; older readers reject the latter representation.
+
 Merge the foundation independently once its normal review and checks are
 satisfied; do not expand it into the entire feature. Keep follow-up work in
 reviewable increments, each with its own correctness coverage:

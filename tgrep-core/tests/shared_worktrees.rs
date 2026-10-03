@@ -446,6 +446,16 @@ fn malformed_checkpoints_fail_instead_of_revealing_base_entries() {
     let mut bad = good.clone();
     bad["overlay"].as_object_mut().unwrap().remove("deleted");
     bad_values.push(bad);
+    for root in [
+        json!(null),
+        json!({"encoding": "unknown", "units": [1, 2, 3]}),
+        json!({"encoding": "windows-wide", "units": [65536]}),
+        json!({"encoding": "unix-bytes", "units": [256]}),
+    ] {
+        let mut bad = good.clone();
+        bad["root"] = root;
+        bad_values.push(bad);
+    }
     for bad in bad_values {
         fs::write(&checkpoint, serde_json::to_vec(&bad).unwrap()).unwrap();
         assert!(
@@ -525,6 +535,151 @@ fn incomplete_or_legacy_metadata_does_not_change_existing_open_behavior() {
         let legacy = HybridIndex::open(directory.path(), root.path()).unwrap();
         assert_eq!(candidates(&legacy, "original", false), ["base.rs"]);
     }
+}
+
+#[test]
+fn shared_base_rejects_mismatched_empty_sections_even_with_zero_metadata_count() {
+    let root = tempfile::tempdir().unwrap();
+    for name in ["lookup.bin", "index.bin"] {
+        let directory = build_base(root.path(), &[("base.rs", b"original")]);
+        fs::write(directory.path().join(name), []).unwrap();
+        let mut meta = IndexMeta::load(directory.path()).unwrap();
+        meta.num_trigrams = 0;
+        meta.save(directory.path()).unwrap();
+
+        assert!(
+            SharedBase::open(directory.path()).is_err(),
+            "accepted an empty {name} with a nonempty companion section"
+        );
+        // Preserve the ordinary reader's existing empty-section behavior.
+        let ordinary = IndexReader::open(directory.path()).unwrap();
+        assert_eq!(ordinary.num_trigrams(), 0);
+    }
+}
+
+#[test]
+fn shared_base_rejects_truncated_sections_with_stale_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = build_base(root.path(), &[("base.rs", b"original")]);
+    let lookup = fs::read(directory.path().join("lookup.bin")).unwrap();
+    assert!(lookup.len() > 16);
+    fs::write(
+        directory.path().join("lookup.bin"),
+        &lookup[..lookup.len() - 16],
+    )
+    .unwrap();
+    assert!(
+        SharedBase::open(directory.path()).is_err(),
+        "accepted a missing lookup entry with a stale trigram count"
+    );
+
+    for name in ["lookup.bin", "index.bin"] {
+        fs::write(directory.path().join(name), []).unwrap();
+    }
+    assert!(
+        SharedBase::open(directory.path()).is_err(),
+        "accepted empty sections with nonzero metadata counts"
+    );
+}
+
+#[test]
+fn shared_base_rejects_inconsistent_file_and_trigram_counts() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = build_base(root.path(), &[("base.rs", b"original")]);
+    let original = IndexMeta::load(directory.path()).unwrap();
+    for count in [0, original.num_files + 1, u64::MAX] {
+        let mut meta = original.clone();
+        meta.num_files = count;
+        meta.save(directory.path()).unwrap();
+        assert!(SharedBase::open(directory.path()).is_err());
+    }
+    for count in [0, original.num_trigrams + 1, u64::MAX] {
+        let mut meta = original.clone();
+        meta.num_trigrams = count;
+        meta.save(directory.path()).unwrap();
+        assert!(SharedBase::open(directory.path()).is_err());
+    }
+    original.save(directory.path()).unwrap();
+    assert!(SharedBase::open(directory.path()).is_ok());
+}
+
+#[test]
+fn shared_base_accepts_empty_sections_for_empty_and_short_files() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = build_base(root.path(), &[("empty.rs", b""), ("short.rs", b"ab")]);
+    let base = SharedBase::open(directory.path()).unwrap();
+    let worktree = base.create_worktree(root.path()).unwrap();
+    assert_eq!(worktree.reader_arc().num_trigrams(), 0);
+    assert_eq!(candidates(&worktree, ".", false), ["empty.rs", "short.rs"]);
+    let checkpoint = root.path().join("overlay.json");
+    base.save_overlay(&worktree, &checkpoint).unwrap();
+    let restored = base.restore_worktree(root.path(), &checkpoint).unwrap();
+    assert_eq!(restored.num_files(), 2);
+}
+
+#[test]
+fn unicode_root_checkpoint_retains_legacy_string_representation() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = build_base(root.path(), &[]);
+    let base = SharedBase::open(directory.path()).unwrap();
+    let worktree = base.create_worktree(root.path()).unwrap();
+    let checkpoint = root.path().join("overlay.json");
+    base.save_overlay(&worktree, &checkpoint).unwrap();
+    let value = read_checkpoint(&checkpoint);
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["root"], json!(fs::canonicalize(root.path()).unwrap()));
+    let legacy: std::path::PathBuf = serde_json::from_value(value["root"].clone()).unwrap();
+    assert_eq!(legacy, worktree.root);
+    assert!(base.restore_worktree(root.path(), &checkpoint).is_ok());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn non_unicode_roots_roundtrip_without_lossy_identity_collisions() {
+    use std::ffi::OsString;
+
+    fn component(last: u8) -> OsString {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![b'r', b'o', b'o', b't', last])
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[114, 111, 111, 116, 0xd800 + u16::from(last)])
+        }
+    }
+
+    let parent = tempfile::tempdir().unwrap();
+    let first = parent.path().join(component(0xfe));
+    let second = parent.path().join(component(0xff));
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&second).unwrap();
+    let directory = build_base(parent.path(), &[("base.rs", b"original")]);
+    let base = SharedBase::open(directory.path()).unwrap();
+    let mut worktree = base.create_worktree(&first).unwrap();
+    assert!(worktree.root.to_str().is_none());
+    assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+    worktree.live.upsert_file("base.rs", b"replacement");
+    let checkpoint = first.join("overlay.json");
+    base.save_overlay(&worktree, &checkpoint).unwrap();
+    let encoded_root = read_checkpoint(&checkpoint)["root"].clone();
+    assert!(encoded_root.is_object());
+    #[cfg(unix)]
+    assert_eq!(encoded_root["encoding"], "unix-bytes");
+    #[cfg(windows)]
+    assert_eq!(encoded_root["encoding"], "windows-wide");
+    let restored = base.restore_worktree(&first, &checkpoint).unwrap();
+    assert_eq!(restored.root, worktree.root);
+    assert_eq!(candidates(&restored, "replacement", false), ["base.rs"]);
+    assert!(
+        base.restore_worktree(&second, &checkpoint)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("different root")
+    );
 }
 
 #[test]

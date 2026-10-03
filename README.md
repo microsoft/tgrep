@@ -644,6 +644,10 @@ each worktree. The returned `HybridIndex` instances share the same
 live postings, and deletion tombstones. Cloning `SharedBase` does not copy the
 base index.
 
+Shared-base opening rejects mismatched empty lookup/posting sections and
+metadata counts inconsistent with the opened index. Legitimately empty
+indexes and files too short to produce trigrams remain supported.
+
 The caller must populate each overlay before exposing it to searches:
 index whole changed/new files using `view.live.upsert_file`, and hide deleted
 or ineligible base paths using `view.live.delete_file`. Include committed
@@ -662,7 +666,13 @@ return errors rather than silently revealing base entries. Opening the base
 computes its fingerprint once; attaching more worktrees does not rescan it.
 Checkpoint parent directories must already exist and be outside the base
 snapshot directory. Repeated saves atomically replace the existing checkpoint,
-including on Windows. Atomic replacement does not guarantee power-loss
+including on Windows. Both staging and replacement use the validated canonical
+parent, not the caller's relative or symlink-parent spelling.
+Unicode worktree roots retain the existing JSON string representation;
+non-Unicode roots use tagged Unix bytes or Windows UTF-16 units to preserve
+their exact identity. Existing Unicode-root checkpoints remain readable;
+older readers cannot restore the new non-Unicode representation.
+Atomic replacement does not guarantee power-loss
 durability: file contents are synced before replacement, but the parent
 directory is not synced afterwards. A successful save may be lost after a
 system crash; callers must reconcile or rebuild stale/missing checkpoints.

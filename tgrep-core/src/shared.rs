@@ -43,7 +43,7 @@ impl SharedBase {
     /// but must be rebuilt before they can be used as shared bases.
     pub fn open(index_dir: &Path) -> Result<Self> {
         let index_dir = std::fs::canonicalize(index_dir)?;
-        let reader = HybridIndex::open_reader(&index_dir)?;
+        let reader = Arc::new(IndexReader::open_for_snapshot(&index_dir)?);
         let meta = IndexMeta::load(&index_dir)?;
         if meta.version != crate::meta::INDEX_FORMAT_VERSION
             || !meta.complete
@@ -52,6 +52,13 @@ impl SharedBase {
         {
             return Err(invalid(
                 "shared base requires a complete current-format index with matching coverage metadata",
+            ));
+        }
+        if meta.num_files != reader.num_files() as u64
+            || meta.num_trigrams != reader.num_trigrams() as u64
+        {
+            return Err(invalid(
+                "shared base metadata counts do not match its index sections",
             ));
         }
         if reader.num_files() >= OVERLAY_BIT as usize {
@@ -94,6 +101,8 @@ impl SharedBase {
     /// canonical worktree root. Its parent directory must already exist and
     /// must be outside the base snapshot directory.
     /// Saving does not prune the live overlay or reset its dirty counter.
+    /// Non-Unicode roots are encoded losslessly using platform-native units;
+    /// Unicode roots retain the existing JSON string representation.
     ///
     /// Atomicity refers to replacement visibility, not power-loss durability.
     /// File contents are synced before replacement, but the parent directory
@@ -103,12 +112,23 @@ impl SharedBase {
         if !Arc::ptr_eq(&self.reader, &worktree.reader_arc()) {
             return Err(invalid("worktree no longer uses this shared base"));
         }
+        let destination = self.checkpoint_destination(path)?;
         let checkpoint = OverlayCheckpoint {
             version: OVERLAY_VERSION,
             base_id: self.id,
-            root: canonical_root(&worktree.root)?,
+            root: CheckpointRoot::from_path(&canonical_root(&worktree.root)?)?,
             overlay: OverlayData::capture(&worktree.live)?,
         };
+        checkpoint.persist(&destination)
+    }
+
+    fn checkpoint_destination(&self, path: &Path) -> Result<PathBuf> {
+        let file_name = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "overlay checkpoint path must name a file",
+            )
+        })?;
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -119,17 +139,7 @@ impl SharedBase {
                 "overlay checkpoint must be outside the shared base directory",
             ));
         }
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        {
-            let mut writer = BufWriter::new(temporary.as_file_mut());
-            serde_json::to_writer(&mut writer, &checkpoint)?;
-            writer.flush()?;
-        }
-        temporary.as_file().sync_all()?;
-        // persist overwrites existing files, including on Windows; do not
-        // remove the destination first and create a gap for concurrent readers.
-        temporary.persist(path).map_err(|error| error.error)?;
-        Ok(())
+        Ok(parent.join(file_name))
     }
 
     /// Restore a checkpoint without changing the base or another worktree.
@@ -150,7 +160,7 @@ impl SharedBase {
             ));
         }
         let root = canonical_root(root)?;
-        if checkpoint.root != root {
+        if checkpoint.root != CheckpointRoot::from_path(&root)? {
             return Err(invalid("worktree overlay belongs to a different root"));
         }
         let live = checkpoint.overlay.into_live()?;
@@ -165,8 +175,83 @@ impl SharedBase {
 struct OverlayCheckpoint {
     version: u32,
     base_id: [u8; 32],
-    root: PathBuf,
+    root: CheckpointRoot,
     overlay: OverlayData,
+}
+
+impl OverlayCheckpoint {
+    fn persist(&self, destination: &Path) -> Result<()> {
+        let parent = destination.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "overlay checkpoint destination must have a parent",
+            )
+        })?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        {
+            let mut writer = BufWriter::new(temporary.as_file_mut());
+            serde_json::to_writer(&mut writer, self)?;
+            writer.flush()?;
+        }
+        temporary.as_file().sync_all()?;
+        // Both operations use the validated absolute destination, never the
+        // caller's potentially relative or symlink-parent spelling.
+        // persist overwrites existing files, including on Windows, without
+        // removing the destination first and exposing a gap to readers.
+        temporary
+            .persist(destination)
+            .map_err(|error| error.error)?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum CheckpointRoot {
+    Unicode(String),
+    Native(NativeRoot),
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "encoding",
+    content = "units",
+    rename_all = "kebab-case",
+    deny_unknown_fields
+)]
+enum NativeRoot {
+    UnixBytes(Vec<u8>),
+    WindowsWide(Vec<u16>),
+}
+
+impl CheckpointRoot {
+    fn from_path(path: &Path) -> Result<Self> {
+        if let Some(path) = path.to_str() {
+            return Ok(Self::Unicode(path.to_string()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            Ok(Self::Native(NativeRoot::UnixBytes(
+                path.as_os_str().as_bytes().to_vec(),
+            )))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            Ok(Self::Native(NativeRoot::WindowsWide(
+                path.as_os_str().encode_wide().collect(),
+            )))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "non-Unicode checkpoint roots are unsupported on this platform",
+            )
+            .into())
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -307,4 +392,96 @@ fn validate_trigram(trigram: u32, loc_mask: u8) -> Result<()> {
 
 fn invalid(message: &str) -> Error {
     Error::IndexCorrupted(message.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn base_at(index_dir: &Path) -> SharedBase {
+        SharedBase {
+            reader: Arc::new(IndexReader::empty()),
+            id: [0; 32],
+            index_dir: fs::canonicalize(index_dir).unwrap(),
+        }
+    }
+
+    fn checkpoint_at(root: &Path) -> OverlayCheckpoint {
+        OverlayCheckpoint {
+            version: OVERLAY_VERSION,
+            base_id: [0; 32],
+            root: CheckpointRoot::from_path(&canonical_root(root).unwrap()).unwrap(),
+            overlay: OverlayData {
+                files: Vec::new(),
+                deleted: vec!["removed.rs".to_string()],
+            },
+        }
+    }
+
+    #[test]
+    fn relative_checkpoint_destination_is_pinned_to_its_canonical_parent() {
+        let working_dir = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&working_dir).unwrap();
+        let index_dir = directory.path().join("base");
+        let checkpoint_dir = directory.path().join("checkpoints");
+        fs::create_dir(&index_dir).unwrap();
+        fs::create_dir(&checkpoint_dir).unwrap();
+        let base = base_at(&index_dir);
+        let relative = checkpoint_dir
+            .strip_prefix(&working_dir)
+            .unwrap()
+            .join("overlay.json");
+        assert!(!relative.is_absolute());
+        let destination = base.checkpoint_destination(&relative).unwrap();
+        assert!(destination.is_absolute());
+        assert_eq!(
+            destination,
+            fs::canonicalize(&checkpoint_dir)
+                .unwrap()
+                .join("overlay.json")
+        );
+        checkpoint_at(directory.path())
+            .persist(&destination)
+            .unwrap();
+        assert!(checkpoint_dir.join("overlay.json").is_file());
+    }
+
+    #[test]
+    fn checkpoint_destination_requires_a_filename() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = base_at(directory.path());
+        for path in ["", ".", ".."] {
+            assert!(base.checkpoint_destination(Path::new(path)).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeting_parent_alias_does_not_redirect_checkpoint_into_base() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let index_dir = directory.path().join("base");
+        let checkpoint_dir = directory.path().join("checkpoints");
+        let alias = directory.path().join("alias");
+        fs::create_dir(&index_dir).unwrap();
+        fs::create_dir(&checkpoint_dir).unwrap();
+        let protected = index_dir.join("index.bin");
+        fs::write(&protected, b"base postings").unwrap();
+        symlink(&checkpoint_dir, &alias).unwrap();
+        let base = base_at(&index_dir);
+        let input = alias.join("index.bin");
+        let destination = base.checkpoint_destination(&input).unwrap();
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&index_dir, &alias).unwrap();
+        assert!(base.checkpoint_destination(&input).is_err());
+        checkpoint_at(directory.path())
+            .persist(&destination)
+            .unwrap();
+        assert_eq!(fs::read(&protected).unwrap(), b"base postings");
+        assert!(checkpoint_dir.join("index.bin").is_file());
+        assert_eq!(fs::read_dir(&checkpoint_dir).unwrap().count(), 1);
+    }
 }

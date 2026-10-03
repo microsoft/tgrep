@@ -7,6 +7,7 @@
 //! neither is represented by these content-index checkpoints.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -32,7 +33,7 @@ const OVERLAY_VERSION: u32 = 1;
 pub struct SharedBase {
     reader: Arc<IndexReader>,
     id: [u8; 32],
-    index_dir: PathBuf,
+    directory_id: Arc<same_file::Handle>,
 }
 
 impl SharedBase {
@@ -43,6 +44,7 @@ impl SharedBase {
     /// but must be rebuilt before they can be used as shared bases.
     pub fn open(index_dir: &Path) -> Result<Self> {
         let index_dir = std::fs::canonicalize(index_dir)?;
+        let directory_id = Arc::new(same_file::Handle::from_path(&index_dir)?);
         let reader = Arc::new(IndexReader::open_for_snapshot(&index_dir)?);
         let meta = IndexMeta::load(&index_dir)?;
         if meta.version != crate::meta::INDEX_FORMAT_VERSION
@@ -77,7 +79,7 @@ impl SharedBase {
         Ok(Self {
             reader,
             id,
-            index_dir,
+            directory_id,
         })
     }
 
@@ -99,7 +101,8 @@ impl SharedBase {
     /// Only live postings, masks and tombstones are saved; the base is neither
     /// copied nor modified. The checkpoint is bound to the exact base bytes and
     /// canonical worktree root. Its parent directory must already exist and
-    /// must be outside the base snapshot directory.
+    /// must be outside the base snapshot directory. Publication stays bound to
+    /// the opened directory, even if its original pathname is replaced.
     /// Saving does not prune the live overlay or reset its dirty counter.
     /// Non-Unicode roots are encoded losslessly using platform-native units;
     /// Unicode roots retain the existing JSON string representation.
@@ -122,7 +125,7 @@ impl SharedBase {
         checkpoint.persist(&destination)
     }
 
-    fn checkpoint_destination(&self, path: &Path) -> Result<PathBuf> {
+    fn checkpoint_destination(&self, path: &Path) -> Result<CheckpointDestination> {
         let file_name = path.file_name().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -133,13 +136,7 @@ impl SharedBase {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let parent = std::fs::canonicalize(parent)?;
-        if parent.starts_with(&self.index_dir) {
-            return Err(invalid(
-                "overlay checkpoint must be outside the shared base directory",
-            ));
-        }
-        Ok(parent.join(file_name))
+        CheckpointDestination::open(parent, file_name.to_os_string(), &self.directory_id)
     }
 
     /// Restore a checkpoint without changing the base or another worktree.
@@ -170,6 +167,100 @@ impl SharedBase {
     }
 }
 
+struct CheckpointDestination {
+    file_name: OsString,
+    #[cfg(unix)]
+    directory: cap_std::fs::Dir,
+    #[cfg(windows)]
+    directory: PathBuf,
+    #[cfg(windows)]
+    _guards: Vec<same_file::Handle>,
+}
+
+impl CheckpointDestination {
+    #[cfg(unix)]
+    fn open(parent: &Path, file_name: OsString, base: &same_file::Handle) -> Result<Self> {
+        use cap_std::{ambient_authority, fs::Dir};
+
+        let directory = Dir::open_ambient_dir(parent, ambient_authority())?;
+        let mut ancestor = directory.try_clone()?;
+        let mut identity = same_file::Handle::from_file(ancestor.try_clone()?.into_std_file())?;
+        loop {
+            if &identity == base {
+                return Err(invalid(
+                    "overlay checkpoint must be outside the shared base directory",
+                ));
+            }
+            let parent = ancestor.open_parent_dir(ambient_authority())?;
+            let parent_id = same_file::Handle::from_file(parent.try_clone()?.into_std_file())?;
+            if identity == parent_id {
+                break;
+            }
+            ancestor = parent;
+            identity = parent_id;
+        }
+        Ok(Self {
+            file_name,
+            directory,
+        })
+    }
+
+    #[cfg(windows)]
+    fn open(parent: &Path, file_name: OsString, base: &same_file::Handle) -> Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let directory = std::fs::canonicalize(parent)?;
+        let mut current = PathBuf::new();
+        let mut guards = Vec::new();
+        for component in directory.components() {
+            current.push(component);
+            if matches!(component, Component::Prefix(_)) {
+                continue;
+            }
+            // Windows replacement uses paths. Deny renames/deletion of every
+            // ancestor, then reject links introduced after canonicalization.
+            // Attribute-only access does not enforce
+            // the delete-sharing restriction, so request directory-list access.
+            let handle = std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&current)?;
+            let metadata = handle.metadata()?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(invalid(
+                    "overlay checkpoint parent changed during resolution",
+                ));
+            }
+            let identity = same_file::Handle::from_file(handle)?;
+            if &identity == base {
+                return Err(invalid(
+                    "overlay checkpoint must be outside the shared base directory",
+                ));
+            }
+            guards.push(identity);
+        }
+        Ok(Self {
+            file_name,
+            directory,
+            _guards: guards,
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn open(_parent: &Path, _file_name: OsString, _base: &same_file::Handle) -> Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory-bound overlay checkpoints are unsupported on this platform",
+        )
+        .into())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OverlayCheckpoint {
@@ -180,28 +271,43 @@ struct OverlayCheckpoint {
 }
 
 impl OverlayCheckpoint {
-    fn persist(&self, destination: &Path) -> Result<()> {
-        let parent = destination.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "overlay checkpoint destination must have a parent",
-            )
-        })?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(any(unix, windows))]
+    fn persist(&self, destination: &CheckpointDestination) -> Result<()> {
+        #[cfg(unix)]
+        let mut temporary = {
+            use cap_std::fs::{Permissions, PermissionsExt};
+
+            let temporary = cap_tempfile::TempFile::new(&destination.directory)?;
+            // cap-tempfile defaults to 0666; keep checkpoint contents private.
+            temporary
+                .as_file()
+                .set_permissions(Permissions::from_mode(0o600))?;
+            temporary
+        };
+        #[cfg(windows)]
+        let mut temporary = tempfile::NamedTempFile::new_in(&destination.directory)?;
         {
             let mut writer = BufWriter::new(temporary.as_file_mut());
             serde_json::to_writer(&mut writer, self)?;
             writer.flush()?;
         }
         temporary.as_file().sync_all()?;
-        // Both operations use the validated absolute destination, never the
-        // caller's potentially relative or symlink-parent spelling.
-        // persist overwrites existing files, including on Windows, without
-        // removing the destination first and exposing a gap to readers.
+        #[cfg(unix)]
+        temporary.replace(&destination.file_name)?;
+        #[cfg(windows)]
         temporary
-            .persist(destination)
+            .persist(destination.directory.join(&destination.file_name))
             .map_err(|error| error.error)?;
         Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn persist(&self, _destination: &CheckpointDestination) -> Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "directory-bound overlay checkpoints are unsupported on this platform",
+        )
+        .into())
     }
 }
 
@@ -403,7 +509,7 @@ mod tests {
         SharedBase {
             reader: Arc::new(IndexReader::empty()),
             id: [0; 32],
-            index_dir: fs::canonicalize(index_dir).unwrap(),
+            directory_id: Arc::new(same_file::Handle::from_path(index_dir).unwrap()),
         }
     }
 
@@ -434,13 +540,7 @@ mod tests {
             .join("overlay.json");
         assert!(!relative.is_absolute());
         let destination = base.checkpoint_destination(&relative).unwrap();
-        assert!(destination.is_absolute());
-        assert_eq!(
-            destination,
-            fs::canonicalize(&checkpoint_dir)
-                .unwrap()
-                .join("overlay.json")
-        );
+        assert_eq!(destination.file_name, "overlay.json");
         checkpoint_at(directory.path())
             .persist(&destination)
             .unwrap();
@@ -453,6 +553,79 @@ mod tests {
         let base = base_at(directory.path());
         for path in ["", ".", ".."] {
             assert!(base.checkpoint_destination(Path::new(path)).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renamed_checkpoint_directory_is_not_replaced_by_its_old_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let index_dir = directory.path().join("base");
+        let checkpoint_dir = directory.path().join("checkpoints");
+        let moved_dir = directory.path().join("moved");
+        fs::create_dir(&index_dir).unwrap();
+        fs::create_dir(&checkpoint_dir).unwrap();
+        let base = base_at(&index_dir);
+        let destination = base
+            .checkpoint_destination(&checkpoint_dir.join("overlay.json"))
+            .unwrap();
+
+        fs::rename(&checkpoint_dir, &moved_dir).unwrap();
+        fs::create_dir(&checkpoint_dir).unwrap();
+        fs::write(
+            checkpoint_dir.join("overlay.json"),
+            b"replacement directory",
+        )
+        .unwrap();
+        checkpoint_at(directory.path())
+            .persist(&destination)
+            .unwrap();
+        assert!(moved_dir.join("overlay.json").is_file());
+        assert_eq!(
+            fs::read(checkpoint_dir.join("overlay.json")).unwrap(),
+            b"replacement directory"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn checkpoint_directory_and_ancestors_cannot_be_renamed_during_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let index_dir = directory.path().join("base");
+        let ancestor = directory.path().join("ancestor");
+        let checkpoint_dir = ancestor.join("checkpoints");
+        fs::create_dir(&index_dir).unwrap();
+        fs::create_dir_all(&checkpoint_dir).unwrap();
+        let base = base_at(&index_dir);
+        let destination = base
+            .checkpoint_destination(&checkpoint_dir.join("overlay.json"))
+            .unwrap();
+        for path in [&ancestor, &checkpoint_dir] {
+            let error = fs::rename(path, path.with_extension("moved")).unwrap_err();
+            assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+        }
+        checkpoint_at(directory.path())
+            .persist(&destination)
+            .unwrap();
+        assert!(checkpoint_dir.join("overlay.json").is_file());
+        drop(destination);
+        fs::rename(&checkpoint_dir, checkpoint_dir.with_extension("moved")).unwrap();
+        fs::rename(&ancestor, ancestor.with_extension("moved")).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_rejects_a_renamed_base_and_its_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let index_dir = directory.path().join("base");
+        let moved_dir = directory.path().join("moved-base");
+        fs::create_dir_all(index_dir.join("child")).unwrap();
+        let base = base_at(&index_dir);
+        fs::rename(&index_dir, &moved_dir).unwrap();
+        for parent in [&moved_dir, &moved_dir.join("child")] {
+            assert!(
+                base.checkpoint_destination(&parent.join("overlay.json"))
+                    .is_err()
+            );
         }
     }
 
@@ -503,5 +676,46 @@ mod tests {
         assert_eq!(fs::read(&protected).unwrap(), b"base postings");
         assert!(checkpoint_dir.join("index.bin").is_file());
         assert_eq!(fs::read_dir(&checkpoint_dir).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_canonical_parent_with_base_symlink_does_not_redirect_publication() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for destination_is_directory in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let index_dir = directory.path().join("base");
+            let checkpoint_dir = directory.path().join("checkpoints");
+            let moved_dir = directory.path().join("moved");
+            fs::create_dir(&index_dir).unwrap();
+            fs::create_dir(&checkpoint_dir).unwrap();
+            let protected = index_dir.join("index.bin");
+            fs::write(&protected, b"base postings").unwrap();
+            if destination_is_directory {
+                fs::create_dir(checkpoint_dir.join("index.bin")).unwrap();
+            }
+            let base = base_at(&index_dir);
+            let destination = base
+                .checkpoint_destination(&checkpoint_dir.join("index.bin"))
+                .unwrap();
+
+            fs::rename(&checkpoint_dir, &moved_dir).unwrap();
+            symlink(&index_dir, &checkpoint_dir).unwrap();
+            assert!(
+                base.checkpoint_destination(&checkpoint_dir.join("index.bin"))
+                    .is_err()
+            );
+            let result = checkpoint_at(directory.path()).persist(&destination);
+            assert_eq!(result.is_err(), destination_is_directory);
+            assert_eq!(fs::read(&protected).unwrap(), b"base postings");
+            assert_eq!(fs::read_dir(&index_dir).unwrap().count(), 1);
+            assert_eq!(fs::read_dir(&moved_dir).unwrap().count(), 1);
+            if !destination_is_directory {
+                let metadata = fs::metadata(moved_dir.join("index.bin")).unwrap();
+                assert!(metadata.is_file());
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            }
+        }
     }
 }

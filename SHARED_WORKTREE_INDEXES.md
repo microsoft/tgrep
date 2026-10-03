@@ -267,10 +267,14 @@ indexing:
 
 Shared-base validation rejects mismatched empty lookup/posting sections and
 metadata counts inconsistent with the opened sections, while allowing empty
-indexes and short files. Checkpoint staging and replacement use the same
-validated canonical parent. Root identities preserve the existing JSON string
-encoding for Unicode paths and use tagged platform-native units for non-Unicode
-Unix/Windows paths; older readers reject the latter representation.
+indexes and short files. Checkpoint destinations exclude the base and its
+descendants by directory identity, even if the base has been renamed. Unix
+staging, replacement, and cleanup are relative to an open parent-directory
+handle; Windows holds non-delete-sharing handles on the canonical parent and
+all its ancestors until publication completes. A renamed/replaced pathname
+cannot redirect publication into the base. Root identities preserve the existing
+JSON string encoding for Unicode paths and use tagged platform-native units for
+non-Unicode Unix/Windows paths; older readers reject the latter representation.
 
 Merge the foundation independently once its normal review and checks are
 satisfied; do not expand it into the entire feature. Keep follow-up work in

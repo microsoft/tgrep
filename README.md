@@ -666,8 +666,11 @@ return errors rather than silently revealing base entries. Opening the base
 computes its fingerprint once; attaching more worktrees does not rescan it.
 Checkpoint parent directories must already exist and be outside the base
 snapshot directory. Repeated saves atomically replace the existing checkpoint,
-including on Windows. Both staging and replacement use the validated canonical
-parent, not the caller's relative or symlink-parent spelling.
+including on Windows. Base-directory exclusion checks directory identities,
+not just pathname prefixes. On Unix, staging, replacement, and cleanup use the
+opened parent directory handle. On Windows, open handles prevent renaming or
+deleting the canonical parent and its ancestors until publication finishes.
+Replacing a parent pathname cannot redirect a save into the shared base.
 Unicode worktree roots retain the existing JSON string representation;
 non-Unicode roots use tagged Unix bytes or Windows UTF-16 units to preserve
 their exact identity. Existing Unicode-root checkpoints remain readable;

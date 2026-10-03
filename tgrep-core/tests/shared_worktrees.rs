@@ -203,6 +203,83 @@ fn checkpoint_contains_only_overlay_and_never_changes_base_files() {
 }
 
 #[test]
+fn repeated_saves_replace_existing_checkpoint_with_latest_overlay() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = build_base(
+        root.path(),
+        &[("changed.rs", b"original"), ("deleted.rs", b"original")],
+    );
+    let base = SharedBase::open(directory.path()).unwrap();
+    let mut worktree = base.create_worktree(root.path()).unwrap();
+    let checkpoint = root.path().join("overlay.json");
+    worktree.live.upsert_file("changed.rs", b"first_revision");
+    base.save_overlay(&worktree, &checkpoint).unwrap();
+    let first_bytes = fs::read(&checkpoint).unwrap();
+
+    worktree.live.upsert_file("changed.rs", b"second_revision");
+    worktree.live.delete_file("deleted.rs");
+    worktree.live.upsert_file("new.rs", b"second_revision");
+    base.save_overlay(&worktree, &checkpoint).unwrap();
+    assert_ne!(fs::read(&checkpoint).unwrap(), first_bytes);
+    let restored = base.restore_worktree(root.path(), &checkpoint).unwrap();
+    assert!(candidates(&restored, "first_revision", false).is_empty());
+    assert_eq!(
+        candidates(&restored, "second_revision", false),
+        ["changed.rs", "new.rs"]
+    );
+    assert!(restored.live.is_deleted("deleted.rs"));
+
+    worktree.live.delete_file("changed.rs");
+    worktree.live.delete_file("new.rs");
+    base.save_overlay(&worktree, &checkpoint).unwrap();
+    let restored = base.restore_worktree(root.path(), &checkpoint).unwrap();
+    assert_eq!(restored.num_files(), 0);
+    assert!(restored.live.is_deleted("changed.rs"));
+    assert!(restored.live.is_deleted("deleted.rs"));
+    assert!(restored.live.is_deleted("new.rs"));
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn locked_checkpoint_preserves_previous_save_and_allows_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let directory = build_base(root.path(), &[("changed.rs", b"original")]);
+    let base = SharedBase::open(directory.path()).unwrap();
+    let mut worktree = base.create_worktree(root.path()).unwrap();
+    let checkpoint = root.path().join("overlay.json");
+    worktree.live.upsert_file("changed.rs", b"first_revision");
+    base.save_overlay(&worktree, &checkpoint).unwrap();
+    let first_bytes = fs::read(&checkpoint).unwrap();
+    let locked = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&checkpoint)
+        .unwrap();
+
+    worktree.live.upsert_file("changed.rs", b"second_revision");
+    assert!(base.save_overlay(&worktree, &checkpoint).is_err());
+    drop(locked);
+    assert_eq!(fs::read(&checkpoint).unwrap(), first_bytes);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    let restored = base.restore_worktree(root.path(), &checkpoint).unwrap();
+    assert_eq!(
+        candidates(&restored, "first_revision", false),
+        ["changed.rs"]
+    );
+
+    base.save_overlay(&worktree, &checkpoint).unwrap();
+    let restored = base.restore_worktree(root.path(), &checkpoint).unwrap();
+    assert_eq!(
+        candidates(&restored, "second_revision", false),
+        ["changed.rs"]
+    );
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn restored_changes_can_be_reverted_to_base_without_affecting_other_worktrees() {
     let root = tempfile::tempdir().unwrap();
     let directory = build_base(

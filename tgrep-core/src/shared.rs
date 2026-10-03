@@ -94,6 +94,11 @@ impl SharedBase {
     /// canonical worktree root. Its parent directory must already exist and
     /// must be outside the base snapshot directory.
     /// Saving does not prune the live overlay or reset its dirty counter.
+    ///
+    /// Atomicity refers to replacement visibility, not power-loss durability.
+    /// File contents are synced before replacement, but the parent directory
+    /// is not synced afterwards. Even a successful save may be lost after a
+    /// system crash; callers must reconcile or rebuild stale/missing checkpoints.
     pub fn save_overlay(&self, worktree: &HybridIndex, path: &Path) -> Result<()> {
         if !Arc::ptr_eq(&self.reader, &worktree.reader_arc()) {
             return Err(invalid("worktree no longer uses this shared base"));
@@ -121,6 +126,8 @@ impl SharedBase {
             writer.flush()?;
         }
         temporary.as_file().sync_all()?;
+        // persist overwrites existing files, including on Windows; do not
+        // remove the destination first and create a gap for concurrent readers.
         temporary.persist(path).map_err(|error| error.error)?;
         Ok(())
     }

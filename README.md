@@ -657,7 +657,11 @@ and postings. Wrong-base, wrong-root, missing, and malformed checkpoints
 return errors rather than silently revealing base entries. Opening the base
 computes its fingerprint once; attaching more worktrees does not rescan it.
 Checkpoint parent directories must already exist and be outside the base
-snapshot directory.
+snapshot directory. Repeated saves atomically replace the existing checkpoint,
+including on Windows. Atomic replacement does not guarantee power-loss
+durability: file contents are synced before replacement, but the parent
+directory is not synced afterwards. A successful save may be lost after a
+system crash; callers must reconcile or rebuild stale/missing checkpoints.
 
 This API does **not yet** discover Git deltas, watch worktrees, share content
 caches, or provide multi-worktree CLI/server registration. Callers must

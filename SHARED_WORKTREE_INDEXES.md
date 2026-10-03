@@ -267,7 +267,10 @@ indexing:
 
 Shared-base validation rejects mismatched empty lookup/posting sections and
 metadata counts inconsistent with the opened sections, while allowing empty
-indexes and short files. Checkpoint destinations exclude the base and its
+indexes and short files. Shared snapshots require aligned, contiguous posting
+ranges covering the entire postings section, valid trigram/file IDs, and
+nonzero location masks. Checkpoint destinations reject trailing separators and
+current-directory suffixes, and exclude the base and its
 descendants by directory identity, even if the base has been renamed. Unix
 staging, replacement, and cleanup are relative to an open parent-directory
 handle; Windows holds non-delete-sharing handles on the canonical parent and

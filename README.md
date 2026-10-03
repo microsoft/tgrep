@@ -646,7 +646,10 @@ base index.
 
 Shared-base opening rejects mismatched empty lookup/posting sections and
 metadata counts inconsistent with the opened index. Legitimately empty
-indexes and files too short to produce trigrams remain supported.
+indexes and files too short to produce trigrams remain supported. Shared
+snapshots also require aligned, contiguous posting ranges covering `index.bin`,
+valid trigram/file IDs, and nonzero location masks; ordinary readers retain
+their existing validation behavior.
 
 The caller must populate each overlay before exposing it to searches:
 index whole changed/new files using `view.live.upsert_file`, and hide deleted
@@ -671,6 +674,8 @@ not just pathname prefixes. On Unix, staging, replacement, and cleanup use the
 opened parent directory handle. On Windows, open handles prevent renaming or
 deleting the canonical parent and its ancestors until publication finishes.
 Replacing a parent pathname cannot redirect a save into the shared base.
+Paths with trailing separators or `/.` are rejected rather than normalized
+into filenames.
 Unicode worktree roots retain the existing JSON string representation;
 non-Unicode roots use tagged Unix bytes or Windows UTF-16 units to preserve
 their exact identity. Existing Unicode-root checkpoints remain readable;

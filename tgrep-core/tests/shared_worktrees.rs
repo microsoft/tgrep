@@ -538,6 +538,113 @@ fn incomplete_or_legacy_metadata_does_not_change_existing_open_behavior() {
 }
 
 #[test]
+fn directory_shaped_checkpoint_paths_do_not_replace_existing_files() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = build_base(root.path(), &[("base.rs", b"original")]);
+    let base = SharedBase::open(directory.path()).unwrap();
+    let mut worktree = base.create_worktree(root.path()).unwrap();
+    let checkpoint = root.path().join("overlay.json");
+    base.save_overlay(&worktree, &checkpoint).unwrap();
+    let before = fs::read(&checkpoint).unwrap();
+    worktree.live.upsert_file("new.rs", b"changed overlay");
+    #[cfg(not(windows))]
+    let suffixes = ["/", "/.", "/./"];
+    #[cfg(windows)]
+    let suffixes = ["/", "/.", "/./", "\\", "\\.", "\\.\\"];
+    for suffix in suffixes {
+        let mut malformed = checkpoint.as_os_str().to_os_string();
+        malformed.push(suffix);
+        assert!(
+            base.save_overlay(&worktree, Path::new(&malformed)).is_err(),
+            "accepted directory-shaped suffix {suffix:?}"
+        );
+        assert_eq!(fs::read(&checkpoint).unwrap(), before);
+    }
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn shared_base_rejects_unaligned_overlapping_and_gapped_posting_ranges() {
+    let root = tempfile::tempdir().unwrap();
+    for (kind, entry, offset) in [
+        ("unaligned", 0, 1_u64),
+        ("overlapping", 1, 0),
+        ("gapped", 0, 6),
+    ] {
+        let directory = build_base(root.path(), &[("base.rs", b"original")]);
+        let mut lookup = fs::read(directory.path().join("lookup.bin")).unwrap();
+        let start = entry * 16 + 4;
+        lookup[start..start + 8].copy_from_slice(&offset.to_le_bytes());
+        fs::write(directory.path().join("lookup.bin"), lookup).unwrap();
+        let ordinary = IndexReader::open(directory.path()).unwrap();
+        assert!(ordinary.validate_lookup().is_ok());
+        assert!(SharedBase::open(directory.path()).is_err(), "{kind}");
+    }
+}
+
+#[test]
+fn shared_base_rejects_unreferenced_posting_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    for extra_bytes in [1, 6] {
+        let directory = build_base(root.path(), &[("base.rs", b"original")]);
+        let mut postings = fs::read(directory.path().join("index.bin")).unwrap();
+        postings.extend_from_within(..extra_bytes);
+        fs::write(directory.path().join("index.bin"), postings).unwrap();
+        assert!(SharedBase::open(directory.path()).is_err());
+    }
+}
+
+#[test]
+fn shared_base_rejects_invalid_posting_ids_and_location_masks() {
+    let root = tempfile::tempdir().unwrap();
+    for last in [false, true] {
+        for replacement in [
+            PostingEntry {
+                file_id: 2,
+                loc_mask: 1,
+                next_mask: 0,
+            },
+            PostingEntry {
+                file_id: u32::MAX,
+                loc_mask: 1,
+                next_mask: 0,
+            },
+            PostingEntry {
+                file_id: 0,
+                loc_mask: 0,
+                next_mask: 0,
+            },
+        ] {
+            let directory = build_base(
+                root.path(),
+                &[("first.rs", b"original"), ("second.rs", b"original")],
+            );
+            let mut postings = fs::read(directory.path().join("index.bin")).unwrap();
+            let start = if last { postings.len() - 6 } else { 0 };
+            postings[start..start + 6].copy_from_slice(&replacement.encode());
+            fs::write(directory.path().join("index.bin"), postings).unwrap();
+            let ordinary = IndexReader::open(directory.path()).unwrap();
+            assert!(ordinary.validate_lookup().is_ok());
+            assert!(
+                SharedBase::open(directory.path()).is_err(),
+                "accepted {replacement:?} at byte offset {start}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_base_rejects_out_of_range_trigrams() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = build_base(root.path(), &[("base.rs", b"original")]);
+    let mut lookup = fs::read(directory.path().join("lookup.bin")).unwrap();
+    let start = lookup.len() - 16;
+    lookup[start..start + 4].copy_from_slice(&0x01000000_u32.to_le_bytes());
+    fs::write(directory.path().join("lookup.bin"), lookup).unwrap();
+    assert!(SharedBase::open(directory.path()).is_err());
+}
+
+#[test]
 fn shared_base_rejects_mismatched_empty_sections_even_with_zero_metadata_count() {
     let root = tempfile::tempdir().unwrap();
     for name in ["lookup.bin", "index.bin"] {

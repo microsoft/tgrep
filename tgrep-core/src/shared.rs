@@ -101,7 +101,8 @@ impl SharedBase {
     /// Only live postings, masks and tombstones are saved; the base is neither
     /// copied nor modified. The checkpoint is bound to the exact base bytes and
     /// canonical worktree root. Its parent directory must already exist and
-    /// must be outside the base snapshot directory. Publication stays bound to
+    /// must be outside the base snapshot directory. Trailing separators and
+    /// current-directory suffixes are rejected. Publication stays bound to
     /// the opened directory, even if its original pathname is replaced.
     /// Saving does not prune the live overlay or reset its dirty counter.
     /// Non-Unicode roots are encoded losslessly using platform-native units;
@@ -126,12 +127,20 @@ impl SharedBase {
     }
 
     fn checkpoint_destination(&self, path: &Path) -> Result<CheckpointDestination> {
-        let file_name = path.file_name().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "overlay checkpoint path must name a file",
-            )
-        })?;
+        let bytes = path.as_os_str().as_encoded_bytes();
+        let suffix = bytes.strip_suffix(b".").unwrap_or(bytes);
+        let names_directory = suffix
+            .last()
+            .is_some_and(|byte| std::path::is_separator(char::from(*byte)));
+        let file_name = path
+            .file_name()
+            .filter(|_| !names_directory)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "overlay checkpoint path must name a file",
+                )
+            })?;
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

@@ -57,6 +57,7 @@ impl IndexReader {
             let (_, bytes) = self.nth_trigram_raw(i).ok_or_else(|| {
                 format!("shared base lookup entry {i} has an invalid posting range")
             })?;
+            let mut previous_file_id = None;
             for raw in bytes.as_chunks::<POSTING_ENTRY_SIZE>().0 {
                 let posting = PostingEntry::decode(raw);
                 if self.file_path(posting.file_id).is_none() {
@@ -65,12 +66,18 @@ impl IndexReader {
                         posting.file_id
                     ));
                 }
+                if previous_file_id.is_some_and(|previous| posting.file_id <= previous) {
+                    return Err(format!(
+                        "shared base lookup entry {i} has non-increasing posting file IDs"
+                    ));
+                }
                 if posting.loc_mask == 0 {
                     return Err(format!(
                         "shared base lookup entry {i} has a zero location mask for file_id {}",
                         posting.file_id
                     ));
                 }
+                previous_file_id = Some(posting.file_id);
             }
             expected_offset += bytes.len() as u64;
         }

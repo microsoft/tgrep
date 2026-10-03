@@ -648,8 +648,9 @@ Shared-base opening rejects mismatched empty lookup/posting sections and
 metadata counts inconsistent with the opened index. Legitimately empty
 indexes and files too short to produce trigrams remain supported. Shared
 snapshots also require aligned, contiguous posting ranges covering `index.bin`,
-valid trigram/file IDs, and nonzero location masks; ordinary readers retain
-their existing validation behavior.
+valid trigrams, strictly increasing valid file IDs within each posting list,
+and nonzero location masks; ordinary readers retain their existing validation
+behavior.
 
 The caller must populate each overlay before exposing it to searches:
 index whole changed/new files using `view.live.upsert_file`, and hide deleted

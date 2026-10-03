@@ -645,6 +645,27 @@ fn shared_base_rejects_out_of_range_trigrams() {
 }
 
 #[test]
+fn shared_base_rejects_duplicate_or_descending_posting_ids() {
+    let root = tempfile::tempdir().unwrap();
+    for ids in [[0_u32, 0_u32], [1, 1], [1, 0]] {
+        let directory = build_base(root.path(), &[("first.rs", b"abc"), ("second.rs", b"abc")]);
+        let mut postings = fs::read(directory.path().join("index.bin")).unwrap();
+        assert_eq!(postings.len(), 12);
+        postings[..4].copy_from_slice(&ids[0].to_le_bytes());
+        postings[6..10].copy_from_slice(&ids[1].to_le_bytes());
+        postings[5] = 1;
+        postings[11] = 0xff;
+        fs::write(directory.path().join("index.bin"), postings).unwrap();
+        let ordinary = IndexReader::open(directory.path()).unwrap();
+        assert!(ordinary.validate_lookup().is_ok());
+        assert!(
+            SharedBase::open(directory.path()).is_err(),
+            "accepted non-increasing IDs {ids:?} with distinct masks"
+        );
+    }
+}
+
+#[test]
 fn shared_base_rejects_mismatched_empty_sections_even_with_zero_metadata_count() {
     let root = tempfile::tempdir().unwrap();
     for name in ["lookup.bin", "index.bin"] {

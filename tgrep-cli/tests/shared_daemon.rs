@@ -1085,6 +1085,7 @@ fn cli_preserves_null_id_and_matching_id_queue_errors() {
             loop {
                 match listener.accept() {
                     Ok((mut connection, _)) => {
+                        connection.set_nonblocking(false).unwrap();
                         connection
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .unwrap();
@@ -1188,8 +1189,12 @@ fn wrong_protocol_port_and_incompatible_roots_profiles_fail_closed() {
         loop {
             match listener.accept() {
                 Ok((mut connection, _)) => {
+                    connection.set_nonblocking(false).unwrap();
                     connection
                         .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    connection
+                        .set_write_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
                     let mut line = String::new();
                     BufReader::new(connection.try_clone().unwrap())

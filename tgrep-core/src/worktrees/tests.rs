@@ -804,16 +804,108 @@ fn snapshot_candidate_opens_reject_directory_link_swaps() {
         .read_to_end(&mut bytes)
         .unwrap();
     assert_eq!(bytes, b"inside needle");
+    let before = view.status().unwrap();
 
     let outside = fixture._temp.path().join("outside");
     write(&outside, "file.txt", b"outside secret");
     fs::rename(fixture.root.join("dir"), fixture.root.join("saved")).unwrap();
     crate::rooted::tests::link_directory(&outside, &fixture.root.join("dir"));
+    assert!(matches!(
+        view.with_snapshot(|snapshot| snapshot.open_file("dir/file.txt")),
+        Err(WorktreeError::Io(_))
+    ));
+    let after = view.status().unwrap();
+    assert!(!after.ready);
+    assert!(after.full_required);
+    assert!(after.epoch > before.epoch);
+    assert_eq!(after.published_epoch, before.published_epoch);
+    assert!(view.refresh().unwrap().full);
+    assert!(candidates(&view, "outside secret").is_empty());
+    assert_eq!(matches(&view, "inside needle"), ["saved/file.txt"]);
+}
+
+#[test]
+fn snapshot_open_failures_require_full_repair_even_if_the_callback_ignores_them() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"inside needle");
+    write(&fixture.root, "other.txt", b"old marker");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let before = view.status().unwrap();
+    let other = fixture.root.join("other.txt");
+    let modified = fs::metadata(&other).unwrap().modified().unwrap();
+    write(&fixture.root, "other.txt", b"new marker");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&other)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    fs::remove_file(fixture.root.join("file.txt")).unwrap();
+
+    let error = view
+        .with_snapshot(|snapshot| {
+            assert!(snapshot.open_file("file.txt").is_err());
+            assert!(snapshot.open_file("second-missing.txt").is_err());
+            assert!(snapshot.open_file("other.txt").is_ok());
+            "a swallowed error must not publish this callback result"
+        })
+        .unwrap_err();
     assert!(
-        view.with_snapshot(|snapshot| snapshot.open_file("dir/file.txt"))
-            .unwrap()
-            .is_err()
+        matches!(&error, WorktreeError::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
     );
+    assert!(error.to_string().contains("file.txt"));
+    assert!(!error.to_string().contains("second-missing.txt"));
+    let after = view.status().unwrap();
+    assert!(!after.ready);
+    assert!(after.full_required);
+    assert_eq!(after.pending_paths, 0);
+    assert!(after.epoch > before.epoch);
+    assert_eq!(after.published_epoch, before.published_epoch);
+    assert!(matches!(
+        view.with_snapshot(|_| panic!("not-ready callbacks must not run")),
+        Err(WorktreeError::NotReady)
+    ));
+
+    view.invalidate_path(Path::new("unrelated.txt")).unwrap();
+    assert!(view.refresh().unwrap().full);
+    assert!(candidates(&view, "inside needle").is_empty());
+    assert_eq!(matches(&view, "new marker"), ["other.txt"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshot_fifo_swaps_invalidate_readiness_without_blocking() {
+    if !crate::rooted::tests::bounded_child(
+        "worktrees::tests::snapshot_fifo_swaps_invalidate_readiness_without_blocking",
+    ) {
+        return;
+    }
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"inside needle");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let path = fixture.root.join("file.txt");
+    fs::remove_file(&path).unwrap();
+    crate::rooted::tests::make_fifo(&path);
+    assert!(matches!(
+        view.with_snapshot(|snapshot| {
+            assert!(snapshot.open_file("file.txt").is_err());
+        }),
+        Err(WorktreeError::Io(_))
+    ));
+    assert!(!view.status().unwrap().ready);
+    assert!(view.status().unwrap().full_required);
+    assert!(matches!(
+        view.with_snapshot(|_| ()),
+        Err(WorktreeError::NotReady)
+    ));
+    fs::remove_file(&path).unwrap();
+    write(&fixture.root, "file.txt", b"repaired needle");
+    assert!(view.refresh().unwrap().full);
+    assert_eq!(matches(&view, "repaired needle"), ["file.txt"]);
 }
 
 #[cfg(unix)]

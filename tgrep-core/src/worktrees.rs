@@ -601,7 +601,8 @@ impl WorktreeView {
     /// Do not reenter this view (including invalidation) from the closure.
     /// Final matching must use `snapshot.open_file()` or a private versioned
     /// cache. Root verification brackets the callback, including empty results;
-    /// failure closes readiness and requires full reconciliation.
+    /// root or candidate-open failure closes readiness and requires full
+    /// reconciliation, even if the callback handles the candidate's error.
     pub fn with_snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
         let mut control = self
             .control
@@ -615,13 +616,25 @@ impl WorktreeView {
             .state
             .read()
             .map_err(|_| WorktreeError::Synchronization)?;
+        let open_error = Mutex::new(None);
         let result = read(WorktreeSnapshot {
             root: &self.root,
             rooted: &self.files,
             state: &state,
             epoch: control.epoch,
+            open_error: &open_error,
         });
         self.verify_snapshot_root(&mut control)?;
+        let failure = match open_error.into_inner() {
+            Ok(error) => error.map(WorktreeError::Io),
+            Err(_) => Some(WorktreeError::Synchronization),
+        };
+        if let Some(error) = failure {
+            control.full = true;
+            control.hints.clear();
+            control.invalidate()?;
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -703,6 +716,7 @@ pub struct WorktreeSnapshot<'a> {
     rooted: &'a RootedDir,
     state: &'a State,
     epoch: u64,
+    open_error: &'a Mutex<Option<std::io::Error>>,
 }
 
 impl WorktreeSnapshot<'_> {
@@ -714,8 +728,23 @@ impl WorktreeSnapshot<'_> {
     /// The returned read-only regular-file handle may outlive this guard, but
     /// does not freeze file contents. Bound reads and check the final snapshot
     /// epoch before publishing a result assembled outside the guard.
+    /// An open failure also makes `with_snapshot` fail and invalidate readiness.
+    /// Report later handle-read failures through the view after leaving the guard.
     pub fn open_file(&self, relative: &str) -> std::io::Result<File> {
-        self.rooted.open_file(Path::new(relative))
+        let result = self.rooted.open_file(Path::new(relative));
+        if let Err(error) = &result {
+            let mut first_error = self
+                .open_error
+                .lock()
+                .map_err(|_| std::io::Error::other("snapshot error lock is poisoned"))?;
+            if first_error.is_none() {
+                *first_error = Some(std::io::Error::new(
+                    error.kind(),
+                    format!("cannot open worktree candidate {relative:?}: {error}"),
+                ));
+            }
+        }
+        result
     }
 
     pub fn epoch(&self) -> u64 {

@@ -406,9 +406,14 @@ comes from complete walker filename membership, not posting lists.
 retained reader, never from a new registration of the root pathname.
 `with_snapshot` checks pinned-root identity before and after every callback,
 including empty/file-only queries; failure invalidates readiness and queues full
-reconciliation. A callback may return the owned handle for bounded matching
+reconciliation. Candidate-open failures are latched and returned as an outer
+I/O error, with readiness invalidated before releasing the guard even if the
+callback swallowed the error or subsequently opened another file successfully.
+A callback may return the owned handle for bounded matching
 outside the guard; reenter `with_snapshot` and verify the original epoch before
 publishing buffered results. File contents are not frozen by these handles.
+Later handle-read errors remain caller-owned: report them and call
+`invalidate_all()` after leaving the guard, without publishing partial results.
 Hidden files
 are included in canonical coverage and filtered at query time, including Windows
 attributes and explicit hidden-directory scopes. Existing walker rules determine

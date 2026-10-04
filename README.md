@@ -776,9 +776,14 @@ Ordinary full scans retain native paths and remain available as the fallback.
 `with_snapshot` holds readiness and overlay guards through candidate-ID
 resolution, and verifies the pinned root before and after the callback, even for
 empty/file-only results. Verification failure closes readiness and queues full
-repair. No live IDs or mutable `HybridIndex` escape. A callback may return an
+repair. Candidate-open failures are recorded too: `with_snapshot` returns an
+outer I/O error and invalidates readiness before releasing the guard, even if
+the callback swallowed the inner error or subsequently opened another file.
+No live IDs or mutable `HybridIndex` escape. A callback may return an
 owned read-only file handle for bounded matching outside the guard; before
 publishing buffered results, reenter `with_snapshot` and reject a changed epoch.
+Later reads through that handle remain caller-owned: report read errors and call
+`invalidate_all()` after leaving the guard rather than publishing partial results.
 Do not reenter the view from its closure. A refresh acknowledges processed hints,
 **not an atomic filesystem snapshot**. Periodic full reconciliation remains necessary; no-watch
 callers must explicitly refresh, and final reads can race subsequent edits.

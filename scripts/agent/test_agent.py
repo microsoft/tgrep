@@ -425,11 +425,36 @@ class RuntimeTests(unittest.TestCase):
                 self.assertTrue(proc.stdout.closed)
                 self.assertTrue(proc.stderr.closed)
 
+    def test_permission_error_waits_for_exit_before_returning_truncated_result(self):
+        with self.truncating_query() as proc:
+            actual_wait = proc.wait
+
+            def exit_during_wait(timeout=None):
+                if proc.returncode is None:
+                    self.assertEqual(timeout, 0.25)
+                    # Keep the child live through EPERM, then exit as the wait starts.
+                    proc.kill()
+                return actual_wait(timeout=timeout)
+
+            with patch.object(runtime.os, "killpg", side_effect=PermissionError("exiting group")):
+                with patch.object(proc, "wait", side_effect=exit_during_wait) as wait:
+                    result = self.search("find_files", max_results=1)
+                    wait.assert_any_call(timeout=0.25)
+            self.assertTrue(result["truncated"])
+            self.assertEqual(result["results"], [{"path": "a"}])
+            self.assertIsNotNone(proc.returncode)
+            self.assertTrue(proc.stdout.closed)
+            self.assertTrue(proc.stderr.closed)
+
     def test_permission_error_for_live_query_is_not_ignored(self):
         with self.truncating_query() as proc:
-            with patch.object(runtime.os, "killpg", side_effect=PermissionError("signal denied")):
-                with self.assertRaisesRegex(PermissionError, "signal denied"):
-                    self.search("find_files", max_results=1)
+            error = PermissionError("signal denied")
+            with patch.object(runtime.os, "killpg", side_effect=error):
+                with patch.object(proc, "wait", wraps=proc.wait) as wait:
+                    with self.assertRaisesRegex(PermissionError, "signal denied") as raised:
+                        self.search("find_files", max_results=1)
+                    self.assertIs(raised.exception, error)
+                    wait.assert_called_once_with(timeout=0.25)
             self.assertIsNone(proc.poll())
             self.assertTrue(proc.stdout.closed)
             self.assertTrue(proc.stderr.closed)

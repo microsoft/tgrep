@@ -322,11 +322,13 @@ class Runtime:
                         os.killpg(proc.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    except PermissionError:
-                        # macOS can return EPERM for an exited process group.
-                        # Ignore it only if our child really finished in the race.
-                        if proc.poll() is None:
-                            raise
+                    except PermissionError as error:
+                        # Allow a short exit race without hiding a denied signal
+                        # to a child that remains alive.
+                        try:
+                            proc.wait(timeout=0.25)
+                        except subprocess.TimeoutExpired:
+                            raise error
                 proc.wait()
             finally:
                 proc.stdout.close()

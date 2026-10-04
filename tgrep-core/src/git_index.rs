@@ -114,39 +114,66 @@ fn membership_hash(path: &str) -> u64 {
 /// Best-effort metadata-directory hint for cheap discovery probes. Callers that
 /// establish repository identity or authorize a scope must validate with Git.
 pub fn git_dir(repo_root: &Path) -> Option<PathBuf> {
+    read_git_dir(repo_root).ok()
+}
+
+fn metadata_path(mut bytes: &[u8]) -> std::io::Result<&Path> {
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    if bytes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "empty Git metadata path",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(Path::new(std::ffi::OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes)
+            .map(Path::new)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+
+fn read_git_dir(repo_root: &Path) -> std::io::Result<PathBuf> {
     let dot_git = repo_root.join(".git");
-    let meta = std::fs::metadata(&dot_git).ok()?;
+    let meta = std::fs::metadata(&dot_git)?;
     if meta.is_dir() {
-        return Some(dot_git);
+        return Ok(dot_git);
     }
-    let contents = std::fs::read_to_string(&dot_git).ok()?;
-    let target = contents.strip_prefix("gitdir:")?.trim();
-    if target.is_empty() {
-        return None;
+    let contents = std::fs::read(&dot_git)?;
+    let target = contents.strip_prefix(b"gitdir: ").ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid worktree gitfile")
+    })?;
+    Ok(repo_root.join(metadata_path(target)?))
+}
+
+fn read_common_dir(git_dir: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::read(git_dir.join("commondir")) {
+        Ok(target) => Ok(git_dir.join(metadata_path(&target)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(git_dir.to_path_buf()),
+        Err(error) => Err(error),
     }
-    let path = Path::new(target);
-    Some(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        repo_root.join(path)
-    })
+}
+
+/// Read native worktree/common-directory paths without spawning Git.
+///
+/// These are not canonical identities. Authority checks must canonicalize and
+/// compare them against a repository previously validated with Git.
+pub fn read_repository_dirs(repo_root: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+    let git_dir = read_git_dir(repo_root)?;
+    let common_dir = read_common_dir(&git_dir)?;
+    Ok((git_dir, common_dir))
 }
 
 /// The repository metadata directory shared by all linked worktrees.
 pub(crate) fn common_git_dir(git_dir: &Path) -> PathBuf {
-    let Ok(target) = std::fs::read_to_string(git_dir.join("commondir")) else {
-        return git_dir.to_path_buf();
-    };
-    let target = target.trim();
-    if target.is_empty() {
-        return git_dir.to_path_buf();
-    }
-    let path = Path::new(target);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        git_dir.join(path)
-    }
+    read_common_dir(git_dir).unwrap_or_else(|_| git_dir.to_path_buf())
 }
 
 fn config_bool(config: &str, section: &str, key: &str) -> Option<bool> {
@@ -337,6 +364,27 @@ fn read_varint(bytes: &[u8], mut pos: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_paths_strip_only_git_line_endings() {
+        for bytes in [b" metadata ".as_slice(), b" metadata \r\n"] {
+            assert_eq!(metadata_path(bytes).unwrap(), Path::new(" metadata "));
+        }
+        assert!(metadata_path(b"\r\n").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_paths_preserve_native_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            metadata_path(b"../repo-\xff/.git\r\n")
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            b"../repo-\xff/.git"
+        );
+    }
 
     /// Build a version 2 index the way git writes one, so the parser is tested
     /// against the layout rather than against itself.

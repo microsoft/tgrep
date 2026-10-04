@@ -519,12 +519,23 @@ only. All requests have this envelope (including `hello`):
 Successful results repeat `protocol`, `instance` and `repository`. Errors have
 `error.code` and `error.message`, never success-shaped empty results. V1 rejects
 unknown envelope/parameter fields, malformed options and incompatible identities.
+Clients require the matching request ID on successful responses. A valid error
+object (integer code, string message, no result) may instead have an explicit
+null ID when rejected before request parsing, preserving connection-queue
+saturation diagnostics. Missing/mismatched IDs and malformed errors are rejected.
 Search RPCs must omit `passthru` or set it to `false`; `true` is rejected with a
 scan-required error because indexed candidates omit nonmatching files. The CLI
 keeps `--passthru` on its existing filesystem-scan path when it emits all lines.
 Canonical worktree roots must be UTF-8 for JSON transport. CLI and server reject
 unsupported roots, including Unicode aliases to them, before serialization or
 generation publication; the core API's native-path support is unchanged.
+Gitfile and `commondir` targets retain native path bytes on Unix, even when
+metadata lives outside a UTF-8 worktree. Discovery and identity revalidation
+share the same decoder without spawning Git on the daemon's hot query path.
+The existing `ignore` dependency is vendored at its locked version with the
+same native-path correction in Git ignore-source discovery; ignore precedence,
+nested repository boundaries and malformed-ignore failures are preserved.
+See [dependency provenance and distribution](vendor/ignore/PATCHES.md).
 Instance IDs prevent stale metadata/port reuse; they are not authentication
 against hostile local processes. Storage, repository metadata and the loopback
 user environment are trusted.

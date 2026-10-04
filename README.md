@@ -1052,6 +1052,10 @@ cd tgrep
 cargo install --path tgrep-cli --locked
 ```
 
+Keep `vendor/ignore` in the checkout: it contains the locked dependency with a
+small native Git-metadata path fix. Source installs and release builds use it
+directly; see its [provenance and patch notes](vendor/ignore/PATCHES.md).
+
 ### Homebrew (Linux, macOS)
 
 ```bash

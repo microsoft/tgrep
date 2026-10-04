@@ -42,21 +42,13 @@ fn validate_repository(root: &Path, repository: &Repository) -> Result<()> {
         worktree_root(root)? == root,
         "root is no longer a worktree root"
     );
-    let git_dir = tgrep_core::git_index::git_dir(root).context("missing worktree Git directory")?;
+    let (git_dir, common_dir) = tgrep_core::git_index::read_repository_dirs(root)
+        .context("reading worktree Git directories")?;
     let git_dir = std::fs::canonicalize(git_dir)?;
     ensure!(
         git_dir == repository.git_dir(),
         "worktree Git directory changed; reattach"
     );
-    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(target) => {
-            let target = target.trim();
-            ensure!(!target.is_empty(), "empty Git common directory");
-            git_dir.join(target)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
-        Err(error) => return Err(error.into()),
-    };
     ensure!(
         std::fs::canonicalize(common_dir)? == repository.common_dir(),
         "worktree repository changed; reattach"

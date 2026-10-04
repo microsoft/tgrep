@@ -193,12 +193,24 @@ impl Client {
         let line = read_line(&mut stream, MAX_RESPONSE)?;
         let response: Value = serde_json::from_slice(&line)?;
         ensure!(
-            response["jsonrpc"] == "2.0" && response["id"] == 1,
+            response.is_object() && response["jsonrpc"] == "2.0",
             "invalid shared RPC response"
         );
         if let Some(error) = response.get("error") {
-            bail!("shared daemon: {}", error["message"]);
+            ensure!(
+                response.get("id").is_some_and(|id| id == 1 || id.is_null())
+                    && response.get("result").is_none()
+                    && error.is_object()
+                    && error["code"].is_i64()
+                    && error["message"].is_string(),
+                "invalid shared RPC error response"
+            );
+            bail!(
+                "shared daemon: {}",
+                error["message"].as_str().expect("validated message")
+            );
         }
+        ensure!(response["id"] == 1, "invalid shared RPC response");
         let result = response
             .get("result")
             .context("missing shared RPC result")?;
@@ -303,4 +315,104 @@ pub fn run_lifecycle(command: Lifecycle) -> Result<()> {
     }
     println!("{}", client.request(method, params)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Instant;
+
+    fn exchange(response: Value) -> Result<Value> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = Client {
+            registration: Registration {
+                protocol: PROTOCOL,
+                instance: "test-instance".into(),
+                repository: "test-repository".into(),
+                pid: std::process::id(),
+                port: listener.local_addr().unwrap().port(),
+                storage: PathBuf::new(),
+            },
+            root: PathBuf::new(),
+        };
+        let worker = thread::spawn(move || {
+            let started = Instant::now();
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(started.elapsed() < Duration::from_secs(5));
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request: Value =
+                serde_json::from_slice(&read_line(&mut stream, MAX_REQUEST).unwrap()).unwrap();
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], "hello");
+            writeln!(stream, "{response}").unwrap();
+        });
+        let result = client.request("hello", json!({}));
+        worker.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn rpc_response_envelopes_preserve_queue_diagnostics() {
+        let success = json!({
+            "protocol":PROTOCOL,"instance":"test-instance","repository":"test-repository"
+        });
+        assert_eq!(
+            exchange(json!({"jsonrpc":"2.0","id":1,"result":success})).unwrap(),
+            success
+        );
+        let error = json!({"code":-32001,"message":"shared connection queue full"});
+        for id in [json!(null), json!(1)] {
+            let failure = exchange(json!({"jsonrpc":"2.0","id":id,"error":error})).unwrap_err();
+            assert!(
+                failure.to_string().contains("shared connection queue full"),
+                "{failure:#}"
+            );
+        }
+        for response in [
+            json!(null),
+            json!([]),
+            json!("not an envelope"),
+            json!({"jsonrpc":"1.0","id":null,"error":error}),
+            json!({"id":null,"error":error}),
+            json!({"jsonrpc":"2.0","error":error}),
+            json!({"jsonrpc":"2.0","id":2,"error":error}),
+            json!({"jsonrpc":"2.0","id":"1","error":error}),
+            json!({"jsonrpc":"2.0","id":null,"error":null}),
+            json!({"jsonrpc":"2.0","id":null,"error":[]}),
+            json!({"jsonrpc":"2.0","id":null,"error":{"message":"shared connection queue full"}}),
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":"-32001","message":"shared connection queue full"}}),
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-1.5,"message":"shared connection queue full"}}),
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32001}}),
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":{}}}),
+            json!({"jsonrpc":"2.0","id":1,"error":error,"result":success}),
+            json!({"jsonrpc":"2.0","id":null,"error":error,"result":null}),
+            json!({"jsonrpc":"2.0","id":null,"result":success}),
+            json!({"jsonrpc":"2.0","id":2,"result":success}),
+            json!({"jsonrpc":"2.0","id":"1","result":success}),
+            json!({"jsonrpc":"2.0","result":success}),
+            json!({"jsonrpc":"2.0","id":1}),
+        ] {
+            let failure = exchange(response.clone()).unwrap_err();
+            assert!(
+                !failure.to_string().contains("shared connection queue full"),
+                "{response}: {failure:#}"
+            );
+        }
+    }
 }

@@ -134,6 +134,10 @@ impl Daemon {
 
     fn start_with_home(root: &Path, storage: &Path, options: &[&str], home: Option<&Path>) -> Self {
         let log = storage.join("daemon.log");
+        let marker_path = tgrep_core::generations::Repository::discover(root)
+            .unwrap()
+            .common_dir()
+            .join("tgrep-daemon-v1.json");
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("tgrep"));
         if let Some(home) = home {
             command
@@ -170,7 +174,7 @@ impl Daemon {
                 "daemon exited: {}",
                 fs::read_to_string(&log).unwrap()
             );
-            if let Ok(bytes) = fs::read(root.join(".git/tgrep-daemon-v1.json"))
+            if let Ok(bytes) = fs::read(&marker_path)
                 && let Ok(marker) = serde_json::from_slice::<Value>(&bytes)
                 && marker["pid"] == daemon.child.id()
             {
@@ -926,7 +930,23 @@ fn polling_and_native_events_reconcile_without_queries() {
             if status["ready"] == true
                 && status["published_epoch"].as_u64() > initial["published_epoch"].as_u64()
             {
-                break;
+                // Another event can close readiness between lookup and search.
+                let response = d
+                    .try_rpc(
+                        "search",
+                        json!({"root":f.a,"view":a["view"],"query":{"pattern":"automatic_term"}}),
+                    )
+                    .unwrap();
+                if response.get("error").is_some() {
+                    assert_eq!(response["error"]["code"], -32001, "{response}");
+                    assert_eq!(
+                        response["error"]["message"],
+                        "shared reconciliation in progress; retry or scan",
+                        "{response}"
+                    );
+                } else if !response["result"]["matches"].as_array().unwrap().is_empty() {
+                    break;
+                }
             }
             assert!(
                 started.elapsed() < Duration::from_secs(15),
@@ -934,12 +954,6 @@ fn polling_and_native_events_reconcile_without_queries() {
             );
             thread::sleep(Duration::from_millis(40));
         }
-        assert!(
-            !d.search(&f.a, "automatic_term")["matches"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
         fs::write(f.a.join(".ignore"), "new-dir/\n").unwrap();
         let started = Instant::now();
         loop {
@@ -1050,6 +1064,75 @@ fn stale_markers_missing_generation_and_foreign_marker_detach_scan_safely() {
     let fallback = cli(&f.a, &["--", "unique_fallback_token", "."]);
     assert!(String::from_utf8_lossy(&fallback.stderr).contains("scanning filesystem"));
     success(fallback);
+}
+
+#[test]
+fn cli_preserves_null_id_and_matching_id_queue_errors() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    for id in [json!(null), json!(1)] {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut marker = d.marker.clone();
+        marker["port"] = json!(listener.local_addr().unwrap().port());
+        fs::write(
+            f.a.join(".git/tgrep-daemon-v1.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let fake = thread::spawn(move || {
+            let started = Instant::now();
+            loop {
+                match listener.accept() {
+                    Ok((mut connection, _)) => {
+                        connection
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        connection
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut line = String::new();
+                        BufReader::new(connection.try_clone().unwrap())
+                            .read_line(&mut line)
+                            .unwrap();
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(request["method"], "hello");
+                        writeln!(
+                            connection,
+                            "{}",
+                            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":"shared connection queue full"}})
+                        )
+                        .unwrap();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(started.elapsed() < Duration::from_secs(15));
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        });
+        let output = cli(
+            &f.a,
+            &[
+                "shared",
+                "attach",
+                ".",
+                "--revision",
+                &f.revision,
+                "--lease",
+                "queue-test",
+            ],
+        );
+        fake.join().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("shared connection queue full"),
+            "{output:?}"
+        );
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
 }
 
 #[test]
@@ -1686,6 +1769,276 @@ fn native_watching_includes_searchable_nested_tgrep_directories() {
         );
         thread::sleep(Duration::from_millis(40));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_gitfile_metadata_supports_the_full_shared_lifecycle() {
+    native_metadata_lifecycle(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_commondir_metadata_supports_the_full_shared_lifecycle() {
+    native_metadata_lifecycle(true);
+}
+
+#[cfg(unix)]
+fn native_metadata_lifecycle(native_commondir: bool) {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    let main = f
+        .temp
+        .path()
+        .join(OsString::from_vec(b"repo-\xff".to_vec()));
+    match fs::rename(&f.a, &main) {
+        Ok(()) => {}
+        Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => {
+            eprintln!(
+                "filesystem rejects non-UTF-8 names with EILSEQ; native metadata fixture unavailable"
+            );
+            return;
+        }
+        Err(error) => panic!("creating repository with native metadata path: {error}"),
+    }
+    git(&main, &["worktree", "repair"]);
+    let repository = tgrep_core::generations::Repository::discover(&f.b).unwrap();
+    assert!(fs::read(f.b.join(".git")).unwrap().contains(&0xff));
+    if native_commondir {
+        let alias = f.temp.path().join("unicode-git-dir");
+        symlink(repository.git_dir(), &alias).unwrap();
+        fs::write(f.b.join(".git"), format!("gitdir: {}\n", alias.display())).unwrap();
+        let mut target = repository.common_dir().as_os_str().as_bytes().to_vec();
+        target.push(b'\n');
+        fs::write(repository.git_dir().join("commondir"), target).unwrap();
+        assert!(!fs::read(f.b.join(".git")).unwrap().contains(&0xff));
+        assert!(
+            fs::read(repository.git_dir().join("commondir"))
+                .unwrap()
+                .contains(&0xff)
+        );
+    }
+    let home = f.temp.path().join("trace-home");
+    fs::create_dir(&home).unwrap();
+    let trace = f.temp.path().join("git-trace.jsonl");
+    let global = home.join("global-ignore");
+    fs::write(
+        &global,
+        "global-only.txt\n!info-over-global.txt\ninfo-unignore-global.txt\n",
+    )
+    .unwrap();
+    let info = repository.common_dir().join("info/exclude");
+    let info_rules = "info-only.txt\ninfo-over-global.txt\n!info-unignore-global.txt\ngit-over-info.txt\nnested-keep.txt\nboundary.txt\n";
+    fs::write(&info, info_rules).unwrap();
+    fs::write(
+        f.b.join(".gitignore"),
+        "!git-over-info.txt\ndot-over-git.txt\nboundary-git.txt\n",
+    )
+    .unwrap();
+    fs::write(f.b.join(".ignore"), "!dot-over-git.txt\n").unwrap();
+    fs::create_dir(f.b.join("nested")).unwrap();
+    fs::write(
+        f.b.join("nested/.gitignore"),
+        "nested-only.txt\n!nested-keep.txt\n",
+    )
+    .unwrap();
+    let nested_repo = f.b.join("nested-repo");
+    fs::create_dir(&nested_repo).unwrap();
+    git(&nested_repo, &["init", "-q"]);
+    fs::write(nested_repo.join(".git/info/exclude"), "own-exclude.txt\n").unwrap();
+    for relative in [
+        "info-only.txt",
+        "global-only.txt",
+        "info-over-global.txt",
+        "info-unignore-global.txt",
+        "git-over-info.txt",
+        "dot-over-git.txt",
+        "nested/nested-only.txt",
+        "nested/nested-keep.txt",
+        "nested-repo/boundary.txt",
+        "nested-repo/boundary-git.txt",
+        "nested-repo/own-exclude.txt",
+        "nested-repo/global-only.txt",
+    ] {
+        fs::write(f.b.join(relative), "shared_term ignore_precedence\n").unwrap();
+    }
+    git(
+        &main,
+        &[
+            "config",
+            "--file",
+            home.join(".gitconfig").to_str().unwrap(),
+            "trace2.eventTarget",
+            trace.to_str().unwrap(),
+        ],
+    );
+    git(
+        &main,
+        &[
+            "config",
+            "--file",
+            home.join(".gitconfig").to_str().unwrap(),
+            "core.excludesFile",
+            global.to_str().unwrap(),
+        ],
+    );
+    let d = Daemon::start_with_home(&f.b, &f.storage, &["--no-watch"], Some(&home));
+    let a = d.attach(&f.b, &f.revision);
+    let b = d.attach(&f.b, &f.revision);
+    let starts = || {
+        String::from_utf8_lossy(&fs::read(&trace).unwrap())
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["event"] == "start")
+            .count()
+    };
+    let before = starts();
+    assert!(before > 0, "trace must include actual daemon Git starts");
+    assert_eq!(d.lookup(&f.b)["view"], a["view"]);
+    assert_eq!(
+        d.rpc("status", json!({"root":f.b,"view":a["view"],"query":{}}))["ready"],
+        true
+    );
+    assert_eq!(d.search(&f.b, "shared_term")["backend"], "shared-v1");
+    assert!(
+        d.rpc("files", json!({"root":f.b,"view":a["view"],"query":{}}))["files"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("notes.txt"))
+    );
+    assert_eq!(
+        starts(),
+        before,
+        "native metadata must not add server Git starts"
+    );
+    let listed = d.rpc("files", json!({"root":f.b,"view":a["view"],"query":{}}));
+    let listed = listed["files"].as_array().unwrap();
+    for relative in [
+        "info-unignore-global.txt",
+        "git-over-info.txt",
+        "dot-over-git.txt",
+        "nested/nested-keep.txt",
+        "nested-repo/boundary.txt",
+        "nested-repo/boundary-git.txt",
+    ] {
+        assert!(listed.contains(&json!(relative)), "{relative}: {listed:?}");
+    }
+    for relative in [
+        "info-only.txt",
+        "global-only.txt",
+        "info-over-global.txt",
+        "nested/nested-only.txt",
+        "nested-repo/own-exclude.txt",
+        "nested-repo/global-only.txt",
+    ] {
+        assert!(!listed.contains(&json!(relative)), "{relative}: {listed:?}");
+    }
+    for args in [
+        vec!["--stats", "--", "shared_term", "."],
+        vec!["--files", "."],
+        vec!["status", "."],
+    ] {
+        let before = starts();
+        let output = Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+            .current_dir(&f.b)
+            .args(&args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .output()
+            .unwrap();
+        if args[0] == "--stats" {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("via shared"),
+                "{output:?}"
+            );
+        }
+        success(output);
+        assert_eq!(starts() - before, 3, "{args:?}: one client discovery only");
+    }
+    let run = |args: &[&str]| {
+        Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+            .current_dir(&f.b)
+            .args(args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec!["--files", "--sort", "path", "."],
+        vec!["--sort", "path", "--", "shared_term", "."],
+    ] {
+        let indexed = run(&args);
+        let mut scan = vec!["--no-index"];
+        scan.extend(args);
+        let scanned = run(&scan);
+        assert_eq!(indexed.status.code(), scanned.status.code());
+        assert_eq!(success(indexed), success(scanned));
+    }
+    fs::write(&info, "[z-a]\n").unwrap();
+    let failed = d
+        .try_rpc(
+            "refresh",
+            json!({"root":f.b,"view":a["view"],"lease":a["lease"],"full":true}),
+        )
+        .unwrap();
+    assert!(
+        failed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("discovery"),
+        "{failed}"
+    );
+    assert_eq!(d.lookup(&f.b)["ready"], false);
+    fs::write(&info, format!("{info_rules}!info-only.txt\n")).unwrap();
+    fs::write(f.b.join("notes.txt"), "native_metadata_refresh\n").unwrap();
+    assert_eq!(d.refresh(&f.b, &a, &["notes.txt"], false)["ready"], true);
+    assert!(
+        !d.search(&f.b, "native_metadata_refresh")["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        d.rpc("files", json!({"root":f.b,"view":a["view"],"query":{}}))["files"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("info-only.txt"))
+    );
+    success(cli(
+        &f.b,
+        &[
+            "shared",
+            "refresh",
+            ".",
+            "--lease",
+            b["lease"].as_str().unwrap(),
+            "--full",
+        ],
+    ));
+    assert_eq!(
+        d.rpc(
+            "detach",
+            json!({"root":f.b,"view":a["view"],"lease":a["lease"]})
+        )["remaining_leases"],
+        1
+    );
+    success(cli(
+        &f.b,
+        &[
+            "shared",
+            "detach",
+            ".",
+            "--lease",
+            b["lease"].as_str().unwrap(),
+        ],
+    ));
+    assert!(!repository.git_dir().join("tgrep-view-v1.json").exists());
 }
 
 #[cfg(unix)]

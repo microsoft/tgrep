@@ -952,7 +952,18 @@ fn non_unicode_repository_roots_are_lossless_but_tracked_paths_are_unsupported()
         ._temp
         .path()
         .join(std::ffi::OsString::from_vec(b"repo-\xff".to_vec()));
-    fs::rename(&fixture.repo, &native).unwrap();
+    match fs::rename(&fixture.repo, &native) {
+        Ok(()) => {}
+        Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => {
+            // APFS rejects non-UTF-8 names before Git or the manager can read them.
+            assert!(matches!(
+                Repository::discover(&native),
+                Err(GenerationError::Io(_))
+            ));
+            return;
+        }
+        Err(error) => panic!("create native repository path: {error}"),
+    }
     write(&native, "source.txt", b"native root");
     git(&native, &["add", "--all"]);
     git(&native, &["commit", "--quiet", "-m", "native"]);

@@ -691,9 +691,23 @@ impl GenerationManager {
         groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (oid, indices) in groups {
             let previous = previous_blobs.get(oid.as_str()).copied();
-            if let Some(previous) = previous {
+            if let (Some(previous), Some(generation)) = (previous, predecessor) {
                 match previous.content {
                     EntryContent::Indexed { .. } | EntryContent::Binary => {
+                        let has_postings = if previous.content_id().is_some() {
+                            generation
+                                .base()
+                                .reader()
+                                .snapshot_path_has_postings(&previous.path)
+                                .ok_or_else(|| {
+                                    GenerationError::InvalidMetadata(
+                                        "indexed predecessor lacks validated posting membership"
+                                            .into(),
+                                    )
+                                })?
+                        } else {
+                            false
+                        };
                         for index in indices {
                             let entry = &mut entries[index];
                             if entry.size != previous.size {
@@ -704,7 +718,9 @@ impl GenerationManager {
                             entry.content = previous.content.clone();
                             if entry.content_id().is_some() {
                                 let id = add_path(&mut paths, &entry.path)?;
-                                reuse.entry(&previous.path).or_default().push(id);
+                                if has_postings {
+                                    reuse.entry(&previous.path).or_default().push(id);
+                                }
                                 stats.reused_indexed_files += 1;
                             }
                         }

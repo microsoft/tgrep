@@ -680,7 +680,10 @@ Destination mode and size eligibility are recomputed. Without a predecessor,
 a missing generation requires a full build. `EnsureResult.stats` reports actual
 blob reads/extractions, bytes, reused files/postings, and publication/reuse.
 `predecessor_posting_lists_read` counts actual predecessor traversal; it is zero
-when no indexed paths can reuse postings.
+when no indexed paths can reuse postings, including when only empty/short files
+are unchanged. Their paths and content identities still reuse normally.
+Posting presence is collected during existing strict snapshot validation;
+no persisted metadata or index-format change is required.
 An OS file lock deduplicates cooperating starters across processes; live
 generation pins share one in-process `Arc<Generation>` and `Arc<SharedBase>`.
 The spill sorter bounds posting accumulation; one raw/decoded blob and its

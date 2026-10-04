@@ -1032,6 +1032,100 @@ fn unchanged_binary_or_empty_destination_does_not_scan_predecessor_postings() {
 }
 
 #[test]
+fn posting_free_indexed_files_reuse_without_predecessor_scan() {
+    let fixture = Fixture::new();
+    let short_files: &[(&str, &[u8])] = &[
+        ("empty.txt", b""),
+        ("one.txt", b"a"),
+        ("two.txt", b"ab"),
+        ("bom-empty.txt", b"\xef\xbb\xbf"),
+        ("bom-two.txt", b"\xef\xbb\xbfab"),
+        ("utf16-one.txt", b"\xff\xfea\0"),
+        ("utf16-two.txt", b"\xff\xfea\0b\0"),
+    ];
+    for &(path, bytes) in short_files {
+        write(&fixture.repo, path, bytes);
+    }
+    write(
+        &fixture.repo,
+        "source.txt",
+        b"original indexed text with postings",
+    );
+    fixture.commit();
+    let manager = fixture.manager();
+    let original = manager
+        .ensure("HEAD", IndexingProfile::default(), None)
+        .unwrap()
+        .generation;
+    assert!(original.base().reader().num_trigrams() > 0);
+    let key = original.key().clone();
+    let identities: Vec<_> = short_files
+        .iter()
+        .map(|&(path, _)| original.entry(path).unwrap().content_id().unwrap())
+        .collect();
+    drop(original);
+    // Reopening an existing generation must recover posting presence without new metadata.
+    let original = manager.open(&key).unwrap();
+
+    for replacement in [Some(b"replacement indexed content".as_slice()), None] {
+        if let Some(bytes) = replacement {
+            write(&fixture.repo, "source.txt", bytes);
+        } else {
+            fs::remove_file(fixture.repo.join("source.txt")).unwrap();
+        }
+        fixture.commit();
+        let next = manager
+            .ensure("HEAD", IndexingProfile::default(), Some(&original))
+            .unwrap();
+        assert_eq!(next.stats.blobs_read, u64::from(replacement.is_some()));
+        assert_eq!(next.stats.blobs_extracted, u64::from(replacement.is_some()));
+        assert_eq!(next.stats.reused_indexed_files, short_files.len() as u64);
+        assert_eq!(next.stats.postings_reused, 0);
+        assert_eq!(next.stats.predecessor_posting_lists_read, 0);
+        for (&(path, bytes), &identity) in short_files.iter().zip(&identities) {
+            let entry = next.generation.entry(path).unwrap();
+            assert_eq!(entry.content_id(), Some(identity));
+            assert!(entry.matches_worktree_bytes(bytes));
+            assert!(next.generation.base().reader().contains_path(path));
+        }
+        assert_eq!(candidates(&next.generation, "a"), {
+            let mut paths: Vec<_> = next.generation.base().reader().all_paths().to_vec();
+            paths.sort_unstable();
+            paths
+        });
+        assert!(candidates(&next.generation, "original indexed").is_empty());
+        if replacement.is_some() {
+            assert_eq!(candidates(&next.generation, "replacement"), ["source.txt"]);
+        } else {
+            assert_eq!(next.generation.base().reader().num_trigrams(), 0);
+        }
+    }
+}
+
+#[test]
+fn short_raw_bytes_with_decoded_postings_still_reuse_postings() {
+    let fixture = Fixture::new();
+    write(&fixture.repo, "invalid.txt", b"\xff");
+    write(&fixture.repo, "source.txt", b"original indexed text");
+    fixture.commit();
+    let manager = fixture.manager();
+    let original = manager
+        .ensure("HEAD", IndexingProfile::default(), None)
+        .unwrap()
+        .generation;
+    write(&fixture.repo, "source.txt", b"replacement indexed text");
+    fixture.commit();
+    let next = manager
+        .ensure("HEAD", IndexingProfile::default(), Some(&original))
+        .unwrap();
+    assert_eq!(next.stats.blobs_extracted, 1);
+    assert_eq!(next.stats.reused_indexed_files, 1);
+    assert!(next.stats.postings_reused > 0);
+    assert!(next.stats.predecessor_posting_lists_read > 0);
+    assert_eq!(candidates(&next.generation, "\u{fffd}"), ["invalid.txt"]);
+}
+
+#[test]
 fn sha256_repositories_and_unicode_paths_are_supported() {
     let fixture = Fixture::new();
     let root = fixture._temp.path().join("repository \u{03bb}");

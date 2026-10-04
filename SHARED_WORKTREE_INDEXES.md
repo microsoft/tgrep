@@ -321,6 +321,10 @@ Without a predecessor the first build extracts the full committed corpus.
 files, copied postings, and whether this request published or reused a generation.
 `predecessor_posting_lists_read` counts decoded predecessor lists; when no indexed
 paths reuse postings, generation creation does not traverse the predecessor.
+Empty/short indexed files retain their paths and content identities without
+triggering that traversal. Strict snapshot opening records per-file posting
+presence during its existing validation pass, including for older generations;
+there is no new metadata field, format boundary, or additional posting scan.
 Publication I/O and metadata enumeration are not eliminated by extraction reuse.
 
 One OS file lock per repository store serializes cooperating processes, including

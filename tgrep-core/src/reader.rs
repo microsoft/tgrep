@@ -18,6 +18,8 @@ pub struct IndexReader {
     /// File IDs sorted by path, for exact membership checks without duplicating
     /// every path string in a second collection.
     path_order: Vec<usize>,
+    /// Populated only by strict snapshot validation, in its existing posting pass.
+    snapshot_file_has_postings: Vec<bool>,
     num_entries: usize,
 }
 
@@ -29,17 +31,18 @@ impl IndexReader {
     /// Open every section needed to identify an immutable snapshot. Ordinary
     /// readers retain their legacy empty-section handling.
     pub(crate) fn open_for_snapshot(index_dir: &Path) -> Result<Self> {
-        let reader = Self::open_impl(index_dir, true)?;
+        let mut reader = Self::open_impl(index_dir, true)?;
         reader
             .validate_lookup()
             .map_err(crate::Error::IndexCorrupted)?;
-        reader
+        reader.snapshot_file_has_postings = reader
             .validate_snapshot_postings()
             .map_err(crate::Error::IndexCorrupted)?;
         Ok(reader)
     }
 
-    fn validate_snapshot_postings(&self) -> std::result::Result<(), String> {
+    fn validate_snapshot_postings(&self) -> std::result::Result<Vec<bool>, String> {
+        let mut file_has_postings = vec![false; self.file_paths.len()];
         let mut expected_offset = 0_u64;
         for i in 0..self.num_entries {
             let entry = self.read_lookup_entry(i);
@@ -77,6 +80,7 @@ impl IndexReader {
                         posting.file_id
                     ));
                 }
+                file_has_postings[posting.file_id as usize] = true;
                 previous_file_id = Some(posting.file_id);
             }
             expected_offset += bytes.len() as u64;
@@ -85,7 +89,7 @@ impl IndexReader {
         if expected_offset != postings_len {
             return Err("shared base index.bin contains unreferenced posting bytes".to_string());
         }
-        Ok(())
+        Ok(file_has_postings)
     }
 
     fn open_impl(index_dir: &Path, require_complete_sections: bool) -> Result<Self> {
@@ -206,6 +210,7 @@ impl IndexReader {
             file_paths,
             file_table_id,
             path_order,
+            snapshot_file_has_postings: Vec::new(),
             num_entries,
         })
     }
@@ -220,6 +225,7 @@ impl IndexReader {
             file_paths: Vec::new(),
             file_table_id: crate::meta::file_table_id(&[]),
             path_order: Vec::new(),
+            snapshot_file_has_postings: Vec::new(),
             num_entries: 0,
         }
     }
@@ -230,6 +236,7 @@ impl IndexReader {
         self.postings = None;
         self.file_paths.clear();
         self.path_order.clear();
+        self.snapshot_file_has_postings.clear();
         self.num_entries = 0;
     }
 
@@ -267,6 +274,18 @@ impl IndexReader {
         self.path_order
             .binary_search_by(|&id| self.file_paths[id].as_str().cmp(path))
             .is_ok()
+    }
+
+    /// Posting presence from strict snapshot opening; `None` for absent paths
+    /// or readers that have not undergone snapshot validation.
+    pub(crate) fn snapshot_path_has_postings(&self, path: &str) -> Option<bool> {
+        let index = self
+            .path_order
+            .binary_search_by(|&id| self.file_paths[id].as_str().cmp(path))
+            .ok()?;
+        self.snapshot_file_has_postings
+            .get(self.path_order[index])
+            .copied()
     }
 
     /// Whether the reader contains a path strictly below `directory`.
@@ -707,6 +726,7 @@ mod tests {
             file_paths: opened.file_paths,
             file_table_id: opened.file_table_id,
             path_order: opened.path_order,
+            snapshot_file_has_postings: opened.snapshot_file_has_postings,
             num_entries: 0,
         };
         assert!(

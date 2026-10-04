@@ -89,7 +89,9 @@ refresh defaults to full verification every 120 seconds after completion;
 `serve --shared --no-watch` requires runtime refresh after the initial pass.
 Use `--no-index` whenever the current disk bytes must be searched.
 On session teardown call `tgrep shared detach <worktree> --lease <token>`.
-Independent leases cannot detach each other. Restart requires fresh attach calls
+Independent leases cannot detach each other. Release all leases and finish
+in-flight operations before removing a worktree; Windows root handles prevent
+removal while its view is live. Restart requires fresh attach calls
 with the intended revision; old leases are invalid. Bases stay pinned and
 checkpoints remain outside disposable worktrees. CRLF/smudge differences can
 require full private overlays, and initial verification still reads content.

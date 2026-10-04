@@ -400,6 +400,34 @@ fn exact_base_sharing_leases_and_revision_pins() {
 }
 
 #[test]
+fn last_detach_releases_root_handle_without_stopping_sibling_queries() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    d.attach(&f.a, &f.revision);
+    let b = d.attach(&f.b, &f.revision);
+    let duplicate = d.attach(&f.b, &f.revision);
+    let first = d.rpc(
+        "detach",
+        json!({"root":f.b,"view":b["view"],"lease":b["lease"]}),
+    );
+    assert_eq!(first["remaining_leases"], 1);
+    assert_eq!(d.search(&f.b, "shared_term")["backend"], "shared-v1");
+    let last = d.rpc(
+        "detach",
+        json!({"root":f.b,"view":duplicate["view"],"lease":duplicate["lease"]}),
+    );
+    assert_eq!(last["remaining_leases"], 0);
+    assert!(last["registration_warning"].is_null());
+    git(
+        &f.a,
+        &["worktree", "remove", "--force", f.b.to_str().unwrap()],
+    );
+    assert!(!f.b.exists());
+    assert_eq!(d.search(&f.a, "shared_term")["backend"], "shared-v1");
+    assert_eq!(d.lookup(&f.a)["ready"], true);
+}
+
+#[test]
 fn isolated_changes_candidate_masking_membership_and_scan_parity() {
     let f = Fixture::new();
     let d = f.start(&["--no-watch"]);

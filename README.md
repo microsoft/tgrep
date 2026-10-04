@@ -668,6 +668,8 @@ instance/view's registration, not another worktree or the daemon. Leases do not
 expire automatically; the runtime must release them or restart the daemon.
 Marker cleanup failures do not prevent lease release: detach reports
 `registration_warning` and leaves unrecognized/corrupt metadata for safe scan fallback.
+Before removing a worktree, detach all its leases and let in-flight operations
+finish. On Windows, retained root handles prevent removal while the view is live.
 An attached view stays pinned across commits/checkouts. Selecting another tree
 for the same root requires releasing **all** its leases first; incompatible
 reattachment is rejected before building or publishing a generation.

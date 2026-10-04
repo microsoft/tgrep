@@ -724,6 +724,8 @@ revision: old leases/instance IDs are invalid and restored checkpoints undergo
 full validation before readiness. Corrupt checkpoints/generations are explicit
 errors, not base-only results. Published generations/checkpoints are retained:
 there is **no online GC**, automatic migration, or checkpoint eviction.
+Shared JSON RPC requires UTF-8 canonical worktree roots; unsupported roots,
+including symlink aliases to them, fail before attachment or generation publication.
 
 Sharing avoids repeated trigram extraction, not all content reads. Tests measure
 three identical **tracked** files as three reads/decodes and **zero** private

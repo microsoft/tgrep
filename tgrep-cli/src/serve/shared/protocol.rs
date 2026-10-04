@@ -282,7 +282,7 @@ pub fn run_lifecycle(command: Lifecycle) -> Result<()> {
         ),
         Lifecycle::Detach { root, lease } => (root, "detach", json!({"lease": lease})),
     };
-    let root = fs::canonicalize(root)?;
+    let root = super::canonical_root(&root)?;
     ensure!(
         super::worktree_root(&root)? == root,
         "lifecycle requires a worktree root"

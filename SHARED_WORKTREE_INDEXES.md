@@ -519,6 +519,9 @@ only. All requests have this envelope (including `hello`):
 Successful results repeat `protocol`, `instance` and `repository`. Errors have
 `error.code` and `error.message`, never success-shaped empty results. V1 rejects
 unknown envelope/parameter fields, malformed options and incompatible identities.
+Canonical worktree roots must be UTF-8 for JSON transport. CLI and server reject
+unsupported roots, including Unicode aliases to them, before serialization or
+generation publication; the core API's native-path support is unchanged.
 Instance IDs prevent stale metadata/port reuse; they are not authentication
 against hostile local processes. Storage, repository metadata and the loopback
 user environment are trusted.
@@ -562,8 +565,8 @@ The `profile` is required on attach:
 `query` uses the existing search RPC fields built by `server_search_request`:
 pattern/extra_patterns, matcher flags, types/type_add/type_clear, globs,
 context/output-detail fields, hidden, scope and max_depth. Only default automatic
-decoding and the 64 MiB profile are compatible. `scope` is empty or a relative
-directory; it cannot escape the root or cross a nested repository. Content reads
+decoding and the 64 MiB profile are compatible. `scope` is empty or an existing
+relative directory, never a regular file; it cannot escape the root or cross a nested repository. Content reads
 use no-follow root-contained handles, never another worktree's content cache.
 Candidate collection captures an epoch; a concurrent invalidation rejects the
 response before output. Read failures invalidate the view and return errors.

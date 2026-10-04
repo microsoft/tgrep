@@ -10,8 +10,17 @@ use anyhow::{Context, Result, bail, ensure};
 use std::path::{Path, PathBuf};
 use tgrep_core::generations::Repository;
 
+fn canonical_root(path: &Path) -> Result<PathBuf> {
+    let root = std::fs::canonicalize(path)?;
+    ensure!(
+        root.to_str().is_some(),
+        "shared protocol requires a UTF-8 root"
+    );
+    Ok(root)
+}
+
 pub fn worktree_root(path: &Path) -> Result<PathBuf> {
-    let path = std::fs::canonicalize(path)?;
+    let path = canonical_root(path)?;
     let start = if path.is_file() {
         path.parent().context("file has no parent")?
     } else {

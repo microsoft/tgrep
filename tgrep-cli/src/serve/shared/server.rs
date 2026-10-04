@@ -463,7 +463,7 @@ impl State {
     }
 
     fn root(&self, root: &Path) -> Result<(PathBuf, Repository)> {
-        let root = fs::canonicalize(root)?;
+        let root = super::canonical_root(root)?;
         let repository = Repository::discover(&root)?;
         ensure!(
             super::worktree_root(&root)? == root
@@ -479,7 +479,7 @@ impl State {
     }
 
     fn entry(&self, root: &Path, id: Option<&str>) -> Result<Arc<Entry>> {
-        let root = fs::canonicalize(root)?;
+        let root = super::canonical_root(root)?;
         let entry = self
             .views
             .lock()
@@ -666,9 +666,6 @@ impl State {
                 },
             )
         } else {
-            let manager = GenerationManager::with_storage(repository, &self.bases)?;
-            let predecessor = entries.iter().map(|entry| entry.view.generation()).next();
-            let ensured = manager.ensure(&requested_commit, params.profile, predecessor)?;
             let root_id = blake3::hash(
                 root.to_str()
                     .context("shared CLI requires a UTF-8 root")?
@@ -676,6 +673,9 @@ impl State {
             )
             .to_hex()
             .to_string();
+            let manager = GenerationManager::with_storage(repository, &self.bases)?;
+            let predecessor = entries.iter().map(|entry| entry.view.generation()).next();
+            let ensured = manager.ensure(&requested_commit, params.profile, predecessor)?;
             let directory = plain_directory(&self.overlays.join(root_id))?;
             let directory =
                 plain_directory(&directory.join(ensured.generation.key().storage_name()))?;
@@ -1097,6 +1097,7 @@ impl State {
         validate_query(query, files)?;
         let scope = crate::serve::SearchScope::parse(query).map_err(anyhow::Error::msg)?;
         let scoped_root = entry.view.root().join(&scope.prefix);
+        ensure!(scoped_root.is_dir(), "scope must be an existing directory");
         ensure!(
             super::worktree_root(&scoped_root)? == entry.view.root()
                 && fs::canonicalize(&scoped_root)?.starts_with(entry.view.root()),

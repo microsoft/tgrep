@@ -411,9 +411,11 @@ root or a private versioned cache and can race later filesystem edits.
 
 Raw LF blobs and clean CRLF/smudge checkouts may differ for **every file**.
 Normalizing line endings would invalidate positional/next-byte masks. Fixtures
-assert three identical files are read/decoded with zero extractions, versus four
-clean transformed files requiring four private extractions; later unchanged
-passes reuse all four overlays. No transformed-content cross-view cache is
+assert three identical tracked files are read/decoded with zero extractions,
+versus four clean transformed tracked files requiring four private extractions.
+The linked worktree's plain `.git` pointer file adds one private extraction
+in either case; later unchanged passes reuse all private overlays.
+No transformed-content cross-view cache is
 implemented. Preparation retains O(paths) metadata plus changed-file masks
 until publication, in addition to the existing private overlay. A large
 transformed checkout can therefore require substantial private memory.
@@ -421,9 +423,13 @@ transformed checkout can therefore require substantial private memory.
 Checkpoints use the foundation's single directory-bound atomic publication;
 there are no unprotected auxiliary manifest writes. A configured private
 checkpoint directory is excluded in its entirety (including staging files),
-along with `.tgrep`, Git metadata, generation storage and caller-supplied
+along with `.tgrep`, Git metadata directories, generation storage and caller-supplied
 `walk.exclude_paths`. It cannot be an index snapshot, Git metadata or a worktree
 ancestor. Storage must remain trusted and not externally renamed while in use.
+The plain `.git` pointer in a linked worktree follows ordinary walker membership:
+its filename and content are available with hidden inclusion, subject to ignore
+and size rules. The named Git metadata directories remain excluded; the file's
+contents are not followed as a filesystem link.
 Restoration validates the exact generation key, base bytes and canonical root but
 does not restore readiness or trusted read evidence; first reconciliation may
 re-extract restored private postings. Missing/stale/invalid state is an explicit

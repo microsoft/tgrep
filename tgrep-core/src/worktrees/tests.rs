@@ -202,7 +202,125 @@ fn assert_scan_parity(view: &WorktreeView, patterns: &[&str]) {
 }
 
 #[test]
-fn identical_worktrees_share_reader_and_verify_without_extraction() {
+fn linked_gitfile_matches_hidden_scan_without_exposing_metadata_directories() {
+    let fixture = Fixture::new();
+    write(&fixture.root, ".gitignore", b"ignored/\n");
+    write(&fixture.root, ".hidden.txt", b"hidden needle");
+    write(&fixture.root, "asset.bin", b"filename only");
+    write(&fixture.root, "src/one.txt", b"source needle");
+    commit(&fixture.root);
+    let pin = fixture.generation();
+    let linked = fixture.linked("gitfile parity");
+    write(&linked, "ignored/private.txt", b"ignored needle");
+    assert!(linked.join(".git").is_file());
+    let view = fixture.view(&linked, &pin);
+    view.refresh().unwrap();
+
+    // Use the ordinary walker without the view's exclusions: inheriting them
+    // here would hide precisely the membership regression this test detects.
+    for include_hidden in [false, true] {
+        let scan = walker::walk_dir(
+            view.root(),
+            &walker::WalkOptions {
+                include_hidden,
+                ..walker::WalkOptions::default()
+            },
+        );
+        assert_eq!(scan.skipped_error, 0);
+        let mut expected: Vec<_> = scan
+            .listed_files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(view.root())
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace('\\', "/")
+            })
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            view.with_snapshot(|snapshot| snapshot.files("", include_hidden))
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(expected.iter().any(|path| path == ".git"), include_hidden);
+
+        let plan = query::build_query_plan("gitdir:", false).unwrap();
+        let expected_matches: Vec<_> = scan
+            .files
+            .iter()
+            .filter(|path| {
+                let bytes = fs::read(path).unwrap();
+                encoding::decode_for_index(&bytes)
+                    .windows(b"gitdir:".len())
+                    .any(|window| window == b"gitdir:")
+            })
+            .map(|path| {
+                path.strip_prefix(view.root())
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(
+            view.with_snapshot(|snapshot| snapshot.candidates(&plan, "", include_hidden))
+                .unwrap(),
+            expected_matches,
+        );
+        assert_eq!(
+            expected_matches.iter().any(|path| path == ".git"),
+            include_hidden
+        );
+    }
+    assert_eq!(matches(&view, "^gitdir:"), [".git"]);
+    assert_scan_parity(&view, &["gitdir:", "^gitdir:", "needle", ".*"]);
+
+    for root in [&fixture.root, &linked] {
+        let view = WorktreeView::new(
+            root,
+            pin.clone(),
+            WorktreeOptions {
+                walk: MetaWalkOptions {
+                    no_ignore: true,
+                    ..MetaWalkOptions::default()
+                },
+                ..WorktreeOptions::default()
+            },
+        )
+        .unwrap();
+        view.refresh().unwrap();
+        let files = view
+            .with_snapshot(|snapshot| snapshot.files("", true))
+            .unwrap();
+        assert!(!files.iter().any(|path| path.starts_with(".git/")));
+        assert_eq!(files.iter().any(|path| path == ".git"), root == &linked);
+        for metadata in [view.repository().common_dir(), view.repository().git_dir()] {
+            assert!(
+                view.options
+                    .walk
+                    .exclude_paths
+                    .iter()
+                    .any(|path| metadata.starts_with(path))
+            );
+        }
+    }
+
+    write(&linked, ".ignore", b".git\n");
+    view.invalidate_path(Path::new(".ignore")).unwrap();
+    view.refresh().unwrap();
+    assert!(candidates(&view, "gitdir:").is_empty());
+    assert!(
+        !view
+            .with_snapshot(|snapshot| snapshot.files("", true))
+            .unwrap()
+            .contains(&".git".to_string())
+    );
+}
+
+#[test]
+fn identical_tracked_files_share_reader_without_extraction() {
     let fixture = Fixture::new();
     write(&fixture.root, "one.txt", b"base needle\n");
     write(&fixture.root, "empty.txt", b"");
@@ -217,13 +335,21 @@ fn identical_worktrees_share_reader_and_verify_without_extraction() {
         Err(WorktreeError::NotReady)
     ));
     first.invalidate_path(Path::new("one.txt")).unwrap();
-    for view in [&first, &second] {
+    for (view, gitfile_count) in [(&first, 0), (&second, 1)] {
         let stats = view.refresh().unwrap();
         assert!(stats.full);
-        assert_eq!(stats.files_read, 3);
-        assert_eq!(stats.files_decoded, 3);
-        assert_eq!(stats.files_extracted, 0);
+        assert_eq!(stats.files_read, 3 + gitfile_count);
+        assert_eq!(stats.files_decoded, 3 + gitfile_count);
+        assert_eq!(stats.files_extracted, gitfile_count);
         assert_eq!(stats.base_reused, 3);
+        assert_eq!(
+            view.state.read().unwrap().index.live.overlay_paths(),
+            if gitfile_count == 0 {
+                vec![]
+            } else {
+                vec![".git".to_string()]
+            },
+        );
         assert_scan_parity(view, &["needle", "xy", "^$", "need.e", "x|needle"]);
     }
     assert!(Arc::ptr_eq(
@@ -235,6 +361,10 @@ fn identical_worktrees_share_reader_and_verify_without_extraction() {
     assert!(no_op.full);
     assert_eq!(no_op.files_read, 3);
     assert_eq!(no_op.files_extracted, 0);
+    let linked_no_op = second.refresh().unwrap();
+    assert_eq!(linked_no_op.files_read, 4);
+    assert_eq!(linked_no_op.files_extracted, 0);
+    assert_eq!(linked_no_op.overlay_reused, 1);
 }
 
 #[test]
@@ -261,7 +391,7 @@ fn divergent_commits_staging_renames_deletes_and_whole_file_overlays_are_isolate
     let va = fixture.view(&a, &pin);
     let vb = fixture.view(&b, &pin);
     let initial = va.refresh().unwrap();
-    assert_eq!(initial.files_extracted, 4);
+    assert_eq!(initial.files_extracted, 5);
     assert_eq!(initial.base_files_copied, 1);
     assert!(initial.postings_copied > 0);
     vb.refresh().unwrap();
@@ -293,7 +423,7 @@ fn divergent_commits_staging_renames_deletes_and_whole_file_overlays_are_isolate
         stats.files_extracted, 0,
         "committing must preserve overrides relative to the pin"
     );
-    assert_eq!(stats.overlay_reused, 5);
+    assert_eq!(stats.overlay_reused, 6);
     assert_eq!(matches(&va, "committed"), ["modified.txt"]);
     write(&a, "modified.txt", b"original base needle\n");
     va.invalidate_path(Path::new("modified.txt")).unwrap();
@@ -495,11 +625,11 @@ fn crlf_and_smudge_checkouts_are_verified_even_when_git_reports_clean() {
     assert!(git(&linked, &["status", "--porcelain"]).is_empty());
     let view = fixture.view(&linked, &pin);
     let stats = view.refresh().unwrap();
-    assert_eq!(stats.files_read, 4);
-    assert_eq!(stats.files_decoded, 4);
+    assert_eq!(stats.files_read, 5);
+    assert_eq!(stats.files_decoded, 5);
     assert_eq!(
-        stats.files_extracted, 4,
-        "all four clean files differ from raw LF blobs"
+        stats.files_extracted, 5,
+        "four clean files differ from raw LF blobs, plus the private .git file"
     );
     assert_eq!(stats.base_reused, 0);
     assert_eq!(matches(&view, "SMUDGED"), ["filtered.txt"]);
@@ -510,7 +640,7 @@ fn crlf_and_smudge_checkouts_are_verified_even_when_git_reports_clean() {
     );
     let no_op = view.reconcile_full().unwrap();
     assert_eq!(no_op.files_extracted, 0);
-    assert_eq!(no_op.overlay_reused, 4);
+    assert_eq!(no_op.overlay_reused, 5);
 }
 
 #[test]
@@ -547,13 +677,13 @@ fn sparse_missing_and_skip_worktree_paths_never_leak_base_terms() {
     write(&linked, "skip.txt", b"skip changed");
     let view = fixture.view(&linked, &pin);
     view.refresh().unwrap();
-    assert!(candidates(&view, "sparse").is_empty());
+    assert!(candidates(&view, "sparse needle").is_empty());
     assert!(candidates(&view, "original").is_empty());
     assert_eq!(matches(&view, "changed"), ["skip.txt"]);
     assert_scan_parity(&view, &["needle", "original", "changed", ".*"]);
     git(&linked, &["sparse-checkout", "disable"]);
     view.reconcile_full().unwrap();
-    assert_eq!(matches(&view, "sparse"), ["omit/source.txt"]);
+    assert_eq!(matches(&view, "sparse needle"), ["omit/source.txt"]);
 }
 
 #[test]

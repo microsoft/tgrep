@@ -768,8 +768,9 @@ files/postings, and content reads avoided.
 **Raw LF bases versus CRLF/smudge checkouts can require an all-file overlay**,
 even for equal committed trees and clean Git status. Position and next-byte
 masks make line-ending normalization unsafe. Regression fixtures measure zero
-extractions for three byte-identical files, but four for four transformed files;
-subsequent unchanged reconciliation reuses those private postings. There is no
+extractions for three byte-identical tracked files, but four for four transformed
+tracked files. A linked worktree's plain `.git` file adds one private extraction
+in either case; subsequent unchanged reconciliation reuses those private postings. There is no
 cross-view transformed-content cache. Preparation retains per-path evidence
 and changed-file masks until atomic publication; removing the size cap increases
 per-file memory, and widespread transforms can make the private overlay large.
@@ -778,8 +779,11 @@ For persistence, configure an existing dedicated `checkpoint_directory` in
 `WorktreeOptions`. `save_checkpoint()` requires readiness and atomically writes
 only `overlay.json`: private postings/tombstones plus exact generation key, base
 fingerprint and canonical root, through the existing directory-bound publisher.
-The entire checkpoint directory, `.tgrep`, Git metadata and the generation store
-are excluded, even with `no_ignore`; custom storage directories belong in
+The entire checkpoint directory, `.tgrep`, Git metadata directories and the generation store
+are excluded, even with `no_ignore`. A linked worktree's plain `.git` pointer
+file remains eligible under ordinary walker rules: `--hidden` exposes its
+filename and searchable text unless ignored or over the size cap. This does
+not expose the metadata directory it names. Custom storage directories belong in
 `walk.exclude_paths`. Checkpoint storage and ancestors must remain trusted and
 not externally renamed while in use. The directory cannot be an index snapshot,
 Git metadata, or a worktree ancestor. `WorktreeView::restore(root, exact_pin,

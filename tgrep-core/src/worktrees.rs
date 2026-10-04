@@ -202,9 +202,9 @@ impl WorktreeView {
         for path in &mut options.walk.exclude_paths {
             *path = absolute_exclusion(&root, path)?;
         }
-        // Never admit metadata or mutable index storage, even with no_ignore.
+        // Exclude actual metadata directories, not a linked worktree's plain
+        // .git file: that file follows normal walker visibility and ignore rules.
         options.walk.exclude_paths.extend([
-            root.join(".git"),
             root.join(".tgrep"),
             repository.common_dir().to_path_buf(),
             repository.git_dir().to_path_buf(),

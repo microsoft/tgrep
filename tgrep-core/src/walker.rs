@@ -712,6 +712,10 @@ pub fn walk_file_metadata_with_ignorecase(
                 }
             };
 
+            if entry.error().is_some() {
+                skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if should_skip_dir(&entry, &exclude) {
                     return ignore::WalkState::Skip;

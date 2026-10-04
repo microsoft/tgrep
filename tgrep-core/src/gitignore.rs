@@ -559,6 +559,26 @@ impl CaseInsensitiveIgnore {
         Self::build(root, use_gitignore, use_exclude, use_parents, true)
     }
 
+    /// Shared-worktree readiness cannot silently lose the tracked exemption
+    /// when its index is unreadable or unsupported.
+    pub(crate) fn try_frozen_snapshot(root: &Path) -> std::io::Result<Option<Self>> {
+        let Some(mut matcher) = Self::build(root, true, true, true, false) else {
+            return Ok(None);
+        };
+        let tracked = crate::git_index::load_tracked(&matcher.repo_root).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot load tracked membership for case-insensitive ignores",
+            )
+        })?;
+        let fingerprint = Self::fingerprint(Some(&tracked));
+        matcher.tracked = TrackedMembership::Frozen(TrackedSnapshot {
+            tracked: Some(tracked),
+            fingerprint,
+        });
+        Ok(Some(matcher))
+    }
+
     fn build(
         root: &Path,
         use_gitignore: bool,

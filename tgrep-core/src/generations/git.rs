@@ -63,6 +63,10 @@ pub(super) fn worktree_git_dir(root: &Path) -> Result<PathBuf> {
     discover_directory(root, "--absolute-git-dir")
 }
 
+pub(super) fn worktree_root(root: &Path) -> Result<PathBuf> {
+    discover_directory(root, "--show-toplevel")
+}
+
 fn discover_directory(root: &Path, option: &str) -> Result<PathBuf> {
     let mut bytes = output(
         command()

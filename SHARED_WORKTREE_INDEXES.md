@@ -2,7 +2,8 @@
 
 **Status:** end-state architecture with the shared-reader and overlay-checkpoint
 foundation implemented in [PR #168](https://github.com/microsoft/tgrep/pull/168),
-and [committed-tree base generations](tgrep-core/src/generations/mod.rs) implemented.
+with [committed-tree base generations](tgrep-core/src/generations/mod.rs) and
+[core worktree synchronization](tgrep-core/src/worktrees.rs) implemented.
 Automatic multi-worktree CLI/server support is not implemented yet.
 
 ## Goal and ownership
@@ -303,8 +304,8 @@ Oversized, binary, symlink and gitlink records remain distinguishable in tracked
 membership; symlinks and gitlinks are not followed or content-indexed.
 
 Clean Git status and equal blob IDs do not prove equivalence of worktree bytes.
-Layer 2 must prove compatible decoded identities from stable reads, or overlay
-transformed/changed files or scan. It must also apply worktree-specific membership,
+The synchronization layer verifies decoded identities from checkout reads, or
+overlays transformed/changed files. It also applies worktree-specific membership,
 including ignored/extension-filtered files, sparse checkout and filesystem case
 behavior. Non-UTF-8 tracked names, unsafe relative paths, and paths unrepresentable
 on the current platform are explicit unsupported errors, not lossy aliases.
@@ -341,11 +342,96 @@ Atomic visibility is not a parent-directory power-loss durability guarantee.
 These checks detect inconsistent/corrupt data; storage must still be trusted,
 not treated as an authenticated format for adversarially rewritten files.
 
-For layer 2, retain the generation pin with each view and serialize its key
-alongside overlay checkpoints. The generation's `SharedBase` fingerprint still
+The synchronization layer retains the generation pin with each view and serializes
+its key inside the delta checkpoint. The generation's `SharedBase` fingerprint still
 binds the checkpoint to exact index bytes. Reopening that key is not readiness:
-reconcile the worktree before enabling indexed queries. No watcher, Git delta
-discovery, daemon wire schema or CLI shared-mode behavior is introduced here.
+reconcile the worktree before enabling indexed queries.
+
+## Implemented worktree synchronization API
+
+`tgrep_core::worktrees::WorktreeView::new(root, pin, options)` validates that the
+canonical root is an actual worktree root in the pinned repository. Independent
+clones, bare repositories and subdirectory roots are rejected. The exact
+`Arc<Generation>`, canonical root and worktree Git directory stay with the view;
+no mutable base/flush handle is exposed and no base migration occurs.
+
+| API | Contract |
+| --- | --- |
+| `WorktreeOptions` | Existing `MetaWalkOptions`, bounded `hint_capacity`, optional existing private `checkpoint_directory` |
+| `invalidate_path(relative)` | Close query gate; queue a file/subtree hint, including old/new rename paths; invalid input errors and forces full repair |
+| `invalidate_all()` | Close gate and require full verification for startup, overflow, Git/config changes, missed events or polling uncertainty |
+| `refresh()` | Rewalk membership/visibility; verify hints/new/stat-changed files or, without hints, all admitted contents |
+| `reconcile_full()` | Always read/verify content, irrespective of size/mtime/Git-status equality |
+| `status()` | Ready flag, invalidation epoch, published epoch, pending-path count and full-required flag |
+| `with_snapshot(closure)` | Guarded query-only view with root/epoch/visibility and resolved candidate paths or complete filename membership |
+| `save_checkpoint()` | Ready-only, delta-only atomic `overlay.json`, including exact generation key/root/base binding |
+| `restore(root, pin, options)` | Explicit errors for missing/invalid/mismatched checkpoints; successful restore remains not ready |
+| `ReconcileStats` | Actual content reads/bytes/decodes/extractions, base/overlay reuse, copied base files/postings and reads avoided |
+
+The agent runtime subscribes **after construction and before initial refresh**,
+then forwards native/polling/no-watch inputs through these same invalidations.
+Each refresh makes one bounded attempt, serialized per view. Files are prepared
+outside the readiness lock; invalidations can continue to arrive. Overlay,
+visibility and filename membership publish together only if the captured epoch
+still matches. Otherwise `ChangedDuringReconcile` leaves the view not ready with
+full work pending. Retrying replays by full verification; sustained churn must
+scan or wait, never spin indefinitely. Incomplete metadata walks (including
+ignore-rule errors), unreadable tracked exemptions, failed reads and detected
+read instability also keep the gate closed. No base-only success is possible.
+Each reconciliation advances the epoch, including no-hint full repairs, so
+successful publication acknowledges earlier invalidation tokens with an equal
+or later epoch.
+
+`WorktreeSnapshot::candidates(plan, prefix, include_hidden)` resolves both base
+and live IDs before releasing the overlay guard. `files(prefix, include_hidden)`
+comes from complete walker filename membership, not posting lists. Hidden files
+are included in canonical coverage and filtered at query time, including Windows
+attributes and explicit hidden-directory scopes. Existing walker rules determine
+ignore/extension, materialized symlink/submodule and regular-file behavior.
+Missing, sparse and ineligible base paths are tombstoned; staged, unstaged,
+committed-divergent and eligible untracked files use whole-file overlays. Restoring
+the pinned content removes the override; committing divergent content does not.
+
+Full passes walk without a metadata-only size cutoff, then bound actual reads to
+the configured limit plus one byte and classify the bytes read. Eligible content
+is auto-decoded and hashed before reuse, so CRLF, smudge, encoding, assume-unchanged
+and skip-worktree cases cannot rely on clean status or index stat data. Verified
+content-identical copies/renames can populate new overlay paths by copying base
+masks in one streaming posting pass. Matching existing overlays keep their masks.
+
+This saves trigram extraction, **not all repository-sized startup work**. Every
+refresh walks metadata and membership. Full passes read/verify all admitted
+content; hinted passes can retain previous evidence for unaffected paths under
+the explicit event-driven freshness contract. Case-alias hints conservatively
+reverify; non-ASCII hints and capacity overflow require full verification.
+Same-size/restored-mtime edits without notifications are repaired by forced
+full checks, not promised by hints. Successful refresh acknowledges processed
+inputs, not an atomic filesystem snapshot. Final matching reads the requesting
+root or a private versioned cache and can race later filesystem edits.
+
+Raw LF blobs and clean CRLF/smudge checkouts may differ for **every file**.
+Normalizing line endings would invalidate positional/next-byte masks. Fixtures
+assert three identical files are read/decoded with zero extractions, versus four
+clean transformed files requiring four private extractions; later unchanged
+passes reuse all four overlays. No transformed-content cross-view cache is
+implemented. Preparation retains O(paths) metadata plus changed-file masks
+until publication, in addition to the existing private overlay. A large
+transformed checkout can therefore require substantial private memory.
+
+Checkpoints use the foundation's single directory-bound atomic publication;
+there are no unprotected auxiliary manifest writes. A configured private
+checkpoint directory is excluded in its entirety (including staging files),
+along with `.tgrep`, Git metadata, generation storage and caller-supplied
+`walk.exclude_paths`. It cannot be an index snapshot, Git metadata or a worktree
+ancestor. Storage must remain trusted and not externally renamed while in use.
+Restoration validates the exact generation key, base bytes and canonical root but
+does not restore readiness or trusted read evidence; first reconciliation may
+re-extract restored private postings. Missing/stale/invalid state is an explicit
+recoverable error, not an empty overlay. Bases remain immutable and retain-all.
+
+This core layer does **not** own native watchers, automatic shared CLI serving,
+daemon routing/wire schemas or content caches. Existing CLI/server behavior is
+unchanged; opt-in integration is the next layer.
 
 ## Implementation status and rollout
 
@@ -361,7 +447,9 @@ The implemented increments are core-library APIs, not automatic shared indexing:
 | [`Regression coverage`](tgrep-core/tests/shared_worktrees.rs) | Sharing/isolation, masks, tombstones, restoration, compatibility, repeated saves, and Windows failure recovery |
 | [`Generation management`](tgrep-core/src/generations/mod.rs) | Canonical common-dir identity, raw committed-tree builds, incremental posting reuse, cross-process deduplication, pins and retain-all |
 | [`Generation coverage`](tgrep-core/tests/generations.rs) | Temporary repositories/worktrees, thread/process races, content transformations, immutable old readers, errors and interrupted publication |
-| Worktree synchronization and daemon routing | Follow-up work; not yet implemented |
+| [`Worktree synchronization`](tgrep-core/src/worktrees.rs) | Pinned private views, actual-content verification, atomic readiness/membership, bounded invalidations, full repair and bound checkpoints |
+| [`Synchronization coverage`](tgrep-core/src/worktrees/tests.rs) | Real divergent worktrees, scan/candidate parity, CRLF/smudge/decoding, sparse/assume-unchanged, filtering, epochs, errors and extraction counts |
+| Shared CLI/daemon routing and native watchers | Follow-up work; not yet implemented |
 
 Shared-base validation rejects mismatched empty lookup/posting sections and
 metadata counts inconsistent with the opened sections, while allowing empty

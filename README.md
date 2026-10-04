@@ -646,9 +646,8 @@ let repository = Repository::discover(Path::new("."))?;
 let manager = GenerationManager::new(repository)?;
 let first = manager.ensure("HEAD", IndexingProfile::default(), None)?;
 let next = manager.ensure("main", IndexingProfile::default(), Some(&first.generation))?;
-// Keep this Arc with the worktree registration; populate its overlay separately.
+// Keep this exact pin with the synchronized worktree registration below.
 let pin = next.generation;
-let view = pin.base().create_worktree(Path::new("."))?;
 ```
 
 Repository identity is the **canonical Git common directory**, shared by linked
@@ -702,6 +701,93 @@ offline cleanup requires stopping all users and discarding dependent checkpoints
 Storage and its ancestors must not be externally renamed, modified or removed
 while in use. Do not run mutable index builders against generation directories.
 
+`tgrep_core::worktrees` provides the core registration and synchronization layer:
+
+```rust
+use tgrep_core::query::build_query_plan;
+use tgrep_core::worktrees::{WorktreeOptions, WorktreeView};
+
+let view = WorktreeView::new(Path::new("."), pin, WorktreeOptions::default())?;
+// An agent runtime subscribes to changes NOW, before the first refresh.
+// Forward file/subtree events to invalidate_path; overflow/config changes
+// and unknown events to invalidate_all. The core does not create a watcher.
+let stats = view.refresh()?; // initially a full verification; now ready
+
+let plan = build_query_plan("needle", false)?;
+let candidates = view.with_snapshot(|snapshot| {
+    snapshot.candidates(&plan, "", false) // root scope, normal hidden filtering
+})?;
+let files = view.with_snapshot(|snapshot| snapshot.files("", false))?;
+// Candidates are root-relative paths, not final matches. Read view.root().join(path),
+// auto-decode, and run the final matcher, or use a private versioned content cache.
+```
+
+The root must be the actual worktree root in the pin's repository, not a
+subdirectory, bare repository or independent clone. `root()`, `repository()`
+and `generation()` preserve its canonical identity and exact pin. Each view
+keeps private whole-file replacements and tombstones relative to **that pin**,
+not current `HEAD`; committing an edit does not clear its override. Missing,
+sparse, ignored and ineligible base paths are hidden. Membership and visibility
+use the existing hidden-inclusive walker and a frozen case-insensitive tracked
+exemption snapshot. `files()` includes eligible filename-only binary paths.
+Query `prefix` is empty or a root-relative directory ending in `/`.
+
+`invalidate_path(relative_path)` immediately closes the query gate and queues
+a bounded file/subtree hint (both paths for renames). Case aliases trigger
+conservative verification; non-ASCII hints and queue overflow force a full pass.
+`invalidate_all()` handles native watcher overflow, polling uncertainty, Git or
+ignore configuration changes, and missed-event repair. `refresh()` rewalks
+membership/visibility and processes hints; with no hints it does full content
+verification. `reconcile_full()` always verifies all admitted bytes, including
+same-size/restored-mtime edits, assume-unchanged and skip-worktree files.
+
+Construction and checkpoint restoration are **not ready**. A successful refresh
+atomically publishes overlay, filenames and visibility. `status()` exposes
+readiness, invalidation/published epochs and pending/full work. A concurrent
+invalidation causes `ChangedDuringReconcile`, not stale ready publication:
+retry or scan. There is one attempt per call, never an unbounded churn loop.
+Every reconciliation advances the epoch, including refreshes without hints;
+the published epoch acknowledges all earlier invalidation tokens.
+Discovery/read errors likewise leave the view unavailable and force full retry.
+`with_snapshot` holds readiness and overlay guards through candidate-ID
+resolution; no live IDs or mutable `HybridIndex` escape. Do not reenter the view
+from its closure. A refresh acknowledges processed hints, **not an atomic
+filesystem snapshot**. Periodic full reconciliation remains necessary; no-watch
+callers must explicitly refresh, and final reads can race subsequent edits.
+
+Full verification reads, auto-decodes and hashes checkout bytes; clean Git
+status, blob identity and index stat data are never byte-equivalence proofs.
+Matching decoded content reuses base postings without extraction. Verified
+renames/copies can copy base masks in one streaming posting pass; unchanged
+private overlays also avoid extraction. A hinted refresh can avoid rereading
+unaffected, previously verified files under the event-driven freshness contract,
+but still performs a metadata/membership walk. `ReconcileStats` separates
+reads/bytes/decodes, actual extraction calls, base and overlay reuse, copied
+files/postings, and content reads avoided.
+
+**Raw LF bases versus CRLF/smudge checkouts can require an all-file overlay**,
+even for equal committed trees and clean Git status. Position and next-byte
+masks make line-ending normalization unsafe. Regression fixtures measure zero
+extractions for three byte-identical files, but four for four transformed files;
+subsequent unchanged reconciliation reuses those private postings. There is no
+cross-view transformed-content cache. Preparation retains per-path evidence
+and changed-file masks until atomic publication; removing the size cap increases
+per-file memory, and widespread transforms can make the private overlay large.
+
+For persistence, configure an existing dedicated `checkpoint_directory` in
+`WorktreeOptions`. `save_checkpoint()` requires readiness and atomically writes
+only `overlay.json`: private postings/tombstones plus exact generation key, base
+fingerprint and canonical root, through the existing directory-bound publisher.
+The entire checkpoint directory, `.tgrep`, Git metadata and the generation store
+are excluded, even with `no_ignore`; custom storage directories belong in
+`walk.exclude_paths`. Checkpoint storage and ancestors must remain trusted and
+not externally renamed while in use. The directory cannot be an index snapshot,
+Git metadata, or a worktree ancestor. `WorktreeView::restore(root, exact_pin,
+options)` rejects missing, malformed, wrong-key and wrong-root checkpoints.
+Successful restoration still requires subscribing and full reconciliation;
+restored overlays have no trusted read evidence and may re-extract private
+postings on that first pass. Generation retention remains `RetainAll`.
+
 `tgrep-core::shared::SharedBase` is the first building block for sharing one
 content index across worktrees. Open a complete, current-format index in an
 **immutable snapshot directory** once, then call `create_worktree(root)` for
@@ -752,10 +838,10 @@ durability: file contents are synced before replacement, but the parent
 directory is not synced afterwards. A successful save may be lost after a
 system crash; callers must reconcile or rebuild stale/missing checkpoints.
 
-This API does **not yet** discover Git deltas, watch worktrees, share content
-caches, or provide multi-worktree CLI/server registration. Callers must
-reconcile restored overlays and maintain worktree-specific ignore rules,
-visibility, filename-only paths for `--files`, and caches separately.
+The lower-level `SharedBase` API alone does not synchronize a checkout; use
+`WorktreeView` for the reconciliation/readiness contract above. Neither API
+creates native watchers, shares content caches, or provides automatic
+multi-worktree CLI/server registration.
 The existing CLI, RPC protocol, index format, and single-root server are
 unchanged. Do not point existing servers at a common `--index-path`: their
 publication path still writes a complete index. Keep shared base files

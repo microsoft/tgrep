@@ -123,6 +123,15 @@ impl SharedBase {
     /// is not synced afterwards. Even a successful save may be lost after a
     /// system crash; callers must reconcile or rebuild stale/missing checkpoints.
     pub fn save_overlay(&self, worktree: &HybridIndex, path: &Path) -> Result<()> {
+        self.save_overlay_with_generation(worktree, path, None)
+    }
+
+    pub(crate) fn save_overlay_with_generation(
+        &self,
+        worktree: &HybridIndex,
+        path: &Path,
+        generation: Option<&crate::generations::GenerationKey>,
+    ) -> Result<()> {
         if !Arc::ptr_eq(&self.reader, &worktree.reader_arc()) {
             return Err(invalid("worktree no longer uses this shared base"));
         }
@@ -132,6 +141,7 @@ impl SharedBase {
             base_id: self.id,
             root: CheckpointRoot::from_path(&canonical_root(&worktree.root)?)?,
             overlay: OverlayData::capture(&worktree.live)?,
+            generation: generation.cloned(),
         };
         checkpoint.persist(&destination)
     }
@@ -165,6 +175,15 @@ impl SharedBase {
     /// fresh as the checkpoint: reconcile changes since it was saved before
     /// making the view available to searches.
     pub fn restore_worktree(&self, root: &Path, path: &Path) -> Result<HybridIndex> {
+        self.restore_worktree_with_generation(root, path, None)
+    }
+
+    pub(crate) fn restore_worktree_with_generation(
+        &self,
+        root: &Path,
+        path: &Path,
+        generation: Option<&crate::generations::GenerationKey>,
+    ) -> Result<HybridIndex> {
         let checkpoint: OverlayCheckpoint =
             serde_json::from_reader(BufReader::new(std::fs::File::open(path)?))?;
         if checkpoint.version != OVERLAY_VERSION {
@@ -173,6 +192,11 @@ impl SharedBase {
         if checkpoint.base_id != self.id {
             return Err(invalid(
                 "worktree overlay belongs to a different base snapshot",
+            ));
+        }
+        if generation.is_some() && checkpoint.generation.as_ref() != generation {
+            return Err(invalid(
+                "worktree overlay belongs to a different generation",
             ));
         }
         let root = canonical_root(root)?;
@@ -287,6 +311,8 @@ struct OverlayCheckpoint {
     base_id: [u8; 32],
     root: CheckpointRoot,
     overlay: OverlayData,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<crate::generations::GenerationKey>,
 }
 
 impl OverlayCheckpoint {
@@ -541,6 +567,7 @@ mod tests {
                 files: Vec::new(),
                 deleted: vec!["removed.rs".to_string()],
             },
+            generation: None,
         }
     }
 

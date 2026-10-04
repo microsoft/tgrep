@@ -7,6 +7,10 @@
 
 mod git;
 
+pub(crate) fn worktree_root(root: &Path) -> Result<PathBuf> {
+    git::worktree_root(root)
+}
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};

@@ -77,10 +77,10 @@ impl Client {
         if let Some(git_dir) = tgrep_core::git_index::git_dir(root) {
             // This only selects shared discovery, never establishes authority.
             // Unattached legacy queries should not spawn Git subprocesses.
-            return Ok(git_dir.join(VIEW_MARKER).try_exists()?);
+            return marker_present(&git_dir.join(VIEW_MARKER));
         }
         let repo = Repository::discover(root)?;
-        Ok(repo.git_dir().join(VIEW_MARKER).try_exists()?)
+        marker_present(&repo.git_dir().join(VIEW_MARKER))
     }
 
     pub fn registered(path: &Path) -> Result<(Self, View)> {
@@ -209,6 +209,14 @@ impl Client {
             "stale or wrong-protocol shared daemon"
         );
         Ok(result.clone())
+    }
+}
+
+pub(super) fn marker_present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 

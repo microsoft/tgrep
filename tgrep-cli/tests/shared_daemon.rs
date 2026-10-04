@@ -1,3 +1,5 @@
+#![deny(unnameable_test_items)]
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -1564,85 +1566,6 @@ fn native_watching_includes_searchable_nested_tgrep_directories() {
                 assert_eq!(result["backend"], "shared-v1");
                 break;
             }
-
-            #[cfg(unix)]
-            #[test]
-            fn non_utf8_canonical_roots_fail_before_json_or_generation_publication() {
-                use std::ffi::OsString;
-                use std::os::unix::ffi::OsStringExt;
-                use std::os::unix::fs::symlink;
-
-                let f = Fixture::new();
-                let root = f
-                    .temp
-                    .path()
-                    .join(OsString::from_vec(b"non-utf8-\xff".to_vec()));
-                match fs::create_dir(&root) {
-                    Ok(()) => {}
-                    Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => {
-                        eprintln!(
-                            "filesystem rejects non-UTF-8 names with EILSEQ; no such root can be created"
-                        );
-                        return;
-                    }
-                    Err(error) => panic!("creating non-UTF-8 worktree directory: {error}"),
-                }
-                success(
-                    Command::new("git")
-                        .current_dir(&f.a)
-                        .args(["worktree", "add", "--detach", "-q"])
-                        .arg(&root)
-                        .arg(&f.revision)
-                        .output()
-                        .unwrap(),
-                );
-                let alias = f.temp.path().join("unicode-alias");
-                symlink(&root, &alias).unwrap();
-                let d = f.start(&[
-                    "--no-watch",
-                    "--shared-max-views",
-                    "1",
-                    "--shared-max-leases",
-                    "1",
-                ]);
-                for path in [&root, &alias] {
-                    let output = Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
-                        .current_dir(&f.a)
-                        .args(["shared", "attach"])
-                        .arg(path)
-                        .args(["--revision", &f.revision, "--lease", "invalid-root"])
-                        .output()
-                        .unwrap();
-                    assert_eq!(output.status.code(), Some(2), "{output:?}");
-                    assert!(
-                        String::from_utf8_lossy(&output.stderr).contains("UTF-8 root"),
-                        "{output:?}"
-                    );
-                }
-                let response = d.try_rpc("attach", json!({"root":alias,"revision":f.revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap(),"lease":"invalid-root"})).unwrap();
-                assert!(
-                    response["error"]["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("UTF-8 root"),
-                    "{response}"
-                );
-                let directory = f
-                    .storage
-                    .join("bases")
-                    .join(d.marker["repository"].as_str().unwrap());
-                assert!(
-                    fs::read_dir(directory).unwrap().all(|entry| {
-                        !entry
-                            .unwrap()
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with("gen-")
-                    }),
-                    "invalid roots must not publish retained generations"
-                );
-                assert_eq!(d.attach(&f.a, &f.revision)["leases"], 1);
-            }
         }
         assert!(
             started.elapsed() < Duration::from_secs(15),
@@ -1650,4 +1573,136 @@ fn native_watching_includes_searchable_nested_tgrep_directories() {
         );
         thread::sleep(Duration::from_millis(40));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_canonical_roots_fail_before_json_or_generation_publication() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    let root = f
+        .temp
+        .path()
+        .join(OsString::from_vec(b"non-utf8-\xff".to_vec()));
+    match fs::create_dir(&root) {
+        Ok(()) => {}
+        Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => {
+            eprintln!(
+                "filesystem rejects non-UTF-8 names with EILSEQ; no such root can be created"
+            );
+            return;
+        }
+        Err(error) => panic!("creating non-UTF-8 worktree directory: {error}"),
+    }
+    success(
+        Command::new("git")
+            .current_dir(&f.a)
+            .args(["worktree", "add", "--detach", "-q"])
+            .arg(&root)
+            .arg(&f.revision)
+            .output()
+            .unwrap(),
+    );
+    let alias = f.temp.path().join("unicode-alias");
+    symlink(&root, &alias).unwrap();
+    let d = f.start(&[
+        "--no-watch",
+        "--shared-max-views",
+        "1",
+        "--shared-max-leases",
+        "1",
+    ]);
+    for path in [&root, &alias] {
+        let output = Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+            .current_dir(&f.a)
+            .args(["shared", "attach"])
+            .arg(path)
+            .args(["--revision", &f.revision, "--lease", "invalid-root"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("UTF-8 root"),
+            "{output:?}"
+        );
+    }
+    let response = d.try_rpc("attach", json!({"root":alias,"revision":f.revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap(),"lease":"invalid-root"})).unwrap();
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("UTF-8 root"),
+        "{response}"
+    );
+    let directory = f
+        .storage
+        .join("bases")
+        .join(d.marker["repository"].as_str().unwrap());
+    assert!(
+        fs::read_dir(directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("gen-")
+        }),
+        "invalid roots must not publish retained generations"
+    );
+    assert_eq!(d.attach(&f.a, &f.revision)["leases"], 1);
+}
+
+#[test]
+fn shared_limits_require_explicit_opt_in() {
+    let f = Fixture::new();
+    for flag in ["--shared-max-views", "--shared-max-leases"] {
+        let output = cli(&f.a, &["serve", "missing-root", flag, "1"]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("required") && stderr.contains("--shared"),
+            "{stderr}"
+        );
+    }
+    let legacy = cli(&f.a, &["serve", "missing-root", "--no-watch"]);
+    assert_eq!(legacy.status.code(), Some(2), "{legacy:?}");
+    assert!(
+        !String::from_utf8_lossy(&legacy.stderr).contains("--shared"),
+        "{legacy:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_view_marker_never_reenables_a_stale_ordinary_index() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    success(cli(&f.a, &["index", "."]));
+    let d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    let marker = f.a.join(".git/tgrep-view-v1.json");
+    fs::remove_file(&marker).unwrap();
+    symlink(f.temp.path().join("missing-marker-target"), &marker).unwrap();
+    fs::write(f.a.join("after-index.txt"), "dangling_marker_fallback\n").unwrap();
+    let output = cli(&f.a, &["--stats", "--", "dangling_marker_fallback", "."]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("scanning filesystem"));
+    assert!(success(output).contains("dangling_marker_fallback"));
+    assert!(success(cli(&f.a, &["--files", "."])).contains("after-index.txt"));
+    assert_eq!(cli(&f.a, &["status", "."]).status.code(), Some(2));
+    let detached = d.rpc(
+        "detach",
+        json!({"root":f.a,"view":a["view"],"lease":a["lease"]}),
+    );
+    assert_eq!(detached["remaining_leases"], 0);
+    assert!(detached["registration_warning"].is_string());
+    assert!(
+        fs::symlink_metadata(&marker)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(d.attach(&f.a, &f.revision)["leases"], 1);
 }

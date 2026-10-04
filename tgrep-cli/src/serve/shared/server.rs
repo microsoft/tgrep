@@ -584,7 +584,12 @@ impl State {
             .join(super::protocol::VIEW_MARKER);
         let file = match File::open(&marker) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if super::protocol::marker_present(&marker)? {
+                    return Err(error.into());
+                }
+                return Ok(());
+            }
             Err(error) => return Err(error.into()),
         };
         let registered: ViewRegistration = serde_json::from_reader(file.take(MAX_REQUEST))?;

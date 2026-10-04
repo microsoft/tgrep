@@ -631,11 +631,11 @@ enum Command {
         shared_storage: Option<PathBuf>,
 
         /// Maximum shared views; native watches and hint slots are divided by this.
-        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=1024))]
+        #[arg(long, requires = "shared", default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=1024))]
         shared_max_views: u32,
 
         /// Maximum leases across all attached worktrees.
-        #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=65536))]
+        #[arg(long, requires = "shared", default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=65536))]
         shared_max_leases: u32,
 
         /// Disable all automatic refresh, including watching and polling.

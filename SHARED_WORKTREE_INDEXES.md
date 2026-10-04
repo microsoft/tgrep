@@ -150,7 +150,7 @@ is below:
 
 | Operation | Purpose |
 | --- | --- |
-| `attach(root, revision, profile)` | Select/pin a base, capture changes and return a view identity, lease and readiness |
+| `attach(root, revision, profile, lease)` | Select/pin a base, capture changes and return a view identity, lease and readiness |
 | `search(root, view, query)` / `files(root, view, query)` | Route requests to the private ready view |
 | `refresh(root, view, lease, changed, full)` | Invalidate immediately; return the processed epoch after reconciliation |
 | `detach(root, view, lease)` | Release one lease; retire the view only after the final lease |
@@ -586,6 +586,8 @@ Normal CLI search/files/status automatically use an existing attachment.
 preserves ordinary index intent unless combined with `--shared`. Stale/missing
 forced registrations, incompatible options, saturation and not-ready states
 produce meaningful scan diagnostics, bypassing all ordinary index shortcuts.
+Marker entry presence includes dangling symlinks, so corrupt metadata cannot
+silently select a stale ordinary index.
 `status` reports an error rather than misleading legacy status. `--no-index`
 always scans. Positive indexed globs filter the admitted corpus; scans can
 reinclude ignored files, as with ordinary indexes.

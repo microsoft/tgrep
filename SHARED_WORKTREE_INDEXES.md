@@ -445,7 +445,9 @@ transformed checkout can therefore require substantial private memory.
 
 Checkpoints use the foundation's single directory-bound atomic publication;
 there are no unprotected auxiliary manifest writes. A configured private
-checkpoint directory is excluded in its entirety (including staging files),
+checkpoint path must be an existing directory; construction, restoration and
+saving reject regular-file paths instead of accepting an unusable view.
+The checkpoint directory is excluded in its entirety (including staging files),
 along with `.tgrep`, Git metadata directories, generation storage and caller-supplied
 `walk.exclude_paths`. It cannot be an index snapshot, Git metadata or a worktree
 ancestor. Storage must remain trusted and not externally renamed while in use.

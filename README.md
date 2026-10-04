@@ -796,7 +796,8 @@ and changed-file masks until atomic publication; removing the size cap increases
 per-file memory, and widespread transforms can make the private overlay large.
 
 For persistence, configure an existing dedicated `checkpoint_directory` in
-`WorktreeOptions`. `save_checkpoint()` requires readiness and atomically writes
+`WorktreeOptions`. Construction, restoration and saving explicitly reject
+non-directory checkpoint paths. `save_checkpoint()` requires readiness and atomically writes
 only `overlay.json`: private postings/tombstones plus exact generation key, base
 fingerprint and canonical root, through the existing directory-bound publisher.
 The entire checkpoint directory, `.tgrep`, Git metadata directories and the generation store

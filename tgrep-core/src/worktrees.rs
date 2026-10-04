@@ -794,6 +794,11 @@ fn validate_checkpoint_directory(
     generation: &Generation,
 ) -> Result<()> {
     let directory = fs::canonicalize(directory)?;
+    if !fs::metadata(&directory)?.is_dir() {
+        return Err(WorktreeError::InvalidInput(
+            "checkpoint_directory must be an existing directory".into(),
+        ));
+    }
     if root.starts_with(&directory)
         || directory.starts_with(repository.common_dir())
         || directory.starts_with(repository.git_dir())

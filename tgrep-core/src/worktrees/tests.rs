@@ -944,6 +944,62 @@ fn restored_checkpoints_revalidate_contents_membership_and_exact_generation() {
 }
 
 #[test]
+fn checkpoint_configuration_rejects_regular_files() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "source.txt", b"needle");
+    commit(&fixture.root);
+    let pin = fixture.generation();
+    for path in [
+        fixture.root.join("checkpoint.json"),
+        fixture._temp.path().join("checkpoint.json"),
+    ] {
+        fs::write(&path, b"preserve checkpoint file").unwrap();
+        let options = WorktreeOptions {
+            checkpoint_directory: Some(path.clone()),
+            ..WorktreeOptions::default()
+        };
+        for restored in [false, true] {
+            let result = if restored {
+                WorktreeView::restore(&fixture.root, pin.clone(), options.clone())
+            } else {
+                WorktreeView::new(&fixture.root, pin.clone(), options.clone())
+            };
+            let error = result
+                .err()
+                .expect("regular files cannot be checkpoint directories");
+            assert!(matches!(error, WorktreeError::InvalidInput(_)), "{error}");
+            assert_eq!(fs::read(&path).unwrap(), b"preserve checkpoint file");
+        }
+    }
+}
+
+#[test]
+fn checkpoint_save_rejects_a_directory_replaced_by_a_file() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "source.txt", b"needle");
+    commit(&fixture.root);
+    let directory = fixture.root.join("private checkpoint");
+    fs::create_dir(&directory).unwrap();
+    let view = WorktreeView::new(
+        &fixture.root,
+        fixture.generation(),
+        WorktreeOptions {
+            checkpoint_directory: Some(directory.clone()),
+            ..WorktreeOptions::default()
+        },
+    )
+    .unwrap();
+    view.refresh().unwrap();
+    fs::remove_dir(&directory).unwrap();
+    fs::write(&directory, b"preserve replacement file").unwrap();
+    assert!(matches!(
+        view.save_checkpoint(),
+        Err(WorktreeError::InvalidInput(_))
+    ));
+    assert_eq!(fs::read(&directory).unwrap(), b"preserve replacement file");
+}
+
+#[test]
 fn registration_rejects_other_repositories_subdirectories_and_immutable_checkpoint_paths() {
     let fixture = Fixture::new();
     write(&fixture.root, "sub/file.txt", b"needle");

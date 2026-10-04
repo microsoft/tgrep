@@ -1012,3 +1012,89 @@ fn blocked_generation_worker_does_not_block_ready_view_queries() {
     );
     worker.join().unwrap();
 }
+
+#[test]
+fn candidate_read_failures_close_readiness_and_never_return_partial_success() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    fs::remove_file(f.a.join("notes.txt")).unwrap();
+    fs::create_dir(f.a.join("notes.txt")).unwrap();
+    let response = d
+        .try_rpc(
+            "search",
+            json!({
+                "root":f.a,"view":a["view"],"query":{"pattern":"shared_term"}
+            }),
+        )
+        .unwrap();
+    assert!(response.get("result").is_none(), "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reading shared candidate notes.txt")
+    );
+    let recovered = d.ready(&f.a);
+    assert_eq!(recovered["last_reconcile"]["full"], true);
+    let matches = d.search(&f.a, "shared_term");
+    assert!(
+        matches["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["file"] != "notes.txt")
+    );
+}
+
+#[test]
+fn configured_storage_is_external_and_excluded_from_all_shared_views() {
+    let f = Fixture::new();
+    let invalid = f.a.join("inside");
+    fs::create_dir(&invalid).unwrap();
+    let output = cli(
+        &f.a,
+        &[
+            "serve",
+            "--shared",
+            ".",
+            "--shared-storage",
+            invalid.to_str().unwrap(),
+            "--no-watch",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("inside a worktree"));
+    let d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    let result = d.rpc(
+        "files",
+        json!({"root":f.a,"view":a["view"],"query":{"hidden":true}}),
+    );
+    assert!(result["files"].as_array().unwrap().iter().all(|p| {
+        let path = p.as_str().unwrap();
+        !path.contains("tgrep-") && !path.contains("overlay.json") && !path.contains("lookup.bin")
+    }));
+    // Corrupting a checkpoint is recoverable by the runtime, not a reason to
+    // silently construct a base-only replacement view on restart.
+    let root = fs::canonicalize(&f.a).unwrap();
+    let root_id = blake3::hash(root.to_str().unwrap().as_bytes())
+        .to_hex()
+        .to_string();
+    let key: tgrep_core::generations::GenerationKey =
+        serde_json::from_value(a["generation"].clone()).unwrap();
+    let checkpoint = f
+        .storage
+        .join("overlays")
+        .join(key.repository_identity())
+        .join(root_id)
+        .join(key.storage_name())
+        .join("overlay.json");
+    drop(d);
+    fs::write(checkpoint, "{}").unwrap();
+    let d = f.start(&["--no-watch"]);
+    let result = d.try_rpc("attach", json!({"root":f.a,"revision":f.revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap()})).unwrap();
+    assert!(result.get("error").is_some(), "{result}");
+    fs::write(f.a.join("late.txt"), "late_safe_scan\n").unwrap();
+    success(cli(&f.a, &["--", "late_safe_scan", "."]));
+}

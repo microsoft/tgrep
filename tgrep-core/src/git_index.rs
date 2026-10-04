@@ -111,7 +111,9 @@ fn membership_hash(path: &str) -> u64 {
 ///
 /// `.git` is usually a directory, but is a file holding `gitdir: <path>` in a
 /// linked worktree or a submodule.
-pub(crate) fn git_dir(repo_root: &Path) -> Option<PathBuf> {
+/// Best-effort metadata-directory hint for cheap discovery probes. Callers that
+/// establish repository identity or authorize a scope must validate with Git.
+pub fn git_dir(repo_root: &Path) -> Option<PathBuf> {
     let dot_git = repo_root.join(".git");
     let meta = std::fs::metadata(&dot_git).ok()?;
     if meta.is_dir() {

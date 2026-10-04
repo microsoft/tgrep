@@ -364,6 +364,7 @@ These tables describe search flags. Use `tgrep index --help` and
 | `-L, --follow` | Follow symbolic links |
 | `--no-messages` | Suppress error messages about unreadable/missing paths |
 | `--no-index` | Read files from disk, bypassing the server and index; normal filters still apply |
+| `--shared` | Require a registered shared view for queries (otherwise scan); on `serve`, opt into the repository daemon |
 | `--exclude <DIR>` | Exclude directory from indexing (repeatable); `index` and `serve` only, not accepted by a search |
 | `--stats` | Print query plan and candidate stats |
 | `--index-path <DIR>` | Custom index directory |

@@ -73,6 +73,11 @@ impl Client {
         let Some(root) = path.ancestors().find(|parent| parent.join(".git").exists()) else {
             return Ok(false);
         };
+        if let Some(git_dir) = tgrep_core::git_index::git_dir(root) {
+            // This only selects shared discovery, never establishes authority.
+            // Unattached legacy queries should not spawn Git subprocesses.
+            return Ok(git_dir.join(VIEW_MARKER).try_exists()?);
+        }
         let repo = Repository::discover(root)?;
         Ok(repo.git_dir().join(VIEW_MARKER).try_exists()?)
     }

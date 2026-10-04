@@ -885,10 +885,7 @@ fn watch_directories(root: &Path, storage: &Path, budget: usize) -> Result<HashS
 }
 
 fn invalidate_event(entry: &Entry, event: &Event) -> Result<()> {
-    if event.need_rescan()
-        || event.paths.is_empty()
-        || matches!(event.kind, EventKind::Any | EventKind::Other)
-    {
+    if event_requires_full(event) {
         entry.view.invalidate_all()?;
         return Ok(());
     }
@@ -913,6 +910,12 @@ fn invalidate_event(entry: &Entry, event: &Event) -> Result<()> {
     Ok(())
 }
 
+fn event_requires_full(event: &Event) -> bool {
+    event.need_rescan()
+        || event.paths.is_empty()
+        || matches!(event.kind, EventKind::Any | EventKind::Other)
+}
+
 fn reconcile_stats(stats: &ReconcileStats) -> Value {
     json!({
         "epoch":stats.epoch, "full":stats.full, "files_discovered":stats.files_discovered,
@@ -928,7 +931,8 @@ fn build_stats(stats: &BuildStats) -> Value {
         "published":stats.published, "reused_generation":stats.reused_generation,
         "tracked_entries":stats.tracked_entries, "blobs_read":stats.blobs_read,
         "blob_bytes_read":stats.blob_bytes_read, "blobs_extracted":stats.blobs_extracted,
-        "reused_indexed_files":stats.reused_indexed_files, "postings_reused":stats.postings_reused
+        "reused_indexed_files":stats.reused_indexed_files, "postings_reused":stats.postings_reused,
+        "predecessor_posting_lists_read":stats.predecessor_posting_lists_read
     })
 }
 
@@ -1028,7 +1032,7 @@ impl State {
             let (paths, total, epoch) = entry.view.with_snapshot(|snapshot| {
                 (
                     snapshot.candidates(&request.plan, &scope.prefix, scope.hidden),
-                    snapshot.files("", true).len(),
+                    request.opts.stats.then(|| snapshot.files("", true).len()),
                     snapshot.epoch(),
                 )
             })?;
@@ -1062,6 +1066,8 @@ impl State {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         entry.view.invalidate_all()?;
+                        entry.metrics.lock().expect("metrics").error =
+                            Some(format!("reading shared candidate {relative}: {error:#}"));
                         return Err(error.context(format!("reading shared candidate {relative}")));
                     }
                 };
@@ -1099,5 +1105,26 @@ impl State {
         result["backend"] = json!("shared-v1");
         entry.queries.fetch_add(1, Ordering::SeqCst);
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_overflow_and_unknown_notifications_require_full_repair() {
+        let changed = Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(PathBuf::from("file.txt"));
+        assert!(!event_requires_full(&changed));
+        assert!(event_requires_full(
+            &changed.clone().set_flag(notify::event::Flag::Rescan)
+        ));
+        assert!(event_requires_full(
+            &Event::new(EventKind::Any).add_path(PathBuf::from("file.txt"))
+        ));
+        assert!(event_requires_full(&Event::new(EventKind::Other)));
     }
 }

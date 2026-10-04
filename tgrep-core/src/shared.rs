@@ -37,6 +37,16 @@ pub struct SharedBase {
 }
 
 impl SharedBase {
+    /// The shared reader, including its single in-memory path table.
+    pub fn reader(&self) -> &Arc<IndexReader> {
+        &self.reader
+    }
+
+    /// Fingerprint binding checkpoints to these exact searchable index bytes.
+    pub fn snapshot_id(&self) -> [u8; 32] {
+        self.id
+    }
+
     /// Open a complete, current-format base in an immutable snapshot directory.
     ///
     /// Do not use a directory being rewritten by `tgrep index` or `tgrep serve`.
@@ -482,7 +492,7 @@ fn canonical_root(root: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
-fn validate_path(path: &str) -> Result<()> {
+pub(crate) fn validate_path(path: &str) -> Result<()> {
     if path.contains(['\\', '\0'])
         || path.split('/').any(|part| matches!(part, "" | "." | ".."))
         || Path::new(path)

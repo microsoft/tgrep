@@ -1151,7 +1151,7 @@ fn write_flat_posting_entries(
     Ok(())
 }
 
-fn write_files_and_meta<'a>(
+pub(crate) fn write_files_and_meta<'a>(
     index_dir: &Path,
     root: &Path,
     path_count: usize,

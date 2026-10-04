@@ -1,8 +1,8 @@
 # Shared worktree index design
 
-**Status:** proposed end-state architecture, with the shared-reader and
-overlay-checkpoint foundation implemented in
-[PR #168](https://github.com/microsoft/tgrep/pull/168).
+**Status:** end-state architecture with the shared-reader and overlay-checkpoint
+foundation implemented in [PR #168](https://github.com/microsoft/tgrep/pull/168),
+and [committed-tree base generations](tgrep-core/src/generations/mod.rs) implemented.
 Automatic multi-worktree CLI/server support is not implemented yet.
 
 ## Goal and ownership
@@ -87,7 +87,7 @@ searches.
 ## Base snapshots and worktree overlays
 
 A base describes an exact committed tree under a compatible indexing profile.
-Its proposed key includes repository identity, Git tree OID, indexing profile,
+Its implemented key includes repository identity, Git tree OID, indexing profile,
 and index-format version; retain the commit OID for diagnostics. The profile
 must account for content decoding, checkout transformations, and corpus
 coverage. Dirty and untracked files from the main checkout belong in its
@@ -223,6 +223,15 @@ restorable checkpoint needs them. A retention policy may evict idle checkpoints
 and release their pins; restoration must then rebuild/reconcile, not silently
 substitute another base. Defer removal of mapped generations on Windows.
 
+The current core manager deliberately implements **retain-all**, not online GC:
+it never deletes or rewrites a published generation, even when its last
+`Arc<Generation>` pin is dropped. This also protects escaped readers/views and
+restorable checkpoints across process restarts. There is no deletion API or
+automatic active-session migration. Reclaiming storage offline requires stopping
+all users and discarding dependent checkpoints. A later daemon can introduce
+ownership-aware retention and resource budgets; absence of a live in-process pin
+alone is not proof that a generation is deletable.
+
 ## Persistence and compatibility
 
 Store bases outside disposable worktree directories. Persist each worktree's
@@ -250,20 +259,99 @@ remain available while shared mode is introduced explicitly. Do not implement
 sharing by pointing today's servers at the same `--index-path`: their
 publication path still writes a complete index.
 
+## Implemented generation API
+
+`tgrep_core::generations::Repository::discover(root)` invokes Git without a shell
+and identifies the canonical native common directory. `.git` files, linked
+worktrees, subdirectories and bare repositories are supported. Independent
+clones do not share identity, even with equal tree OIDs and remotes.
+`Repository::git_dir()` retains the discovered worktree's metadata directory so
+symbolic revisions such as `HEAD` resolve there, not at another worktree's HEAD.
+Ambient `GIT_*` environment overrides and replace refs are ignored; Git failures,
+missing objects and unsupported native/index paths are explicit errors.
+
+`GenerationManager::new(repository)` uses
+`<common-dir>/tgrep-bases-v1/<repository-identity>/`.
+`with_storage(repository, storage)` accepts an existing trusted external
+directory and uses a repository-identity subdirectory. It rejects storage in
+registered worktrees, Git metadata or another index snapshot. Stores and their
+ancestors must not be externally renamed or modified while in use.
+
+| API | Contract |
+| --- | --- |
+| `ensure(revision, profile, predecessor)` | Resolve an exact commit/tree, build or reuse the key; incompatible supplied predecessors error |
+| `EnsureResult` | Pinned `Arc<Generation>`, requested commit, and per-request `BuildStats` |
+| `open(key)` / `list()` | Open exact or list validated published generations; errors never become empty bases |
+| `Generation::key()` / `commit_oid()` | Serializable exact repository/tree/profile/format/schema key; first publishing commit for diagnostics |
+| `Generation::base()` | The shared `Arc<SharedBase>`; use existing worktree/overlay APIs without changing their validation |
+| `entries()` / `entry(path)` | Sorted complete tracked membership, Git modes/OIDs/raw sizes and content classification |
+| `TrackedEntry::matches_worktree_bytes(bytes)` | Decoded-content identity comparison only, not a freshness/visibility/eligibility claim |
+| `retention()` | `RetentionPolicy::RetainAll`, including after all current pins drop |
+
+The versioned profile is `RawGitBlobAutoV1` plus `TrackedRegularFilesV1` and a raw
+blob-size cap (64 MiB by default; `None` disables it). It invokes the existing
+automatic decoder, binary classifier and masked trigram extractor on raw blobs,
+never checkout-filtered bytes. Ignore rules, hidden visibility and binary
+extensions are deliberately not applied to this tracked-path superset.
+Destination mode/size eligibility is always recomputed. Only regular-file
+predecessor entries with compatible indexed content supply reusable postings.
+Binary entries may reuse their classification, but cannot supply absent postings.
+Empty and short text entries carry a content identity even with zero postings.
+Oversized, binary, symlink and gitlink records remain distinguishable in tracked
+membership; symlinks and gitlinks are not followed or content-indexed.
+
+Clean Git status and equal blob IDs do not prove equivalence of worktree bytes.
+Layer 2 must prove compatible decoded identities from stable reads, or overlay
+transformed/changed files or scan. It must also apply worktree-specific membership,
+including ignored/extension-filtered files, sparse checkout and filesystem case
+behavior. Non-UTF-8 tracked names, unsafe relative paths, and paths unrepresentable
+on the current platform are explicit unsupported errors, not lossy aliases.
+Native repository paths are retained losslessly. Content/coverage enum versions
+must advance if their semantics change, independently of the index format.
+
+A supplied compatible predecessor provides postings by blob identity, including
+renames/copies, without reading unchanged blob contents. Changed/new blobs use
+one `git cat-file --batch` process and the existing spill sorter, then publish a
+complete streamed index. Memory includes one blob, its decoded text/masks,
+O(tracked paths) metadata and the bounded sorter arena, not all postings.
+Without a predecessor the first build extracts the full committed corpus.
+`BuildStats` counts actual blob reads/bytes, extraction calls, reused indexed
+files, copied postings, and whether this request published or reused a generation.
+Publication I/O and metadata enumeration are not eliminated by extraction reuse.
+
+One OS file lock per repository store serializes cooperating processes, including
+different-tree builds; it is released on process exit/crash. A weak in-process
+cache shares live `Arc<Generation>` pins and their shared reader/path table.
+Staging uses unique `.stage-*` directories on the same filesystem. The complete
+index is strictly opened, its fingerprint and checksummed tracked metadata
+validated, and files synced before atomic directory rename to the key's name.
+Final directories are never overwritten, even if corrupt. Abandoned staging
+directories are ignored, not advertised or automatically garbage-collected.
+Atomic visibility is not a parent-directory power-loss durability guarantee.
+These checks detect inconsistent/corrupt data; storage must still be trusted,
+not treated as an authenticated format for adversarially rewritten files.
+
+For layer 2, retain the generation pin with each view and serialize its key
+alongside overlay checkpoints. The generation's `SharedBase` fingerprint still
+binds the checkpoint to exact index bytes. Reopening that key is not readiness:
+reconcile the worktree before enabling indexed queries. No watcher, Git delta
+discovery, daemon wire schema or CLI shared-mode behavior is introduced here.
+
 ## Implementation status and rollout
 
-The initial increment is a core-library foundation, not automatic shared
-indexing:
+The implemented increments are core-library APIs, not automatic shared indexing:
 
-| Surface | Status in the initial increment |
+| Surface | Current status |
 | --- | --- |
 | [`SharedBase`](tgrep-core/src/shared.rs) | Opens a validated reader once; creates independent worktree-rooted views sharing its `Arc` |
 | [`HybridIndex`](tgrep-core/src/hybrid.rs) / [`LiveIndex`](tgrep-core/src/live.rs) | Reuses existing candidate merging, replacements, and tombstones |
 | Overlay checkpoints | Atomic delta-only save/restore; validate format, root, paths, and exact base fingerprint |
-| Base identity | Fingerprint of path table, lookup table, and postings; not yet a Git revision/profile registry |
-| Base immutability | Caller obligation; callers must not rewrite files while readers map them |
+| Base identity | Index fingerprint plus repository/tree/profile/format/schema generation key |
+| Base immutability | Generation manager stages/validates/publishes once; external callers must not mutate mapped files |
 | [`Regression coverage`](tgrep-core/tests/shared_worktrees.rs) | Sharing/isolation, masks, tombstones, restoration, compatibility, repeated saves, and Windows failure recovery |
-| Generation management, Git discovery, daemon routing | Proposed follow-up work |
+| [`Generation management`](tgrep-core/src/generations/mod.rs) | Canonical common-dir identity, raw committed-tree builds, incremental posting reuse, cross-process deduplication, pins and retain-all |
+| [`Generation coverage`](tgrep-core/tests/generations.rs) | Temporary repositories/worktrees, thread/process races, content transformations, immutable old readers, errors and interrupted publication |
+| Worktree synchronization and daemon routing | Follow-up work; not yet implemented |
 
 Shared-base validation rejects mismatched empty lookup/posting sections and
 metadata counts inconsistent with the opened sections, while allowing empty
@@ -284,8 +372,8 @@ Merge the foundation independently once its normal review and checks are
 satisfied; do not expand it into the entire feature. Keep follow-up work in
 reviewable increments, each with its own correctness coverage:
 
-1. **Base generations:** Git tree/profile identity, immutable build/publication,
-   incremental reuse, and lifecycle/retention.
+1. **Base generations (implemented):** Git tree/profile identity, immutable
+   build/publication, incremental reuse, pins and conservative retain-all.
 2. **Worktree synchronization:** complete delta discovery, private membership,
    watchers/reconciliation, checkpoint recovery, and readiness gating.
 3. **Daemon and integration:** worktree registration/routing, CLI discovery,

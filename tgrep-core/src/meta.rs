@@ -292,7 +292,7 @@ impl PersistedVersion {
 /// The domain prefix must change if decoding, binary classification, or posting
 /// semantics change in a way that makes identities from an older index unsafe
 /// to compare with newly decoded bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContentId([u8; 16]);
 
 impl ContentId {

@@ -636,6 +636,65 @@ See the [shared worktree index design](SHARED_WORKTREE_INDEXES.md) for
 architecture diagrams, the agent runtime boundary, base-generation lifecycle,
 and the staged implementation plan.
 
+`tgrep-core::generations` manages immutable committed-tree bases:
+
+```rust
+use std::path::Path;
+use tgrep_core::generations::{GenerationManager, IndexingProfile, Repository};
+
+let repository = Repository::discover(Path::new("."))?;
+let manager = GenerationManager::new(repository)?;
+let first = manager.ensure("HEAD", IndexingProfile::default(), None)?;
+let next = manager.ensure("main", IndexingProfile::default(), Some(&first.generation))?;
+// Keep this Arc with the worktree registration; populate its overlay separately.
+let pin = next.generation;
+let view = pin.base().create_worktree(Path::new("."))?;
+```
+
+Repository identity is the **canonical Git common directory**, shared by linked
+worktrees but not independent clones. Git is required; commands use arguments,
+not shell interpolation, and ignore ambient `GIT_*` overrides. Symbolic revisions
+such as `HEAD` resolve in the discovered worktree. Keys contain repository
+identity, exact committed tree OID, indexing profile, and format/schema versions;
+commit OIDs are retained for diagnostics. `new` stores generations below the
+common directory's `tgrep-bases-v1`. `with_storage` accepts an existing trusted
+directory outside registered worktrees and Git metadata.
+
+The current profile indexes **raw Git blobs** with the existing automatic text
+decoder. It covers all tracked regular files, including hidden, ignored, and
+extension-filtered paths: a superset, not a worktree's searchable membership.
+`entries()` records each tracked path's mode, object OID, size and classification.
+`Indexed { content_id }` includes empty/short files; `Binary`, `TooLarge`, and
+`NotRegular` have no content-index entry. Symlinks and gitlinks are never followed.
+Non-UTF-8 tracked paths and paths the platform/index cannot represent return
+explicit unsupported errors; repository roots preserve their native identity.
+Clean Git status does **not** establish compatibility with CRLF, encoding, LFS
+or smudge transformations. `entry.matches_worktree_bytes(bytes)` compares the
+decoded identity only; it proves neither stable filesystem reads nor visibility.
+
+A compatible predecessor reuses unchanged blob postings and masks, including
+copies/renames, while extracting only new content through one Git batch process.
+Destination mode and size eligibility are recomputed. Without a predecessor,
+a missing generation requires a full build. `EnsureResult.stats` reports actual
+blob reads/extractions, bytes, reused files/postings, and publication/reuse.
+An OS file lock deduplicates cooperating starters across processes; live
+generation pins share one in-process `Arc<Generation>` and `Arc<SharedBase>`.
+The spill sorter bounds posting accumulation; one raw/decoded blob and its
+extracted masks are held at a time. Removing the size cap can therefore require
+substantial memory. Publication still streams a complete new index.
+
+`open(key)` reopens an exact generation; `list()` returns validated published
+keys. Complete staging directories are validated and atomically renamed before
+discovery. Corrupt/incomplete final generations error rather than being replaced;
+abandoned staging directories are not discoverable. File contents are synced,
+but parent-directory power-loss durability is not guaranteed.
+**Retention is explicitly `RetainAll`: no published generation is deleted**, even
+after pins drop. Persist the key with retained overlay checkpoints. Online GC,
+checkpoint eviction and resource budgets remain future daemon responsibilities;
+offline cleanup requires stopping all users and discarding dependent checkpoints.
+Storage and its ancestors must not be externally renamed, modified or removed
+while in use. Do not run mutable index builders against generation directories.
+
 `tgrep-core::shared::SharedBase` is the first building block for sharing one
 content index across worktrees. Open a complete, current-format index in an
 **immutable snapshot directory** once, then call `create_worktree(root)` for

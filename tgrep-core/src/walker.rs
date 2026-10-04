@@ -577,7 +577,8 @@ pub struct MetaWalkResult {
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
     pub visibility: crate::visibility::PathVisibility,
-    /// Entries or metadata reads the walk could not inspect.
+    /// Entries/metadata the walk could not inspect, or relative paths that
+    /// cannot be represented losslessly in the index's Unicode path format.
     pub skipped_error: usize,
 }
 
@@ -716,10 +717,28 @@ pub fn walk_file_metadata_with_ignorecase(
                 skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
 
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if should_skip_dir(&entry, &exclude) {
-                    return ignore::WalkState::Skip;
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            if is_dir && should_skip_dir(&entry, &exclude) {
+                return ignore::WalkState::Skip;
+            }
+            if !is_dir && !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            // Never convert a native name into another file's path. Validate
+            // directories too, before recording visibility or descending.
+            let relative = match entry.path().strip_prefix(&root).ok().and_then(Path::to_str) {
+                Some(relative) if cfg!(windows) || !relative.contains('\\') => relative,
+                _ => {
+                    skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return if is_dir {
+                        ignore::WalkState::Skip
+                    } else {
+                        ignore::WalkState::Continue
+                    };
                 }
+            };
+
+            if is_dir {
                 record_visibility(visibility, &root, &entry);
                 // Probing each descended directory finds ignore files the walk
                 // itself filters out; see `gitignore::ignore_files_in`.
@@ -733,16 +752,9 @@ pub fn walk_file_metadata_with_ignorecase(
                 return ignore::WalkState::Continue;
             }
 
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return ignore::WalkState::Continue;
-            }
-
             let path = entry.path();
             record_visibility(visibility, &root, &entry);
-            let rel_path = match path.strip_prefix(&root) {
-                Ok(p) => p.to_string_lossy().replace('\\', "/"),
-                Err(_) => return ignore::WalkState::Continue,
-            };
+            let rel_path = relative.replace('\\', "/");
 
             if is_binary_extension(path) {
                 let too_large = match exceeds_size_limit(max_file_size, || {

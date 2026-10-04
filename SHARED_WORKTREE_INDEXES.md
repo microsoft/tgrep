@@ -378,6 +378,10 @@ full work pending. Retrying replays by full verification; sustained churn must
 scan or wait, never spin indefinitely. Incomplete metadata walks (including
 ignore-rule errors), unreadable tracked exemptions, failed reads and detected
 read instability also keep the gate closed. No base-only success is possible.
+Native directory/file names are validated before converting metadata-walk paths
+or recording visibility. Non-Unicode names and literal Unix backslashes produce
+discovery errors instead of aliasing valid or ignored paths; ordinary native-path
+full scans remain the fallback.
 Each reconciliation advances the epoch, including no-hint full repairs, so
 successful publication acknowledges earlier invalidation tokens with an equal
 or later epoch.
@@ -404,6 +408,9 @@ refresh walks metadata and membership. Full passes read/verify all admitted
 content; hinted passes can retain previous evidence for unaffected paths under
 the explicit event-driven freshness contract. Case-alias hints conservatively
 reverify; non-ASCII hints and capacity overflow require full verification.
+Accepted hints are rebuilt from normal path components, so trailing/repeated
+separators and interior `.` spellings cannot lose subtree invalidations. Absolute,
+parent-component and leading `.` component hints still error and require full repair.
 Same-size/restored-mtime edits without notifications are repaired by forced
 full checks, not promised by hints. Successful refresh acknowledges processed
 inputs, not an atomic filesystem snapshot. Final matching reads the requesting

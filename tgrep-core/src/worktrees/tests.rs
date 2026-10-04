@@ -947,6 +947,223 @@ fn subtree_hints_and_case_aliases_reverify_unchanged_metadata() {
 }
 
 #[test]
+fn subtree_hint_spellings_reverify_restored_mtime_edits() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "dir/nested/one.txt", b"term00");
+    write(&fixture.root, "dir/nested/two.txt", b"unchanged");
+    write(&fixture.root, "outside.txt", b"outside");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let path = fixture.root.join("dir/nested/one.txt");
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    for (number, hint) in [
+        "dir/",
+        "dir//",
+        "dir/.",
+        "dir//./",
+        "dir/./nested//",
+        "dir//nested/.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let content = format!("term{:02}", number + 1);
+        fs::write(&path, &content).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 6);
+        view.invalidate_path(Path::new(hint)).unwrap();
+        let stats = view.refresh().unwrap();
+        assert_eq!(matches(&view, &content), ["dir/nested/one.txt"], "{hint}");
+        // The unchanged sibling also needs verification: this assertion
+        // detects lost subtree hints even when Unix ctime catches the edit.
+        assert_eq!(stats.files_read, 2, "{hint}");
+        assert_eq!(stats.content_reads_avoided, 1, "{hint}");
+        assert!(!stats.full, "{hint}");
+    }
+}
+
+#[test]
+fn accepted_hint_spellings_have_one_canonical_queue_entry() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "dir/file.txt", b"needle");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    for hint in ["dir", "dir/", "dir//", "dir/.", "dir//./"] {
+        view.invalidate_path(Path::new(hint)).unwrap();
+        let control = view.control.lock().unwrap();
+        assert_eq!(control.hints, BTreeSet::from(["dir".to_string()]), "{hint}");
+        assert!(!control.full);
+    }
+    #[cfg(windows)]
+    for hint in [r"dir\", r"dir\\.\", r"dir//.\"] {
+        view.invalidate_path(Path::new(hint)).unwrap();
+        assert_eq!(
+            view.control.lock().unwrap().hints,
+            BTreeSet::from(["dir".to_string()])
+        );
+    }
+    for hint in ["", ".", "./dir", "../dir", "dir/../file"] {
+        assert!(matches!(
+            view.invalidate_path(Path::new(hint)),
+            Err(WorktreeError::InvalidInput(_))
+        ));
+        assert!(view.status().unwrap().full_required);
+        assert!(!view.status().unwrap().ready);
+    }
+}
+
+#[cfg(unix)]
+fn assert_native_alias_is_rejected(native_name: &std::ffi::OsStr, alias: &str) {
+    let fixture = Fixture::new();
+    write(&fixture.root, "source.txt", b"tracked needle");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let published = view.status().unwrap().published_epoch;
+    write(&fixture.root, alias, b"ignored alias secret");
+    write(
+        &fixture.root,
+        ".gitignore",
+        format!("/{alias}\n").as_bytes(),
+    );
+    let native = fixture.root.join(native_name);
+    match fs::write(&native, b"native visible needle") {
+        Ok(()) => {}
+        Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => {
+            eprintln!("APFS rejected the non-UTF-8 fixture filename: {error}");
+            return;
+        }
+        Err(error) => panic!("create native alias fixture: {error}"),
+    }
+    let scan = walker::walk_dir(
+        view.root(),
+        &walker::WalkOptions {
+            include_hidden: true,
+            ..walker::WalkOptions::default()
+        },
+    );
+    assert_eq!(scan.skipped_error, 0);
+    assert!(
+        scan.listed_files
+            .contains(&fs::canonicalize(&native).unwrap())
+    );
+    assert!(
+        !scan
+            .listed_files
+            .contains(&fs::canonicalize(fixture.root.join(alias)).unwrap())
+    );
+
+    assert!(
+        matches!(view.refresh(), Err(WorktreeError::IncompleteWalk(_))),
+        "unsupported native path must not read an ignored alias: {native_name:?}"
+    );
+    assert!(!view.status().unwrap().ready);
+    assert!(view.status().unwrap().full_required);
+    assert_eq!(view.status().unwrap().published_epoch, published);
+    assert!(matches!(
+        view.with_snapshot(|_| ()),
+        Err(WorktreeError::NotReady)
+    ));
+    let metadata = walker::walk_file_metadata(view.root(), &MetaWalkOptions::default());
+    assert!(metadata.skipped_error > 0);
+    assert!(!metadata.listed_files.iter().any(|path| path == alias));
+    assert!(
+        !metadata
+            .files
+            .iter()
+            .any(|file| file.relative_path == alias)
+    );
+
+    fs::remove_file(native).unwrap();
+    view.refresh().unwrap();
+    assert!(matches(&view, "ignored alias secret").is_empty());
+    assert_eq!(matches(&view, "tracked needle"), ["source.txt"]);
+    fs::remove_file(fixture.root.join(".gitignore")).unwrap();
+    view.refresh().unwrap();
+    assert!(
+        view.with_snapshot(|snapshot| snapshot.files("", true))
+            .unwrap()
+            .contains(&alias.to_string())
+    );
+    if !walker::is_binary_extension(Path::new(alias)) {
+        assert_eq!(matches(&view, "ignored alias secret"), [alias]);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_checkout_paths_cannot_alias_literal_replacement_paths() {
+    use std::os::unix::ffi::OsStrExt;
+    assert_native_alias_is_rejected(
+        std::ffi::OsStr::from_bytes(b"native-\xff.txt"),
+        "native-\u{fffd}.txt",
+    );
+    assert_native_alias_is_rejected(
+        std::ffi::OsStr::from_bytes(b"native-\xff.bin"),
+        "native-\u{fffd}.bin",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn literal_backslash_checkout_paths_cannot_alias_directory_paths() {
+    assert_native_alias_is_rejected(
+        std::ffi::OsStr::new(r"ignored\alias.txt"),
+        "ignored/alias.txt",
+    );
+    assert_native_alias_is_rejected(
+        std::ffi::OsStr::new(r"ignored\alias.bin"),
+        "ignored/alias.bin",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_directory_paths_are_rejected_before_visibility_or_descent() {
+    use std::os::unix::ffi::OsStrExt;
+    let fixture = Fixture::new();
+    write(&fixture.root, "source.txt", b"tracked needle");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    let native = fixture
+        .root
+        .join(std::ffi::OsStr::from_bytes(b".native-\xff"));
+    match fs::create_dir(&native) {
+        Ok(()) => {}
+        Err(error) if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) => {
+            eprintln!("APFS rejected the non-UTF-8 fixture directory: {error}");
+            return;
+        }
+        Err(error) => panic!("create native directory fixture: {error}"),
+    }
+    fs::write(native.join("one.txt"), b"first").unwrap();
+    fs::write(native.join("two.txt"), b"second").unwrap();
+    let metadata = walker::walk_file_metadata(view.root(), &view.options.walk);
+    assert_eq!(
+        metadata.skipped_error, 1,
+        "reject the directory without descending"
+    );
+    assert_eq!(metadata.listed_files, ["source.txt"]);
+    assert!(
+        metadata.visibility.is_empty(),
+        "do not record a lossy hidden path"
+    );
+    assert!(matches!(
+        view.refresh(),
+        Err(WorktreeError::IncompleteWalk(1))
+    ));
+    assert!(!view.status().unwrap().ready);
+}
+
+#[test]
 fn no_ignore_still_excludes_private_storage_and_larger_view_can_overlay_capped_base() {
     let fixture = Fixture::new();
     write(&fixture.root, "source.txt", b"larger than base cap needle");

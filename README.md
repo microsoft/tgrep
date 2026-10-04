@@ -735,6 +735,9 @@ Query `prefix` is empty or a root-relative directory ending in `/`.
 `invalidate_path(relative_path)` immediately closes the query gate and queues
 a bounded file/subtree hint (both paths for renames). Case aliases trigger
 conservative verification; non-ASCII hints and queue overflow force a full pass.
+Accepted trailing/repeated separators and interior `.` components are normalized,
+so `dir/` still invalidates the entire `dir` subtree. Absolute paths, parent
+components, and leading `.` remain explicit errors that force full repair.
 `invalidate_all()` handles native watcher overflow, polling uncertainty, Git or
 ignore configuration changes, and missed-event repair. `refresh()` rewalks
 membership/visibility and processes hints; with no hints it does full content
@@ -749,6 +752,9 @@ retry or scan. There is one attempt per call, never an unbounded churn loop.
 Every reconciliation advances the epoch, including refreshes without hints;
 the published epoch acknowledges all earlier invalidation tokens.
 Discovery/read errors likewise leave the view unavailable and force full retry.
+Metadata discovery rejects unrepresentable native names before conversion:
+non-Unicode paths and literal Unix backslashes cannot alias other indexed paths.
+Ordinary full scans retain native paths and remain available as the fallback.
 `with_snapshot` holds readiness and overlay guards through candidate-ID
 resolution; no live IDs or mutable `HybridIndex` escape. Do not reenter the view
 from its closure. A refresh acknowledges processed hints, **not an atomic

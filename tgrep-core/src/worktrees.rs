@@ -271,6 +271,8 @@ impl WorktreeView {
     /// Queue a root-relative file or subtree, including missing/renamed paths.
     /// Pass both old and new rename paths. Invalid hints close the gate and
     /// force a full pass before returning an error; never silently discard one.
+    /// Accepted repeated/trailing separators and interior `.` components are
+    /// normalized without requiring the hinted path to still exist.
     /// Git/ignore configuration changes should use `invalidate_all`. A
     /// successful refresh acknowledges this token with an equal or later epoch.
     pub fn invalidate_path(&self, path: &Path) -> Result<u64> {
@@ -741,9 +743,11 @@ fn relative_path(path: &Path) -> Result<String> {
             .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(WorktreeError::InvalidInput(
-            "hint must be a nonempty root-relative path without dot components".into(),
+            "hint must be nonempty and root-relative, without '..' or a leading '.' component"
+                .into(),
         ));
     }
+    let path: PathBuf = path.components().collect();
     let path = path
         .to_str()
         .ok_or_else(|| WorktreeError::InvalidInput("non-Unicode checkout path".into()))?;

@@ -519,6 +519,9 @@ only. All requests have this envelope (including `hello`):
 Successful results repeat `protocol`, `instance` and `repository`. Errors have
 `error.code` and `error.message`, never success-shaped empty results. V1 rejects
 unknown envelope/parameter fields, malformed options and incompatible identities.
+Search RPCs must omit `passthru` or set it to `false`; `true` is rejected with a
+scan-required error because indexed candidates omit nonmatching files. The CLI
+keeps `--passthru` on its existing filesystem-scan path when it emits all lines.
 Canonical worktree roots must be UTF-8 for JSON transport. CLI and server reject
 unsupported roots, including Unicode aliases to them, before serialization or
 generation publication; the core API's native-path support is unchanged.

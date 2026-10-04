@@ -1141,6 +1141,10 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
     if !files {
         ensure!(query["pattern"].is_string(), "pattern is required");
         ensure!(
+            query.get("passthru").is_none_or(|value| value == false),
+            "passthru requires a filesystem scan"
+        );
+        ensure!(
             query.get("encoding").is_none_or(|v| v == "auto")
                 && query.get("text").is_none_or(|v| v == false)
                 && query

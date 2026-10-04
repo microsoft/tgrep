@@ -720,6 +720,49 @@ fn no_watch_full_repair_and_restart_checkpoint_revalidation() {
 }
 
 #[test]
+fn passthru_rpc_is_rejected_while_cli_preserves_scan_output() {
+    let f = Fixture::new();
+    fs::write(f.a.join("nonmatching.txt"), "nonmatching_file_payload\n").unwrap();
+    let d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    let normal = d.rpc(
+        "search",
+        json!({"root":f.a,"view":a["view"],"query":{"pattern":"shared_term","passthru":false}}),
+    );
+    assert_eq!(normal["backend"], "shared-v1");
+    let before = d.lookup(&f.a)["queries"].as_u64().unwrap();
+    for pattern in ["shared_term", "absentZXQJVPKMW"] {
+        let response = d
+            .try_rpc(
+                "search",
+                json!({"root":f.a,"view":a["view"],"query":{"pattern":pattern,"passthru":true}}),
+            )
+            .unwrap();
+        assert!(response.get("result").is_none(), "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("passthru requires a filesystem scan"),
+            "{response}"
+        );
+        let args = ["--passthru", "--sort", "path", "--", pattern, "."];
+        let attached = cli(&f.a, &args);
+        let mut scan = vec!["--no-index"];
+        scan.extend(args);
+        let scanned = cli(&f.a, &scan);
+        assert_eq!(attached.status.code(), scanned.status.code());
+        assert_eq!(attached.stdout, scanned.stdout);
+        assert!(String::from_utf8_lossy(&attached.stdout).contains("nonmatching_file_payload"));
+        assert!(
+            String::from_utf8_lossy(&attached.stderr).contains("scanning filesystem"),
+            "{attached:?}"
+        );
+    }
+    assert_eq!(d.lookup(&f.a)["queries"].as_u64().unwrap(), before);
+}
+
+#[test]
 fn protocol_root_scope_and_aggregate_limit_rejections() {
     let f = Fixture::new();
     let d = f.start(&[

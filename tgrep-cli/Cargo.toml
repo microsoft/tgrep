@@ -19,6 +19,7 @@ tgrep-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 notify = "7"
 rayon = "1"

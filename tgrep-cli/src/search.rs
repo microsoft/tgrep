@@ -38,6 +38,7 @@ pub struct SearchOptions {
     pub vimgrep: bool,
     pub stats: bool,
     pub no_index: bool,
+    pub shared: bool,
     pub glob: Vec<String>,
     pub iglob: Vec<String>,
     pub glob_case_insensitive: bool,
@@ -468,7 +469,52 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         .map(Path::to_path_buf)
         .unwrap_or_else(|| builder::default_index_dir(&root));
 
-    if filename_index_compatible(opts) {
+    let shared = crate::serve::shared::Client::selected(&root, opts.shared, index_path);
+    let shared_selected = !matches!(shared, Ok(false));
+    if shared_selected && !opts.no_index {
+        let result = (|| -> Result<_> {
+            shared?;
+            anyhow::ensure!(
+                index_path.is_none() && shared_compatible(opts),
+                "options require a filesystem scan"
+            );
+            let (client, view) = crate::serve::shared::Client::registered(&root)?;
+            let scope = IndexScope::resolve(&view.root, &root)
+                .ok_or_else(|| anyhow::anyhow!("search root outside shared worktree"))?;
+            let result = client.view_request(
+                "files", &view,
+                serde_json::json!({"hidden":opts.hidden,"scope":scope.prefix(),"max_depth":opts.max_depth}),
+            )?;
+            let paths: Vec<String> = serde_json::from_value(
+                result
+                    .get("files")
+                    .ok_or_else(|| anyhow::anyhow!("shared response omitted files"))?
+                    .clone(),
+            )?;
+            Ok((view.root, scope, paths))
+        })();
+        match result {
+            Ok((index_root, scope, paths)) => {
+                write_indexed_file_paths(
+                    &index_root,
+                    &root,
+                    &scope,
+                    paths,
+                    None,
+                    &glob_filter,
+                    &type_filter,
+                    opts,
+                )?;
+                if opts.stats {
+                    eprintln!("Filename search completed (via shared daemon v1)");
+                }
+                return Ok(());
+            }
+            Err(error) => warn_shared_fallback(&error, opts),
+        }
+    }
+
+    if !shared_selected && filename_index_compatible(opts) {
         if let Ok(info) = ServerInfo::load(&index_dir)
             && let Some((index_root, scope)) = resolve_scope(&index_dir, &root)
             && let Ok(paths) = list_files_via_server(&info, &scope, opts)
@@ -573,6 +619,32 @@ fn filename_index_compatible(opts: &SearchOptions) -> bool {
         && opts.ignore_files.is_empty()
         && !opts.ignore_file_case_insensitive
         && !opts.max_filesize_requested
+}
+
+fn shared_compatible(opts: &SearchOptions) -> bool {
+    !opts.no_ignore
+        && !opts.no_ignore_dot
+        && !opts.no_ignore_exclude
+        && !opts.no_ignore_global
+        && !opts.no_ignore_parent
+        && !opts.no_ignore_vcs
+        && !opts.no_require_git
+        && !opts.follow
+        && !opts.one_file_system
+        && opts.ignore_files.is_empty()
+        && !opts.ignore_file_case_insensitive
+        && !opts.encoding.may_differ_from_index()
+        && !opts.text
+        && !opts.binary
+        && opts.max_filesize == Some(64 * 1024 * 1024)
+}
+
+fn warn_shared_fallback(error: &anyhow::Error, opts: &SearchOptions) {
+    if !opts.no_messages {
+        eprintln!(
+            "warning: shared view unavailable ({error:#}) - scanning filesystem (not a legacy index)"
+        );
+    }
 }
 
 /// Load a complete local filename index, including the paths deliberately
@@ -730,6 +802,38 @@ pub fn run(
 
     let ci = opts.effective_case_insensitive();
 
+    let selected = crate::serve::shared::Client::selected(&root, opts.shared, index_path);
+    if !matches!(selected, Ok(false)) {
+        if !opts.no_index {
+            let response = (|| -> Result<_> {
+                selected?;
+                anyhow::ensure!(
+                    index_path.is_none()
+                        && !root.is_file()
+                        && shared_compatible(opts)
+                        && !opts.effective_passthru()
+                        && !opts.files_without_match
+                        && !opts.include_zero,
+                    "options require a filesystem scan"
+                );
+                let (client, view) = crate::serve::shared::Client::registered(&root)?;
+                let scope = IndexScope::resolve(&view.root, &root)
+                    .ok_or_else(|| anyhow::anyhow!("search root outside shared worktree"))?;
+                let request = server_search_request(&scope, opts, ci)?;
+                let result = client.view_request("search", &view, request["params"].clone())?;
+                require_server_coverage(&result)?;
+                Ok((view.root, scope, result))
+            })();
+            match response {
+                Ok((index_root, scope, result)) => {
+                    return render_server_result(&result, &root, &index_root, &scope, opts, writer);
+                }
+                Err(error) => warn_shared_fallback(&error, opts),
+            }
+        }
+        return brute_force_search(&root, &index_dir, opts, ci, writer);
+    }
+
     // A non-default `--encoding` re-decodes files into text the index never
     // saw. Worse, a file the indexer classified as binary (BOM-less UTF-16 is
     // nothing but NUL-interleaved bytes) is absent from the index entirely, so
@@ -844,7 +948,31 @@ fn search_via_server(
 ) -> Result<bool> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
+    let request = server_search_request(scope, opts, ci)?;
+    writeln!(stream, "{request}")?;
+    stream.flush()?;
+    let mut reader = BufReader::new(&stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let response: serde_json::Value = serde_json::from_str(&line)?;
+    if let Some(error) = response.get("error") {
+        let msg = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("server error: {msg}");
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| anyhow::anyhow!("no result in response"))?;
+    render_server_result(result, root, index_root, scope, opts, writer)
+}
 
+fn server_search_request(
+    scope: &IndexScope,
+    opts: &SearchOptions,
+    ci: bool,
+) -> Result<serde_json::Value> {
     // Resolve `-f/--file` here rather than sending the path: the server has a
     // different working directory and no `pattern_file` param, so forwarding
     // only `pattern`/`extra_patterns` would silently drop the file's patterns
@@ -916,26 +1044,17 @@ fn search_via_server(
     request["params"]["hidden"] = serde_json::json!(opts.hidden);
     request["params"]["scope"] = serde_json::json!(scope.prefix());
     request["params"]["max_depth"] = serde_json::json!(opts.max_depth);
-    writeln!(stream, "{}", request)?;
-    stream.flush()?;
+    Ok(request)
+}
 
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-
-    let response: serde_json::Value = serde_json::from_str(&line)?;
-
-    if let Some(error) = response.get("error") {
-        let msg = error
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error");
-        anyhow::bail!("server error: {msg}");
-    }
-
-    let result = response
-        .get("result")
-        .ok_or_else(|| anyhow::anyhow!("no result in response"))?;
+fn render_server_result(
+    result: &serde_json::Value,
+    root: &Path,
+    index_root: &Path,
+    scope: &IndexScope,
+    opts: &SearchOptions,
+    writer: &mut OutputWriter,
+) -> Result<bool> {
     // Older servers ignore unknown request fields. Validate before writing any
     // rows, so an old/partial server can never silently answer --hidden.
     require_server_coverage(result)?;
@@ -1203,8 +1322,13 @@ fn search_via_server(
             print_index_stats(plan, raw, candidates, total);
             narrowing_note = index_narrowing_note(raw, total);
         }
+        let backend = if result.get("backend").and_then(|v| v.as_str()) == Some("shared-v1") {
+            "shared daemon v1"
+        } else {
+            "server"
+        };
         eprintln!(
-            "{num} matches ({lines} matched lines) in {elapsed:.1}ms (via server){narrowing_note}"
+            "{num} matches ({lines} matched lines) in {elapsed:.1}ms (via {backend}){narrowing_note}"
         );
     }
 

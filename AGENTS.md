@@ -64,6 +64,32 @@ Check that a server is up:
 tgrep status .
 ```
 
+For linked-worktree sessions, an agent runtime can instead start **one opt-in
+repository daemon** with `tgrep serve --shared <root> --shared-storage <existing
+trusted external directory>`. It runs in the foreground; keep it supervised.
+Call `tgrep shared attach <worktree> --revision <starting-commit>` per session
+and retain the returned JSON lease. Wait for `tgrep status <worktree>` to report
+`"ready": true`. Ordinary queries and `--files` then discover that attached view
+without changing every search command. No attachment means the legacy behavior
+above; a stale attachment means a diagnostic and a filesystem scan, not use of
+an ordinary stale index.
+
+After known edits, use `tgrep shared refresh <worktree> --lease <token> --changed
+<relative-path>` (repeat `--changed` for multiple paths, including both rename
+paths), or `--full` for missed-event repair. The returned `processed_epoch`
+acknowledges those changes, not every concurrent filesystem write. Native/poll
+refresh defaults to full verification every 120 seconds after completion;
+`serve --shared --no-watch` requires runtime refresh after the initial pass.
+Use `--no-index` whenever the current disk bytes must be searched.
+On session teardown call `tgrep shared detach <worktree> --lease <token>`.
+Independent leases cannot detach each other. Restart requires fresh attach calls
+with the intended revision; old leases are invalid. Bases stay pinned and
+checkpoints remain outside disposable worktrees. CRLF/smudge differences can
+require full private overlays, and initial verification still reads content.
+See [shared mode](README.md#shared-repository-daemon-opt-in) for budgets, profile
+compatibility and retain-all storage. The runtime owns process lifetime and
+offline cleanup; tgrep does not implement online GC.
+
 If your agent framework cannot keep a background process alive, skip `serve`
 and run `tgrep index .` instead. Searches then use the on-disk index. That
 index is not updated by searches or edits, so re-run `tgrep index .` after any
@@ -92,7 +118,7 @@ Rules of thumb for agents:
 
 - **Put `--` before the pattern** and pass the search root explicitly. Shell
   quotes do not stop the parser from reading a bare `index`, `serve`,
-  `search`, `status`, `count-files` or `help` as a subcommand;
+  `search`, `shared`, `status`, `count-files` or `help` as a subcommand;
   `tgrep -- serve .` searches for the word. Everything after `--` is read as
   the pattern and paths, so all flags must come before it.
 - **Prefer `-F`** when the query is a symbol or a string the user typed. It

@@ -1267,6 +1267,7 @@ version = "1.0.11"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "blake3",
  "clap",
  "fancy-regex",
  "fs2",

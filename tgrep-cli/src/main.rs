@@ -257,6 +257,10 @@ struct Cli {
     #[arg(long = "no-index", global = true)]
     no_index: bool,
 
+    /// Require shared-worktree discovery; unavailable/incompatible views scan.
+    #[arg(long, global = true)]
+    shared: bool,
+
     /// Custom index directory.
     #[arg(long = "index-path", global = true)]
     index_path: Option<PathBuf>,
@@ -622,6 +626,18 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
 
+        /// Existing trusted external directory for shared bases and checkpoints.
+        #[arg(long, requires = "shared")]
+        shared_storage: Option<PathBuf>,
+
+        /// Maximum shared views; native watches and hint slots are divided by this.
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=1024))]
+        shared_max_views: u32,
+
+        /// Maximum leases across all attached worktrees.
+        #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(1..=65536))]
+        shared_max_leases: u32,
+
         /// Disable all automatic refresh, including watching and polling.
         #[arg(long, conflicts_with_all = ["watch_mode", "poll_interval", "watch_budget"])]
         no_watch: bool,
@@ -691,6 +707,12 @@ enum Command {
             value_parser = clap::value_parser!(u64).range(1..=usize::MAX as u64)
         )]
         watcher_queue_cap: Option<u64>,
+    },
+
+    /// Explicit shared-worktree attachment lifecycle (JSON output).
+    Shared {
+        #[command(subcommand)]
+        command: serve::shared::Lifecycle,
     },
 
     /// Search for a pattern.
@@ -881,6 +903,7 @@ impl Cli {
             vimgrep: self.vimgrep,
             stats: self.stats || self.debug || self.trace,
             no_index: self.no_index,
+            shared: self.shared,
             glob: self.glob.clone(),
             iglob: self.iglob.clone(),
             glob_case_insensitive: self.glob_case_insensitive,
@@ -1113,6 +1136,36 @@ fn run_cli() {
         _ => {}
     }
 
+    if cli.shared && matches!(cli.command, Some(Command::Index { .. })) {
+        eprintln!("tgrep: --shared does not change index; use shared attach --revision");
+        process::exit(2);
+    }
+    if cli.shared
+        && let Some(Command::Serve {
+            ref exclude,
+            max_memory_mb,
+            max_cpu_percent,
+            auto_save_mutations,
+            ..
+        }) = cli.command
+        && (cli.index_path.is_some()
+            || no_ignore
+            || cli.no_require_git
+            || !exclude.is_empty()
+            || max_memory_mb.is_some()
+            || max_cpu_percent.is_some()
+            || auto_save_mutations.is_some()
+            || max_filesize != Some(64 * 1024 * 1024)
+            || resolved.encoding.may_differ_from_index()
+            || cli.text
+            || cli.binary)
+    {
+        eprintln!(
+            "tgrep: shared serve supports only the default raw-auto 64 MiB profile, not legacy index/storage/build options"
+        );
+        process::exit(2);
+    }
+
     let result = match cli.command {
         Some(Command::Index {
             path,
@@ -1137,6 +1190,9 @@ fn run_cli() {
         }
         Some(Command::Serve {
             path,
+            shared_storage,
+            shared_max_views,
+            shared_max_leases,
             no_watch,
             watch_mode,
             poll_interval,
@@ -1151,31 +1207,53 @@ fn run_cli() {
                 .map(|mb| mb.saturating_mul(1024 * 1024))
                 .unwrap_or_else(mem::default_memory_cap_bytes);
             let index_threads = cpu::index_thread_count(max_cpu_percent.unwrap_or(50));
-            serve::run(
-                &path,
-                cli.index_path.as_deref(),
-                serve::ServeOptions {
-                    no_watch,
-                    watch_mode,
-                    poll_interval: Duration::from_secs(poll_interval),
-                    watch_budget: watch_budget as usize,
-                    exclude_dirs: &exclude,
-                    memory_cap_bytes: memory_cap,
-                    index_threads,
-                    no_ignore,
-                    no_require_git: cli.no_require_git,
-                    // Same resolved value the search path uses, so the index
-                    // and the queries against it agree on what exists.
-                    max_file_size: max_filesize,
-                    auto_save_mutations,
-                    // Clap's range bound guarantees this fits; saturating keeps
-                    // the conversion total, and errs toward a large cap rather
-                    // than a zero-length (rendezvous) queue.
-                    watcher_queue_cap: watcher_queue_cap
-                        .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
-                },
-            )
+            if cli.shared {
+                match shared_storage {
+                    Some(storage) => serve::shared::run(
+                        &path,
+                        serve::shared::Options {
+                            storage: &storage,
+                            no_watch,
+                            watch_mode,
+                            poll_interval: Duration::from_secs(poll_interval),
+                            watch_budget: watch_budget as usize,
+                            hint_budget: watcher_queue_cap.unwrap_or(16384) as usize,
+                            max_views: shared_max_views as usize,
+                            max_leases: shared_max_leases as usize,
+                        },
+                    ),
+                    None => Err(anyhow::anyhow!(
+                        "serve --shared requires --shared-storage <existing external directory>"
+                    )),
+                }
+            } else {
+                serve::run(
+                    &path,
+                    cli.index_path.as_deref(),
+                    serve::ServeOptions {
+                        no_watch,
+                        watch_mode,
+                        poll_interval: Duration::from_secs(poll_interval),
+                        watch_budget: watch_budget as usize,
+                        exclude_dirs: &exclude,
+                        memory_cap_bytes: memory_cap,
+                        index_threads,
+                        no_ignore,
+                        no_require_git: cli.no_require_git,
+                        // Same resolved value the search path uses, so the index
+                        // and the queries against it agree on what exists.
+                        max_file_size: max_filesize,
+                        auto_save_mutations,
+                        // Clap's range bound guarantees this fits; saturating keeps
+                        // the conversion total, and errs toward a large cap rather
+                        // than a zero-length (rendezvous) queue.
+                        watcher_queue_cap: watcher_queue_cap
+                            .map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
+                    },
+                )
+            }
         }
+        Some(Command::Shared { command }) => serve::shared::run_lifecycle(command),
         Some(Command::Search {
             ref pattern,
             ref paths,
@@ -1183,7 +1261,13 @@ fn run_cli() {
             let (pattern, paths) = cli.split_pattern_and_paths(Some(pattern), paths);
             run_search(&cli, pattern, &paths, &resolved)
         }
-        Some(Command::Status { path }) => status::run(&path, cli.index_path.as_deref()),
+        Some(Command::Status { path }) => {
+            match serve::shared::Client::selected(&path, cli.shared, cli.index_path.as_deref()) {
+                Ok(false) => status::run(&path, cli.index_path.as_deref()),
+                Ok(true) => serve::shared::status(&path, cli.index_path.as_deref()),
+                Err(error) => Err(error),
+            }
+        }
         Some(Command::CountFiles { path }) => walkcount::run(&path, cli.hidden, no_ignore),
         None => {
             if cli.list_files {

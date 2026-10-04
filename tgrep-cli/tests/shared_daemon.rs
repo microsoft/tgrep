@@ -1,0 +1,1014 @@
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+use tempfile::TempDir;
+
+const PROFILE: &str = r#"{"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864}"#;
+
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+fn cli(root: &Path, args: &[&str]) -> Output {
+    Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn success(output: Output) -> String {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+struct Fixture {
+    temp: TempDir,
+    a: PathBuf,
+    b: PathBuf,
+    storage: PathBuf,
+    revision: String,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let temp = TempDir::new().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        let storage = temp.path().join("storage");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&storage).unwrap();
+        git(&a, &["init", "-q"]);
+        git(&a, &["config", "user.name", "Shared test"]);
+        git(&a, &["config", "user.email", "shared@example.invalid"]);
+        git(&a, &["config", "core.autocrlf", "false"]);
+        fs::create_dir(a.join("src")).unwrap();
+        fs::write(
+            a.join("src/main.rs"),
+            "fn shared_term() {}\ncontext line\nshared_term again\n",
+        )
+        .unwrap();
+        fs::write(a.join("notes.txt"), "shared_term notes\n").unwrap();
+        fs::write(a.join(".hidden"), "shared_term hidden\n").unwrap();
+        git(&a, &["add", "."]);
+        git(&a, &["commit", "-qm", "base"]);
+        let revision = git(&a, &["rev-parse", "HEAD"]);
+        git(
+            &a,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                b.to_str().unwrap(),
+                &revision,
+            ],
+        );
+        Self {
+            temp,
+            a,
+            b,
+            storage,
+            revision,
+        }
+    }
+
+    fn start(&self, options: &[&str]) -> Daemon {
+        Daemon::start(&self.a, &self.storage, options)
+    }
+
+    fn third(&self, revision: &str) -> PathBuf {
+        let root = self.temp.path().join("c");
+        git(
+            &self.a,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                root.to_str().unwrap(),
+                revision,
+            ],
+        );
+        root
+    }
+}
+
+struct Daemon {
+    child: Child,
+    marker: Value,
+}
+
+impl Daemon {
+    fn start(root: &Path, storage: &Path, options: &[&str]) -> Self {
+        let log = storage.join("daemon.log");
+        let child = Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+            .args([
+                "serve",
+                "--shared",
+                root.to_str().unwrap(),
+                "--shared-storage",
+                storage.to_str().unwrap(),
+            ])
+            .args(options)
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        let mut daemon = Self {
+            child,
+            marker: Value::Null,
+        };
+        let started = Instant::now();
+        loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "daemon readiness timed out: {}",
+                fs::read_to_string(&log).unwrap()
+            );
+            assert!(
+                daemon.child.try_wait().unwrap().is_none(),
+                "daemon exited: {}",
+                fs::read_to_string(&log).unwrap()
+            );
+            if let Ok(bytes) = fs::read(root.join(".git/tgrep-daemon-v1.json"))
+                && let Ok(marker) = serde_json::from_slice::<Value>(&bytes)
+                && marker["pid"] == daemon.child.id()
+            {
+                daemon.marker = marker;
+                if daemon
+                    .try_rpc("hello", json!({}))
+                    .is_ok_and(|v| v.get("result").is_some())
+                {
+                    return daemon;
+                }
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    fn request(&self, method: &str, params: Value) -> Value {
+        json!({
+            "jsonrpc":"2.0","protocol":1, "instance":self.marker["instance"],
+            "repository":self.marker["repository"], "id":1, "method":method,"params":params
+        })
+    }
+
+    fn raw(&self, request: &Value) -> std::io::Result<Value> {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", self.marker["port"].as_u64().unwrap() as u16))?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        writeln!(stream, "{request}")?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line)?;
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    fn try_rpc(&self, method: &str, params: Value) -> std::io::Result<Value> {
+        self.raw(&self.request(method, params))
+    }
+
+    fn rpc(&self, method: &str, params: Value) -> Value {
+        let response = self.try_rpc(method, params).unwrap();
+        assert!(response.get("error").is_none(), "{method}: {response}");
+        assert_eq!(response["result"]["instance"], self.marker["instance"]);
+        assert_eq!(response["result"]["protocol"], 1);
+        response["result"].clone()
+    }
+
+    fn attach(&self, root: &Path, revision: &str) -> Value {
+        let result = self.rpc("attach", json!({"root":root,"revision":revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap()}));
+        self.ready(root);
+        result
+    }
+
+    fn lookup(&self, root: &Path) -> Value {
+        self.rpc("lookup", json!({"root":root}))
+    }
+
+    fn ready(&self, root: &Path) -> Value {
+        let started = Instant::now();
+        loop {
+            let status = self.lookup(root);
+            if status["ready"] == true {
+                return status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "view never ready: {status}"
+            );
+            thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    fn refresh(&self, root: &Path, lease: &Value, changed: &[&str], full: bool) -> Value {
+        self.rpc("refresh", json!({
+            "root":root,"view":lease["view"],"lease":lease["lease"],"changed":changed,"full":full
+        }))
+    }
+
+    fn search(&self, root: &Path, pattern: &str) -> Value {
+        let view = self.lookup(root);
+        self.rpc(
+            "search",
+            json!({"root":root, "view":view["view"], "query":{"pattern":pattern}}),
+        )
+    }
+
+    fn stop(&mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn exact_base_sharing_leases_and_revision_pins() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    let b = d.attach(&f.b, &f.revision);
+    assert_eq!(a["generation"], b["generation"]);
+    assert_eq!(a["attach_build"]["blobs_extracted"], 3);
+    assert_eq!(b["attach_build"]["blobs_extracted"], 0);
+    assert_eq!(b["attach_build"]["reused_generation"], true);
+    for root in [&f.a, &f.b] {
+        let status = d.lookup(root);
+        assert_eq!(status["base_sharing_views"], 2);
+        assert_eq!(status["last_reconcile"]["files_read"], 3);
+        assert_eq!(status["last_reconcile"]["files_decoded"], 3);
+        assert_eq!(status["last_reconcile"]["files_extracted"], 0);
+        assert_eq!(status["last_reconcile"]["base_reused"], 3);
+    }
+    let duplicate = d.attach(&f.a, &f.revision);
+    assert_eq!(a["view"], duplicate["view"]);
+    assert_ne!(a["lease"], duplicate["lease"]);
+    let detached = d.rpc(
+        "detach",
+        json!({"root":f.a,"view":a["view"],"lease":a["lease"]}),
+    );
+    assert_eq!(detached["remaining_leases"], 1);
+    assert!(f.a.join(".git/tgrep-view-v1.json").exists());
+    let output = cli(&f.a, &["--stats", "--", "shared_term", "."]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("via shared daemon v1"));
+    success(output);
+    fs::write(f.a.join("new.txt"), "new_generation_term\n").unwrap();
+    git(&f.a, &["add", "."]);
+    git(&f.a, &["commit", "-qm", "new generation"]);
+    let revision = git(&f.a, &["rev-parse", "HEAD"]);
+    let c = f.third(&revision);
+    let newer = d.attach(&c, &revision);
+    assert_ne!(newer["generation"], a["generation"]);
+    assert_eq!(newer["attach_build"]["blobs_extracted"], 1);
+    assert_eq!(newer["attach_build"]["reused_indexed_files"], 3);
+    assert_eq!(d.lookup(&f.a)["generation"], a["generation"]);
+    d.refresh(&f.a, &duplicate, &["new.txt"], false);
+    assert!(
+        !d.search(&f.a, "new_generation_term")["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        d.search(&f.b, "new_generation_term")["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let mismatch = d.try_rpc("attach", json!({"root":f.a,"revision":revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap()})).unwrap();
+    assert!(
+        mismatch["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("different base")
+    );
+    d.rpc(
+        "detach",
+        json!({"root":f.a,"view":duplicate["view"],"lease":duplicate["lease"]}),
+    );
+    assert!(!f.a.join(".git/tgrep-view-v1.json").exists());
+    assert_eq!(d.lookup(&f.b)["ready"], true);
+}
+
+#[test]
+fn isolated_changes_candidate_masking_membership_and_scan_parity() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    d.attach(&f.b, &f.revision);
+    fs::write(
+        f.a.join("src/main.rs"),
+        "fn private_term() {}\ncontext line\nprivate_term again\n",
+    )
+    .unwrap();
+    fs::rename(f.a.join("notes.txt"), f.a.join("renamed.txt")).unwrap();
+    git(&f.a, &["add", "-A"]);
+    git(&f.a, &["commit", "-qm", "private commit"]);
+    fs::write(f.a.join("staged.txt"), "private_term staged\n").unwrap();
+    git(&f.a, &["add", "staged.txt"]);
+    fs::write(f.a.join("untracked.py"), "private_term untracked\n").unwrap();
+    fs::write(f.a.join("ignored.txt"), "private_term ignored\n").unwrap();
+    fs::write(f.a.join(".gitignore"), "ignored.txt\n").unwrap();
+    fs::write(f.a.join("binary.txt"), b"private_term\0hidden binary").unwrap();
+    fs::write(f.a.join("asset.bin"), "private_term extension\n").unwrap();
+    fs::remove_file(f.a.join(".hidden")).unwrap();
+    let refreshed = d.refresh(&f.a, &a, &[], true);
+    assert!(refreshed["processed_epoch"].as_u64().unwrap() >= a["epoch"].as_u64().unwrap());
+    assert!(
+        d.search(&f.a, "shared_term")["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["file"] != "src/main.rs")
+    );
+    assert!(
+        d.search(&f.b, "private_term")["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    for args in [
+        vec!["-n"],
+        vec!["-l"],
+        vec!["-c"],
+        vec!["--count-matches"],
+        vec!["-C", "1"],
+        vec!["--vimgrep"],
+        vec!["--column", "--byte-offset"],
+        vec!["-o"],
+        vec!["-t", "rust"],
+        vec!["-g", "*.txt", "-g", "!ignored.txt"],
+        vec!["--hidden"],
+        vec!["--max-depth", "1"],
+        vec!["-i"],
+        vec!["-w"],
+        vec!["-e", "private_.*", "-e", "unmatched"],
+    ] {
+        let before = d.lookup(&f.a)["queries"].as_u64().unwrap();
+        let mut shared = vec!["--sort", "path", "--color", "never"];
+        shared.extend(args.clone());
+        if !args.contains(&"-e") {
+            shared.extend(["--", "private_term", "."]);
+        } else {
+            shared.push(".");
+        }
+        let indexed = cli(&f.a, &shared);
+        let mut scan = vec!["--no-index"];
+        scan.extend(shared);
+        let scanned = cli(&f.a, &scan);
+        assert_eq!(indexed.status.code(), scanned.status.code(), "{args:?}");
+        assert_eq!(
+            indexed.stdout,
+            scanned.stdout,
+            "{args:?}\n{}",
+            String::from_utf8_lossy(&indexed.stderr)
+        );
+        assert_eq!(
+            d.lookup(&f.a)["queries"].as_u64().unwrap(),
+            before + 1,
+            "must use daemon for {args:?}"
+        );
+    }
+    let listed = success(cli(&f.a, &["--files", "--sort", "path", "--hidden", "."]));
+    assert!(
+        listed.contains("binary.txt")
+            && listed.contains("asset.bin")
+            && !listed.contains("ignored.txt")
+    );
+    assert_eq!(
+        listed,
+        success(cli(
+            &f.a,
+            &[
+                "--no-index",
+                "--files",
+                "--sort",
+                "path",
+                "--hidden",
+                "-g",
+                "!.git",
+                "."
+            ]
+        ))
+    );
+    let scope = success(cli(&f.a, &["-n", "--stats", "--", "private_term", "src"]));
+    assert!(scope.starts_with(&format!("src{}main.rs:1:", std::path::MAIN_SEPARATOR)));
+    let multi = success(cli(
+        &f.a,
+        &[
+            "-l",
+            "--sort",
+            "path",
+            "--",
+            "private_term",
+            "src",
+            f.b.to_str().unwrap(),
+        ],
+    ));
+    assert!(multi.contains("main.rs") && !multi.contains(f.b.to_str().unwrap()));
+    let json_output = success(cli(
+        &f.a,
+        &["--json", "-C", "1", "--", "private_term", "src"],
+    ));
+    let rows: Vec<Value> = json_output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|row| row["type"] == "match" && row["data"]["line_number"] == 1)
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["type"] == "context" && row["data"]["line_number"] == 2)
+    );
+    assert_eq!(
+        rows.iter().filter(|row| row["type"] == "summary").count(),
+        1
+    );
+}
+
+#[test]
+fn cli_lifecycle_unsupported_options_and_explicit_index_intent() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    let attached: Value = serde_json::from_str(&success(cli(
+        &f.a,
+        &["shared", "attach", ".", "--revision", &f.revision],
+    )))
+    .unwrap();
+    d.ready(&f.a);
+    fs::write(f.a.join("late.txt"), "late_term\n").unwrap();
+    success(cli(
+        &f.a,
+        &[
+            "shared",
+            "refresh",
+            ".",
+            "--lease",
+            attached["lease"].as_str().unwrap(),
+            "--changed",
+            "late.txt",
+        ],
+    ));
+    assert!(success(cli(&f.a, &["status", "."])).contains("\"ready\": true"));
+    for args in [
+        vec!["--no-ignore"],
+        vec!["--text"],
+        vec!["--binary"],
+        vec!["--follow"],
+        vec!["--one-file-system"],
+        vec!["--no-require-git"],
+        vec!["--encoding", "latin1"],
+        vec!["--max-filesize", "1M"],
+        vec!["--files-without-match"],
+        vec!["--include-zero", "-c"],
+    ] {
+        let before = d.lookup(&f.a)["queries"].as_u64().unwrap();
+        let mut query = args.clone();
+        query.extend(["--sort", "path", "--", "late_term", "."]);
+        let indexed = cli(&f.a, &query);
+        let mut scan = vec!["--no-index"];
+        scan.extend(query);
+        let scanned = cli(&f.a, &scan);
+        assert_eq!(indexed.status.code(), scanned.status.code(), "{args:?}");
+        assert_eq!(indexed.stdout, scanned.stdout, "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&indexed.stderr).contains("scanning filesystem"),
+            "{args:?}"
+        );
+        assert_eq!(d.lookup(&f.a)["queries"].as_u64().unwrap(), before);
+    }
+    let explicit = cli(&f.a, &["--", "late_term", "late.txt"]);
+    assert!(explicit.status.success());
+    assert!(String::from_utf8_lossy(&explicit.stderr).contains("scanning filesystem"));
+    let index = f.temp.path().join("ordinary-index");
+    success(cli(
+        &f.a,
+        &["index", ".", "--index-path", index.to_str().unwrap()],
+    ));
+    let explicit = cli(
+        &f.a,
+        &[
+            "--stats",
+            "--index-path",
+            index.to_str().unwrap(),
+            "--",
+            "late_term",
+            ".",
+        ],
+    );
+    assert!(!String::from_utf8_lossy(&explicit.stderr).contains("via shared"));
+    success(explicit);
+    success(cli(
+        &f.a,
+        &[
+            "shared",
+            "detach",
+            ".",
+            "--lease",
+            attached["lease"].as_str().unwrap(),
+        ],
+    ));
+    assert!(!f.a.join(".git/tgrep-view-v1.json").exists());
+}
+
+#[test]
+fn no_watch_full_repair_and_restart_checkpoint_revalidation() {
+    let f = Fixture::new();
+    let mut d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    fs::write(f.a.join("private.txt"), "checkpoint_term\n").unwrap();
+    d.refresh(&f.a, &a, &["private.txt"], false);
+    let path = f.a.join("notes.txt");
+    let metadata = fs::metadata(&path).unwrap();
+    fs::write(&path, "ZXQJVPKBMWH notes\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(d.lookup(&f.a)["watch_mode"], "disabled");
+    assert!(
+        d.search(&f.a, "ZXQJVPKBMWH")["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let repaired = d.refresh(&f.a, &a, &[], true);
+    assert_eq!(repaired["last_reconcile"]["full"], true);
+    assert!(
+        !d.search(&f.a, "ZXQJVPKBMWH")["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let old_instance = d.marker["instance"].clone();
+    d.stop();
+    fs::write(f.a.join("after-crash.txt"), "fresh_restart_term\n").unwrap();
+    let fallback = cli(&f.a, &["--", "fresh_restart_term", "."]);
+    assert!(String::from_utf8_lossy(&fallback.stderr).contains("scanning filesystem"));
+    success(fallback);
+    let d = f.start(&["--no-watch"]);
+    assert_ne!(d.marker["instance"], old_instance);
+    let stale = cli(&f.a, &["--", "fresh_restart_term", "."]);
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("stale"));
+    success(stale);
+    let new = d.attach(&f.a, &f.revision);
+    assert_eq!(new["checkpoint_restored"], true);
+    assert_eq!(new["generation"], a["generation"]);
+    assert_eq!(new["attach_build"]["blobs_extracted"], 0);
+    assert!(
+        !d.search(&f.a, "fresh_restart_term")["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !d.search(&f.a, "checkpoint_term")["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let old_detach = d
+        .try_rpc(
+            "detach",
+            json!({"root":f.a,"view":a["view"],"lease":a["lease"]}),
+        )
+        .unwrap();
+    assert!(old_detach.get("error").is_some());
+    assert!(f.a.join(".git/tgrep-view-v1.json").exists());
+}
+
+#[test]
+fn protocol_root_scope_and_aggregate_limit_rejections() {
+    let f = Fixture::new();
+    let d = f.start(&[
+        "--no-watch",
+        "--shared-max-views",
+        "1",
+        "--shared-max-leases",
+        "2",
+        "--watcher-queue-cap",
+        "2",
+    ]);
+    let a = d.attach(&f.a, &f.revision);
+    let mut wrong = d.request("hello", json!({}));
+    wrong["protocol"] = json!(2);
+    assert!(d.raw(&wrong).unwrap().get("error").is_some());
+    wrong["protocol"] = json!(1);
+    wrong["instance"] = json!("port-reused-by-another-daemon");
+    assert!(d.raw(&wrong).unwrap().get("error").is_some());
+    let error = d.try_rpc("attach", json!({"root":f.b,"revision":f.revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap()})).unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("view limit")
+    );
+    d.attach(&f.a, &f.revision);
+    let error = d.try_rpc("attach", json!({"root":f.a,"revision":f.revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap()})).unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("lease limit")
+    );
+    let error = d
+        .try_rpc(
+            "refresh",
+            json!({"root":f.a,"view":a["view"],"lease":a["lease"],"changed":["one","two","three"]}),
+        )
+        .unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("full repair")
+    );
+    d.ready(&f.a);
+    for scope in ["../", "/tmp", "C:/", "src/../../", "src\\.."] {
+        let error = d
+            .try_rpc(
+                "files",
+                json!({"root":f.a,"view":a["view"],"query":{"scope":scope}}),
+            )
+            .unwrap();
+        assert!(error.get("error").is_some(), "{scope}: {error}");
+    }
+    let error = d
+        .try_rpc(
+            "search",
+            json!({"root":f.a,"view":a["view"],"query":{"pattern":"x","hidden":"yes"}}),
+        )
+        .unwrap();
+    assert!(error.get("error").is_some());
+    let error = d
+        .try_rpc(
+            "search",
+            json!({"root":f.b,"view":a["view"],"query":{"pattern":"x"}}),
+        )
+        .unwrap();
+    assert!(error.get("error").is_some());
+    let duplicate = cli(
+        &f.a,
+        &[
+            "serve",
+            "--shared",
+            ".",
+            "--shared-storage",
+            f.storage.to_str().unwrap(),
+            "--no-watch",
+        ],
+    );
+    assert_eq!(duplicate.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already owns"));
+    let nested = f.a.join("nested");
+    fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    fs::write(nested.join("file.txt"), "nested_term\n").unwrap();
+    let result = cli(&nested, &["--stats", "--", "nested_term", "."]);
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("via shared"));
+    success(result);
+    let error = d
+        .try_rpc(
+            "files",
+            json!({"root":f.a,"view":a["view"],"query":{"scope":"nested/"}}),
+        )
+        .unwrap();
+    assert!(error.get("error").is_some());
+}
+
+#[test]
+fn polling_and_native_events_reconcile_without_queries() {
+    for options in [
+        vec!["--watch-mode", "poll", "--poll-interval", "1"],
+        vec![
+            "--watch-mode",
+            "auto",
+            "--poll-interval",
+            "60",
+            "--shared-max-views",
+            "2",
+        ],
+        vec![
+            "--watch-mode",
+            "auto",
+            "--poll-interval",
+            "1",
+            "--watch-budget",
+            "1",
+        ],
+    ] {
+        let f = Fixture::new();
+        let d = f.start(&options);
+        let a = d.attach(&f.a, &f.revision);
+        let initial = d.lookup(&f.a);
+        if options.contains(&"60") {
+            assert_eq!(initial["watch_mode"], "native", "{initial}");
+        } else {
+            assert_eq!(initial["watch_mode"], "poll");
+        }
+        fs::create_dir(f.a.join("new-dir")).unwrap();
+        fs::write(f.a.join("new-dir/new.txt"), "automatic_term\n").unwrap();
+        let started = Instant::now();
+        loop {
+            let status = d.lookup(&f.a);
+            if status["ready"] == true
+                && status["published_epoch"].as_u64() > initial["published_epoch"].as_u64()
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "automatic repair failed: {status}"
+            );
+            thread::sleep(Duration::from_millis(40));
+        }
+        assert!(
+            !d.search(&f.a, "automatic_term")["matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        fs::write(f.a.join(".ignore"), "new-dir/\n").unwrap();
+        let started = Instant::now();
+        loop {
+            let result = d
+                .try_rpc("files", json!({"root":f.a,"view":a["view"],"query":{}}))
+                .unwrap();
+            if let Some(paths) = result["result"]["files"].as_array()
+                && !paths.iter().any(|p| p == "new-dir/new.txt")
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "ignore repair failed: {result}"
+            );
+            thread::sleep(Duration::from_millis(40));
+        }
+    }
+}
+
+#[test]
+fn crlf_transform_and_sparse_membership_are_honest() {
+    let f = Fixture::new();
+    git(&f.a, &["config", "core.autocrlf", "true"]);
+    fs::write(f.a.join(".gitattributes"), "* -text\none.txt text eol=crlf\ntwo.txt text eol=crlf\nthree.txt text eol=crlf\nfour.txt text eol=crlf\n").unwrap();
+    for name in ["one.txt", "two.txt", "three.txt", "four.txt"] {
+        fs::write(f.a.join(name), format!("transformed_{name}\n")).unwrap();
+    }
+    git(&f.a, &["add", "."]);
+    git(&f.a, &["commit", "-qm", "CRLF profile"]);
+    let rev = git(&f.a, &["rev-parse", "HEAD"]);
+    let c = f.third(&rev);
+    for name in ["one.txt", "two.txt", "three.txt", "four.txt"] {
+        assert!(
+            fs::read(c.join(name))
+                .unwrap()
+                .windows(2)
+                .any(|bytes| bytes == b"\r\n")
+        );
+    }
+    let d = f.start(&["--no-watch"]);
+    let lease = d.attach(&c, &rev);
+    let status = d.lookup(&c);
+    assert_eq!(status["last_reconcile"]["files_extracted"], 4, "{status}");
+    let noop = d.refresh(&c, &lease, &[], true);
+    assert_eq!(noop["last_reconcile"]["files_extracted"], 0);
+    assert_eq!(noop["last_reconcile"]["overlay_reused"], 4);
+    git(&c, &["sparse-checkout", "set", "--no-cone", "src/"]);
+    d.refresh(&c, &lease, &[], true);
+    assert!(!c.join("one.txt").exists());
+    assert!(
+        d.search(&c, "transformed_")["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let listed = success(cli(&c, &["--files", "."]));
+    assert!(!listed.contains("one.txt"));
+    assert!(listed.contains("main.rs"));
+}
+
+#[test]
+fn stale_markers_missing_generation_and_foreign_marker_detach_scan_safely() {
+    let f = Fixture::new();
+    success(cli(&f.a, &["index", "."]));
+    let mut d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    fs::write(f.a.join("not-in-any-base.txt"), "unique_fallback_token\n").unwrap();
+    let view_marker = f.a.join(".git/tgrep-view-v1.json");
+    let original = fs::read(&view_marker).unwrap();
+    for payload in [b"{invalid".to_vec(), {
+        let mut marker: Value = serde_json::from_slice(&original).unwrap();
+        marker["daemon"]["protocol"] = json!(999);
+        serde_json::to_vec(&marker).unwrap()
+    }] {
+        fs::write(&view_marker, payload).unwrap();
+        let fallback = cli(&f.a, &["--stats", "--", "unique_fallback_token", "."]);
+        assert!(String::from_utf8_lossy(&fallback.stderr).contains("scanning filesystem"));
+        assert!(success(fallback).contains("unique_fallback_token"));
+        assert!(success(cli(&f.a, &["--files", "."])).contains("not-in-any-base.txt"));
+        assert_eq!(cli(&f.a, &["status", "."]).status.code(), Some(2));
+    }
+    let mut foreign: Value = serde_json::from_slice(&original).unwrap();
+    foreign["view"] = json!("belongs-to-a-different-view");
+    fs::write(&view_marker, serde_json::to_vec(&foreign).unwrap()).unwrap();
+    d.rpc(
+        "detach",
+        json!({"root":f.a,"view":a["view"],"lease":a["lease"]}),
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&view_marker).unwrap()).unwrap(),
+        foreign
+    );
+    let a = d.attach(&f.a, &f.revision);
+    d.stop();
+    let key: tgrep_core::generations::GenerationKey =
+        serde_json::from_value(a["generation"].clone()).unwrap();
+    let generation = f
+        .storage
+        .join("bases")
+        .join(key.repository_identity())
+        .join(key.storage_name());
+    fs::remove_file(generation.join("lookup.bin")).unwrap();
+    let d = f.start(&["--no-watch"]);
+    let response = d.try_rpc("attach", json!({"root":f.a,"revision":f.revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap()})).unwrap();
+    assert!(response.get("error").is_some(), "{response}");
+    let fallback = cli(&f.a, &["--", "unique_fallback_token", "."]);
+    assert!(String::from_utf8_lossy(&fallback.stderr).contains("scanning filesystem"));
+    success(fallback);
+}
+
+#[test]
+fn wrong_protocol_port_and_incompatible_roots_profiles_fail_closed() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    d.attach(&f.a, &f.revision);
+    let other = f.temp.path().join("other");
+    fs::create_dir(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    let profile: Value = serde_json::from_str(PROFILE).unwrap();
+    for root in [&other, &f.a.join("src")] {
+        let response = d
+            .try_rpc(
+                "attach",
+                json!({"root":root,"revision":f.revision,"profile":profile}),
+            )
+            .unwrap();
+        assert!(response.get("error").is_some(), "{response}");
+    }
+    let mut incompatible = profile.clone();
+    incompatible["max_blob_bytes"] = Value::Null;
+    let response = d
+        .try_rpc(
+            "attach",
+            json!({"root":f.b,"revision":f.revision,"profile":incompatible}),
+        )
+        .unwrap();
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("profile")
+    );
+    let output = cli(&f.b, &["--stats", "--", "shared_term", "."]);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("via shared"));
+    success(output);
+    let output = cli(&f.b, &["--shared", "--", "shared_term", "."]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no shared attachment"));
+    success(output);
+    fs::write(f.a.join("after-base.txt"), "wrong_port_fallback\n").unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut marker = d.marker.clone();
+    marker["port"] = json!(listener.local_addr().unwrap().port());
+    fs::write(
+        f.a.join(".git/tgrep-daemon-v1.json"),
+        serde_json::to_vec(&marker).unwrap(),
+    )
+    .unwrap();
+    let fake = thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut connection, _)) => {
+                    connection
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut line = String::new();
+                    BufReader::new(connection.try_clone().unwrap())
+                        .read_line(&mut line)
+                        .unwrap();
+                    writeln!(
+                        connection,
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":1,"result":{"hidden_complete":true}})
+                    )
+                    .unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(15),
+                        "fake daemon never queried"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    });
+    let output = cli(&f.a, &["--", "wrong_port_fallback", "."]);
+    fake.join().unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("wrong-protocol"));
+    success(output);
+}
+
+#[test]
+fn blocked_generation_worker_does_not_block_ready_view_queries() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    d.attach(&f.a, &f.revision);
+    d.attach(&f.b, &f.revision);
+    let c = f.third(&f.revision);
+    let lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(
+            f.storage
+                .join("bases")
+                .join(d.marker["repository"].as_str().unwrap())
+                .join("publication.lock"),
+        )
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let request = d.request("attach", json!({"root":c,"revision":f.revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap()}));
+    let port = d.marker["port"].as_u64().unwrap() as u16;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        writeln!(stream, "{request}").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        tx.send(serde_json::from_str::<Value>(&line).unwrap())
+            .unwrap();
+    });
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_millis(500)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    let result = d.search(&f.b, "shared_term");
+    assert!(!result["matches"].as_array().unwrap().is_empty());
+    assert_eq!(result["backend"], "shared-v1");
+    assert!(
+        rx.try_recv().is_err(),
+        "generation lock must still block attach"
+    );
+    drop(lock);
+    assert!(
+        rx.recv_timeout(Duration::from_secs(15))
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    worker.join().unwrap();
+}

@@ -25,6 +25,7 @@ use tgrep_core::hybrid::HybridIndex;
 use tgrep_core::query;
 
 mod index_cleanup;
+pub mod shared;
 
 #[cfg(test)]
 #[path = "serve/poll_tests.rs"]

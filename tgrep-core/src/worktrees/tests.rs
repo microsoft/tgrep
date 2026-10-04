@@ -118,7 +118,12 @@ fn matches(view: &WorktreeView, pattern: &str) -> Vec<String> {
             .candidates(&plan, "", true)
             .into_iter()
             .filter(|path| {
-                let bytes = fs::read(snapshot.root().join(path)).unwrap();
+                let mut bytes = Vec::new();
+                snapshot
+                    .open_file(path)
+                    .unwrap()
+                    .read_to_end(&mut bytes)
+                    .unwrap();
                 regex.is_match(&encoding::decode_for_index(&bytes))
             })
             .collect()
@@ -783,6 +788,78 @@ fn actual_bytes_not_discovery_size_decide_size_and_binary_classification() {
             .unwrap(),
         ["file.txt"]
     );
+}
+
+#[test]
+fn snapshot_candidate_opens_reject_directory_link_swaps() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "dir/file.txt", b"inside needle");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let mut bytes = Vec::new();
+    view.with_snapshot(|snapshot| snapshot.open_file("dir/file.txt"))
+        .unwrap()
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"inside needle");
+
+    let outside = fixture._temp.path().join("outside");
+    write(&outside, "file.txt", b"outside secret");
+    fs::rename(fixture.root.join("dir"), fixture.root.join("saved")).unwrap();
+    crate::rooted::tests::link_directory(&outside, &fixture.root.join("dir"));
+    assert!(
+        view.with_snapshot(|snapshot| snapshot.open_file("dir/file.txt"))
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn snapshots_reject_root_replacement_before_and_during_empty_queries() {
+    for during_callback in [false, true] {
+        let fixture = Fixture::new();
+        write(&fixture.root, "file.txt", b"inside needle");
+        commit(&fixture.root);
+        let view = fixture.view(&fixture.root, &fixture.generation());
+        view.refresh().unwrap();
+        let before = view.status().unwrap();
+        let saved = fixture._temp.path().join("saved");
+        let replace = || {
+            fs::rename(&fixture.root, &saved).unwrap();
+            fs::create_dir(&fixture.root).unwrap();
+            write(&fixture.root, "file.txt", b"outside secret");
+        };
+        if !during_callback {
+            replace();
+        }
+        let result = view.with_snapshot(|snapshot| {
+            assert!(
+                during_callback,
+                "verify the root before invoking the callback"
+            );
+            replace();
+            snapshot.files("missing/", true)
+        });
+        assert!(matches!(result, Err(WorktreeError::Io(_))));
+        let after = view.status().unwrap();
+        assert!(!after.ready);
+        assert!(after.full_required);
+        assert!(after.epoch > before.epoch);
+        assert_eq!(after.published_epoch, before.published_epoch);
+        assert!(matches!(
+            view.with_snapshot(|_| ()),
+            Err(WorktreeError::NotReady)
+        ));
+
+        fs::remove_file(fixture.root.join("file.txt")).unwrap();
+        fs::remove_dir(&fixture.root).unwrap();
+        fs::rename(saved, &fixture.root).unwrap();
+        assert!(view.refresh().unwrap().full);
+        assert_eq!(matches(&view, "inside needle"), ["file.txt"]);
+    }
 }
 
 #[test]

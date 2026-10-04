@@ -714,12 +714,17 @@ let view = WorktreeView::new(Path::new("."), pin, WorktreeOptions::default())?;
 let stats = view.refresh()?; // initially a full verification; now ready
 
 let plan = build_query_plan("needle", false)?;
-let candidates = view.with_snapshot(|snapshot| {
-    snapshot.candidates(&plan, "", false) // root scope, normal hidden filtering
-})?;
+view.with_snapshot(|snapshot| -> std::io::Result<()> {
+    for path in snapshot.candidates(&plan, "", false) {
+        let file = snapshot.open_file(&path)?; // uses the view's retained root handle
+        // Bounded-read `file`, auto-decode and run your final matcher here,
+        // buffering results until with_snapshot succeeds; or use a private cache.
+    }
+    Ok(())
+})??;
 let files = view.with_snapshot(|snapshot| snapshot.files("", false))?;
-// Candidates are root-relative paths, not final matches. Read view.root().join(path),
-// auto-decode, and run the final matcher, or use a private versioned content cache.
+// Candidates are root-relative paths, not final matches. Do not read a joined
+// pathname with ordinary filesystem APIs: a raced link could leave the worktree.
 ```
 
 The root must be the actual worktree root in the pin's repository, not a
@@ -757,17 +762,25 @@ Unix uses component-relative no-follow, nonblocking opens; Windows guards
 ancestor handles against replacement and checks resolved handle
 containment before reading. Detected root identity changes and read-path
 swaps leave the view not-ready. Windows retains the root guard until view drop, so
-an agent runtime should release registrations before removing a worktree.
+an agent runtime should release registrations before removing or renaming a
+worktree. Ordinary servers also retain their root guard for their lifetime:
+stop `tgrep serve` before removing or renaming its served root on Windows.
 The shared helper is `tgrep_core::rooted::RootedDir`
 (`open`, `open_file` with a relative path, and `verify_root`); ordinary serving
-uses it too. It does not provide immutable content or a filesystem snapshot.
+retains one per server and reuses it across build, watcher and verification reads.
+`WorktreeSnapshot::open_file` uses the view's existing reader, not a new root
+registration per candidate. Neither API freezes file contents.
 Metadata discovery rejects unrepresentable native names before conversion:
 non-Unicode paths and literal Unix backslashes cannot alias other indexed paths.
 Ordinary full scans retain native paths and remain available as the fallback.
 `with_snapshot` holds readiness and overlay guards through candidate-ID
-resolution; no live IDs or mutable `HybridIndex` escape. Do not reenter the view
-from its closure. A refresh acknowledges processed hints, **not an atomic
-filesystem snapshot**. Periodic full reconciliation remains necessary; no-watch
+resolution, and verifies the pinned root before and after the callback, even for
+empty/file-only results. Verification failure closes readiness and queues full
+repair. No live IDs or mutable `HybridIndex` escape. A callback may return an
+owned read-only file handle for bounded matching outside the guard; before
+publishing buffered results, reenter `with_snapshot` and reject a changed epoch.
+Do not reenter the view from its closure. A refresh acknowledges processed hints,
+**not an atomic filesystem snapshot**. Periodic full reconciliation remains necessary; no-watch
 callers must explicitly refresh, and final reads can race subsequent edits.
 
 Full verification reads, auto-decodes and hashes checkout bytes; clean Git

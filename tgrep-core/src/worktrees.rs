@@ -597,26 +597,42 @@ impl WorktreeView {
     }
 
     /// Hold the readiness, overlay, visibility and membership guards together.
-    /// Only resolved owned paths may escape; live overlay IDs are never exposed.
+    /// Owned paths and read-only file handles may escape; live IDs never do.
     /// Do not reenter this view (including invalidation) from the closure.
-    /// Final matching must read `snapshot.root()` or a private versioned cache.
+    /// Final matching must use `snapshot.open_file()` or a private versioned
+    /// cache. Root verification brackets the callback, including empty results;
+    /// failure closes readiness and requires full reconciliation.
     pub fn with_snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
-        let control = self
+        let mut control = self
             .control
             .lock()
             .map_err(|_| WorktreeError::Synchronization)?;
         if !control.ready {
             return Err(WorktreeError::NotReady);
         }
+        self.verify_snapshot_root(&mut control)?;
         let state = self
             .state
             .read()
             .map_err(|_| WorktreeError::Synchronization)?;
-        Ok(read(WorktreeSnapshot {
+        let result = read(WorktreeSnapshot {
             root: &self.root,
+            rooted: &self.files,
             state: &state,
             epoch: control.epoch,
-        }))
+        });
+        self.verify_snapshot_root(&mut control)?;
+        Ok(result)
+    }
+
+    fn verify_snapshot_root(&self, control: &mut Control) -> Result<()> {
+        if let Err(error) = self.files.verify_root() {
+            control.full = true;
+            control.hints.clear();
+            control.invalidate()?;
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     /// Save only the private delta, binding it to the exact generation key.
@@ -684,6 +700,7 @@ impl WorktreeView {
 /// Borrowed, query-only atomic view. Does not expose the mutable HybridIndex.
 pub struct WorktreeSnapshot<'a> {
     root: &'a Path,
+    rooted: &'a RootedDir,
     state: &'a State,
     epoch: u64,
 }
@@ -691,6 +708,14 @@ pub struct WorktreeSnapshot<'a> {
 impl WorktreeSnapshot<'_> {
     pub fn root(&self) -> &Path {
         self.root
+    }
+
+    /// Open a root-relative candidate through the view's retained root handle.
+    /// The returned read-only regular-file handle may outlive this guard, but
+    /// does not freeze file contents. Bound reads and check the final snapshot
+    /// epoch before publishing a result assembled outside the guard.
+    pub fn open_file(&self, relative: &str) -> std::io::Result<File> {
+        self.rooted.open_file(Path::new(relative))
     }
 
     pub fn epoch(&self) -> u64 {

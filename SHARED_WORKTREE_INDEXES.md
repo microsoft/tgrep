@@ -363,7 +363,7 @@ no mutable base/flush handle is exposed and no base migration occurs.
 | `refresh()` | Rewalk membership/visibility; verify hints/new/stat-changed files or, without hints, all admitted contents |
 | `reconcile_full()` | Always read/verify content, irrespective of size/mtime/Git-status equality |
 | `status()` | Ready flag, invalidation epoch, published epoch, pending-path count and full-required flag |
-| `with_snapshot(closure)` | Guarded query-only view with root/epoch/visibility and resolved candidate paths or complete filename membership |
+| `with_snapshot(closure)` | Guarded query-only view with root/epoch/visibility, resolved paths and read-only candidate opens; verifies pinned-root identity before/after the callback |
 | `save_checkpoint()` | Ready-only, delta-only atomic `overlay.json`, including exact generation key/root/base binding |
 | `restore(root, pin, options)` | Explicit errors for missing/invalid/mismatched checkpoints; successful restore remains not ready |
 | `ReconcileStats` | Actual content reads/bytes/decodes/extractions, base/overlay reuse, copied base files/postings, reads avoided and `hint_lookups` ordered-set probes |
@@ -384,21 +384,32 @@ discovery errors instead of aliasing valid or ignored paths; ordinary native-pat
 full scans remain the fallback.
 Reconciliation holds a stable root directory handle. The extracted
 `tgrep_core::rooted::RootedDir` helper (`open`, relative `open_file`, `verify_root`)
-is also used by ordinary serving. Unix descends with component-relative
+is also retained once per ordinary server and reused across indexing, watcher
+and verification passes, rather than reconstructed for each file open. Unix descends with component-relative
 `openat`, `O_NOFOLLOW` and `O_NONBLOCK`, then verifies the final handle is regular.
 Windows holds ancestor handles without delete sharing, rejects reparse
 points and validates the final handle's containment and actual parent before
 reading. File version and identity are rechecked through rooted handles; a root identity change also
 prevents publication. Errors leave readiness closed, including directory/link
 swaps and regular-file/FIFO swaps. Windows keeps the root guard until view drop;
-agent runtimes must release registrations before removing worktrees.
+agent runtimes must release registrations before removing or renaming worktrees.
+Ordinary serving retains its root guard for the server lifetime too: stop the
+ordinary server before removing or renaming its served root on Windows.
 Each reconciliation advances the epoch, including no-hint full repairs, so
 successful publication acknowledges earlier invalidation tokens with an equal
 or later epoch.
 
 `WorktreeSnapshot::candidates(plan, prefix, include_hidden)` resolves both base
 and live IDs before releasing the overlay guard. `files(prefix, include_hidden)`
-comes from complete walker filename membership, not posting lists. Hidden files
+comes from complete walker filename membership, not posting lists.
+`open_file(relative)` returns a read-only regular-file handle from the view's
+retained reader, never from a new registration of the root pathname.
+`with_snapshot` checks pinned-root identity before and after every callback,
+including empty/file-only queries; failure invalidates readiness and queues full
+reconciliation. A callback may return the owned handle for bounded matching
+outside the guard; reenter `with_snapshot` and verify the original epoch before
+publishing buffered results. File contents are not frozen by these handles.
+Hidden files
 are included in canonical coverage and filtered at query time, including Windows
 attributes and explicit hidden-directory scopes. Existing walker rules determine
 ignore/extension, materialized symlink/submodule and regular-file behavior.
@@ -429,8 +440,10 @@ Hinted passes still open eligible regular-file handles for safe metadata
 verification even when content reads are avoided.
 Same-size/restored-mtime edits without notifications are repaired by forced
 full checks, not promised by hints. Successful refresh acknowledges processed
-inputs, not an atomic filesystem snapshot. Final matching reads the requesting
-root or a private versioned cache and can race later filesystem edits.
+inputs, not an atomic filesystem snapshot. Final matching uses
+`WorktreeSnapshot::open_file` or a private versioned cache, not an ordinary read
+of `snapshot.root().join(path)` that could follow a raced link outside the
+worktree. Contents can still change through later writes to the opened file.
 
 Raw LF blobs and clean CRLF/smudge checkouts may differ for **every file**.
 Normalizing line endings would invalidate positional/next-byte masks. Fixtures

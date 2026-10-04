@@ -469,6 +469,7 @@ struct ServerState {
     cache_generation: std::sync::atomic::AtomicU64,
     recent_reindexes: Mutex<RecentReindexCache>,
     root: PathBuf,
+    rooted: tgrep_core::rooted::RootedDir,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
     indexing: std::sync::atomic::AtomicBool,
@@ -888,6 +889,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
             RECENT_REINDEX_MAX_ENTRY_BYTES,
         )),
         root: root.clone(),
+        rooted: tgrep_core::rooted::RootedDir::open(&root)?,
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
         flushing: std::sync::atomic::AtomicBool::new(false),
@@ -4083,7 +4085,7 @@ fn sweep_removed_files(
         // Transient failures preserve, as they do in `reindex_file`: a
         // descriptor limit or a sharing violation says nothing about whether
         // the path belongs in the index, and the next reconcile will ask again.
-        match open_within_root(&state.root, &state.root.join(rel)) {
+        match open_within_root(state, &state.root.join(rel)) {
             Ok(file) => match file.metadata() {
                 // Back, and reachable without leaving the tree.
                 Ok(meta) if meta.file_type().is_file() => continue,
@@ -4988,13 +4990,13 @@ fn proves_ineligible(error: &std::io::Error) -> bool {
     false
 }
 
-/// Use the same handle-rooted regular-file opener as worktree reconciliation.
-fn open_within_root(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
+/// Reuse the server's pinned root for every read and verification pass.
+fn open_within_root(state: &ServerState, path: &Path) -> std::io::Result<std::fs::File> {
     use std::io::{Error, ErrorKind};
     let relative = path
-        .strip_prefix(root)
+        .strip_prefix(&state.root)
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "path is outside the served root"))?;
-    tgrep_core::rooted::RootedDir::open(root)?.open_file(relative)
+    state.rooted.open_file(relative)
 }
 
 #[cfg(all(test, windows))]
@@ -5009,14 +5011,14 @@ enum CappedRead {
 }
 
 fn file_still_has_bytes(
-    root: &Path,
+    state: &ServerState,
     path: &Path,
     expected_version: &tgrep_core::builder::FileVersion,
     expected: &[u8],
 ) -> std::io::Result<bool> {
     use std::io::Read;
 
-    let mut file = open_within_root(root, path)?;
+    let mut file = open_within_root(state, path)?;
     if tgrep_core::builder::file_version(&file.metadata()?) != *expected_version {
         return Ok(false);
     }
@@ -5037,12 +5039,12 @@ fn file_still_has_bytes(
     {
         return Ok(false);
     }
-    let current = open_within_root(root, path)?;
+    let current = open_within_root(state, path)?;
     Ok(tgrep_core::builder::file_version(&current.metadata()?) == *expected_version)
 }
 
 fn current_path_is_ineligible(state: &ServerState, path: &Path) -> bool {
-    let file = match open_within_root(&state.root, path) {
+    let file = match open_within_root(state, path) {
         Ok(file) => file,
         Err(error) => return proves_ineligible(&error),
     };
@@ -5118,7 +5120,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     // type, size, mtime, bytes — read back off it. Nothing that happens to the
     // path in the meantime can then make the content we index disagree with the
     // metadata we judged it by, or put it outside the tree we serve.
-    let file = match open_within_root(&state.root, path) {
+    let file = match open_within_root(state, path) {
         Ok(f) => f,
         Err(e) if proves_ineligible(&e) => {
             // Gone, or not a regular file reachable without traversing a link.
@@ -5197,7 +5199,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         drop(file);
         let mut stable = None;
         for _ in 0..2 {
-            let mut verify = match open_within_root(&state.root, path) {
+            let mut verify = match open_within_root(state, path) {
                 Ok(file) => file,
                 Err(e) if proves_ineligible(&e) => {
                     drop_indexed_file(state, rel_path, "no longer eligible");
@@ -5279,7 +5281,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     };
     #[cfg(test)]
     run_stale_refresh_hook(state, StaleRefreshPhase::BeforeConcreteCommit);
-    match file_still_has_bytes(&state.root, path, &version, &data) {
+    match file_still_has_bytes(state, path, &version, &data) {
         Ok(true) => {}
         Ok(false) => {
             if current_path_is_ineligible(state, path) {
@@ -7192,7 +7194,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 .par_iter()
                 .filter_map(|path| {
                     let read = (|| -> Result<_> {
-                        let mut file = open_within_root(root, path)?;
+                        let mut file = open_within_root(state, path)?;
                         let version = builder::file_version(&file.metadata()?);
                         let data = match read_within_limit(
                             &mut file,
@@ -7205,7 +7207,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                             }
                             CappedRead::Failed => anyhow::bail!("file read failed"),
                         };
-                        if !file_still_has_bytes(root, path, &version, &data)? {
+                        if !file_still_has_bytes(state, path, &version, &data)? {
                             anyhow::bail!("file changed during indexing");
                         }
                         Ok((data, version))
@@ -8793,7 +8795,9 @@ mod tests {
     #[test]
     fn failed_polling_startup_hands_retries_to_the_configured_cadence() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("missing");
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(".ignore"), "[z-a]\n").unwrap();
         let index_dir = tmp.path().join("index");
         let mut state = test_server_state(&root, &index_dir);
         Arc::get_mut(&mut state).unwrap().refresh =
@@ -8874,6 +8878,7 @@ mod tests {
                 RECENT_REINDEX_MAX_ENTRY_BYTES,
             )),
             root: root.to_path_buf(),
+            rooted: tgrep_core::rooted::RootedDir::open(root).expect("pin served root"),
             watcher_active: std::sync::atomic::AtomicBool::new(false),
             indexing: std::sync::atomic::AtomicBool::new(false),
             flushing: std::sync::atomic::AtomicBool::new(false),
@@ -12180,8 +12185,36 @@ mod tests {
         );
     }
 
-    /// The metadata the eligibility check uses and the bytes that get indexed
-    /// have to describe the same object, which means one handle.
+    #[test]
+    fn serving_retains_root_identity_between_file_reads() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"inside").unwrap();
+        let state = test_server_state(&root, &temp.path().join("index"));
+        for _ in 0..3 {
+            let file = open_within_root(&state, &root.join("file.txt")).unwrap();
+            assert_eq!(file.metadata().unwrap().len(), 6);
+        }
+        let renamed = std::fs::rename(&root, temp.path().join("saved"));
+        #[cfg(unix)]
+        {
+            renamed.unwrap();
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("file.txt"), b"outside").unwrap();
+            assert!(
+                open_within_root(&state, &root.join("file.txt")).is_err(),
+                "successive opens must retain the original root identity"
+            );
+        }
+        #[cfg(windows)]
+        assert!(
+            renamed.is_err(),
+            "the server must retain its root guard between opens"
+        );
+    }
+
+    /// The metadata and bytes must describe the same opened object.
     #[test]
     fn open_within_root_reads_a_regular_file() {
         use std::io::Read;
@@ -12191,7 +12224,8 @@ mod tests {
         let path = tmp.path().join("src").join("plain.rs");
         std::fs::write(&path, "fn main() {}\n").unwrap();
 
-        let file = open_within_root(tmp.path(), &path).expect("a regular file opens");
+        let state = test_server_state(tmp.path(), &tmp.path().join(".tgrep"));
+        let file = open_within_root(&state, &path).expect("a regular file opens");
         let meta = file.metadata().expect("metadata off the handle");
         assert!(meta.is_file());
         assert_eq!(meta.len(), 13);
@@ -12213,9 +12247,10 @@ mod tests {
         let root = TempDir::new().unwrap();
         let link = root.path().join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        let state = test_server_state(root.path(), &root.path().join(".tgrep"));
 
         assert!(
-            open_within_root(root.path(), &link).is_err(),
+            open_within_root(&state, &link).is_err(),
             "the link must not open as its target"
         );
     }
@@ -12233,12 +12268,13 @@ mod tests {
         let link = root.path().join("a");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         let through_link = link.join("secret.txt");
+        let state = test_server_state(root.path(), &root.path().join(".tgrep"));
 
         // The file at the end of that path is a perfectly ordinary file, and
         // opening it by name works — which is the point.
         assert!(std::fs::File::open(&through_link).is_ok());
         assert!(
-            open_within_root(root.path(), &through_link).is_err(),
+            open_within_root(&state, &through_link).is_err(),
             "an intermediate symlink must not be traversed"
         );
     }
@@ -12391,18 +12427,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir(tmp.path().join("src")).unwrap();
         std::fs::write(tmp.path().join("src").join("a.rs"), "x\n").unwrap();
+        let state = test_server_state(tmp.path(), &tmp.path().join(".tgrep"));
 
+        assert!(open_within_root(&state, tmp.path()).is_err(), "the root");
         assert!(
-            open_within_root(tmp.path(), tmp.path()).is_err(),
-            "the root"
-        );
-        assert!(
-            open_within_root(tmp.path(), &tmp.path().join("..").join("a.rs")).is_err(),
+            open_within_root(&state, &tmp.path().join("..").join("a.rs")).is_err(),
             "a parent component"
         );
         assert!(
-            open_within_root(&tmp.path().join("src"), &tmp.path().join("src")).is_err(),
-            "outside the given root"
+            open_within_root(&state, &tmp.path().join("src")).is_err(),
+            "a directory, not a regular file"
         );
     }
 

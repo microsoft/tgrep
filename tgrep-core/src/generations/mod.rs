@@ -293,6 +293,8 @@ pub struct BuildStats {
     pub blobs_extracted: u64,
     pub reused_indexed_files: u64,
     pub postings_reused: u64,
+    /// Predecessor posting lists decoded for reuse; zero when none can contribute.
+    pub predecessor_posting_lists_read: u64,
 }
 
 /// Conservative retention protects even escaped raw readers and disk checkpoints.
@@ -373,6 +375,27 @@ pub struct EnsureResult {
 type Cache = HashMap<PathBuf, Weak<Generation>>;
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
+fn cached_generation(
+    directory: PathBuf,
+    load: impl FnOnce() -> Result<Generation>,
+) -> Result<Arc<Generation>> {
+    let cache = CACHE.get_or_init(Default::default);
+    {
+        let cache = cache.lock().map_err(|_| GenerationError::Synchronization)?;
+        if let Some(generation) = cache.get(&directory).and_then(Weak::upgrade) {
+            return Ok(generation);
+        }
+    }
+    let generation = Arc::new(load()?);
+    let mut cache = cache.lock().map_err(|_| GenerationError::Synchronization)?;
+    if let Some(existing) = cache.get(&directory).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
+    cache.retain(|_, value| value.strong_count() > 0);
+    cache.insert(directory, Arc::downgrade(&generation));
+    Ok(generation)
+}
+
 /// Additive core API; ordinary CLI/server index paths never use this manager.
 ///
 /// Cooperating processes serialize publication with an OS file lock (released
@@ -395,17 +418,30 @@ impl GenerationManager {
 
     /// An existing, trusted storage directory outside all registered worktrees
     /// and Git metadata. Unrelated repositories get separate identity subdirs.
+    /// Both the supplied parent and the effective subdirectory are validated.
     pub fn with_storage(repository: Repository, storage: &Path) -> Result<Self> {
         let storage = fs::canonicalize(storage)?;
+        let worktrees = git::worktrees(&repository)?;
+        Self::validate_external_storage(&repository, &storage, &worktrees)?;
+        let manager = Self::initialize(repository, &storage)?;
+        Self::validate_external_storage(&manager.repository, &manager.directory, &worktrees)?;
+        Ok(manager)
+    }
+
+    fn validate_external_storage(
+        repository: &Repository,
+        storage: &Path,
+        worktrees: &[PathBuf],
+    ) -> Result<()> {
         if storage.starts_with(repository.common_dir()) {
             return Err(GenerationError::Unsupported(
                 "use new() for Git common-directory storage".into(),
             ));
         }
-        for worktree in git::worktrees(&repository)? {
+        for worktree in worktrees {
             // Missing/stale worktree registrations do not make a live storage
             // directory unsafe; existing prefixes are checked canonically.
-            match fs::canonicalize(&worktree) {
+            match fs::canonicalize(worktree) {
                 Ok(root) if storage.starts_with(&root) => {
                     return Err(GenerationError::Unsupported(
                         "generation storage is inside a worktree".into(),
@@ -413,7 +449,7 @@ impl GenerationManager {
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if storage.starts_with(&worktree) {
+                    if storage.starts_with(worktree) {
                         return Err(GenerationError::Unsupported(
                             "storage is inside a registered worktree".into(),
                         ));
@@ -422,11 +458,23 @@ impl GenerationManager {
                 Err(error) => return Err(error.into()),
             }
         }
-        Self::initialize(repository, &storage)
+        Ok(())
     }
 
     fn initialize(repository: Repository, storage: &Path) -> Result<Self> {
         let storage = fs::canonicalize(storage)?;
+        Self::validate_snapshot_boundary(&storage)?;
+        let directory = storage.join(repository.identity());
+        create_plain_directory(&directory)?;
+        let directory = fs::canonicalize(directory)?;
+        Self::validate_snapshot_boundary(&directory)?;
+        Ok(Self {
+            repository,
+            directory,
+        })
+    }
+
+    fn validate_snapshot_boundary(storage: &Path) -> Result<()> {
         for ancestor in storage.ancestors() {
             if ancestor.join(MANIFEST).try_exists()?
                 || (ancestor.join("files.bin").try_exists()?
@@ -437,13 +485,7 @@ impl GenerationManager {
                 ));
             }
         }
-        let directory = storage.join(repository.identity());
-        create_plain_directory(&directory)?;
-        let directory = fs::canonicalize(directory)?;
-        Ok(Self {
-            repository,
-            directory,
-        })
+        Ok(())
     }
 
     pub fn repository(&self) -> &Repository {
@@ -575,17 +617,7 @@ impl GenerationManager {
     fn open_locked(&self, key: &GenerationKey) -> Result<Arc<Generation>> {
         self.validate_key(key)?;
         let directory = self.directory.join(key.storage_name());
-        let mut cache = CACHE
-            .get_or_init(Default::default)
-            .lock()
-            .map_err(|_| GenerationError::Synchronization)?;
-        if let Some(generation) = cache.get(&directory).and_then(Weak::upgrade) {
-            return Ok(generation);
-        }
-        let generation = Arc::new(self.load(&directory, key)?);
-        cache.retain(|_, value| value.strong_count() > 0);
-        cache.insert(directory, Arc::downgrade(&generation));
-        Ok(generation)
+        cached_generation(directory.clone(), || self.load(&directory, key))
     }
 
     fn load(&self, directory: &Path, key: &GenerationKey) -> Result<Generation> {
@@ -712,7 +744,9 @@ impl GenerationManager {
         if let Some(blobs) = blobs {
             blobs.finish()?;
         }
-        if let Some(previous) = predecessor {
+        if !reuse.is_empty()
+            && let Some(previous) = predecessor
+        {
             let reader = previous.base().reader();
             let remap: Vec<_> = reader
                 .all_paths()
@@ -720,6 +754,7 @@ impl GenerationManager {
                 .map(|path| reuse.get(path.as_str()))
                 .collect();
             for index in 0..reader.num_trigrams() {
+                stats.predecessor_posting_lists_read += 1;
                 let (trigram, postings) = reader.trigram_posting_at(index);
                 for posting in postings {
                     if let Some(ids) = remap[posting.file_id as usize] {
@@ -918,6 +953,119 @@ fn validate_entries(manifest: &Manifest, base: &SharedBase, oid_length: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn empty_generation(directory: &Path) -> Generation {
+        builder::write_index_from_snapshot(directory, directory, &[], &HashMap::new(), true)
+            .unwrap();
+        let mut meta = IndexMeta::load(directory).unwrap();
+        meta.hidden_complete = true;
+        meta.save(directory).unwrap();
+        let base = Arc::new(SharedBase::open(directory).unwrap());
+        Generation {
+            directory: directory.to_path_buf(),
+            manifest: Manifest {
+                key: GenerationKey {
+                    repository: "test".into(),
+                    tree: "0".repeat(40),
+                    profile: IndexingProfile::default(),
+                    index_format: INDEX_FORMAT_VERSION,
+                    schema: SCHEMA_VERSION,
+                },
+                commit: "1".repeat(40),
+                base_id: base.snapshot_id(),
+                entries: vec![],
+            },
+            base,
+        }
+    }
+
+    #[test]
+    fn cold_load_does_not_block_unrelated_warm_cache_hit() {
+        let cold_directory = tempfile::tempdir().unwrap();
+        let warm_directory = tempfile::tempdir().unwrap();
+        let cold_generation = empty_generation(cold_directory.path());
+        let warm = cached_generation(warm_directory.path().to_path_buf(), || {
+            Ok(empty_generation(warm_directory.path()))
+        })
+        .unwrap();
+        let (loading, started) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let (hit, observed) = mpsc::channel();
+        let cold_path = cold_directory.path().to_path_buf();
+        let cold = thread::spawn(move || {
+            cached_generation(cold_path, || {
+                loading.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(15)).unwrap();
+                Ok(cold_generation)
+            })
+            .unwrap()
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let warm_path = warm_directory.path().to_path_buf();
+        let lookup = thread::spawn(move || {
+            let result =
+                cached_generation(warm_path, || panic!("warm entry must not reload")).unwrap();
+            hit.send(()).unwrap();
+            result
+        });
+        let hit_before_release = observed.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        cold.join().unwrap();
+        let same = lookup.join().unwrap();
+        assert!(
+            hit_before_release.is_ok(),
+            "cold load held the global cache mutex"
+        );
+        assert!(Arc::ptr_eq(&warm, &same));
+    }
+
+    #[test]
+    fn concurrent_cold_loads_recheck_before_cache_insertion() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = empty_generation(directory.path());
+        let second = Generation {
+            directory: first.directory.clone(),
+            manifest: serde_json::from_slice(&serde_json::to_vec(&first.manifest).unwrap())
+                .unwrap(),
+            base: Arc::clone(&first.base),
+        };
+        let (loading, started) = mpsc::channel();
+        let mut releases = Vec::new();
+        let threads: Vec<_> = [first, second]
+            .into_iter()
+            .map(|generation| {
+                let loading = loading.clone();
+                let (release, resume) = mpsc::channel();
+                releases.push(release);
+                thread::spawn(move || {
+                    cached_generation(generation.directory.clone(), || {
+                        loading.send(()).unwrap();
+                        resume.recv_timeout(Duration::from_secs(15)).unwrap();
+                        Ok(generation)
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+        let both_loading = started
+            .recv_timeout(Duration::from_secs(5))
+            .and_then(|_| started.recv_timeout(Duration::from_secs(5)));
+        for release in releases {
+            let _ = release.send(());
+        }
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(
+            both_loading.is_ok(),
+            "cold loads were serialized by the global cache"
+        );
+        assert!(Arc::ptr_eq(&results[0], &results[1]));
+    }
 
     #[test]
     fn invalid_staged_generation_is_never_published() {

@@ -276,6 +276,8 @@ missing objects and unsupported native/index paths are explicit errors.
 directory and uses a repository-identity subdirectory. It rejects storage in
 registered worktrees, Git metadata or another index snapshot. Stores and their
 ancestors must not be externally renamed or modified while in use.
+Checks cover the effective canonical repository-identity directory as well as
+the supplied parent, including an existing worktree or snapshot at that child.
 
 | API | Contract |
 | --- | --- |
@@ -317,11 +319,15 @@ O(tracked paths) metadata and the bounded sorter arena, not all postings.
 Without a predecessor the first build extracts the full committed corpus.
 `BuildStats` counts actual blob reads/bytes, extraction calls, reused indexed
 files, copied postings, and whether this request published or reused a generation.
+`predecessor_posting_lists_read` counts decoded predecessor lists; when no indexed
+paths reuse postings, generation creation does not traverse the predecessor.
 Publication I/O and metadata enumeration are not eliminated by extraction reuse.
 
 One OS file lock per repository store serializes cooperating processes, including
 different-tree builds; it is released on process exit/crash. A weak in-process
 cache shares live `Arc<Generation>` pins and their shared reader/path table.
+Cold validation/fingerprinting runs outside the process-wide cache mutex, so it
+does not block unrelated repository cache hits; insertion rechecks for a winner.
 Staging uses unique `.stage-*` directories on the same filesystem. The complete
 index is strictly opened, its fingerprint and checksummed tracked metadata
 validated, and files synced before atomic directory rename to the key's name.

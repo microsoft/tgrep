@@ -659,6 +659,8 @@ identity, exact committed tree OID, indexing profile, and format/schema versions
 commit OIDs are retained for diagnostics. `new` stores generations below the
 common directory's `tgrep-bases-v1`. `with_storage` accepts an existing trusted
 directory outside registered worktrees and Git metadata.
+Both that parent and its effective repository-identity subdirectory are checked;
+the effective directory cannot itself be a linked worktree or index snapshot.
 
 The current profile indexes **raw Git blobs** with the existing automatic text
 decoder. It covers all tracked regular files, including hidden, ignored, and
@@ -677,6 +679,8 @@ copies/renames, while extracting only new content through one Git batch process.
 Destination mode and size eligibility are recomputed. Without a predecessor,
 a missing generation requires a full build. `EnsureResult.stats` reports actual
 blob reads/extractions, bytes, reused files/postings, and publication/reuse.
+`predecessor_posting_lists_read` counts actual predecessor traversal; it is zero
+when no indexed paths can reuse postings.
 An OS file lock deduplicates cooperating starters across processes; live
 generation pins share one in-process `Arc<Generation>` and `Arc<SharedBase>`.
 The spill sorter bounds posting accumulation; one raw/decoded blob and its

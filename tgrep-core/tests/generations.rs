@@ -322,6 +322,10 @@ fn incremental_reuses_masks_renames_and_copies_extracting_only_new_blobs() {
     assert_eq!(next.stats.reused_indexed_files, 3);
     assert!(next.stats.postings_reused > 0);
     assert_eq!(
+        next.stats.predecessor_posting_lists_read,
+        previous.base().reader().num_trigrams() as u64
+    );
+    assert_eq!(
         next.stats.blob_bytes_read,
         (b"after change".len() + b"brand new content".len()) as u64
     );
@@ -909,6 +913,122 @@ fn unsupported_storage_and_discovery_return_errors() {
             .ensure("HEAD", IndexingProfile::default(), None)
             .is_err()
     );
+}
+
+#[test]
+fn effective_storage_cannot_be_a_linked_worktree() {
+    let fixture = Fixture::new();
+    write(&fixture.repo, "source.txt", b"original worktree content");
+    fixture.commit();
+    let repository = Repository::discover(&fixture.repo).unwrap();
+    let effective = fixture.storage.join(repository.identity());
+    let output = command(&fixture.repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(&effective)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        GenerationManager::with_storage(repository.clone(), &fixture.storage),
+        Err(GenerationError::Unsupported(_))
+    ));
+    assert!(!effective.join("publication.lock").exists());
+    assert!(git(&effective, &["status", "--porcelain"]).is_empty());
+    let manager = GenerationManager::new(repository.clone()).unwrap();
+    let generation = manager
+        .ensure("HEAD", IndexingProfile::default(), None)
+        .unwrap()
+        .generation;
+    assert!(generation.directory().starts_with(repository.common_dir()));
+    assert!(
+        !generation
+            .directory()
+            .starts_with(fs::canonicalize(effective).unwrap())
+    );
+}
+
+#[test]
+fn effective_storage_cannot_be_an_existing_snapshot() {
+    let fixture = Fixture::new();
+    fixture.commit();
+    let repository = Repository::discover(&fixture.repo).unwrap();
+    let effective = fixture.storage.join(repository.identity());
+    fs::create_dir(&effective).unwrap();
+    tgrep_core::builder::write_index_from_snapshot(
+        &fixture.repo,
+        &effective,
+        &[],
+        &std::collections::HashMap::new(),
+        true,
+    )
+    .unwrap();
+    let mut meta = tgrep_core::meta::IndexMeta::load(&effective).unwrap();
+    meta.hidden_complete = true;
+    meta.save(&effective).unwrap();
+    let base = tgrep_core::shared::SharedBase::open(&effective).unwrap();
+    assert!(matches!(
+        GenerationManager::with_storage(repository, &fixture.storage),
+        Err(GenerationError::Unsupported(_))
+    ));
+    assert!(!effective.join("publication.lock").exists());
+    assert_eq!(
+        tgrep_core::shared::SharedBase::open(&effective)
+            .unwrap()
+            .snapshot_id(),
+        base.snapshot_id()
+    );
+}
+
+#[test]
+fn unchanged_binary_or_empty_destination_does_not_scan_predecessor_postings() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.repo,
+        "source.txt",
+        b"previous indexed contents with many trigrams",
+    );
+    write(&fixture.repo, "binary.txt", b"unchanged\0binary");
+    fixture.commit();
+    let manager = fixture.manager();
+    let original = manager
+        .ensure("HEAD", IndexingProfile::default(), None)
+        .unwrap()
+        .generation;
+    assert!(original.base().reader().num_trigrams() > 0);
+    write(
+        &fixture.repo,
+        "source.txt",
+        b"entirely different indexed data",
+    );
+    fixture.commit();
+    let changed = manager
+        .ensure("HEAD", IndexingProfile::default(), Some(&original))
+        .unwrap();
+    assert_eq!(changed.stats.blobs_extracted, 1);
+    assert_eq!(changed.stats.reused_indexed_files, 0);
+    assert_eq!(changed.stats.postings_reused, 0);
+    assert_eq!(changed.stats.predecessor_posting_lists_read, 0);
+    assert_eq!(candidates(&changed.generation, "entirely"), ["source.txt"]);
+    assert_eq!(
+        changed.generation.entry("binary.txt").unwrap().content,
+        EntryContent::Binary
+    );
+
+    fs::remove_file(fixture.repo.join("source.txt")).unwrap();
+    fs::remove_file(fixture.repo.join("binary.txt")).unwrap();
+    fixture.commit();
+    let empty = manager
+        .ensure("HEAD", IndexingProfile::default(), Some(&original))
+        .unwrap();
+    assert!(empty.generation.entries().is_empty());
+    assert_eq!(empty.stats.blobs_extracted, 0);
+    assert_eq!(empty.stats.reused_indexed_files, 0);
+    assert_eq!(empty.stats.postings_reused, 0);
+    assert_eq!(empty.stats.predecessor_posting_lists_read, 0);
 }
 
 #[test]

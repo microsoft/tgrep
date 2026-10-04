@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const PROFILE: &str = r#"{"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864}"#;
+static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -125,8 +127,19 @@ struct Daemon {
 
 impl Daemon {
     fn start(root: &Path, storage: &Path, options: &[&str]) -> Self {
+        Self::start_with_home(root, storage, options, None)
+    }
+
+    fn start_with_home(root: &Path, storage: &Path, options: &[&str], home: Option<&Path>) -> Self {
         let log = storage.join("daemon.log");
-        let child = Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin("tgrep"));
+        if let Some(home) = home {
+            command
+                .env("HOME", home)
+                .env("USERPROFILE", home)
+                .env("XDG_CONFIG_HOME", home);
+        }
+        let child = command
             .args([
                 "serve",
                 "--shared",
@@ -171,7 +184,13 @@ impl Daemon {
         }
     }
 
-    fn request(&self, method: &str, params: Value) -> Value {
+    fn request(&self, method: &str, mut params: Value) -> Value {
+        if method == "attach" && params.get("lease").is_none() {
+            params["lease"] = json!(format!(
+                "test-{}",
+                LEASE_SEQUENCE.fetch_add(1, Ordering::SeqCst)
+            ));
+        }
         json!({
             "jsonrpc":"2.0","protocol":1, "instance":self.marker["instance"],
             "repository":self.marker["repository"], "id":1, "method":method,"params":params
@@ -205,6 +224,31 @@ impl Daemon {
         let result = self.rpc("attach", json!({"root":root,"revision":revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap()}));
         self.ready(root);
         result
+    }
+
+    fn attach_without_response(&self, params: Value) {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", self.marker["port"].as_u64().unwrap() as u16))
+                .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        writeln!(stream, "{}", self.request("attach", params.clone())).unwrap();
+        drop(stream);
+        let started = Instant::now();
+        loop {
+            let response = self
+                .try_rpc("lookup", json!({"root": params["root"]}))
+                .unwrap();
+            if response.get("result").is_some() {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "lost-response attach did not complete: {response}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn lookup(&self, root: &Path) -> Value {
@@ -1148,4 +1192,254 @@ fn configured_storage_is_external_and_excluded_from_all_shared_views() {
     assert!(result.get("error").is_some(), "{result}");
     fs::write(f.a.join("late.txt"), "late_safe_scan\n").unwrap();
     success(cli(&f.a, &["--", "late_safe_scan", "."]));
+}
+
+#[test]
+fn lost_attach_response_is_recoverable_without_allocating_another_lease() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch", "--shared-max-leases", "2"]);
+    let params = json!({"root":f.a,"revision":"HEAD","profile":serde_json::from_str::<Value>(PROFILE).unwrap(),"lease":"retry-client"});
+    d.attach_without_response(params.clone());
+    let original = d.ready(&f.a);
+    assert_eq!(original["leases"], 1);
+    fs::write(f.a.join("new.txt"), "new commit after interrupted attach\n").unwrap();
+    git(&f.a, &["add", "."]);
+    git(&f.a, &["commit", "-qm", "move HEAD after response loss"]);
+    let moved = git(&f.a, &["rev-parse", "HEAD"]);
+    let retry: Value = serde_json::from_str(&success(cli(
+        &f.a,
+        &[
+            "shared",
+            "attach",
+            ".",
+            "--revision",
+            "HEAD",
+            "--lease",
+            "retry-client",
+        ],
+    )))
+    .unwrap();
+    assert_eq!(retry["view"], original["view"]);
+    assert_eq!(retry["generation"], original["generation"]);
+    assert_eq!(retry["requested_commit"], f.revision);
+    assert_eq!(retry["leases"], 1);
+    let independent = d.attach(&f.a, &f.revision);
+    assert_ne!(independent["lease"], retry["lease"]);
+    let retry_at_limit = d.rpc("attach", params.clone());
+    assert_eq!(retry_at_limit["leases"], 2);
+    assert_eq!(retry_at_limit["attach_build"], retry["attach_build"]);
+    for (root, revision) in [(&f.b, "HEAD"), (&f.a, moved.as_str())] {
+        let mut changed = params.clone();
+        changed["root"] = json!(root);
+        changed["revision"] = json!(revision);
+        let response = d.try_rpc("attach", changed).unwrap();
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("different root or revision"),
+            "{response}"
+        );
+    }
+    for token in ["".to_string(), "../unsafe".to_string(), "x".repeat(129)] {
+        let mut changed = params.clone();
+        changed["lease"] = json!(token);
+        let response = d.try_rpc("attach", changed).unwrap();
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("lease must"),
+            "{response}"
+        );
+    }
+    let mut missing = d.request("attach", params);
+    missing["params"].as_object_mut().unwrap().remove("lease");
+    assert!(d.raw(&missing).unwrap().get("error").is_some());
+    success(cli(
+        &f.a,
+        &["shared", "detach", ".", "--lease", "retry-client"],
+    ));
+    assert_eq!(d.lookup(&f.a)["leases"], 1);
+    d.rpc(
+        "detach",
+        json!({"root":f.a,"view":independent["view"],"lease":independent["lease"]}),
+    );
+    d.attach_without_response(json!({"root":f.b,"revision":f.revision,"profile":serde_json::from_str::<Value>(PROFILE).unwrap(),"lease":"detach-after-loss"}));
+    success(cli(
+        &f.b,
+        &["shared", "detach", ".", "--lease", "detach-after-loss"],
+    ));
+    assert!(
+        d.try_rpc("lookup", json!({"root":f.b}))
+            .unwrap()
+            .get("error")
+            .is_some()
+    );
+}
+
+#[test]
+fn rejected_reattach_does_not_publish_a_generation() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    let attached = d.attach(&f.a, &f.revision);
+    git(
+        &f.a,
+        &[
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "same tree different commit",
+        ],
+    );
+    let same_tree = d.attach(&f.a, "HEAD");
+    assert_eq!(same_tree["generation"], attached["generation"]);
+    assert_ne!(same_tree["requested_commit"], attached["requested_commit"]);
+    assert_eq!(same_tree["attach_build"]["blobs_extracted"], 0);
+    assert_eq!(same_tree["attach_build"]["tracked_entries"], 3);
+    let directory = f
+        .storage
+        .join("bases")
+        .join(d.marker["repository"].as_str().unwrap());
+    let generations = || {
+        let mut names: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with("gen-"))
+            .collect();
+        names.sort();
+        names
+    };
+    let before = generations();
+    assert_eq!(before.len(), 1);
+    for content in ["new revision one\n", "new revision two\n"] {
+        fs::write(f.a.join("new.txt"), content).unwrap();
+        git(&f.a, &["add", "."]);
+        git(&f.a, &["commit", "-qm", "incompatible tree"]);
+        let response = d.try_rpc("attach", json!({"root":f.a,"revision":"HEAD","profile":serde_json::from_str::<Value>(PROFILE).unwrap()})).unwrap();
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("different base"),
+            "{response}"
+        );
+        assert_eq!(generations(), before);
+        assert_eq!(d.lookup(&f.a)["generation"], attached["generation"]);
+        assert_eq!(d.lookup(&f.a)["leases"], 2);
+    }
+}
+
+#[test]
+fn attached_queries_run_one_client_discovery_and_no_server_git_processes() {
+    let f = Fixture::new();
+    let home = f.temp.path().join("trace-home");
+    fs::create_dir(&home).unwrap();
+    let trace = f.temp.path().join("git-trace.jsonl");
+    git(
+        &f.a,
+        &[
+            "config",
+            "--file",
+            home.join(".gitconfig").to_str().unwrap(),
+            "trace2.eventTarget",
+            trace.to_str().unwrap(),
+        ],
+    );
+    let d = Daemon::start_with_home(&f.a, &f.storage, &["--no-watch"], Some(&home));
+    d.attach(&f.a, &f.revision);
+    let b = d.attach(&f.b, &f.revision);
+    let starts = || {
+        fs::read_to_string(&trace)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["event"] == "start")
+            .count()
+    };
+    let before = starts();
+    assert!(
+        before > 0,
+        "real Git trace must be active, including discovery during attach"
+    );
+    for _ in 0..3 {
+        assert_eq!(d.lookup(&f.b)["view"], b["view"]);
+        assert_eq!(d.search(&f.b, "shared_term")["backend"], "shared-v1");
+        d.rpc("files", json!({"root":f.b,"view":b["view"],"query":{}}));
+        d.rpc("status", json!({"root":f.b,"view":b["view"],"query":{}}));
+    }
+    assert_eq!(
+        starts(),
+        before,
+        "server hot requests must launch no Git subprocesses"
+    );
+    for args in [
+        vec!["--stats", "--", "shared_term", "src"],
+        vec!["--files", "src"],
+        vec!["status", "."],
+    ] {
+        let before = starts();
+        let output = Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+            .current_dir(&f.b)
+            .args(&args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .output()
+            .unwrap();
+        if args[0] == "--stats" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("via shared"));
+        }
+        success(output);
+        assert_eq!(
+            starts() - before,
+            3,
+            "{args:?}: exactly one validated client discovery"
+        );
+    }
+    let nested = f.b.join("src/nested");
+    fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    let response = d
+        .try_rpc(
+            "files",
+            json!({"root":f.b,"view":b["view"],"query":{"scope":"src/nested/"}}),
+        )
+        .unwrap();
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("boundary"),
+        "{response}"
+    );
+    let git_dir = PathBuf::from(git(&f.b, &["rev-parse", "--absolute-git-dir"]));
+    let common = fs::read(git_dir.join("commondir")).unwrap();
+    fs::write(
+        git_dir.join("commondir"),
+        nested.join(".git").to_str().unwrap(),
+    )
+    .unwrap();
+    let response = d.try_rpc("lookup", json!({"root":f.b})).unwrap();
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("repository changed"),
+        "{response}"
+    );
+    fs::write(git_dir.join("commondir"), common).unwrap();
+    fs::write(
+        f.b.join(".git"),
+        format!("gitdir: {}\n", f.a.join(".git").display()),
+    )
+    .unwrap();
+    let response = d.try_rpc("lookup", json!({"root":f.b})).unwrap();
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Git directory changed"),
+        "{response}"
+    );
 }

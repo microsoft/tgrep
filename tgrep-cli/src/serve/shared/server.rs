@@ -57,13 +57,20 @@ struct State {
 struct Entry {
     id: String,
     view: WorktreeView,
-    leases: Mutex<HashSet<String>>,
+    leases: Mutex<HashMap<String, Lease>>,
     queued: AtomicBool,
     running: AtomicBool,
     active: AtomicBool,
     monitor: Mutex<Monitor>,
     metrics: Mutex<Metrics>,
     queries: AtomicU64,
+}
+
+#[derive(Clone)]
+struct Lease {
+    revision: String,
+    requested_commit: String,
+    build: BuildStats,
 }
 
 struct Monitor {
@@ -409,6 +416,7 @@ struct AttachParams {
     root: PathBuf,
     revision: String,
     profile: IndexingProfile,
+    lease: String,
 }
 
 #[derive(Deserialize)]
@@ -454,11 +462,12 @@ impl State {
         Ok(())
     }
 
-    fn root(&self, root: &Path) -> Result<PathBuf> {
+    fn root(&self, root: &Path) -> Result<(PathBuf, Repository)> {
         let root = fs::canonicalize(root)?;
+        let repository = Repository::discover(&root)?;
         ensure!(
             super::worktree_root(&root)? == root
-                && Repository::discover(&root)?.identity() == self.repository.identity(),
+                && repository.identity() == self.repository.identity(),
             "root is not a worktree of this repository"
         );
         ensure!(
@@ -466,11 +475,11 @@ impl State {
                 && !root.starts_with(&self.registration.storage),
             "worktree overlaps shared storage"
         );
-        Ok(root)
+        Ok((root, repository))
     }
 
     fn entry(&self, root: &Path, id: Option<&str>) -> Result<Arc<Entry>> {
-        let root = self.root(root)?;
+        let root = fs::canonicalize(root)?;
         let entry = self
             .views
             .lock()
@@ -478,6 +487,7 @@ impl State {
             .get(&root)
             .cloned()
             .context("worktree is not attached; attach explicitly")?;
+        super::validate_repository(&root, entry.view.repository())?;
         ensure!(
             id.is_none_or(|id| id == entry.id) && entry.active.load(Ordering::SeqCst),
             "stale shared view identity"
@@ -496,7 +506,11 @@ impl State {
     fn lease(&self, params: &LeaseParams) -> Result<Arc<Entry>> {
         let entry = self.entry(&params.root, Some(&params.view))?;
         ensure!(
-            entry.leases.lock().expect("leases").contains(&params.lease),
+            entry
+                .leases
+                .lock()
+                .expect("leases")
+                .contains_key(&params.lease),
             "invalid or released lease"
         );
         Ok(entry)
@@ -538,7 +552,7 @@ impl State {
                 );
                 let entry = self.lease(&params)?;
                 let leases = entry.leases.lock().expect("leases");
-                ensure!(leases.contains(&params.lease), "lease already released");
+                ensure!(leases.contains_key(&params.lease), "lease already released");
                 let remaining = leases.len() - 1;
                 drop(leases);
                 if remaining == 0 {
@@ -569,11 +583,38 @@ impl State {
 
     fn attach(&self, params: AttachParams) -> Result<Value> {
         ensure!(
+            !params.lease.is_empty()
+                && params.lease.len() <= 128
+                && params
+                    .lease
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)),
+            "lease must contain 1-128 ASCII letters, digits, hyphens or underscores"
+        );
+        ensure!(params.revision.len() <= 4096, "revision is too long");
+        ensure!(
             params.profile == IndexingProfile::default(),
             "unsupported indexing profile; v1 uses raw-auto tracked regular files, 64 MiB"
         );
-        let root = self.root(&params.root)?;
+        let (root, repository) = self.root(&params.root)?;
         let entries = self.entries();
+        for entry in &entries {
+            let lease = entry
+                .leases
+                .lock()
+                .expect("leases")
+                .get(&params.lease)
+                .cloned();
+            if let Some(lease) = lease {
+                ensure!(
+                    entry.view.root() == root && lease.revision == params.revision,
+                    "lease already belongs to a different root or revision"
+                );
+                super::validate_repository(&root, entry.view.repository())?;
+                self.publish_view(entry)?;
+                return self.attach_result(entry, &params.lease, &lease);
+            }
+        }
         let total_leases: usize = entries
             .iter()
             .map(|entry| entry.leases.lock().expect("leases").len())
@@ -590,16 +631,27 @@ impl State {
             existing.is_some() || entries.len() < self.policy.max_views,
             "shared view limit reached"
         );
-        let manager = GenerationManager::with_storage(Repository::discover(&root)?, &self.bases)?;
-        let predecessor = entries.iter().map(|entry| entry.view.generation()).next();
-        let ensured = manager.ensure(&params.revision, params.profile, predecessor)?;
-        let entry = if let Some(entry) = existing {
+        let (requested_commit, tree) = repository.resolve_commit_tree(&params.revision)?;
+        let (entry, build) = if let Some(entry) = existing {
+            super::validate_repository(&root, entry.view.repository())?;
             ensure!(
-                entry.view.generation().key() == ensured.generation.key(),
+                entry.view.generation().key().tree_oid() == tree
+                    && *entry.view.generation().key().profile() == params.profile,
                 "worktree already pins a different base; release all leases before selecting another"
             );
-            entry
+            let tracked_entries = entry.view.generation().entries().len();
+            (
+                entry,
+                BuildStats {
+                    reused_generation: true,
+                    tracked_entries,
+                    ..Default::default()
+                },
+            )
         } else {
+            let manager = GenerationManager::with_storage(repository, &self.bases)?;
+            let predecessor = entries.iter().map(|entry| entry.view.generation()).next();
+            let ensured = manager.ensure(&requested_commit, params.profile, predecessor)?;
             let root_id = blake3::hash(
                 root.to_str()
                     .context("shared CLI requires a UTF-8 root")?
@@ -627,7 +679,7 @@ impl State {
             let entry = Arc::new(Entry {
                 id: self.token(),
                 view,
-                leases: Mutex::new(HashSet::new()),
+                leases: Mutex::new(HashMap::new()),
                 queued: AtomicBool::new(false),
                 running: AtomicBool::new(false),
                 active: AtomicBool::new(true),
@@ -654,35 +706,51 @@ impl State {
                 .lock()
                 .expect("views")
                 .insert(root.clone(), Arc::clone(&entry));
-            entry
+            (entry, ensured.stats)
         };
-        let lease = self.token();
-        entry.leases.lock().expect("leases").insert(lease.clone());
+        let lease = Lease {
+            revision: params.revision,
+            requested_commit,
+            build,
+        };
+        if let Err(error) = self.publish_view(&entry) {
+            if entry.leases.lock().expect("leases").is_empty() {
+                entry.active.store(false, Ordering::SeqCst);
+                entry.monitor.lock().expect("monitor").registry = None;
+                self.views.lock().expect("views").remove(entry.view.root());
+            }
+            return Err(error);
+        }
+        entry
+            .leases
+            .lock()
+            .expect("leases")
+            .insert(params.lease.clone(), lease.clone());
+        self.attach_result(&entry, &params.lease, &lease)
+    }
+
+    fn publish_view(&self, entry: &Entry) -> Result<()> {
         let marker = ViewRegistration {
             daemon: self.registration.clone(),
-            root,
+            root: entry.view.root().to_path_buf(),
             view: entry.id.clone(),
             generation: entry.view.generation().key().clone(),
         };
-        if let Err(error) = publish(
+        publish(
             &entry
                 .view
                 .repository()
                 .git_dir()
                 .join(super::protocol::VIEW_MARKER),
             &marker,
-        ) {
-            entry.leases.lock().expect("leases").remove(&lease);
-            if entry.leases.lock().expect("leases").is_empty() {
-                entry.active.store(false, Ordering::SeqCst);
-                self.views.lock().expect("views").remove(entry.view.root());
-            }
-            return Err(error);
-        }
-        let mut value = self.describe(&entry)?;
-        value["lease"] = json!(lease);
-        value["requested_commit"] = json!(ensured.requested_commit);
-        value["attach_build"] = build_stats(&ensured.stats);
+        )
+    }
+
+    fn attach_result(&self, entry: &Entry, token: &str, lease: &Lease) -> Result<Value> {
+        let mut value = self.describe(entry)?;
+        value["lease"] = json!(token);
+        value["requested_commit"] = json!(lease.requested_commit);
+        value["attach_build"] = build_stats(&lease.build);
         Ok(value)
     }
 
@@ -742,7 +810,7 @@ impl State {
             "hello" => {
                 ensure!(request.params == json!({}), "hello params must be empty");
                 Ok(json!({
-                    "capabilities":["leases","worktree-overlays","refresh","search","files"],
+                    "capabilities":["leases","recoverable-attach","worktree-overlays","refresh","search","files"],
                     "profile":IndexingProfile::default(), "retention":"retain-all",
                     "limits":{"views":self.policy.max_views, "leases":self.policy.max_leases,
                         "watches_per_view":self.policy.watches_per_view, "hints_per_view":self.policy.hints_per_view,

@@ -284,6 +284,7 @@ the supplied parent, including an existing worktree or snapshot at that child.
 
 | API | Contract |
 | --- | --- |
+| `Repository::resolve_commit_tree(revision)` | Resolve exact commit/tree IDs without building or publishing; symbolic revisions use the discovered worktree |
 | `ensure(revision, profile, predecessor)` | Resolve an exact commit/tree, build or reuse the key; incompatible supplied predecessors error |
 | `EnsureResult` | Pinned `Arc<Generation>`, requested commit, and per-request `BuildStats` |
 | `open(key)` / `list()` | Open exact or list validated published generations; errors never become empty bases |
@@ -488,7 +489,7 @@ unchanged unless a worktree is explicitly attached to the daemon described below
 
 Run `tgrep serve --shared ROOT --shared-storage EXISTING_EXTERNAL_DIRECTORY`.
 The runtime supervises this foreground process. `shared attach ROOT --revision
-REV`, `shared refresh ROOT --lease TOKEN [--changed REL ... | --full]`, and
+REV --lease TOKEN`, `shared refresh ROOT --lease TOKEN [--changed REL ... | --full]`, and
 `shared detach ROOT --lease TOKEN` are CLI wrappers emitting one JSON result.
 The new literal subcommand name must be escaped as a pattern: `tgrep -- shared .`.
 
@@ -502,6 +503,11 @@ generation. No `serve.json` schema is overloaded. Attach publishes this marker;
 last detach removes it only if instance/view still match. Discovery stops at the
 nearest Git boundary and validates capabilities, root/base/profile and readiness
 before emitting any rows. Merely having a daemon is not attachment.
+Client discovery carries one validated root/repository through daemon discovery
+and lookup (three Git subprocesses total per attached CLI query). Daemon query
+workers launch no Git subprocesses: they reuse the attached repository, rechecking
+canonical root, nested boundaries, gitfile target and common-directory identity.
+Real Git trace2 process-start events assert these counts in integration tests.
 
 RPC is one newline-delimited JSON request/response per TCP connection, loopback
 only. All requests have this envelope (including `hello`):
@@ -520,13 +526,28 @@ user environment are trusted.
 | Method | `params` | Result-specific fields |
 | --- | --- | --- |
 | `hello` | `{}` | `capabilities`, `profile`, `retention`, `limits` |
-| `attach` | `root`, `revision`, `profile` | `view`, `lease`, `root`, `generation`, `requested_commit`, `ready`, `attach_build` |
+| `attach` | `root`, `revision`, `profile`, `lease` | `view`, `lease`, `root`, `generation`, `requested_commit`, `ready`, `attach_build` |
 | `lookup` | `root` | Current view descriptor and status; does not create a lease |
 | `status` | `root`, `view`, `query: {}` | Readiness, pending/full flags, epoch, last error/success, watcher mode, sharing/extraction counters |
 | `refresh` | `root`, `view`, `lease`, `changed: []`, `full: false` | Descriptor plus `processed_epoch`; no hints means full verification |
 | `detach` | `root`, `view`, `lease` | `remaining_leases`, `detached`, `view` |
 | `files` | `root`, `view`, `query: {scope, hidden, max_depth}` | Root-relative `files`, `epoch`, `ready`, `generation`, `backend: "shared-v1"` |
 | `search` | `root`, `view`, `query` | Root-relative match/context rows, `file_stats`, `index_stats`, `epoch`, same view/base/backend fields |
+
+The `recoverable-attach` capability requires a caller-owned `lease` on every
+attach RPC: 1-128 ASCII letters, digits, hyphens or underscores. Persist a unique
+token before sending. Repeating a live token with the same canonical root,
+literal revision and profile replays the original attachment and `attach_build`
+statistics, without allocating another lease or re-resolving symbolic revisions.
+It works at the lease limit and after response loss. A token already used by
+another root/revision is an error. Distinct callers use distinct tokens.
+`lookup` followed by `detach` also releases a known token without its original
+response; the CLI does that lookup automatically. Tokens are scoped to the
+daemon instance, are not authentication credentials, and are forgotten on detach
+or restart. After restart, explicitly attach again with fresh tokens.
+CLI `--lease` is optional for interactive convenience: if omitted, a generated
+token is printed on stderr before transmission and must be captured and supplied
+on retry. Runtime integrations should always supply their own token.
 
 The `profile` is required on attach:
 
@@ -545,7 +566,9 @@ response before output. Read failures invalidate the view and return errors.
 
 Views are shared only for the same root and exact tree/profile. Independent lease
 tokens release independently, have no automatic expiry, and are invalid after
-restart. New generations may reuse a compatible currently pinned predecessor;
+restart. Reattachment resolves and compares the requested tree with the existing
+pin before any generation build/publication; a different commit with the same
+tree is compatible when using a new lease. New generations may reuse a compatible currently pinned predecessor;
 existing views never migrate. All generations/checkpoints are retained.
 Generation and overlay directories are separate under external storage. A saved
 delta is keyed by canonical root and exact generation and is full-revalidated on

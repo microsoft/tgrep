@@ -642,8 +642,8 @@ Do **not** point ordinary servers at a shared `--index-path`.
 mkdir /trusted/external/tgrep-cache
 tgrep serve --shared /repo --shared-storage /trusted/external/tgrep-cache
 # In another terminal (the runtime owns the foreground daemon's supervision):
-tgrep shared attach /worktrees/session-a --revision <starting-commit>
-tgrep shared attach /worktrees/session-b --revision <starting-commit>
+tgrep shared attach /worktrees/session-a --revision <starting-commit> --lease <session-a-token>
+tgrep shared attach /worktrees/session-b --revision <starting-commit> --lease <session-b-token>
 tgrep status /worktrees/session-a
 tgrep -- 'pattern' /worktrees/session-a/src
 tgrep --files /worktrees/session-b
@@ -652,14 +652,23 @@ tgrep shared refresh /worktrees/session-a --lease <lease-from-attach> --full
 tgrep shared detach /worktrees/session-a --lease <lease-from-attach>
 ```
 
-`attach` returns JSON with a unique **lease**, view ID, exact generation key,
+`attach` returns JSON with the caller's **lease**, view ID, exact generation key,
 requested commit and readiness. Wait for `"ready": true` in `status`; attaching
-does not expose the base before reconciliation. Repeated compatible attaches
-share the view but return independent leases. The last detach removes only that
+does not expose the base before reconciliation. Use a unique caller-owned
+`--lease` token (1-128 ASCII letters, digits, hyphens or underscores) per logical
+attachment and retain it **before** sending the request. Retrying that token with
+the same root/revision/profile returns the original attachment without consuming
+another lease, even if symbolic `HEAD` moved or the lease budget is full. A lost
+response can also be recovered by `detach --lease` without knowing the view ID.
+Reusing a live token with another root or revision is rejected.
+Without `--lease`, the CLI generates a token and prints it on stderr before the
+request; capture it and pass it explicitly on retry. Independent compatible
+attachments use different tokens and share the view. The last detach removes only that
 instance/view's registration, not another worktree or the daemon. Leases do not
 expire automatically; the runtime must release them or restart the daemon.
 An attached view stays pinned across commits/checkouts. Selecting another tree
-for the same root requires releasing **all** its leases first.
+for the same root requires releasing **all** its leases first; incompatible
+reattachment is rejected before building or publishing a generation.
 
 Attachment is the opt-in: subsequent normal search, `--files`, and `status`
 discover a versioned registration in the worktree's Git metadata, including from
@@ -670,6 +679,9 @@ or incompatible registrations **scan the filesystem**, never a legacy index or
 bare base. `status` reports those errors instead of displaying legacy status.
 An explicit `--index-path` retains legacy intent unless `--shared` is also set
 (then queries scan). `--no-index` always reads the filesystem.
+Each attached CLI query validates the repository once (three Git processes);
+daemon lookup/search/files/status reuse the attached identity with filesystem
+boundary/gitfile/common-directory checks and launch no Git subprocesses.
 
 The v1 profile is raw-Git-blob automatic decoding, tracked regular files and a
 64 MiB size cap. Worktree reconciliation separately applies local ignores,

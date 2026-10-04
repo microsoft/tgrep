@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
@@ -57,6 +57,7 @@ pub(super) struct ViewRegistration {
 
 pub struct Client {
     registration: Registration,
+    root: PathBuf,
 }
 
 impl Client {
@@ -90,7 +91,7 @@ impl Client {
                 .context("worktree has no shared attachment")?
                 .take(MAX_REQUEST),
         )?;
-        let client = Self::discover(&root)?;
+        let client = Self::discover(root.clone(), &repo)?;
         ensure!(
             marker.daemon.protocol == PROTOCOL
                 && marker.daemon.instance == client.registration.instance
@@ -99,7 +100,7 @@ impl Client {
                 && marker.root == root,
             "stale or incompatible worktree registration; reattach"
         );
-        let view = client.lookup(&root)?;
+        let view = client.lookup()?;
         ensure!(
             view.view == marker.view && view.generation == marker.generation,
             "stale shared view registration"
@@ -107,9 +108,7 @@ impl Client {
         Ok((client, view))
     }
 
-    pub fn discover(path: &Path) -> Result<Self> {
-        let root = super::worktree_root(path)?;
-        let repo = Repository::discover(&root)?;
+    fn discover(root: PathBuf, repo: &Repository) -> Result<Self> {
         let registration: Registration = serde_json::from_reader(
             fs::File::open(repo.common_dir().join(MARKER))
                 .context("no shared daemon registration; start serve --shared")?
@@ -122,23 +121,29 @@ impl Client {
                 && registration.port != 0,
             "incompatible shared daemon registration"
         );
-        let client = Self { registration };
+        let client = Self { registration, root };
         let hello = client.request("hello", json!({}))?;
         ensure!(
             hello["capabilities"]
-                == json!(["leases", "worktree-overlays", "refresh", "search", "files"])
+                == json!([
+                    "leases",
+                    "recoverable-attach",
+                    "worktree-overlays",
+                    "refresh",
+                    "search",
+                    "files"
+                ])
                 && hello["profile"] == json!(IndexingProfile::default()),
             "shared daemon capabilities/profile are incompatible"
         );
         Ok(client)
     }
 
-    pub fn lookup(&self, path: &Path) -> Result<View> {
-        let root = super::worktree_root(path)?;
-        let result = self.request("lookup", json!({"root": root}))?;
+    pub fn lookup(&self) -> Result<View> {
+        let result = self.request("lookup", json!({"root": self.root}))?;
         let view: View = serde_json::from_value(result)?;
         ensure!(
-            view.root == root
+            view.root == self.root
                 && view.generation.repository_identity() == self.registration.repository
                 && *view.generation.profile() == IndexingProfile::default(),
             "shared view identity/profile mismatch"
@@ -224,6 +229,9 @@ pub enum Lifecycle {
         root: PathBuf,
         #[arg(long)]
         revision: String,
+        /// Caller-owned unique token. Reuse it to recover an interrupted attach.
+        #[arg(long)]
+        lease: Option<String>,
     },
     /// Acknowledge known changes, or verify all bytes with --full (the default).
     Refresh {
@@ -245,11 +253,23 @@ pub enum Lifecycle {
 
 pub fn run_lifecycle(command: Lifecycle) -> Result<()> {
     let (root, method, mut params) = match command {
-        Lifecycle::Attach { root, revision } => (
+        Lifecycle::Attach {
             root,
-            "attach",
-            json!({"revision": revision, "profile": IndexingProfile::default()}),
-        ),
+            revision,
+            lease,
+        } => {
+            let lease = lease.unwrap_or_else(|| {
+                blake3::hash(format!("{}:{:?}", std::process::id(), SystemTime::now()).as_bytes())
+                    .to_hex()
+                    .to_string()
+            });
+            eprintln!("shared attach lease: {lease} (retry with --lease {lease})");
+            (
+                root,
+                "attach",
+                json!({"revision": revision, "profile": IndexingProfile::default(), "lease": lease}),
+            )
+        }
         Lifecycle::Refresh {
             root,
             lease,
@@ -267,10 +287,11 @@ pub fn run_lifecycle(command: Lifecycle) -> Result<()> {
         super::worktree_root(&root)? == root,
         "lifecycle requires a worktree root"
     );
-    let client = Client::discover(&root)?;
+    let repo = Repository::discover(&root)?;
+    let client = Client::discover(root.clone(), &repo)?;
     params["root"] = json!(root);
     if method != "attach" {
-        params["view"] = json!(client.lookup(&root)?.view);
+        params["view"] = json!(client.lookup()?.view);
     }
     println!("{}", client.request(method, params)?);
     Ok(())

@@ -67,8 +67,15 @@ tgrep status .
 For linked-worktree sessions, an agent runtime can instead start **one opt-in
 repository daemon** with `tgrep serve --shared <root> --shared-storage <existing
 trusted external directory>`. It runs in the foreground; keep it supervised.
-Call `tgrep shared attach <worktree> --revision <starting-commit>` per session
-and retain the returned JSON lease. Wait for `tgrep status <worktree>` to report
+Choose and retain a unique caller-owned token before calling `tgrep shared attach
+<worktree> --revision <starting-commit> --lease <token>` per session. Retry the
+same token/root/revision after response loss; it returns the original attachment
+without creating another lease. You can also detach that token without receiving
+the first attach response. Different sessions use different tokens, even when
+they share a worktree. Tokens contain 1-128 ASCII letters, digits, hyphens or
+underscores. Omitting `--lease` prints a generated token to stderr before sending;
+capture it and supply it explicitly on retry.
+Wait for `tgrep status <worktree>` to report
 `"ready": true`. Ordinary queries and `--files` then discover that attached view
 without changing every search command. No attachment means the legacy behavior
 above; a stale attachment means a diagnostic and a filesystem scan, not use of

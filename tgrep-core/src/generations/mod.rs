@@ -153,6 +153,12 @@ impl Repository {
     pub fn identity(&self) -> &str {
         &self.identity
     }
+
+    /// Resolve a revision to its exact (commit, tree) IDs without building or
+    /// publishing a generation. Symbolic revisions use this worktree's HEAD.
+    pub fn resolve_commit_tree(&self, revision: &str) -> Result<(String, String)> {
+        git::commit_tree(self, revision)
+    }
 }
 
 impl PartialEq for Repository {

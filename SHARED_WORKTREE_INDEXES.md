@@ -620,7 +620,12 @@ retries; no base-only window exists. Consecutive failures use completion-based
 exponential retry delays of 1, 2, 4, 8, 16 then 30 seconds; success or explicit
 refresh resets the delay. Explicit refresh does not wait for the retry deadline.
 Status exposes `reconcile_attempts`, `consecutive_failures`, `retry_delay_ms` and
-the retained `last_error`. Both auto and poll modes perform full
+the retained `last_error`. Daemon readiness stays closed until both the core
+refresh and checkpoint publication finish, including failed checkpoint retries.
+Candidate files are opened through the view's retained snapshot reader. Every
+query ends with a root-verified epoch check, including empty and filename-only
+responses; replacing the directory cannot pair old candidates with a new root.
+Both auto and poll modes perform full
 verification every `--poll-interval` seconds after completion (default 120), also
 repairing missed bytes, ignores and external Git/global configuration changes.
 Native notifications allow earlier incremental repair. `--no-watch` disables

@@ -1181,6 +1181,48 @@ fn candidate_read_failures_close_readiness_and_never_return_partial_success() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn replaced_root_cannot_publish_matches_files_or_empty_results() {
+    let f = Fixture::new();
+    fs::create_dir(f.b.join("empty")).unwrap();
+    let d = f.start(&["--no-watch"]);
+    d.attach(&f.a, &f.revision);
+    let b = d.attach(&f.b, &f.revision);
+    let moved = f.temp.path().join("original-b");
+    let gitfile = fs::read(f.b.join(".git")).unwrap();
+    for (method, query) in [
+        ("search", json!({"pattern":"shared_term"})),
+        ("search", json!({"pattern":"absentZXQJVPKMW"})),
+        ("files", json!({"hidden":true})),
+        ("files", json!({"scope":"empty/"})),
+    ] {
+        fs::rename(&f.b, &moved).unwrap();
+        fs::create_dir_all(f.b.join("src")).unwrap();
+        fs::create_dir(f.b.join("empty")).unwrap();
+        fs::write(f.b.join(".git"), &gitfile).unwrap();
+        for relative in ["src/main.rs", "notes.txt", ".hidden"] {
+            fs::write(
+                f.b.join(relative),
+                "shared_term replacement_must_not_be_returned\n",
+            )
+            .unwrap();
+        }
+        let response = d
+            .try_rpc(method, json!({"root":f.b,"view":b["view"],"query":query}))
+            .unwrap();
+        assert!(response.get("result").is_none(), "{method}: {response}");
+        assert!(response["error"]["message"].is_string(), "{response}");
+        let status = d.lookup(&f.b);
+        assert_eq!(status["ready"], false, "{status}");
+        assert!(status["last_error"].is_string(), "{status}");
+        assert_eq!(d.search(&f.a, "shared_term")["backend"], "shared-v1");
+        fs::remove_dir_all(&f.b).unwrap();
+        fs::rename(&moved, &f.b).unwrap();
+        assert_eq!(d.refresh(&f.b, &b, &[], true)["ready"], true);
+    }
+}
+
 #[test]
 fn configured_storage_is_external_and_excluded_from_all_shared_views() {
     let f = Fixture::new();
@@ -1742,6 +1784,12 @@ fn canonical_directory_hints_refresh_same_size_restored_mtime_edits() {
         .unwrap();
         assert_eq!(refreshed["ready"], true);
         assert_eq!(refreshed["last_reconcile"]["full"], false);
+        assert!(
+            refreshed["last_reconcile"]["hint_lookups"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         assert!(refreshed["processed_epoch"].as_u64().unwrap() >= a["epoch"].as_u64().unwrap());
         assert!(
             !d.search(&f.a, next)["matches"]

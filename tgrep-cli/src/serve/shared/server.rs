@@ -13,7 +13,9 @@ use notify::{Event, EventKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tgrep_core::generations::{BuildStats, GenerationManager, IndexingProfile, Repository};
-use tgrep_core::worktrees::{ReconcileStats, WorktreeOptions, WorktreeView};
+use tgrep_core::worktrees::{
+    ReconcileStats, WorktreeError, WorktreeOptions, WorktreeSnapshot, WorktreeView,
+};
 
 use super::protocol::{MAX_REQUEST, MAX_RESPONSE, Registration, Request, ViewRegistration};
 use super::{MARKER, PROTOCOL};
@@ -827,39 +829,55 @@ impl State {
             entry.view.save_checkpoint()?;
             Ok((stats, epoch))
         })();
+        let result = (|| {
+            let mut metrics = entry.metrics.lock().expect("metrics");
+            metrics.last_attempt = Instant::now();
+            match result {
+                Ok((stats, epoch)) => {
+                    metrics.total_reads += stats.files_read;
+                    metrics.total_extractions += stats.files_extracted;
+                    metrics.last = Some(stats);
+                    metrics.error = None;
+                    metrics.failures = 0;
+                    metrics.last_success =
+                        Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+                    Ok(epoch)
+                }
+                Err(error) => {
+                    entry.view.invalidate_all()?;
+                    metrics.error = Some(format!("{error:#}"));
+                    metrics.failures = metrics.failures.saturating_add(1);
+                    Err(error)
+                }
+            }
+        })();
         entry.running.store(false, Ordering::SeqCst);
-        let mut metrics = entry.metrics.lock().expect("metrics");
-        metrics.last_attempt = Instant::now();
-        match result {
-            Ok((stats, epoch)) => {
-                metrics.total_reads += stats.files_read;
-                metrics.total_extractions += stats.files_extracted;
-                metrics.last = Some(stats);
-                metrics.error = None;
-                metrics.failures = 0;
-                metrics.last_success =
-                    Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
-                Ok(epoch)
-            }
-            Err(error) => {
-                entry.view.invalidate_all()?;
-                metrics.error = Some(format!("{error:#}"));
-                metrics.failures = metrics.failures.saturating_add(1);
-                Err(error)
-            }
-        }
+        result
     }
 
     fn describe(&self, entry: &Entry) -> Result<Value> {
+        let snapshot_valid = match entry.view.with_snapshot(|_| ()) {
+            Ok(()) => true,
+            Err(WorktreeError::NotReady) => false,
+            Err(error) => {
+                entry.metrics.lock().expect("metrics").error =
+                    Some(format!("validating shared snapshot: {error}"));
+                false
+            }
+        };
         let status = entry.view.status()?;
+        let running = entry.running.load(Ordering::SeqCst);
         let metrics = entry.metrics.lock().expect("metrics");
         let monitor = entry.monitor.lock().expect("monitor");
+        let checkpoint_epoch = metrics.last.as_ref().map(|stats| stats.epoch);
         Ok(json!({
             "root":entry.view.root(), "view":entry.id, "generation":entry.view.generation().key(),
-            "ready":status.ready, "epoch":status.epoch, "published_epoch":status.published_epoch,
+            "ready":snapshot_valid && status.ready && !running
+                && checkpoint_epoch == Some(status.epoch),
+            "epoch":status.epoch, "published_epoch":status.published_epoch,
             "pending_paths":status.pending_paths, "full_required":status.full_required,
             "queued":entry.queued.load(Ordering::SeqCst), "last_error":metrics.error,
-            "reconcile_running":entry.running.load(Ordering::SeqCst),
+            "reconcile_running":running,
             "reconcile_attempts":metrics.attempts, "consecutive_failures":metrics.failures,
             "retry_delay_ms":retry_delay(metrics.failures).as_millis(),
             "last_success":metrics.last_success, "leases":entry.leases.lock().expect("leases").len(),
@@ -1066,7 +1084,8 @@ fn reconcile_stats(stats: &ReconcileStats) -> Value {
         "files_read":stats.files_read, "bytes_read":stats.bytes_read, "files_decoded":stats.files_decoded,
         "files_extracted":stats.files_extracted, "base_reused":stats.base_reused,
         "base_files_copied":stats.base_files_copied, "postings_copied":stats.postings_copied,
-        "overlay_reused":stats.overlay_reused, "content_reads_avoided":stats.content_reads_avoided
+        "overlay_reused":stats.overlay_reused, "content_reads_avoided":stats.content_reads_avoided,
+        "hint_lookups":stats.hint_lookups
     })
 }
 
@@ -1149,6 +1168,38 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
 }
 
 impl State {
+    fn query_snapshot<T>(
+        &self,
+        entry: &Entry,
+        read: impl FnOnce(WorktreeSnapshot<'_>) -> T,
+    ) -> Result<T> {
+        ensure!(
+            !entry.running.load(Ordering::SeqCst),
+            "shared reconciliation in progress; retry or scan"
+        );
+        let (epoch, result) = entry
+            .view
+            .with_snapshot(|snapshot| (snapshot.epoch(), read(snapshot)))
+            .inspect_err(|error| {
+                if !matches!(error, WorktreeError::NotReady) {
+                    entry.metrics.lock().expect("metrics").error =
+                        Some(format!("validating shared snapshot: {error}"));
+                }
+            })?;
+        let checkpoint_epoch = entry
+            .metrics
+            .lock()
+            .expect("metrics")
+            .last
+            .as_ref()
+            .map(|stats| stats.epoch);
+        ensure!(
+            !entry.running.load(Ordering::SeqCst) && checkpoint_epoch == Some(epoch),
+            "shared reconciliation or checkpoint publication incomplete; retry or scan"
+        );
+        Ok(result)
+    }
+
     fn search(&self, entry: &Entry, query: &Value, files: bool, id: &Value) -> Result<Value> {
         validate_query(query, files)?;
         let scope = crate::serve::SearchScope::parse(query).map_err(anyhow::Error::msg)?;
@@ -1170,8 +1221,8 @@ impl State {
             remaining: MAX_RESPONSE as usize - 1024,
         };
         budget.charge(&json!({"jsonrpc":"2.0","id":id,"result":metadata}))?;
-        let mut result = if files {
-            let (paths, epoch) = entry.view.with_snapshot(|snapshot| -> Result<_> {
+        let (mut result, epoch) = if files {
+            let (paths, epoch) = self.query_snapshot(entry, |snapshot| -> Result<_> {
                 let mut paths = Vec::new();
                 for path in snapshot.files(&scope.prefix, scope.hidden) {
                     if scope.relative(&path).is_some() {
@@ -1181,10 +1232,10 @@ impl State {
                 }
                 Ok((paths, snapshot.epoch()))
             })??;
-            json!({"files":paths, "epoch":epoch})
+            (json!({"files":paths, "epoch":epoch}), epoch)
         } else {
             let request = crate::serve::parse_search_params(query).map_err(anyhow::Error::msg)?;
-            let (paths, total, epoch) = entry.view.with_snapshot(|snapshot| {
+            let (paths, total, epoch) = self.query_snapshot(entry, |snapshot| {
                 (
                     snapshot.candidates(&request.plan, &scope.prefix, scope.hidden),
                     request.opts.stats.then(|| snapshot.files("", true).len()),
@@ -1208,10 +1259,8 @@ impl State {
             let mut stats = Vec::new();
             for relative in &paths {
                 let read = (|| -> Result<Vec<u8>> {
-                    let file = crate::serve::open_within_root(
-                        entry.view.root(),
-                        &entry.view.root().join(relative),
-                    )?;
+                    let file =
+                        self.query_snapshot(entry, |snapshot| snapshot.open_file(relative))??;
                     ensure!(
                         file.metadata()?.is_file(),
                         "candidate is no longer a regular file: {relative}"
@@ -1243,18 +1292,19 @@ impl State {
                 rows.extend(found.rows);
                 stats.extend(found.stats);
             }
-            ensure!(
-                entry
-                    .view
-                    .with_snapshot(|snapshot| snapshot.epoch() == epoch)?,
-                "view changed during search; retry or scan"
-            );
-            json!({
-                "matches":rows, "file_stats":stats, "epoch":epoch,
-                "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
-                "index_stats":index_stats
-            })
+            (
+                json!({
+                    "matches":rows, "file_stats":stats, "epoch":epoch,
+                    "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
+                    "index_stats":index_stats
+                }),
+                epoch,
+            )
         };
+        ensure!(
+            self.query_snapshot(entry, |snapshot| snapshot.epoch() == epoch)?,
+            "view changed during query; retry or scan"
+        );
         for (key, value) in metadata.as_object().expect("metadata object") {
             result[key] = value.clone();
         }

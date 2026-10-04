@@ -686,6 +686,11 @@ An explicit `--index-path` retains legacy intent unless `--shared` is also set
 Each attached CLI query validates the repository once (three Git processes);
 daemon lookup/search/files/status reuse the attached identity with filesystem
 boundary/gitfile/common-directory checks and launch no Git subprocesses.
+Queries open candidates through the view's retained root handle and verify that
+identity before and after snapshot callbacks, including empty and filename-only
+results. Replacing the root closes readiness rather than mixing old candidates
+with a new directory. Daemon readiness also stays closed until reconciliation
+and checkpoint publication have both finished.
 
 The v1 profile is raw-Git-blob automatic decoding, tracked regular files and a
 64 MiB size cap. Worktree reconciliation separately applies local ignores,

@@ -2040,11 +2040,63 @@ struct FileSearchResult {
     stats: Option<crate::search::FileMatchStats>,
 }
 
+/// Counts encoded bytes without allocating a serialized copy.
+struct JsonBudget {
+    remaining: usize,
+}
+
+impl JsonBudget {
+    fn charge(&mut self, value: &impl serde::Serialize) -> anyhow::Result<()> {
+        // One byte also covers a separator between array items.
+        self.write_all(b",")?;
+        serde_json::to_writer(self, value)?;
+        Ok(())
+    }
+}
+
+impl std::io::Write for JsonBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(std::io::Error::other(
+                "shared response exceeds 64 MiB; narrow the query or scan",
+            ));
+        }
+        self.remaining -= bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn push_row(
+    rows: &mut Vec<serde_json::Value>,
+    row: impl serde::Serialize,
+    budget: &mut Option<&mut JsonBudget>,
+) -> anyhow::Result<()> {
+    if let Some(budget) = budget {
+        budget.charge(&row)?;
+    }
+    rows.push(serde_json::to_value(row)?);
+    Ok(())
+}
+
 fn search_file_matches(
     rel_path: &str,
     file: &DecodedFile,
     matcher: &crate::matching::SearchMatcher,
     opts: &SearchOpts,
+) -> anyhow::Result<FileSearchResult> {
+    search_file_matches_bounded(rel_path, file, matcher, opts, None)
+}
+
+fn search_file_matches_bounded(
+    rel_path: &str,
+    file: &DecodedFile,
+    matcher: &crate::matching::SearchMatcher,
+    opts: &SearchOpts,
+    mut budget: Option<&mut JsonBudget>,
 ) -> anyhow::Result<FileSearchResult> {
     use crate::matching::FileMatches;
 
@@ -2084,6 +2136,11 @@ fn search_file_matches(
             }
         }),
     };
+    if let Some(stats) = &result.stats
+        && let Some(budget) = &mut budget
+    {
+        budget.charge(stats)?;
+    }
 
     // Never stream raw binary back to the client; report a note instead, the
     // same way the local path does. Emitted for `-l`/`-c` too so the client can
@@ -2099,7 +2156,7 @@ fn search_file_matches(
         });
         // `--json` reports binary matches as ordinary match events carrying a
         // `binary_offset`, so those clients ask for the lines as well.
-        result.rows.push(marker);
+        push_row(&mut result.rows, marker, &mut budget)?;
         if !opts.binary_lines || (opts.files_only && opts.stats) {
             return Ok(result);
         }
@@ -2109,14 +2166,18 @@ fn search_file_matches(
         // Totals need the full search, but files-only clients consume just the
         // path. Avoid rendering content or span arrays proportional to hits.
         // Keep legacy replies unchanged when per-file stats were not requested.
-        result.rows.push(serde_json::json!({
-            "type": "match",
-            "file": rel_path,
-        }));
+        push_row(
+            &mut result.rows,
+            serde_json::json!({
+                "type": "match",
+                "file": rel_path,
+            }),
+            &mut budget,
+        )?;
         return Ok(result);
     }
 
-    result.rows.extend(collect_match_rows(
+    collect_match_rows_bounded(
         &found,
         &match_opts,
         matcher,
@@ -2124,12 +2185,15 @@ fn search_file_matches(
         fixups,
         opts.detail,
         opts.positions,
-    )?);
+        &mut result.rows,
+        budget,
+    )?;
     Ok(result)
 }
 
-/// Turn a file's matches into the protocol's `match`/`context` rows.
-fn collect_match_rows(
+/// Check each borrowed row before allocating its JSON object and owned strings.
+#[allow(clippy::too_many_arguments)]
+fn collect_match_rows_bounded(
     found: &crate::matching::FileMatches,
     match_opts: &crate::matching::MatchOptions,
     matcher: &crate::matching::SearchMatcher,
@@ -2137,10 +2201,28 @@ fn collect_match_rows(
     fixups: &tgrep_core::encoding::LossyFixups,
     detail: bool,
     positions: bool,
-) -> anyhow::Result<Vec<serde_json::Value>> {
+    results: &mut Vec<serde_json::Value>,
+    mut budget: Option<&mut JsonBudget>,
+) -> anyhow::Result<()> {
     use crate::matching::Emit;
 
-    let mut results = Vec::new();
+    #[derive(serde::Serialize)]
+    struct Row<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        file: &'a str,
+        line: usize,
+        content: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spans: Option<&'a [(usize, usize)]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        columns: Option<&'a [usize]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        offset: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        term: Option<usize>,
+    }
+
     found.for_each(match_opts, matcher, |emit| -> anyhow::Result<()> {
         match emit {
             Emit::Match {
@@ -2162,23 +2244,20 @@ fn collect_match_rows(
                     line_offset,
                     fixups,
                 );
-                let mut entry = serde_json::json!({
-                    "type": "match",
-                    "file": rel_path,
-                    "line": line_number,
-                    "content": content,
-                });
-                // The two arrays are what make a reply large; see `SearchOpts::detail`.
-                if detail {
-                    entry["spans"] =
-                        serde_json::json!(spans.iter().map(|&(s, e)| [s, e]).collect::<Vec<_>>());
-                    entry["columns"] = serde_json::json!(columns);
-                }
-                if positions {
-                    entry["offset"] = serde_json::json!(offset);
-                    entry["term"] = serde_json::json!(terminator_len);
-                }
-                results.push(entry);
+                push_row(
+                    results,
+                    Row {
+                        kind: "match",
+                        file: rel_path,
+                        line: line_number,
+                        content: &content,
+                        spans: detail.then_some(&spans),
+                        columns: detail.then_some(&columns),
+                        offset: positions.then_some(offset),
+                        term: positions.then_some(terminator_len),
+                    },
+                    &mut budget,
+                )?;
             }
             Emit::Context {
                 line_number,
@@ -2186,23 +2265,26 @@ fn collect_match_rows(
                 absolute_offset,
                 terminator_len,
             } => {
-                let mut entry = serde_json::json!({
-                    "type": "context",
-                    "file": rel_path,
-                    "line": line_number,
-                    "content": content,
-                });
-                if positions {
-                    entry["offset"] = serde_json::json!(fixups.to_source_offset(absolute_offset));
-                    entry["term"] = serde_json::json!(terminator_len);
-                }
-                results.push(entry);
+                push_row(
+                    results,
+                    Row {
+                        kind: "context",
+                        file: rel_path,
+                        line: line_number,
+                        content,
+                        spans: None,
+                        columns: None,
+                        offset: positions.then(|| fixups.to_source_offset(absolute_offset)),
+                        term: positions.then_some(terminator_len),
+                    },
+                    &mut budget,
+                )?;
             }
         }
         Ok(())
     })?;
 
-    Ok(results)
+    Ok(())
 }
 
 fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {

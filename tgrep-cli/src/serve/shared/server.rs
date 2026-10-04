@@ -89,6 +89,16 @@ struct Metrics {
     total_extractions: u64,
     build: BuildStats,
     restored: bool,
+    attempts: u64,
+    failures: u32,
+}
+
+fn retry_delay(failures: u32) -> Duration {
+    if failures == 0 {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs((1_u64 << failures.saturating_sub(1).min(5)).min(30))
+    }
 }
 
 type RpcJob = (TcpStream, Request);
@@ -223,7 +233,13 @@ pub fn run(root: &Path, options: Options<'_>) -> Result<()> {
                         })
                     }
                     Work::Reconcile(entry) => {
+                        let retry_ready = {
+                            let metrics = entry.metrics.lock().expect("metrics");
+                            metrics.failures == 0
+                                || metrics.last_attempt.elapsed() >= retry_delay(metrics.failures)
+                        };
                         if entry.active.load(Ordering::SeqCst)
+                            && retry_ready
                             && !entry.view.status().is_ok_and(|status| status.ready)
                             && let Err(error) = worker_state.reconcile(&entry)
                         {
@@ -259,16 +275,18 @@ pub fn run(root: &Path, options: Options<'_>) -> Result<()> {
                 thread::sleep(Duration::from_millis(100));
                 let entries = schedule_state.entries();
                 for entry in entries {
-                    let elapsed = entry
-                        .metrics
-                        .lock()
-                        .expect("metrics")
-                        .last_attempt
-                        .elapsed();
+                    let (elapsed, retry) = {
+                        let metrics = entry.metrics.lock().expect("metrics");
+                        (
+                            metrics.last_attempt.elapsed(),
+                            retry_delay(metrics.failures),
+                        )
+                    };
                     let ready = entry.view.status().is_ok_and(|status| status.ready);
-                    let periodic = !schedule_state.policy.no_watch
+                    let periodic = ready
+                        && !schedule_state.policy.no_watch
                         && elapsed >= schedule_state.policy.interval;
-                    if ((!ready && elapsed >= Duration::from_millis(200)) || periodic)
+                    if ((!ready && elapsed >= retry) || periodic)
                         && !entry.running.load(Ordering::SeqCst)
                         && !entry.queued.swap(true, Ordering::SeqCst)
                     {
@@ -384,13 +402,10 @@ fn respond(
         result["protocol"] = json!(PROTOCOL);
         result["instance"] = json!(state.registration.instance);
         result["repository"] = json!(state.registration.repository);
-        let response =
-            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":request.id,"result":result}))?;
-        ensure!(
-            response.len() < MAX_RESPONSE as usize,
-            "shared response exceeds 64 MiB; narrow the query or scan"
-        );
-        Ok(response)
+        bounded_response(
+            &json!({"jsonrpc":"2.0","id":request.id,"result":result}),
+            MAX_RESPONSE as usize - 1,
+        )
     }) {
         Ok(bytes) => {
             if let Err(error) = stream
@@ -402,6 +417,29 @@ fn respond(
         }
         Err(error) => send_error(&mut stream, request.id.clone(), &error),
     }
+}
+
+fn bounded_response(value: &Value, limit: usize) -> Result<Vec<u8>> {
+    struct Buffer {
+        bytes: Vec<u8>,
+        budget: crate::serve::JsonBudget,
+    }
+    impl Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.budget.write_all(bytes)?;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Buffer {
+        bytes: Vec::new(),
+        budget: crate::serve::JsonBudget { remaining: limit },
+    };
+    serde_json::to_writer(&mut buffer, value)?;
+    Ok(buffer.bytes)
 }
 
 #[derive(Deserialize)]
@@ -519,6 +557,7 @@ impl State {
     fn invalidate(&self, value: &Value) -> Result<()> {
         let params: LeaseParams = serde_json::from_value(value.clone())?;
         let entry = self.lease(&params)?;
+        entry.metrics.lock().expect("metrics").failures = 0;
         if params.full || params.changed.is_empty() {
             entry.view.invalidate_all()?;
         } else {
@@ -719,6 +758,8 @@ impl State {
                     total_extractions: 0,
                     build: ensured.stats.clone(),
                     restored,
+                    attempts: 0,
+                    failures: 0,
                 }),
                 queries: AtomicU64::new(0),
             });
@@ -778,6 +819,7 @@ impl State {
 
     fn reconcile(&self, entry: &Arc<Entry>) -> Result<u64> {
         entry.running.store(true, Ordering::SeqCst);
+        entry.metrics.lock().expect("metrics").attempts += 1;
         let result = (|| {
             self.watch(entry)?;
             let stats = entry.view.refresh()?;
@@ -794,6 +836,7 @@ impl State {
                 metrics.total_extractions += stats.files_extracted;
                 metrics.last = Some(stats);
                 metrics.error = None;
+                metrics.failures = 0;
                 metrics.last_success =
                     Some(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
                 Ok(epoch)
@@ -801,6 +844,7 @@ impl State {
             Err(error) => {
                 entry.view.invalidate_all()?;
                 metrics.error = Some(format!("{error:#}"));
+                metrics.failures = metrics.failures.saturating_add(1);
                 Err(error)
             }
         }
@@ -816,6 +860,8 @@ impl State {
             "pending_paths":status.pending_paths, "full_required":status.full_required,
             "queued":entry.queued.load(Ordering::SeqCst), "last_error":metrics.error,
             "reconcile_running":entry.running.load(Ordering::SeqCst),
+            "reconcile_attempts":metrics.attempts, "consecutive_failures":metrics.failures,
+            "retry_delay_ms":retry_delay(metrics.failures).as_millis(),
             "last_success":metrics.last_success, "leases":entry.leases.lock().expect("leases").len(),
             "watch_mode":if self.policy.no_watch {"disabled"} else if monitor.registry.is_some() {"native"} else {"poll"},
             "watch_fallback":monitor.fallback, "watch_count":monitor.registry.as_ref().map_or(0, |r| r.watched.len()),
@@ -852,7 +898,12 @@ impl State {
                     ensure!(params.query == json!({}), "status query must be empty");
                     return self.describe(&entry);
                 }
-                self.search(&entry, &params.query, request.method == "files")
+                self.search(
+                    &entry,
+                    &params.query,
+                    request.method == "files",
+                    &request.id,
+                )
             }
             _ => bail!("unknown shared RPC method"),
         }
@@ -1098,7 +1149,7 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
 }
 
 impl State {
-    fn search(&self, entry: &Entry, query: &Value, files: bool) -> Result<Value> {
+    fn search(&self, entry: &Entry, query: &Value, files: bool, id: &Value) -> Result<Value> {
         validate_query(query, files)?;
         let scope = crate::serve::SearchScope::parse(query).map_err(anyhow::Error::msg)?;
         let scoped_root = entry.view.root().join(&scope.prefix);
@@ -1109,17 +1160,27 @@ impl State {
             "scope crosses a repository boundary"
         );
         let start = Instant::now();
+        let metadata = json!({
+            "root":entry.view.root(), "view":entry.id, "generation":entry.view.generation().key(),
+            "ready":true, "hidden_complete":true, "backend":"shared-v1",
+            "protocol":PROTOCOL, "instance":self.registration.instance,
+            "repository":self.registration.repository
+        });
+        let mut budget = crate::serve::JsonBudget {
+            remaining: MAX_RESPONSE as usize - 1024,
+        };
+        budget.charge(&json!({"jsonrpc":"2.0","id":id,"result":metadata}))?;
         let mut result = if files {
-            let (paths, epoch) = entry.view.with_snapshot(|snapshot| {
-                (
-                    snapshot
-                        .files(&scope.prefix, scope.hidden)
-                        .into_iter()
-                        .filter(|path| scope.relative(path).is_some())
-                        .collect::<Vec<_>>(),
-                    snapshot.epoch(),
-                )
-            })?;
+            let (paths, epoch) = entry.view.with_snapshot(|snapshot| -> Result<_> {
+                let mut paths = Vec::new();
+                for path in snapshot.files(&scope.prefix, scope.hidden) {
+                    if scope.relative(&path).is_some() {
+                        budget.charge(&path)?;
+                        paths.push(path);
+                    }
+                }
+                Ok((paths, snapshot.epoch()))
+            })??;
             json!({"files":paths, "epoch":epoch})
         } else {
             let request = crate::serve::parse_search_params(query).map_err(anyhow::Error::msg)?;
@@ -1140,6 +1201,9 @@ impl State {
                     })
                 })
                 .collect();
+            let index_stats = json!({"query_plan":crate::search::plan_summary(&request.plan),
+                "raw_candidates":raw_count,"candidates":paths.len(),"total_files":total});
+            budget.charge(&index_stats)?;
             let mut rows = Vec::new();
             let mut stats = Vec::new();
             for relative in &paths {
@@ -1169,11 +1233,12 @@ impl State {
                     continue;
                 }
                 let decoded = crate::serve::DecodedFile::new(bytes, request.encoding);
-                let found = crate::serve::search_file_matches(
+                let found = crate::serve::search_file_matches_bounded(
                     relative,
                     &decoded,
                     &request.matcher,
                     &request.opts,
+                    Some(&mut budget),
                 )?;
                 rows.extend(found.rows);
                 stats.extend(found.stats);
@@ -1187,16 +1252,12 @@ impl State {
             json!({
                 "matches":rows, "file_stats":stats, "epoch":epoch,
                 "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
-                "index_stats":{"query_plan":crate::search::plan_summary(&request.plan),
-                    "raw_candidates":raw_count,"candidates":paths.len(),"total_files":total}
+                "index_stats":index_stats
             })
         };
-        result["root"] = json!(entry.view.root());
-        result["view"] = json!(entry.id);
-        result["generation"] = json!(entry.view.generation().key());
-        result["ready"] = json!(true);
-        result["hidden_complete"] = json!(true);
-        result["backend"] = json!("shared-v1");
+        for (key, value) in metadata.as_object().expect("metadata object") {
+            result[key] = value.clone();
+        }
         entry.queries.fetch_add(1, Ordering::SeqCst);
         Ok(result)
     }
@@ -1205,6 +1266,131 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_budgets_count_escaped_rows_paths_and_serialized_envelopes() {
+        let request = crate::serve::parse_search_params(&json!({
+            "pattern":"x", "detail":true, "positions":true, "stats":true,
+            "before_context":1, "after_context":1
+        }))
+        .unwrap();
+        let file = crate::serve::DecodedFile::new(
+            "context\t\\\"\nx x\u{1} \"\\\nlast context\n"
+                .repeat(20)
+                .into_bytes(),
+            request.encoding,
+        );
+        let path = "src/\"escaped\\path\t.rs";
+        let expected =
+            crate::serve::search_file_matches(path, &file, &request.matcher, &request.opts)
+                .unwrap();
+        let required = expected
+            .rows
+            .iter()
+            .map(|row| serde_json::to_vec(row).unwrap().len() + 1)
+            .sum::<usize>()
+            + serde_json::to_vec(expected.stats.as_ref().unwrap())
+                .unwrap()
+                .len()
+            + 1;
+        let mut budget = crate::serve::JsonBudget {
+            remaining: required,
+        };
+        let result = crate::serve::search_file_matches_bounded(
+            path,
+            &file,
+            &request.matcher,
+            &request.opts,
+            Some(&mut budget),
+        )
+        .unwrap();
+        assert_eq!(result.rows, expected.rows);
+        assert_eq!(budget.remaining, 0);
+        let mut short = crate::serve::JsonBudget {
+            remaining: required - 1,
+        };
+        assert!(
+            crate::serve::search_file_matches_bounded(
+                path,
+                &file,
+                &request.matcher,
+                &request.opts,
+                Some(&mut short)
+            )
+            .is_err()
+        );
+        let found = crate::matching::FileMatches::find(
+            &file.text,
+            &request.matcher,
+            &request.opts.match_options(),
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        let mut tiny = crate::serve::JsonBudget {
+            remaining: serde_json::to_vec(&expected.rows[0]).unwrap().len() + 1,
+        };
+        assert!(
+            crate::serve::collect_match_rows_bounded(
+                &found,
+                &request.opts.match_options(),
+                &request.matcher,
+                path,
+                &file.fixups,
+                true,
+                true,
+                &mut rows,
+                Some(&mut tiny)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "stop within one file rather than building every row first"
+        );
+
+        let paths = vec![path, "other/\ncontrol\u{1}.txt"];
+        let required = paths
+            .iter()
+            .map(|path| serde_json::to_vec(path).unwrap().len() + 1)
+            .sum();
+        let mut budget = crate::serve::JsonBudget {
+            remaining: required,
+        };
+        for path in &paths {
+            budget.charge(path).unwrap();
+        }
+        assert_eq!(budget.remaining, 0);
+        assert!(budget.charge(&"").is_err());
+        for value in [
+            json!({"files":paths}),
+            json!({"matches":expected.rows,"file_stats":expected.stats}),
+        ] {
+            let envelope = json!({"jsonrpc":"2.0","id":"\"\\\n","result":value});
+            let expected = serde_json::to_vec(&envelope).unwrap();
+            assert_eq!(
+                bounded_response(&envelope, expected.len()).unwrap(),
+                expected
+            );
+            assert!(bounded_response(&envelope, expected.len() - 1).is_err());
+        }
+    }
+
+    #[test]
+    fn failed_reconcile_backoff_is_capped_and_success_resets_it() {
+        assert_eq!(retry_delay(0), Duration::from_millis(200));
+        for (failures, seconds) in [
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (4, 8),
+            (5, 16),
+            (6, 30),
+            (u32::MAX, 30),
+        ] {
+            assert_eq!(retry_delay(failures), Duration::from_secs(seconds));
+        }
+    }
 
     #[test]
     fn native_overflow_and_unknown_notifications_require_full_repair() {

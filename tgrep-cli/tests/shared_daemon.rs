@@ -1674,6 +1674,155 @@ fn shared_limits_require_explicit_opt_in() {
     );
 }
 
+#[test]
+fn canonical_directory_hints_refresh_same_size_restored_mtime_edits() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    d.attach(&f.b, &f.revision);
+    let path = f.a.join("src/main.rs");
+    let mut previous = "shared_term";
+    for (hint, next) in [("src/", "ZXQJVPKBMWH"), ("src//./", "KZVXJQWBMPH")] {
+        let metadata = fs::metadata(&path).unwrap();
+        let updated = fs::read_to_string(&path).unwrap().replace(previous, next);
+        fs::write(&path, updated).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), metadata.len());
+        assert!(
+            d.search(&f.a, next)["matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let refreshed: Value = serde_json::from_str(&success(cli(
+            &f.a,
+            &[
+                "shared",
+                "refresh",
+                ".",
+                "--lease",
+                a["lease"].as_str().unwrap(),
+                "--changed",
+                hint,
+            ],
+        )))
+        .unwrap();
+        assert_eq!(refreshed["ready"], true);
+        assert_eq!(refreshed["last_reconcile"]["full"], false);
+        assert!(refreshed["processed_epoch"].as_u64().unwrap() >= a["epoch"].as_u64().unwrap());
+        assert!(
+            !d.search(&f.a, next)["matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            d.search(&f.b, next)["matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        previous = next;
+    }
+}
+
+#[test]
+fn persistent_reconcile_failures_back_off_without_blocking_explicit_repair() {
+    let f = Fixture::new();
+    let d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    d.attach(&f.b, &f.revision);
+    let key: tgrep_core::generations::GenerationKey =
+        serde_json::from_value(a["generation"].clone()).unwrap();
+    let root = fs::canonicalize(&f.a).unwrap();
+    let root_id = blake3::hash(root.to_str().unwrap().as_bytes())
+        .to_hex()
+        .to_string();
+    let checkpoint = f
+        .storage
+        .join("overlays")
+        .join(key.repository_identity())
+        .join(root_id)
+        .join(key.storage_name())
+        .join("overlay.json");
+    fs::remove_file(&checkpoint).unwrap();
+    fs::create_dir(&checkpoint).unwrap();
+    let before = d.lookup(&f.a)["reconcile_attempts"].as_u64().unwrap();
+    let failure = d
+        .try_rpc(
+            "refresh",
+            json!({"root":f.a,"view":a["view"],"lease":a["lease"],"full":true}),
+        )
+        .unwrap();
+    assert!(failure.get("error").is_some(), "{failure}");
+    let started = Instant::now();
+    let failed = loop {
+        let status = d.lookup(&f.a);
+        assert_eq!(status["ready"], false);
+        assert!(status["last_error"].is_string());
+        if status["consecutive_failures"].as_u64().unwrap() >= 2 {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "background retry never happened: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(failed["reconcile_attempts"], before + 2);
+    assert_eq!(failed["retry_delay_ms"], 2000);
+    let stable = Instant::now();
+    while stable.elapsed() < Duration::from_millis(600) {
+        let status = d.lookup(&f.a);
+        assert_eq!(
+            status["reconcile_attempts"], failed["reconcile_attempts"],
+            "{status}"
+        );
+        assert_eq!(d.search(&f.b, "shared_term")["backend"], "shared-v1");
+        thread::sleep(Duration::from_millis(30));
+    }
+    fs::remove_dir(&checkpoint).unwrap();
+    let repaired = d.refresh(&f.a, &a, &[], true);
+    assert_eq!(repaired["ready"], true);
+    assert_eq!(repaired["consecutive_failures"], 0);
+    assert_eq!(repaired["reconcile_attempts"], before + 3);
+    assert!(repaired["last_error"].is_null());
+    assert_eq!(repaired["retry_delay_ms"], 200);
+}
+
+#[test]
+fn oversized_single_file_response_errors_and_cli_scans_without_truncation() {
+    let f = Fixture::new();
+    fs::write(
+        f.a.join("oversized.txt"),
+        format!("oversize_marker{}\n", "\u{1}".repeat(12 * 1024 * 1024)),
+    )
+    .unwrap();
+    let d = f.start(&["--no-watch"]);
+    let a = d.attach(&f.a, &f.revision);
+    let response = d.try_rpc("search", json!({"root":f.a,"view":a["view"],"query":{"pattern":"oversize_marker","detail":true,"positions":true}})).unwrap();
+    assert!(response.get("result").is_none(), "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("response exceeds 64 MiB"),
+        "{response}"
+    );
+    let output = cli(&f.a, &["-c", "--", "oversize_marker", "."]);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("scanning filesystem"),
+        "{output:?}"
+    );
+    assert!(success(output).contains("oversized.txt:1"));
+    assert_eq!(d.search(&f.a, "shared_term")["backend"], "shared-v1");
+}
+
 #[cfg(unix)]
 #[test]
 fn dangling_view_marker_never_reenables_a_stale_ordinary_index() {

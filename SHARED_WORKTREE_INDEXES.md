@@ -603,7 +603,12 @@ index/reconcile worker and two separate query workers, so repairing A does not
 take a repository-global search lock or prevent ready B from searching. Work
 queue capacity is max_views; query queue is 16, incoming connection queue 32.
 Two routers enforce 1 MiB requests and timeouts. Responses over 64 MiB fail
-explicitly; there is no content cache. Mapped generations, path tables and private
+explicitly without truncation. An encoded-byte budget checks borrowed rows before
+allocating their JSON objects, counts filename/statistic/escaped-string overhead
+across files, and bounds final serialization. Existing per-file matching state
+and candidate/path tables remain proportional to the admitted input corpus;
+the response cap is not a total-process memory cap. There is no content cache.
+Mapped generations, path tables and private
 postings still scale with repository/overlay size, not with a fixed memory cap.
 Native directory registration and event filtering exclude the root's `.tgrep`
 storage directory, not eligible hidden directories such as `src/.tgrep`.
@@ -611,7 +616,11 @@ storage directory, not eligible hidden directories such as `src/.tgrep`.
 Callbacks immediately invalidate the appropriate view; hints are bounded and
 overflow/unknown events request full repair. Registration precedes initial
 reconciliation. A failed or concurrently invalidated pass stays not ready and
-retries; no base-only window exists. Both auto and poll modes perform full
+retries; no base-only window exists. Consecutive failures use completion-based
+exponential retry delays of 1, 2, 4, 8, 16 then 30 seconds; success or explicit
+refresh resets the delay. Explicit refresh does not wait for the retry deadline.
+Status exposes `reconcile_attempts`, `consecutive_failures`, `retry_delay_ms` and
+the retained `last_error`. Both auto and poll modes perform full
 verification every `--poll-interval` seconds after completion (default 120), also
 repairing missed bytes, ignores and external Git/global configuration changes.
 Native notifications allow earlier incremental repair. `--no-watch` disables

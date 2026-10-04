@@ -704,6 +704,10 @@ automatic modes after initial reconciliation, leaving refresh to the runtime.
 `refresh --changed` returns `processed_epoch`; this acknowledges those changes,
 not an atomic filesystem snapshot. `refresh --full` also detects missed
 same-size/restored-mtime changes and Git/ignore configuration changes.
+Persistent reconciliation failures retain not-ready/last-error status and retry
+with completion-based exponential delays from 1 to 30 seconds. Explicit refresh
+bypasses and resets this backoff; a successful repair resets it too. Status includes
+attempt counts, consecutive failures and the current retry delay.
 Native registration and event filtering include searchable nested `.tgrep`
 directories; only the root `.tgrep` storage directory is excluded.
 
@@ -713,7 +717,9 @@ The daemon bounds views (default 32, `--shared-max-views`), leases (256,
 the configured maximum views; unused shares are not borrowed. There is one
 index/reconcile worker, two independent query workers, bounded connection and
 work queues, 1 MiB requests and 64 MiB responses. There is no content cache.
-Large queries exceeding the response limit fail explicitly and CLI queries scan;
+The response limit is enforced while producing individual match/context rows,
+file paths and statistics, including JSON escaping and envelope overhead, and
+again during final serialization. Large queries fail explicitly and CLI queries scan;
 generation mappings and private posting memory still scale with admitted data.
 
 Storage must already exist, be trusted and outside **all** registered worktrees,

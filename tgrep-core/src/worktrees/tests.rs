@@ -786,6 +786,95 @@ fn actual_bytes_not_discovery_size_decide_size_and_binary_classification() {
 }
 
 #[test]
+fn directory_link_swap_after_discovery_keeps_the_view_not_ready() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "dir/file.txt", b"inside needle");
+    commit(&fixture.root);
+    let outside = fixture._temp.path().join("outside");
+    write(&outside, "file.txt", b"outside secret");
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let published = view.status().unwrap().published_epoch;
+    let result = view.refresh_inner(
+        || {
+            fs::rename(fixture.root.join("dir"), fixture.root.join("saved")).unwrap();
+            crate::rooted::tests::link_directory(&outside, &fixture.root.join("dir"));
+        },
+        || {},
+    );
+    assert!(matches!(result, Err(WorktreeError::Io(_))));
+    let status = view.status().unwrap();
+    assert!(!status.ready);
+    assert!(status.full_required);
+    assert_eq!(status.published_epoch, published);
+    assert!(matches!(
+        view.with_snapshot(|_| ()),
+        Err(WorktreeError::NotReady)
+    ));
+    view.refresh().unwrap();
+    assert!(candidates(&view, "outside secret").is_empty());
+    assert_eq!(matches(&view, "inside needle"), ["saved/file.txt"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn root_replacement_before_publication_keeps_the_view_not_ready() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"inside needle");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let result = view.refresh_inner(
+        || {},
+        || {
+            fs::rename(&fixture.root, fixture._temp.path().join("saved")).unwrap();
+            fs::create_dir(&fixture.root).unwrap();
+            write(&fixture.root, "file.txt", b"outside secret");
+        },
+    );
+    assert!(matches!(result, Err(WorktreeError::Io(_))));
+    assert!(!view.status().unwrap().ready);
+    assert!(matches!(
+        view.with_snapshot(|_| ()),
+        Err(WorktreeError::NotReady)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_swap_after_discovery_is_bounded_and_keeps_the_view_not_ready() {
+    if !crate::rooted::tests::bounded_child(
+        "worktrees::tests::fifo_swap_after_discovery_is_bounded_and_keeps_the_view_not_ready",
+    ) {
+        return;
+    }
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"inside needle");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let path = fixture.root.join("file.txt");
+    let result = view.refresh_inner(
+        || {
+            fs::remove_file(&path).unwrap();
+            crate::rooted::tests::make_fifo(&path);
+        },
+        || {},
+    );
+    assert!(matches!(result, Err(WorktreeError::Io(_))));
+    assert!(!view.status().unwrap().ready);
+    assert!(view.status().unwrap().full_required);
+    assert!(matches!(
+        view.with_snapshot(|_| ()),
+        Err(WorktreeError::NotReady)
+    ));
+    fs::remove_file(&path).unwrap();
+    write(&fixture.root, "file.txt", b"repaired needle");
+    view.refresh().unwrap();
+    assert_eq!(matches(&view, "repaired"), ["file.txt"]);
+}
+
+#[test]
 fn restored_checkpoints_revalidate_contents_membership_and_exact_generation() {
     let fixture = Fixture::new();
     write(&fixture.root, "file.txt", b"base needle");
@@ -1018,6 +1107,55 @@ fn accepted_hint_spellings_have_one_canonical_queue_entry() {
         assert!(view.status().unwrap().full_required);
         assert!(!view.status().unwrap().ready);
     }
+}
+
+#[test]
+fn hint_lookup_work_depends_on_path_depth_not_queue_size() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "dir/nested/one.txt", b"old needle");
+    write(&fixture.root, "directory/other.txt", b"unaffected");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    assert_eq!(view.refresh().unwrap().hint_lookups, 0);
+    let path = fixture.root.join("dir/nested/one.txt");
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, b"new needle").unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    for index in 0..2000 {
+        view.invalidate_path(Path::new(&format!("unrelated-{index}/file")))
+            .unwrap();
+    }
+    view.invalidate_path(Path::new("DIR//.")).unwrap();
+    let stats = view.refresh().unwrap();
+    assert!(!stats.full);
+    assert_eq!(
+        stats.hint_lookups, 5,
+        "three prefixes plus two, independent of 2001 hints"
+    );
+    assert_eq!(stats.files_read, 1);
+    assert_eq!(
+        stats.content_reads_avoided, 1,
+        "dir must not match directory"
+    );
+    assert_eq!(stats.files_extracted, 1);
+    assert_eq!(matches(&view, "new needle"), ["dir/nested/one.txt"]);
+
+    view.invalidate_path(Path::new("dir/nested/one.txt"))
+        .unwrap();
+    let stats = view.refresh().unwrap();
+    assert_eq!(stats.hint_lookups, 3, "exact matches stop at the full path");
+    assert_eq!(stats.files_read, 1);
+    assert_eq!(stats.files_extracted, 0);
+    view.invalidate_path(Path::new("\u{00e9}")).unwrap();
+    let stats = view.refresh().unwrap();
+    assert!(stats.full);
+    assert_eq!(stats.hint_lookups, 0);
+    assert_eq!(stats.files_read, 2);
 }
 
 #[cfg(unix)]

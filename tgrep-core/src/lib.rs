@@ -13,6 +13,7 @@ pub(crate) mod ondisk;
 pub mod path_index;
 pub mod query;
 pub mod reader;
+pub mod rooted;
 pub mod shared;
 pub mod trigram;
 pub mod visibility;

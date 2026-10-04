@@ -366,7 +366,7 @@ no mutable base/flush handle is exposed and no base migration occurs.
 | `with_snapshot(closure)` | Guarded query-only view with root/epoch/visibility and resolved candidate paths or complete filename membership |
 | `save_checkpoint()` | Ready-only, delta-only atomic `overlay.json`, including exact generation key/root/base binding |
 | `restore(root, pin, options)` | Explicit errors for missing/invalid/mismatched checkpoints; successful restore remains not ready |
-| `ReconcileStats` | Actual content reads/bytes/decodes/extractions, base/overlay reuse, copied base files/postings and reads avoided |
+| `ReconcileStats` | Actual content reads/bytes/decodes/extractions, base/overlay reuse, copied base files/postings, reads avoided and `hint_lookups` ordered-set probes |
 
 The agent runtime subscribes **after construction and before initial refresh**,
 then forwards native/polling/no-watch inputs through these same invalidations.
@@ -382,6 +382,16 @@ Native directory/file names are validated before converting metadata-walk paths
 or recording visibility. Non-Unicode names and literal Unix backslashes produce
 discovery errors instead of aliasing valid or ignored paths; ordinary native-path
 full scans remain the fallback.
+Reconciliation holds a stable root directory handle. The extracted
+`tgrep_core::rooted::RootedDir` helper (`open`, relative `open_file`, `verify_root`)
+is also used by ordinary serving. Unix descends with component-relative
+`openat`, `O_NOFOLLOW` and `O_NONBLOCK`, then verifies the final handle is regular.
+Windows holds ancestor handles without delete sharing, rejects reparse
+points and validates the final handle's containment and actual parent before
+reading. File version and identity are rechecked through rooted handles; a root identity change also
+prevents publication. Errors leave readiness closed, including directory/link
+swaps and regular-file/FIFO swaps. Windows keeps the root guard until view drop;
+agent runtimes must release registrations before removing worktrees.
 Each reconciliation advances the epoch, including no-hint full repairs, so
 successful publication acknowledges earlier invalidation tokens with an equal
 or later epoch.
@@ -411,6 +421,12 @@ reverify; non-ASCII hints and capacity overflow require full verification.
 Accepted hints are rebuilt from normal path components, so trailing/repeated
 separators and interior `.` spellings cannot lose subtree invalidations. Absolute,
 parent-component and leading `.` component hints still error and require full repair.
+Hint matching probes a `BTreeSet` for the normalized full path and ancestor
+prefixes, rather than scanning every hint for every file. `hint_lookups` counts
+these probes (at most path depth per file, each logarithmic in queue size);
+the regression uses 2,001 pending hints but only five probes for two files.
+Hinted passes still open eligible regular-file handles for safe metadata
+verification even when content reads are avoided.
 Same-size/restored-mtime edits without notifications are repaired by forced
 full checks, not promised by hints. Successful refresh acknowledges processed
 inputs, not an atomic filesystem snapshot. Final matching reads the requesting

@@ -19,6 +19,7 @@ use crate::hybrid::HybridIndex;
 use crate::live::LiveIndex;
 use crate::meta::{ContentId, FileVersion, file_version};
 use crate::query::QueryPlan;
+use crate::rooted::RootedDir;
 use crate::trigram::TrigramMaskMap;
 use crate::visibility::PathVisibility;
 use crate::walker::{self, MetaWalkOptions};
@@ -135,6 +136,9 @@ pub struct ReconcileStats {
     pub overlay_reused: u64,
     /// Prior verified content retained during an event-driven hint pass.
     pub content_reads_avoided: u64,
+    /// Ordered-set probes for hinted paths/ancestors, bounded by path depth
+    /// rather than the number of pending hints. Full passes make no probes.
+    pub hint_lookups: u64,
 }
 
 struct Control {
@@ -176,6 +180,7 @@ struct State {
 /// repository, or another clone). No mutable index/flush API is exposed.
 pub struct WorktreeView {
     root: PathBuf,
+    files: RootedDir,
     repository: Repository,
     generation: Arc<Generation>,
     options: WorktreeOptions,
@@ -220,8 +225,10 @@ impl WorktreeView {
             options.walk.exclude_paths.push(directory.clone());
         }
         let index = generation.base().create_worktree(&root)?;
+        let files = RootedDir::open(&root)?;
         Ok(Self {
             root,
+            files,
             repository,
             generation,
             options,
@@ -357,6 +364,7 @@ impl WorktreeView {
         };
         let prepared = self.prepare(full, &hints, after_discovery)?;
         before_publish();
+        self.files.verify_root()?;
         let mut control = self
             .control
             .lock()
@@ -429,6 +437,7 @@ impl WorktreeView {
         hints: &BTreeSet<String>,
         after_discovery: impl FnOnce(),
     ) -> Result<Prepared> {
+        self.files.verify_root()?;
         let repository = Repository::discover(&self.root)?;
         if fs::canonicalize(&self.root)? != self.root
             || repository != self.repository
@@ -471,22 +480,13 @@ impl WorktreeView {
         let mut copies: HashMap<u32, Vec<String>> = HashMap::new();
         for path in walk.listed_files {
             relative_path(Path::new(&path))?;
-            let absolute = self.root.join(&path);
-            let metadata = fs::symlink_metadata(&absolute)?;
-            if !metadata.is_file() {
-                return Err(WorktreeError::UnstableFile(absolute));
-            }
+            let file = self.files.open_file(Path::new(&path))?;
+            let metadata = file.metadata()?;
             let version = file_version(&metadata);
             let previous = state.evidence.get(&path);
             // Case aliases must not lose notifications on case-insensitive
             // filesystems. Extra verification on case-sensitive trees is safe.
-            let hint_path = path.to_ascii_lowercase();
-            let hinted = hints.iter().any(|hint| {
-                hint_path == *hint
-                    || hint_path
-                        .strip_prefix(hint)
-                        .is_some_and(|tail| tail.starts_with('/'))
-            });
+            let hinted = !full && is_hinted(&path, hints, &mut prepared.stats.hint_lookups);
             let evidence = if !full
                 && !hinted
                 && version.is_trusted()
@@ -495,8 +495,12 @@ impl WorktreeView {
                 prepared.stats.content_reads_avoided += 1;
                 previous.expect("verified previous entry").clone()
             } else {
-                let (bytes, version) =
-                    read_file(&self.root, &absolute, self.options.walk.max_file_size)?;
+                let (bytes, version) = read_file(
+                    &self.files,
+                    Path::new(&path),
+                    file,
+                    self.options.walk.max_file_size,
+                )?;
                 prepared.stats.files_read += 1;
                 prepared.stats.bytes_read += bytes.len() as u64;
                 let listed = self
@@ -810,38 +814,40 @@ fn validate_checkpoint_directory(
     Ok(())
 }
 
-fn read_file(root: &Path, path: &Path, limit: Option<u64>) -> Result<(Vec<u8>, FileVersion)> {
-    // Do not follow a directory or file changed into a link since discovery.
-    let mut ancestor = path.parent();
-    while let Some(directory) = ancestor {
-        let metadata = fs::symlink_metadata(directory)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(WorktreeError::UnstableFile(path.into()));
-        }
-        if directory == root {
-            break;
-        }
-        ancestor = directory.parent();
+fn is_hinted(path: &str, hints: &BTreeSet<String>, lookups: &mut u64) -> bool {
+    if hints.is_empty() {
+        return false;
     }
-    let before = fs::symlink_metadata(path)?;
-    if !before.is_file() || before.file_type().is_symlink() {
-        return Err(WorktreeError::UnstableFile(path.into()));
+    let path = path.to_ascii_lowercase();
+    let mut prefix = path.as_str();
+    loop {
+        *lookups += 1;
+        if hints.contains(prefix) {
+            return true;
+        }
+        let Some((parent, _)) = prefix.rsplit_once('/') else {
+            return false;
+        };
+        prefix = parent;
     }
-    let mut file = File::open(path)?;
+}
+
+fn read_file(
+    root: &RootedDir,
+    path: &Path,
+    mut file: File,
+    limit: Option<u64>,
+) -> Result<(Vec<u8>, FileVersion)> {
     let opened = file.metadata()?;
     let version = file_version(&opened);
-    if file_version(&before) != version {
-        return Err(WorktreeError::UnstableFile(path.into()));
-    }
     let mut bytes = Vec::new();
     (&mut file)
         .take(limit.map_or(u64::MAX, |limit| limit.saturating_add(1)))
         .read_to_end(&mut bytes)?;
-    let after = fs::symlink_metadata(path)?;
-    if !after.is_file()
-        || after.file_type().is_symlink()
-        || version != file_version(&file.metadata()?)
-        || version != file_version(&after)
+    let current = root.open_file(path)?;
+    if version != file_version(&file.metadata()?)
+        || version != file_version(&current.metadata()?)
+        || same_file::Handle::from_file(file)? != same_file::Handle::from_file(current)?
         || (limit.is_none_or(|limit| bytes.len() as u64 <= limit)
             && bytes.len() as u64 != opened.len())
     {

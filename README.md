@@ -752,6 +752,15 @@ retry or scan. There is one attempt per call, never an unbounded churn loop.
 Every reconciliation advances the epoch, including refreshes without hints;
 the published epoch acknowledges all earlier invalidation tokens.
 Discovery/read errors likewise leave the view unavailable and force full retry.
+Reconciliation pins a root directory handle and opens only regular files:
+Unix uses component-relative no-follow, nonblocking opens; Windows guards
+ancestor handles against replacement and checks resolved handle
+containment before reading. Detected root identity changes and read-path
+swaps leave the view not-ready. Windows retains the root guard until view drop, so
+an agent runtime should release registrations before removing a worktree.
+The shared helper is `tgrep_core::rooted::RootedDir`
+(`open`, `open_file` with a relative path, and `verify_root`); ordinary serving
+uses it too. It does not provide immutable content or a filesystem snapshot.
 Metadata discovery rejects unrepresentable native names before conversion:
 non-Unicode paths and literal Unix backslashes cannot alias other indexed paths.
 Ordinary full scans retain native paths and remain available as the fallback.
@@ -770,6 +779,11 @@ unaffected, previously verified files under the event-driven freshness contract,
 but still performs a metadata/membership walk. `ReconcileStats` separates
 reads/bytes/decodes, actual extraction calls, base and overlay reuse, copied
 files/postings, and content reads avoided.
+`hint_lookups` counts ordered-set probes: each file checks its normalized path
+and ancestor prefixes, at most one probe per component rather than a scan of
+all queued hints. Each probe is logarithmic in the hint count. Even a hinted
+pass opens eligible file handles to verify regular-file metadata safely;
+avoided content reads do not mean zero filesystem I/O.
 
 **Raw LF bases versus CRLF/smudge checkouts can require an all-file overlay**,
 even for equal committed trees and clean Git status. Position and next-byte

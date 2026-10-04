@@ -555,30 +555,47 @@ impl State {
                 ensure!(leases.contains_key(&params.lease), "lease already released");
                 let remaining = leases.len() - 1;
                 drop(leases);
+                let mut registration_warning = None;
                 if remaining == 0 {
-                    let marker = entry
-                        .view
-                        .repository()
-                        .git_dir()
-                        .join(super::protocol::VIEW_MARKER);
-                    if marker.try_exists()? {
-                        let registered: ViewRegistration =
-                            serde_json::from_reader(File::open(&marker)?)?;
-                        if registered.daemon.instance == self.registration.instance
-                            && registered.view == entry.id
-                        {
-                            fs::remove_file(marker)?;
-                        }
+                    if let Err(error) = self.remove_view_marker(&entry) {
+                        let warning = format!("shared view registration cleanup failed: {error:#}");
+                        eprintln!("{warning}");
+                        registration_warning = Some(warning);
                     }
                     entry.active.store(false, Ordering::SeqCst);
                     entry.monitor.lock().expect("monitor").registry = None;
                     self.views.lock().expect("views").remove(entry.view.root());
                 }
                 entry.leases.lock().expect("leases").remove(&params.lease);
-                Ok(json!({"remaining_leases":remaining, "view":entry.id, "detached":true}))
+                Ok(
+                    json!({"remaining_leases":remaining, "view":entry.id, "detached":true,
+                    "registration_warning":registration_warning}),
+                )
             }
             _ => bail!("unknown shared lifecycle method"),
         }
+    }
+
+    fn remove_view_marker(&self, entry: &Entry) -> Result<()> {
+        let marker = entry
+            .view
+            .repository()
+            .git_dir()
+            .join(super::protocol::VIEW_MARKER);
+        let file = match File::open(&marker) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let registered: ViewRegistration = serde_json::from_reader(file.take(MAX_REQUEST))?;
+        if registered.daemon.instance == self.registration.instance && registered.view == entry.id {
+            match fs::remove_file(marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     fn attach(&self, params: AttachParams) -> Result<Value> {
@@ -936,7 +953,8 @@ fn watch_directories(root: &Path, storage: &Path, budget: usize) -> Result<HashS
             let child = child?;
             if child.file_type()?.is_dir() {
                 let path = child.path();
-                if matches!(child.file_name().to_str(), Some(".git" | ".tgrep"))
+                if child.file_name() == ".git"
+                    || path == root.join(".tgrep")
                     || path.starts_with(storage)
                 {
                     continue;
@@ -966,10 +984,8 @@ fn invalidate_event(entry: &Entry, event: &Event) -> Result<()> {
         // A linked worktree's ordinary gitfile is searchable, not a directory
         // containing our registration/checkpoint metadata.
         let gitfile = relative == Path::new(".git") && !path.is_dir();
-        if !gitfile
-            && relative
-                .components()
-                .any(|part| part.as_os_str() == ".git" || part.as_os_str() == ".tgrep")
+        if relative.starts_with(".tgrep")
+            || (!gitfile && relative.components().any(|part| part.as_os_str() == ".git"))
         {
             continue;
         }

@@ -1443,3 +1443,123 @@ fn attached_queries_run_one_client_discovery_and_no_server_git_processes() {
         "{response}"
     );
 }
+
+#[test]
+fn final_detach_releases_budgets_despite_corrupt_or_missing_marker() {
+    let f = Fixture::new();
+    let d = f.start(&[
+        "--no-watch",
+        "--shared-max-views",
+        "1",
+        "--shared-max-leases",
+        "1",
+    ]);
+    for removed in [false, true] {
+        let a = d.attach(&f.a, &f.revision);
+        let marker = f.a.join(".git/tgrep-view-v1.json");
+        if removed {
+            fs::remove_file(&marker).unwrap();
+        } else {
+            fs::write(&marker, "{invalid").unwrap();
+        }
+        let detached: Value = serde_json::from_str(&success(cli(
+            &f.a,
+            &[
+                "shared",
+                "detach",
+                ".",
+                "--lease",
+                a["lease"].as_str().unwrap(),
+            ],
+        )))
+        .unwrap();
+        assert_eq!(detached["detached"], true);
+        assert_eq!(detached["remaining_leases"], 0);
+        if removed {
+            assert!(detached["registration_warning"].is_null());
+        } else {
+            assert!(
+                detached["registration_warning"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cleanup failed")
+            );
+            assert_eq!(fs::read_to_string(&marker).unwrap(), "{invalid");
+        }
+        assert!(
+            d.try_rpc("lookup", json!({"root":f.a}))
+                .unwrap()
+                .get("error")
+                .is_some()
+        );
+        let b = d.attach(&f.b, &f.revision);
+        d.rpc(
+            "detach",
+            json!({"root":f.b,"view":b["view"],"lease":b["lease"]}),
+        );
+    }
+}
+
+#[test]
+fn native_watching_includes_searchable_nested_tgrep_directories() {
+    let f = Fixture::new();
+    fs::create_dir(f.a.join(".tgrep")).unwrap();
+    fs::write(f.a.join(".tgrep/excluded.txt"), "excluded_storage_marker\n").unwrap();
+    fs::create_dir(f.a.join("src/.tgrep")).unwrap();
+    fs::write(
+        f.a.join("src/.tgrep/private.txt"),
+        "old_nested_hidden_marker\n",
+    )
+    .unwrap();
+    let d = f.start(&[
+        "--watch-mode",
+        "auto",
+        "--poll-interval",
+        "60",
+        "--shared-max-views",
+        "1",
+    ]);
+    let a = d.attach(&f.a, &f.revision);
+    let before = d.ready(&f.a);
+    assert_eq!(before["watch_mode"], "native", "{before}");
+    assert_eq!(before["watch_count"], 3, "{before}");
+    let files = d.rpc(
+        "files",
+        json!({"root":f.a,"view":a["view"],"query":{"hidden":true}}),
+    );
+    assert!(
+        files["files"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("src/.tgrep/private.txt"))
+    );
+    assert!(
+        !files["files"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(".tgrep/excluded.txt"))
+    );
+    fs::write(
+        f.a.join("src/.tgrep/private.txt"),
+        "new_nested_hidden_marker\n",
+    )
+    .unwrap();
+    let started = Instant::now();
+    loop {
+        let status = d.lookup(&f.a);
+        if status["ready"] == true
+            && status["published_epoch"].as_u64() > before["published_epoch"].as_u64()
+        {
+            let result = d.rpc("search", json!({"root":f.a,"view":a["view"],"query":{"pattern":"new_nested_hidden_marker","hidden":true}}));
+            if !result["matches"].as_array().unwrap().is_empty() {
+                assert_eq!(result["backend"], "shared-v1");
+                break;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "nested .tgrep native event was ignored: {status}"
+        );
+        thread::sleep(Duration::from_millis(40));
+    }
+}

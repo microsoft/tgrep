@@ -530,7 +530,7 @@ user environment are trusted.
 | `lookup` | `root` | Current view descriptor and status; does not create a lease |
 | `status` | `root`, `view`, `query: {}` | Readiness, pending/full flags, epoch, last error/success, watcher mode, sharing/extraction counters |
 | `refresh` | `root`, `view`, `lease`, `changed: []`, `full: false` | Descriptor plus `processed_epoch`; no hints means full verification |
-| `detach` | `root`, `view`, `lease` | `remaining_leases`, `detached`, `view` |
+| `detach` | `root`, `view`, `lease` | `remaining_leases`, `detached`, `view`, nullable `registration_warning` |
 | `files` | `root`, `view`, `query: {scope, hidden, max_depth}` | Root-relative `files`, `epoch`, `ready`, `generation`, `backend: "shared-v1"` |
 | `search` | `root`, `view`, `query` | Root-relative match/context rows, `file_stats`, `index_stats`, `epoch`, same view/base/backend fields |
 
@@ -545,6 +545,10 @@ another root/revision is an error. Distinct callers use distinct tokens.
 response; the CLI does that lookup automatically. Tokens are scoped to the
 daemon instance, are not authentication credentials, and are forgotten on detach
 or restart. After restart, explicitly attach again with fresh tokens.
+Final detach always releases the view/lease even if registration cleanup fails;
+it reports the failure in `registration_warning` and daemon stderr. Missing
+markers are harmless. Corrupt or foreign markers are not removed without
+matching instance/view identity, so their continued presence selects safe fallback.
 CLI `--lease` is optional for interactive convenience: if omitted, a generated
 token is printed on stderr before transmission and must be captured and supplied
 on retry. Runtime integrations should always supply their own token.
@@ -596,6 +600,8 @@ queue capacity is max_views; query queue is 16, incoming connection queue 32.
 Two routers enforce 1 MiB requests and timeouts. Responses over 64 MiB fail
 explicitly; there is no content cache. Mapped generations, path tables and private
 postings still scale with repository/overlay size, not with a fixed memory cap.
+Native directory registration and event filtering exclude the root's `.tgrep`
+storage directory, not eligible hidden directories such as `src/.tgrep`.
 
 Callbacks immediately invalidate the appropriate view; hints are bounded and
 overflow/unknown events request full repair. Registration precedes initial

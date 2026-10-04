@@ -1124,7 +1124,9 @@ fn scheduled_poll_rechecks_busy_state_before_claiming_catch_up() {
 #[test]
 fn polling_startup_preserves_a_previous_failed_attempt_and_its_retry_cadence() {
     let temp = TempDir::new().unwrap();
-    let root = temp.path().join("missing");
+    let root = temp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join(".ignore"), "[z-a]\n").unwrap();
     let index_dir = temp.path().join("index");
     let mut state = test_server_state(&root, &index_dir);
     Arc::get_mut(&mut state).unwrap().refresh =

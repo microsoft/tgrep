@@ -263,14 +263,46 @@ fn exact_base_sharing_leases_and_revision_pins() {
     assert_eq!(a["attach_build"]["blobs_extracted"], 3);
     assert_eq!(b["attach_build"]["blobs_extracted"], 0);
     assert_eq!(b["attach_build"]["reused_generation"], true);
-    for root in [&f.a, &f.b] {
+    for (root, gitfiles) in [(&f.a, 0), (&f.b, 1)] {
         let status = d.lookup(root);
         assert_eq!(status["base_sharing_views"], 2);
-        assert_eq!(status["last_reconcile"]["files_read"], 3);
-        assert_eq!(status["last_reconcile"]["files_decoded"], 3);
-        assert_eq!(status["last_reconcile"]["files_extracted"], 0);
+        assert_eq!(status["last_reconcile"]["files_read"], 3 + gitfiles);
+        assert_eq!(status["last_reconcile"]["files_decoded"], 3 + gitfiles);
+        assert_eq!(status["last_reconcile"]["files_extracted"], gitfiles);
         assert_eq!(status["last_reconcile"]["base_reused"], 3);
     }
+    let hidden = d.rpc(
+        "files",
+        json!({"root":f.b,"view":b["view"],"query":{"hidden":true}}),
+    );
+    assert!(
+        hidden["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == ".git")
+    );
+    assert_eq!(
+        success(cli(&f.b, &["--files", "--hidden", "--sort", "path", "."])),
+        success(cli(
+            &f.b,
+            &["--files", "--hidden", "--no-index", "--sort", "path", "."]
+        ))
+    );
+    let gitfile = d.rpc(
+        "search",
+        json!({"root":f.b,"view":b["view"],"query":{"pattern":"gitdir:","hidden":true}}),
+    );
+    assert!(
+        gitfile["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["file"] == ".git")
+    );
+    let noop = d.refresh(&f.b, &b, &[], true);
+    assert_eq!(noop["last_reconcile"]["files_extracted"], 0);
+    assert_eq!(noop["last_reconcile"]["overlay_reused"], 1);
     let duplicate = d.attach(&f.a, &f.revision);
     assert_eq!(a["view"], duplicate["view"]);
     assert_ne!(a["lease"], duplicate["lease"]);
@@ -739,6 +771,24 @@ fn polling_and_native_events_reconcile_without_queries() {
         let initial = d.lookup(&f.a);
         if options.contains(&"60") {
             assert_eq!(initial["watch_mode"], "native", "{initial}");
+            d.attach(&f.b, &f.revision);
+            let before = d.ready(&f.b);
+            let gitfile = f.b.join(".git");
+            fs::write(&gitfile, fs::read(&gitfile).unwrap()).unwrap();
+            let started = Instant::now();
+            loop {
+                let status = d.lookup(&f.b);
+                if status["ready"] == true
+                    && status["published_epoch"].as_u64() > before["published_epoch"].as_u64()
+                {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(15),
+                    "gitfile event was ignored: {status}"
+                );
+                thread::sleep(Duration::from_millis(40));
+            }
         } else {
             assert_eq!(initial["watch_mode"], "poll");
         }
@@ -807,10 +857,11 @@ fn crlf_transform_and_sparse_membership_are_honest() {
     let d = f.start(&["--no-watch"]);
     let lease = d.attach(&c, &rev);
     let status = d.lookup(&c);
-    assert_eq!(status["last_reconcile"]["files_extracted"], 4, "{status}");
+    // Four CRLF transformations plus the ordinary linked-worktree .git file.
+    assert_eq!(status["last_reconcile"]["files_extracted"], 5, "{status}");
     let noop = d.refresh(&c, &lease, &[], true);
     assert_eq!(noop["last_reconcile"]["files_extracted"], 0);
-    assert_eq!(noop["last_reconcile"]["overlay_reused"], 4);
+    assert_eq!(noop["last_reconcile"]["overlay_reused"], 5);
     git(&c, &["sparse-checkout", "set", "--no-cone", "src/"]);
     d.refresh(&c, &lease, &[], true);
     assert!(!c.join("one.txt").exists());

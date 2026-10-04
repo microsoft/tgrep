@@ -710,10 +710,14 @@ errors, not base-only results. Published generations/checkpoints are retained:
 there is **no online GC**, automatic migration, or checkpoint eviction.
 
 Sharing avoids repeated trigram extraction, not all content reads. Tests measure
-three identical files as three reads/decodes and **zero** overlay extractions;
-four CRLF-transformed files need **four** private extractions on first
-reconciliation and zero on a no-op verification. Smudge/encoding transformations
-may similarly require full overlays. See the [wire contract and design](SHARED_WORKTREE_INDEXES.md#daemon-wire-contract-v1)
+three identical **tracked** files as three reads/decodes and **zero** private
+extractions. A linked worktree additionally reads/decodes and extracts its ordinary
+`.git` pointer file once, for totals of four reads and one private extraction;
+that file participates in `--hidden` searches and filename listings, unlike a
+real `.git` metadata directory. Four CRLF-transformed files need **four** private
+extractions, plus one for a linked worktree's gitfile (five total). Full no-op
+verification reuses those overlays with zero new extractions. Smudge/encoding
+transformations may similarly require full overlays. See the [wire contract and design](SHARED_WORKTREE_INDEXES.md#daemon-wire-contract-v1)
 for generic runtime integration.
 
 ### Shared worktree core APIs

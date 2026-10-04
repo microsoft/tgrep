@@ -895,9 +895,13 @@ fn invalidate_event(entry: &Entry, event: &Event) -> Result<()> {
             continue;
         };
         // Our own metadata publication must not create an endless repair loop.
-        if relative
-            .components()
-            .any(|part| part.as_os_str() == ".git" || part.as_os_str() == ".tgrep")
+        // A linked worktree's ordinary gitfile is searchable, not a directory
+        // containing our registration/checkpoint metadata.
+        let gitfile = relative == Path::new(".git") && !path.is_dir();
+        if !gitfile
+            && relative
+                .components()
+                .any(|part| part.as_os_str() == ".git" || part.as_os_str() == ".tgrep")
         {
             continue;
         }

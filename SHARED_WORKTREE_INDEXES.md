@@ -584,9 +584,13 @@ Native notifications allow earlier incremental repair. `--no-watch` disables
 both periodic and native refresh, not initial reconciliation or explicit runtime
 refresh. Neither ready nor a processed epoch promises the newest possible bytes.
 
-Integration tests measure three unchanged files as 3 reads/decodes, 0 private
-extractions, and the same `Arc<SharedBase>` in both views. Four CRLF-transformed
-paths require 4 private extractions initially and 0 on no-op verification.
+Integration tests measure three unchanged tracked files as 3 reads/decodes,
+0 private extractions, and the same `Arc<SharedBase>` in both views. A linked
+worktree's ordinary `.git` pointer file adds 1 read/decode and 1 private extraction
+on initial reconciliation (4 reads and 1 extraction total); it remains visible
+with `--hidden`, while real Git metadata directories stay excluded.
+Four CRLF-transformed paths require 4 private extractions plus the linked
+gitfile's 1 (5 total), with 0 new extractions on no-op verification.
 Sharing never promises to eliminate startup reads or checkout transformations.
 
 ## Implementation status and rollout

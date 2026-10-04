@@ -86,6 +86,8 @@ Independent leases cannot detach each other. Restart requires fresh attach calls
 with the intended revision; old leases are invalid. Bases stay pinned and
 checkpoints remain outside disposable worktrees. CRLF/smudge differences can
 require full private overlays, and initial verification still reads content.
+A linked worktree also indexes its ordinary `.git` pointer file in the private
+overlay; it is visible with `--hidden`, unlike a real Git metadata directory.
 See [shared mode](README.md#shared-repository-daemon-opt-in) for budgets, profile
 compatibility and retain-all storage. The runtime owns process lifetime and
 offline cleanup; tgrep does not implement online GC.

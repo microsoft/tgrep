@@ -327,6 +327,96 @@ fn indexed_inline_case_flags_keep_candidates_selective() {
 }
 
 #[test]
+fn indexed_fixed_strings_preserve_unicode_case_folds() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    for (name, content) in [
+        ("upper_accent.txt", "CAF\u{c9}\n"),
+        ("upper_fullwidth.txt", "\u{ff29}\u{ff24}\n"),
+        ("long_s_kelvin.txt", "\u{17f}hell\u{17f}hoc\u{212a}\n"),
+        ("short_fold.txt", "\u{17f}\u{212a}\u{17f}\n"),
+        ("lower.txt", "caf\u{e9} \u{ff49}\u{ff44} shellshock sks\n"),
+        ("literal.txt", "HELLO[.+](?i)\\END\n"),
+        ("decoy.txt", "unrelated content\n"),
+    ] {
+        fs::write(root.join(name), content).unwrap();
+    }
+    let cases: &[(&[&str], &str, &[&str])] = &[
+        (&["-i"], "caf\u{e9}", &["lower.txt", "upper_accent.txt"]),
+        (&["-i"], "CAF\u{c9}", &["lower.txt", "upper_accent.txt"]),
+        (
+            &["-i"],
+            "\u{ff49}\u{ff44}",
+            &["lower.txt", "upper_fullwidth.txt"],
+        ),
+        (
+            &["-i"],
+            "\u{ff29}\u{ff24}",
+            &["lower.txt", "upper_fullwidth.txt"],
+        ),
+        (&["-i"], "shellshock", &["long_s_kelvin.txt", "lower.txt"]),
+        (&["-i"], "sks", &["lower.txt", "short_fold.txt"]),
+        (&["-S"], "caf\u{e9}", &["lower.txt", "upper_accent.txt"]),
+        (
+            &["-S"],
+            "\u{ff49}\u{ff44}",
+            &["lower.txt", "upper_fullwidth.txt"],
+        ),
+        (&["-S"], "shellshock", &["long_s_kelvin.txt", "lower.txt"]),
+        (&["-S"], "CAF\u{c9}", &["upper_accent.txt"]),
+        (&[], "CAF\u{c9}", &["upper_accent.txt"]),
+        (&[], "\u{ff29}\u{ff24}", &["upper_fullwidth.txt"]),
+        (&["-i", "--no-unicode"], "shellshock", &["lower.txt"]),
+        (&["-i"], r"hello[.+](?i)\end", &["literal.txt"]),
+        (
+            &["-i", "-e", "caf\u{e9}"],
+            "shellshock",
+            &["long_s_kelvin.txt", "lower.txt", "upper_accent.txt"],
+        ),
+        (
+            &["-i", "-e", "\u{ff49}\u{ff44}"],
+            "caf\u{e9}",
+            &["lower.txt", "upper_accent.txt", "upper_fullwidth.txt"],
+        ),
+    ];
+    let mut direct = Vec::new();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (i, &(flags, pattern, files)) in cases.iter().enumerate() {
+            let mut cmd = tgrep();
+            cmd.args(backend)
+                .args(flags)
+                .args(["-F", "-l", "--stats", "--sort", "path", "--color", "never"]);
+            if flags.contains(&"-e") {
+                cmd.args(["-e", pattern, "--", root.to_str().unwrap()]);
+            } else {
+                cmd.args(["--", pattern, root.to_str().unwrap()]);
+            }
+            let output = cmd.assert().success().get_output().clone();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains(marker), "{flags:?} {pattern}: {stderr}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let names: Vec<_> = stdout
+                .lines()
+                .map(|line| {
+                    std::path::Path::new(line)
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(names, files, "{backend:?} {flags:?} {pattern}");
+            if backend == ["--no-index"] {
+                direct.push(stdout);
+            } else {
+                assert_eq!(stdout, direct[i], "{backend:?} {flags:?} {pattern}");
+            }
+        }
+    });
+}
+
+#[test]
 fn indexed_stats_distinguish_full_corpus_candidates_from_server_transport() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");

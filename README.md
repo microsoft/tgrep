@@ -619,7 +619,10 @@ exit code determined by the search alone. Suppress the message with
 2. **Querying** decomposes regex literals into trigram lookups, intersects or
    unions posting lists, and verifies candidates with the full regex engine.
    Inline case flags participate in planning; unsupported constructs use
-   conservative plans rather than excluding possible matches.
+   conservative plans rather than excluding possible matches. Case-insensitive
+   fixed strings use the same Unicode-aware planning after escaping regex
+   syntax. Both paths require only trigrams safe for the index's ASCII folding;
+   if none remain, all indexed files are candidates.
 3. **Serving** combines a memory-mapped `IndexReader` with a mutable `LiveIndex`
    overlay in `HybridIndex`. Updates take precedence over disk entries.
    Clients use JSON-RPC 2.0 over newline-delimited TCP on loopback, with one

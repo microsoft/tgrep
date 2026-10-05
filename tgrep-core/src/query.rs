@@ -51,12 +51,13 @@ pub fn build_query_plan(pattern: &str, case_insensitive: bool) -> Result<QueryPl
 
 /// Build a query plan for a literal (fixed-string) pattern.
 pub fn build_literal_plan(literal: &str, case_insensitive: bool) -> QueryPlan {
-    let text = if case_insensitive {
-        literal.to_lowercase()
-    } else {
-        literal.to_string()
-    };
-    literals_to_query_plan(text.as_bytes())
+    if case_insensitive {
+        // The index only folds ASCII. Let the regex planner break literal runs
+        // at Unicode case classes that cannot safely use those folded trigrams.
+        return build_query_plan(&regex_syntax::escape(literal), true)
+            .expect("an escaped literal is a valid regex");
+    }
+    literals_to_query_plan(literal.as_bytes())
 }
 
 /// Build one plan covering every pattern the user supplied.
@@ -1102,20 +1103,88 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_literal_plan() {
-        // "class AlertSchema" with case-insensitive should produce trigrams
-        // from "class alertschema"
-        let plan = build_literal_plan("class AlertSchema", true);
+        let plan = build_literal_plan("HeLLo", true);
         match &plan {
             QueryPlan::And(queries) => {
                 assert!(!queries.is_empty(), "should have trigrams");
                 // Verify these are lowercase trigrams
-                let expected = trigram::extract_from_literal("class alertschema");
+                let expected = trigram::extract_from_literal("hello");
                 let hashes: Vec<TrigramHash> = queries.iter().map(|q| q.hash).collect();
                 for tri in &expected {
                     assert!(hashes.contains(tri), "missing trigram {tri:#010x}");
                 }
             }
             _ => panic!("expected And plan"),
+        }
+    }
+
+    #[test]
+    fn case_insensitive_literals_preserve_unicode_candidates() {
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("caf\u{e9}", &["CAF\u{c9}", "caf\u{e9}"], true),
+            ("CAF\u{c9}", &["CAF\u{c9}", "caf\u{e9}"], true),
+            (
+                "\u{ff49}\u{ff44}",
+                &["\u{ff29}\u{ff24}", "\u{ff49}\u{ff44}"],
+                false,
+            ),
+            (
+                "\u{ff29}\u{ff24}",
+                &["\u{ff29}\u{ff24}", "\u{ff49}\u{ff44}"],
+                false,
+            ),
+            (
+                "shellshock",
+                &["SHELLSHOCK", "\u{17f}hell\u{17f}hoc\u{212a}"],
+                true,
+            ),
+            ("sks", &["SKS", "\u{17f}\u{212a}\u{17f}"], false),
+            (
+                "prefix\u{e9}suffix",
+                &["PREFIX\u{c9}SUFFIX", "prefix\u{e9}suffix"],
+                true,
+            ),
+            ("a\u{130}bc", &["A\u{130}BC"], true),
+            (r"hello[.+](?i)\end", &[r"HELLO[.+](?i)\END"], true),
+            ("", &[""], false),
+            ("ab", &["AB"], false),
+        ];
+        for &(literal, matches, narrows) in cases {
+            let mut inverted = std::collections::HashMap::<u32, Vec<PostingEntry>>::new();
+            for (id, content) in matches.iter().chain([&"unrelated decoy"]).enumerate() {
+                for (tri, masks) in trigram::extract_merged_masks(content.as_bytes()) {
+                    inverted.entry(tri).or_default().push(PostingEntry {
+                        file_id: id as u32,
+                        loc_mask: masks.loc_mask,
+                        next_mask: masks.next_mask,
+                    });
+                }
+            }
+            let plan = build_literal_plan(literal, true);
+            assert_eq!(!plan.is_match_all(), narrows, "{literal:?}: {plan:?}");
+            let matcher = regex::RegexBuilder::new(&regex_syntax::escape(literal))
+                .case_insensitive(true)
+                .build()
+                .unwrap();
+            for content in matches {
+                assert!(matcher.is_match(content), "{literal:?}: {content:?}");
+            }
+            if plan.is_match_all() {
+                continue;
+            }
+            let lookup = |tri| inverted.get(&tri).cloned().unwrap_or_default();
+            for candidates in [
+                execute_plan(&plan, &|tri| {
+                    lookup(tri).iter().map(|entry| entry.file_id).collect()
+                }),
+                execute_plan_with_masks(&plan, &lookup),
+            ] {
+                assert_eq!(
+                    candidates,
+                    (0..matches.len() as u32).collect::<Vec<_>>(),
+                    "{literal:?}: {plan:?}"
+                );
+            }
         }
     }
 

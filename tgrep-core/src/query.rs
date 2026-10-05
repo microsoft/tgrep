@@ -50,12 +50,15 @@ pub fn build_query_plan(pattern: &str, case_insensitive: bool) -> Result<QueryPl
 }
 
 /// Build a query plan for a literal (fixed-string) pattern.
+///
+/// If regex planning fails, scan all candidates rather than reject a valid
+/// literal. This only disables index narrowing; the matcher still verifies it.
 pub fn build_literal_plan(literal: &str, case_insensitive: bool) -> QueryPlan {
     if case_insensitive {
         // The index only folds ASCII. Let the regex planner break literal runs
         // at Unicode case classes that cannot safely use those folded trigrams.
         return build_query_plan(&regex_syntax::escape(literal), true)
-            .expect("an escaped literal is a valid regex");
+            .unwrap_or(QueryPlan::MatchAll);
     }
     literals_to_query_plan(literal.as_bytes())
 }
@@ -1116,6 +1119,30 @@ mod tests {
             }
             _ => panic!("expected And plan"),
         }
+    }
+
+    #[test]
+    fn case_insensitive_literal_plan_handles_long_literals() {
+        let literal = "[(HeLLo.+)\u{e9}]".repeat(4096);
+        let content = "[(HELLO.+)\u{c9}]".repeat(4096);
+        let plan = build_literal_plan(&literal, true);
+        if plan.is_match_all() {
+            return;
+        }
+
+        let masks = trigram::extract_merged_masks(content.as_bytes());
+        let candidates = execute_plan_with_masks(&plan, &|tri| {
+            masks
+                .get(&tri)
+                .map(|mask| PostingEntry {
+                    file_id: 0,
+                    loc_mask: mask.loc_mask,
+                    next_mask: mask.next_mask,
+                })
+                .into_iter()
+                .collect()
+        });
+        assert_eq!(candidates, vec![0], "{plan:?}");
     }
 
     #[test]

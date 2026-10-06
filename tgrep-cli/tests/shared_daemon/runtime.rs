@@ -345,15 +345,41 @@ fn runtime_sessions_recover_abandonment_restart_and_release_budgets() {
     );
     d.ready(&c);
     disposable.end();
+    let phase = AtomicU64::new(0);
     thread::scope(|scope| {
-        let queries = scope.spawn(|| {
-            for _ in 0..8 {
+        let phase = &phase;
+        let daemon = &d;
+        let root = &f.a;
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let (progress, receipts) = std::sync::mpsc::channel();
+        let queries = scope.spawn(move || {
+            let started = Instant::now();
+            let mut reported = None;
+            while matches!(
+                stopped.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ) {
+                assert!(started.elapsed() < DEADLINE, "sibling query loop deadline");
+                let observed = phase.load(Ordering::SeqCst);
                 assert_eq!(
-                    d.search(&f.a, "offline_runtime_needle")["backend"],
+                    daemon.search(root, "offline_runtime_needle")["backend"],
                     "shared-v1"
                 );
+                if reported != Some(observed) {
+                    progress.send(observed).unwrap();
+                    reported = Some(observed);
+                }
             }
         });
+        let checkpoint = |next| {
+            phase.store(next, Ordering::SeqCst);
+            loop {
+                if receipts.recv_timeout(DEADLINE).unwrap() == next {
+                    break;
+                }
+            }
+        };
+        checkpoint(1);
         // All operations hold no view/root handles for either disposable worktree.
         let renamed = f.temp.path().join("renamed-c");
         git(
@@ -365,15 +391,20 @@ fn runtime_sessions_recover_abandonment_restart_and_release_budgets() {
                 renamed.to_str().unwrap(),
             ],
         );
+        checkpoint(2);
         git(
             &f.a,
             &["worktree", "remove", "--force", renamed.to_str().unwrap()],
         );
+        checkpoint(3);
         git(
             &f.a,
             &["worktree", "remove", "--force", f.b.to_str().unwrap()],
         );
         assert!(!c.exists() && !renamed.exists() && !f.b.exists());
+        checkpoint(4);
+        // Disconnection also cancels the loop if an operation panics.
+        drop(stop);
         queries.join().unwrap();
     });
     sibling.end();

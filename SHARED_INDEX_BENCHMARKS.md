@@ -19,11 +19,14 @@ checkout transformations, memory budget and latency tradeoff of the intended
 workload before a targeted feature-flag rollout. These measurements do not
 justify a universal default.
 
-All **37 paired cases / 74 mode runs** below passed full JSON/context/filename
+The **37 selected paired cases / 74 mode runs** below passed full JSON/context/filename
 equality, positive backend proof, timed-sample checks, output-schema validation
-and owned cleanup. This is one measured run per case, not a confidence interval
-or production-scale proof. The primary corpus is deliberately small; the
-separately labeled file-count supplement increases it 16-fold.
+and owned cleanup. Retained evidence contains **43 validated pairs / 86 runs**:
+six original LF cases are superseded by six explicitly identified corrective
+cases after a coordination-overlap audit. This is one selected measured run per
+case, not a confidence interval or production-scale proof. The primary corpus
+is deliberately small; the separately labeled file-count supplement increases
+it 16-fold.
 
 ### Exact provenance
 
@@ -37,12 +40,21 @@ separately labeled file-count supplement increases it 16-fold.
 | Host | Intel Xeon Platinum 8370C, WSL2 Linux `6.18.33.2-microsoft-standard-WSL2`, x86_64, 16 visible logical CPUs, about 32 GiB RAM |
 | Filesystem/tools | Native ext4 binary and `/tmp` fixtures; Python 3.12.3; Git 2.43.0 |
 | Runtime parameters | Seed `20261005`; 2 Rayon threads/process; shipped native-watch/view budgets; shared full-pass interval 120s |
-| Timing windows (UTC) | Primary 06:29:42-06:50:43; LF scale 06:50:53-06:58:37; CRLF scale 06:58:57-07:00:04 |
+| Timing windows (UTC) | Primary 06:29:42-06:50:43; LF scale 06:50:53-06:58:37; CRLF scale 06:58:57-07:00:04; corrective LF 07:08:01-07:09:18 |
 
-No own build, test, or cross-platform smoke ran concurrently with accepted
-timing. Other hardening sessions coordinated a no-heavy-build window. This was
-still a shared Windows/WSL host, not exclusive hardware or a controlled CPU/
-storage laboratory. Primary Linux load averages were recorded at both ends
+No benchmark-session build/test ran concurrently with timing, but a later
+timestamp audit found the coordinator's Windows combined smoke ran
+**06:29:40-06:30:33 UTC**, overlapping the original primary's first 51 seconds.
+Its native smoke ended at 06:29:42. The raw primary is retained unchanged:
+**all LF1/4/16 fresh/restart rows in the table use the corrective artifact**,
+rerun with identical workload/thread/sample parameters and `--idle-seconds 0`
+after the coordinator confirmed no remaining local workloads. LF32 and the
+later workloads/scales retain original provenance. No rows were silently
+averaged, and the overlapped rows are not used to improve or worsen comparisons.
+
+The sessions otherwise coordinated a no-heavy-build window. This was still a
+shared Windows/WSL host, not exclusive hardware or a controlled CPU/storage
+laboratory. Original primary Linux load averages were recorded at both ends
 (`0.463/0.145/0.049` and `1.850/1.810/1.248`). No global OS caches were purged.
 Fresh here means **no existing index**, not cold physical storage.
 
@@ -55,13 +67,13 @@ query-readiness contracts; see the restart-contract caveat below.
 
 | LF views | Condition | Samples/mode | Ready ms O / S | Query p50 ms O / S | Query p95 ms O / S |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 1 | Fresh | 30 | 67.6 / 577.1 | 5.84 / 14.01 | 16.23 / 45.65 |
-| 4 | Fresh | 120 | 234.4 / 1566.1 | 5.40 / 13.96 | 13.48 / 39.88 |
-| 16 | Fresh | 480 | 1030.8 / 5180.9 | 5.31 / 13.74 | 13.02 / 37.62 |
+| 1 | Fresh, corrective | 30 | 45.8 / 455.8 | 4.83 / 13.06 | 11.25 / 35.79 |
+| 4 | Fresh, corrective | 120 | 171.0 / 1468.6 | 4.50 / 12.32 | 11.99 / 34.50 |
+| 16 | Fresh, corrective | 480 | 999.9 / 4964.2 | 4.22 / 12.11 | 11.38 / 34.86 |
 | 32 | Fresh | 960 | 2051.9 / 10185.1 | 4.39 / 13.17 | 11.45 / 35.48 |
-| 1 | Restart | 30 | 21.9 / 357.1 | 4.74 / 15.06 | 12.28 / 41.18 |
-| 4 | Restart | 120 | 88.4 / 1263.1 | 5.08 / 13.46 | 13.73 / 42.24 |
-| 16 | Restart | 480 | 352.7 / 4861.2 | 4.46 / 12.78 | 11.53 / 35.25 |
+| 1 | Restart, corrective | 30 | 21.9 / 353.6 | 4.20 / 13.64 | 11.03 / 47.65 |
+| 4 | Restart, corrective | 120 | 87.3 / 1262.7 | 4.29 / 11.99 | 10.99 / 34.49 |
+| 16 | Restart, corrective | 480 | 351.7 / 4870.3 | 4.54 / 12.42 | 11.30 / 34.61 |
 | 32 | Restart | 960 | 709.3 / 9679.0 | 4.47 / 12.19 | 11.52 / 36.14 |
 
 In LF32/fresh, the first shared build/registration call took **265.47 ms** and
@@ -174,12 +186,14 @@ are retained. No timing fields were rewritten for publication.
 | [Primary](scripts/benchmark-results/2026-10-06-linux-primary.json.gz) | 30,574,049 | 971,523 |
 | [LF scale](scripts/benchmark-results/2026-10-06-linux-scale-lf.json.gz) | 1,396,774 | 58,428 |
 | [CRLF scale](scripts/benchmark-results/2026-10-06-linux-scale-crlf.json.gz) | 122,851 | 10,477 |
+| [LF quiet-window correction](scripts/benchmark-results/2026-10-06-linux-lf-correction.json.gz) | 2,135,306 | 97,204 |
 
 | Artifact | SHA-256 of gzip | SHA-256 of decompressed JSON |
 | --- | --- | --- |
 | Primary | `700642cc711716c73ec548e5ff9048020f9b628e70aebb40103482bfbbe39b2a` | `89ea1bc4a7c6011acaf2c9d2e121dccf22ffbc1be812b7db6c0f53aa42b58646` |
 | LF scale | `24e012e5d91ba9db61c5eea2ccca50b9a0ed1579813a5e6b8c6e79404d3024c5` | `c1aa0ba6c1d3f15d3476f461deeac6674d21eadf7adf5469016dafb1aa7a297b` |
 | CRLF scale | `004dddaedc4e7ee2a0e2adf762a78b88f5ce3df0966ed0dc0cfcba780d8370d4` | `77a293b17b1dd80761c67de361759b8cff068add9ae56a998614eb2f1807b387` |
+| LF correction | `cb18cfd78f63f9aa2065b8f4695009b10701d080589864316d0432001d52a112` | `f63d1810f390e2662296bf73aa209152e8050c1650e27dc28679070780a89a51` |
 
 Read and validate without extracting files (works on Windows and Linux):
 
@@ -189,6 +203,9 @@ python -B -c "import gzip,json,sys; from pathlib import Path; sys.path.insert(0,
 
 To decompress one file, `python -m gzip -d <artifact.json.gz>` writes its sibling
 `.json` file. Check hashes before/after decompression when independently auditing.
+The validation command reports **43 validated paired cases**. For the 37-case
+selected baseline, exclude original-primary `scenario == "lf"` rows with
+`worktrees in [1, 4, 16]`, and use the six corrective cases in their place.
 Original offset-failure, restricted-output experiments, and an interrupted
 pre-backend-proof run are **not accepted baseline inputs** and are not mixed
 into these artifacts or tables.
@@ -223,6 +240,8 @@ Its `--binary-commit` is the exact source SHA above. The LF scale run instead us
 `--scenarios lf --conditions fresh --files 4096 --file-bytes 8192
 --samples-per-view 3 --churn-rounds 2 --idle-seconds 0 --temp-parent /tmp`;
 CRLF scale additionally used `--scenarios crlf --worktrees 4`.
+The corrective run kept the primary's file size/count, seed, 30 samples/view and
+thread settings, using `--scenarios lf --worktrees 1,4,16 --idle-seconds 0`.
 Full parameter values and host notes are in each artifact.
 
 The frozen harness passed 14 unit tests on Windows and 13 plus one Windows-only

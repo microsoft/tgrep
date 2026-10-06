@@ -84,7 +84,12 @@ git diff --exit-code -- Cargo.lock fuzz/Cargo.lock vendor/ignore/Cargo.lock
 The helper uses private temporary Git fixtures, configuration, external shared
 storage, logs and installation roots. Commands/readiness have deadlines; owned
 processes are stopped and reaped before temporary roots are removed, including
-on failure. Cargo's normal cache is not removed. All three lockfiles must remain
+on failure. Windows children start suspended, join an owned kill-on-close Job
+Object, then resume; descendants remain owned even after their parent exits.
+Unix children use private process groups. Windows temporary cleanup reports and
+retries briefly retained executable images for at most five seconds; persistent
+cleanup errors fail qualification. Cargo's normal cache is not removed.
+All three lockfiles must remain
 byte-for-byte unchanged, even on helper failure. For native Unix invalid-byte
 regressions, run the Rust suite on native Linux/macOS filesystems; under WSL use
 a native checkout and `TMPDIR`, not a Windows-mounted `/mnt/...` directory.

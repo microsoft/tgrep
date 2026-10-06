@@ -147,9 +147,10 @@ class QualificationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "server exited"):
                 qualify.wait_for(child, lambda _: False, "test readiness")
 
-    def test_cleanup_stops_descendants_not_only_the_direct_child(self):
+    def check_descendant_cleanup(self, parent_exits):
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "port"
+            release = Path(directory) / "release-parent"
             descendant = (
                 "import socket, pathlib, time; "
                 "s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(); "
@@ -157,9 +158,11 @@ class QualificationTests(unittest.TestCase):
                 "time.sleep(60)"
             )
             parent = (
-                "import subprocess, sys, time; "
-                f"subprocess.Popen([sys.executable, '-c', {descendant!r}]); "
-                "time.sleep(60)"
+                "import subprocess, sys, time, pathlib; "
+                f"subprocess.Popen([sys.executable, '-c', {descendant!r}], "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                + (f"\nwhile not pathlib.Path({str(release)!r}).exists(): time.sleep(0.01)"
+                   if parent_exits else "time.sleep(60)")
             )
             with qualify.process([sys.executable, "-c", parent]) as child:
                 qualify.wait_for(child, lambda _: marker.exists() and bool(marker.read_text()),
@@ -167,6 +170,12 @@ class QualificationTests(unittest.TestCase):
                 port = int(marker.read_text())
                 with socket.create_connection(("127.0.0.1", port), timeout=1):
                     pass
+                if parent_exits:
+                    release.write_text("exit", encoding="utf-8")
+                    child.wait(timeout=10)
+                    self.assertEqual(child.returncode, 0)
+                    with socket.create_connection(("127.0.0.1", port), timeout=1):
+                        pass
             deadline = time.monotonic() + 5
             while True:
                 try:
@@ -177,6 +186,47 @@ class QualificationTests(unittest.TestCase):
                 # Group termination is asynchronous for the grandchild on Unix.
                 self.assertLess(time.monotonic(), deadline, "descendant survived cleanup")
                 time.sleep(0.05)
+
+    def test_cleanup_stops_descendants_not_only_the_direct_child(self):
+        self.check_descendant_cleanup(parent_exits=False)
+
+    def test_cleanup_stops_descendants_after_direct_child_exit(self):
+        self.check_descendant_cleanup(parent_exits=True)
+
+    @unittest.skipUnless(os.name == "nt", "Windows suspended launch and job assignment")
+    def test_windows_assignment_and_resume_failures_reap_suspended_child(self):
+        import windows_job
+
+        original_popen = qualify.subprocess.Popen
+        original_assign = windows_job.WindowsJob.assign_and_resume
+        children = []
+
+        def record(*args, **kwargs):
+            child = original_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "must-not-run"
+            command = [sys.executable, "-c",
+                       f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ran')"]
+            for failure in ("assign", "resume"):
+                def fail(job, pid):
+                    time.sleep(0.1)
+                    self.assertFalse(marker.exists(), "child executed before job assignment")
+                    if failure == "assign":
+                        raise OSError("injected assignment failure")
+                    with patch.object(job.kernel, "ResumeThread", return_value=0xFFFFFFFF):
+                        original_assign(job, pid)
+
+                with self.subTest(failure=failure), \
+                        patch.object(qualify.subprocess, "Popen", side_effect=record), \
+                        patch.object(windows_job.WindowsJob, "assign_and_resume", fail):
+                    with self.assertRaises(OSError):
+                        with qualify.process(command):
+                            self.fail("job setup failure was suppressed")
+                self.assertIsNotNone(children[-1].poll())
+                self.assertFalse(marker.exists())
 
     def test_command_timeout_reaps_owned_process(self):
         children = []
@@ -215,6 +265,28 @@ class QualificationTests(unittest.TestCase):
         self.assertIn("--locked", command)
         self.assertEqual(command[-2:], ["--root", scratch / "install"])
         self.assertFalse(scratch.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows deferred executable image release")
+    def test_private_cleanup_retries_brief_denial_but_never_hides_persistent_failure(self):
+        for cleanup_results, times, fails in (
+            ([PermissionError("image pending"), None], [0, 1], False),
+            ([PermissionError("image pending")] * 2, [0, 1, 6], True),
+        ):
+            with self.subTest(fails=fails), \
+                    patch.object(qualify.tempfile, "TemporaryDirectory") as temporary, \
+                    patch.object(qualify.time, "monotonic", side_effect=times), \
+                    patch.object(qualify.time, "sleep"), redirect_stdout(io.StringIO()) as output:
+                temporary.return_value.name = str(Path.cwd())
+                temporary.return_value.cleanup.side_effect = cleanup_results
+                if fails:
+                    with self.assertRaisesRegex(PermissionError, "image pending"):
+                        with qualify.private_directory():
+                            pass
+                else:
+                    with qualify.private_directory():
+                        pass
+                self.assertEqual(temporary.return_value.cleanup.call_count, 2)
+                self.assertIn("Retrying private fixture cleanup", output.getvalue())
 
     def test_fixture_git_environment_is_private(self):
         with patch.dict(os.environ, {"GIT_DIR": "foreign", "GIT_CONFIG_COUNT": "9"}):

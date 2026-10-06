@@ -50,18 +50,15 @@ def unchanged_locks(checkout):
         require(not changed, f"qualification changed lockfiles: {changed}")
 
 
-def stop(child):
+def stop(child, job=None):
     # These are only children created here, never a PID discovered from a marker.
     if os.name == "nt":
-        if child.poll() is None:
-            result = subprocess.run(
-                ["taskkill", "/PID", str(child.pid), "/T", "/F"],
-                capture_output=True, timeout=10,
-            )
-            require(
-                result.returncode == 0 or child.poll() is not None,
-                f"cannot stop owned process {child.pid}: {result.stderr!r}",
-            )
+        try:
+            job.terminate()
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=10)
     else:
         # Each child owns a new process group, including Cargo/Git descendants.
         try:
@@ -73,19 +70,34 @@ def stop(child):
 
 @contextmanager
 def process(argv, **kwargs):
-    child = subprocess.Popen(
-        [str(arg) for arg in argv], stdin=subprocess.DEVNULL,
-        start_new_session=os.name != "nt", **kwargs,
-    )
+    job = None
+    if os.name == "nt":
+        from windows_job import WindowsJob
+        job = WindowsJob()
     try:
-        yield child
-    finally:
+        child = subprocess.Popen(
+            [str(arg) for arg in argv], stdin=subprocess.DEVNULL,
+            start_new_session=os.name != "nt",
+            creationflags=4 if job is not None else 0,  # CREATE_SUSPENDED
+            **kwargs,
+        )
         try:
-            stop(child)
+            if job is not None:
+                job.assign_and_resume(child.pid)
+            yield child
         finally:
-            for pipe in (child.stdout, child.stderr):
-                if pipe is not None:
-                    pipe.close()
+            try:
+                stop(child, job)
+            finally:
+                for pipe in (child.stdout, child.stderr):
+                    if pipe is not None:
+                        pipe.close()
+                if job is not None:
+                    # Popen otherwise retains this owned handle until garbage collection.
+                    child._handle.Close()
+    finally:
+        if job is not None:
+            job.close()
 
 
 def run(argv, *, cwd, env=None, timeout=60, expected=0):
@@ -313,9 +325,27 @@ def smoke(binary, scratch):
     print("Installed binary: restart, detach and worktree deletion while daemon lives", flush=True)
 
 
+@contextmanager
+def private_directory():
+    temporary = tempfile.TemporaryDirectory(prefix="tgrep-qualification-")
+    try:
+        yield Path(temporary.name).resolve()
+    finally:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                temporary.cleanup()
+                break
+            except PermissionError as error:
+                if os.name != "nt" or time.monotonic() >= deadline:
+                    raise
+                # Windows can retain an executable image briefly after process exit.
+                print(f"Retrying private fixture cleanup: {error}", flush=True)
+                time.sleep(0.05)
+
+
 def installed(checkout):
-    with tempfile.TemporaryDirectory(prefix="tgrep-qualification-") as directory:
-        scratch = Path(directory).resolve()
+    with private_directory() as scratch:
         install_root = scratch / "install"
         print("Installing checkout into private root (release profile)", flush=True)
         result = run(

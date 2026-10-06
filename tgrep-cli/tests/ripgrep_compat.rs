@@ -265,6 +265,72 @@ fn with_stats_backends(
 }
 
 #[test]
+fn indexed_json_preserves_utf8_match_and_context_offsets() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("offsets.txt"),
+        "pr\u{e9}face\nbefore\ncaf\u{e9} needle needle\napr\u{e8}s\nneedle last\n",
+    )
+    .unwrap();
+    let mut direct = Vec::new();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        let output = tgrep()
+            .args(backend)
+            .args(["--json", "--stats", "-F", "-C", "1", "--", "needle"])
+            .arg(&root)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert!(String::from_utf8_lossy(&output.stderr).contains(marker));
+        let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|row: &serde_json::Value| row["type"] == "match" || row["type"] == "context")
+            .collect();
+        assert_eq!(rows.len(), 4);
+        for (row, (kind, line, offset, text, spans)) in rows.iter().zip([
+            ("context", 2, 9, "before\n", vec![]),
+            (
+                "match",
+                3,
+                16,
+                "caf\u{e9} needle needle\n",
+                vec![(6, 12), (13, 19)],
+            ),
+            ("context", 4, 36, "apr\u{e8}s\n", vec![]),
+            ("match", 5, 43, "needle last\n", vec![(0, 6)]),
+        ]) {
+            assert_eq!(row["type"], kind);
+            assert_eq!(row["data"]["line_number"], line);
+            assert_eq!(row["data"]["absolute_offset"], offset);
+            assert_eq!(row["data"]["lines"]["text"], text);
+            let actual: Vec<_> = row["data"]["submatches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|span| {
+                    assert_eq!(span["match"]["text"], "needle");
+                    (
+                        span["start"].as_u64().unwrap(),
+                        span["end"].as_u64().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(actual, spans);
+        }
+        if backend == ["--no-index"] {
+            direct = rows;
+        } else {
+            assert_eq!(rows, direct, "{marker}");
+        }
+    });
+}
+
+#[test]
 fn indexed_inline_case_flags_keep_candidates_selective() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");

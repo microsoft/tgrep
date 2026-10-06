@@ -282,9 +282,9 @@ impl SearchOptions {
 
     /// Whether the reply has to carry per-row `offset` and `term`.
     ///
-    /// Only these two flags read them, and both default off.
+    /// JSON always reports absolute offsets, even without `--byte-offset`.
     fn wants_position_detail(&self) -> bool {
-        self.byte_offset || self.max_columns.is_some()
+        self.json || self.byte_offset || self.max_columns.is_some()
     }
 
     /// `--only-matching` as the search should actually apply it.
@@ -2445,6 +2445,22 @@ mod tests {
             "line": line,
             "spans": (0..spans).map(|i| serde_json::json!([i, i + 1])).collect::<Vec<_>>(),
         })
+    }
+
+    #[test]
+    fn json_server_requests_include_offsets_without_byte_offset_flag() {
+        let mut opts = SearchOptions {
+            pattern: "needle".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            server_search_request(&IndexScope::Whole, &opts, false).unwrap()["params"]["positions"],
+            false
+        );
+        opts.json = true;
+        let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+        assert_eq!(request["params"]["positions"], true);
+        assert_eq!(request["params"]["detail"], true);
     }
 
     #[test]

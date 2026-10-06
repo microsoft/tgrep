@@ -161,18 +161,18 @@ def fixture_environment(home):
 
 @contextmanager
 def server(binary, root, options, env, log):
-    with log.open("w+b") as output:
-        with process(
-            [binary, "serve", root, *options], cwd=root, env=env,
-            stdout=output, stderr=subprocess.STDOUT,
-        ) as child:
-            try:
+    with log.open("wb") as output:
+        try:
+            with process(
+                [binary, "serve", root, *options], cwd=root, env=env,
+                stdout=output, stderr=subprocess.STDOUT,
+            ) as child:
                 yield child
-            except BaseException:
-                output.seek(0)
-                print(f"Server log ({log}):\n{output.read().decode('utf-8', errors='replace')}",
-                      flush=True)
-                raise
+        except BaseException:
+            output.close()
+            print(f"Server log ({log}):\n{log.read_text(encoding='utf-8', errors='replace')}",
+                  flush=True)
+            raise
 
 
 def wait_for(child, probe, description, timeout=30):
@@ -187,9 +187,14 @@ def wait_for(child, probe, description, timeout=30):
 
 
 def marker_owned(path, child):
-    if not path.exists():
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return False
-    return json.loads(path.read_text(encoding="utf-8"))["pid"] == child.pid
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        print(f"Waiting for complete registration {path}: {error}", flush=True)
+        return False
+    return isinstance(marker, dict) and marker.get("pid") == child.pid
 
 
 def assert_parity(indexed, scanned, backend):
@@ -198,6 +203,9 @@ def assert_parity(indexed, scanned, backend):
             f"indexed/scan output mismatch:\n{indexed.stdout!r}\n{scanned.stdout!r}")
     require(backend in indexed.stderr,
             f"expected backend {backend!r}, got stderr:\n{indexed.stderr}")
+    require("(via filesystem walk)" in scanned.stderr
+            or "Brute-force search completed" in scanned.stderr,
+            f"expected filesystem scan control, got stderr:\n{scanned.stderr}")
 
 
 def smoke(binary, scratch):
@@ -238,7 +246,7 @@ def smoke(binary, scratch):
 
     cli(root, "index", ".")
     local_files = cli(root, "--files", "--stats", "--sort", "path", ".")
-    assert_parity(local_files, cli(root, "--files", "--no-index", "--sort", "path", "."),
+    assert_parity(local_files, cli(root, "--files", "--stats", "--no-index", "--sort", "path", "."),
                   "(via local index)")
     with server(binary, root, ["--no-watch"], env, scratch / "ordinary.log") as child:
         wait_for(child, lambda _: marker_owned(root / ".tgrep/serve.json", child),

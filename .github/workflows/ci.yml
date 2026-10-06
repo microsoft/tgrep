@@ -49,6 +49,10 @@ jobs:
         run: bash scripts/test-install.sh
       - name: Test qualification runner
         run: python -B -m unittest discover -s scripts/qualification -p 'test_*.py' -v
+      - name: Test standalone scripts
+        # Python 3.14 exits 5 for an empty inventory; never mask real test failures.
+        if: hashFiles('scripts/test_*.py') != ''
+        run: python -B -m unittest discover -s scripts -p 'test_*.py' -v
       - name: Check locked dependency graphs and all four fuzz targets
         if: runner.os == 'Linux'
         run: python -B scripts/qualification/qualify.py dependencies

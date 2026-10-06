@@ -1,6 +1,8 @@
 """Run: python -B -m unittest discover -s scripts/qualification -p 'test_*.py' -v"""
 
 import copy
+from contextlib import contextmanager, redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -76,7 +78,13 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "expected backend"):
             qualify.assert_parity(indexed, scanned, "via shared daemon v1")
         indexed.stderr = "via shared daemon v1"
-        qualify.assert_parity(indexed, scanned, "via shared daemon v1")
+        for diagnostic in ("", "(via shared daemon v1)", "(via local index)"):
+            scanned.stderr = diagnostic
+            with self.assertRaisesRegex(RuntimeError, "expected filesystem scan control"):
+                qualify.assert_parity(indexed, scanned, "via shared daemon v1")
+        for diagnostic in ("(via filesystem walk)", "Brute-force search completed in 1ms"):
+            scanned.stderr = diagnostic
+            qualify.assert_parity(indexed, scanned, "via shared daemon v1")
         scanned.stdout = "other\n"
         with self.assertRaisesRegex(RuntimeError, "output mismatch"):
             qualify.assert_parity(indexed, scanned, "via shared daemon v1")
@@ -87,6 +95,39 @@ class QualificationTests(unittest.TestCase):
     def test_command_failure_is_not_suppressed(self):
         with self.assertRaisesRegex(RuntimeError, "expected exit 0, got 2"):
             qualify.run([sys.executable, "-c", "raise SystemExit(2)"], cwd=Path.cwd())
+
+    def test_server_log_is_read_only_after_process_exit_and_log_close(self):
+        events = []
+        stream = None
+
+        @contextmanager
+        def fake_process(*args, **kwargs):
+            nonlocal stream
+            stream = kwargs["stdout"]
+            try:
+                yield None
+            finally:
+                stream.write(b"final server diagnostic\n")
+                events.append("reaped")
+
+        original = Path.read_text
+
+        def read_log(path, **kwargs):
+            self.assertEqual(events, ["reaped"])
+            self.assertTrue(stream.closed)
+            events.append("read")
+            return original(path, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = io.StringIO()
+            with patch.object(qualify, "process", fake_process), \
+                    patch.object(Path, "read_text", read_log), redirect_stdout(output):
+                with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                    with qualify.server("unused", root, [], {}, root / "server.log"):
+                        raise RuntimeError("injected failure")
+            self.assertEqual(events, ["reaped", "read"])
+            self.assertIn("final server diagnostic", output.getvalue())
 
     def test_service_is_reaped_after_exception_and_deadline(self):
         for fail in ("exception", "deadline"):
@@ -193,6 +234,31 @@ class QualificationTests(unittest.TestCase):
                 self.assertFalse(qualify.marker_owned(path, child))
                 path.write_text(json.dumps({"pid": child.pid}), encoding="utf-8")
                 self.assertTrue(qualify.marker_owned(path, child))
+
+    def test_registration_poll_retries_partial_and_unreadable_markers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "marker.json"
+            with qualify.process([sys.executable, "-c", "import time; time.sleep(60)"]) as child:
+                for partial in ("", "{", "null", "{}"):
+                    path.write_text(partial, encoding="utf-8")
+                    with redirect_stdout(io.StringIO()):
+                        self.assertFalse(qualify.marker_owned(path, child))
+                path.write_bytes(b'{"root":"\xc3')
+                with redirect_stdout(io.StringIO()):
+                    self.assertFalse(qualify.marker_owned(path, child))
+                with patch.object(Path, "read_text", side_effect=PermissionError("busy marker")), \
+                        redirect_stdout(io.StringIO()):
+                    self.assertFalse(qualify.marker_owned(path, child))
+                with patch.object(Path, "read_text", side_effect=[
+                    "{", json.dumps({"pid": child.pid}),
+                ]), redirect_stdout(io.StringIO()):
+                    qualify.wait_for(child, lambda _: qualify.marker_owned(path, child),
+                                     "partial registration", timeout=2)
+                path.write_text("{", encoding="utf-8")
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(RuntimeError, "timed out waiting"):
+                        qualify.wait_for(child, lambda _: qualify.marker_owned(path, child),
+                                         "permanently malformed marker", timeout=0.1)
 
 
 if __name__ == "__main__":

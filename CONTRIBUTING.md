@@ -42,6 +42,10 @@ builds/tests are locked; the separately excluded `vendor/ignore` manifest runs
 its upstream unit/integration tests **and doctests** on each OS at version
 0.4.25. Do not format or upgrade vendored code to satisfy unrelated checks;
 see its [provenance and distribution contract](vendor/ignore/PATCHES.md).
+Generic root-level `scripts/test_*.py` discovery also runs on each OS alongside
+the explicit nested qualification/agent suites when those files exist. Older
+checkouts with no standalone tests skip that step (Python 3.14 exits 5 for an
+empty inventory); newly landed script tests are included without workflow edits.
 
 Linux additionally validates both complete Cargo dependency graphs and checks
 all four fuzz binaries with `--locked`. Exactly one `ignore`, resolving directly
@@ -55,9 +59,10 @@ OSes weekly/manually**. It runs the documented
 uses that exact installed executable for ordinary index/server search and file
 listing, shared attach/readiness/refresh, scan parity, stale-daemon fallback over
 a deliberately stale ordinary index, restart, detach and worktree deletion while
-the daemon remains alive. Backend diagnostics are required: matching scan
-results alone cannot accidentally qualify a broken indexed backend. No runtime
-integration, user-home installation, signing or release publication occurs.
+the daemon remains alive. Both indexed and scan-control backend diagnostics are
+required: matching results alone cannot qualify a broken indexed backend or a
+`--no-index` regression. No runtime integration, user-home installation, signing
+or release publication occurs.
 Only one release-profile build is added to normal PR CI; the existing builds
 share Cargo's checkout target directory and downloads where Cargo permits.
 
@@ -66,6 +71,8 @@ a C++ compiler available:
 
 ```bash
 python -B -m unittest discover -s scripts/qualification -p 'test_*.py' -v
+# When root-level scripts/test_*.py files exist:
+python -B -m unittest discover -s scripts -p 'test_*.py' -v
 cargo test --manifest-path vendor/ignore/Cargo.toml --locked
 cargo build --locked --workspace
 cargo test --locked --workspace

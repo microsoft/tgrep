@@ -17,6 +17,47 @@ import benchmark_shared as bench
 
 
 class MetricsTests(unittest.TestCase):
+    def test_optional_missing_tool_is_unavailable(self):
+        result = bench.tool_version("tgrep-benchmark-nonexistent-tool-8b01870d")
+        self.assertIsNone(result["value"])
+        self.assertIn("not executable on harness PATH", result["reason"])
+
+    def test_optional_nonzero_tool_is_unavailable(self):
+        command = bench.command
+        with patch.object(bench, "command", side_effect=lambda *args, **kwargs: command(
+                [sys.executable, "-c", "import sys; sys.stderr.write('no toolchain'); sys.exit(2)"])):
+            result = bench.tool_version(sys.executable)
+        self.assertIsNone(result["value"])
+        self.assertIn("exit 2", result["reason"])
+        self.assertIn("no toolchain", result["reason"])
+
+    def test_optional_timeout_reaps_before_returning_unavailable(self):
+        command = bench.command
+        with patch.object(bench, "command", side_effect=lambda *args, **kwargs: command(
+                [sys.executable, "-c", "import time; time.sleep(30)"], timeout=.05)):
+            result = bench.tool_version(sys.executable)
+        self.assertIsNone(result["value"])
+        self.assertIn("timed out", result["reason"])
+
+    def test_optional_probe_does_not_hide_containment_or_cleanup_errors(self):
+        for error in (OSError("job assignment failed"), RuntimeError("job still active"),
+                      FileNotFoundError("cleanup failed"), subprocess.TimeoutExpired("reap", 10)):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(bench, "command", side_effect=error):
+                with self.assertRaises(type(error)):
+                    bench.tool_version(sys.executable)
+
+    def test_optional_cleanup_failure_after_child_exit_is_fatal(self):
+        stop = bench.OwnedProcess.stop
+
+        def failed_stop(owned):
+            stop(owned)
+            raise subprocess.TimeoutExpired("owned cleanup verification", 10)
+
+        with patch.object(bench.OwnedProcess, "stop", failed_stop):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                bench.tool_version(sys.executable)
+
     def test_safety_limits_and_output_reuse(self):
         with tempfile.TemporaryDirectory(prefix="tgrep-bench-test-") as directory:
             output = Path(directory) / "result.json"
@@ -271,7 +312,7 @@ class ProcessTests(unittest.TestCase):
             script = ("import subprocess,sys,time; "
                       "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
                       "open(sys.argv[1],'w').write(str(p.pid)); time.sleep(30)")
-            with self.assertRaises(subprocess.TimeoutExpired):
+            with self.assertRaisesRegex(bench.CommandError, "timed out"):
                 bench.command([sys.executable, "-c", script, str(marker)], timeout=1)
             self.assert_dead(int(marker.read_text()))
 

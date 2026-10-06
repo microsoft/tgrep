@@ -29,6 +29,10 @@ RESOURCE_KEYS = (
 )
 
 
+class CommandError(RuntimeError):
+    """Invocation failure, distinct from process containment/cleanup failure."""
+
+
 def metric(value=None, reason=None):
     if (value is None) != (reason is not None):
         raise ValueError("A missing metric must have a reason, and only missing metrics do")
@@ -257,9 +261,11 @@ class OwnedProcess:
         try:
             self.process = subprocess.Popen(argv, start_new_session=os.name != "nt",
                                             creationflags=4 if self.job else 0, **kwargs)
-        except BaseException:
+        except BaseException as error:
             if self.job:
                 self.job.close()
+            if isinstance(error, FileNotFoundError):
+                raise CommandError(f"Executable unavailable: {argv[0]}: {error}") from error
             raise
         try:
             if self.job:
@@ -321,9 +327,12 @@ def command(argv, cwd=None, env=None, timeout=60, allowed=(0,)):
     owned = OwnedProcess([str(a) for a in argv], cwd=cwd, env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        stdout, stderr = owned.process.communicate(timeout=timeout)
+        try:
+            stdout, stderr = owned.process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise CommandError(f"{argv!r}: timed out after {timeout}s") from error
         if owned.process.returncode not in allowed:
-            raise RuntimeError(f"{argv!r}: exit {owned.process.returncode}: "
+            raise CommandError(f"{argv!r}: exit {owned.process.returncode}: "
                                f"{stderr.decode('utf-8', errors='replace')}")
         return stdout, stderr
     finally:
@@ -889,10 +898,14 @@ def validate(report):
 
 
 def tool_version(name):
+    executable = shutil.which(name)
+    if executable is None:
+        return {"value": None, "reason": f"Optional {name} is not executable on harness PATH"}
     try:
-        return {"value": command([name, "--version"])[0].decode().strip(), "reason": None}
-    except FileNotFoundError:
-        return {"value": None, "reason": f"{name} not on harness PATH; see build provenance"}
+        return {"value": command([executable, "--version"], timeout=5)[0].decode().strip(),
+                "reason": None}
+    except CommandError as error:
+        return {"value": None, "reason": f"Optional {name} provenance unavailable: {error}"}
 
 
 def parse_args(argv=None):

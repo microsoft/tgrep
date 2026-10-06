@@ -42,6 +42,15 @@ it 16-fold.
 | Runtime parameters | Seed `20261005`; 2 Rayon threads/process; shipped native-watch/view budgets; shared full-pass interval 120s |
 | Timing windows (UTC) | Primary 06:29:42-06:50:43; LF scale 06:50:53-06:58:37; CRLF scale 06:58:57-07:00:04; corrective LF 07:08:01-07:09:18 |
 
+The final harness includes a **post-measurement provenance-only hardening
+follow-up**: optional `rustc`/`cargo --version` probes now have five-second
+deadlines and report missing executables, nonzero exits and invocation timeouts
+as unavailable metadata. Process containment and cleanup failures remain fatal.
+Successful timing commands, workload, measurements and equality gates are
+unchanged. The artifacts were neither rerun nor relabeled for this follow-up:
+their exact measured source is the frozen commit/hash above. Use that commit
+when reproducing the historical source byte-for-byte.
+
 No benchmark-session build/test ran concurrently with timing, but a later
 timestamp audit found the coordinator's Windows combined smoke ran
 **06:29:40-06:30:33 UTC**, overlapping the original primary's first 51 seconds.
@@ -250,6 +259,21 @@ worktrees: eight fresh paired cases on Windows and sixteen fresh/restart paired
 cases on Linux, with strict backend/JSON/schema gates and successful cleanup.
 These smokes are functional cross-platform evidence, not additional timing rows
 in the Linux baseline.
+The post-measurement provenance follow-up passes **19 tests on Windows** and
+**18 plus one Windows-only skip on Linux**, including failed optional-tool
+probes and fatal cleanup-error propagation.
+
+**Merge prerequisite:** [PR #175](https://github.com/microsoft/tgrep/pull/175),
+specifically the generic root-script discovery in
+[`ci.yml` at `e7b62505f104f72b5cffaa3c816dd06b000d58f7`](https://github.com/microsoft/tgrep/blob/e7b62505f104f72b5cffaa3c816dd06b000d58f7/.github/workflows/ci.yml),
+must land before this benchmark PR. It runs
+`python -B -m unittest discover -s scripts -p 'test_*.py' -v` in the
+Ubuntu/macOS/Windows test matrix. The standalone benchmark branch's preexisting
+CI does **not** discover these tests yet; its green Rust/agent CI is not a claim
+that it ran this Python suite. The coordinator independently verified combined
+root discovery with the frozen 14-test suite on Windows/Linux; the same discovery
+command runs all 19 current tests locally. Workflow changes remain owned by the
+qualification PR, not duplicated here.
 
 For a small cross-platform functional smoke, not a performance claim:
 

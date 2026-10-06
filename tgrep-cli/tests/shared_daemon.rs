@@ -15,15 +15,21 @@ use tempfile::TempDir;
 const PROFILE: &str = r#"{"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864}"#;
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[path = "shared_daemon/runtime.rs"]
+mod runtime;
+#[path = "shared_daemon/stateful.rs"]
+mod stateful;
+
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .current_dir(root)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .unwrap();
+    let output = runtime::output(
+        Command::new("git")
+            .current_dir(root)
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE"),
+    );
     assert!(
         output.status.success(),
         "git {args:?}: {}",
@@ -33,11 +39,11 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 
 fn cli(root: &Path, args: &[&str]) -> Output {
-    Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
-        .current_dir(root)
-        .args(args)
-        .output()
-        .unwrap()
+    runtime::output(
+        Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+            .current_dir(root)
+            .args(args),
+    )
 }
 
 fn success(output: Output) -> String {

@@ -655,6 +655,58 @@ Four CRLF-transformed paths require 4 private extractions plus the linked
 gitfile's 1 (5 total), with 0 new extractions on no-op verification.
 Sharing never promises to eliminate startup reads or checkout transformations.
 
+### Stateful parity and runtime lifecycle exercisers
+
+The existing `shared_daemon` integration fixture also runs two bounded seeded
+sequences (`stateful::`) and a process supervisor (`runtime::`). These are
+test-only helpers, not an integration SDK or an automatic lease collector:
+
+```sh
+cargo test -p tgrep-cli --test shared_daemon -- stateful:: runtime::
+cargo test -p tgrep-cli --test ripgrep_compat indexed_json_preserves_utf8_match_and_context_offsets
+```
+
+The parity sequences compose edits, additions, deletes, renames, staged and
+unstaged versions, committed divergence, ignore changes, restoration to the
+pin, reset/checkout/rebase, sparse materialization, CRLF checkout bytes and
+daemon restart across three real worktrees. A small independent file/line model
+checks isolation and membership, including hidden gitfiles, empty files and
+filename-only binary entries. CLI line/count/match/file/JSON output is compared
+with `--no-index`; scans exclude the main worktree's actual `.git` directory
+because shared indexes intentionally exclude Git internals. Linked gitfiles
+remain included. Unicode `-F -i` folds are checked through both base and overlay
+paths, ignores and restarts. JSON comparisons retain offsets, lines, submatches
+and match totals; only timing and backend work counters are normalized.
+The accompanying regression checks multibyte UTF-8 before later match/context
+rows through scans, local indexes and the ordinary server.
+
+Every comparison requires the shared backend (RPC identity plus CLI stats/query
+counters); a scan fallback cannot count as passing parity. Writes stop before
+acknowledged hinted/full refresh barriers. Native-watch sequences additionally
+require an event-driven publication before explicit refresh, with bounded retries
+only for documented not-ready/concurrent-invalidation responses. This tests
+processed-input contracts, not a promise that readiness proves latest disk bytes.
+
+Defaults use seed `1742026`, one round per watch mode and small fixtures in normal
+CI. Set `TGREP_SHARED_SEED` to a decimal u64 and `TGREP_SHARED_ROUNDS` to `1..16`
+for replay/stress; invalid values fail rather than silently changing coverage.
+Failures print the seed, round count and ordered operation log. Roles and edit
+payloads vary by seed while prerequisite-dependent transitions remain ordered.
+Each sequence has a 300-second-per-round overall deadline.
+
+The supervisor persists caller-owned tokens outside worktrees before spawning
+actual client processes. It combines simultaneous callers, repeated/lost-response
+attach at the lease limit, explicit crash/timeout cancellation, journal-based
+abandoned-lease recovery, daemon restart with fresh tokens, budget release and
+detach-before-move/remove while a sibling keeps querying. Abandoned leases remain
+live until the runtime explicitly releases them; there is no expiry or GC.
+File-backed child output avoids pipe deadlocks, RPC/start/stop waits are bounded,
+and owned child guards kill/reap only their own PIDs on failure. The ignored
+`runtime::runtime_client_process` test is a subprocess entry point invoked by the
+supervisor, not an additional standalone test to run with `--ignored`.
+Run watcher qualification on native filesystems (including native-ext4 WSL
+checkouts rather than DrvFS); no platform is silently skipped.
+
 ## Implementation status and rollout
 
 The implemented increments are additive; shared serving requires explicit opt-in:

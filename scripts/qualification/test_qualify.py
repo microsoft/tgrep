@@ -96,6 +96,16 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "expected exit 0, got 2"):
             qualify.run([sys.executable, "-c", "raise SystemExit(2)"], cwd=Path.cwd())
 
+    def test_local_content_diagnostic_rejects_server_and_scan_backends(self):
+        indexed = subprocess.CompletedProcess([], 0, "hit\n", "Search completed in 1ms: 1 matches")
+        scanned = subprocess.CompletedProcess([], 0, "hit\n", "Brute-force search completed in 1ms")
+        qualify.assert_parity(indexed, scanned, "Search completed in ")
+        for diagnostic in ("1 matches in 1ms (via server)", "(via shared daemon v1)",
+                           "Brute-force search completed in 1ms"):
+            indexed.stderr = diagnostic
+            with self.assertRaisesRegex(RuntimeError, "expected backend"):
+                qualify.assert_parity(indexed, scanned, "Search completed in ")
+
     def test_server_log_is_read_only_after_process_exit_and_log_close(self):
         events = []
         stream = None

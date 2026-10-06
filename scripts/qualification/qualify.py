@@ -233,7 +233,7 @@ def smoke(binary, scratch):
     def cli(where, *args, timeout=30, expected=0):
         return run([binary, *args], cwd=where, env=env, timeout=timeout, expected=expected)
 
-    def parity(where, backend, *, hidden=False):
+    def parity(where, backend, *, hidden=False, content_backend=None):
         for flags in (["--files"], ["-n", "--with-filename", "-F", "--", PATTERN]):
             options = ["--stats", "--sort", "path", "--color", "never"]
             if hidden:
@@ -243,7 +243,8 @@ def smoke(binary, scratch):
                     options.extend(["--glob", "!.git"])
             indexed = cli(where, *options, *flags, ".")
             scanned = cli(where, "--no-index", *options, *flags, ".")
-            assert_parity(indexed, scanned, backend)
+            expected_backend = content_backend if content_backend and flags[0] != "--files" else backend
+            assert_parity(indexed, scanned, expected_backend)
             require(bool(indexed.stdout.strip()), "fixture must produce nonempty results")
 
     git("init", "-q")
@@ -257,9 +258,8 @@ def smoke(binary, scratch):
     (root / "ignored.txt").write_text(f"{PATTERN} ignored\n", encoding="utf-8")
 
     cli(root, "index", ".")
-    local_files = cli(root, "--files", "--stats", "--sort", "path", ".")
-    assert_parity(local_files, cli(root, "--files", "--stats", "--no-index", "--sort", "path", "."),
-                  "(via local index)")
+    parity(root, "(via local index)", content_backend="Search completed in ")
+    parity(root, "(via local index)", content_backend="Search completed in ", hidden=True)
     with server(binary, root, ["--no-watch"], env, scratch / "ordinary.log") as child:
         wait_for(child, lambda _: marker_owned(root / ".tgrep/serve.json", child),
                  "ordinary registration")

@@ -2,6 +2,7 @@
 
 import copy
 import contextlib
+import gzip
 import io
 import json
 import os
@@ -112,45 +113,131 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(match["data"]["submatches"], row["data"]["submatches"])
 
     def test_output_validation(self):
-        checks = [{"view": 0, "query": q, "equal": True} for q in
-                  bench.QUERIES + ["shared_token -C 1", "--files --hidden"]]
-        mode = {"mode": "ordinary", "ok": True, "cleanup": {"ok": True}, "equality": checks,
-                "queries": {"samples": [{"ms": 1, "backend": "ordinary",
-                                        "diagnostic": "1 matches (1 matched lines) in 1.0ms (via server)"}],
-                            "latency": bench.distribution([1])},
-                "resources_final": {"aggregate": {k: bench.metric(1) for k in bench.RESOURCE_KEYS}}}
-        shared = copy.deepcopy(mode)
-        shared["mode"] = "shared"
-        shared["queries"]["samples"][0].update(
-            backend="shared", diagnostic="1 matches (1 matched lines) in 1.0ms (via shared daemon v1)")
-        report = {"schema": bench.SCHEMA, "cleanup": {"ok": True},
-                  "parameters": {"scenarios": ["lf"], "worktrees": [1], "conditions": ["fresh"],
-                                 "samples_per_view": 1, "churn_rounds": 2},
-                  "cases": [{"scenario": "lf", "worktrees": 1, "condition": "fresh",
-                             "pair_equal": True, "modes": [mode, shared]}]}
+        report = self.report()
         bench.validate(report)
-        metrics = mode["resources_final"]["aggregate"]
-        mode["resources_final"]["aggregate"] = {}
-        with self.assertRaisesRegex(ValueError, "resource"):
+        for key in ("ok", "error", "finished_utc"):
+            del report[key]
+        bench.validate(report, finalized=False)
+        with self.assertRaisesRegex(ValueError, "ok"):
             bench.validate(report)
-        mode["resources_final"]["aggregate"] = metrics
-        mode["queries"]["samples"].append({"ms": 1})
-        with self.assertRaisesRegex(ValueError, "count"):
+
+    @staticmethod
+    def report():
+        # The smallest committed raw artifact is a complete, real v1 schema fixture.
+        path = Path(__file__).parent / "benchmark-results" / "2026-10-06-linux-scale-crlf.json.gz"
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            return json.load(stream)
+
+    def test_output_validation_requires_each_mode_section(self):
+        original = self.report()
+        for index in range(2):
+            for key in original["cases"][0]["modes"][index]:
+                with self.subTest(mode=index, missing=key):
+                    report = copy.deepcopy(original)
+                    del report["cases"][0]["modes"][index][key]
+                    with self.assertRaises(ValueError):
+                        bench.validate(report)
+
+    def test_output_validation_rejects_inconsistent_evidence(self):
+        mutations = [
+            (("resources_final", "aggregate"), {}),
+            (("resources_final", "aggregate", "cpu_seconds", "value"), 999),
+            (("resources_final", "processes"), []),
+            (("queries", "resource_delta", "cpu_seconds", "value"), 999),
+            (("queries", "samples", 0, "ms"), -1),
+            (("queries", "samples", 0, "view"), 999),
+            (("queries", "samples", 0, "query"), "wrong"),
+            (("queries", "samples"), []),
+            (("startup", "total_ready_ms"), 0),
+            (("startup", "per_view"), []),
+            (("startup", "statuses"), []),
+            (("startup", "listener_ms"), {"value": None, "reason": None}),
+            (("storage_final", "total", "files"), "1"),
+            (("storage_ready", "total", "logical_bytes"), -1),
+            (("status_final",), []),
+            (("churn", "reason"), None),
+            (("idle", "reason"), ""),
+            (("cleanup", "processes"), []),
+            (("cleanup", "processes", 0, "exited"), False),
+            (("cleanup", "processes", 0, "pid"), 0),
+            (("cleanup", "processes", 0, "returncode"), None),
+            (("cleanup", "stop_errors"), ["still running"]),
+            (("cleanup", "logs"), []),
+            (("backend_gate", "files_checked"), False),
+        ]
+        for path, value in mutations:
+            with self.subTest(path=path):
+                report = self.report()
+                target = report["cases"][0]["modes"][0]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                with self.assertRaises(ValueError):
+                    bench.validate(report)
+        for key in ("attach_build", "ready"):
+            report = self.report()
+            shared = next(m for m in report["cases"][0]["modes"] if m["mode"] == "shared")
+            del shared["startup"]["attachments"][0][key]
+            with self.subTest(missing=key), self.assertRaises(ValueError):
+                bench.validate(report)
+        report = self.report()
+        report["cleanup"]["fixtures"][0]["removed"] = False
+        with self.assertRaisesRegex(ValueError, "cleanup"):
             bench.validate(report)
-        mode["queries"]["samples"].pop()
-        report["cases"][0]["pair_equal"] = False
-        with self.assertRaisesRegex(ValueError, "equality"):
-            bench.validate(report)
-        report["cases"][0]["pair_equal"] = True
-        report["parameters"]["worktrees"].append(4)
+        report = self.report()
+        report["parameters"]["worktrees"].append(16)
         with self.assertRaisesRegex(ValueError, "matrix"):
             bench.validate(report)
-        report["parameters"]["worktrees"].pop()
-        report["parameters"]["scenarios"] = ["churn"]
-        report["cases"][0]["scenario"] = "churn"
-        mode["churn"] = {"samples": []}
-        with self.assertRaisesRegex(ValueError, "churn"):
+
+    def test_output_validation_requires_active_churn_and_idle_evidence(self):
+        for scenario in ("churn", "lf"):
+            report = self.report()
+            report["parameters"].update(scenarios=[scenario], churn_rounds=1, idle_seconds=1)
+            case = report["cases"][0]
+            case["scenario"] = scenario
+            for mode in case["modes"]:
+                phase = {"reason": None, "samples": [],
+                         "resources_before": copy.deepcopy(mode["resources_final"]),
+                         "resources_after": copy.deepcopy(mode["resources_final"]),
+                         "resource_delta": bench.resource_delta(
+                             mode["resources_final"]["aggregate"], mode["resources_final"]["aggregate"])}
+                if scenario == "churn":
+                    for view in range(case["worktrees"]):
+                        sample = copy.deepcopy(mode["queries"]["samples"][view])
+                        sample.update(round=0, equal=True, polls=1, diagnostics=[])
+                        phase["samples"].append(sample)
+                    phase["latency"] = bench.distribution([s["ms"] for s in phase["samples"]])
+                    phase["statuses"] = [copy.deepcopy(mode["status_final"])]
+                    mode["churn"] = phase
+                    mode["equality_after_churn"] = copy.deepcopy(mode["equality"])
+                else:
+                    keys = (("ready", "reconcile_running", "reconcile_attempts", "total_reads",
+                             "total_extractions", "last_success") if mode["mode"] == "shared" else
+                            ("reconcile_running", "last_reconcile_at",
+                             "last_reconcile_duration_ms", "reconcile_overdue"))
+                    views = [{k: s[k] for k in keys} for s in mode["status_final"]]
+                    phase["samples"] = [{"elapsed_seconds": t, "views": copy.deepcopy(views)}
+                                        for t in (0, 1)]
+                    phase["changed_statuses"] = [
+                        {"elapsed_seconds": 0, "view": i, "status": copy.deepcopy(s)}
+                        for i, s in enumerate(mode["status_final"])]
+                    if mode["mode"] == "shared":
+                        # A real idle full pass can temporarily make the view unready.
+                        observation = phase["samples"][-1]["views"][0]
+                        observation.update(ready=False, reconcile_running=True)
+                        observation["reconcile_attempts"] += 1
+                        phase["changed_statuses"].append(
+                            {"elapsed_seconds": 1, "view": 0,
+                             "status": {**mode["status_final"][0], **observation}})
+                    mode["idle"] = phase
             bench.validate(report)
+            name = "churn" if scenario == "churn" else "idle"
+            for key in case["modes"][0][name]:
+                with self.subTest(phase=name, missing=key):
+                    broken = copy.deepcopy(report)
+                    del broken["cases"][0]["modes"][0][name][key]
+                    with self.assertRaises(ValueError):
+                        bench.validate(broken)
 
     def test_offset_only_difference_rejects_parity(self):
         fixture = type("Fixture", (), {"trees": [Path(".")]})()

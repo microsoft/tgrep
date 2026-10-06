@@ -42,12 +42,16 @@ it 16-fold.
 | Runtime parameters | Seed `20261005`; 2 Rayon threads/process; shipped native-watch/view budgets; shared full-pass interval 120s |
 | Timing windows (UTC) | Primary 06:29:42-06:50:43; LF scale 06:50:53-06:58:37; CRLF scale 06:58:57-07:00:04; corrective LF 07:08:01-07:09:18 |
 
-The final harness includes a **post-measurement provenance-only hardening
-follow-up**: optional `rustc`/`cargo --version` probes now have five-second
+The final harness includes **post-measurement provenance/validation hardening**:
+optional `rustc`/`cargo --version` probes now have five-second
 deadlines and report missing executables, nonzero exits and invocation timeouts
 as unavailable metadata. Process containment and cleanup failures remain fatal.
+The validator now requires the documented evidence sections and cross-checks
+process inventories, aggregates/deltas, startup, status/counters, storage,
+refresh/churn/idle coverage and actual cleanup records instead of trusting only
+summary booleans. All 43 historical pairs pass those stricter checks unchanged.
 Successful timing commands, workload, measurements and equality gates are
-unchanged. The artifacts were neither rerun nor relabeled for this follow-up:
+unchanged. The artifacts were neither rerun nor relabeled for these follow-ups:
 their exact measured source is the frozen commit/hash above. Use that commit
 when reproducing the historical source byte-for-byte.
 
@@ -143,6 +147,10 @@ serialized reconcile worker. These are polling-resolution observations, not
 exact per-view scheduler deadlines or latency targets. Ordinary native servers
 did not report a full reconciliation in that window and used **1.97 seconds**
 of aggregate server CPU; the idle status probes themselves add overhead.
+One shared-view lookup at 120.107 seconds reported `ready: false` while its
+reconciliation was running. This was an idle status observation, not a timed
+query failure; no queries were issued during that phase, and these samples do
+not establish the duration of that readiness transition.
 
 At 32 views, twelve all-view write bursts produced **384 observed latency
 samples per mode**. Fresh churn write-to-indexed-observation p50/p95/max was
@@ -259,9 +267,13 @@ worktrees: eight fresh paired cases on Windows and sixteen fresh/restart paired
 cases on Linux, with strict backend/JSON/schema gates and successful cleanup.
 These smokes are functional cross-platform evidence, not additional timing rows
 in the Linux baseline.
-The post-measurement provenance follow-up passes **19 tests on Windows** and
-**18 plus one Windows-only skip on Linux**, including failed optional-tool
-probes and fatal cleanup-error propagation.
+The current post-measurement source passes **22 tests on Windows** and
+**21 plus one Windows-only skip on Linux**, including failed optional-tool
+probes, fatal cleanup-error propagation and missing/inconsistent report evidence.
+An additional real LF/fresh smoke with one view, eight 256-byte files and three
+queries/view passed on Windows and native-ext4 Linux. It exercised `main()`'s
+pre-finalization validation, finalized report validation, and owned cleanup;
+these functional timings are not added to the baseline.
 
 **Merge prerequisite:** [PR #175](https://github.com/microsoft/tgrep/pull/175),
 specifically the generic root-script discovery in
@@ -272,7 +284,7 @@ Ubuntu/macOS/Windows test matrix. The standalone benchmark branch's preexisting
 CI does **not** discover these tests yet; its green Rust/agent CI is not a claim
 that it ran this Python suite. The coordinator independently verified combined
 root discovery with the frozen 14-test suite on Windows/Linux; the same discovery
-command runs all 19 current tests locally. Workflow changes remain owned by the
+command runs all 22 current tests locally. Workflow changes remain owned by the
 qualification PR, not duplicated here.
 
 For a small cross-platform functional smoke, not a performance claim:
@@ -411,6 +423,11 @@ metric semantics, cases, errors and cleanup. Each case includes exact fixture
 revision/fingerprints, cleanliness, mode order and paired equality. Per-mode
 records retain startup samples/statuses, raw query/churn/refresh/idle samples,
 resource snapshots/deltas, storage growth, equality digests and cleanup/logs.
+`validate(report)` requires a finalized successful envelope and complete
+measurement/cleanup evidence. Internally, `main()` uses `finalized=False` before
+writing its final `ok`/`error`/`finished_utc` fields; this skips only that final
+envelope check, not any measurement or cleanup checks. Idle status validation
+allows the observed transient unready state during a full reconciliation.
 Failures still emit a partial report with `ok: false`; it must never be compared
 as a successful baseline. A binary SHA-256 identifies the executable exactly;
 `--binary-commit` is an explicit caller attestation, not inferred from whatever

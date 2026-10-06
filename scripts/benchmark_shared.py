@@ -841,10 +841,321 @@ def run_mode(fixture, mode, condition, result, idle_seconds):
             raise RuntimeError(f"Owned server cleanup failed: {servers.cleanup}")
 
 
-def validate(report):
+def require_fields(record, **fields):
+    if not isinstance(record, dict):
+        raise ValueError("Expected an evidence object")
+    for key, kinds in fields.items():
+        if type(record.get(key)) not in (kinds if isinstance(kinds, tuple) else (kinds,)):
+            raise ValueError(f"Missing or invalid evidence field: {key}")
+        if key not in record:
+            raise ValueError(f"Missing evidence field: {key}")
+
+
+def validate_mode_evidence(mode, case, params):
+    name, count = mode["mode"], case["worktrees"]
+    require_fields(mode, ok=bool, condition=str, equality=list, queries=dict,
+                   startup=dict, storage_ready=dict, storage_after_churn=dict,
+                   storage_final=dict, storage_after_stop=dict, resources_ready=dict,
+                   resources_final=dict, status_final=list, backend_gate=dict,
+                   churn=dict, refresh=dict, idle=dict, cleanup=dict)
+    if mode["condition"] != case["condition"]:
+        raise ValueError("Mode/case condition mismatch")
+
+    def numbers(values):
+        for value in values:
+            metric(value)
+
+    def counters(value, names, **extra):
+        require_fields(value, **dict.fromkeys(names.split(), int), **extra)
+        numbers(value[k] for k in names.split())
+
+    def metrics(values, keys=RESOURCE_KEYS):
+        if not isinstance(values, dict) or set(values) != set(keys):
+            raise ValueError("Incomplete resource metrics")
+        for item in values.values():
+            require_fields(item, value=(int, float, type(None)), reason=(str, type(None)))
+            metric(item["value"], item["reason"])
+
+    def snapshot(value, expected_pids=None):
+        require_fields(value, processes=list, aggregate=dict)
+        pids = []
+        for process in value["processes"]:
+            require_fields(process, pid=int, metrics=dict)
+            if process["pid"] <= 0:
+                raise ValueError("Invalid resource PID")
+            pids.append(process["pid"])
+            metrics(process["metrics"])
+        if (len(pids) != (count if name == "ordinary" else 1) or
+                len(set(pids)) != len(pids) or
+                (expected_pids is not None and set(pids) != expected_pids)):
+            raise ValueError("Resource process inventory mismatch")
+        metrics(value["aggregate"])
+        if value["aggregate"] != aggregate([p["metrics"] for p in value["processes"]]):
+            raise ValueError("Incorrect resource aggregation")
+        return set(pids)
+
+    pids = snapshot(mode["resources_ready"])
+    snapshot(mode["resources_final"], pids)
+
+    def resources(phase):
+        require_fields(phase, resources_before=dict, resources_after=dict, resource_delta=dict)
+        for key in ("resources_before", "resources_after"):
+            snapshot(phase[key], pids)
+        metrics(phase["resource_delta"], ("cpu_seconds", "read_transfer_bytes", "storage_read_bytes"))
+        if phase["resource_delta"] != resource_delta(
+                phase["resources_before"]["aggregate"], phase["resources_after"]["aggregate"]):
+            raise ValueError("Incorrect resource delta")
+
+    def samples(phase, active):
+        require_fields(phase, samples=list, reason=(str, type(None)))
+        if not active:
+            if phase["samples"] or not phase["reason"]:
+                raise ValueError("Inactive phase needs empty samples and an unavailable reason")
+            return
+        if phase["reason"] is not None or not phase["samples"]:
+            raise ValueError("Active phase requires samples, not an unavailable reason")
+        latency(phase)
+
+    def latency(phase):
+        require_fields(phase, samples=list, latency=dict)
+        for sample in phase["samples"]:
+            require_fields(sample, ms=(int, float), view=int)
+            numbers([sample["ms"]])
+            if not 0 <= sample["view"] < count:
+                raise ValueError("Invalid sample view")
+        if phase["latency"] != distribution([s["ms"] for s in phase["samples"]]):
+            raise ValueError("Incorrect latency aggregation")
+
+    build_fields = ("blob_bytes_read blobs_extracted blobs_read postings_reused "
+                    "predecessor_posting_lists_read reused_indexed_files tracked_entries")
+    reconcile_fields = ("base_files_copied base_reused bytes_read content_reads_avoided epoch "
+                        "files_decoded files_discovered files_extracted files_read hint_lookups "
+                        "overlay_reused postings_copied")
+
+    def status(value, require_ready=False):
+        require_fields(value, reconcile_running=bool)
+        if name == "ordinary":
+            counters(value, "num_files", hidden_complete=bool, indexing=bool,
+                     last_reconcile_at=(int, type(None)),
+                     last_reconcile_duration_ms=(int, type(None)), reconcile_overdue=bool)
+            if require_ready and (not value["hidden_complete"] or value["indexing"]):
+                raise ValueError("Ordinary status is not query-ready")
+        else:
+            counters(value, "base_sharing_views epoch published_epoch reconcile_attempts "
+                     "total_reads total_extractions", ready=bool, root=str, view=str,
+                     generation_build=dict, last_reconcile=dict,
+                     last_success=(int, type(None)))
+            counters(value["generation_build"], build_fields, published=bool, reused_generation=bool)
+            counters(value["last_reconcile"], reconcile_fields, full=bool)
+            if ((require_ready and not value["ready"]) or not 1 <= value["base_sharing_views"] <= count or
+                    value["published_epoch"] > value["epoch"] or
+                    value["last_reconcile"]["epoch"] > value["epoch"] or
+                    value["total_reads"] < value["last_reconcile"]["files_read"] or
+                    value["total_extractions"] < value["last_reconcile"]["files_extracted"]):
+                raise ValueError("Inconsistent shared readiness/counters")
+
+    def statuses(values):
+        if not isinstance(values, list) or len(values) != count:
+            raise ValueError("Incomplete per-view statuses")
+        for value in values:
+            status(value)
+        if name == "shared" and (len({s["root"] for s in values}) != count or
+                                 len({s["view"] for s in values}) != count):
+            raise ValueError("Duplicate shared status views")
+
+    startup = mode["startup"]
+    require_fields(startup, total_ready_ms=(int, float), listener_ms=dict, base_build_ms=dict,
+                   per_view=list, attachments=list, statuses=list, hello=(dict, type(None)))
+    numbers([startup["total_ready_ms"]])
+    for key in ("listener_ms", "base_build_ms"):
+        require_fields(startup[key], value=(int, float, type(None)), reason=(str, type(None)))
+        metric(**startup[key])
+    if len(startup["per_view"]) != count:
+        raise ValueError("Incomplete startup samples")
+    for i, sample in enumerate(startup["per_view"]):
+        require_fields(sample, view=int, ready_ms=(int, float))
+        numbers([sample["ready_ms"]])
+        if sample["view"] != i:
+            raise ValueError("Startup view mismatch")
+        if name == "shared":
+            require_fields(sample, attach_build_register_ms=(int, float))
+            numbers([sample["attach_build_register_ms"]])
+            if sample["ready_ms"] < sample["attach_build_register_ms"]:
+                raise ValueError("Readiness precedes attach")
+    if startup["total_ready_ms"] < sum(s["ready_ms"] for s in startup["per_view"]):
+        raise ValueError("Total startup omits per-view readiness")
+    if name == "shared":
+        require_fields(startup["hello"], protocol=int, limits=dict, capabilities=list)
+        counters(startup["hello"]["limits"], "reconcile_workers query_workers views")
+        if (len(startup["attachments"]) != count or startup["listener_ms"]["value"] is None or
+                startup["listener_ms"]["value"] > startup["total_ready_ms"]):
+            raise ValueError("Missing shared attach/listener evidence")
+        for attachment in startup["attachments"]:
+            require_fields(attachment, attach_build=dict, ready=dict)
+            counters(attachment["attach_build"], build_fields, published=bool, reused_generation=bool)
+            status(attachment["ready"], require_ready=True)
+    elif startup["attachments"] or startup["hello"] is not None or startup["listener_ms"]["value"] is not None:
+        raise ValueError("Unexpected ordinary attach/listener evidence")
+    statuses(startup["statuses"])
+    statuses(mode["status_final"])
+    for key in ("storage_ready", "storage_after_churn", "storage_final", "storage_after_stop"):
+        parts = ("total", "bases", "checkpoints") if name == "shared" else ("total",)
+        require_fields(mode[key], **dict.fromkeys(parts, dict))
+        for part in parts:
+            counters(mode[key][part], "logical_bytes files")
+
+    require_fields(mode["backend_gate"], indexed=str, control=str, files_checked=bool, method=str)
+    if (mode["backend_gate"]["indexed"] != name or mode["backend_gate"]["control"] != "scan" or
+            not mode["backend_gate"]["files_checked"] or not mode["backend_gate"]["method"]):
+        raise ValueError("Incomplete backend gate")
+    latency(mode["queries"])
+    resources(mode["queries"])
+    if [(s["view"], s["query"]) for s in mode["queries"]["samples"]] != [
+            (v, QUERIES[r % len(QUERIES)])
+            for r in range(params["samples_per_view"]) for v in range(count)]:
+        raise ValueError("Query sample coverage/order mismatch")
+
+    churn = mode["churn"]
+    samples(churn, case["scenario"] == "churn")
+    if case["scenario"] == "churn":
+        resources(churn)
+        require_fields(churn, statuses=list)
+        if len(churn["statuses"]) != params["churn_rounds"]:
+            raise ValueError("Incomplete churn status rounds")
+        for values in churn["statuses"]:
+            statuses(values)
+        for sample in churn["samples"]:
+            require_fields(sample, polls=int, diagnostics=list, backend=str)
+            if sample["polls"] < 1 or sample["backend"] != name or not all(
+                    isinstance(d, str) for d in sample["diagnostics"]):
+                raise ValueError("Invalid churn polling evidence")
+
+    refresh = mode["refresh"]
+    samples(refresh, name == "shared")
+    if name == "shared":
+        require_fields(refresh, kind=str)
+        if [s["view"] for s in refresh["samples"]] != list(range(count)):
+            raise ValueError("Incomplete refresh samples")
+        for sample in refresh["samples"]:
+            require_fields(sample, status=dict)
+            status(sample["status"])
+            counters(sample["status"], "processed_epoch")
+            if sample["status"]["processed_epoch"] > sample["status"]["epoch"]:
+                raise ValueError("Invalid refresh acknowledgement epoch")
+
+    idle = mode["idle"]
+    seconds = (params["idle_seconds"] if case["scenario"] == "lf" and
+               count == max(params["worktrees"]) and case["condition"] == "fresh" else 0)
+    require_fields(idle, reason=(str, type(None)), samples=list)
+    if not seconds:
+        samples(idle, False)
+    else:
+        if idle["reason"] is not None or not idle["samples"]:
+            raise ValueError("Missing requested idle observations")
+        resources(idle)
+        require_fields(idle, changed_statuses=list)
+        previous, changes, elapsed = [None] * count, [], -1
+        for sample in idle["samples"]:
+            require_fields(sample, elapsed_seconds=(int, float), views=list)
+            numbers([sample["elapsed_seconds"]])
+            if sample["elapsed_seconds"] < elapsed or len(sample["views"]) != count:
+                raise ValueError("Incomplete or unordered idle observations")
+            elapsed = sample["elapsed_seconds"]
+            for i, value in enumerate(sample["views"]):
+                require_fields(value, reconcile_running=bool)
+                if name == "shared":
+                    counters(value, "reconcile_attempts total_reads total_extractions",
+                             ready=bool, last_success=(int, type(None)))
+                    signature = (value["reconcile_attempts"], value["last_success"])
+                else:
+                    require_fields(value, last_reconcile_at=(int, type(None)),
+                                   last_reconcile_duration_ms=(int, type(None)), reconcile_overdue=bool)
+                    signature = (value["last_reconcile_at"], value["last_reconcile_duration_ms"])
+                if signature != previous[i]:
+                    changes.append((elapsed, i, value))
+                    previous[i] = signature
+        if elapsed < seconds or len(idle["changed_statuses"]) != len(changes):
+            raise ValueError("Incomplete idle duration/change evidence")
+        for event, (elapsed, view, observation) in zip(idle["changed_statuses"], changes):
+            require_fields(event, elapsed_seconds=(int, float), view=int, status=dict)
+            status(event["status"])
+            if (event["elapsed_seconds"] != elapsed or event["view"] != view or
+                    any(event["status"][k] != v for k, v in observation.items())):
+                raise ValueError("Idle change evidence disagrees with observations")
+
+    cleanup = mode["cleanup"]
+    require_fields(cleanup, ok=bool, processes=list, detach_errors=list, stop_errors=list,
+                   log_errors=list, logs=list)
+    for process in cleanup["processes"]:
+        require_fields(process, pid=int, exited=bool, returncode=int)
+        if not process["exited"]:
+            raise ValueError("Cleanup process did not exit")
+    if (not cleanup["ok"] or any(cleanup[k] for k in ("detach_errors", "stop_errors", "log_errors")) or
+            len(cleanup["processes"]) != len(pids) or
+            {p["pid"] for p in cleanup["processes"]} != pids):
+        raise ValueError("Cleanup evidence does not cover owned processes")
+    for log in cleanup["logs"]:
+        require_fields(log, name=str, text=str)
+    if (len(cleanup["logs"]) != len(pids) or
+            {s["name"] for s in cleanup["logs"]} != {f"{name}-{i}.log" for i in range(len(pids))}):
+        raise ValueError("Incomplete cleanup logs")
+
+
+def validate(report, *, finalized=True):
+    require_fields(report, schema=str, cases=list, parameters=dict, cleanup=dict, binary=dict,
+                   host=dict, harness_sha256=str, queries=list, semantics=dict, unavailable=dict,
+                   started_utc=str)
+    if finalized:
+        require_fields(report, ok=bool, error=type(None), finished_utc=str)
+        if not report["ok"]:
+            raise ValueError("Report is not successful")
     if report.get("schema") != SCHEMA or not report.get("cases"):
         raise ValueError("Missing schema/cases")
     params = report["parameters"]
+    require_fields(params, scenarios=list, worktrees=list, conditions=list, samples_per_view=int,
+                   churn_rounds=int, idle_seconds=(int, float), files=int, file_bytes=int,
+                   seed=int, threads=int, timeout=(int, float), binary_commit=str)
+    if (not params["scenarios"] or not params["worktrees"] or
+            not set(params["scenarios"]) <= {"lf", "crlf", "divergent", "churn"} or
+            params["conditions"] not in (["fresh"], ["fresh", "restart"]) or
+            any(type(n) is not int or not 1 <= n <= 32 for n in params["worktrees"]) or
+            not 1 <= params["samples_per_view"] <= 1000 or not 1 <= params["churn_rounds"] <= 100):
+        raise ValueError("Invalid matrix parameters")
+    metric(params["idle_seconds"])
+    require_fields(report["binary"], path=str, source_commit_attested=str, sha256=str, version=str)
+    for value, length in ((report["harness_sha256"], 64), (report["binary"]["sha256"], 64),
+                          (report["binary"]["source_commit_attested"], 40)):
+        if not re.fullmatch(f"[0-9a-f]{{{length}}}", value):
+            raise ValueError("Invalid source/binary provenance hash")
+    if params["binary_commit"] != report["binary"]["source_commit_attested"] or report["queries"] != QUERIES:
+        raise ValueError("Inconsistent binary/query provenance")
+    require_fields(report["host"], platform=str, machine=str, processor=str, python=str,
+                   logical_cpus=(int, type(None)), git=str, rustc=dict, cargo=dict, note=str)
+    for key in ("rustc", "cargo"):
+        value = report["host"][key]
+        require_fields(value, value=(str, type(None)), reason=(str, type(None)))
+        if ((value["value"] is None and not value["reason"]) or
+                (value["value"] is not None and value["reason"] is not None)):
+            raise ValueError("Invalid optional tool provenance")
+    require_fields(report["unavailable"], ordinary_extraction_counters=dict,
+                   whole_process_tree_cpu_io=dict)
+    for value in report["unavailable"].values():
+        require_fields(value, value=(int, float, type(None)), reason=(str, type(None)))
+        metric(**value)
+    for case in report["cases"]:
+        require_fields(case, scenario=str, worktrees=int, condition=str, modes=list, pair_equal=bool,
+                       revision=str, fixture_sha256=list, git_clean=list, order=list,
+                       free_disk_before_fixture_bytes=int)
+        if (not re.fullmatch("[0-9a-f]{40}", case["revision"]) or
+                len(case["fixture_sha256"]) != case["worktrees"] or
+                any(not isinstance(s, str) or not re.fullmatch("[0-9a-f]{64}", s)
+                    for s in case["fixture_sha256"]) or len(case["git_clean"]) != case["worktrees"] or
+                any(type(c) is not bool for c in case["git_clean"])):
+            raise ValueError("Invalid per-view fixture provenance")
+        for mode in case["modes"]:
+            require_fields(mode, mode=str, equality=list)
+        if case["order"] != [m["mode"] for m in case["modes"]]:
+            raise ValueError("Mode execution order mismatch")
     expected = {(s, n, c) for s in params["scenarios"] for n in params["worktrees"]
                 for c in params["conditions"]}
     actual = {(c["scenario"], c["worktrees"], c["condition"]) for c in report["cases"]}
@@ -858,6 +1169,7 @@ def validate(report):
         if case["modes"][0]["equality"] != case["modes"][1]["equality"]:
             raise ValueError("Paired equality records differ")
         for mode in case["modes"]:
+            validate_mode_evidence(mode, case, params)
             if not mode.get("ok") or not mode["cleanup"]["ok"]:
                 raise ValueError("Incomplete run or cleanup")
             if not mode["equality"] or not all(c["equal"] for c in mode["equality"]):
@@ -866,6 +1178,13 @@ def validate(report):
                                for q in QUERIES + ["shared_token -C 1", "--files --hidden"]}
             if {(c["view"], c["query"]) for c in mode["equality"]} != expected_checks:
                 raise ValueError("Incomplete per-view scan equality")
+            if len(mode["equality"]) != len(expected_checks):
+                raise ValueError("Duplicate per-view scan equality")
+            for check in mode["equality"]:
+                require_fields(check, equal=bool, view=int, query=str, rows=int, sha256=str)
+                metric(check["rows"])
+                if not re.fullmatch("[0-9a-f]{64}", check["sha256"]):
+                    raise ValueError("Invalid equality digest")
             queries = mode["queries"]
             if len(queries["samples"]) != case["worktrees"] * params["samples_per_view"]:
                 raise ValueError("Sample count mismatch")
@@ -881,6 +1200,8 @@ def validate(report):
                 metric(item["value"], item["reason"])
             if case["scenario"] == "churn":
                 samples = mode["churn"]["samples"]
+                for sample in samples:
+                    require_fields(sample, round=int, view=int, equal=bool, diagnostic=str)
                 expected_churn = {(r, v) for r in range(params["churn_rounds"])
                                   for v in range(case["worktrees"])}
                 if (len(samples) != len(expected_churn) or
@@ -893,7 +1214,15 @@ def validate(report):
                     raise ValueError("Incorrect churn aggregation")
                 if mode["equality_after_churn"] != mode["equality"]:
                     raise ValueError("Post-churn corpus parity missing/changed")
-    if not report["cleanup"]["ok"]:
+    require_fields(report["cleanup"], ok=bool, fixtures=list)
+    fixtures = report["cleanup"]["fixtures"]
+    for fixture in fixtures:
+        require_fields(fixture, path=str, removed=bool, permission_retries=list)
+        if not fixture["removed"] or not fixture["path"] or not all(
+                isinstance(r, str) for r in fixture["permission_retries"]):
+            raise ValueError("Missing fixture cleanup evidence")
+    if (not report["cleanup"]["ok"] or len(fixtures) != len(params["scenarios"]) * len(params["worktrees"]) or
+            len({f["path"] for f in fixtures}) != len(fixtures)):
         raise ValueError("Fixture cleanup failed")
 
 
@@ -1046,7 +1375,8 @@ def main(argv=None):
                     cleanup["permission_retries"] = remove_fixture(fixture.root)
                     cleanup["removed"] = not fixture.root.exists()
                     report["cleanup"]["ok"] &= cleanup["removed"]
-        validate(report)
+        # The final status envelope is written below, after qualification succeeds.
+        validate(report, finalized=False)
     except (Exception, KeyboardInterrupt) as caught:
         error = f"{type(caught).__name__}: {caught}"
         print(error, file=sys.stderr)

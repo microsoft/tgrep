@@ -46,10 +46,11 @@ The final harness includes **post-measurement provenance/validation hardening**:
 optional `rustc`/`cargo --version` probes now have five-second
 deadlines and report missing executables, nonzero exits and invocation timeouts
 as unavailable metadata. Process containment and cleanup failures remain fatal.
-The validator now requires the documented evidence sections and cross-checks
-process inventories, aggregates/deltas, startup, status/counters, storage,
-refresh/churn/idle coverage and actual cleanup records instead of trusting only
-summary booleans. All 43 historical pairs pass those stricter checks unchanged.
+The validator now requires the documented evidence sections, checks storage
+types/completeness, and cross-checks process inventories, aggregates/deltas,
+startup, status/counters, refresh/churn/idle coverage and actual cleanup records
+instead of trusting only summary booleans. All 43 historical pairs pass those
+stricter checks unchanged.
 Successful timing commands, workload, measurements and equality gates are
 unchanged. The artifacts were neither rerun nor relabeled for these follow-ups:
 their exact measured source is the frozen commit/hash above. Use that commit
@@ -423,12 +424,25 @@ metric semantics, cases, errors and cleanup. Each case includes exact fixture
 revision/fingerprints, cleanliness, mode order and paired equality. Per-mode
 records retain startup samples/statuses, raw query/churn/refresh/idle samples,
 resource snapshots/deltas, storage growth, equality digests and cleanup/logs.
+Storage `total`, `bases` and `checkpoints` are **separate sequential directory
+walks**, not an atomic partition snapshot. Background checkpoint publication
+between walks can make a later subtree sum exceed an earlier total. Validation
+therefore requires every storage stage and nonnegative integer byte/file counts,
+but does not impose `total >= bases + checkpoints` on live observations. Do not
+interpret subtree arithmetic as simultaneous filesystem accounting. The 172
+retained shared storage observations happen to satisfy that relationship; this
+is an observation, not a guarantee made by the sampling method.
+
 `validate(report)` requires a finalized successful envelope and complete
 measurement/cleanup evidence. Internally, `main()` uses `finalized=False` before
 writing its final `ok`/`error`/`finished_utc` fields; this skips only that final
 envelope check, not any measurement or cleanup checks. Idle status validation
 allows the observed transient unready state during a full reconciliation.
-Failures still emit a partial report with `ok: false`; it must never be compared
-as a successful baseline. A binary SHA-256 identifies the executable exactly;
+Once report construction succeeds, measurement, validation and cleanup failures
+emit a partial report with `ok: false`; it must never be compared as a successful
+baseline. Argument validation and required binary/Git version probes happen
+before that boundary: their failures exit with a diagnostic and do not create
+a JSON report. Optional Rust probe failures instead become unavailable metadata.
+A binary SHA-256 identifies the executable exactly;
 `--binary-commit` is an explicit caller attestation, not inferred from whatever
 checkout happens to contain the script.

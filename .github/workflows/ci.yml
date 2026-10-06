@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '0 8 * * 1' # Weekly release qualification, native filesystems on all OSes
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,6 +19,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup component add rustfmt
@@ -21,10 +28,11 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup component add clippy
-      - run: cargo clippy --workspace --benches -- -D warnings
+      - run: cargo clippy --locked --workspace --benches -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -33,14 +41,29 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test Unix installer
         if: runner.os != 'Windows'
         run: bash scripts/test-install.sh
-      - run: cargo build --workspace --verbose
+      - name: Test qualification runner
+        run: python -B -m unittest discover -s scripts/qualification -p 'test_*.py' -v
+      - name: Check locked dependency graphs and all four fuzz targets
+        if: runner.os == 'Linux'
+        run: python -B scripts/qualification/qualify.py dependencies
+      - name: Test vendored ignore, including doctests (separate workspace)
+        run: cargo test --manifest-path vendor/ignore/Cargo.toml --locked
+      - run: cargo build --locked --workspace --verbose
       - name: Test agent integrations
         if: runner.os != 'Windows'
         run: python3 -B -m unittest discover -s scripts/agent -p 'test_*.py' -v
-      - run: cargo build --workspace --benches --verbose
-      - run: cargo test --workspace --verbose
+      - run: cargo build --locked --workspace --benches --verbose
+      - run: cargo test --locked --workspace --verbose
+      - name: Qualify private checkout installation
+        # Pay for one release build on PRs/pushes; cover all OSes weekly/manually.
+        if: runner.os == 'Linux' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: python -B scripts/qualification/qualify.py installed
+      - name: Verify all lockfiles stayed unchanged
+        if: always()
+        run: git diff --exit-code -- Cargo.lock fuzz/Cargo.lock vendor/ignore/Cargo.lock

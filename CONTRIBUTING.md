@@ -32,6 +32,58 @@ cargo clippy --all-targets
 cargo build --release
 ```
 
+## Recurring release qualification
+
+The CI workflow runs on PRs and pushes to `main`, weekly on Monday at 08:00 UTC,
+and manually with **Actions > CI > Run workflow**. Its native Linux, macOS and
+Windows matrix is fail-fast disabled and bounded to 40 minutes per test job.
+Existing Rust and Python agent integration coverage is retained. Workspace
+builds/tests are locked; the separately excluded `vendor/ignore` manifest runs
+its upstream unit/integration tests **and doctests** on each OS at version
+0.4.25. Do not format or upgrade vendored code to satisfy unrelated checks;
+see its [provenance and distribution contract](vendor/ignore/PATCHES.md).
+
+Linux additionally validates both complete Cargo dependency graphs and checks
+all four fuzz binaries with `--locked`. Exactly one `ignore`, resolving directly
+from `tgrep-core` to `vendor/ignore`, is required in each graph. This is a stable
+Cargo compile check using the host C++ compiler, not a sanitizer fuzz campaign;
+the separate nightly weekly/manual Fuzz workflow remains unchanged.
+
+An installed-release smoke runs on Linux for each PR/push and on **all three
+OSes weekly/manually**. It runs the documented
+`cargo install --path tgrep-cli --locked --root <private-temporary-root>`, then
+uses that exact installed executable for ordinary index/server search and file
+listing, shared attach/readiness/refresh, scan parity, stale-daemon fallback over
+a deliberately stale ordinary index, restart, detach and worktree deletion while
+the daemon remains alive. Backend diagnostics are required: matching scan
+results alone cannot accidentally qualify a broken indexed backend. No runtime
+integration, user-home installation, signing or release publication occurs.
+Only one release-profile build is added to normal PR CI; the existing builds
+share Cargo's checkout target directory and downloads where Cargo permits.
+
+To reproduce in an isolated source checkout with Cargo, Git, Python 3.11+ and
+a C++ compiler available:
+
+```bash
+python -B -m unittest discover -s scripts/qualification -p 'test_*.py' -v
+cargo test --manifest-path vendor/ignore/Cargo.toml --locked
+cargo build --locked --workspace
+cargo test --locked --workspace
+python -B scripts/qualification/qualify.py dependencies # Linux fuzz compile check
+python -B scripts/qualification/qualify.py installed
+git diff --exit-code -- Cargo.lock fuzz/Cargo.lock vendor/ignore/Cargo.lock
+```
+
+The helper uses private temporary Git fixtures, configuration, external shared
+storage, logs and installation roots. Commands/readiness have deadlines; owned
+processes are stopped and reaped before temporary roots are removed, including
+on failure. Cargo's normal cache is not removed. All three lockfiles must remain
+byte-for-byte unchanged, even on helper failure. For native Unix invalid-byte
+regressions, run the Rust suite on native Linux/macOS filesystems; under WSL use
+a native checkout and `TMPDIR`, not a Windows-mounted `/mnt/...` directory.
+These checks qualify checkout-based distribution, not crates.io packaging or
+the separate cross-build/signing pipelines.
+
 ## Pre-commit Hook
 
 Install the git hook to auto-check formatting and lints before each commit:

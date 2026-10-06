@@ -30,8 +30,14 @@ impl Process {
     }
 
     fn cancel(&mut self) {
-        if self.child.try_wait().unwrap().is_none() {
-            self.child.kill().unwrap();
+        if self.child.try_wait().unwrap().is_none()
+            && let Err(error) = self.child.kill()
+        {
+            assert!(
+                self.child.try_wait().unwrap().is_some(),
+                "cannot cancel owned PID {}: {error}",
+                self.child.id()
+            );
         }
         self.child.wait().unwrap();
     }
@@ -285,6 +291,7 @@ fn runtime_sessions_recover_abandonment_restart_and_release_budgets() {
         .unwrap_err();
     assert!(timeout.contains("killed and reaped"), "{timeout}");
     assert!(retried.process.child.try_wait().unwrap().is_some());
+    retried.process.cancel();
     assert_eq!(d.lookup(&f.b)["leases"], 1);
     let c = f.third(&f.revision);
     let c_journal = Session::persist(&f, &d, "replacement", &c, false);

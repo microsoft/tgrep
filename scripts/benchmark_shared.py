@@ -22,6 +22,8 @@ import time
 
 
 SCHEMA = "tgrep.shared-benchmark.v1"
+MAX_FILES = 4096
+MAX_TREE_BYTES = 32 * 1024 * 1024
 QUERIES = ["symbol_000007", "shared_token", "absent_marker_xyz"]
 RESOURCE_KEYS = (
     "cpu_seconds", "rss_bytes", "private_bytes", "pss_bytes",
@@ -132,6 +134,8 @@ if os.name == "nt":
         "Thread32Next": (wt.BOOL, [wt.HANDLE, ctypes.POINTER(ThreadEntry)]),
         "OpenThread": (wt.HANDLE, [wt.DWORD, wt.BOOL, wt.DWORD]),
         "ResumeThread": (wt.DWORD, [wt.HANDLE]),
+        "GetVolumePathNameW": (wt.BOOL, [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]),
+        "GetDiskFreeSpaceW": (wt.BOOL, [wt.LPCWSTR] + [ctypes.POINTER(wt.DWORD)] * 4),
     }.items():
         getattr(kernel, name).restype = result
         getattr(kernel, name).argtypes = arguments
@@ -435,6 +439,35 @@ def remove_fixture(root):
             time.sleep(.05)
 
 
+def allocation_unit(path):
+    if os.name == "nt":
+        volume = ctypes.create_unicode_buffer(32768)
+        if not kernel.GetVolumePathNameW(str(path), volume, len(volume)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        sectors, sector_bytes, free_clusters, total_clusters = [wt.DWORD() for _ in range(4)]
+        if not kernel.GetDiskFreeSpaceW(
+                volume.value, ctypes.byref(sectors), ctypes.byref(sector_bytes),
+                ctypes.byref(free_clusters), ctypes.byref(total_clusters)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        unit = sectors.value * sector_bytes.value
+    else:
+        info = os.statvfs(path)
+        unit = info.f_frsize or info.f_bsize
+    if unit <= 0:
+        raise OSError("Filesystem did not report a positive allocation unit")
+    return unit
+
+
+def fixture_disk_reserve(files, file_bytes, count, allocation_bytes):
+    if type(allocation_bytes) is not int or allocation_bytes <= 0:
+        raise ValueError("Allocation unit must be a positive integer")
+    unit = max(4096, allocation_bytes)
+    # Allow worst-case CRLF expansion, allocation rounding and one metadata unit
+    # per entry, then headroom for Git, both indexes and temporary publications.
+    allocated_file = ((2 * file_bytes + unit - 1) // unit) * unit
+    return (files + 8) * (allocated_file + unit) * (count + 1) * 4 + 256 * 1024 * 1024
+
+
 class Fixture:
     def __init__(self, parent, args, count, scenario):
         self.root = Path(tempfile.mkdtemp(prefix="tgrep-shared-bench-", dir=parent)).resolve()
@@ -467,10 +500,11 @@ class Fixture:
 
     def populate(self, count):
         self.free_disk_before = shutil.disk_usage(self.root).free
-        reserve = self.args.files * self.args.file_bytes * (count + 1) * 4 + 256 * 1024 * 1024
+        unit = allocation_unit(self.root)
+        reserve = fixture_disk_reserve(self.args.files, self.args.file_bytes, count, unit)
         if self.free_disk_before < reserve:
             raise RuntimeError(f"Insufficient free disk: {self.free_disk_before} < "
-                               f"{reserve} byte conservative fixture/index reserve")
+                               f"{reserve} byte fixture/index reserve (allocation unit {unit})")
         self.git("init", "--quiet", "--template=")
         self.git("config", "core.autocrlf", "false")
         self.git("config", "core.safecrlf", "false")
@@ -851,6 +885,35 @@ def require_fields(record, **fields):
             raise ValueError(f"Missing evidence field: {key}")
 
 
+def validate_parameters(params):
+    require_fields(params, scenarios=list, worktrees=list, conditions=list, samples_per_view=int,
+                   churn_rounds=int, churn_interval=(int, float), idle_seconds=(int, float),
+                   files=int, file_bytes=int, seed=int, threads=int, timeout=(int, float),
+                   binary_commit=str)
+    if (not params["worktrees"] or
+            any(type(n) is not int or not 1 <= n <= 32 for n in params["worktrees"])):
+        raise ValueError("worktrees must contain counts in 1..32")
+    if (not params["scenarios"] or
+            any(type(s) is not str or s not in ("lf", "crlf", "divergent", "churn")
+                for s in params["scenarios"])):
+        raise ValueError("scenarios must contain lf, crlf, divergent or churn")
+    if params["conditions"] not in (["fresh"], ["fresh", "restart"]):
+        raise ValueError("conditions must be fresh or fresh,restart")
+    for key in ("worktrees", "scenarios"):
+        if len(params[key]) != len(set(params[key])):
+            raise ValueError(f"Duplicate {key} are not allowed")
+    for key, lower, upper in (
+            ("files", 8, MAX_FILES), ("samples_per_view", 1, 1000), ("churn_rounds", 1, 100),
+            ("churn_interval", 0, 10), ("idle_seconds", 0, 600), ("timeout", 1, 600),
+            ("threads", 1, 8)):
+        if not lower <= params[key] <= upper:
+            raise ValueError(f"{key} must be {lower}..{upper}")
+    if params["file_bytes"] < 256 or params["files"] * params["file_bytes"] > MAX_TREE_BYTES:
+        raise ValueError("file_bytes must be >=256 with <=32 MiB generated text per tree")
+    if not re.fullmatch("[0-9a-f]{40}", params["binary_commit"]):
+        raise ValueError("binary_commit must be a full lowercase SHA")
+
+
 def validate_mode_evidence(mode, case, params):
     name, count = mode["mode"], case["worktrees"]
     require_fields(mode, ok=bool, condition=str, equality=list, queries=dict,
@@ -1112,16 +1175,7 @@ def validate(report, *, finalized=True):
     if report.get("schema") != SCHEMA or not report.get("cases"):
         raise ValueError("Missing schema/cases")
     params = report["parameters"]
-    require_fields(params, scenarios=list, worktrees=list, conditions=list, samples_per_view=int,
-                   churn_rounds=int, idle_seconds=(int, float), files=int, file_bytes=int,
-                   seed=int, threads=int, timeout=(int, float), binary_commit=str)
-    if (not params["scenarios"] or not params["worktrees"] or
-            not set(params["scenarios"]) <= {"lf", "crlf", "divergent", "churn"} or
-            params["conditions"] not in (["fresh"], ["fresh", "restart"]) or
-            any(type(n) is not int or not 1 <= n <= 32 for n in params["worktrees"]) or
-            not 1 <= params["samples_per_view"] <= 1000 or not 1 <= params["churn_rounds"] <= 100):
-        raise ValueError("Invalid matrix parameters")
-    metric(params["idle_seconds"])
+    validate_parameters(params)
     require_fields(report["binary"], path=str, source_commit_attested=str, sha256=str, version=str)
     for value, length in ((report["harness_sha256"], 64), (report["binary"]["sha256"], 64),
                           (report["binary"]["source_commit_attested"], 40)):
@@ -1246,7 +1300,8 @@ def parse_args(argv=None):
     parser.add_argument("--worktrees", default="1,4,16,32")
     parser.add_argument("--scenarios", default="lf,crlf,divergent,churn")
     parser.add_argument("--conditions", default="fresh,restart")
-    parser.add_argument("--files", type=int, default=128)
+    parser.add_argument("--files", type=int, default=128,
+                        help=f"Synthetic text files per tree (8..{MAX_FILES})")
     parser.add_argument("--file-bytes", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=20261005)
     parser.add_argument("--threads", type=int, default=2,
@@ -1271,27 +1326,10 @@ def parse_args(argv=None):
         parser.error("--worktrees must be comma-separated integers")
     args.scenarios = args.scenarios.split(",")
     args.conditions = args.conditions.split(",")
-    if not args.worktrees or any(n < 1 or n > 32 for n in args.worktrees):
-        parser.error("worktree counts must be 1..32 (default daemon budget)")
-    if not set(args.scenarios) <= {"lf", "crlf", "divergent", "churn"}:
-        parser.error("unknown scenario")
-    if args.conditions not in (["fresh"], ["fresh", "restart"]):
-        parser.error("--conditions must be fresh or fresh,restart")
-    if args.files < 8 or args.file_bytes < 256 or args.files * args.file_bytes > 32 * 1024 * 1024:
-        parser.error("require >=8 files, >=256 bytes/file, <=32 MiB/tree")
-    if not 1 <= args.samples_per_view <= 1000 or not 1 <= args.churn_rounds <= 100:
-        parser.error("samples/view must be 1..1000; churn rounds 1..100")
-    if not 0 <= args.churn_interval <= 10 or not 0 <= args.idle_seconds <= 600:
-        parser.error("churn interval must be 0..10s; idle must be 0..600s")
-    if not 1 <= args.timeout <= 600:
-        parser.error("timeout must be 1..600s")
-    if not 1 <= args.threads <= 8:
-        parser.error("threads must be 1..8")
-    if len(args.binary_commit) != 40 or any(c not in "0123456789abcdef" for c in args.binary_commit):
-        parser.error("--binary-commit must be a full lowercase SHA")
-    for values in (args.worktrees, args.scenarios):
-        if len(values) != len(set(values)):
-            parser.error("duplicate cases are not allowed")
+    try:
+        validate_parameters(vars(args))
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 

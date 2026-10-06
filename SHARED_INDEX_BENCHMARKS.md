@@ -42,7 +42,7 @@ it 16-fold.
 | Runtime parameters | Seed `20261005`; 2 Rayon threads/process; shipped native-watch/view budgets; shared full-pass interval 120s |
 | Timing windows (UTC) | Primary 06:29:42-06:50:43; LF scale 06:50:53-06:58:37; CRLF scale 06:58:57-07:00:04; corrective LF 07:08:01-07:09:18 |
 
-The final harness includes **post-measurement provenance/validation hardening**:
+The final harness includes **post-measurement provenance/validation/safety hardening**:
 optional `rustc`/`cargo --version` probes now have five-second
 deadlines and report missing executables, nonzero exits and invocation timeouts
 as unavailable metadata. Process containment and cleanup failures remain fatal.
@@ -51,6 +51,10 @@ types/completeness, and cross-checks process inventories, aggregates/deltas,
 startup, status/counters, refresh/churn/idle coverage and actual cleanup records
 instead of trusting only summary booleans. All 43 historical pairs pass those
 stricter checks unchanged.
+Setup now caps generated file count at 4,096, reserves allocation/metadata
+overhead before population, and shares workload-parameter bounds between CLI
+parsing and report validation, including the previously unchecked churn pause.
+The measured 4,096-file supplement remains supported.
 Successful timing commands, workload, measurements and equality gates are
 unchanged. The artifacts were neither rerun nor relabeled for these follow-ups:
 their exact measured source is the frozen commit/hash above. Use that commit
@@ -268,9 +272,10 @@ worktrees: eight fresh paired cases on Windows and sixteen fresh/restart paired
 cases on Linux, with strict backend/JSON/schema gates and successful cleanup.
 These smokes are functional cross-platform evidence, not additional timing rows
 in the Linux baseline.
-The current post-measurement source passes **22 tests on Windows** and
-**21 plus one Windows-only skip on Linux**, including failed optional-tool
-probes, fatal cleanup-error propagation and missing/inconsistent report evidence.
+The current post-measurement source passes **27 tests on Windows** and
+**26 plus one Windows-only skip on Linux**, including failed optional-tool
+probes, fatal cleanup-error propagation, missing/inconsistent report evidence,
+shared parameter bounds and allocation-aware disk safety.
 An additional real LF/fresh smoke with one view, eight 256-byte files and three
 queries/view passed on Windows and native-ext4 Linux. It exercised `main()`'s
 pre-finalization validation, finalized report validation, and owned cleanup;
@@ -285,7 +290,7 @@ Ubuntu/macOS/Windows test matrix. The standalone benchmark branch's preexisting
 CI does **not** discover these tests yet; its green Rust/agent CI is not a claim
 that it ran this Python suite. The coordinator independently verified combined
 root discovery with the frozen 14-test suite on Windows/Linux; the same discovery
-command runs all 22 current tests locally. Workflow changes remain owned by the
+command runs all 27 current tests locally. Workflow changes remain owned by the
 qualification PR, not duplicated here.
 
 For a small cross-platform functional smoke, not a performance claim:
@@ -408,15 +413,29 @@ an uncatchable kill or host crash cannot
 guarantee Python cleanup. Child stdout/stderr never uses an undrained pipe for
 long-lived servers.
 
-Limits include at most 32 views, 32 MiB generated text per tree, 100 churn rounds,
-and configurable per-command/readiness deadlines (`--timeout`, default 60s).
+Limits include at most 32 views, 4,096 generated text files and 32 MiB nominal LF
+text per tree, 100 churn rounds, and configurable per-command/readiness deadlines
+(`--timeout`, default 60s). CLI parsing and report validation share the same
+type/range checks for all workload parameters, including `churn_interval`,
+file count/size, threads, samples/rounds, idle duration and timeout.
 Default corpus footprint across 32 trees is roughly 16 MiB plus Git/index data;
 index/process memory is additional. `--files`, `--file-bytes`, `--seed`,
 `--samples-per-view`, `--churn-rounds`, `--threads` and `--idle-seconds` are recorded.
 There is deliberately no real-repository clone mode or global cache manipulation.
-Each fixture checks free disk against a conservative source/index reserve before
-population. This does not impose a process-memory cap; check host memory before
-increasing the corpus, especially for transformed private overlays.
+Before Git initialization or corpus population, each fixture reads the temp
+filesystem's allocation unit (`GetVolumePathNameW`/`GetDiskFreeSpaceW` on Windows,
+`statvfs` on Unix). A failed geometry probe aborts rather than guessing. The
+reserve rounds twice each nominal file size (worst-case CRLF expansion) to at
+least a 4 KiB allocation unit, adds one unit of per-entry metadata allowance,
+and allows eight auxiliary entries per tree. It covers the main checkout plus
+all worktrees, multiplies by four for Git, both indexes and temporary
+publications, and retains a 256 MiB fixed allowance. The file-count cap also
+prevents millions of tiny files from passing the logical-byte cap.
+
+This is a conservative preflight heuristic, not a disk reservation, a
+filesystem-specific metadata upper bound or a process-memory cap. Other users
+can consume free space after the check; check host memory before increasing the
+corpus, especially for transformed private overlays.
 
 JSON schema ID is `tgrep.shared-benchmark.v1`. Top-level fields include parameters,
 binary source-commit attestation/hash/version, harness hash, host/tool versions,

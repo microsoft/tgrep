@@ -75,6 +75,110 @@ class MetricsTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 bench.parse_args(base)
 
+    def test_report_requires_every_workload_parameter(self):
+        for key in ("scenarios", "worktrees", "conditions", "samples_per_view", "churn_rounds",
+                    "churn_interval", "idle_seconds", "files", "file_bytes", "seed", "threads",
+                    "timeout", "binary_commit"):
+            report = self.report()
+            del report["parameters"][key]
+            with self.subTest(missing=key), self.assertRaisesRegex(ValueError, key):
+                bench.validate(report)
+
+    def test_parser_and_report_share_parameter_bounds(self):
+        invalid = {
+            "worktrees": [[], [0], [33], [1, 1]],
+            "scenarios": [[], ["unknown"], ["lf", "lf"]],
+            "conditions": [["restart"], ["fresh", "fresh"]],
+            "files": [7, 4097, 131072],
+            "file_bytes": [255, 32 * 1024 * 1024],
+            "threads": [0, 9],
+            "samples_per_view": [0, 1001],
+            "churn_rounds": [0, 101],
+            "churn_interval": [-.1, 10.1, float("nan"), float("inf")],
+            "idle_seconds": [-1, 601, float("nan"), float("inf")],
+            "timeout": [0, 601, float("nan"), float("inf")],
+            "binary_commit": ["", "A" * 40],
+        }
+        with tempfile.TemporaryDirectory(prefix="tgrep-bench-test-") as directory:
+            base = ["--binary", sys.executable, "--binary-commit", "a" * 40,
+                    "--output", str(Path(directory) / "result.json")]
+            for key, values in invalid.items():
+                for value in values:
+                    with self.subTest(key=key, value=value):
+                        report = self.report()
+                        report["parameters"][key] = value
+                        extra = []
+                        if key == "files":
+                            report["parameters"]["file_bytes"] = 256
+                            extra = ["--file-bytes", "256"]
+                        with self.assertRaises(ValueError):
+                            bench.validate(report)
+                        argument = ",".join(map(str, value)) if isinstance(value, list) else str(value)
+                        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                            bench.parse_args(base + ["--" + key.replace("_", "-"), argument] + extra)
+            args = bench.parse_args(base + ["--files", "4096", "--file-bytes", "8192",
+                                           "--worktrees", "1,4,16,32", "--threads", "8",
+                                           "--churn-interval", "10", "--idle-seconds", "600",
+                                           "--timeout", "600", "--samples-per-view", "1000",
+                                           "--churn-rounds", "100"])
+            bench.validate_parameters(vars(args))
+        for key, value in (("files", True), ("threads", 1.5), ("seed", False),
+                           ("churn_interval", "0.1"), ("worktrees", [True])):
+            report = self.report()
+            report["parameters"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                bench.validate(report)
+
+    def test_fixture_reserve_accounts_for_allocation_and_metadata(self):
+        for files, size, count, unit in ((131072, 256, 32, 4096), (4096, 8192, 32, 4096),
+                                         (4096, 256, 32, 65536), (8, 256, 1, 512)):
+            block = max(4096, unit)
+            payload = ((2 * size + block - 1) // block) * block
+            reserve = bench.fixture_disk_reserve(files, size, count, unit)
+            with self.subTest(files=files, size=size, unit=unit):
+                self.assertEqual(reserve, (files + 8) * (payload + block) * (count + 1) * 4
+                                 + 256 * 1024 * 1024)
+                self.assertGreater(reserve, files * ((size + block - 1) // block) * block * (count + 1))
+        for unit in (0, -1, True, 4096.0):
+            with self.subTest(unit=unit), self.assertRaises(ValueError):
+                bench.fixture_disk_reserve(8, 256, 1, unit)
+
+    def test_disk_guard_rejects_before_git_or_file_population(self):
+        args = bench.argparse.Namespace(**self.report()["parameters"])
+        args.files, args.file_bytes = 4096, 256
+        reserve = bench.fixture_disk_reserve(args.files, args.file_bytes, 32, 4096)
+        with tempfile.TemporaryDirectory(prefix="tgrep-bench-test-") as directory:
+            fixture = bench.Fixture(directory, args, 32, "lf")
+            try:
+                with patch.object(bench, "allocation_unit", return_value=4096), \
+                        patch.object(bench.shutil, "disk_usage") as usage, \
+                        patch.object(fixture, "git") as git:
+                    usage.return_value.free = reserve - 1
+                    git.side_effect = AssertionError("population started before disk guard")
+                    with self.assertRaisesRegex(RuntimeError, "Insufficient free disk"):
+                        fixture.populate(32)
+                    git.assert_not_called()
+                    self.assertFalse((fixture.repo / "src").exists())
+                    self.assertEqual(fixture.trees, [])
+                    usage.return_value.free = reserve
+                    git.side_effect = RuntimeError("guard passed")
+                    with self.assertRaisesRegex(RuntimeError, "guard passed"):
+                        fixture.populate(32)
+                    git.assert_called_once()
+                with patch.object(bench, "allocation_unit", side_effect=OSError("geometry failed")), \
+                        patch.object(fixture, "git") as git:
+                    with self.assertRaisesRegex(OSError, "geometry failed"):
+                        fixture.populate(32)
+                    git.assert_not_called()
+            finally:
+                bench.remove_fixture(fixture.root)
+
+    def test_allocation_unit_uses_fixture_filesystem(self):
+        with tempfile.TemporaryDirectory(prefix="tgrep-bench-test-") as directory:
+            unit = bench.allocation_unit(Path(directory))
+            self.assertIs(type(unit), int)
+            self.assertGreater(unit, 0)
+
     def test_nearest_rank_and_empty(self):
         self.assertEqual(bench.distribution(list(range(1, 21))),
                          {"count": 20, "p50_ms": 10, "p95_ms": 19,

@@ -14,7 +14,9 @@
 #   - Builds tgrep.exe for Windows x64 and arm64
 #   - Signs tgrep.exe using OneBranch signing (no ESRP service connection needed)
 #   - Packages into zip matching the GitHub release.yml naming convention
-#   - Optionally uploads signed zip to GitHub Release via GitHubRelease@1 ADO task
+#   - Generates a SHA256 sidecar for each signed zip (<zip-name>.sha256)
+#     without modifying the Linux/macOS release workflow's checksums.txt
+#   - Optionally uploads each signed zip and its checksum via GitHubRelease@1 ADO task
 #
 # Prerequisites:
 #   - DeepPrompt ADO project must have access to OneBranch.Pipelines/GovernedTemplates repo
@@ -214,23 +216,47 @@ extends:
                 displayName: 'Package signed tgrep.exe into zip'
 
               # ---------------------------------------------------------------
-              # Step 10: Copy to OneBranch output directory
+              # Step 10: Hash the final signed archive, not the unsigned executable
+              # ---------------------------------------------------------------
+              - powershell: |
+                  $ErrorActionPreference = 'Stop'
+                  $zipName = "tgrep-$(TGREP_TAG)-x86_64-pc-windows-msvc.zip"
+                  $zipPath = Join-Path "$(Build.ArtifactStagingDirectory)" $zipName
+                  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+                  $stream = $null
+                  try {
+                    $stream = [System.IO.File]::OpenRead($zipPath)
+                    $hash = [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+                  } finally {
+                    if ($null -ne $stream) { $stream.Dispose() }
+                    $sha256.Dispose()
+                  }
+                  $checksumPath = "$zipPath.sha256"
+                  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+                  [System.IO.File]::WriteAllText($checksumPath, "$hash  $zipName`n", $utf8NoBom)
+                  Write-Host "Written: $checksumPath"
+                displayName: 'Generate SHA256 checksum for signed Windows x64 archive'
+
+              # ---------------------------------------------------------------
+              # Step 11: Copy to OneBranch output directory
               # This directory is automatically uploaded as a pipeline artifact by OneBranch.
               # ---------------------------------------------------------------
               - task: CopyFiles@2
                 displayName: 'Copy artifacts to ONEBRANCH_ARTIFACT'
                 inputs:
                   SourceFolder: '$(Build.ArtifactStagingDirectory)'
-                  Contents: '*.zip'
+                  Contents: |
+                    tgrep-$(TGREP_TAG)-x86_64-pc-windows-msvc.zip
+                    tgrep-$(TGREP_TAG)-x86_64-pc-windows-msvc.zip.sha256
                   TargetFolder: '$(Build.ArtifactStagingDirectory)/ONEBRANCH_ARTIFACT'
 
               # ---------------------------------------------------------------
-              # Step 11 (optional): Publish to GitHub Release
+              # Step 12 (optional): Publish to GitHub Release
               # Uses GitHubRelease@1 task with ADO service connection (no PAT needed).
               # ---------------------------------------------------------------
               - ${{ if eq(parameters.PublishToGitHub, true) }}:
                 - task: GitHubRelease@1
-                  displayName: 'Publish signed binary to GitHub Release'
+                  displayName: 'Publish signed binary and checksum to GitHub Release'
                   inputs:
                     gitHubConnection: 'github.com_msftsiwei_microsoftsso'
                     repositoryName: 'microsoft/tgrep'
@@ -238,7 +264,9 @@ extends:
                     target: '$(Build.SourceVersion)'
                     tagSource: 'userSpecifiedTag'
                     tag: '$(TGREP_TAG)'
-                    assets: '$(Build.ArtifactStagingDirectory)/*.zip'
+                    assets: |
+                      $(Build.ArtifactStagingDirectory)/tgrep-$(TGREP_TAG)-x86_64-pc-windows-msvc.zip
+                      $(Build.ArtifactStagingDirectory)/tgrep-$(TGREP_TAG)-x86_64-pc-windows-msvc.zip.sha256
                     assetUploadMode: 'replace'
                     addChangeLog: false
 
@@ -330,16 +358,37 @@ extends:
                   dir $outPath
                 displayName: 'Package signed tgrep.exe (arm64) into zip'
 
+              - powershell: |
+                  $ErrorActionPreference = 'Stop'
+                  $zipName = "tgrep-$(TGREP_TAG)-aarch64-pc-windows-msvc.zip"
+                  $zipPath = Join-Path "$(Build.ArtifactStagingDirectory)" $zipName
+                  $sha256 = [System.Security.Cryptography.SHA256]::Create()
+                  $stream = $null
+                  try {
+                    $stream = [System.IO.File]::OpenRead($zipPath)
+                    $hash = [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+                  } finally {
+                    if ($null -ne $stream) { $stream.Dispose() }
+                    $sha256.Dispose()
+                  }
+                  $checksumPath = "$zipPath.sha256"
+                  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+                  [System.IO.File]::WriteAllText($checksumPath, "$hash  $zipName`n", $utf8NoBom)
+                  Write-Host "Written: $checksumPath"
+                displayName: 'Generate SHA256 checksum for signed Windows arm64 archive'
+
               - task: CopyFiles@2
                 displayName: 'Copy artifacts to ONEBRANCH_ARTIFACT'
                 inputs:
                   SourceFolder: '$(Build.ArtifactStagingDirectory)'
-                  Contents: '*.zip'
+                  Contents: |
+                    tgrep-$(TGREP_TAG)-aarch64-pc-windows-msvc.zip
+                    tgrep-$(TGREP_TAG)-aarch64-pc-windows-msvc.zip.sha256
                   TargetFolder: '$(Build.ArtifactStagingDirectory)/ONEBRANCH_ARTIFACT'
 
               - ${{ if eq(parameters.PublishToGitHub, true) }}:
                 - task: GitHubRelease@1
-                  displayName: 'Publish arm64 signed binary to GitHub Release'
+                  displayName: 'Publish arm64 signed binary and checksum to GitHub Release'
                   inputs:
                     gitHubConnection: 'github.com_msftsiwei_microsoftsso'
                     repositoryName: 'microsoft/tgrep'
@@ -347,6 +396,8 @@ extends:
                     target: '$(Build.SourceVersion)'
                     tagSource: 'userSpecifiedTag'
                     tag: '$(TGREP_TAG)'
-                    assets: '$(Build.ArtifactStagingDirectory)/*.zip'
+                    assets: |
+                      $(Build.ArtifactStagingDirectory)/tgrep-$(TGREP_TAG)-aarch64-pc-windows-msvc.zip
+                      $(Build.ArtifactStagingDirectory)/tgrep-$(TGREP_TAG)-aarch64-pc-windows-msvc.zip.sha256
                     assetUploadMode: 'replace'
                     addChangeLog: false

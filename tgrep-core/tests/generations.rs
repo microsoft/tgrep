@@ -599,7 +599,7 @@ fn process_worker() {
             .truncate(false)
             .open(manager.directory().join("publication.lock"))
             .unwrap();
-        lock.lock().unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
         let stage = manager.directory().join(".stage-killed-process");
         fs::create_dir(&stage).unwrap();
         fs::write(stage.join("index.bin"), b"partial bytes").unwrap();

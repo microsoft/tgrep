@@ -1296,6 +1296,7 @@ dependencies = [
  "cap-tempfile",
  "criterion",
  "encoding_rs",
+ "fs2",
  "globset",
  "ignore",
  "libc",

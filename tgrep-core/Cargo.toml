@@ -22,6 +22,7 @@ rayon = "1"
 ignore = { path = "../vendor/ignore" }
 globset = "0.4.18"
 encoding_rs = "0.8"
+fs2 = "0.4.3"
 tempfile = "3"
 same-file = "1"
 

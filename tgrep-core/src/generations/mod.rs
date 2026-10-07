@@ -620,7 +620,8 @@ impl GenerationManager {
             .create(true)
             .truncate(false)
             .open(path)?;
-        file.lock()?;
+        // Keep locking compatible with the Windows release pipeline's older Rust toolchain.
+        fs2::FileExt::lock_exclusive(&file)?;
         Ok(file)
     }
 
@@ -982,6 +983,36 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn publication_lock_is_exclusive_and_released_when_dropped() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Repository {
+            common_dir: directory.path().to_path_buf(),
+            git_dir: directory.path().to_path_buf(),
+            identity: "test".into(),
+            oid_length: 40,
+        };
+        let manager = GenerationManager {
+            repository,
+            directory: directory.path().to_path_buf(),
+        };
+        let held = manager.lock().unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(manager.directory().join("publication.lock"))
+            .unwrap();
+        let error = fs2::FileExt::try_lock_exclusive(&contender).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
+        drop(held);
+        fs2::FileExt::try_lock_exclusive(&contender).unwrap();
+        drop(contender);
+        manager.lock().unwrap();
+    }
 
     fn empty_generation(directory: &Path) -> Generation {
         builder::write_index_from_snapshot(directory, directory, &[], &HashMap::new(), true)

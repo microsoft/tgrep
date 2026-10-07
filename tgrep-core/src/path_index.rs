@@ -171,6 +171,8 @@ pub fn read_filename_index(index_dir: &Path) -> Result<Option<FilenameIndex>> {
             .ok_or_else(|| corrupted(format!("path {index} exceeds the file bounds")))?;
         let value = std::str::from_utf8(&data[pos..end])
             .map_err(|_| corrupted(format!("path {index} is not valid UTF-8")))?;
+        crate::rooted::validate_index_path(value)
+            .map_err(|error| corrupted(format!("path {index}: {error}")))?;
         paths.push(value.to_string());
         pos = end;
     }
@@ -200,6 +202,18 @@ fn corrupted(message: String) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filename_sidecar_rejects_unsafe_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["../file", "/file", "C:/file", "\\\\server\\share\\file", ""] {
+            write_extra_paths(dir.path(), &[path.to_string()]).unwrap();
+            assert!(matches!(
+                read_filename_index(dir.path()),
+                Err(Error::IndexCorrupted(_))
+            ));
+        }
+    }
 
     #[test]
     fn missing_sidecar_identifies_a_legacy_index() {

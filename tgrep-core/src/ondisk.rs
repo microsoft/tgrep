@@ -211,9 +211,8 @@ pub(crate) fn write_file_entry(
 /// Decode file entries from `files.bin` data.
 ///
 /// Returns `Error::IndexCorrupted` if `data` is truncated mid-record (i.e.
-/// not enough bytes for a declared path or a partial header), so that callers
-/// don't silently load a partial file table that would cause queries to drop
-/// matches.
+/// not enough bytes for a declared path or a partial header), or a path is not
+/// valid UTF-8 and normalized relative to the indexed root.
 pub(crate) fn decode_file_entries(data: &[u8]) -> crate::Result<Vec<(u32, String)>> {
     let mut entries = Vec::new();
     let mut pos = 0;
@@ -234,8 +233,15 @@ pub(crate) fn decode_file_entries(data: &[u8]) -> crate::Result<Vec<(u32, String
                 data.len() - pos
             )));
         }
-        let path = String::from_utf8_lossy(&data[pos..pos + path_len]).into_owned();
-        entries.push((file_id, path));
+        let path = std::str::from_utf8(&data[pos..pos + path_len]).map_err(|_| {
+            crate::Error::IndexCorrupted(format!(
+                "files.bin file_id {file_id} has a non-UTF-8 path"
+            ))
+        })?;
+        crate::rooted::validate_index_path(path).map_err(|error| {
+            crate::Error::IndexCorrupted(format!("files.bin file_id {file_id}: {error}"))
+        })?;
+        entries.push((file_id, path.to_string()));
         pos += path_len;
     }
     Ok(entries)
@@ -244,6 +250,51 @@ pub(crate) fn decode_file_entries(data: &[u8]) -> crate::Result<Vec<(u32, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_tables_reject_unsafe_paths_in_every_format() {
+        for path in [
+            "",
+            ".",
+            "./file",
+            "..",
+            "../file",
+            "dir/../../file",
+            "/file",
+            "dir/./file",
+            "dir//file",
+            "dir/",
+            "C:/file",
+            "C:file",
+            "\\file",
+            "\\\\server\\share\\file",
+            "//server/share/file",
+            "\\\\?\\C:\\file",
+            "dir\\file",
+            "file\0suffix",
+        ] {
+            for versioned in [false, true] {
+                let mut data = Vec::new();
+                if versioned {
+                    write_file_table_header(&mut data).unwrap();
+                }
+                data.extend_from_slice(&encode_file_entry(0, path).unwrap());
+                assert!(
+                    matches!(
+                        decode_file_entries(file_table_body(&data).unwrap()),
+                        Err(crate::Error::IndexCorrupted(_))
+                    ),
+                    "accepted {path:?}, versioned={versioned}"
+                );
+            }
+        }
+        let mut data = encode_file_entry(0, "file").unwrap();
+        *data.last_mut().unwrap() = 0xff;
+        assert!(matches!(
+            decode_file_entries(&data),
+            Err(crate::Error::IndexCorrupted(_))
+        ));
+    }
 
     #[test]
     fn versioned_file_table_rejects_legacy_readers() {

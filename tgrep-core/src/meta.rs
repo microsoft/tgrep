@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::SystemTime;
 
-use crate::Result;
+use crate::{Error, Result};
 
 const META_FILENAME: &str = "meta.json";
 const FILESTAMPS_FILENAME: &str = "filestamps.json";
@@ -543,22 +543,60 @@ pub fn remove_file_evidence(index_dir: &Path) -> Result<()> {
 }
 
 /// Collect file stamps (mtime + size) for a list of relative paths under `root`.
-pub fn collect_filestamps(root: &Path, paths: &[String]) -> HashMap<String, FileStamp> {
+/// Invalid paths and failed file opens are reported rather than following links.
+pub fn collect_filestamps(root: &Path, paths: &[String]) -> Result<HashMap<String, FileStamp>> {
     use rayon::prelude::*;
 
+    let rooted = crate::rooted::RootedDir::open(root)?;
     paths
         .par_iter()
         .filter_map(|rel_path| {
-            let full_path = root.join(rel_path);
-            std::fs::metadata(&full_path)
-                .ok()
-                .map(|metadata| (rel_path.clone(), file_stamp(&metadata)))
+            let result = (|| {
+                crate::rooted::validate_index_path(rel_path)?;
+                let file = rooted.open_file(Path::new(rel_path))?;
+                Ok((rel_path.clone(), file_stamp(&file.metadata()?)))
+            })();
+            match result {
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                result => Some(result),
+            }
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filestamps_reject_paths_outside_the_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("inside.txt"), b"inside").unwrap();
+        std::fs::write(temp.path().join("outside.txt"), b"outside").unwrap();
+        let stamps = super::collect_filestamps(
+            &root,
+            &["inside.txt".to_string(), "missing.txt".to_string()],
+        )
+        .unwrap();
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps["inside.txt"].size, 6);
+        for path in [
+            "../outside.txt".to_string(),
+            temp.path()
+                .join("outside.txt")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            assert!(super::collect_filestamps(&root, &[path]).is_err());
+        }
+        crate::rooted::tests::link_directory(temp.path(), &root.join("link"));
+        assert!(super::collect_filestamps(&root, &["link/outside.txt".to_string()]).is_err());
+        #[cfg(unix)]
+        std::fs::remove_file(root.join("link")).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(root.join("link")).unwrap();
+    }
+
     #[test]
     fn legacy_metadata_does_not_prove_hidden_coverage() {
         let mut value = serde_json::to_value(super::IndexMeta::new("root", 1, 2)).unwrap();

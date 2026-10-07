@@ -180,25 +180,40 @@ impl SortMode {
         index_root: &Path,
         scope: &IndexScope,
         relative_path: impl Fn(&T) -> &str,
-    ) {
+    ) -> Result<()> {
+        let rooted = (self.key != SortKey::Path)
+            .then(|| tgrep_core::rooted::RootedDir::open(index_root))
+            .transpose()?;
         entries.sort_by_cached_key(|entry| {
             let rel = relative_path(entry);
-            let time = if self.key == SortKey::Path {
-                None
-            } else {
-                time_key(&scope.full_path(index_root, rel), self.key)
-            };
+            let time = rooted.as_ref().and_then(|rooted| {
+                match rooted
+                    .open_file(&scope.indexed_path(rel))
+                    .and_then(|file| file.metadata())
+                {
+                    Ok(metadata) => metadata_time_key(&metadata, self.key),
+                    Err(error) => {
+                        eprintln!("warning: cannot stat indexed file {rel:?}: {error}");
+                        None
+                    }
+                }
+            });
             (time, PathBuf::from(rel))
         });
         if self.reverse {
             entries.reverse();
         }
+        Ok(())
     }
 }
 
 /// Read the timestamp `--sort` selected, if the platform records it.
 fn time_key(path: &Path, key: SortKey) -> Option<std::time::SystemTime> {
     let md = std::fs::metadata(path).ok()?;
+    metadata_time_key(&md, key)
+}
+
+fn metadata_time_key(md: &std::fs::Metadata, key: SortKey) -> Option<std::time::SystemTime> {
     match key {
         SortKey::Modified => md.modified().ok(),
         SortKey::Accessed => md.accessed().ok(),
@@ -655,9 +670,8 @@ fn load_indexed_file_paths(
     if !index_dir.join("lookup.bin").exists() {
         return Ok(None);
     }
-    let filename_index = match tgrep_core::path_index::read_filename_index(index_dir) {
-        Ok(Some(index)) => index,
-        Ok(None) | Err(_) => return Ok(None),
+    let Some(filename_index) = tgrep_core::path_index::read_filename_index(index_dir)? else {
+        return Ok(None);
     };
     let Some(visibility) = filename_index.visibility else {
         return Ok(None);
@@ -708,7 +722,7 @@ fn write_indexed_file_paths(
         .collect();
 
     if let Some(sort) = opts.sort {
-        sort.apply_indexed(&mut paths, index_root, scope, String::as_str);
+        sort.apply_indexed(&mut paths, index_root, scope, String::as_str)?;
     }
 
     let mut writer = OutputWriter::new(opts.make_output_config());
@@ -1128,7 +1142,7 @@ fn render_server_result(
                 }
                 ranked.push(rel.to_string());
             }
-            sort.apply_indexed(&mut ranked, index_root, scope, String::as_str);
+            sort.apply_indexed(&mut ranked, index_root, scope, String::as_str)?;
             let rank: std::collections::HashMap<&str, usize> = ranked
                 .iter()
                 .enumerate()
@@ -1392,9 +1406,12 @@ fn search_local_index(
     // the two, `tgrep --index-path IDX foo src` looks for `src/src/lib.rs` and
     // silently reports nothing.
     let Some((index_root, scope)) = resolve_scope(index_dir, root) else {
-        // The index covers an unrelated tree, so it cannot answer this search.
+        if !opts.quiet && !opts.no_messages {
+            eprintln!("warning: index root unavailable or unrelated - scanning filesystem");
+        }
         return brute_force_search(root, index_dir, opts, ci, writer);
     };
+    let rooted = tgrep_core::rooted::RootedDir::open(root)?;
 
     let glob_filter = opts.glob_filter()?;
     let type_filter = opts.type_filter()?;
@@ -1449,7 +1466,7 @@ fn search_local_index(
         .collect();
 
     if let Some(sort) = opts.sort {
-        sort.apply_indexed(&mut candidates, &index_root, &scope, |(_, rel)| rel);
+        sort.apply_indexed(&mut candidates, &index_root, &scope, |(_, rel)| rel)?;
     }
 
     let mut had_matches = false;
@@ -1458,13 +1475,25 @@ fn search_local_index(
     let explicit = matches!(scope, IndexScope::File(_));
 
     for (_, rel_path) in &candidates {
-        let full_path = scope.full_path(&index_root, rel_path);
-        if exceeds_max_filesize(&full_path, opts, explicit) {
-            continue;
-        }
-        let read = match read_text_lossy(&full_path, opts.encoding) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let read = (|| -> std::io::Result<Option<FileRead>> {
+            let file = rooted.open_file(Path::new(rel_path))?;
+            if (!explicit || opts.max_filesize_requested)
+                && let Some(limit) = opts.max_filesize
+                && file.metadata()?.len() > limit
+            {
+                return Ok(None);
+            }
+            read_open_text_lossy(file, opts.encoding).map(Some)
+        })();
+        let read = match read {
+            Ok(Some(read)) => read,
+            Ok(None) => continue,
+            Err(error) => {
+                if !opts.no_messages {
+                    eprintln!("warning: cannot read indexed file {rel_path:?}: {error}");
+                }
+                continue;
+            }
         };
 
         if search_file(&read, &matcher, rel_path, opts, writer, explicit)? {
@@ -1541,7 +1570,7 @@ impl IndexScope {
         }
     }
 
-    fn full_path(&self, index_root: &Path, rel: &str) -> PathBuf {
+    fn indexed_path(&self, rel: &str) -> PathBuf {
         let indexed = match self {
             Self::Whole => rel.to_string(),
             Self::Subtree(prefix) => format!("{prefix}{rel}"),
@@ -1549,17 +1578,18 @@ impl IndexScope {
             // index stores.
             Self::File(f) => f.clone(),
         };
-        index_root.join(indexed.replace('/', std::path::MAIN_SEPARATOR_STR))
+        PathBuf::from(indexed.replace('/', std::path::MAIN_SEPARATOR_STR))
     }
 }
 
 /// The slice of the index at `index_dir` that covers `root`, with the absolute
 /// root the index was built for.
 fn resolve_scope(index_dir: &Path, root: &Path) -> Option<(PathBuf, IndexScope)> {
-    let index_root = IndexMeta::load(index_dir)
-        .ok()
-        .and_then(|m| std::fs::canonicalize(m.root_path).ok())
-        .unwrap_or_else(|| root.to_path_buf());
+    let recorded_root = PathBuf::from(IndexMeta::load(index_dir).ok()?.root_path);
+    if !recorded_root.is_absolute() {
+        return None;
+    }
+    let index_root = std::fs::canonicalize(recorded_root).ok()?;
     let scope = IndexScope::resolve(&index_root, root)?;
     Some((index_root, scope))
 }
@@ -1788,10 +1818,9 @@ fn validate_utf8_and_find_nul(bytes: &[u8]) -> Option<Option<usize>> {
 /// a file below the threshold, an encoding that transcodes or strips a BOM, or
 /// content that is not already valid UTF-8 and so needs lossy repair.
 fn try_map_text(
-    path: &Path,
+    file: &std::fs::File,
     encoding: tgrep_core::encoding::EncodingMode,
 ) -> Option<(FileText, Option<usize>)> {
-    let file = std::fs::File::open(path).ok()?;
     if file.metadata().ok()?.len() < MMAP_MIN_BYTES {
         return None;
     }
@@ -1799,7 +1828,7 @@ fn try_map_text(
     // dropped before this function's caller finishes with the file. Mapping is
     // undefined behaviour if another process truncates the file underneath us;
     // that is inherent to searching by map and is the tradeoff ripgrep makes.
-    let map = unsafe { memmap2::Mmap::map(&file).ok()? };
+    let map = unsafe { memmap2::Mmap::map(file).ok()? };
     if !tgrep_core::encoding::borrows_whole_input(&map, encoding) {
         return None;
     }
@@ -1816,15 +1845,25 @@ fn read_text_lossy(
     path: &Path,
     encoding: tgrep_core::encoding::EncodingMode,
 ) -> std::io::Result<FileRead> {
+    read_open_text_lossy(std::fs::File::open(path)?, encoding)
+}
+
+fn read_open_text_lossy(
+    mut file: std::fs::File,
+    encoding: tgrep_core::encoding::EncodingMode,
+) -> std::io::Result<FileRead> {
+    use std::io::Read;
+
     // A mapped file is always already-valid UTF-8, so it needs no fixups.
-    if let Some((text, first_nul)) = try_map_text(path, encoding) {
+    if let Some((text, first_nul)) = try_map_text(&file, encoding) {
         return Ok(FileRead {
             text,
             fixups: tgrep_core::encoding::LossyFixups::default(),
             first_nul,
         });
     }
-    let bytes = std::fs::read(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     let (text, fixups) = tgrep_core::encoding::decode_owned_with_fixups(bytes, encoding);
     // The read path already walks these bytes at least once and they are under
     // the mapping threshold or repaired, so a separate scan here is cheap. It
@@ -2227,6 +2266,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn indexed_reads_keep_the_open_handle_for_mapping_and_decoding() {
+        let temp = tempfile::tempdir().unwrap();
+        for (index, bytes) in [
+            b"original small file\n".to_vec(),
+            vec![b'a'; MMAP_MIN_BYTES as usize + 1],
+            vec![0xff; MMAP_MIN_BYTES as usize + 1],
+            vec![0xff, 0xfe, b'a', 0, b'\n', 0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = temp.path().join(format!("file{index}"));
+            std::fs::write(&path, &bytes).unwrap();
+            let rooted = tgrep_core::rooted::RootedDir::open(temp.path()).unwrap();
+            let file = rooted
+                .open_file(path.file_name().unwrap().as_ref())
+                .unwrap();
+            std::fs::rename(&path, temp.path().join(format!("saved{index}"))).unwrap();
+            std::fs::write(&path, b"replacement must not be read\n").unwrap();
+            let read =
+                read_open_text_lossy(file, tgrep_core::encoding::EncodingMode::Auto).unwrap();
+            let (expected, _) = tgrep_core::encoding::decode_owned_with_fixups(
+                bytes,
+                tgrep_core::encoding::EncodingMode::Auto,
+            );
+            assert_eq!(read.text.as_str(), expected);
+        }
+    }
+
+    #[test]
     fn only_a_nonempty_full_corpus_gets_a_no_narrowing_note() {
         assert_eq!(index_narrowing_note(2, 2), " (no index narrowing)");
         assert_eq!(index_narrowing_note(1, 2), "");
@@ -2253,7 +2322,8 @@ mod tests {
                 Path::new("unused-index-root"),
                 &IndexScope::Whole,
                 |(_, rel)| rel,
-            );
+            )
+            .unwrap();
             assert_eq!(sorted.map(|(id, _)| id), expected);
         }
     }
@@ -2283,7 +2353,8 @@ mod tests {
                 dir.path(),
                 &IndexScope::Subtree("nested/".to_string()),
                 |path| path,
-            );
+            )
+            .unwrap();
             let mut expected = ["missing.txt", "a-old.txt", "z-old.txt", "new.txt"];
             if reverse {
                 expected.reverse();

@@ -5,6 +5,26 @@ use std::fs::{self, File};
 use std::io::{self, Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 
+/// Validate the normalized, portable relative paths stored in an index.
+pub fn validate_index_path(path: &str) -> io::Result<()> {
+    let drive_prefix =
+        path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic();
+    if drive_prefix
+        || path.contains(['\\', '\0'])
+        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+        || Path::new(path)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || (cfg!(windows) && path.contains(':'))
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "index path must be a normalized root-relative path",
+        ));
+    }
+    Ok(())
+}
+
 /// A stable directory handle, not a pathname-only containment check.
 ///
 /// The root may be a caller-selected symlink at construction; its resolved
@@ -153,7 +173,13 @@ fn components(relative: &Path) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for component in relative.components() {
         match component {
-            Component::Normal(name) => names.push(name.to_os_string()),
+            Component::Normal(name) => {
+                #[cfg(windows)]
+                if name.to_string_lossy().contains(':') {
+                    return Err(Error::new(ErrorKind::InvalidInput, "alternate data stream"));
+                }
+                names.push(name.to_os_string());
+            }
             _ => {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,

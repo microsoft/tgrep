@@ -242,6 +242,9 @@ impl HybridIndex {
     }
 
     /// Resolve a file ID to an absolute path using a specific reader snapshot.
+    ///
+    /// This is a pathname, not permission to read it: use `RootedDir::open_file`
+    /// on the relative path to enforce containment against filesystem links.
     pub fn resolve_full_path(&self, file_id: u32, reader: &IndexReader) -> Option<PathBuf> {
         self.resolve_path(file_id, reader).map(|rel| {
             self.root
@@ -309,6 +312,7 @@ impl HybridIndex {
     }
 
     /// Full path on disk for a file ID.
+    /// Use a handle-rooted open, not this pathname, when reading indexed content.
     pub fn full_path(&self, file_id: u32) -> Option<PathBuf> {
         self.file_path(file_id).map(|rel| {
             self.root

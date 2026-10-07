@@ -76,6 +76,16 @@ fn regular_opens_and_literal_path_validation() {
         assert!(root.open_file(Path::new(path)).is_err(), "{path}");
     }
     assert!(root.open_file(&temp.path().join("dir/file")).is_err());
+    #[cfg(windows)]
+    for path in [
+        "dir/file:stream",
+        "dir/file::$DATA",
+        "C:dir/file",
+        "\\dir\\file",
+    ] {
+        assert!(root.open_file(Path::new(path)).is_err(), "{path}");
+        assert!(validate_index_path(path).is_err(), "{path}");
+    }
 }
 
 #[test]

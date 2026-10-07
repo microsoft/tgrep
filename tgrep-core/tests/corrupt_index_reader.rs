@@ -63,6 +63,43 @@ fn write_index(dir: &Path, lookup: &[u8], postings: &[u8], files: &[u8]) {
     std::fs::write(dir.join("files.bin"), files).unwrap();
 }
 
+#[test]
+fn reader_rejects_unsafe_stored_paths_before_queries() {
+    let tmp = tempfile::tempdir().unwrap();
+    for path in [
+        "../outside.txt",
+        "/outside.txt",
+        "C:/outside.txt",
+        "C:outside.txt",
+        "",
+    ] {
+        let mut files = Vec::new();
+        files.extend_from_slice(&0u32.to_le_bytes());
+        files.extend_from_slice(&(path.len() as u16).to_le_bytes());
+        files.extend_from_slice(path.as_bytes());
+        write_index(
+            tmp.path(),
+            &lookup_entry(1, 0, 1),
+            &postings_bytes(1),
+            &files,
+        );
+        assert!(
+            matches!(
+                IndexReader::open(tmp.path()),
+                Err(tgrep_core::Error::IndexCorrupted(_))
+            ),
+            "accepted {path:?}"
+        );
+        assert!(
+            matches!(
+                tgrep_core::hybrid::HybridIndex::open(tmp.path(), tmp.path()),
+                Err(tgrep_core::Error::IndexCorrupted(_))
+            ),
+            "hybrid accepted {path:?}"
+        );
+    }
+}
+
 /// Exercise every read path the way `fuzz_reader` does, and assert the one
 /// invariant that matters: nothing decoded can exceed what `index.bin` holds.
 fn exercise(dir: &Path, postings_len: usize) {

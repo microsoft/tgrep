@@ -1831,11 +1831,16 @@ fn handle_search(
                 // Match local-index stats: count after path filters, before
                 // size checks or reads can discard candidates.
                 filtered_count += 1;
-                let full_path = index.resolve_full_path(fid, &reader_snapshot)?;
-                if let Some(limit) = query_size_limit
-                    && std::fs::metadata(&full_path).is_ok_and(|md| md.len() > limit)
-                {
-                    return None;
+                let full_path = state.root.join(&rel_path);
+                if let Some(limit) = query_size_limit {
+                    match open_within_root(state, &full_path).and_then(|file| file.metadata()) {
+                        Ok(metadata) if metadata.len() <= limit => {}
+                        Ok(_) => return None,
+                        Err(error) => {
+                            eprintln!("warning: cannot stat indexed file {rel_path:?}: {error}");
+                            return None;
+                        }
+                    }
                 }
                 Some((rel_path, full_path))
             })
@@ -1861,6 +1866,25 @@ fn handle_search(
     // Two-phase approach: read-lock for cache hits, then disk I/O outside the
     // lock, then a single write-lock to promote hits and insert misses.
     let t_resolve = Instant::now();
+    let read_candidate = |path: &Path| {
+        use std::io::Read;
+        let read = (|| -> std::io::Result<Vec<u8>> {
+            let mut file = open_within_root(state, path)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })();
+        match read {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                eprintln!(
+                    "warning: cannot read indexed file {}: {error}",
+                    path.display()
+                );
+                None
+            }
+        }
+    };
     let candidate_contents: Vec<(String, Arc<DecodedFile>)> = if encoding.may_differ_from_index() {
         // The cache holds text decoded with the default (BOM-sniffing) rules and
         // is shared by every client. A request that asked for a different
@@ -1869,7 +1893,7 @@ fn handle_search(
         candidate_info
             .iter()
             .filter_map(|(rel_path, full_path)| {
-                let bytes = std::fs::read(full_path).ok()?;
+                let bytes = read_candidate(full_path)?;
                 Some((
                     rel_path.clone(),
                     Arc::new(DecodedFile::new(bytes, encoding)),
@@ -1901,7 +1925,7 @@ fn handle_search(
                 // Lossy, like the local path: refusing invalid UTF-8 would make
                 // UTF-16 and Latin-1 sources silently invisible over the server
                 // while the same query works with --no-index.
-                let bytes = std::fs::read(&full_path).ok()?;
+                let bytes = read_candidate(&full_path)?;
                 let decoded = DecodedFile::new(bytes, tgrep_core::encoding::EncodingMode::Auto);
                 Some((rel_path, Arc::new(decoded)))
             })
@@ -9016,6 +9040,7 @@ mod tests {
                 .unwrap();
         let content_id = outcome.content_ids[rel_path];
         let stamp = tgrep_core::meta::collect_filestamps(root, &[rel_path.to_string()])
+            .unwrap()
             .remove(rel_path)
             .unwrap();
         let mut evidence = tgrep_core::meta::FileEvidence::default();
@@ -9024,6 +9049,57 @@ mod tests {
         *state.index.write().unwrap() = HybridIndex::open(index_dir, root).unwrap();
         *state.file_evidence.write().unwrap() = evidence;
         content_id
+    }
+
+    #[test]
+    fn indexed_server_reads_reject_directory_links_before_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file.txt"), b"needle OUTSIDE_SENTINEL\n").unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        install_reader_file(
+            &state,
+            &root,
+            &state.index_dir,
+            "dir/file.txt",
+            b"needle inside\n",
+        );
+        let before = handle_search(None, &serde_json::json!({"pattern": "needle"}), &state);
+        assert!(before.contains("needle inside"), "{before}");
+        std::fs::rename(root.join("dir"), temp.path().join("saved")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("dir")).unwrap();
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/j"])
+                .arg(root.join("dir"))
+                .arg(&outside)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        let cached = handle_search(None, &serde_json::json!({"pattern": "needle"}), &state);
+        assert!(cached.contains("needle inside"), "{cached}");
+        for request in [
+            serde_json::json!({"pattern": "needle"}),
+            serde_json::json!({"pattern": "."}),
+            serde_json::json!({"pattern": "needle", "encoding": "windows-1252"}),
+            serde_json::json!({"pattern": "needle", "max_filesize": 1024}),
+        ] {
+            state.cache.write().unwrap().clear();
+            let response = handle_search(None, &request, &state);
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(value["result"]["num_matches"], 0, "{response}");
+            assert!(!response.contains("OUTSIDE_SENTINEL"), "{response}");
+        }
+        #[cfg(unix)]
+        std::fs::remove_file(root.join("dir")).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(root.join("dir")).unwrap();
     }
 
     fn test_git(root: &Path, args: &[&str]) {
@@ -10079,7 +10155,8 @@ mod tests {
                 "change.rs".to_string(),
                 "binary.rs".to_string(),
             ],
-        );
+        )
+        .unwrap();
         stamps.insert("unreadable.rs".to_string(), unreadable_stamp);
         let mut desired = tgrep_core::meta::FileEvidence::from_stamps(stamps);
         desired.content_ids.extend(

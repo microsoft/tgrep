@@ -24,7 +24,15 @@ tgrep status .          # show indexing and refresh status
 Without a server, run `tgrep index .` to build an on-disk index. Searches use
 the server when available, then the local index, or scan the filesystem if no
 usable index exists. Indexes are stored in `.tgrep/` by default; add this
-directory to `.gitignore`.
+directory to `.gitignore`. It is generated build output and must not be committed
+or distributed with a repository. Build indexes locally for repositories you
+search; index metadata is not a statement of trust or freshness.
+
+Indexed file reads stay beneath the selected root and do not follow descendant
+symlinks or Windows reparse points. Invalid stored paths are rejected; indexes
+with an unavailable or unrelated recorded root fall back to a filesystem scan.
+Explicit file arguments and `--no-index --follow` retain their normal scan
+semantics.
 
 **Indexes can lag filesystem changes.** The server updates asynchronously;
 without a server, rerun `tgrep index .` after changes. Use `--no-index` when a

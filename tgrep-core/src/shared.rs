@@ -519,17 +519,7 @@ fn canonical_root(root: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn validate_path(path: &str) -> Result<()> {
-    if path.contains(['\\', '\0'])
-        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
-        || Path::new(path)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(invalid(
-            "index path must be a normalized worktree-relative path",
-        ));
-    }
-    Ok(())
+    crate::rooted::validate_index_path(path).map_err(|error| invalid(&error.to_string()))
 }
 
 fn validate_trigram(trigram: u32, loc_mask: u8) -> Result<()> {

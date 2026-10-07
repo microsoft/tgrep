@@ -280,7 +280,11 @@ pub fn peak_private_bytes() -> Option<u64> {
 /// and the flush it triggers then frees nothing, so the build pays for a full
 /// overlay flush and is still "over budget" on the next check.
 pub fn budgeted_memory_bytes() -> Option<u64> {
-    process_private_bytes().or_else(process_rss_bytes)
+    select_budgeted_memory(process_private_bytes(), process_rss_bytes)
+}
+
+fn select_budgeted_memory(private: Option<u64>, rss: impl FnOnce() -> Option<u64>) -> Option<u64> {
+    private.or_else(rss)
 }
 
 /// How much larger the working set must be than private bytes before it is
@@ -510,29 +514,43 @@ mod tests {
         );
     }
 
-    // The cap exists to stop tgrep exhausting the host, so it must charge
-    // against memory the process actually owns wherever that is available.
-    //
-    // The two figures are sampled at different instants, and the rest of the
-    // suite is allocating on other threads meanwhile, so they are compared for
-    // *provenance* rather than exact equality - an exact match made this test
-    // flaky. Private and RSS differ by far more than the tolerance whenever the
-    // distinction matters, so a wrong source still fails.
+    // Fixed samples test the source selection without racing allocations in
+    // other tests. Live counters are checked independently for availability.
     #[test]
     fn budgeted_memory_prefers_private_bytes() {
-        let budgeted = budgeted_memory_bytes();
-        match process_private_bytes() {
-            Some(private) => {
-                let budgeted = budgeted.expect("private bytes are available, so a budget is too");
-                let drift = budgeted.abs_diff(private);
-                let tolerance = (private / 10).max(16 * 1024 * 1024);
-                assert!(
-                    drift <= tolerance,
-                    "budgeted {budgeted} should track private {private} (drift {drift} > {tolerance})"
-                );
-            }
-            None => assert_eq!(budgeted, process_rss_bytes()),
+        for private in [0, 12 * 1024 * 1024, u64::MAX] {
+            assert_eq!(
+                select_budgeted_memory(Some(private), || {
+                    panic!("RSS must not be sampled when private bytes are available")
+                }),
+                Some(private)
+            );
         }
+    }
+
+    #[test]
+    fn budgeted_memory_falls_back_to_rss() {
+        for rss in [Some(0), Some(14_352_384), Some(u64::MAX), None] {
+            let mut calls = 0;
+            assert_eq!(
+                select_budgeted_memory(None, || {
+                    calls += 1;
+                    rss
+                }),
+                rss
+            );
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn budgeted_memory_is_nonzero() {
+        let budgeted = budgeted_memory_bytes().expect("budgeted memory query should succeed");
+        assert!(
+            budgeted > 0,
+            "budgeted memory should be non-zero, got {budgeted}"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufReader, BufWriter, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -261,7 +261,7 @@ impl CheckpointDestination {
         let mut guards = Vec::new();
         for component in directory.components() {
             current.push(component);
-            if matches!(component, Component::Prefix(_)) {
+            if matches!(component, std::path::Component::Prefix(_)) {
                 continue;
             }
             // Windows replacement uses paths. Deny renames/deletion of every

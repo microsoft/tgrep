@@ -5,12 +5,9 @@ use std::fs::{self, File};
 use std::io::{self, Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 
-/// Validate the normalized, portable relative paths stored in an index.
+/// Validate normalized root-relative index paths using the host's path rules.
 pub fn validate_index_path(path: &str) -> io::Result<()> {
-    let drive_prefix =
-        path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic();
-    if drive_prefix
-        || path.contains(['\\', '\0'])
+    if path.contains(['\\', '\0'])
         || path.split('/').any(|part| matches!(part, "" | "." | ".."))
         || Path::new(path)
             .components()

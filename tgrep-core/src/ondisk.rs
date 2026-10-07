@@ -264,15 +264,16 @@ mod tests {
             "dir/./file",
             "dir//file",
             "dir/",
-            "C:/file",
-            "C:file",
             "\\file",
             "\\\\server\\share\\file",
             "//server/share/file",
             "\\\\?\\C:\\file",
             "dir\\file",
             "file\0suffix",
-        ] {
+        ]
+        .into_iter()
+        .chain(["C:/file", "C:file"].into_iter().filter(|_| cfg!(windows)))
+        {
             for versioned in [false, true] {
                 let mut data = Vec::new();
                 if versioned {

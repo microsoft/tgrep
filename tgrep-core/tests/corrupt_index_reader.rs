@@ -66,13 +66,11 @@ fn write_index(dir: &Path, lookup: &[u8], postings: &[u8], files: &[u8]) {
 #[test]
 fn reader_rejects_unsafe_stored_paths_before_queries() {
     let tmp = tempfile::tempdir().unwrap();
-    for path in [
-        "../outside.txt",
-        "/outside.txt",
-        "C:/outside.txt",
-        "C:outside.txt",
-        "",
-    ] {
+    for path in ["../outside.txt", "/outside.txt", ""].into_iter().chain(
+        ["C:/outside.txt", "C:outside.txt"]
+            .into_iter()
+            .filter(|_| cfg!(windows)),
+    ) {
         let mut files = Vec::new();
         files.extend_from_slice(&0u32.to_le_bytes());
         files.extend_from_slice(&(path.len() as u16).to_le_bytes());
@@ -98,6 +96,42 @@ fn reader_rejects_unsafe_stored_paths_before_queries() {
             "hybrid accepted {path:?}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn builder_and_reader_round_trip_unix_colon_filenames() {
+    use std::io::Read;
+
+    let root = tempfile::tempdir().unwrap();
+    let index = tempfile::tempdir().unwrap();
+    let paths = ["a:b", "C:relative.txt", "C:/nested.txt", "dir/name:stream"];
+    for path in paths {
+        let full = root.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, b"colon filename content\n").unwrap();
+    }
+    tgrep_core::builder::build_index(root.path(), Some(index.path()), true, false, &[]).unwrap();
+    let reader = IndexReader::open(index.path()).unwrap();
+    assert_eq!(reader.num_files(), paths.len());
+    let rooted = tgrep_core::rooted::RootedDir::open(root.path()).unwrap();
+    for path in paths {
+        assert!(reader.contains_path(path), "{path}");
+        let mut contents = String::new();
+        rooted
+            .open_file(Path::new(path))
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "colon filename content\n");
+    }
+    tgrep_core::path_index::write_extra_paths(index.path(), &paths.map(str::to_string)).unwrap();
+    assert_eq!(
+        tgrep_core::path_index::read_extra_paths(index.path())
+            .unwrap()
+            .unwrap(),
+        paths.map(str::to_string),
+    );
 }
 
 /// Exercise every read path the way `fuzz_reader` does, and assert the one

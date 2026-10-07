@@ -258,12 +258,18 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
 struct DecodedFile {
     text: String,
     fixups: tgrep_core::encoding::LossyFixups,
+    source_bytes: u64,
 }
 
 impl DecodedFile {
     fn new(bytes: Vec<u8>, encoding: tgrep_core::encoding::EncodingMode) -> Self {
+        let source_bytes = bytes.len() as u64;
         let (text, fixups) = tgrep_core::encoding::decode_owned_with_fixups(bytes, encoding);
-        Self { text, fixups }
+        Self {
+            text,
+            fixups,
+            source_bytes,
+        }
     }
 
     /// Heap cost of this entry, used to bound the cache by memory rather than
@@ -1767,11 +1773,9 @@ fn handle_search(
     let case_insensitive = req.case_insensitive;
     let scope = req.scope;
 
-    // The index build already dropped everything above the server's own cap, so
-    // re-checking a query cap that is no stricter can never reject a candidate
-    // the index did not already reject — it would only buy a `metadata` call
-    // per candidate on every query. Now that a cap is the default rather than
-    // opt-in, that is the common case, so recognise it and skip the stat.
+    // Skip redundant prefilter stats when the index used an equally strict cap.
+    // This is only an optimization: disk reads and cached source lengths must
+    // still enforce the query limit because files can grow after indexing.
     let query_size_limit = match (opts.max_filesize, state.max_file_size) {
         (Some(query), Some(built)) if built <= query => None,
         (query, _) => query,
@@ -1867,15 +1871,26 @@ fn handle_search(
     // lock, then a single write-lock to promote hits and insert misses.
     let t_resolve = Instant::now();
     let read_candidate = |path: &Path| {
-        use std::io::Read;
-        let read = (|| -> std::io::Result<Vec<u8>> {
+        let read = (|| -> std::io::Result<Option<Vec<u8>>> {
             let mut file = open_within_root(state, path)?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
+            let length = file.metadata()?.len();
+            if opts.max_filesize.is_some_and(|limit| length > limit) {
+                return Ok(None);
+            }
+            let bytes = crate::search::read_bytes_with_limit(
+                &mut file,
+                opts.max_filesize,
+                length.min(1 << 20) as usize,
+            )?;
+            if let Some(limit) = opts.max_filesize
+                && file.metadata()?.len() > limit
+            {
+                return Ok(None);
+            }
             Ok(bytes)
         })();
         match read {
-            Ok(bytes) => Some(bytes),
+            Ok(bytes) => bytes,
             Err(error) => {
                 eprintln!(
                     "warning: cannot read indexed file {}: {error}",
@@ -1909,7 +1924,10 @@ fn handle_search(
         {
             let cache = state.cache.read().unwrap();
             for (rel_path, full_path) in &candidate_info {
-                if let Some(cached) = cache.peek(rel_path) {
+                if let Some(cached) = cache.peek(rel_path).filter(|cached| {
+                    opts.max_filesize
+                        .is_none_or(|limit| cached.source_bytes <= limit)
+                }) {
                     hit_keys.push(rel_path.clone());
                     hits.push((rel_path.clone(), Arc::clone(cached)));
                 } else {
@@ -5174,29 +5192,14 @@ fn current_path_is_ineligible(state: &ServerState, path: &Path) -> bool {
 /// the limit the user set. One byte over is enough to prove it no longer
 /// qualifies, and is all that is ever read beyond the limit.
 fn read_within_limit(file: &mut std::fs::File, limit: Option<u64>, capacity: usize) -> CappedRead {
-    use std::io::Read;
-
-    let mut data = Vec::with_capacity(capacity);
-    match limit {
-        Some(limit) => {
-            if file
-                .take(limit.saturating_add(1))
-                .read_to_end(&mut data)
-                .is_err()
-            {
-                return CappedRead::Failed;
-            }
-            if data.len() as u64 > limit {
-                return CappedRead::TooLarge;
-            }
-        }
-        None => {
-            if file.read_to_end(&mut data).is_err() {
-                return CappedRead::Failed;
-            }
+    match crate::search::read_bytes_with_limit(file, limit, capacity) {
+        Ok(Some(data)) => CappedRead::Data(data),
+        Ok(None) => CappedRead::TooLarge,
+        Err(error) => {
+            eprintln!("warning: file read failed: {error}");
+            CappedRead::Failed
         }
     }
-    CappedRead::Data(data)
 }
 
 fn content_id_matches(
@@ -8757,6 +8760,7 @@ mod tests {
         Arc::new(DecodedFile {
             text: String::from_utf8(bytes).unwrap(),
             fixups: Default::default(),
+            source_bytes: len as u64,
         })
     }
 
@@ -9039,7 +9043,7 @@ mod tests {
             builder::build_index_for_files(root, index_dir, std::slice::from_ref(&path), 1024)
                 .unwrap();
         let content_id = outcome.content_ids[rel_path];
-        let stamp = tgrep_core::meta::collect_filestamps(root, &[rel_path.to_string()])
+        let stamp = tgrep_core::meta::try_collect_filestamps(root, &[rel_path.to_string()])
             .unwrap()
             .remove(rel_path)
             .unwrap();
@@ -9100,6 +9104,107 @@ mod tests {
         std::fs::remove_file(root.join("dir")).unwrap();
         #[cfg(windows)]
         std::fs::remove_dir(root.join("dir")).unwrap();
+    }
+
+    #[test]
+    fn server_reads_enforce_query_limits_after_indexed_files_grow() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        // This skips the metadata prefilter: the actual read must enforce the cap.
+        Arc::get_mut(&mut state).unwrap().max_file_size = Some(64);
+        install_reader_file(
+            &state,
+            &root,
+            &state.index_dir,
+            "file.txt",
+            b"needle small\n",
+        );
+        let grown = format!("needle oversized {}\n", "x".repeat(4096));
+        std::fs::write(root.join("file.txt"), grown).unwrap();
+        for request in [
+            serde_json::json!({"pattern": "needle", "max_filesize": 64}),
+            serde_json::json!({"pattern": ".", "max_filesize": 64}),
+            serde_json::json!({"pattern": "needle", "encoding": "windows-1252", "max_filesize": 64}),
+        ] {
+            let response = handle_search(None, &request, &state);
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(value["result"]["num_matches"], 0, "{response}");
+            assert!(state.cache.read().unwrap().peek("file.txt").is_none());
+        }
+        let response = handle_search(None, &serde_json::json!({"pattern": "needle"}), &state);
+        assert!(response.contains("needle oversized"), "{response}");
+    }
+
+    #[test]
+    fn server_cache_limits_use_source_bytes_and_retry_smaller_replacements() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        let original = "needle original\n".repeat(3);
+        let mut encoded = vec![0xff, 0xfe];
+        for unit in original.encode_utf16() {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert!(original.len() < 64 && encoded.len() > 64);
+        install_reader_file(&state, &root, &state.index_dir, "file.txt", &encoded);
+        let response = handle_search(None, &serde_json::json!({"pattern": "needle"}), &state);
+        assert!(response.contains("needle original"), "{response}");
+        assert_eq!(
+            state
+                .cache
+                .read()
+                .unwrap()
+                .peek("file.txt")
+                .unwrap()
+                .source_bytes,
+            encoded.len() as u64,
+        );
+        std::fs::write(root.join("file.txt"), b"needle replacement\n").unwrap();
+        let response = handle_search(
+            None,
+            &serde_json::json!({"pattern": "needle", "max_filesize": 64}),
+            &state,
+        );
+        assert!(response.contains("needle replacement"), "{response}");
+        assert!(!response.contains("needle original"), "{response}");
+    }
+
+    #[test]
+    fn server_read_limits_preserve_exact_caps_cache_hits_and_encoding() {
+        let temp = TempDir::new().unwrap();
+        let mut utf16 = vec![0xff, 0xfe];
+        for unit in "needle\n".encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        for (index, (bytes, forced_encoding)) in
+            [(b"needle\n".to_vec(), "windows-1252"), (utf16, "utf-16le")]
+                .into_iter()
+                .enumerate()
+        {
+            let root = temp.path().join(format!("root{index}"));
+            std::fs::create_dir(&root).unwrap();
+            let state = test_server_state(&root, &root.join(".tgrep"));
+            install_reader_file(&state, &root, &state.index_dir, "file.txt", &bytes);
+            let size = bytes.len() as u64;
+            for encoding in [None, Some(forced_encoding)] {
+                // The repeated exact cap exercises a warm entry as well as a cold read.
+                for limit in [Some(size), Some(size), Some(size - 1), Some(0), None] {
+                    let response = handle_search(
+                        None,
+                        &serde_json::json!({
+                            "pattern": "needle", "encoding": encoding, "max_filesize": limit,
+                        }),
+                        &state,
+                    );
+                    let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+                    let expected = usize::from(limit.is_none_or(|limit| size <= limit));
+                    assert_eq!(value["result"]["num_matches"], expected, "{response}");
+                }
+            }
+        }
     }
 
     fn test_git(root: &Path, args: &[&str]) {
@@ -10148,7 +10253,7 @@ mod tests {
         std::fs::remove_file(root.join("delete.rs")).unwrap();
         std::fs::remove_file(root.join("unreadable.rs")).unwrap();
 
-        let mut stamps = tgrep_core::meta::collect_filestamps(
+        let mut stamps = tgrep_core::meta::try_collect_filestamps(
             &root,
             &[
                 "keep.rs".to_string(),

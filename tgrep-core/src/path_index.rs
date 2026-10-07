@@ -206,7 +206,10 @@ mod tests {
     #[test]
     fn filename_sidecar_rejects_unsafe_paths() {
         let dir = tempfile::tempdir().unwrap();
-        for path in ["../file", "/file", "C:/file", "\\\\server\\share\\file", ""] {
+        for path in ["../file", "/file", "\\\\server\\share\\file", ""]
+            .into_iter()
+            .chain(["C:/file"].into_iter().filter(|_| cfg!(windows)))
+        {
             write_extra_paths(dir.path(), &[path.to_string()]).unwrap();
             assert!(matches!(
                 read_filename_index(dir.path()),

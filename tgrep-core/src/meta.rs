@@ -543,25 +543,59 @@ pub fn remove_file_evidence(index_dir: &Path) -> Result<()> {
 }
 
 /// Collect file stamps (mtime + size) for a list of relative paths under `root`.
-/// Invalid paths and failed file opens are reported rather than following links.
-pub fn collect_filestamps(root: &Path, paths: &[String]) -> Result<HashMap<String, FileStamp>> {
+///
+/// This compatibility API is best-effort: missing files are omitted, and other
+/// failures are diagnosed and omitted without following links. Use
+/// [`try_collect_filestamps`] when failures must be returned to the caller.
+pub fn collect_filestamps(root: &Path, paths: &[String]) -> HashMap<String, FileStamp> {
+    use rayon::prelude::*;
+
+    let rooted = match crate::rooted::RootedDir::open(root) {
+        Ok(rooted) => rooted,
+        Err(error) => {
+            eprintln!(
+                "warning: cannot collect file stamps under {}: {error}",
+                root.display()
+            );
+            return HashMap::new();
+        }
+    };
+    paths
+        .par_iter()
+        .filter_map(|path| match collect_filestamp(&rooted, path) {
+            Ok(stamp) => Some((path.clone(), stamp)),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                eprintln!("warning: cannot collect file stamp for {path:?}: {error}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Collect contained file stamps, omitting missing files but returning other
+/// path validation and I/O errors.
+pub fn try_collect_filestamps(root: &Path, paths: &[String]) -> Result<HashMap<String, FileStamp>> {
     use rayon::prelude::*;
 
     let rooted = crate::rooted::RootedDir::open(root)?;
     paths
         .par_iter()
         .filter_map(|rel_path| {
-            let result = (|| {
-                crate::rooted::validate_index_path(rel_path)?;
-                let file = rooted.open_file(Path::new(rel_path))?;
-                Ok((rel_path.clone(), file_stamp(&file.metadata()?)))
-            })();
+            let result =
+                collect_filestamp(&rooted, rel_path).map(|stamp| (rel_path.clone(), stamp));
             match result {
                 Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
                 result => Some(result),
             }
         })
         .collect()
+}
+
+fn collect_filestamp(rooted: &crate::rooted::RootedDir, path: &str) -> Result<FileStamp> {
+    crate::rooted::validate_index_path(path)?;
+    let file = rooted.open_file(Path::new(path))?;
+    Ok(file_stamp(&file.metadata()?))
 }
 
 #[cfg(test)]
@@ -573,7 +607,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("inside.txt"), b"inside").unwrap();
         std::fs::write(temp.path().join("outside.txt"), b"outside").unwrap();
-        let stamps = super::collect_filestamps(
+        let stamps = super::try_collect_filestamps(
             &root,
             &["inside.txt".to_string(), "missing.txt".to_string()],
         )
@@ -587,10 +621,18 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         ] {
-            assert!(super::collect_filestamps(&root, &[path]).is_err());
+            assert!(super::try_collect_filestamps(&root, &[path]).is_err());
         }
         crate::rooted::tests::link_directory(temp.path(), &root.join("link"));
-        assert!(super::collect_filestamps(&root, &["link/outside.txt".to_string()]).is_err());
+        assert!(super::try_collect_filestamps(&root, &["link/outside.txt".to_string()]).is_err());
+        let paths = [
+            "inside.txt".to_string(),
+            "missing.txt".to_string(),
+            "../outside.txt".to_string(),
+            "link/outside.txt".to_string(),
+        ];
+        let compatible: HashMap<String, FileStamp> = super::collect_filestamps(&root, &paths);
+        assert_eq!(compatible, stamps);
         #[cfg(unix)]
         std::fs::remove_file(root.join("link")).unwrap();
         #[cfg(windows)]

@@ -803,6 +803,11 @@ retirement is excluded. A stale root, owner claim or generation open cannot
 probe a retired guard and disrupt its physical reclamation. Releasing the last
 root handle withdraws that incarnation; bounded maintenance reclaims its control
 file separately, so successful handle release does not wait for physical GC.
+Owner release and released-view draining use that same withdrawal path. An
+unrelated control-file cleanup cannot fail a committed logical owner release;
+the retired root guard remains accounted for until bounded maintenance removes
+it. Root-lifetime verification and physical-cleanup failures remain explicit
+errors in their respective operations.
 
 Namespace ownership is rooted in external storage and survives repository
 deletion. Live startup also coordinates through the repository's common-directory

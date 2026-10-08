@@ -446,6 +446,92 @@ fn collection_crash_boundaries_preserve_live_views_and_resumable_progress() {
 }
 
 #[test]
+fn owner_release_drains_roots_while_unrelated_control_cleanup_is_paused() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    let mut request = attach_input(&fixture, &claim);
+    request["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
+    let attached = completed(&daemon, &daemon.rpc("views.attach", request));
+    let current = &attached["result"]["current"];
+    super::live::wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":current["id"]}),
+        |status| status["ready"] == true && status["work"].is_null(),
+    );
+    let namespace = fixture
+        .storage
+        .join(tgrep_core::managed::STORE_DIRECTORY)
+        .join(daemon.marker["repository"].as_str().unwrap());
+    let root_guard = namespace.join("guards").join(format!(
+        "root-{}.lock",
+        current["root_anchor"]["guard"].as_str().unwrap()
+    ));
+    assert!(root_guard.is_file());
+    let (ended, ended_guard) = owner(&daemon);
+    let ended_proof = namespace
+        .join("owners")
+        .join(format!("{}.json", ended.owner));
+    let hook = pause(&daemon, "control-intent-saved");
+    daemon.rpc("owners.release", json!({"claim":ended}));
+    drop(ended_guard);
+    reached(&daemon, &hook);
+    assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
+
+    let released = daemon
+        .try_rpc("owners.release", json!({"claim":claim}))
+        .unwrap();
+    let replay = daemon
+        .try_rpc("owners.release", json!({"claim":claim}))
+        .unwrap();
+    let owner_state = daemon.rpc("owners.inspect", json!({"id":claim.owner}));
+    let view_state = daemon.rpc("views.recover", json!({"id":current["id"]}));
+    let control_retained = root_guard.is_file();
+    let root_released = fs::rename(&fixture.b, fixture.temp.path().join("released-worktree"));
+    let paused = daemon.rpc("testing.status", json!({}));
+    daemon.rpc("testing.release", json!({"id":hook["ticket"]}));
+
+    assert!(released.get("error").is_none(), "{released}");
+    assert_eq!(released["result"]["data"]["owner"]["released"], true);
+    assert_eq!(released["result"]["data"]["leases_released"], 1);
+    assert!(replay.get("error").is_none(), "{replay}");
+    assert_eq!(replay["result"]["data"]["leases_released"], 0);
+    assert_eq!(owner_state["released"], true);
+    assert_eq!(view_state["active"], false);
+    assert!(
+        control_retained,
+        "root draining synchronously unlinked its guard"
+    );
+    assert!(root_released.is_ok(), "{root_released:?}");
+    assert_eq!(paused["ticket"], hook["ticket"]);
+    assert_eq!(paused["stage"], "waiting");
+
+    let started = Instant::now();
+    while root_guard.exists() || ended_proof.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "retired controls were not reclaimed: {}",
+            daemon.rpc("maintenance.status", json!({}))
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let retained = fs::metadata(
+        namespace
+            .join("owners")
+            .join(format!("{}.json", claim.owner)),
+    )
+    .unwrap()
+    .len();
+    assert_eq!(
+        daemon.rpc("namespace.status", json!({}))["usage"]["control_logical_bytes"],
+        retained
+    );
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
 fn control_unlink_crashes_preserve_sibling_proofs_and_credit_only_the_ended_owner() {
     for point in [
         "control-intent-saved",

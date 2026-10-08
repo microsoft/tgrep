@@ -1806,7 +1806,7 @@ impl ViewManager {
                         if self.namespace.root_busy(anchor)? {
                             continue;
                         }
-                        self.namespace.retire_root(anchor)?;
+                        self.namespace.withdraw_root(anchor)?;
                     }
                     self.slots
                         .lock()

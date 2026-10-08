@@ -151,29 +151,40 @@ impl Ownership {
             hash.update(&metadata.st_mode().to_le_bytes());
             hash.update(&metadata.st_flags().to_le_bytes());
             // SAFETY: a live pinned file descriptor.
-            let acl = Acl(unsafe { acl_get_fd(file.as_raw_fd()) });
-            if acl.0.is_null() {
-                return Err(std::io::Error::last_os_error().into());
+            let acl = unsafe { acl_get_fd(file.as_raw_fd()) };
+            if acl.is_null() {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(error.into());
+                }
+                // Darwin's FILESEC_ACL property reports ENOENT when this live
+                // descriptor has no extended ACL; it is not a pathname lookup.
+                file.metadata()?;
+                hash.update(&0_u64.to_le_bytes());
+            } else {
+                let acl = Acl(acl);
+                // SAFETY: a live native ACL owned by the wrapper.
+                let size = unsafe { acl_size(acl.0) };
+                if size < 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                let size = usize::try_from(size)
+                    .map_err(|_| Error::corrupt("native ACL size overflow"))?;
+                if size > SECURITY_BYTES {
+                    return Err(Error::incompatible(
+                        "native ACL exceeds the supported ownership bound",
+                    ));
+                }
+                let mut bytes = [0_u8; SECURITY_BYTES];
+                // SAFETY: the bounded output and owned ACL remain alive for the call.
+                if unsafe { acl_copy_ext(bytes.as_mut_ptr().cast(), acl.0, size as libc::ssize_t) }
+                    < 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                hash.update(&(size as u64).to_le_bytes());
+                hash.update(&bytes[..size]);
             }
-            // SAFETY: a live native ACL owned by the wrapper.
-            let size = unsafe { acl_size(acl.0) };
-            if size < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            let size =
-                usize::try_from(size).map_err(|_| Error::corrupt("native ACL size overflow"))?;
-            if size > SECURITY_BYTES {
-                return Err(Error::incompatible(
-                    "native ACL exceeds the supported ownership bound",
-                ));
-            }
-            let mut bytes = [0_u8; SECURITY_BYTES];
-            // SAFETY: the bounded output and owned ACL remain alive for the call.
-            if unsafe { acl_copy_ext(bytes.as_mut_ptr().cast(), acl.0, size as libc::ssize_t) } < 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            hash.update(&bytes[..size]);
         }
         #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         return Err(Error::incompatible(
@@ -914,6 +925,38 @@ pub(crate) fn allocated_bytes(file: &File) -> Result<Measurement<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_ownership_distinguishes_absent_and_changed_extended_acl() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = Directory::open(temp.path()).unwrap();
+        let mut file = directory.create_file("acl-member").unwrap();
+        file.write_all(b"owned ACL fixture").unwrap();
+        file.sync_all().unwrap();
+        let path = directory.path().join("acl-member");
+        let chmod = |arguments: &[&str]| {
+            let status = std::process::Command::new("chmod")
+                .args(arguments)
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "native fixture ACL update failed: {status}"
+            );
+        };
+        chmod(&["-N"]);
+        let without_acl = Ownership::capture(&file).unwrap();
+        chmod(&["+a", "everyone allow read"]);
+        let with_acl = Ownership::capture(&file).unwrap();
+        assert_ne!(without_acl, with_acl);
+        chmod(&["-N"]);
+        assert_eq!(without_acl, Ownership::capture(&file).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"owned ACL fixture");
+        drop((file, directory));
+        temp.close().unwrap();
+    }
 
     #[test]
     fn no_open_observation_preserves_identity_size_and_allocation() {

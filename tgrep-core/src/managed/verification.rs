@@ -364,22 +364,24 @@ impl Verification {
 
 impl Namespace {
     pub(super) fn verification_scratch(&self, bytes: u64) -> Result<super::memory::RetainedMemory> {
-        self.read(|connection| {
-            let encoded: String =
-                connection.query_row("SELECT policy FROM state WHERE singleton=1", [], |row| {
-                    row.get(0)
-                })?;
-            let policy: super::Policy = serde_json::from_str(&encoded)?;
-            let allocation = super::work::allocation_row(connection)?;
-            self.memory.retain_unreserved(
-                connection,
-                bytes,
-                0,
-                policy
-                    .work
-                    .private_work_bytes
-                    .min(allocation.private_work_bytes),
-            )
+        self.memory.retain_unreserved(bytes, 0, |memory| {
+            self.fault(super::faults::Point::VerificationMemoryAdmission, None)?;
+            self.read(|connection| {
+                let encoded: String = connection.query_row(
+                    "SELECT policy FROM state WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let policy: super::Policy = serde_json::from_str(&encoded)?;
+                let allocation = super::work::allocation_row(connection)?;
+                memory.unreserved_capacity(
+                    connection,
+                    policy
+                        .work
+                        .private_work_bytes
+                        .min(allocation.private_work_bytes),
+                )
+            })
         })
     }
 

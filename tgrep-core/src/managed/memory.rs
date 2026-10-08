@@ -44,6 +44,24 @@ pub(crate) struct MemoryState {
 }
 
 impl MemoryState {
+    pub(crate) fn unreserved_capacity(
+        &mut self,
+        connection: &Connection,
+        limit: u64,
+    ) -> Result<u64> {
+        let usage = self.usage(connection)?;
+        let reserved: u64 = connection.query_row(
+            "SELECT coalesce(sum(json_extract(record,'$.request.private_bytes')),0) FROM reservations",
+            [], |row| super::catalog::unsigned(row, 0),
+        )?;
+        let used = reserved
+            .checked_add(usage.unreserved_retained_private_estimate_bytes)
+            .ok_or_else(|| Error::pressure("retained-private-allocation"))?;
+        limit
+            .checked_sub(used)
+            .ok_or_else(|| Error::pressure("retained-private-allocation"))
+    }
+
     pub(crate) fn usage(&mut self, connection: &Connection) -> Result<MemoryUsage> {
         let mut statement = connection.prepare("SELECT id FROM reservations LIMIT 65")?;
         let active = statement
@@ -163,21 +181,14 @@ impl MemoryAccount {
 
     pub(crate) fn retain_unreserved(
         self: &Arc<Self>,
-        connection: &Connection,
         private: u64,
         mapped: u64,
-        limit: u64,
+        capacity: impl FnOnce(&mut MemoryState) -> Result<u64>,
     ) -> Result<RetainedMemory> {
+        // Reservations and retained allocations always take memory before the
+        // catalog. Finish the fallible catalog read before creating a charge.
         let mut state = self.lock()?;
-        let usage = state.usage(connection)?;
-        let reserved: u64 = connection.query_row(
-            "SELECT coalesce(sum(json_extract(record,'$.request.private_bytes')),0) FROM reservations",
-            [], |row| super::catalog::unsigned(row, 0),
-        )?;
-        let total = reserved
-            .checked_add(usage.unreserved_retained_private_estimate_bytes)
-            .and_then(|bytes| bytes.checked_add(private));
-        if total.is_none_or(|bytes| bytes > limit) {
+        if private > capacity(&mut state)? {
             return Err(Error::pressure("retained-private-allocation"));
         }
         state.add(private, mapped, None)?;

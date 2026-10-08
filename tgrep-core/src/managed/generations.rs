@@ -91,7 +91,9 @@ fn load(
         let account = super::memory::MemoryAccount::for_namespace(&pin.namespace)?;
         (
             None,
-            Some(account.retain_unreserved(&connection, private, mapped, limit)?),
+            Some(account.retain_unreserved(private, mapped, |memory| {
+                memory.unreserved_capacity(&connection, limit)
+            })?),
         )
     };
     let generation = Arc::new(Generation::load_managed(

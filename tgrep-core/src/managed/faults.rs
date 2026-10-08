@@ -17,6 +17,7 @@ pub enum Point {
     MemberCreated,
     MemberSealBeforeCommit,
     MemberSealAfterCommit,
+    VerificationMemoryAdmission,
     MemberVerificationPage,
     MemberVerified,
     GenerationBuilt,

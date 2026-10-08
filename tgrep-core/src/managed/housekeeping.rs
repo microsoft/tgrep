@@ -673,18 +673,7 @@ impl Namespace {
             Some(permit) => permit
                 .memory(super::verification::MEMORY_BYTES)?
                 .retain(0)?,
-            None => self.read(|connection| {
-                self.memory.retain_unreserved(
-                    connection,
-                    super::verification::MEMORY_BYTES,
-                    0,
-                    policy
-                        .policy
-                        .work
-                        .private_work_bytes
-                        .min(allocation.private_work_bytes),
-                )
-            })?,
+            None => self.verification_scratch(super::verification::MEMORY_BYTES)?,
         };
         let recheck = |native: &super::authentication_native::NativeFile| -> Result<()> {
             native.check()?;

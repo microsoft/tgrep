@@ -1663,6 +1663,59 @@ mod tests {
     }
 
     #[test]
+    fn unreserved_verifier_admission_does_not_hold_the_catalog_before_memory() {
+        use crate::managed::faults::{Action, Point, Specification, Stage};
+        let (_temp, namespace) = namespace();
+        namespace.activate().unwrap();
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::VerificationMemoryAdmission,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let (scratch, reached, catalog_available) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| namespace.verification_scratch(64 * 1024));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let catalog_available = namespace.database.try_lock().is_ok();
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            (worker.join().unwrap().unwrap(), reached, catalog_available)
+        });
+        assert!(reached, "the memory-admission boundary was not exercised");
+        assert!(
+            catalog_available,
+            "verifier admission inverts memory/catalog lock order"
+        );
+        assert_eq!(
+            namespace
+                .work_usage()
+                .unwrap()
+                .memory
+                .retained_private_estimate_bytes,
+            64 * 1024
+        );
+        drop(scratch);
+        assert_eq!(
+            namespace
+                .work_usage()
+                .unwrap()
+                .memory
+                .retained_private_estimate_bytes,
+            0
+        );
+    }
+
+    #[test]
     fn independent_authentication_boundary_rejects_missing_zero_and_future_formats() {
         let (_temp, namespace) = namespace();
         let claim = namespace.prepare_owner().unwrap().claim;

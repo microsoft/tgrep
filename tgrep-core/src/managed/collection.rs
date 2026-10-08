@@ -100,6 +100,9 @@ mod tests {
                 save_object(transaction, &mut object)
             })
             .unwrap();
+        namespace
+            .record_operation_result(&operation.id, Ok(serde_json::json!({})), false)
+            .unwrap();
         let object = namespace.object(&object.id).unwrap();
         (temp, namespace, object, path)
     }
@@ -117,6 +120,41 @@ mod tests {
             )
             .unwrap();
         namespace.collect_pass(&operation.id, request).unwrap()
+    }
+
+    fn cached_prefix(namespace: &Arc<Namespace>, token: &str) -> (CollectionRequest, u32) {
+        let mut request = CollectionRequest {
+            policy_version: namespace.policy().unwrap().version,
+            allocation_version: namespace.allocation().unwrap().version,
+            bounds: CollectionBounds {
+                max_duration_ms: 1000,
+                max_examined: 1,
+                max_removed: 1,
+                max_delete_bytes: 4096,
+                max_pages: 1,
+            },
+            cursor: None,
+        };
+        let mut bytes = 0;
+        let mut restarts = 0;
+        for sequence in 0..8 {
+            let result = request_pass(namespace, &request, &format!("{token}-{sequence}"));
+            assert_eq!(result.errors, 0, "{result:?}");
+            assert_eq!(result.logical_bytes_reclaimed, 0);
+            assert!(result.verification_bytes <= 4096);
+            bytes += result.verification_bytes;
+            restarts += result.verification_restarts;
+            request.cursor = result.next;
+            if result.verification_context_retained && bytes >= 4096 {
+                break;
+            }
+        }
+        assert_eq!(bytes, 4096);
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"],
+            4096
+        );
+        (request, restarts)
     }
 
     #[test]
@@ -143,35 +181,7 @@ mod tests {
     fn discarded_verification_restarts_before_accepting_a_changed_earlier_prefix() {
         let original = vec![b'a'; 128 * 1024 + 17];
         let (_temp, namespace, _object, path) = authenticated_fixture(&original);
-        let mut request = CollectionRequest {
-            policy_version: 1,
-            allocation_version: 1,
-            bounds: CollectionBounds {
-                max_duration_ms: 1000,
-                max_examined: 1,
-                max_removed: 1,
-                max_delete_bytes: 4096,
-                max_pages: 1,
-            },
-            cursor: None,
-        };
-        let mut bytes = 0;
-        for sequence in 0..8 {
-            let result = request_pass(&namespace, &request, &format!("prefix-{sequence}"));
-            assert_eq!(result.errors, 0, "{result:?}");
-            assert_eq!(result.logical_bytes_reclaimed, 0);
-            assert!(result.verification_bytes <= 4096);
-            bytes += result.verification_bytes;
-            request.cursor = result.next;
-            if result.verification_context_retained && bytes >= 4096 {
-                break;
-            }
-        }
-        assert_eq!(bytes, 4096);
-        assert_eq!(
-            namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"],
-            4096
-        );
+        let (request, _) = cached_prefix(&namespace, "prefix");
         assert!(namespace.discard_idle_verification(false).unwrap());
         let mut writer = File::options().write(true).open(&path).unwrap();
         writer.write_all(b"changed prefix").unwrap();
@@ -189,6 +199,183 @@ mod tests {
             original.len() as u64
         );
         assert!(std::fs::read(&path).unwrap().starts_with(b"changed prefix"));
+    }
+
+    #[test]
+    fn independent_read_only_inventory_preserves_verification_progress() {
+        let original = vec![b'a'; 128 * 1024 + 17];
+        let (_temp, namespace, _object, path) = authenticated_fixture(&original);
+        let (request, _) = cached_prefix(&namespace, "inspection");
+        let expected_path = crate::managed::NativePath::from_path(&path).unwrap();
+        let mut cursor = None;
+        let mut found = false;
+        let mut payload_error = None;
+        for _ in 0..32 {
+            let page = namespace.inventory_page(cursor.take()).unwrap();
+            for entry in page.entries {
+                if entry.path == expected_path {
+                    found = true;
+                    payload_error = entry.error;
+                }
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none(), "bounded fixture inventory did not finish");
+        assert!(found, "inventory did not inspect the retained member");
+        let resumed = request_pass(&namespace, &request, "inspection-resume");
+        assert_eq!(
+            resumed.errors, 0,
+            "read-only inspection invalidated collection; inventory={payload_error:?}, resumed={resumed:?}"
+        );
+        assert!(payload_error.is_none());
+        assert!(resumed.verification_context_retained);
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"],
+            8192
+        );
+    }
+
+    #[test]
+    fn policy_and_allocation_versions_restart_cached_prefix_authentication() {
+        for policy_change in [false, true] {
+            let (_temp, namespace, _object, _path) =
+                authenticated_fixture(&vec![b'a'; 128 * 1024 + 17]);
+            cached_prefix(&namespace, "initial");
+            if policy_change {
+                let policy = namespace.policy().unwrap();
+                namespace
+                    .update_policy(policy.version, policy.policy)
+                    .unwrap();
+            } else {
+                let allocation = namespace.allocation().unwrap();
+                namespace
+                    .update_allocation(allocation.version, allocation)
+                    .unwrap();
+            }
+            let (_, restarts) = cached_prefix(&namespace, "after-version-change");
+            assert_eq!(restarts, 1);
+        }
+    }
+
+    #[test]
+    fn expiration_releases_cached_native_resources_and_restarts_at_the_first_byte() {
+        let (_temp, namespace, _object, path) = authenticated_fixture(&vec![b'a'; 128 * 1024 + 17]);
+        cached_prefix(&namespace, "initial");
+        namespace.expire_verification_for_test().unwrap();
+        namespace.expire_cursors().unwrap();
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["state"],
+            "empty"
+        );
+        assert_eq!(
+            namespace
+                .work_usage()
+                .unwrap()
+                .memory
+                .retained_private_estimate_bytes,
+            0
+        );
+        drop(File::options().write(true).open(&path).unwrap());
+        cached_prefix(&namespace, "after-expiry");
+    }
+
+    #[test]
+    fn idle_shutdown_discards_cached_proof_but_an_active_verifier_keeps_admission_open() {
+        let (_temp, namespace, _object, path) = authenticated_fixture(&vec![b'a'; 128 * 1024 + 17]);
+        cached_prefix(&namespace, "initial");
+        let mut active = namespace.active_verification().unwrap();
+        let busy = namespace
+            .stop_if_idle(crate::managed::ExternalWork::default())
+            .unwrap();
+        assert!(!busy.stopping);
+        assert!(busy.verification_active);
+        assert!(!namespace.stop_is_committed().unwrap());
+        active.keep = true;
+        drop(active);
+        let idle = namespace
+            .stop_if_idle(crate::managed::ExternalWork::default())
+            .unwrap();
+        assert!(idle.stopping, "{idle:?}");
+        assert!(!idle.verification_active);
+        assert!(namespace.stop_is_committed().unwrap());
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["state"],
+            "empty"
+        );
+        assert_eq!(
+            namespace
+                .work_usage()
+                .unwrap()
+                .memory
+                .retained_private_estimate_bytes,
+            0
+        );
+        drop(File::options().write(true).open(&path).unwrap());
+    }
+
+    #[test]
+    fn cancellation_at_a_verified_page_discards_all_cached_proof_without_delete_credit() {
+        let original = vec![b'a'; 128 * 1024 + 17];
+        let (_temp, namespace, _object, path) = authenticated_fixture(&original);
+        let (request, _) = cached_prefix(&namespace, "initial");
+        let operation = namespace
+            .accept_system_operation(
+                Token::parse("cancel-verifier").unwrap(),
+                "collection",
+                serde_json::to_value(&request).unwrap(),
+            )
+            .unwrap();
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::MemberVerificationPage,
+                operation: Some(operation.id.clone()),
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| namespace.collect_pass(&operation.id, &request));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage
+                    == crate::managed::faults::Stage::Waiting
+                {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let cancelled = namespace.cancel_operation(&operation.id);
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            let result = worker.join().unwrap().unwrap();
+            assert!(reached, "the active verification page was not exercised");
+            assert!(cancelled.unwrap().cancelled);
+            result
+        });
+        assert!(result.cancelled, "{result:?}");
+        assert_eq!(
+            result.logical_bytes_reclaimed + result.recovered_logical_bytes,
+            0
+        );
+        assert!(!result.verification_context_retained);
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["state"],
+            "empty"
+        );
+        assert_eq!(
+            namespace
+                .work_usage()
+                .unwrap()
+                .memory
+                .retained_private_estimate_bytes,
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]

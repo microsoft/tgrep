@@ -10,7 +10,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::ReadDir;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 const PAGE_LIMIT: u32 = 256;
@@ -379,7 +379,30 @@ impl Namespace {
                 }
             }
         }
-        let file = frame.directory.open_file(name, false)?;
+        let cached_file = if let Some(expected) = &expected
+            && matches!(&frame.area, Area::Object(_))
+        {
+            let cache = self.verification.try_lock().map_err(|error| match error {
+                TryLockError::WouldBlock => Error::busy("member-verifier-active"),
+                TryLockError::Poisoned(_) => Error::corrupt("member verification cache poisoned"),
+            })?;
+            if let Some(context) = cache.as_ref()
+                && super::FileIdentity::of(&context.native.file)? == expected.identity
+            {
+                context.check(&frame.directory)?;
+                // A duplicate shares the existing lease; reopening would break
+                // Linux verification even though inventory is read-only.
+                Some(context.native.file.try_clone()?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let file = match cached_file {
+            Some(file) => file,
+            None => frame.directory.open_file(name, false)?,
+        };
         if let Some(expected) = expected {
             let _memory = self.verification_scratch(super::storage::SECURITY_BYTES as u64)?;
             let length = file.metadata()?.len();

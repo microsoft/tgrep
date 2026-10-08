@@ -414,6 +414,18 @@ impl Namespace {
         Ok(true)
     }
 
+    #[cfg(test)]
+    pub(super) fn expire_verification_for_test(&self) -> Result<()> {
+        let mut active = self.active_verification()?;
+        active
+            .context
+            .as_mut()
+            .ok_or_else(|| Error::corrupt("missing verification fixture"))?
+            .expires = Instant::now();
+        active.keep = true;
+        Ok(())
+    }
+
     pub(super) fn verification_diagnostics(&self) -> Result<serde_json::Value> {
         self.discard_idle_verification(true)?;
         let cache = match self.verification.try_lock() {

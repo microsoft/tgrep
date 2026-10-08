@@ -1209,9 +1209,11 @@ pages also subject to page, duration, cancellation and allocation checks.
 Consequently, deletion-byte limits are not a claim about total physical I/O.
 A member larger than one pass can resume verification using a bounded, volatile
 context; verification bytes, invalidations and retained resources are reported
-separately. Restart, cancellation, expiration or loss of valid native evidence
-discards that context. Durable deletion intents do not preserve authority over
-an earlier verified prefix.
+separately. Restart, cancellation, expiration, policy/allocation version changes
+or loss of valid native evidence discards that context. Durable deletion intents
+do not preserve authority over an earlier verified prefix. Read-only inventory
+duplicates a matching cached descriptor rather than breaking its native lease
+with a new open; an active verifier can produce a typed retryable busy finding.
 
 Native evidence is checked around each verification page and immediately before
 destructive I/O:

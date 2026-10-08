@@ -482,15 +482,14 @@ fn monitor_directories(
     root: &Path,
     storage: &Path,
     budget: usize,
-) -> Result<(HashSet<PathBuf>, HashSet<PathBuf>)> {
+) -> Result<(HashSet<PathBuf>, Vec<PathBuf>)> {
     let mut directories = HashSet::new();
     let mut stack = vec![(root.to_path_buf(), false)];
     let mut examined = 0_usize;
     let deadline = Instant::now() + Duration::from_millis(100);
     let (git, common) = tgrep_core::git_index::read_repository_dirs_bounded(root)?;
-    let metadata: HashSet<_> = [std::fs::canonicalize(git)?, std::fs::canonicalize(common)?]
-        .into_iter()
-        .collect();
+    let mut metadata = vec![std::fs::canonicalize(git)?, std::fs::canonicalize(common)?];
+    metadata.dedup();
     for directory in &metadata {
         directories.insert(directory.clone());
         for name in ["refs", "info"] {
@@ -552,7 +551,7 @@ fn process_memory() -> Value {
 
 fn watch_event(
     slot: &ViewSlot,
-    metadata: &HashSet<PathBuf>,
+    metadata: &[PathBuf],
     watch_failure: &Mutex<Option<String>>,
     event: notify::Result<notify::Event>,
 ) -> managed::Result<()> {
@@ -566,7 +565,8 @@ fn watch_event(
             for path in event.paths {
                 if let Some(relative) = metadata
                     .iter()
-                    .find_map(|directory| path.strip_prefix(directory).ok())
+                    .filter_map(|directory| path.strip_prefix(directory).ok())
+                    .min_by_key(|relative| relative.components().count())
                 {
                     let first = relative.components().next().map(|part| part.as_os_str());
                     if !path
@@ -1016,7 +1016,7 @@ impl State {
                         "injected native watcher uncertainty",
                     )),
                 };
-                watch_event(&slot, &HashSet::new(), &failure, event)?;
+                watch_event(&slot, &[], &failure, event)?;
                 Ok(json!({"input_epoch":slot.input_epoch()}))
             }
             "views.attach" => {
@@ -2058,6 +2058,206 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
 #[cfg(test)]
 mod scheduling_tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "managed-test-hooks")]
+    fn nested_git_metadata_events_use_the_most_specific_root_in_either_order() {
+        use std::fs;
+        use std::process::{Command, Stdio};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        let linked = temp.path().join("linked");
+        let storage = temp.path().join("storage");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&storage).unwrap();
+        let git = |args: &[&str]| {
+            let mut command = Command::new("git");
+            command
+                .current_dir(&root)
+                .args([
+                    "-c",
+                    "user.name=Managed fixture",
+                    "-c",
+                    "user.email=managed@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.autocrlf=false",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            let mut child = managed::SupervisedChild::spawn(&mut command).unwrap();
+            assert!(child.wait().unwrap().success(), "git {args:?}");
+        };
+        git(&["init", "--quiet"]);
+        fs::write(root.join("source.txt"), "shared_term\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+        ]);
+        let repository = Repository::discover(&linked).unwrap();
+        let policy: Policy = serde_json::from_value(json!({
+            "schema":2,"storage":"managed","retention":{"mode":"retain-all"},"advancement":{"mode":"fixed"},
+            "work":{
+                "max_views":8,"max_leases":32,"workers":2,"queue_items":16,
+                "staging_bytes":67108864,"private_work_bytes":67108864,
+                "sort_buffer_bytes":1048576,"blob_bytes":1048576,"operation_timeout_ms":30000,
+                "page_objects":16,"max_cursors":8,"cursor_lifetime_ms":30000,"max_receipts":1024,
+                "metadata_bytes":16777216
+            },
+            "collection":{
+                "schedule":{"mode":"disabled"},"on_pressure":false,
+                "checkpoint_grace_ms":0,"generation_grace_ms":0,
+                "max_duration_ms":1000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,
+                "chunk_bytes":65536,"max_pages":4,"retry_ms":100
+            }
+        })).unwrap();
+        let namespace = Namespace::initialize(&repository, &storage, policy).unwrap();
+        let prepared = namespace.prepare_owner().unwrap();
+        let owner = managed::OwnerGuard::claim(prepared.claim).unwrap();
+        namespace.register_owner(owner.registration()).unwrap();
+        let manager = ViewManager::new(
+            Arc::clone(&namespace),
+            None,
+            WorktreeOptions::default(),
+            None,
+        )
+        .unwrap();
+        let operation = manager
+            .accept_attach(
+                OperationToken {
+                    scope: owner.registration().owner.clone(),
+                    sequence: 1,
+                    token: Token::parse("watch-attach").unwrap(),
+                },
+                AttachRequest {
+                    root: linked.clone(),
+                    revision: Some("HEAD".into()),
+                    profile: IndexingProfile::default(),
+                    lease: Token::parse("watch-client").unwrap(),
+                    owner: owner.registration().owner.clone(),
+                    accept_current: None,
+                    migratable: true,
+                    allocation_version: 1,
+                },
+            )
+            .unwrap();
+        let completed = manager.execute(&operation.id).unwrap();
+        assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+        let record: managed::ViewRecord =
+            serde_json::from_value(completed.result.unwrap()["current"].clone()).unwrap();
+        assert!(record.pin().unwrap().incarnation.is_some());
+        assert!(manager.status(&record.id).unwrap().ready);
+        let slot = manager.slot(&record.id).unwrap();
+        let (private, common) =
+            tgrep_core::git_index::read_repository_dirs_bounded(&linked).unwrap();
+        let private = fs::canonicalize(private).unwrap();
+        let common = fs::canonicalize(common).unwrap();
+        assert_ne!(private, common);
+        assert!(private.starts_with(&common));
+        let failure = Mutex::new(None);
+        for roots in [
+            [common.clone(), private.clone()],
+            [private.clone(), common.clone()],
+        ] {
+            for directory in [&private, &common] {
+                for name in [
+                    "HEAD",
+                    "index",
+                    "config",
+                    "config.worktree",
+                    "packed-refs",
+                    "commondir",
+                    "refs",
+                    "info",
+                ] {
+                    let before = slot.input_epoch();
+                    watch_event(
+                        &slot,
+                        &roots,
+                        &failure,
+                        Ok(
+                            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                                .add_path(directory.join(name)),
+                        ),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        slot.input_epoch(),
+                        before + 1,
+                        "ignored {directory:?}/{name}; roots {roots:?}"
+                    );
+                    assert!(!manager.status(&record.id).unwrap().ready);
+                }
+                for name in [
+                    "HEAD.lock",
+                    "index.lock",
+                    "config.lock",
+                    "config.worktree.lock",
+                    "objects",
+                    "logs",
+                ] {
+                    let before = slot.input_epoch();
+                    watch_event(
+                        &slot,
+                        &roots,
+                        &failure,
+                        Ok(
+                            notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                                .add_path(directory.join(name)),
+                        ),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        slot.input_epoch(),
+                        before,
+                        "unexpected invalidation for {name}; roots {roots:?}"
+                    );
+                }
+            }
+            let before = slot.input_epoch();
+            watch_event(
+                &slot,
+                &roots,
+                &failure,
+                Ok(
+                    notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                        .add_path(common.join("worktrees").join("unrelated").join("HEAD")),
+                ),
+            )
+            .unwrap();
+            assert_eq!(slot.input_epoch(), before);
+            watch_event(
+                &slot,
+                &roots,
+                &failure,
+                Ok(
+                    notify::Event::new(EventKind::Access(notify::event::AccessKind::Any))
+                        .add_path(private.join("HEAD")),
+                ),
+            )
+            .unwrap();
+            assert_eq!(slot.input_epoch(), before);
+        }
+        assert!(failure.into_inner().unwrap().is_none());
+        drop((slot, manager, owner, namespace, repository));
+        temp.close().unwrap();
+    }
 
     #[test]
     fn successful_ticks_preserve_timestamped_failure_evidence_without_exposing_details_in_aggregates()

@@ -1050,7 +1050,10 @@ in an operation envelope and performs full verification. `views.invalidate`
 directly accepts `view`, `expected_version`, `owner`, `changed` (relative paths)
 and `full`; include both rename paths. A processed epoch acknowledges observed
 inputs, not every concurrent filesystem write. Native/poll watching and full
-repair use the same reconciliation path. `--no-index` remains the way to search
+repair use the same reconciliation path. Git metadata events use the most
+specific matching metadata root, including a linked worktree's private Git
+directory nested under the common directory; lock-file traffic is ignored.
+`--no-index` remains the way to search
 current disk bytes without relying on watcher delivery.
 
 `views.adaptive` takes `view`, `owner`, `expected_version`, `allocation_version`

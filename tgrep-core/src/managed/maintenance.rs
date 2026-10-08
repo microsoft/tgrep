@@ -176,7 +176,7 @@ impl Namespace {
             .maintenance
             .try_lock()
             .map_err(|_| Error::busy("namespace-maintenance-active"))?;
-        self.stop_if_idle_inner(external, None, serial)
+        self.stop_if_idle_inner(external, None, &serial)
     }
 
     /// Resolve shutdown authorization for the activated instance. A committed
@@ -240,11 +240,19 @@ impl Namespace {
         if let Some(error) = operation.error {
             return Err(serde_json::from_value(error)?);
         }
-        self.check_operation_lifetime(&operation)?;
         let serial = self.maintenance.try_lock().map_err(|_| {
             Error::busy("namespace-maintenance-active").operation(operation.id.to_string())
         })?;
-        let result = self.stop_if_idle_inner(external, Some(&operation.id), serial);
+        // Another caller may have completed this token after our first read.
+        let operation = self.operation(&operation.id)?;
+        if let Some(result) = operation.result {
+            return Ok(serde_json::from_value(result)?);
+        }
+        if let Some(error) = operation.error {
+            return Err(serde_json::from_value(error)?);
+        }
+        self.check_operation_lifetime(&operation)?;
+        let result = self.stop_if_idle_inner(external, Some(&operation.id), &serial);
         if let Err(error) = result {
             self.fail_operation(
                 &operation.id,
@@ -259,7 +267,7 @@ impl Namespace {
         &self,
         external: ExternalWork,
         operation: Option<&Id>,
-        _serial: std::sync::MutexGuard<'_, ()>,
+        _serial: &std::sync::MutexGuard<'_, ()>,
     ) -> Result<IdleOutcome> {
         self.expire_cursors()?;
         let result = (|| {
@@ -1025,5 +1033,87 @@ mod independent_tests {
             .unwrap();
         assert!(final_attempt.stopping);
         assert!(namespace.stop_is_committed().unwrap());
+    }
+
+    #[test]
+    fn concurrent_idle_replay_preserves_the_first_terminal_decision() {
+        use super::super::faults::{Action, Point, Specification, Stage};
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = Namespace::initialize_identity(
+            &"a".repeat(64),
+            temp.path(),
+            super::super::policy::fixture_policy(),
+        )
+        .unwrap();
+        namespace.activate().unwrap();
+        let token = OperationToken {
+            scope: namespace.header().namespace.clone(),
+            sequence: 1,
+            token: Token::parse("concurrent-idle-replay").unwrap(),
+        };
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::IdleAccepted,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let (winner, replay, reached) = std::thread::scope(|scope| {
+            let contender = scope.spawn(|| {
+                namespace.stop_if_idle_with_token(token.clone(), ExternalWork::default())
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let winner = namespace.stop_if_idle_with_token(
+                token.clone(),
+                ExternalWork {
+                    queries: 1,
+                    ..ExternalWork::default()
+                },
+            );
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            (winner, contender.join().unwrap(), reached)
+        });
+        assert!(reached, "the stale accepted receipt was not retained");
+        let winner = winner.unwrap();
+        assert!(!winner.stopping);
+        assert_eq!(
+            serde_json::to_value(replay.unwrap()).unwrap(),
+            serde_json::to_value(&winner).unwrap()
+        );
+        assert!(!namespace.stop_is_committed().unwrap());
+        assert_eq!(
+            serde_json::to_value(
+                namespace
+                    .stop_if_idle_with_token(token, ExternalWork::default())
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(winner).unwrap()
+        );
+        assert!(
+            namespace
+                .stop_if_idle_with_token(
+                    OperationToken {
+                        scope: namespace.header().namespace.clone(),
+                        sequence: 2,
+                        token: Token::parse("after-concurrent-idle").unwrap(),
+                    },
+                    ExternalWork::default(),
+                )
+                .unwrap()
+                .stopping
+        );
     }
 }

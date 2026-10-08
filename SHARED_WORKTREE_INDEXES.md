@@ -1333,8 +1333,8 @@ lifetime. A retained cache alone does not make a daemon permanently busy.
 A busy decision reopens admission; a committed stop leaves it closed before exit.
 An uncommitted lock-admission Busy error leaves the accepted token pending;
 retry that same token rather than abandoning it and consuming another queue
-slot. A completed non-stopping decision is terminal and replayable, so a later
-idle probe needs a new token. Disconnecting
+slot. A completed non-stopping decision is terminal and replayable, including
+concurrent uses of that token; a later idle probe needs a new token. Disconnecting
 the final client or checking the lease count alone is not atomic shutdown.
 Committed operation acceptance or bookkeeping alone does not authorize exit.
 Error recovery checks the current instance's durable stop decision together

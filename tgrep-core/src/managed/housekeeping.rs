@@ -373,6 +373,32 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
+    fn change_control_ownership(path: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)?.permissions().mode();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode ^ 0o040))?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_ARCHIVE, SetFileAttributesW,
+            };
+            let attributes = std::fs::metadata(path)?.file_attributes();
+            let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: the owned fixture path is NUL-terminated and remains live.
+            if unsafe { SetFileAttributesW(path.as_ptr(), attributes ^ FILE_ATTRIBUTE_ARCHIVE) }
+                == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn independent_control_permission_changes_are_preserved() {
         for changed in [false, true] {
@@ -386,31 +412,7 @@ mod tests {
                 .read(|connection| control_row(connection, "owners", &name))
                 .unwrap();
             if changed {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode ^ 0o040))
-                        .unwrap();
-                }
-                #[cfg(windows)]
-                {
-                    use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
-                    use windows_sys::Win32::Storage::FileSystem::{
-                        FILE_ATTRIBUTE_ARCHIVE, SetFileAttributesW,
-                    };
-                    let attributes = std::fs::metadata(&path).unwrap().file_attributes();
-                    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-                    // SAFETY: the owned fixture path is NUL-terminated and remains live.
-                    assert_ne!(
-                        unsafe {
-                            SetFileAttributesW(path.as_ptr(), attributes ^ FILE_ATTRIBUTE_ARCHIVE)
-                        },
-                        0,
-                        "{}",
-                        std::io::Error::last_os_error()
-                    );
-                }
+                change_control_ownership(&path).unwrap();
                 let file = std::fs::File::open(&path).unwrap();
                 assert_ne!(
                     super::super::Ownership::capture(&file).unwrap(),
@@ -438,6 +440,71 @@ mod tests {
                 assert_eq!(removed.logical_bytes, before.file.logical_bytes);
             }
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn independent_control_ownership_change_after_intent_is_preserved() {
+        use super::super::faults::{Action, Point, Specification, Stage};
+        use std::time::Duration;
+
+        let (_temp, namespace, owner) = namespace();
+        let name = format!("{}.json", owner.registration().owner);
+        namespace.release_owner(owner.registration()).unwrap();
+        drop(owner);
+        let path = namespace.owners.path().join(&name);
+        let contents = std::fs::read(&path).unwrap();
+        let before = namespace
+            .read(|connection| control_row(connection, "owners", &name))
+            .unwrap();
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::ControlIntentSaved,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| namespace.remove_owned_control("owners", &name));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                let status = namespace.test_fault_status().unwrap().unwrap();
+                if status.stage == Stage::Waiting {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let mutation = reached.then(|| change_control_ownership(&path));
+            let released = namespace.release_test_fault(&fault.ticket);
+            let result = worker.join();
+            assert!(reached, "the control unlink intent barrier was not reached");
+            mutation.unwrap().unwrap();
+            let released = released.unwrap();
+            assert_eq!(released.stage, Stage::Released);
+            assert_eq!(released.hits, 1);
+            result.unwrap()
+        });
+        let error = result.err().expect(
+            "control cleanup deleted a file whose ownership changed after intent commitment",
+        );
+        assert_eq!(error.committed_state, super::super::CommitState::Committed);
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        let file = std::fs::File::open(&path).unwrap();
+        assert_ne!(
+            super::super::Ownership::capture(&file).unwrap(),
+            before.file.ownership
+        );
+        let after = namespace
+            .read(|connection| control_row(connection, "owners", &name))
+            .unwrap();
+        assert!(!after.file.removed);
+        assert_eq!(after.file.pending_length, Some(before.file.logical_bytes));
+        assert_eq!(after.file.credited_logical_bytes, 0);
     }
 
     #[test]
@@ -666,11 +733,13 @@ impl Namespace {
                 })?;
                 self.fault(super::faults::Point::ControlIntentSaved, None)
                     .map_err(|error| error.committed(super::CommitState::Committed))?;
+                let committed = |error: Error| error.committed(super::CommitState::Committed);
+                let uncertain = |error: Error| error.committed(super::CommitState::Unknown);
                 if let Some(permit) = permit {
-                    permit.check()?;
+                    permit.check().map_err(committed)?;
                 }
-                let current_policy = self.policy()?.version;
-                let current_allocation = self.allocation()?.version;
+                let current_policy = self.policy().map_err(committed)?.version;
+                let current_allocation = self.allocation().map_err(committed)?.version;
                 if current_policy != policy.version || current_allocation != allocation.version {
                     return Err(Error::stale_version(if current_policy != policy.version {
                         current_policy
@@ -679,7 +748,7 @@ impl Namespace {
                     })
                     .committed(super::CommitState::Committed));
                 }
-                recheck(&native)?;
+                recheck(&native).map_err(committed)?;
                 directory
                     .unlink_verified_file(name, &record.file.identity, &native.file)
                     .map_err(|error| error.committed(super::CommitState::Committed))?;
@@ -691,8 +760,9 @@ impl Namespace {
                 native
                     .check()
                     .map_err(|error| error.committed(super::CommitState::Unknown))?;
-                if FileIdentity::of(&native.file)? != record.file.identity
-                    || super::Ownership::after_unlink(&native.file)? != record.file.ownership
+                if FileIdentity::of(&native.file).map_err(uncertain)? != record.file.identity
+                    || super::Ownership::after_unlink(&native.file).map_err(uncertain)?
+                        != record.file.ownership
                 {
                     return Err(Error::new(
                         ErrorCategory::StaleIdentity,
@@ -702,7 +772,7 @@ impl Namespace {
                     .committed(super::CommitState::Unknown));
                 }
                 drop(native);
-                directory.confirm_unlinked_file(name)?;
+                directory.confirm_unlinked_file(name).map_err(uncertain)?;
                 false
             }
             Err(error)

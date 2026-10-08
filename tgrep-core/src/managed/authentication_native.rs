@@ -119,6 +119,8 @@ impl NativeFile {
 #[cfg(target_os = "linux")]
 fn acquire_lease(file: &File) -> Result<()> {
     use std::os::fd::AsRawFd;
+    // Linux UAPI; libc does not expose this command on every supported target.
+    const F_SETOWN_EX: libc::c_int = 15;
     #[repr(C)]
     struct Owner {
         kind: libc::c_int,
@@ -148,7 +150,7 @@ fn acquire_lease(file: &File) -> Result<()> {
                         kind: 0,
                         tid: libc::syscall(libc::SYS_gettid) as libc::pid_t,
                     };
-                    if libc::fcntl(fd, libc::F_SETOWN_EX, &owner) < 0 {
+                    if libc::fcntl(fd, F_SETOWN_EX, &owner) < 0 {
                         return Err(std::io::Error::last_os_error().into());
                     }
                     if libc::fcntl(fd, libc::F_SETLEASE, libc::F_WRLCK) < 0 {

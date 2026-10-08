@@ -178,6 +178,90 @@ mod tests {
     }
 
     #[test]
+    fn competing_control_cleanup_keeps_the_selected_object_pending_and_resumable() {
+        use crate::managed::OwnerGuard;
+        use crate::managed::faults::Stage;
+
+        let (_temp, namespace, object, path) = authenticated_fixture(&[b'a'; 4096]);
+        let owner = namespace.prepare_owner().unwrap();
+        let guard = OwnerGuard::claim(owner.claim.clone()).unwrap();
+        namespace.register_owner(&owner.claim).unwrap();
+        namespace.release_owner(&owner.claim).unwrap();
+        drop(guard);
+        let name = format!("{}.json", owner.claim.owner);
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::ControlIntentSaved,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let (progress, removal, reached) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| namespace.remove_owned_control("owners", &name));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let progress = pass(&namespace, "control-contention");
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            (progress, worker.join().unwrap(), reached)
+        });
+        assert!(reached, "the active control verifier was not retained");
+        assert!(removal.unwrap().removed);
+        assert_eq!(progress.errors, 0, "{progress:?}");
+        assert_eq!(progress.skipped, 1);
+        assert_eq!(progress.removed, 0);
+        assert_eq!(progress.logical_bytes_reclaimed, object.logical_bytes);
+        assert_eq!(
+            progress
+                .next
+                .as_ref()
+                .and_then(|cursor| cursor.current.as_ref()),
+            Some(&object.id)
+        );
+        assert_eq!(progress.details[0].reasons, ["control-verifier-active"]);
+        assert_eq!(
+            progress.details[0].error.as_ref().unwrap()["category"],
+            "busy"
+        );
+        assert_eq!(
+            namespace.object(&object.id).unwrap().state,
+            ObjectState::PendingDeletion
+        );
+        assert!(!path.exists());
+        let resumed = request_pass(
+            &namespace,
+            &CollectionRequest {
+                policy_version: namespace.policy().unwrap().version,
+                allocation_version: namespace.allocation().unwrap().version,
+                bounds: CollectionBounds::from_policy(
+                    &namespace.policy().unwrap().policy.collection,
+                ),
+                cursor: progress.next,
+            },
+            "after-control-contention",
+        );
+        assert_eq!(resumed.errors, 0, "{resumed:?}");
+        assert_eq!(resumed.removed, 1);
+        assert_eq!(resumed.recovered_objects, 1);
+        assert_eq!(
+            resumed.logical_bytes_reclaimed + resumed.recovered_logical_bytes,
+            0
+        );
+        assert_eq!(
+            namespace.object(&object.id).unwrap().state,
+            ObjectState::Removed
+        );
+    }
+
+    #[test]
     fn discarded_verification_restarts_before_accepting_a_changed_earlier_prefix() {
         let original = vec![b'a'; 128 * 1024 + 17];
         let (_temp, namespace, _object, path) = authenticated_fixture(&original);
@@ -1735,7 +1819,10 @@ impl Namespace {
                         return Err(error.operation(operation.to_string()));
                     }
                     progress.skipped += 1;
-                    progress.errors += 1;
+                    let deferred = error.category == ErrorCategory::Busy
+                        && error.retryable
+                        && error.reason_code == "control-verifier-active";
+                    progress.errors += u32::from(!deferred);
                     if progress.details.len() < policy.policy.work.page_objects as usize {
                         progress.details.push(CollectionSkip {
                             object: id.clone(),
@@ -1744,6 +1831,9 @@ impl Namespace {
                         });
                     } else {
                         progress.omitted_skip_details += 1;
+                    }
+                    if deferred {
+                        break;
                     }
                     self.collection_transaction(
                         operation,

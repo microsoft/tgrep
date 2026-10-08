@@ -415,6 +415,12 @@ impl Namespace {
         let operation =
             self.accept_maintenance_operation(token, "recovery", serde_json::to_value(&request)?)?;
         let _receipt = self.hold_operation(&operation.id)?;
+        self.fault(super::faults::Point::RecoveryAccepted, Some(&operation.id))
+            .map_err(|error| {
+                error
+                    .committed(CommitState::Committed)
+                    .operation(operation.id.to_string())
+            })?;
         if matches!(
             operation.state,
             OperationState::Completed | OperationState::Failed | OperationState::Cancelled
@@ -430,19 +436,32 @@ impl Namespace {
             .operation(operation.id.to_string())
             .committed(operation.committed_state));
         }
-        if let Err(error) = self.check_operation_lifetime(&operation) {
-            return self.fail_operation(&operation.id, error);
-        }
         let _serial = self.maintenance.try_lock().map_err(|_| {
             Error::busy("namespace-maintenance-active").operation(operation.id.to_string())
         })?;
-        self.transaction(|transaction| {
+        let operation = self.operation(&operation.id)?;
+        if matches!(
+            operation.state,
+            OperationState::Completed | OperationState::Failed | OperationState::Cancelled
+        ) {
+            return Ok(operation);
+        }
+        if let Err(error) = self.check_operation_lifetime(&operation) {
+            return self.fail_operation(&operation.id, error);
+        }
+        let preparing = self.transaction(|transaction| {
             let encoded: String = transaction.query_row(
                 "SELECT record FROM operations WHERE id=?1",
                 [operation.id.as_str()],
                 |row| row.get(0),
             )?;
             let mut current: OperationRecord = serde_json::from_str(&encoded)?;
+            if matches!(
+                current.state,
+                OperationState::Completed | OperationState::Failed | OperationState::Cancelled
+            ) {
+                return Ok(Some(current));
+            }
             if current.cancelled {
                 return Err(Error::new(
                     ErrorCategory::Cancelled,
@@ -455,8 +474,14 @@ impl Namespace {
             // durable, an interrupted pass must not claim that none took effect.
             current.committed_state = CommitState::Unknown;
             current.progress = serde_json::json!({"request":request,"measurements_complete":false});
-            Self::save_operation(transaction, &current)
-        })?;
+            Self::save_operation(transaction, &current)?;
+            Ok(None)
+        });
+        match preparing {
+            Ok(Some(terminal)) => return Ok(terminal),
+            Ok(None) => {}
+            Err(error) => return self.fail_operation(&operation.id, error),
+        }
         let progress = match self.recover_pass_inner(request.cursor, Some(&operation.id)) {
             Ok(progress) => progress,
             Err(error) => return self.fail_operation(&operation.id, error),
@@ -971,6 +996,170 @@ impl Namespace {
 mod independent_tests {
     use super::super::{OperationToken, Token};
     use super::*;
+
+    #[test]
+    fn independent_concurrent_recovery_preserves_terminal_receipt_and_defers_new_work() {
+        use super::super::OwnerGuard;
+        use super::super::faults::{Action, Point, Specification, Stage};
+
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = Namespace::initialize_identity(
+            &"a".repeat(64),
+            temp.path(),
+            super::super::policy::fixture_policy(),
+        )
+        .unwrap();
+        namespace.activate().unwrap();
+        let owner = namespace.prepare_owner().unwrap();
+        let owner_id = owner.claim.owner.clone();
+        let guard = OwnerGuard::claim(owner.claim).unwrap();
+        namespace.register_owner(guard.registration()).unwrap();
+        let token = OperationToken {
+            scope: namespace.header().namespace.clone(),
+            sequence: 1,
+            token: Token::parse("concurrent-recovery-replay").unwrap(),
+        };
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::RecoveryAccepted,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let (winner, replay, reached) = std::thread::scope(|scope| {
+            let contender = scope
+                .spawn(|| namespace.recover_with_token(token.clone(), RecoveryRequest::default()));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let winner = namespace.recover_with_token(token.clone(), RecoveryRequest::default());
+            drop(guard);
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            (winner, contender.join().unwrap(), reached)
+        });
+        assert!(
+            reached,
+            "the stale accepted recovery receipt was not retained"
+        );
+        let winner = winner.unwrap();
+        let replay = replay.unwrap();
+        assert_eq!(winner.state, OperationState::Completed);
+        assert_eq!(winner.result.as_ref().unwrap()["owners_reaped"], 0);
+        assert_eq!(
+            replay.result.as_ref().unwrap()["owners_reaped"],
+            0,
+            "same-token replay performed new recovery work after the first terminal receipt: \
+             first={winner:?}; replay={replay:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(&replay).unwrap(),
+            serde_json::to_value(&winner).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(namespace.operation(&winner.id).unwrap()).unwrap(),
+            serde_json::to_value(&winner).unwrap()
+        );
+        assert!(!namespace.owner(&owner_id).unwrap().released);
+        let next = namespace
+            .recover_with_token(
+                OperationToken {
+                    scope: namespace.header().namespace.clone(),
+                    sequence: 2,
+                    token: Token::parse("after-concurrent-recovery").unwrap(),
+                },
+                RecoveryRequest::default(),
+            )
+            .unwrap();
+        assert_eq!(next.state, OperationState::Completed);
+        assert_eq!(next.result.unwrap()["owners_reaped"], 1);
+    }
+
+    #[test]
+    fn concurrent_recovery_preserves_failed_and_cancelled_receipts() {
+        use super::super::faults::{Action, Point, Specification, Stage};
+
+        for category in [ErrorCategory::InvalidInput, ErrorCategory::Cancelled] {
+            let temp = tempfile::tempdir().unwrap();
+            let namespace = Namespace::initialize_identity(
+                &"a".repeat(64),
+                temp.path(),
+                super::super::policy::fixture_policy(),
+            )
+            .unwrap();
+            namespace.activate().unwrap();
+            let token = OperationToken {
+                scope: namespace.header().namespace.clone(),
+                sequence: 1,
+                token: Token::parse("terminal-recovery-replay").unwrap(),
+            };
+            let operation = namespace
+                .accept_maintenance_operation(
+                    token.clone(),
+                    "recovery",
+                    serde_json::to_value(RecoveryRequest::default()).unwrap(),
+                )
+                .unwrap();
+            let fault = namespace
+                .install_test_fault(Specification {
+                    point: Point::RecoveryAccepted,
+                    operation: Some(operation.id.clone()),
+                    skip_hits: 0,
+                    action: Action::Pause { timeout_ms: 10_000 },
+                })
+                .unwrap();
+            let (winner, replay, reached) = std::thread::scope(|scope| {
+                let contender = scope.spawn(|| {
+                    namespace.recover_with_token(token.clone(), RecoveryRequest::default())
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let reached = loop {
+                    if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                };
+                let winner = namespace.fail_operation(
+                    &operation.id,
+                    Error::new(
+                        category,
+                        "test-recovery-terminal",
+                        "terminal recovery outcome",
+                    ),
+                );
+                namespace.release_test_fault(&fault.ticket).unwrap();
+                (winner, contender.join().unwrap(), reached)
+            });
+            assert!(reached, "the stale accepted receipt was not retained");
+            let winner = winner.unwrap();
+            assert_eq!(
+                winner.state,
+                if category == ErrorCategory::Cancelled {
+                    OperationState::Cancelled
+                } else {
+                    OperationState::Failed
+                }
+            );
+            assert_eq!(
+                serde_json::to_value(replay.unwrap()).unwrap(),
+                serde_json::to_value(&winner).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(namespace.operation(&operation.id).unwrap()).unwrap(),
+                serde_json::to_value(winner).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn independent_idle_admission_contention_preserves_same_token_replay() {

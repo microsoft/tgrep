@@ -45,6 +45,7 @@ pub enum Point {
     ControlBeforeCredit,
     RootGuardObserved,
     IdleAccepted,
+    RecoveryAccepted,
     IdleAdmissionClosed,
     IdleCommitted,
 }

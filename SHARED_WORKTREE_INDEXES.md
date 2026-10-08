@@ -1228,6 +1228,10 @@ contention rather than attempting a new open that would break a Linux lease.
 Other control members remain accessible. This is not a persistent
 namespace-wide reader pin: unrelated ready views continue serving, and
 maintenance can retry after the bounded control operation ends.
+If this admission conflict interrupts a collection unit, its typed Busy detail
+is reported as a skip, not a failed deletion. The continuation retains that
+exact object, including any already credited member removals; it never reports
+the object's removal complete until its remaining control cleanup finishes.
 
 Native evidence is checked around each verification page and immediately before
 destructive I/O:
@@ -1271,6 +1275,8 @@ references. With `--apply`, `metadata.run`, `collections.run` and
 `maintenance.recover` use persisted **namespace-scoped** operation tokens;
 live asynchronous `.start` is unavailable offline. Recovery requests are
 `{"cursor":null-or-returned-recovery-cursor}` and use policy bounds.
+Concurrent replay preserves the first completed, failed or cancelled recovery
+receipt. Newly eligible work requires a new token, not reuse of that receipt.
 
 A maintenance `session` accepts NDJSON
 `{"id":1,"method":"objects.page","params":{"cursor":null}}`

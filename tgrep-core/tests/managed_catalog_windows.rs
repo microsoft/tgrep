@@ -10,7 +10,7 @@ use rusqlite::{Connection, ffi};
 use std::fs::File;
 use std::mem::ManuallyDrop;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE, SetLastError};
@@ -42,6 +42,7 @@ fn identity(file: &File) -> (u64, [u8; 16]) {
 struct Rendezvous {
     arrived: Mutex<u32>,
     ready: Condvar,
+    timed_out: AtomicBool,
 }
 
 impl Rendezvous {
@@ -49,6 +50,7 @@ impl Rendezvous {
         Self {
             arrived: Mutex::new(0),
             ready: Condvar::new(),
+            timed_out: AtomicBool::new(false),
         }
     }
 
@@ -56,11 +58,13 @@ impl Rendezvous {
         let mut arrived = self.arrived.lock().unwrap();
         *arrived += 1;
         self.ready.notify_all();
-        drop(
-            self.ready
-                .wait_timeout_while(arrived, Duration::from_millis(250), |arrived| *arrived < 2)
-                .unwrap(),
-        );
+        let (_arrived, timeout) = self
+            .ready
+            .wait_timeout_while(arrived, Duration::from_secs(1), |arrived| *arrived < 2)
+            .unwrap();
+        if timeout.timed_out() {
+            self.timed_out.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -161,6 +165,15 @@ impl Drop for Installed {
 }
 
 #[test]
+fn native_rendezvous_records_timeout() {
+    let rendezvous = Rendezvous::new();
+    rendezvous.wait();
+    assert!(rendezvous.timed_out.load(Ordering::SeqCst));
+    rendezvous.wait();
+    assert!(rendezvous.timed_out.load(Ordering::SeqCst));
+}
+
+#[test]
 fn canonical_windows_catalog_readers_release_native_wal_locks() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().canonicalize().unwrap().join("catalog.sqlite");
@@ -225,6 +238,13 @@ fn canonical_windows_catalog_readers_release_native_wal_locks() {
     let calls = probe.calls.load(Ordering::SeqCst);
     drop(hook);
     assert!(calls >= 2, "native overlapping-reader gate was not reached");
+    assert!(
+        !probe.before.timed_out.load(Ordering::SeqCst)
+            && !probe.after.timed_out.load(Ordering::SeqCst),
+        "native two-reader rendezvous timed out: before={}, after={}",
+        probe.before.timed_out.load(Ordering::SeqCst),
+        probe.after.timed_out.load(Ordering::SeqCst),
+    );
     assert_eq!(
         checkpoint,
         (0, 0, 0),

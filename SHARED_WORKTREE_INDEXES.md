@@ -1192,10 +1192,34 @@ guarantees. Recovery validates identities and sealed state before serving.
 On POSIX, catalog identity/accounting probes use no-open metadata observation:
 closing an independently opened database/sidecar descriptor can otherwise
 release SQLite's process-wide record locks.
-WAL checkpointing is bounded and occurs before catalog mutations, not after a
-successful commit. Reader contention produces an explicit retryable busy
-outcome before mutation; a durable WAL commit does not become a failed
-publication merely because truncation would have to wait for a reader.
+WAL truncation is attempted without waiting before catalog mutations, never
+after a successful commit. A retained SQLite snapshot does not reject indexed
+queries or lifecycle work while publication headroom remains. After acquiring
+the actual SQLite writer lock, every managed writer rechecks policy and
+physical lengths and reserves a complete publication: database growth, WAL
+headers and frames, worst-case FULL-sync sector padding (including VFSes
+without powersafe overwrite), and future WAL-index regions. Genuine exhausted
+headroom is a retryable, pre-mutation error; a durable WAL commit does not become
+a failed publication merely because truncation would have to wait for a reader.
+
+Within `metadata_bytes`, database page payload is capped at one third. SQLite
+files, including WAL, shared memory and any retained rollback journal, use at
+most five sixths; the remaining sixth covers bounded registered control files
+and the namespace header. New-work admission also checks observed total metadata.
+Externally enlarged anchors may exceed that target but do not prohibit bounded,
+reference-safe cleanup. Policy reductions must fit both existing pages and
+their own worst-case publication before commitment; a rejected reduction
+leaves the prior policy available for cleanup or a version-checked increase.
+
+All managed connections disable automatic checkpoints, page-cache spill and
+database mmap. The spill-disabled page payload bound is **per catalog
+connection**, with only one SQLite writer per namespace; the 256 KiB clean-cache
+setting is a soft target, not a hard memory limit. `maintenance.status` reports
+the latest primary writer's page/payload bounds, checkpoint result and observed
+native cache bytes before commit. Native cache bytes include pager headers but
+exclude other connections and non-pager SQLite allocations. These control-plane
+observations are separate from build-buffer reservations and are not aggregate
+RSS or process-heap limits.
 
 All managed failures have `category`, stable `reason_code`, `retryable`,
 `committed_state` (`not-committed`, `committed`, `unknown`) and local `detail`;

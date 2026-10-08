@@ -9,9 +9,7 @@ use super::{
     STORE_DIRECTORY,
 };
 use crate::generations::{GenerationKey, Repository};
-use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
-};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -353,8 +351,7 @@ pub(crate) fn connect(directory: &Directory, read_only: bool) -> Result<Connecti
     }) | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     let connection = Connection::open_with_flags(directory.path().join("catalog.sqlite"), flags)?;
-    connection.busy_timeout(Duration::from_millis(250))?;
-    connection.pragma_update(None, "foreign_keys", true)?;
+    super::catalog_io::configure(&connection, read_only)?;
     if directory.observe_file("catalog.sqlite")?.identity != identity {
         return Err(Error::corrupt("catalog file was replaced during open"));
     }
@@ -416,18 +413,20 @@ impl Namespace {
             activity_identity: directory.observe_file("activity.lock")?.identity,
             catalog_identity: directory.observe_file("catalog.sqlite")?.identity,
         };
-        let connection = connect(&directory, false)?;
+        let mut connection = connect(&directory, false)?;
         Self::configure_database(&connection)?;
-        connection.execute_batch(SCHEMA)?;
-        super::accounting::install_counters(&connection)?;
-        connection.execute(
+        let transaction = super::catalog_io::begin_initial(&mut connection, &directory, &policy)?;
+        transaction.execute_batch(SCHEMA)?;
+        super::accounting::install_counters(&transaction)?;
+        transaction.execute(
             "INSERT INTO state(singleton,namespace,schema,revision,policy_version,policy,admission) VALUES(1,?1,?2,0,1,?3,'open')",
             params![header.namespace.as_str(), STORAGE_VERSION, text(&policy)?],
         )?;
-        connection.execute(
+        transaction.execute(
             "INSERT INTO records VALUES('allocation','namespace',1,?1)",
             [text(&super::Allocation::local(&policy))?],
         )?;
+        transaction.commit()?;
         directory.create_json("namespace.json", &header)?;
         Ok(Arc::new(Self {
             memory: super::memory::MemoryAccount::for_namespace(&header.namespace)?,
@@ -551,28 +550,31 @@ impl Namespace {
         &self,
         action: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
+        self.transaction_with_policy(None, action)
+    }
+
+    pub(crate) fn transaction_with_policy<T>(
+        &self,
+        change: Option<VersionedPolicy>,
+        action: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         self.verify_identity()?;
         let mut connection = self
             .database
             .lock()
             .map_err(|_| Error::corrupt("catalog lock poisoned"))?;
-        let policy: String =
-            connection.query_row("SELECT policy FROM state WHERE singleton=1", [], |row| {
-                row.get(0)
-            })?;
-        let policy: Policy = serde_json::from_str(&policy)?;
-        let page_size: u64 =
-            connection.pragma_query_value(None, "page_size", |row| unsigned(row, 0))?;
-        if page_size == 0 {
-            return Err(Error::corrupt("invalid SQLite page size"));
-        }
-        let max_pages = (policy.work.metadata_bytes / 3 / page_size).max(32);
-        connection.pragma_update(None, "max_page_count", sql_integer(max_pages)?)?;
-        // FULL-synchronous WAL commitment is durable without truncation. Keep
-        // reader contention before the mutation, not after its successful commit.
-        self.checkpoint_wal(&connection, policy.work.metadata_bytes)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (transaction, mut budget) =
+            match super::catalog_io::begin(&mut connection, &self.directory, change.as_ref()) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.observe_catalog_error(&error)?;
+                    return Err(error);
+                }
+            };
+        self.observe_catalog_write(&budget)?;
         let result = action(&transaction)?;
+        budget.cache_used_before_commit_bytes = super::catalog_io::cache_used(&transaction);
+        self.observe_catalog_write(&budget)?;
         self.fault(super::faults::Point::CatalogBeforeCommit, None)?;
         transaction
             .commit()
@@ -601,33 +603,9 @@ impl Namespace {
         Ok(())
     }
 
-    fn checkpoint_wal(&self, connection: &Connection, limit: u64) -> Result<()> {
-        let bytes = match self.directory.observe_file("catalog.sqlite-wal") {
-            Ok(file) => file.logical_bytes,
-            Err(error) if error.source_io_kind() == Some(std::io::ErrorKind::NotFound) => 0,
-            Err(error) => return Err(error),
-        };
-        if bytes >= limit / 4 {
-            let (busy, frames, checkpointed): (u32, i64, i64) =
-                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?;
-            if busy != 0 {
-                return Err(Error::new(
-                    ErrorCategory::Busy,
-                    "catalog-checkpoint-readers-active",
-                    format!(
-                        "catalog WAL truncation is busy: {bytes} bytes, \
-                         {frames} frames, {checkpointed} checkpointed"
-                    ),
-                ));
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn admit_metadata(&self) -> Result<()> {
         let limit = self.policy()?.policy.work.metadata_bytes;
+        self.read(|connection| super::catalog_io::admit_control(connection, limit, 0))?;
         if self
             .catalog_file_bytes()?
             .checked_add(self.control_logical_bytes()?)
@@ -657,26 +635,32 @@ impl Namespace {
         if policy.storage != self.header.storage {
             return Err(Error::incompatible("namespace storage mode is immutable"));
         }
-        self.transaction(|transaction| {
-            let current: u64 = transaction.query_row(
-                "SELECT policy_version FROM state WHERE singleton=1",
-                [],
-                |row| unsigned(row, 0),
-            )?;
-            if expected != current {
-                return Err(Error::stale_version(current));
-            }
-            let version = current
-                .checked_add(1)
-                .filter(|version| *version <= i64::MAX as u64)
-                .ok_or_else(|| Error::corrupt("policy version exhausted"))?;
-            transaction.execute(
-                "UPDATE state SET policy_version=?1,policy=?2 WHERE singleton=1",
-                params![sql_integer(version)?, text(&policy)?],
-            )?;
-            next_revision(transaction)?;
-            Ok(VersionedPolicy { version, policy })
-        })
+        self.transaction_with_policy(
+            Some(VersionedPolicy {
+                version: expected,
+                policy: policy.clone(),
+            }),
+            |transaction| {
+                let current: u64 = transaction.query_row(
+                    "SELECT policy_version FROM state WHERE singleton=1",
+                    [],
+                    |row| unsigned(row, 0),
+                )?;
+                if expected != current {
+                    return Err(Error::stale_version(current));
+                }
+                let version = current
+                    .checked_add(1)
+                    .filter(|version| *version <= i64::MAX as u64)
+                    .ok_or_else(|| Error::corrupt("policy version exhausted"))?;
+                transaction.execute(
+                    "UPDATE state SET policy_version=?1,policy=?2 WHERE singleton=1",
+                    params![sql_integer(version)?, text(&policy)?],
+                )?;
+                next_revision(transaction)?;
+                Ok(VersionedPolicy { version, policy })
+            },
+        )
     }
 
     pub fn object(&self, id: &Id) -> Result<ObjectRecord> {
@@ -1143,6 +1127,7 @@ impl Namespace {
             if count >= u64::from(limits.max_leases) || receipts >= u64::from(limits.max_receipts) {
                 return Err(Error::pressure("owner-registration-limit"));
             }
+            super::catalog_io::admit_control(transaction, limits.metadata_bytes, 4096)?;
             let id = Id::new()?;
             let file = self.owners.create_file(&format!("{id}.lock"))?;
             file.sync_all()?;
@@ -1567,6 +1552,8 @@ impl Namespace {
 mod tests {
     use super::super::{OwnerGuard, Token};
     use super::*;
+    #[cfg(unix)]
+    use rusqlite::TransactionBehavior;
 
     fn namespace() -> (tempfile::TempDir, Arc<Namespace>) {
         let temp = tempfile::tempdir().unwrap();
@@ -1608,11 +1595,8 @@ mod tests {
                 .observe_file("catalog.sqlite-wal")
                 .unwrap()
                 .logical_bytes;
-            if bytes >= limit / 4 {
-                crossed = true;
-                break;
-            }
-            namespace
+            crossed |= bytes >= limit / 4;
+            let written = namespace
                 .transaction(|transaction| {
                     transaction.execute(
                         "INSERT INTO records VALUES('probe','wal',1,?1)
@@ -1620,17 +1604,37 @@ mod tests {
                         [text(&serde_json::json!({"sequence":sequence,"padding":"x".repeat(8192)}))?],
                     )?;
                     Ok(())
-                })
-                .unwrap();
+                });
+            if let Err(error) = written {
+                assert_eq!(error.reason_code, "catalog-checkpoint-readers-active");
+                assert_eq!(error.committed_state, CommitState::NotCommitted);
+                break;
+            }
         }
         assert!(crossed, "fixture did not reach the bounded WAL threshold");
         let mutation = |transaction: &Transaction<'_>| -> Result<()> {
             transaction.execute("INSERT INTO records VALUES('probe','next',1,'{}')", [])?;
             Ok(())
         };
-        let blocked = namespace.transaction(mutation).unwrap_err();
+        let mut entered = false;
+        let blocked = namespace
+            .transaction(|transaction| {
+                entered = true;
+                mutation(transaction)
+            })
+            .unwrap_err();
+        assert!(!entered, "headroom rejection must precede the mutation");
         assert_eq!(blocked.reason_code, "catalog-checkpoint-readers-active");
         assert_eq!(blocked.committed_state, CommitState::NotCommitted);
+        let usage = namespace.work_usage().unwrap();
+        assert!(usage.catalog_file_bytes + usage.control_logical_bytes <= limit);
+        let diagnostics = namespace.maintenance_diagnostics().unwrap();
+        let budget = &diagnostics.details["last_catalog_write"];
+        assert!(budget["pager_payload_limit_bytes"].as_u64().unwrap() <= limit / 3);
+        assert_eq!(
+            budget["cache_used_before_commit_bytes"]["status"],
+            "observed"
+        );
         assert!(
             !namespace
                 .read(|connection| Ok(connection.query_row(
@@ -1841,6 +1845,138 @@ mod tests {
                 1 + u64::from(committed)
             );
         }
+    }
+
+    #[test]
+    fn policy_reduction_reserves_its_own_publication_and_rejection_does_not_trap_updates() {
+        let (_temp, namespace) = namespace();
+        let owner = namespace.prepare_owner().unwrap();
+        let guard = OwnerGuard::claim(owner.claim).unwrap();
+        namespace.register_owner(guard.registration()).unwrap();
+        let mut configured = namespace.policy().unwrap();
+        configured.policy.work.metadata_bytes = 2 * 1024 * 1024;
+        namespace
+            .update_policy(configured.version, configured.policy)
+            .unwrap();
+        namespace
+            .read(|connection| {
+                assert_eq!(
+                    connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row
+                        .get::<_, u32>(0))?,
+                    0,
+                );
+                Ok(())
+            })
+            .unwrap();
+        let reader = connect(&namespace.directory, true).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT namespace FROM state")
+            .unwrap();
+        for sequence in 0..256 {
+            namespace
+                .transaction(|transaction| {
+                    transaction.execute(
+                        "INSERT INTO records VALUES('probe','resize',1,?1)
+                     ON CONFLICT(kind,id) DO UPDATE SET version=version+1,record=excluded.record",
+                        [text(&serde_json::json!({"sequence":sequence}))?],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            if namespace
+                .directory
+                .observe_file("catalog.sqlite-wal")
+                .unwrap()
+                .logical_bytes
+                >= 680 * 1024
+            {
+                break;
+            }
+        }
+        let usage = namespace.work_usage().unwrap();
+        assert!(usage.catalog_file_bytes + usage.control_logical_bytes < 1024 * 1024);
+        let original = namespace.policy().unwrap();
+        let mut reduced = original.policy.clone();
+        reduced.work.metadata_bytes = 1024 * 1024;
+        let rejected = namespace
+            .update_policy(original.version, reduced.clone())
+            .unwrap_err();
+        assert_eq!(rejected.committed_state, CommitState::NotCommitted);
+        assert_eq!(rejected.reason_code, "catalog-checkpoint-readers-active");
+        assert_eq!(namespace.policy().unwrap().version, original.version);
+        let operation = namespace
+            .accept_metadata_mutation(
+                OperationToken {
+                    scope: guard.registration().owner.clone(),
+                    sequence: 1,
+                    token: Token::parse("resize-receipt").unwrap(),
+                },
+                super::super::MetadataMutation::Policy {
+                    expected_version: original.version,
+                    policy: reduced,
+                },
+            )
+            .unwrap();
+        let failed = namespace.execute_metadata_mutation(&operation.id).unwrap();
+        assert_eq!(failed.state, OperationState::Failed);
+        assert_eq!(failed.committed_state, CommitState::NotCommitted);
+        assert_eq!(namespace.policy().unwrap().version, original.version);
+        let mut raised = original.policy;
+        raised.work.metadata_bytes = 4 * 1024 * 1024;
+        let updated = namespace
+            .update_policy(original.version, raised.clone())
+            .unwrap();
+        assert_eq!(updated.policy, raised);
+        assert!(!reader.is_autocommit());
+        reader.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn database_page_exhaustion_rolls_back_without_spilling_unbounded_wal() {
+        let (_temp, namespace) = namespace();
+        let mut configured = namespace.policy().unwrap();
+        configured.policy.work.metadata_bytes = 1024 * 1024;
+        namespace
+            .update_policy(configured.version, configured.policy)
+            .unwrap();
+        let before = namespace
+            .directory
+            .observe_file("catalog.sqlite-wal")
+            .unwrap()
+            .logical_bytes;
+        let error = namespace
+            .transaction(|transaction| {
+                transaction.execute(
+                    "INSERT INTO records VALUES('probe','too-large',1,?1)",
+                    ["x".repeat(1024 * 1024)],
+                )?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::ResourcePressure);
+        assert_eq!(error.committed_state, CommitState::NotCommitted);
+        let after = namespace
+            .directory
+            .observe_file("catalog.sqlite-wal")
+            .unwrap()
+            .logical_bytes;
+        assert!(after <= before);
+        namespace
+            .read(|connection| {
+                assert!(!connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE kind='probe' AND id='too-large')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?);
+                Ok(())
+            })
+            .unwrap();
+        namespace
+            .transaction(|transaction| {
+                transaction.execute("INSERT INTO records VALUES('probe','small',1,'{}')", [])?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

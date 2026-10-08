@@ -280,7 +280,17 @@ impl Namespace {
             },
             _ => None,
         };
-        let result = self.transaction(|transaction| {
+        let policy_change = match &mutation {
+            MetadataMutation::Policy {
+                expected_version,
+                policy,
+            } => Some(VersionedPolicy {
+                version: *expected_version,
+                policy: policy.clone(),
+            }),
+            _ => None,
+        };
+        let result = self.transaction_with_policy(policy_change, |transaction| {
             ensure_admission(transaction)?;
             let encoded: String = transaction.query_row(
                 "SELECT record FROM operations WHERE id=?1", [id.as_str()], |row| row.get(0),

@@ -8,6 +8,7 @@
 mod accounting;
 mod adaptive;
 mod catalog;
+mod catalog_io;
 mod checkpoints;
 mod clock;
 mod collection;

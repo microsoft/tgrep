@@ -223,9 +223,7 @@ fn independent_process_leases_survive_detach_and_only_proven_owner_death_reaps_a
         2
     );
     child.cancel();
-    let ended = daemon
-        .try_rpc("owners.reap", json!({"id":claim.owner}))
-        .unwrap();
+    let ended = retry_busy_response(&daemon, "owners.reap", json!({"id":claim.owner}));
     if ended.get("error").is_some() {
         assert_eq!(
             ended["error"]["data"]["category"], "receipt-expired",
@@ -593,9 +591,7 @@ fn owner_holder_graceful_eof_releases_its_os_proof_without_guessing_process_iden
     assert_eq!(alive["error"]["data"]["reason_code"], "owner-still-alive");
     child.close_input();
     success(child.finish(Duration::from_secs(30)).unwrap());
-    let ended = daemon
-        .try_rpc("owners.reap", json!({"id":claim.owner}))
-        .unwrap();
+    let ended = retry_busy_response(&daemon, "owners.reap", json!({"id":claim.owner}));
     if ended.get("error").is_some() {
         assert_eq!(
             ended["error"]["data"]["category"], "receipt-expired",

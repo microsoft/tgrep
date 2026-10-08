@@ -128,7 +128,6 @@ pub fn open_generation(namespace: &Path, incarnation: &Id) -> Result<Arc<Generat
         return Err(Error::incompatible("namespace schema or identity differs"));
     }
     let mut connection = connect(&directory, false)?;
-    connection.pragma_update(None, "synchronous", "FULL")?;
     if directory.observe_file("catalog.sqlite")?.identity != header.catalog_identity {
         return Err(Error::corrupt("reader catalog identity changed"));
     }
@@ -190,8 +189,7 @@ pub fn open_generation(namespace: &Path, incarnation: &Id) -> Result<Arc<Generat
             "generation changed during protected open",
         ));
     }
-    let transaction =
-        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (transaction, _) = super::catalog_io::begin(&mut connection, &directory, None)?;
     ensure_admission(&transaction)?;
     touch_object(&transaction, incarnation)?;
     transaction.commit()?;

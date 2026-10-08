@@ -5,7 +5,7 @@ use super::lifetime::{ActivityGuard, ObjectGuard, lock_error};
 use super::storage::Directory;
 use super::{Error, ErrorCategory, FileIdentity, Id, Namespace, NativePath, Result};
 use crate::rooted::RootedDir;
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::sync::Arc;
@@ -81,8 +81,7 @@ impl RootProtection {
                 .to_hex()
                 .to_string();
         let mut connection = connect(directory, false)?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (transaction, _) = super::catalog_io::begin(&mut connection, directory, None)?;
         super::work::ensure_admission(&transaction)?;
         let previous: Option<String> = transaction
             .query_row(

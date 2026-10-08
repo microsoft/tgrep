@@ -50,6 +50,8 @@ pub(super) struct Observations {
     aggregate: MaintenanceAggregate,
     collection_error: Option<serde_json::Value>,
     recovery_error: Option<serde_json::Value>,
+    catalog_error: Option<serde_json::Value>,
+    catalog_write: Option<super::catalog_io::WriteBudget>,
 }
 
 #[derive(Serialize)]
@@ -211,6 +213,25 @@ impl Drop for Pass<'_> {
 }
 
 impl Namespace {
+    pub(super) fn observe_catalog_write(
+        &self,
+        budget: &super::catalog_io::WriteBudget,
+    ) -> Result<()> {
+        self.observations
+            .lock()
+            .map_err(|_| Error::corrupt("maintenance observations poisoned"))?
+            .catalog_write = Some(budget.clone());
+        Ok(())
+    }
+
+    pub(super) fn observe_catalog_error(&self, error: &Error) -> Result<()> {
+        self.observations
+            .lock()
+            .map_err(|_| Error::corrupt("maintenance observations poisoned"))?
+            .catalog_error = Some(serde_json::to_value(error)?);
+        Ok(())
+    }
+
     pub(super) fn observe_pass(&self, kind: Kind) -> Result<Pass<'_>> {
         let mut observations = self
             .observations
@@ -242,6 +263,8 @@ impl Namespace {
             details: serde_json::json!({
                 "last_collection_error":observations.collection_error,
                 "last_recovery_error":observations.recovery_error,
+                "last_catalog_error":observations.catalog_error,
+                "last_catalog_write":observations.catalog_write,
             }),
         })
     }

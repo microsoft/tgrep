@@ -80,6 +80,119 @@ pub(super) fn wait_for(
 }
 
 #[test]
+fn ready_views_and_migration_continue_while_a_catalog_reader_pins_the_wal() {
+    let fixture = Fixture::new();
+    let configured = policy();
+    let mut daemon = start(&fixture, &configured, &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    let attached = completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let id = attached["result"]["current"]["id"].clone();
+    wait_for(&daemon, "views.status", json!({"id":id}), |status| {
+        status["ready"] == true && status["work"].is_null()
+    });
+    let mut sibling = attach_input(&fixture, &claim);
+    sibling["token"] = token(&claim, 2);
+    sibling["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
+    sibling["request"]["lease"] = json!("sibling-client");
+    let sibling = completed(&daemon, &daemon.rpc("views.attach", sibling));
+    let sibling_id = sibling["result"]["current"]["id"].clone();
+    wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":sibling_id}),
+        |status| status["ready"] == true && status["work"].is_null(),
+    );
+    let namespace = PathBuf::from(daemon.marker["storage"].as_str().unwrap());
+    let reader = rusqlite::Connection::open_with_flags(
+        namespace.join("catalog.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT namespace FROM state")
+        .unwrap();
+    let wal_bytes = || {
+        fs::metadata(namespace.join("catalog.sqlite-wal"))
+            .unwrap()
+            .len()
+    };
+    let limit = configured["work"]["metadata_bytes"].as_u64().unwrap();
+    let old_gate = limit / 4;
+    let mut crossed = false;
+    for _ in 0..1024 {
+        search(&daemon, &fixture.a);
+        if wal_bytes() > old_gate + 65536 {
+            crossed = true;
+            break;
+        }
+    }
+    assert!(crossed, "fixture did not reach the old truncation gate");
+    assert!(!reader.is_autocommit());
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    fs::write(
+        fixture.a.join("notes.txt"),
+        "shared_term pinned-WAL target\n",
+    )
+    .unwrap();
+    git(
+        &fixture.a,
+        &["commit", "-qam", "target during retained catalog snapshot"],
+    );
+    let target = git(&fixture.a, &["rev-parse", "HEAD"]);
+    refresh(&daemon, &claim, 3, &view);
+    wait_for(&daemon, "views.status", json!({"id":id}), |status| {
+        status["ready"] == true && status["work"].is_null()
+    });
+    let hook = pause(&daemon, "generation-built");
+    let operation = daemon.rpc("views.advance", advance(&claim, 4, &view, &target));
+    reached(&daemon, &hook);
+    assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
+    release(&daemon, &hook);
+    let migrated = completed(&daemon, &operation);
+    assert_eq!(migrated["result"]["current"]["version"], 2);
+    assert_eq!(migrated["result"]["current"]["current"]["commit"], target);
+    wait_for(&daemon, "views.status", json!({"id":id}), |status| {
+        status["ready"] == true && status["work"].is_null()
+    });
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
+    assert!(!reader.is_autocommit());
+    assert!(wal_bytes() < limit);
+    let diagnostics = daemon.rpc("maintenance.status", json!({}));
+    assert_eq!(
+        diagnostics["details"]["last_catalog_write"]["checkpoint"]["busy"],
+        true
+    );
+    reader.execute_batch("ROLLBACK").unwrap();
+    drop(reader);
+    for _ in 0..32 {
+        search(&daemon, &fixture.a);
+        if wal_bytes() < old_gate {
+            break;
+        }
+    }
+    assert!(wal_bytes() < old_gate, "WAL reclamation did not resume");
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"sibling-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
 fn concurrent_clients_share_one_new_publication_with_distinct_exact_commits_and_private_views() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);

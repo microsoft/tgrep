@@ -426,6 +426,12 @@ pub(super) fn register_control(
     }
     let file = directory.open_file(name, false)?;
     let bytes = directory.read_bytes(name, 4096)?;
+    let policy: String =
+        transaction.query_row("SELECT policy FROM state WHERE singleton=1", [], |row| {
+            row.get(0)
+        })?;
+    let policy: super::Policy = serde_json::from_str(&policy)?;
+    super::catalog_io::admit_control(transaction, policy.work.metadata_bytes, bytes.len() as u64)?;
     if file.metadata()?.len() != bytes.len() as u64 {
         return Err(Error::corrupt(
             "control file changed while being inventoried",

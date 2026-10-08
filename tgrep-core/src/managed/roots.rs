@@ -209,7 +209,7 @@ impl Namespace {
             .map(|busy| busy.unwrap_or(false))
     }
 
-    pub fn root_busy(&self, expected: &RootAnchor) -> Result<bool> {
+    fn checked_root_anchor(&self, expected: &RootAnchor) -> Result<RootAnchor> {
         let current = self
             .read(|connection| anchor_row(connection, expected.guard.as_str()))?
             .ok_or_else(|| {
@@ -219,17 +219,40 @@ impl Namespace {
                     "root guard record is unavailable",
                 )
             })?;
-        if current.guard != expected.guard || current.guard_identity != expected.guard_identity {
+        if current.version != expected.version {
+            return Err(Error::stale_version(current.version));
+        }
+        if current.guard != expected.guard
+            || current.guard_identity != expected.guard_identity
+            || current.key != expected.key
+            || current.root != expected.root
+            || current.identity != expected.identity
+        {
             return Err(Error::new(
                 ErrorCategory::StaleIdentity,
                 "root-anchor-replaced",
                 "root has a newer lifetime incarnation",
             ));
         }
+        Ok(current)
+    }
+
+    pub fn root_busy(&self, expected: &RootAnchor) -> Result<bool> {
+        let current = self.checked_root_anchor(expected)?;
         if current.retired {
             return Ok(false);
         }
-        let file = open_guard(&self.directory, &current)?;
+        self.fault(super::faults::Point::RootGuardObserved, None)?;
+        let file = match open_guard(&self.directory, &current) {
+            Ok(file) => file,
+            Err(error)
+                if error.source_io_kind() == Some(std::io::ErrorKind::NotFound)
+                    && self.checked_root_anchor(expected)?.retired =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         match fs2::FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(false),
             Err(error) => {
@@ -247,19 +270,13 @@ impl Namespace {
         &self,
         expected: &RootAnchor,
     ) -> Result<(bool, super::housekeeping::ControlRemoval)> {
-        let previous = self
-            .read(|connection| anchor_row(connection, expected.guard.as_str()))?
-            .ok_or_else(|| Error::corrupt("root anchor missing"))?;
-        if previous.guard_identity != expected.guard_identity
-            || previous.version != expected.version
-        {
-            return Err(Error::stale_version(previous.version));
-        }
+        let previous = self.checked_root_anchor(expected)?;
+        self.fault(super::faults::Point::RootGuardObserved, None)?;
         let file = match open_guard(&self.directory, expected) {
             Ok(file) => file,
             Err(error)
-                if previous.retired
-                    && error.source_io_kind() == Some(std::io::ErrorKind::NotFound) =>
+                if error.source_io_kind() == Some(std::io::ErrorKind::NotFound)
+                    && self.checked_root_anchor(expected)?.retired =>
             {
                 return self
                     .remove_owned_control("guards", &format!("root-{}.lock", expected.guard))
@@ -289,5 +306,107 @@ impl Namespace {
             .remove_owned_control("guards", &format!("root-{}.lock", expected.guard))
             .map_err(|error| error.committed(super::CommitState::Committed))?;
         Ok((!previous.retired, removed))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed::faults::{Action, Point, Specification, Stage};
+    use std::time::{Duration, Instant};
+
+    fn released_root() -> (tempfile::TempDir, Arc<Namespace>, RootAnchor) {
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = Namespace::initialize_identity(
+            &"a".repeat(64),
+            temp.path(),
+            crate::managed::policy::fixture_policy(),
+        )
+        .unwrap();
+        namespace.activate().unwrap();
+        let path = temp.path().join("worktree");
+        std::fs::create_dir(&path).unwrap();
+        let root = RootedDir::open(&path).unwrap();
+        let protection = RootProtection::in_namespace(&namespace.directory, &root, &path).unwrap();
+        let anchor = protection.anchor.clone();
+        drop((protection, root));
+        (temp, namespace, anchor)
+    }
+
+    fn retirement_race(retiring: bool) {
+        let (_temp, namespace, anchor) = released_root();
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::RootGuardObserved,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                if retiring {
+                    namespace.retire_root(&anchor).map(|result| result.0)
+                } else {
+                    namespace.root_busy(&anchor)
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let retired = namespace.retire_root(&anchor);
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            let result = worker.join().unwrap();
+            assert!(reached, "root guard observation boundary was not exercised");
+            let (transitioned, removed) = retired.unwrap();
+            assert!(transitioned);
+            assert!(removed.removed);
+            result
+        });
+        assert!(!result.unwrap(), "the completed retirement is not new work");
+        assert!(!namespace.root_busy(&anchor).unwrap());
+    }
+
+    #[test]
+    fn root_probe_observes_concurrent_completed_retirement() {
+        retirement_race(false);
+    }
+
+    #[test]
+    fn root_retirement_observes_concurrent_completed_retirement() {
+        retirement_race(true);
+    }
+
+    #[test]
+    fn missing_guard_without_exact_retirement_evidence_stays_unknown() {
+        let (_temp, namespace, anchor) = released_root();
+        std::fs::remove_file(
+            namespace
+                .directory
+                .path()
+                .join("guards")
+                .join(format!("root-{}.lock", anchor.guard)),
+        )
+        .unwrap();
+        assert_eq!(
+            namespace.root_busy(&anchor).unwrap_err().source_io_kind(),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        let error = namespace.retire_root(&anchor).err().unwrap();
+        assert_eq!(error.source_io_kind(), Some(std::io::ErrorKind::NotFound));
+        assert!(
+            !namespace
+                .read(|connection| anchor_row(connection, anchor.guard.as_str()))
+                .unwrap()
+                .unwrap()
+                .retired
+        );
     }
 }

@@ -372,6 +372,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn completed_concurrent_control_removal_does_not_repeat_credit() {
+        use super::super::faults::{Action, Point, Specification, Stage};
+        let (_temp, namespace, owner) = namespace();
+        let claim = owner.registration().clone();
+        namespace.release_owner(&claim).unwrap();
+        drop(owner);
+        let name = format!("{}.json", claim.owner);
+        let before = namespace.work_usage().unwrap().control_logical_bytes;
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::ControlObserved,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let replayed = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| namespace.remove_owned_control("owners", &name));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            let removal = namespace.remove_owned_control("owners", &name);
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            let result = worker.join().unwrap();
+            assert!(reached, "control observation boundary was not exercised");
+            let removal = removal.unwrap();
+            assert!(removal.removed);
+            assert_eq!(removal.logical_bytes, before);
+            result.unwrap()
+        });
+        assert!(!replayed.removed);
+        assert_eq!(replayed.logical_bytes + replayed.recovered_logical_bytes, 0);
+        assert_eq!(namespace.work_usage().unwrap().control_logical_bytes, 0);
+    }
+
     #[cfg(any(unix, windows))]
     fn change_control_ownership(path: &std::path::Path) -> std::io::Result<()> {
         #[cfg(unix)]
@@ -647,6 +690,7 @@ impl Namespace {
         if record.file.removed {
             return Ok(ControlRemoval::default());
         }
+        self.fault(super::faults::Point::ControlObserved, None)?;
         let seal = record.file.seal.clone().ok_or_else(|| {
             Error::new(
                 ErrorCategory::RecoveryRequired,
@@ -744,8 +788,6 @@ impl Namespace {
                 native
                     .after_unlink()
                     .map_err(|error| error.committed(super::CommitState::Unknown))?;
-                self.fault(super::faults::Point::ControlAfterRemove, None)
-                    .map_err(|error| error.committed(super::CommitState::Committed))?;
                 native
                     .check()
                     .map_err(|error| error.committed(super::CommitState::Unknown))?;
@@ -762,12 +804,32 @@ impl Namespace {
                 }
                 drop(native);
                 directory.confirm_unlinked_file(name).map_err(uncertain)?;
+                self.fault(super::faults::Point::ControlAfterRemove, None)
+                    .map_err(|error| error.committed(super::CommitState::Committed))?;
                 false
             }
-            Err(error)
-                if error.source_io_kind() == Some(std::io::ErrorKind::NotFound)
-                    && record.file.pending_length.is_some() =>
-            {
+            Err(error) if error.source_io_kind() == Some(std::io::ErrorKind::NotFound) => {
+                let current = self.read(|connection| control_row(connection, area, name))?;
+                if current.file.identity != record.file.identity
+                    || current.file.ownership != record.file.ownership
+                    || current.file.seal != record.file.seal
+                    || current.checksum != record.checksum
+                {
+                    return Err(Error::new(
+                        ErrorCategory::StaleIdentity,
+                        "control-file-replaced",
+                        "missing control entry has different incarnation or producer evidence",
+                    ));
+                }
+                if current.file.removed {
+                    return Ok(ControlRemoval::default());
+                }
+                if current.file.pending_length != Some(current.file.logical_bytes)
+                    || current.file.pending_manifest != Some(seal.manifest)
+                {
+                    return Err(error);
+                }
+                record = current;
                 true
             }
             Err(error) => return Err(error),

@@ -16,3 +16,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 blake3 = "1"
+rusqlite = { git = "https://github.com/rusqlite/rusqlite.git", rev = "2a71e35d94b2a02f7dd4a0c4cfd59c339370e747", features = ["bundled"] }

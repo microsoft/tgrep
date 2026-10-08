@@ -317,24 +317,27 @@ mod tests {
 
     #[test]
     fn full_sync_without_powersafe_overwrite_pads_beyond_the_database_page_count() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("catalog psow %# ")
+            .tempdir()
+            .unwrap();
         let directory = Directory::open(temp.path()).unwrap();
         directory.create_file("catalog.sqlite").unwrap();
-        let mut connection = connect(&directory, false).unwrap();
-        let mut disabled = 0_i32;
-        // SAFETY: FILE_CONTROL consumes the typed in/out integer synchronously on
-        // this live connection. It runs before the first WAL handle is opened.
-        assert_eq!(
-            unsafe {
-                rusqlite::ffi::sqlite3_file_control(
-                    connection.handle(),
-                    std::ptr::null(),
-                    rusqlite::ffi::SQLITE_FCNTL_POWERSAFE_OVERWRITE,
-                    (&mut disabled as *mut i32).cast(),
-                )
-            },
-            rusqlite::ffi::SQLITE_OK
-        );
+        let path = directory.path().join("catalog.sqlite");
+        let encoded: String = path
+            .to_str()
+            .unwrap()
+            .bytes()
+            .map(|byte| format!("%{byte:02X}"))
+            .collect();
+        // Unix caches device characteristics before a later PSOW file-control
+        // change. Disable it when opening, before the VFS computes that cache.
+        let mut connection = Connection::open_with_flags(
+            format!("file:{encoded}?psow=0"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        configure(&connection, false).unwrap();
         connection
             .execute_batch(
                 "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; CREATE TABLE probe(value)",

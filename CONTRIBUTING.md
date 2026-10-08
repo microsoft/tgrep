@@ -97,6 +97,23 @@ a native checkout and `TMPDIR`, not a Windows-mounted `/mnt/...` directory.
 These checks qualify checkout-based distribution, not crates.io packaging or
 the separate cross-build/signing pipelines.
 
+Managed catalogs pin `rusqlite` to upstream Git revision
+`2a71e35d94b2a02f7dd4a0c4cfd59c339370e747`, which bundles SQLite 3.53.3.
+SQLite 3.53.2 can retain native WAL read locks after readers close when a
+canonical Windows DOS-device path is mistaken for a UNC path. The upstream
+correction preserves canonical path and identity checks; a separate native
+integration test forces overlapping read-lock acquisition and requires
+reclamation after both readers close. Core and CLI test dependencies share this
+revision, including when core is consumed outside this workspace.
+
+Both root and fuzz lockfiles record the immutable Git source. A fresh locked
+checkout build, including the compliant internal pipeline, must retrieve that
+revision and its bundled sources from GitHub or an approved pre-populated Cargo
+Git cache; registry-feed access alone is insufficient. Configure that retrieval
+within the pipeline's existing dependency/feed policy. This does not change
+feed, signing or publication policy, and ordinary CI or checkout-install results
+do not qualify that separate pipeline.
+
 ## Managed lifecycle qualification
 
 The managed lifecycle suite uses actual CLI/RPC clients, temporary Git

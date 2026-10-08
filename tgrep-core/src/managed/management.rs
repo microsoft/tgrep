@@ -255,8 +255,14 @@ impl Namespace {
 
     /// The resource CAS and its original receipt are committed in one catalog
     /// transaction, including when the caller loses the successful response.
+    /// Serializing metadata execution keeps completed replays out of admission
+    /// for a superseded policy without serializing queries or collection work.
     pub fn execute_metadata_mutation(&self, id: &Id) -> Result<OperationRecord> {
         let _receipt = self.hold_operation(id)?;
+        let _serial = self
+            .metadata_operations
+            .lock()
+            .map_err(|_| Error::corrupt("metadata execution lock poisoned"))?;
         let operation = self.operation(id)?;
         if matches!(
             operation.state,

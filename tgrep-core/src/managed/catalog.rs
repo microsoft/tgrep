@@ -221,6 +221,7 @@ pub struct Namespace {
     pub(super) inventories: super::inventory::Inventories,
     pub(super) observations: Mutex<super::diagnostics::Observations>,
     pub(crate) maintenance: Mutex<()>,
+    pub(crate) metadata_operations: Mutex<()>,
     pub(crate) system_operations: Mutex<()>,
     pub(crate) operation_readers: Arc<Mutex<HashMap<Id, u32>>>,
     pub(super) live_views: Mutex<HashMap<Id, Vec<Weak<super::ViewSlot>>>>,
@@ -441,6 +442,7 @@ impl Namespace {
             inventories: Mutex::new(HashMap::new()),
             observations: Mutex::new(super::diagnostics::Observations::default()),
             maintenance: Mutex::new(()),
+            metadata_operations: Mutex::new(()),
             system_operations: Mutex::new(()),
             operation_readers: Arc::new(Mutex::new(HashMap::new())),
             live_views: Mutex::new(HashMap::new()),
@@ -512,6 +514,7 @@ impl Namespace {
             inventories: Mutex::new(HashMap::new()),
             observations: Mutex::new(super::diagnostics::Observations::default()),
             maintenance: Mutex::new(()),
+            metadata_operations: Mutex::new(()),
             system_operations: Mutex::new(()),
             operation_readers: Arc::new(Mutex::new(HashMap::new())),
             live_views: Mutex::new(HashMap::new()),
@@ -1564,6 +1567,311 @@ mod tests {
         )
         .unwrap();
         (temp, namespace)
+    }
+
+    #[test]
+    fn independent_concurrent_policy_replay_preserves_original_receipt() {
+        let (_temp, namespace) = namespace();
+        let owner = namespace.prepare_owner().unwrap();
+        let guard = OwnerGuard::claim(owner.claim).unwrap();
+        namespace.register_owner(guard.registration()).unwrap();
+        for sequence in 1..=16 {
+            let configured = namespace.policy().unwrap();
+            let operation = namespace
+                .accept_metadata_mutation(
+                    OperationToken {
+                        scope: guard.registration().owner.clone(),
+                        sequence,
+                        token: Token::parse(format!("policy-replay-{sequence}")).unwrap(),
+                    },
+                    super::super::MetadataMutation::Policy {
+                        expected_version: configured.version,
+                        policy: configured.policy,
+                    },
+                )
+                .unwrap();
+            let start = std::sync::Barrier::new(9);
+            let results = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            namespace.execute_metadata_mutation(&operation.id)
+                        })
+                    })
+                    .collect();
+                start.wait();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let authoritative = namespace.operation(&operation.id).unwrap();
+            assert_eq!(authoritative.state, OperationState::Completed);
+            assert!(authoritative.error.is_none(), "{:?}", authoritative.error);
+            for receipt in results {
+                assert_eq!(
+                    serde_json::to_value(receipt).unwrap(),
+                    serde_json::to_value(&authoritative).unwrap(),
+                );
+            }
+            assert_eq!(namespace.policy().unwrap().version, configured.version + 1);
+        }
+    }
+
+    #[test]
+    fn independent_queued_policy_replay_ignores_obsolete_headroom() {
+        let (_temp, namespace) = namespace();
+        let owner = namespace.prepare_owner().unwrap();
+        let guard = OwnerGuard::claim(owner.claim).unwrap();
+        namespace.register_owner(guard.registration()).unwrap();
+        let mut configured = namespace.policy().unwrap();
+        configured.policy.work.metadata_bytes = 1024 * 1024;
+        let operation = namespace
+            .accept_metadata_mutation(
+                OperationToken {
+                    scope: guard.registration().owner.clone(),
+                    sequence: 1,
+                    token: Token::parse("small-policy").unwrap(),
+                },
+                super::super::MetadataMutation::Policy {
+                    expected_version: configured.version,
+                    policy: configured.policy.clone(),
+                },
+            )
+            .unwrap();
+        let original = namespace.execute_metadata_mutation(&operation.id).unwrap();
+        assert_eq!(original.state, OperationState::Completed);
+        assert!(original.error.is_none());
+        std::thread::scope(|scope| {
+            let serial = namespace.metadata_operations.lock().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let namespace = &namespace;
+            let id = &operation.id;
+            let worker = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                finished_tx
+                    .send(namespace.execute_metadata_mutation(id))
+                    .unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !namespace.operation_readers.lock().unwrap().contains_key(id) {
+                assert!(
+                    Instant::now() < deadline,
+                    "queued replay did not retain its receipt"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut current = namespace.policy().unwrap();
+            current.policy.work.metadata_bytes = 4 * 1024 * 1024;
+            let raised = namespace
+                .update_policy(current.version, current.policy)
+                .unwrap();
+            let reader = connect(&namespace.directory, true).unwrap();
+            reader
+                .execute_batch("BEGIN; SELECT namespace FROM state")
+                .unwrap();
+            let old_limit = configured.policy.work.metadata_bytes;
+            let mut crossed = false;
+            for sequence in 0..512 {
+                namespace
+                    .transaction(|transaction| {
+                        transaction.execute(
+                            "INSERT INTO records VALUES('probe','replay-pressure',1,?1)
+                             ON CONFLICT(kind,id) DO UPDATE SET version=version+1,record=excluded.record",
+                            [sequence.to_string()],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                if namespace
+                    .directory
+                    .observe_file("catalog.sqlite-wal")
+                    .unwrap()
+                    .logical_bytes
+                    > old_limit
+                {
+                    crossed = true;
+                    break;
+                }
+            }
+            assert!(crossed);
+            let mut entered = false;
+            let rejected = namespace
+                .transaction_with_policy(
+                    Some(VersionedPolicy {
+                        version: raised.version,
+                        policy: configured.policy,
+                    }),
+                    |_| {
+                        entered = true;
+                        Ok(())
+                    },
+                )
+                .unwrap_err();
+            assert!(!entered);
+            assert_eq!(rejected.reason_code, "catalog-checkpoint-readers-active");
+            assert_eq!(rejected.committed_state, CommitState::NotCommitted);
+            let forgotten = namespace
+                .acknowledge_operations(&operation.token.scope, operation.token.sequence)
+                .unwrap_err();
+            assert_eq!(forgotten.reason_code, "operation-result-still-in-use");
+            assert!(!worker.is_finished(), "replay bypassed the execution gate");
+            drop(serial);
+            let replay = finished_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            worker.join().unwrap();
+            assert_eq!(
+                serde_json::to_value(replay).unwrap(),
+                serde_json::to_value(original).unwrap(),
+            );
+            assert!(!reader.is_autocommit());
+            reader.execute_batch("ROLLBACK").unwrap();
+            reader.close().unwrap();
+        });
+        assert_eq!(
+            namespace
+                .acknowledge_operations(&operation.token.scope, operation.token.sequence)
+                .unwrap(),
+            operation.token.sequence,
+        );
+    }
+
+    #[test]
+    fn independent_distinct_policy_operations_preserve_real_cas_failure() {
+        let (_temp, namespace) = namespace();
+        let owner = namespace.prepare_owner().unwrap();
+        let guard = OwnerGuard::claim(owner.claim).unwrap();
+        namespace.register_owner(guard.registration()).unwrap();
+        let configured = namespace.policy().unwrap();
+        let operations: Vec<_> = (1..=2)
+            .map(|sequence| {
+                namespace
+                    .accept_metadata_mutation(
+                        OperationToken {
+                            scope: guard.registration().owner.clone(),
+                            sequence,
+                            token: Token::parse(format!("conflicting-policy-{sequence}")).unwrap(),
+                        },
+                        super::super::MetadataMutation::Policy {
+                            expected_version: configured.version,
+                            policy: configured.policy.clone(),
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = operations
+            .iter()
+            .map(|operation| {
+                let namespace = Arc::clone(&namespace);
+                let start = Arc::clone(&start);
+                let id = operation.id.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    namespace.execute_metadata_mutation(&id)
+                })
+            })
+            .collect();
+        start.wait();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
+        let receipts: Vec<_> = results
+            .into_iter()
+            .map(|result| result.unwrap().unwrap())
+            .collect();
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| receipt.state == OperationState::Completed)
+                .count(),
+            1,
+        );
+        let failed = receipts
+            .iter()
+            .find(|receipt| receipt.state == OperationState::Failed)
+            .unwrap();
+        assert_eq!(failed.committed_state, CommitState::NotCommitted);
+        let error = failed.error.as_ref().unwrap();
+        assert_eq!(error["reason_code"], "stale-version");
+        assert_eq!(error["current_version"], configured.version + 1);
+        for receipt in &receipts {
+            let replay = namespace.execute_metadata_mutation(&receipt.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(replay).unwrap(),
+                serde_json::to_value(receipt).unwrap(),
+            );
+        }
+        assert_eq!(namespace.policy().unwrap().version, configured.version + 1);
+    }
+
+    #[test]
+    fn independent_metadata_execution_reports_real_commit_boundary_errors() {
+        use super::super::faults::{Action, Point, Specification};
+        for point in [Point::CatalogBeforeCommit, Point::CatalogAfterCommit] {
+            let (_temp, namespace) = namespace();
+            let owner = namespace.prepare_owner().unwrap();
+            let guard = OwnerGuard::claim(owner.claim).unwrap();
+            namespace.register_owner(guard.registration()).unwrap();
+            let configured = namespace.policy().unwrap();
+            let operation = namespace
+                .accept_metadata_mutation(
+                    OperationToken {
+                        scope: guard.registration().owner.clone(),
+                        sequence: 1,
+                        token: Token::parse("metadata-commit-boundary").unwrap(),
+                    },
+                    super::super::MetadataMutation::Policy {
+                        expected_version: configured.version,
+                        policy: configured.policy,
+                    },
+                )
+                .unwrap();
+            namespace
+                .install_test_fault(Specification {
+                    point,
+                    operation: None,
+                    skip_hits: 0,
+                    action: Action::Error {
+                        category: ErrorCategory::Io,
+                    },
+                })
+                .unwrap();
+            let response = namespace.execute_metadata_mutation(&operation.id);
+            let committed = point == Point::CatalogAfterCommit;
+            let original = if committed {
+                let error = response.unwrap_err();
+                assert_eq!(error.category, ErrorCategory::Io);
+                assert_eq!(error.committed_state, CommitState::Committed);
+                assert_eq!(error.operation_id.as_deref(), Some(operation.id.as_str()));
+                let receipt = namespace.operation(&operation.id).unwrap();
+                assert_eq!(receipt.state, OperationState::Completed);
+                assert_eq!(receipt.committed_state, CommitState::Committed);
+                assert!(receipt.error.is_none());
+                receipt
+            } else {
+                let receipt = response.unwrap();
+                assert_eq!(receipt.state, OperationState::Failed);
+                assert_eq!(receipt.committed_state, CommitState::NotCommitted);
+                let error = receipt.error.as_ref().unwrap();
+                assert_eq!(error["reason_code"], "injected-test-failure");
+                assert_eq!(error["operation_id"], operation.id.as_str());
+                receipt
+            };
+            let replay = namespace.execute_metadata_mutation(&operation.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(replay).unwrap(),
+                serde_json::to_value(original).unwrap(),
+            );
+            assert_eq!(
+                namespace.policy().unwrap().version,
+                configured.version + u64::from(committed),
+            );
+        }
     }
 
     #[test]

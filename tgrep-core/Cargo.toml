@@ -28,7 +28,7 @@ encoding_rs = "0.8"
 fs2 = "0.4.3"
 tempfile = "3"
 same-file = "1"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { workspace = true }
 getrandom = "0.4.2"
 
 [target.'cfg(unix)'.dependencies]
@@ -43,7 +43,7 @@ windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Storage_F
 criterion = "0.5"
 
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_ProcessStatus"] }
+windows-sys = { version = "0.61", features = ["Win32_System_IO", "Win32_System_ProcessStatus"] }
 
 [[bench]]
 name = "trigram_extraction"

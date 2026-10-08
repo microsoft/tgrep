@@ -116,6 +116,13 @@ do not qualify that separate pipeline.
 
 ## Managed lifecycle qualification
 
+The `installed` qualification also exercises managed v2 through the public CLI
+of the normally installed release binary, without test hooks. It covers
+`owner-hold`, exact-generation reuse with no blob reads, independent private
+overlays, indexed RPC/CLI parity with forced scans, migration, exact receipt
+replay and explicit detach/owner release. Ordinary and default-v1 installed
+coverage remains enabled.
+
 The managed lifecycle suite uses actual CLI/RPC clients, temporary Git
 repositories, native filesystem/owner locks and the production owned-child
 supervisor. Enable `managed-test-hooks` for deterministic preparation,

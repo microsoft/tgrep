@@ -8,6 +8,8 @@ Run with Python 3.11+ and Cargo/Git on PATH:
 targets (a C++ compiler is required by libfuzzer-sys; nightly/cargo-fuzz are not).
 `installed` performs the documented release-profile cargo install into a private
 temporary root, then exercises that exact executable, never a PATH/debug binary.
+It covers ordinary/default-v1 search and opt-in managed-v2 owner claims,
+shared generation reuse, private overlays, migration, replay and detach.
 Fixtures, Git configuration, storage, logs and installation are private and
 removed after owned servers stop, including on failures/timeouts. Cargo's normal
 download/build cache is reused. On WSL, run from a native Linux checkout and use
@@ -74,9 +76,10 @@ def process(argv, **kwargs):
     if os.name == "nt":
         from windows_job import WindowsJob
         job = WindowsJob()
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
     try:
         child = subprocess.Popen(
-            [str(arg) for arg in argv], stdin=subprocess.DEVNULL,
+            [str(arg) for arg in argv],
             start_new_session=os.name != "nt",
             creationflags=4 if job is not None else 0,  # CREATE_SUSPENDED
             **kwargs,
@@ -89,7 +92,7 @@ def process(argv, **kwargs):
             try:
                 stop(child, job)
             finally:
-                for pipe in (child.stdout, child.stderr):
+                for pipe in (child.stdin, child.stdout, child.stderr):
                     if pipe is not None:
                         pipe.close()
                 if job is not None:
@@ -172,19 +175,22 @@ def fixture_environment(home):
 
 
 @contextmanager
-def server(binary, root, options, env, log):
+def logged_process(argv, root, env, log, **kwargs):
     with log.open("wb") as output:
         try:
             with process(
-                [binary, "serve", root, *options], cwd=root, env=env,
-                stdout=output, stderr=subprocess.STDOUT,
+                argv, cwd=root, env=env, stdout=output, stderr=subprocess.STDOUT, **kwargs,
             ) as child:
                 yield child
         except BaseException:
             output.close()
-            print(f"Server log ({log}):\n{log.read_text(encoding='utf-8', errors='replace')}",
+            print(f"Process log ({log}):\n{log.read_text(encoding='utf-8', errors='replace')}",
                   flush=True)
             raise
+
+
+def server(binary, root, options, env, log):
+    return logged_process([binary, "serve", root, *options], root, env, log)
 
 
 def wait_for(child, probe, description, timeout=30):
@@ -325,6 +331,211 @@ def smoke(binary, scratch):
     print("Installed binary: restart, detach and worktree deletion while daemon lives", flush=True)
 
 
+def owner_holding(path, claim):
+    with path.open("rb") as stream:
+        data = stream.read(65537)
+    require(len(data) <= 65536, "owner-hold readiness output exceeded its byte bound")
+    if not data.endswith(b"\n"):
+        return False
+    frame = json.loads(data)
+    require(frame["holding"] is True and frame["claim"] == claim,
+            f"owner-hold did not prove the requested claim: {frame}")
+    return True
+
+
+def managed_completed(child, accepted, manage):
+    record = None
+
+    def complete(remaining):
+        nonlocal record
+        record = manage("operations.inspect", {"id": accepted["id"]}, timeout=remaining)
+        require(record["id"] == accepted["id"], f"wrong operation receipt: {record}")
+        require(record["state"] not in ("failed", "cancelled"),
+                f"managed operation did not succeed: {record}")
+        if record["state"] != "completed":
+            return False
+        require(record.get("error") is None, f"completed operation reported an error: {record}")
+        return True
+
+    wait_for(child, complete, f"managed operation {accepted['id']}")
+    return record
+
+
+def managed_smoke(binary, scratch):
+    require(binary.is_file(), f"installed executable missing: {binary}")
+    fixture = scratch / "managed"
+    fixture.mkdir()
+    home, root, linked, storage = (fixture / name for name in ("home", "repo", "linked", "storage"))
+    for directory in (home, root, storage):
+        directory.mkdir()
+    env = fixture_environment(home)
+
+    def git(*args):
+        return run(["git", *args], cwd=root, env=env).stdout.strip()
+
+    def cli(where, *args, timeout=30):
+        return run([binary, *args], cwd=where, env=env, timeout=timeout)
+
+    def manage(method, params, timeout=30):
+        result = json.loads(cli(
+            root, "shared", "manage", ".", method, "--params", json.dumps(params),
+            timeout=timeout,
+        ).stdout)
+        require(result["ok"] is True, f"managed {method} failed: {result}")
+        return result["result"]
+
+    def parity(where):
+        view = manage("lookup", {"root": str(where)})
+        result = manage("search", {
+            "root": view["root"], "view": view["view"], "expected_version": view["version"],
+            "query": {"pattern": PATTERN, "hidden": True},
+        })
+        require(result["backend"] == "shared-v2" and result["ready"] is True,
+                f"managed RPC did not use a ready indexed view: {result}")
+        content = None
+        for flags in (["--files"], ["-n", "--with-filename", "-F", "--", PATTERN]):
+            options = ["--stats", "--sort", "path", "--color", "never", "--hidden", "--glob", "!.git"]
+            indexed = cli(where, *options, *flags, ".")
+            scanned = cli(where, "--no-index", *options, *flags, ".")
+            assert_parity(indexed, scanned, "(via shared daemon v2)")
+            require(bool(indexed.stdout.strip()), "managed fixture must produce nonempty results")
+            if flags[0] != "--files":
+                content = indexed.stdout
+        return content
+
+    git("init", "-q")
+    git("config", "core.autocrlf", "false")
+    for name in ("keep.txt", "gone.txt", ".hidden"):
+        (root / name).write_text(f"{PATTERN} base {name}\n", encoding="utf-8")
+    (root / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "managed shipping base")
+    revision = git("rev-parse", "HEAD")
+    git("worktree", "add", "-q", "--detach", str(linked), revision)
+    cli(linked, "index", ".")
+    (linked / "keep.txt").write_text(f"{PATTERN} private linked view\n", encoding="utf-8")
+    (linked / "gone.txt").unlink()
+    (linked / "new.txt").write_text(f"{PATTERN} private new file\n", encoding="utf-8")
+    (linked / "ignored.txt").write_text(f"{PATTERN} ignored\n", encoding="utf-8")
+
+    policy = {
+        "schema": 2, "storage": "managed",
+        "retention": {"mode": "retain-all"}, "advancement": {"mode": "fixed"},
+        "work": {
+            "max_views": 8, "max_leases": 32, "workers": 2, "queue_items": 16,
+            "staging_bytes": 67108864, "private_work_bytes": 67108864,
+            "sort_buffer_bytes": 1048576, "blob_bytes": 1048576, "operation_timeout_ms": 30000,
+            "page_objects": 16, "max_cursors": 8, "cursor_lifetime_ms": 30000,
+            "max_receipts": 1024, "metadata_bytes": 16777216,
+        },
+        "collection": {
+            "schedule": {"mode": "disabled"}, "on_pressure": False,
+            "checkpoint_grace_ms": 0, "generation_grace_ms": 0,
+            "max_duration_ms": 1000, "max_examined": 64, "max_removed": 16,
+            "max_delete_bytes": 1048576, "chunk_bytes": 65536, "max_pages": 4, "retry_ms": 100,
+        },
+    }
+    profile = {
+        "content": "raw-git-blob-auto-v1", "coverage": "tracked-regular-files-v1",
+        "max_blob_bytes": 67108864,
+    }
+    policy_path = fixture / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    options = ["--shared", "--shared-storage", storage, "--shared-policy", policy_path, "--no-watch"]
+    with server(binary, root, options, env, fixture / "daemon.log") as child:
+        wait_for(child, lambda _: marker_owned(root / ".git/tgrep-daemon-v2.json", child),
+                 "managed registration")
+        require(manage("hello", {})["storage"] == "managed", "managed storage was not selected")
+        claim = manage("owners.prepare", {"token": "shipping-owner"})["claim"]
+        claim_path = fixture / "owner.json"
+        claim_path.write_text(json.dumps(claim), encoding="utf-8")
+        holder_log = fixture / "owner.log"
+        with logged_process(
+            [binary, "shared", "owner-hold", "--claim", claim_path], root, env, holder_log,
+            stdin=subprocess.PIPE,
+        ) as holder:
+            wait_for(holder, lambda _: owner_holding(holder_log, claim), "managed owner proof")
+            manage("owners.register", {"claim": claim})
+
+            def token(sequence):
+                return {"scope": claim["owner"], "sequence": sequence, "token": f"shipping-{sequence}"}
+
+            def attach(where, lease, sequence):
+                return {
+                    "token": token(sequence),
+                    "request": {
+                        "root": str(where), "revision": revision, "profile": profile,
+                        "lease": lease, "owner": claim["owner"], "accept_current": None,
+                        "migratable": True, "allocation_version": 1,
+                    },
+                }
+
+            def ready(view):
+                def available(remaining):
+                    status = manage("views.status", {"id": view}, timeout=remaining)
+                    return status["ready"] is True and status["work"] is None
+                wait_for(child, available, f"managed view {view}")
+
+            primary_input = attach(root, "shipping-primary", 1)
+            primary = managed_completed(child, manage("views.attach", primary_input), manage)
+            ready(primary["result"]["current"]["id"])
+            sibling = managed_completed(
+                child, manage("views.attach", attach(linked, "shipping-linked", 2)), manage,
+            )
+            ready(sibling["result"]["current"]["id"])
+            require(sibling["result"]["build"]["reused_generation"] is True
+                    and sibling["result"]["build"]["published"] is False
+                    and sibling["result"]["build"]["blobs_read"] == 0,
+                    f"warm managed attachment rebuilt content: {sibling}")
+            require(primary["result"]["current"]["current"]["incarnation"]
+                    == sibling["result"]["current"]["current"]["incarnation"],
+                    "managed worktrees did not share the same physical generation")
+            require("private linked view" not in parity(root), "private overlay leaked into primary")
+            require("private linked view" in parity(linked), "linked private overlay was lost")
+
+            before = manage("lookup", {"root": str(root)})
+            require(before["version"] == 1, f"unexpected initial managed version: {before}")
+            (root / "keep.txt").write_text(f"{PATTERN} committed target\n", encoding="utf-8")
+            git("add", "keep.txt")
+            git("commit", "-qm", "managed shipping target")
+            target = git("rev-parse", "HEAD")
+            (root / "keep.txt").write_text(f"{PATTERN} private primary view\n", encoding="utf-8")
+            migration = {
+                "token": token(3), "request": {
+                    "view": before["view"], "root": before["root"], "expected_version": 1,
+                    "target_commit": target, "profile": profile, "owner": claim["owner"],
+                    "allocation_version": 1,
+                },
+            }
+            advanced = managed_completed(child, manage("views.advance", migration), manage)
+            require(advanced["committed_state"] == "committed",
+                    f"managed migration did not commit: {advanced}")
+            ready(before["view"])
+            require(manage("views.advance", migration) == advanced, "migration replay changed its receipt")
+            require(manage("views.attach", primary_input) == primary, "attachment replay changed its receipt")
+            after = manage("lookup", {"root": str(root)})
+            sibling_view = manage("lookup", {"root": str(linked)})
+            require(after["version"] == 2 and after["commit"] == target,
+                    f"managed primary did not advance exactly once: {after}")
+            require(sibling_view["version"] == 1 and sibling_view["commit"] == revision,
+                    f"managed sibling unexpectedly migrated: {sibling_view}")
+            primary_content, sibling_content = parity(root), parity(linked)
+            require("private primary view" in primary_content and "private linked view" not in primary_content
+                    and "private linked view" in sibling_content and "private primary view" not in sibling_content,
+                    "managed migration mixed or lost private overlays")
+            for lease in ("shipping-primary", "shipping-linked"):
+                detached = manage("views.detach", {"owner": claim["owner"], "lease": lease})
+                require(detached["lease_released"] is True and detached["root_handles_released"] is True,
+                        f"managed detach retained its lease or root handles: {detached}")
+            manage("owners.release", {"claim": claim})
+            holder.stdin.close()
+            holder.wait(timeout=10)
+            require(holder.returncode == 0,
+                    f"managed owner-hold failed ({holder.returncode}): {holder_log.read_bytes()!r}")
+    print("Installed binary: managed-v2 owner proof, generation reuse, indexed parity, migration and replay",
+          flush=True)
+
+
 @contextmanager
 def private_directory():
     temporary = tempfile.TemporaryDirectory(prefix="tgrep-qualification-")
@@ -357,6 +568,7 @@ def installed(checkout):
         binary = install_root / "bin" / ("tgrep.exe" if os.name == "nt" else "tgrep")
         print(f"Qualifying installed executable: {binary}", flush=True)
         smoke(binary, scratch)
+        managed_smoke(binary, scratch)
 
 
 def main():

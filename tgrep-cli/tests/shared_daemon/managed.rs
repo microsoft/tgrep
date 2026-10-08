@@ -684,6 +684,17 @@ fn v2_cli_real_backend_migration_replay_and_idle_shutdown() {
         "{}",
         String::from_utf8_lossy(&indexed.stderr)
     );
+    let indexed_files = cli(&fixture.a, &["--files", "--stats", "--sort", "path", "."]);
+    let scanned_files = cli(
+        &fixture.a,
+        &["--files", "--no-index", "--sort", "path", "."],
+    );
+    assert!(
+        String::from_utf8_lossy(&indexed_files.stderr).contains("(via shared daemon v2)"),
+        "{}",
+        String::from_utf8_lossy(&indexed_files.stderr)
+    );
+    assert_eq!(success(indexed_files), success(scanned_files));
 
     fs::write(
         fixture.a.join("notes.txt"),

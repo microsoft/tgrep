@@ -477,24 +477,7 @@ fn removed(daemon: &Daemon, incarnation: &Value) -> bool {
 }
 
 fn idle_status(daemon: &Daemon) -> Value {
-    let started = Instant::now();
-    loop {
-        let response = daemon
-            .try_rpc("stop-if-idle", idle_request(daemon))
-            .unwrap();
-        if response.get("error").is_none() {
-            return response["result"]["data"].clone();
-        }
-        let error = &response["error"]["data"];
-        assert_eq!(error["category"], "busy", "{response}");
-        assert_eq!(error["committed_state"], "not-committed", "{response}");
-        assert_eq!(error["retryable"], true, "{response}");
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "idle inspection remains busy: {response}"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    retry_busy(daemon, "stop-if-idle", idle_request(daemon))
 }
 
 #[test]

@@ -39,7 +39,7 @@ impl Namespace {
         if !record.registered {
             return Err(Error::busy("unregistered-owner-has-no-proven-lifetime"));
         }
-        let file = self.owners.open_file(&format!("{id}.lock"), true)?;
+        let file = self.open_control(&self.owners, &format!("{id}.lock"), true)?;
         if FileIdentity::of(&file)? != record.claim.guard_identity {
             return Err(Error::busy("owner-guard-identity-unknown"));
         }

@@ -145,23 +145,14 @@ impl OwnerGuard {
             ));
         }
         let owners = namespace.child("owners")?;
-        let file = owners.open_file(&format!("{}.lock", claim.owner), true)?;
-        if FileIdentity::of(&file)? != claim.guard_identity {
-            return Err(Error::new(
-                ErrorCategory::StaleIdentity,
-                "owner-guard-replaced",
-                "owner guard identity differs from the issued claim",
-            ));
-        }
-        fs2::FileExt::try_lock_exclusive(&file)
-            .map_err(|error| lock_error(error, "owner-guard-already-held"))?;
         if namespace.observe_file("catalog.sqlite")?.identity != header.catalog_identity {
             return Err(Error::corrupt(
                 "owner catalog identity differs from its namespace",
             ));
         }
-        let connection = super::catalog::connect(&namespace, true)?;
-        let service: Option<String> = connection
+        let mut connection = super::catalog::connect(&namespace, false)?;
+        let (transaction, _) = super::catalog_io::begin(&mut connection, &namespace, None)?;
+        let service: Option<String> = transaction
             .query_row(
                 "SELECT record FROM records WHERE kind='service' AND id='current'",
                 [],
@@ -180,7 +171,7 @@ impl OwnerGuard {
                 ));
             }
         }
-        let record: Option<String> = connection
+        let record: Option<String> = transaction
             .query_row(
                 "SELECT record FROM owners WHERE id=?1",
                 [claim.owner.as_str()],
@@ -204,6 +195,17 @@ impl OwnerGuard {
                 "a released or previously registered lifetime cannot be acquired again",
             ));
         }
+        super::work::ensure_admission(&transaction)?;
+        let file = owners.open_file(&format!("{}.lock", claim.owner), true)?;
+        if FileIdentity::of(&file)? != claim.guard_identity {
+            return Err(Error::new(
+                ErrorCategory::StaleIdentity,
+                "owner-guard-replaced",
+                "owner guard identity differs from the issued claim",
+            ));
+        }
+        fs2::FileExt::try_lock_exclusive(&file)
+            .map_err(|error| lock_error(error, "owner-guard-already-held"))?;
         let seal: OwnerSeal = owners.read_json(&format!("{}.json", claim.owner), 4096)?;
         if seal.namespace != claim.namespace
             || seal.instance != claim.instance
@@ -220,6 +222,7 @@ impl OwnerGuard {
         if namespace.observe_file("catalog.sqlite")?.identity != header.catalog_identity {
             return Err(Error::corrupt("owner catalog changed during claim"));
         }
+        transaction.commit()?;
         Ok(Self {
             claim,
             _guard: file,

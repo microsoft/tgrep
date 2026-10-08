@@ -798,6 +798,11 @@ build predecessors, checkpoint restore and both sides of migration. Local
 `Arc` counts alone are not reclamation evidence. Per-object guards allow an
 unrelated obsolete object to be collected while ready views continue serving;
 the namespace activity guard is used for idle shutdown, not to block all GC.
+Guard acquisition is authorized against the current catalog state while
+retirement is excluded. A stale root, owner claim or generation open cannot
+probe a retired guard and disrupt its physical reclamation. Releasing the last
+root handle withdraws that incarnation; bounded maintenance reclaims its control
+file separately, so successful handle release does not wait for physical GC.
 
 Namespace ownership is rooted in external storage and survives repository
 deletion. Live startup also coordinates through the repository's common-directory
@@ -1216,6 +1221,13 @@ restarting authentication at the first byte. Durable deletion intents do not
 preserve authority over an earlier verified prefix. Read-only inventory
 duplicates a matching cached descriptor rather than breaking its native lease
 with a new open; an active verifier can produce a typed retryable busy finding.
+One short-lived control-file verifier per namespace holds an OS-backed activity
+guard. Open admission checks its exact directory/member identity. A competing
+cleaner, inventory pass or owner probe for that member reports retryable
+contention rather than attempting a new open that would break a Linux lease.
+Other control members remain accessible. This is not a persistent
+namespace-wide reader pin: unrelated ready views continue serving, and
+maintenance can retry after the bounded control operation ends.
 
 Native evidence is checked around each verification page and immediately before
 destructive I/O:
@@ -1318,8 +1330,11 @@ reservations, operations and receipt readers, independent namespace/root/object
 guards, requests, queries, queued jobs and background batches. Idle verifier
 caches are discarded while active verification remains protected by its work
 lifetime. A retained cache alone does not make a daemon permanently busy.
-A busy decision reopens admission; a committed stop leaves it closed before exit. A terminal
-busy receipt is replayable, so a later probe needs a new token. Disconnecting
+A busy decision reopens admission; a committed stop leaves it closed before exit.
+An uncommitted lock-admission Busy error leaves the accepted token pending;
+retry that same token rather than abandoning it and consuming another queue
+slot. A completed non-stopping decision is terminal and replayable, so a later
+idle probe needs a new token. Disconnecting
 the final client or checking the lease count alone is not atomic shutdown.
 Committed operation acceptance or bookkeeping alone does not authorize exit.
 Error recovery checks the current instance's durable stop decision together

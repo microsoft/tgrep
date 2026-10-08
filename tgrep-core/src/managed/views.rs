@@ -862,7 +862,7 @@ impl ViewManager {
                     if self.namespace.root_busy(anchor)? {
                         return Err(Error::busy("previous-root-readers-active"));
                     }
-                    self.namespace.retire_root(anchor)?;
+                    self.namespace.withdraw_root(anchor)?;
                 }
                 None
             }

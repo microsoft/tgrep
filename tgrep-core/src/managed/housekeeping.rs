@@ -42,6 +42,17 @@ pub(super) struct ControlRemoval {
     pub verification_bytes: u64,
 }
 
+pub(super) struct ControlAccess {
+    directory: FileIdentity,
+    name: String,
+    _activity: super::lifetime::ActivityGuard,
+}
+
+pub(super) struct ControlRead<'a> {
+    _serial: std::sync::MutexGuard<'a, std::sync::Weak<ControlAccess>>,
+    _activity: super::lifetime::ActivityGuard,
+}
+
 impl CleanupCounts {
     pub(super) fn control_removed(&mut self, removal: ControlRemoval) {
         self.control_files_removed += u32::from(removal.removed);
@@ -415,6 +426,196 @@ mod tests {
         assert_eq!(namespace.work_usage().unwrap().control_logical_bytes, 0);
     }
 
+    #[test]
+    fn independent_control_cleanup_preserves_unrelated_owner_admission() {
+        use super::super::faults::{Action, Point, Specification, Stage};
+        use std::time::{Duration, Instant};
+
+        let (_temp, namespace, owner) = namespace();
+        let claim = owner.registration().clone();
+        namespace.release_owner(&claim).unwrap();
+        drop(owner);
+        let name = format!("{}.json", claim.owner);
+        let before = namespace.work_usage().unwrap().control_logical_bytes;
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::ControlIntentSaved,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let (removal, sibling, reached, admitted_before_release) = std::thread::scope(|scope| {
+            let remover = scope.spawn(|| namespace.remove_owned_control("owners", &name));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let admission_namespace = &namespace;
+            let admission = scope.spawn(move || {
+                let result = (|| -> Result<OwnerGuard> {
+                    let prepared = admission_namespace
+                        .prepare_owner_with_token(&Token::parse("unrelated-bootstrap")?)?;
+                    let guard = OwnerGuard::claim(prepared.claim)?;
+                    admission_namespace.register_owner(guard.registration())?;
+                    Ok(guard)
+                })();
+                sender.send(()).unwrap();
+                result
+            });
+            let admitted = receiver.recv_timeout(Duration::from_secs(3)).is_ok();
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            (
+                remover.join().unwrap(),
+                admission.join().unwrap(),
+                reached,
+                admitted,
+            )
+        });
+        assert!(reached, "the authenticated control intent was not reached");
+        assert!(
+            admitted_before_release,
+            "unrelated owner admission waited for another control's verification"
+        );
+        let sibling =
+            sibling.expect("unrelated owner admission must not inherit control contention");
+        let removal =
+            removal.expect("unrelated owner admission must not invalidate authentication");
+        assert!(removal.removed);
+        assert_eq!(removal.logical_bytes, before);
+        assert_eq!(removal.recovered_logical_bytes, 0);
+        namespace
+            .validate_active_owner(&sibling.registration().owner)
+            .unwrap();
+        let sibling_proof = namespace
+            .path()
+            .join("owners")
+            .join(format!("{}.json", sibling.registration().owner));
+        assert_eq!(
+            namespace.work_usage().unwrap().control_logical_bytes,
+            std::fs::metadata(sibling_proof).unwrap().len()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn independent_concurrent_cleaner_preserves_active_control_verification() {
+        use super::super::faults::{Action, Point, Specification, Stage};
+        use std::time::{Duration, Instant};
+        let (_temp, namespace, owner) = namespace();
+        let claim = owner.registration().clone();
+        namespace.release_owner(&claim).unwrap();
+        drop(owner);
+        let name = format!("{}.json", claim.owner);
+        let before = namespace.work_usage().unwrap().control_logical_bytes;
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::ControlIntentSaved,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        let (first, second, reached, contender_finished) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| namespace.remove_owned_control("owners", &name));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let contender_namespace = &namespace;
+            let contender_name = &name;
+            let second = scope.spawn(move || {
+                let result = contender_namespace.remove_owned_control("owners", contender_name);
+                sender.send(()).unwrap();
+                result
+            });
+            let contender_finished = receiver.recv_timeout(Duration::from_secs(3)).is_ok();
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            (
+                first.join().unwrap(),
+                second.join().unwrap(),
+                reached,
+                contender_finished,
+            )
+        });
+        assert!(reached, "the protected control intent was not reached");
+        eprintln!("contender finished before release: {contender_finished}");
+        match &second {
+            Ok(removed) => eprintln!(
+                "contender removed={}, bytes={}",
+                removed.removed,
+                removed.logical_bytes + removed.recovered_logical_bytes
+            ),
+            Err(error) => eprintln!("contender error: {error:?}"),
+        }
+        let first = first.unwrap_or_else(|error| {
+            panic!("a cooperating cleaner invalidated active verification: {error:?}")
+        });
+        assert!(first.removed);
+        assert_eq!(first.logical_bytes, before);
+        assert_eq!(namespace.work_usage().unwrap().control_logical_bytes, 0);
+    }
+
+    #[test]
+    fn control_access_blocks_idle_stop_and_protects_probes() {
+        let (_temp, namespace, owner) = namespace();
+        let claim = owner.registration().clone();
+        namespace.release_owner(&claim).unwrap();
+        drop(owner);
+        let access = namespace
+            .control_access(&namespace.owners, &format!("{}.lock", claim.owner))
+            .unwrap();
+        let native = super::super::authentication_native::NativeFile::open(
+            &namespace.owners,
+            &format!("{}.lock", claim.owner),
+        )
+        .unwrap();
+        let inspected = namespace.inspect_owner(&claim.owner).unwrap();
+        assert_eq!(inspected.last_proof, super::super::OwnerProof::Unknown);
+        let error: Error = serde_json::from_value(inspected.last_error.unwrap()).unwrap();
+        assert_eq!(error.category, ErrorCategory::Busy);
+        assert!(error.retryable);
+        assert_eq!(error.reason_code, "control-verifier-active");
+        let error = OwnerGuard::claim(claim).err().unwrap();
+        assert_eq!(error.category, ErrorCategory::StaleIdentity);
+        let other = namespace.prepare_owner().unwrap().claim;
+        let other_guard = OwnerGuard::claim(other.clone()).unwrap();
+        namespace.register_owner(&other).unwrap();
+        assert_eq!(
+            namespace.inspect_owner(&other.owner).unwrap().last_proof,
+            super::super::OwnerProof::Held
+        );
+        namespace.release_owner(&other).unwrap();
+        drop(other_guard);
+        native.check().unwrap();
+        let idle = namespace
+            .stop_if_idle(super::super::ExternalWork::default())
+            .unwrap();
+        assert!(!idle.stopping);
+        assert!(idle.namespace_readers_or_work);
+        drop((native, access));
+        assert!(
+            namespace
+                .stop_if_idle(super::super::ExternalWork::default())
+                .unwrap()
+                .stopping
+        );
+    }
+
     #[cfg(any(unix, windows))]
     fn change_control_ownership(path: &std::path::Path) -> std::io::Result<()> {
         #[cfg(unix)]
@@ -670,6 +871,62 @@ fn control_row(connection: &rusqlite::Connection, area: &str, name: &str) -> Res
 }
 
 impl Namespace {
+    pub(super) fn control_access(
+        &self,
+        directory: &Directory,
+        name: &str,
+    ) -> Result<Arc<ControlAccess>> {
+        let activity = super::lifetime::ActivityGuard::acquire(&self.directory)?;
+        let mut serial = self
+            .controls
+            .lock()
+            .map_err(|_| Error::corrupt("control access lock poisoned"))?;
+        if serial.upgrade().is_some() {
+            return Err(Error::busy("control-verifier-active"));
+        }
+        let access = Arc::new(ControlAccess {
+            directory: directory.identity()?,
+            name: name.into(),
+            _activity: activity,
+        });
+        *serial = Arc::downgrade(&access);
+        Ok(access)
+    }
+
+    // Even a failed Linux open can break a lease. Hold this only through
+    // matching-file open admission, never across catalog or memory work.
+    pub(super) fn control_read(
+        &self,
+        directory: &Directory,
+        name: &str,
+    ) -> Result<ControlRead<'_>> {
+        let activity = super::lifetime::ActivityGuard::acquire(&self.directory)?;
+        let serial = self
+            .controls
+            .lock()
+            .map_err(|_| Error::corrupt("control access lock poisoned"))?;
+        if let Some(active) = serial.upgrade()
+            && active.directory == directory.identity()?
+            && active.name == name
+        {
+            return Err(Error::busy("control-verifier-active"));
+        }
+        Ok(ControlRead {
+            _serial: serial,
+            _activity: activity,
+        })
+    }
+
+    pub(super) fn open_control(
+        &self,
+        directory: &Directory,
+        name: &str,
+        write: bool,
+    ) -> Result<std::fs::File> {
+        let _access = self.control_read(directory, name)?;
+        directory.open_file(name, write)
+    }
+
     /// An unlink intent remains until its once-only credit is durable. A missing
     /// file without that intent is not evidence that this collector reclaimed it.
     pub(super) fn remove_owned_control(&self, area: &str, name: &str) -> Result<ControlRemoval> {
@@ -691,6 +948,23 @@ impl Namespace {
             return Ok(ControlRemoval::default());
         }
         self.fault(super::faults::Point::ControlObserved, None)?;
+        let _access = self.control_access(&directory, name)?;
+        let current = self.read(|connection| control_row(connection, area, name))?;
+        if current.file.identity != record.file.identity
+            || current.file.ownership != record.file.ownership
+            || current.file.seal != record.file.seal
+            || current.checksum != record.checksum
+        {
+            return Err(Error::new(
+                ErrorCategory::StaleIdentity,
+                "control-file-replaced",
+                "control entry has different incarnation or producer evidence",
+            ));
+        }
+        record = current;
+        if record.file.removed {
+            return Ok(ControlRemoval::default());
+        }
         let seal = record.file.seal.clone().ok_or_else(|| {
             Error::new(
                 ErrorCategory::RecoveryRequired,
@@ -955,7 +1229,7 @@ impl Namespace {
             return Ok(true);
         }
         if control.file.pending_length.is_some() {
-            match self.owners.open_file(&format!("{scope}.lock"), false) {
+            match self.open_control(&self.owners, &format!("{scope}.lock"), false) {
                 Err(error) if error.source_io_kind() == Some(std::io::ErrorKind::NotFound) => {
                     return Ok(true);
                 }
@@ -1167,7 +1441,7 @@ impl Namespace {
                 let guard = if guard_record.file.removed {
                     None
                 } else {
-                    let guard = match self.owners.open_file(&name, true) {
+                    let guard = match self.open_control(&self.owners, &name, true) {
                         Ok(guard) => Some(guard),
                         Err(error)
                             if error.source_io_kind() == Some(std::io::ErrorKind::NotFound)

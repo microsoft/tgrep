@@ -172,7 +172,11 @@ impl Namespace {
     /// Close admission before looking for *any* protected category. A failed
     /// idle check reopens service; retained cache references alone are not work.
     pub fn stop_if_idle(&self, external: ExternalWork) -> Result<IdleOutcome> {
-        self.stop_if_idle_inner(external, None)
+        let serial = self
+            .maintenance
+            .try_lock()
+            .map_err(|_| Error::busy("namespace-maintenance-active"))?;
+        self.stop_if_idle_inner(external, None, serial)
     }
 
     /// Resolve shutdown authorization for the activated instance. A committed
@@ -237,7 +241,10 @@ impl Namespace {
             return Err(serde_json::from_value(error)?);
         }
         self.check_operation_lifetime(&operation)?;
-        let result = self.stop_if_idle_inner(external, Some(&operation.id));
+        let serial = self.maintenance.try_lock().map_err(|_| {
+            Error::busy("namespace-maintenance-active").operation(operation.id.to_string())
+        })?;
+        let result = self.stop_if_idle_inner(external, Some(&operation.id), serial);
         if let Err(error) = result {
             self.fail_operation(
                 &operation.id,
@@ -252,11 +259,8 @@ impl Namespace {
         &self,
         external: ExternalWork,
         operation: Option<&Id>,
+        _serial: std::sync::MutexGuard<'_, ()>,
     ) -> Result<IdleOutcome> {
-        let _serial = self
-            .maintenance
-            .try_lock()
-            .map_err(|_| Error::busy("namespace-maintenance-active"))?;
         self.expire_cursors()?;
         let result = (|| {
             self.transaction(|transaction| {
@@ -612,9 +616,11 @@ impl Namespace {
                         progress.owners_reaped += 1;
                     } else if !owner.registered && owner.claim.instance != *self.instance() {
                         // Old, never-authorized bootstrap claims cannot register in this instance.
-                        let file = self
-                            .owners
-                            .open_file(&format!("{}.lock", owner.claim.owner), true)?;
+                        let file = self.open_control(
+                            &self.owners,
+                            &format!("{}.lock", owner.claim.owner),
+                            true,
+                        )?;
                         if FileIdentity::of(&file)? != owner.claim.guard_identity {
                             return Err(Error::corrupt("bootstrap guard replaced"));
                         }
@@ -698,8 +704,11 @@ impl Namespace {
                                 .guard_identity
                                 .as_ref()
                                 .ok_or_else(|| Error::corrupt("unsealed recovery object guard"))?;
-                            let guard =
-                                self.guards.open_file(&format!("{object_id}.lock"), true)?;
+                            let guard = self.open_control(
+                                &self.guards,
+                                &format!("{object_id}.lock"),
+                                true,
+                            )?;
                             if FileIdentity::of(&guard)? != *expected {
                                 return Err(Error::corrupt("recovery object guard differs"));
                             }
@@ -947,5 +956,74 @@ impl Namespace {
         progress.elapsed_nanos = u64::try_from(started.elapsed().as_nanos())
             .map_err(|_| Error::corrupt("recovery duration overflow"))?;
         Ok(progress)
+    }
+}
+
+#[cfg(test)]
+mod independent_tests {
+    use super::super::{OperationToken, Token};
+    use super::*;
+
+    #[test]
+    fn independent_idle_admission_contention_preserves_same_token_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = Namespace::initialize_identity(
+            &"a".repeat(64),
+            temp.path(),
+            super::super::policy::fixture_policy(),
+        )
+        .unwrap();
+        namespace.activate().unwrap();
+        let token = OperationToken {
+            scope: namespace.header().namespace.clone(),
+            sequence: 1,
+            token: Token::parse("idle-maintenance-contention").unwrap(),
+        };
+        let external = ExternalWork {
+            queries: 1,
+            ..ExternalWork::default()
+        };
+
+        let maintenance = namespace.maintenance.lock().unwrap();
+        let blocked = namespace
+            .stop_if_idle_with_token(token.clone(), external.clone())
+            .unwrap_err();
+        assert_eq!(blocked.category, ErrorCategory::Busy);
+        assert!(blocked.retryable);
+        assert_eq!(blocked.committed_state, CommitState::NotCommitted);
+        assert_eq!(
+            serde_json::to_value(&blocked).unwrap()["reason_code"],
+            "namespace-maintenance-active"
+        );
+        drop(maintenance);
+        assert!(namespace.maintenance.try_lock().is_ok());
+        assert!(!namespace.stop_is_committed().unwrap());
+
+        let outcome = namespace
+            .stop_if_idle_with_token(token.clone(), external)
+            .expect("the same token must progress after maintenance admission contention ends");
+        assert!(!outcome.stopping);
+        assert_eq!(outcome.external.queries, 1);
+        assert!(!namespace.stop_is_committed().unwrap());
+        let replay = namespace
+            .stop_if_idle_with_token(token, ExternalWork::default())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(replay).unwrap(),
+            serde_json::to_value(outcome).unwrap()
+        );
+
+        let final_attempt = namespace
+            .stop_if_idle_with_token(
+                OperationToken {
+                    scope: namespace.header().namespace.clone(),
+                    sequence: 2,
+                    token: Token::parse("idle-after-work-ended").unwrap(),
+                },
+                ExternalWork::default(),
+            )
+            .unwrap();
+        assert!(final_attempt.stopping);
+        assert!(namespace.stop_is_committed().unwrap());
     }
 }

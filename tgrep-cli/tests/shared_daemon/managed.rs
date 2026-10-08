@@ -96,7 +96,8 @@ fn terminal(daemon: &Daemon, operation: &Value) -> Value {
 
 fn search(daemon: &Daemon, root: &Path) -> Value {
     let view = daemon.rpc("lookup", json!({"root":fs::canonicalize(root).unwrap()}));
-    let result = daemon.rpc(
+    let result = retry_busy(
+        daemon,
         "search",
         json!({
             "root":view["root"],"view":view["view"],"expected_version":view["version"],
@@ -110,10 +111,9 @@ fn search(daemon: &Daemon, root: &Path) -> Value {
 
 fn stop(daemon: &mut Daemon) {
     let started = Instant::now();
+    let mut request = idle_request(daemon);
     loop {
-        let response = daemon
-            .try_rpc("stop-if-idle", idle_request(daemon))
-            .unwrap();
+        let response = daemon.try_rpc("stop-if-idle", request.clone()).unwrap();
         if let Some(error) = response.get("error") {
             assert_eq!(error["data"]["category"], "busy", "{response}");
             assert_eq!(error["data"]["retryable"], true, "{response}");
@@ -123,6 +123,8 @@ fn stop(daemon: &mut Daemon) {
             );
         } else if response["result"]["data"]["stopping"] == true {
             break;
+        } else {
+            request = idle_request(daemon);
         }
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -237,9 +239,13 @@ fn assert_scan_parity(daemon: &Daemon, root: &Path, home: &Path) {
             } else {
                 json!({"hidden":hidden})
             };
-            let result = daemon.rpc(method, json!({
-                "root":view["root"],"view":view["view"],"expected_version":view["version"],"query":query
-            }));
+            let result = retry_busy(
+                daemon,
+                method,
+                json!({
+                    "root":view["root"],"view":view["view"],"expected_version":view["version"],"query":query
+                }),
+            );
             assert_eq!(result["backend"], "shared-v2", "{result}");
             assert_eq!(result["ready"], true, "{result}");
             if method == "files" {
@@ -730,22 +736,9 @@ fn v2_cli_real_backend_migration_replay_and_idle_shutdown() {
         "root":before["root"],"view":before["view"],"expected_version":1,"query":{"pattern":"shared_term"}
     })).unwrap();
     assert_eq!(stale["error"]["data"]["category"], "stale-version");
-    let idle = daemon
-        .try_rpc("stop-if-idle", idle_request(&daemon))
-        .unwrap();
-    if idle.get("error").is_some() {
-        assert_eq!(idle["error"]["data"]["category"], "busy", "{idle}");
-        assert_eq!(
-            idle["error"]["data"]["committed_state"], "not-committed",
-            "{idle}"
-        );
-    } else {
-        assert_eq!(idle["result"]["data"]["stopping"], false, "{idle}");
-        assert!(
-            idle["result"]["data"]["leases"].as_u64().unwrap() > 0,
-            "{idle}"
-        );
-    }
+    let idle = retry_busy(&daemon, "stop-if-idle", idle_request(&daemon));
+    assert_eq!(idle["stopping"], false, "{idle}");
+    assert!(idle["leases"].as_u64().unwrap() > 0, "{idle}");
     let detached = daemon.rpc(
         "views.detach",
         json!({"owner":claim.owner,"lease":"managed-client"}),

@@ -237,6 +237,7 @@ pub struct Namespace {
     pub(super) inventories: super::inventory::Inventories,
     pub(super) observations: Mutex<super::diagnostics::Observations>,
     pub(super) verification: Mutex<Option<super::verification::Verification>>,
+    pub(super) controls: Mutex<Weak<super::housekeeping::ControlAccess>>,
     pub(crate) maintenance: Mutex<()>,
     pub(crate) metadata_operations: Mutex<()>,
     pub(crate) system_operations: Mutex<()>,
@@ -461,6 +462,7 @@ impl Namespace {
             inventories: Mutex::new(HashMap::new()),
             observations: Mutex::new(super::diagnostics::Observations::default()),
             verification: Mutex::new(None),
+            controls: Mutex::new(Weak::new()),
             maintenance: Mutex::new(()),
             metadata_operations: Mutex::new(()),
             system_operations: Mutex::new(()),
@@ -540,6 +542,7 @@ impl Namespace {
             inventories: Mutex::new(HashMap::new()),
             observations: Mutex::new(super::diagnostics::Observations::default()),
             verification: Mutex::new(None),
+            controls: Mutex::new(Weak::new()),
             maintenance: Mutex::new(()),
             metadata_operations: Mutex::new(()),
             system_operations: Mutex::new(()),
@@ -881,59 +884,35 @@ impl Namespace {
     }
 
     fn pin_inner(&self, id: &Id, preparing: bool) -> Result<Arc<ObjectGuard>> {
-        let object = self.object(id)?;
-        if object.state != ObjectState::Published
-            && !(preparing && object.state == ObjectState::Preparing)
-        {
-            return Err(Error::new(
-                ErrorCategory::CacheEvicted,
-                "object-not-published",
-                "incarnation is not published",
-            ));
-        }
-        let expected = object
-            .guard_identity
-            .as_ref()
-            .ok_or_else(|| Error::corrupt("object guard is unsealed"))?;
-        let pin = ObjectGuard::acquire(
-            &self.header.namespace,
-            &self.directory,
-            &self.guards,
-            &self.objects,
-            id,
-            expected,
-        )
-        .map_err(|error| match self.object(id) {
-            Ok(current)
-                if matches!(
-                    current.state,
-                    ObjectState::Retired | ObjectState::PendingDeletion | ObjectState::Removed
-                ) =>
+        let (object, pin) = self.read(|connection| {
+            super::work::ensure_admission(connection)?;
+            let object = object_row(connection, id)?;
+            if object.state != ObjectState::Published
+                && !(preparing && object.state == ObjectState::Preparing)
             {
-                Error::new(
+                return Err(Error::new(
                     ErrorCategory::CacheEvicted,
-                    "object-retired",
-                    "the incarnation was withdrawn before open",
-                )
+                    "object-not-published",
+                    "incarnation is not published",
+                ));
             }
-            Err(current) if current.category == ErrorCategory::CacheEvicted => current,
-            Ok(_) => error,
-            Err(current) => current,
+            let expected = object
+                .guard_identity
+                .as_ref()
+                .ok_or_else(|| Error::corrupt("object guard is unsealed"))?;
+            let pin = ObjectGuard::acquire(
+                &self.header.namespace,
+                &self.directory,
+                &self.guards,
+                &self.objects,
+                id,
+                expected,
+            )?;
+            if object.directory_identity.as_ref() != Some(&pin.directory.identity()?) {
+                return Err(Error::corrupt("object directory identity changed"));
+            }
+            Ok((object, pin))
         })?;
-        self.read(super::work::ensure_admission)?;
-        let object = self.object(id)?;
-        let admissible = object.state == ObjectState::Published
-            || (preparing && object.state == ObjectState::Preparing);
-        if !admissible {
-            return Err(Error::new(
-                ErrorCategory::CacheEvicted,
-                "object-not-published",
-                "the selected incarnation is retired, removed or not ready",
-            ));
-        }
-        if object.directory_identity.as_ref() != Some(&pin.directory.identity()?) {
-            return Err(Error::corrupt("object directory identity changed"));
-        }
         if object.state == ObjectState::Published {
             self.transaction(|transaction| {
                 super::work::ensure_admission(transaction)?;
@@ -1305,7 +1284,11 @@ impl Namespace {
                 "owner claim is not valid for this daemon instance",
             ));
         }
-        if owner_proof(&self.directory, claim)? != OwnerProof::Held {
+        let proof = {
+            let _access = self.control_read(&self.owners, &format!("{}.lock", claim.owner))?;
+            owner_proof(&self.directory, claim)?
+        };
+        if proof != OwnerProof::Held {
             return Err(Error::busy("owner-guard-not-held"));
         }
         record.registered = true;
@@ -1334,7 +1317,10 @@ impl Namespace {
 
     pub fn inspect_owner(&self, id: &Id) -> Result<OwnerRecord> {
         let mut record = self.owner(id)?;
-        match owner_proof(&self.directory, &record.claim) {
+        match self
+            .control_read(&self.owners, &format!("{id}.lock"))
+            .and_then(|_access| owner_proof(&self.directory, &record.claim))
+        {
             Ok(proof) => {
                 record.last_proof = proof;
                 record.last_error = None;

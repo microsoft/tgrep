@@ -52,6 +52,32 @@ fn open_guard(directory: &Directory, anchor: &RootAnchor) -> Result<File> {
     Ok(file)
 }
 
+fn checked_anchor(connection: &rusqlite::Connection, expected: &RootAnchor) -> Result<RootAnchor> {
+    let current = anchor_row(connection, expected.guard.as_str())?.ok_or_else(|| {
+        Error::new(
+            ErrorCategory::StaleIdentity,
+            "root-anchor-missing",
+            "root guard record is unavailable",
+        )
+    })?;
+    if current.version != expected.version {
+        return Err(Error::stale_version(current.version));
+    }
+    if current.guard != expected.guard
+        || current.guard_identity != expected.guard_identity
+        || current.key != expected.key
+        || current.root != expected.root
+        || current.identity != expected.identity
+    {
+        return Err(Error::new(
+            ErrorCategory::StaleIdentity,
+            "root-anchor-replaced",
+            "root has a newer lifetime incarnation",
+        ));
+    }
+    Ok(current)
+}
+
 impl RootProtection {
     pub(crate) fn acquire(
         base: &ObjectGuard,
@@ -210,102 +236,68 @@ impl Namespace {
     }
 
     fn checked_root_anchor(&self, expected: &RootAnchor) -> Result<RootAnchor> {
-        let current = self
-            .read(|connection| anchor_row(connection, expected.guard.as_str()))?
-            .ok_or_else(|| {
-                Error::new(
-                    ErrorCategory::StaleIdentity,
-                    "root-anchor-missing",
-                    "root guard record is unavailable",
-                )
-            })?;
-        if current.version != expected.version {
-            return Err(Error::stale_version(current.version));
-        }
-        if current.guard != expected.guard
-            || current.guard_identity != expected.guard_identity
-            || current.key != expected.key
-            || current.root != expected.root
-            || current.identity != expected.identity
-        {
-            return Err(Error::new(
-                ErrorCategory::StaleIdentity,
-                "root-anchor-replaced",
-                "root has a newer lifetime incarnation",
-            ));
-        }
-        Ok(current)
+        self.read(|connection| checked_anchor(connection, expected))
     }
 
     pub fn root_busy(&self, expected: &RootAnchor) -> Result<bool> {
+        let _activity = ActivityGuard::acquire(&self.directory)?;
         let current = self.checked_root_anchor(expected)?;
         if current.retired {
             return Ok(false);
         }
         self.fault(super::faults::Point::RootGuardObserved, None)?;
-        let file = match open_guard(&self.directory, &current) {
-            Ok(file) => file,
-            Err(error)
-                if error.source_io_kind() == Some(std::io::ErrorKind::NotFound)
-                    && self.checked_root_anchor(expected)?.retired =>
-            {
+        self.read(|connection| {
+            let current = checked_anchor(connection, expected)?;
+            if current.retired {
                 return Ok(false);
             }
-            Err(error) => return Err(error),
-        };
-        match fs2::FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(false),
-            Err(error) => {
-                let error = lock_error(error, "root-readers-active");
-                if error.category == ErrorCategory::Busy {
-                    Ok(true)
-                } else {
-                    Err(error)
+            let file = open_guard(&self.directory, &current)?;
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => Ok(false),
+                Err(error) => {
+                    let error = lock_error(error, "root-readers-active");
+                    if error.category == ErrorCategory::Busy {
+                        Ok(true)
+                    } else {
+                        Err(error)
+                    }
                 }
             }
+        })
+    }
+
+    pub(super) fn withdraw_root(&self, expected: &RootAnchor) -> Result<bool> {
+        let _activity = ActivityGuard::acquire(&self.directory)?;
+        if self.checked_root_anchor(expected)?.retired {
+            return Ok(false);
         }
+        self.fault(super::faults::Point::RootGuardObserved, None)?;
+        self.transaction(|transaction| {
+            let mut current = checked_anchor(transaction, expected)?;
+            if current.retired {
+                return Ok(false);
+            }
+            let file = open_guard(&self.directory, &current)?;
+            fs2::FileExt::try_lock_exclusive(&file)
+                .map_err(|error| lock_error(error, "root-readers-active"))?;
+            current.retired = true;
+            transaction.execute(
+                "UPDATE records SET record=?2 WHERE kind='root' AND id=?1",
+                params![current.guard.as_str(), text(&current)?],
+            )?;
+            Ok(true)
+        })
     }
 
     pub(super) fn retire_root(
         &self,
         expected: &RootAnchor,
     ) -> Result<(bool, super::housekeeping::ControlRemoval)> {
-        let previous = self.checked_root_anchor(expected)?;
-        self.fault(super::faults::Point::RootGuardObserved, None)?;
-        let file = match open_guard(&self.directory, expected) {
-            Ok(file) => file,
-            Err(error)
-                if error.source_io_kind() == Some(std::io::ErrorKind::NotFound)
-                    && self.checked_root_anchor(expected)?.retired =>
-            {
-                return self
-                    .remove_owned_control("guards", &format!("root-{}.lock", expected.guard))
-                    .map(|removed| (false, removed));
-            }
-            Err(error) => return Err(error),
-        };
-        fs2::FileExt::try_lock_exclusive(&file)
-            .map_err(|error| lock_error(error, "root-readers-active"))?;
-        if !previous.retired {
-            self.transaction(|transaction| {
-                let mut current = anchor_row(transaction, expected.guard.as_str())?
-                    .ok_or_else(|| Error::corrupt("root anchor missing"))?;
-                if current.guard != expected.guard || current.version != expected.version {
-                    return Err(Error::stale_version(current.version));
-                }
-                current.retired = true;
-                transaction.execute(
-                    "UPDATE records SET record=?2 WHERE kind='root' AND id=?1",
-                    params![current.guard.as_str(), text(&current)?],
-                )?;
-                Ok(())
-            })?;
-        }
-        drop(file);
+        let retired = self.withdraw_root(expected)?;
         let removed = self
             .remove_owned_control("guards", &format!("root-{}.lock", expected.guard))
             .map_err(|error| error.committed(super::CommitState::Committed))?;
-        Ok((!previous.retired, removed))
+        Ok((retired, removed))
     }
 }
 
@@ -382,6 +374,45 @@ mod tests {
     #[test]
     fn root_retirement_observes_concurrent_completed_retirement() {
         retirement_race(true);
+    }
+
+    #[test]
+    fn retired_root_probe_does_not_break_an_active_control_verifier() {
+        let (_temp, namespace, anchor) = released_root();
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::RootGuardObserved,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 10_000 },
+            })
+            .unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| namespace.root_busy(&anchor));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reached = loop {
+                if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            let retired = namespace.withdraw_root(&anchor);
+            let verifier = crate::managed::authentication_native::NativeFile::open(
+                &namespace.guards,
+                &format!("root-{}.lock", anchor.guard),
+            );
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            let result = worker.join().unwrap();
+            assert!(reached, "root probe boundary was not exercised");
+            assert!(retired.unwrap());
+            let verifier = verifier.unwrap();
+            assert!(!result.unwrap());
+            assert!(!namespace.withdraw_root(&anchor).unwrap());
+            verifier.check().unwrap();
+        });
     }
 
     #[test]

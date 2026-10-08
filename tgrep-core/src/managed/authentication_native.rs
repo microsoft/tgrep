@@ -344,6 +344,25 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn live_lease_observes_nonblocking_writer_break_and_recovers_after_close() {
+        const HELPER: &str = "managed::authentication_native::tests::live_lease_observes_nonblocking_writer_break_and_recovers_after_close";
+        if std::env::var_os("TGREP_NATIVE_LEASE_FIXTURE").is_none() {
+            // Other tests can fork while this fixture's producer is open,
+            // retaining its CLOEXEC writer until the child's exec completes.
+            use crate::managed::process::{Control, PipedProcess};
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", HELPER, "--nocapture"])
+                .env("TGREP_NATIVE_LEASE_FIXTURE", "1");
+            let mut child = PipedProcess::spawn(&mut command, Control::bootstrap(), false).unwrap();
+            let output = child.read_output(64 * 1024).unwrap();
+            let (status, diagnostics) = child.finish().unwrap();
+            assert!(
+                status.success(),
+                "{diagnostics}\n{}",
+                String::from_utf8_lossy(&output)
+            );
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let directory = Directory::open(temp.path()).unwrap();
         let mut file = directory.create_file("member").unwrap();

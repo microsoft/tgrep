@@ -1249,9 +1249,7 @@ fn exclusive_guard(namespace: &Namespace, object: &ObjectRecord) -> Result<File>
         .guard_identity
         .as_ref()
         .ok_or_else(|| Error::corrupt("object has no sealed guard identity"))?;
-    let guard = namespace
-        .guards
-        .open_file(&format!("{}.lock", object.id), true)?;
+    let guard = namespace.open_control(&namespace.guards, &format!("{}.lock", object.id), true)?;
     if &FileIdentity::of(&guard)? != expected {
         return Err(Error::corrupt("object guard was replaced"));
     }
@@ -1961,7 +1959,7 @@ impl Namespace {
             ));
         }
         let name = format!("{}.lock", object.id);
-        match self.guards.open_file(&name, true) {
+        match self.open_control(&self.guards, &name, true) {
             Ok(file) => {
                 let expected = object
                     .guard_identity

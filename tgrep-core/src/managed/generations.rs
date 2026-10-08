@@ -144,8 +144,9 @@ pub fn open_generation(namespace: &Path, incarnation: &Id) -> Result<Arc<Generat
             "reader catalog belongs to another namespace",
         ));
     }
-    ensure_admission(&connection)?;
-    let object = object_row(&connection, incarnation)?;
+    let (transaction, _) = super::catalog_io::begin(&mut connection, &directory, None)?;
+    ensure_admission(&transaction)?;
+    let object = object_row(&transaction, incarnation)?;
     if object.state != ObjectState::Published || object.kind != ObjectKind::Generation {
         return Err(Error::new(
             ErrorCategory::CacheEvicted,
@@ -163,37 +164,10 @@ pub fn open_generation(namespace: &Path, incarnation: &Id) -> Result<Arc<Generat
             .guard_identity
             .as_ref()
             .ok_or_else(|| Error::corrupt("object guard is unsealed"))?,
-    )
-    .map_err(|error| match object_row(&connection, incarnation) {
-        Ok(current)
-            if matches!(
-                current.state,
-                ObjectState::Retired | ObjectState::PendingDeletion | ObjectState::Removed
-            ) =>
-        {
-            Error::new(
-                ErrorCategory::CacheEvicted,
-                "generation-retired",
-                "generation was withdrawn before guard acquisition",
-            )
-        }
-        Err(current) if current.category == ErrorCategory::CacheEvicted => current,
-        Ok(_) => error,
-        Err(current) => current,
-    })?;
-    ensure_admission(&connection)?;
-    let object = object_row(&connection, incarnation)?;
-    if object.state != ObjectState::Published
-        || object.directory_identity != Some(pin.directory.identity()?)
-    {
-        return Err(Error::new(
-            ErrorCategory::CacheEvicted,
-            "generation-retired",
-            "generation changed during protected open",
-        ));
+    )?;
+    if object.directory_identity != Some(pin.directory.identity()?) {
+        return Err(Error::corrupt("object directory identity changed"));
     }
-    let (transaction, _) = super::catalog_io::begin(&mut connection, &directory, None)?;
-    ensure_admission(&transaction)?;
     touch_object(&transaction, incarnation)?;
     transaction.commit()?;
     let policy: String =

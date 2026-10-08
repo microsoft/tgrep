@@ -321,6 +321,7 @@ impl Namespace {
                     }
                     Err(error) => return Err(error),
                 };
+                let access = self.control_read(&self.guards, &format!("{id}.lock"))?;
                 let pin = ObjectGuard::acquire(
                     &self.header().namespace,
                     &self.directory,
@@ -332,6 +333,7 @@ impl Namespace {
                         .as_ref()
                         .ok_or_else(|| Error::corrupt("unsealed inventory object"))?,
                 )?;
+                drop(access);
                 if object.directory_identity.as_ref() != Some(&pin.directory.identity()?) {
                     return Err(Error::new(
                         ErrorCategory::StaleIdentity,
@@ -379,6 +381,11 @@ impl Namespace {
                 }
             }
         }
+        let control = if matches!(&frame.area, Area::Controls(_)) {
+            Some(self.control_read(&frame.directory, name)?)
+        } else {
+            None
+        };
         let cached_file = if let Some(expected) = &expected
             && matches!(&frame.area, Area::Object(_))
         {
@@ -403,6 +410,7 @@ impl Namespace {
             Some(file) => file,
             None => frame.directory.open_file(name, false)?,
         };
+        drop(control);
         if let Some(expected) = expected {
             let _memory = self.verification_scratch(super::storage::SECURITY_BYTES as u64)?;
             let length = file.metadata()?.len();

@@ -59,6 +59,10 @@ impl RootedDir {
         Ok(())
     }
 
+    pub(crate) fn directory_handle(&self) -> io::Result<File> {
+        self.directory.try_clone()
+    }
+
     fn open_directory(path: &Path) -> io::Result<File> {
         #[cfg(unix)]
         {

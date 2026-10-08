@@ -60,6 +60,7 @@ impl IndexMeta {
     }
 
     pub fn save(&self, index_dir: &Path) -> Result<()> {
+        crate::managed::reject_unguarded(index_dir)?;
         let path = index_dir.join(META_FILENAME);
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(path, json)?;
@@ -81,13 +82,36 @@ pub fn file_table_id(data: &[u8]) -> FileTableId {
     *blake3::hash(data).as_bytes()
 }
 
+pub(crate) fn file_table_id_controlled(
+    data: &[u8],
+    permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
+) -> Result<FileTableId> {
+    Ok(crate::managed::inputs::hash_bytes(data, permit)?)
+}
+
 pub fn read_file_table_id(index_dir: &Path) -> Result<FileTableId> {
+    read_file_table_id_with_layout(index_dir, crate::ondisk::IndexLayout::Legacy)
+}
+
+pub(crate) fn read_file_table_id_with_layout(
+    index_dir: &Path,
+    layout: crate::ondisk::IndexLayout,
+) -> Result<FileTableId> {
+    read_file_table_id_controlled(std::fs::File::open(index_dir.join(layout.files()))?, None)
+}
+
+pub(crate) fn read_file_table_id_controlled(
+    mut file: std::fs::File,
+    permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
+) -> Result<FileTableId> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(index_dir.join("files.bin"))?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0; 64 * 1024];
     loop {
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             return Ok(*hasher.finalize().as_bytes());
@@ -296,6 +320,25 @@ impl PersistedVersion {
 pub struct ContentId([u8; 16]);
 
 impl ContentId {
+    pub(crate) fn from_indexed_bytes_controlled(
+        bytes: &[u8],
+        permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
+    ) -> crate::managed::Result<Self> {
+        let Some(permit) = permit else {
+            return Ok(Self::from_indexed_bytes(bytes));
+        };
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(CONTENT_ID_DOMAIN);
+        for chunk in bytes.chunks(64 * 1024) {
+            permit.check()?;
+            hasher.update(chunk);
+        }
+        permit.check()?;
+        let mut id = [0; 16];
+        id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+        Ok(Self(id))
+    }
+
     pub fn from_indexed_bytes(bytes: &[u8]) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(CONTENT_ID_DOMAIN);

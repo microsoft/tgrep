@@ -62,6 +62,100 @@ impl LiveIndex {
         Self::default()
     }
 
+    pub(crate) fn active_paths(&self) -> impl Iterator<Item = &str> {
+        self.path_to_id.keys().map(String::as_str)
+    }
+
+    pub(crate) fn deleted_paths(&self) -> impl Iterator<Item = &str> {
+        self.deleted_paths.iter().map(String::as_str)
+    }
+
+    pub(crate) fn private_memory_estimate(
+        &self,
+        permit: &std::sync::Arc<crate::managed::WorkPermit>,
+    ) -> crate::managed::Result<u64> {
+        let mut bytes = std::mem::size_of::<Self>() as u64;
+        let mut add = |count: usize, width: usize| -> crate::managed::Result<()> {
+            permit.check()?;
+            bytes = (count as u64)
+                .checked_mul(width as u64)
+                .and_then(|amount| bytes.checked_add(amount))
+                .ok_or_else(|| {
+                    crate::managed::Error::pressure("overlay-memory-account-overflow")
+                })?;
+            Ok(())
+        };
+        add(
+            self.inverted.capacity(),
+            2 * (std::mem::size_of::<(u32, HashSet<u32>)>() + 16),
+        )?;
+        add(
+            self.masks.capacity(),
+            2 * (std::mem::size_of::<((u32, u32), trigram::TrigramMasks)>() + 16),
+        )?;
+        add(
+            self.file_paths.capacity(),
+            2 * (std::mem::size_of::<(u32, String)>() + 16),
+        )?;
+        add(
+            self.path_to_id.capacity(),
+            2 * (std::mem::size_of::<(String, u32)>() + 16),
+        )?;
+        add(
+            self.deleted_paths.capacity(),
+            2 * (std::mem::size_of::<String>() + 16),
+        )?;
+        for ids in self.inverted.values() {
+            add(ids.capacity(), 2 * (std::mem::size_of::<u32>() + 16))?;
+        }
+        for path in self
+            .file_paths
+            .values()
+            .chain(self.path_to_id.keys())
+            .chain(self.deleted_paths.iter())
+        {
+            add(path.capacity(), 1)?;
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn clone_controlled(
+        &self,
+        permit: &std::sync::Arc<crate::managed::WorkPermit>,
+        memory: &mut crate::managed::work::MemoryCharge,
+    ) -> crate::managed::Result<Self> {
+        memory.grow(self.private_memory_estimate(permit)?)?;
+        let mut copy = Self::new();
+        for (trigram, ids) in &self.inverted {
+            permit.check()?;
+            let mut copied_ids = HashSet::new();
+            for (index, id) in ids.iter().enumerate() {
+                if index % 512 == 0 {
+                    permit.check()?;
+                }
+                copied_ids.insert(*id);
+            }
+            copy.inverted.insert(*trigram, copied_ids);
+        }
+        for (key, masks) in &self.masks {
+            permit.check()?;
+            copy.masks.insert(*key, *masks);
+        }
+        for (id, path) in &self.file_paths {
+            permit.check()?;
+            copy.file_paths.insert(*id, path.clone());
+            copy.path_to_id.insert(path.clone(), *id);
+        }
+        for path in &self.deleted_paths {
+            permit.check()?;
+            copy.deleted_paths.insert(path.clone());
+        }
+        copy.next_id
+            .store(self.next_id.load(Ordering::Relaxed), Ordering::Relaxed);
+        copy.dirty_count = self.dirty_count;
+        Ok(copy)
+    }
+
     /// Insert or update a file in the live index.
     pub fn upsert_file(&mut self, rel_path: &str, content: &[u8]) {
         let per_tri = Self::compute_trigram_masks(content);
@@ -500,6 +594,13 @@ impl LiveIndex {
     /// Return every reader path currently hidden by a deletion tombstone.
     pub fn tombstone_paths(&self) -> Vec<String> {
         self.deleted_paths.iter().cloned().collect()
+    }
+
+    pub(crate) fn private_paths(&self) -> impl Iterator<Item = &str> {
+        self.path_to_id
+            .keys()
+            .chain(self.deleted_paths.iter())
+            .map(String::as_str)
     }
 
     fn remove_file_by_id(&mut self, file_id: u32) {

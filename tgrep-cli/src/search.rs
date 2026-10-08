@@ -1336,10 +1336,10 @@ fn render_server_result(
             print_index_stats(plan, raw, candidates, total);
             narrowing_note = index_narrowing_note(raw, total);
         }
-        let backend = if result.get("backend").and_then(|v| v.as_str()) == Some("shared-v1") {
-            "shared daemon v1"
-        } else {
-            "server"
+        let backend = match result.get("backend").and_then(|v| v.as_str()) {
+            Some("shared-v1") => "shared daemon v1",
+            Some("shared-v2") => "shared daemon v2",
+            _ => "server",
         };
         eprintln!(
             "{num} matches ({lines} matched lines) in {elapsed:.1}ms (via {backend}){narrowing_note}"

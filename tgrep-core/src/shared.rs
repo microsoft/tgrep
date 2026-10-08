@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hybrid::HybridIndex;
 use crate::live::{LiveIndex, OVERLAY_BIT};
+use crate::managed::WorkPermit;
 use crate::meta::IndexMeta;
 use crate::reader::IndexReader;
 use crate::trigram::{TrigramMaskMap, TrigramMasks};
@@ -31,9 +32,9 @@ const OVERLAY_VERSION: u32 = 1;
 /// The caller owns the association with a Git tree and indexing profile.
 #[derive(Clone)]
 pub struct SharedBase {
-    reader: Arc<IndexReader>,
     id: [u8; 32],
     directory_id: Arc<same_file::Handle>,
+    reader: Arc<IndexReader>,
 }
 
 impl SharedBase {
@@ -53,10 +54,67 @@ impl SharedBase {
     /// Legacy and incomplete indexes remain usable through the existing APIs,
     /// but must be rebuilt before they can be used as shared bases.
     pub fn open(index_dir: &Path) -> Result<Self> {
+        crate::managed::reject_unguarded(index_dir)?;
         let index_dir = std::fs::canonicalize(index_dir)?;
         let directory_id = Arc::new(same_file::Handle::from_path(&index_dir)?);
         let reader = Arc::new(IndexReader::open_for_snapshot(&index_dir)?);
         let meta = IndexMeta::load(&index_dir)?;
+        Self::validate(reader, meta, directory_id, None)
+    }
+
+    pub(crate) fn open_controlled(
+        index_dir: &Path,
+        permit: &Arc<WorkPermit>,
+        limits: &crate::reader::SnapshotLimits,
+    ) -> Result<Self> {
+        crate::managed::reject_unguarded(index_dir)?;
+        permit.check()?;
+        let index_dir = std::fs::canonicalize(index_dir)?;
+        let directory_id = Arc::new(same_file::Handle::from_path(&index_dir)?);
+        let reader = Arc::new(IndexReader::open_for_snapshot_controlled(
+            &index_dir, permit, limits,
+        )?);
+        let meta = crate::managed::inputs::read_json(
+            std::fs::File::open(index_dir.join(crate::ondisk::IndexLayout::Legacy.meta()))?,
+            limits.metadata,
+            Some(permit),
+        )?;
+        Self::validate(reader, meta, directory_id, Some(permit))
+    }
+
+    pub(crate) fn open_managed(
+        guard: Arc<crate::managed::lifetime::ObjectGuard>,
+        permit: Option<&Arc<WorkPermit>>,
+        limits: &crate::reader::SnapshotLimits,
+    ) -> Result<Self> {
+        let meta: IndexMeta = crate::managed::inputs::read_json(
+            guard.directory.open_file("meta.tgm", false)?,
+            limits.metadata,
+            permit,
+        )?;
+        let directory_id = Arc::new(same_file::Handle::from_file(
+            guard.directory.directory_handle()?,
+        )?);
+        let reader = Arc::new(IndexReader::open_managed(guard, permit, limits)?);
+        Self::validate(reader, meta, directory_id, permit)
+    }
+
+    pub(crate) fn retain_memory(
+        &mut self,
+        memory: crate::managed::memory::RetainedMemory,
+    ) -> Result<()> {
+        Arc::get_mut(&mut self.reader)
+            .ok_or_else(|| crate::managed::Error::busy("shared-reader-already-exposed"))?
+            .retain_memory(memory);
+        Ok(())
+    }
+
+    fn validate(
+        reader: Arc<IndexReader>,
+        meta: IndexMeta,
+        directory_id: Arc<same_file::Handle>,
+        permit: Option<&Arc<WorkPermit>>,
+    ) -> Result<Self> {
         if meta.version != crate::meta::INDEX_FORMAT_VERSION
             || !meta.complete
             || !meta.hidden_complete
@@ -80,12 +138,18 @@ impl SharedBase {
         }
         let mut paths = HashSet::with_capacity(reader.num_files());
         for path in reader.all_paths() {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
             validate_path(path)?;
             if !paths.insert(path) {
                 return Err(invalid("shared base contains duplicate paths"));
             }
         }
-        let id = reader.snapshot_id();
+        let id = match permit {
+            Some(_) => reader.snapshot_id_controlled(permit)?,
+            None => reader.snapshot_id(),
+        };
         Ok(Self {
             reader,
             id,
@@ -123,7 +187,18 @@ impl SharedBase {
     /// is not synced afterwards. Even a successful save may be lost after a
     /// system crash; callers must reconcile or rebuild stale/missing checkpoints.
     pub fn save_overlay(&self, worktree: &HybridIndex, path: &Path) -> Result<()> {
+        self.require_unmanaged_checkpoint()?;
         self.save_overlay_with_generation(worktree, path, None)
+    }
+
+    fn require_unmanaged_checkpoint(&self) -> Result<()> {
+        if self.reader.managed_identity().is_some() {
+            return Err(crate::managed::Error::incompatible(
+                "managed checkpoints require a catalog-owned save/restore capability",
+            )
+            .into());
+        }
+        Ok(())
     }
 
     pub(crate) fn save_overlay_with_generation(
@@ -132,18 +207,38 @@ impl SharedBase {
         path: &Path,
         generation: Option<&crate::generations::GenerationKey>,
     ) -> Result<()> {
+        self.require_unmanaged_checkpoint()?;
+        let checkpoint = self.capture_checkpoint(worktree, generation)?;
+        checkpoint.persist(&self.checkpoint_destination(path)?)
+    }
+
+    pub(crate) fn capture_checkpoint(
+        &self,
+        worktree: &HybridIndex,
+        generation: Option<&crate::generations::GenerationKey>,
+    ) -> Result<OverlayCheckpoint> {
+        self.capture_checkpoint_controlled(worktree, generation, None)
+    }
+
+    pub(crate) fn capture_checkpoint_controlled(
+        &self,
+        worktree: &HybridIndex,
+        generation: Option<&crate::generations::GenerationKey>,
+        permit: Option<&Arc<WorkPermit>>,
+    ) -> Result<OverlayCheckpoint> {
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
         if !Arc::ptr_eq(&self.reader, &worktree.reader_arc()) {
             return Err(invalid("worktree no longer uses this shared base"));
         }
-        let destination = self.checkpoint_destination(path)?;
-        let checkpoint = OverlayCheckpoint {
+        Ok(OverlayCheckpoint {
             version: OVERLAY_VERSION,
             base_id: self.id,
             root: CheckpointRoot::from_path(&canonical_root(&worktree.root)?)?,
-            overlay: OverlayData::capture(&worktree.live)?,
+            overlay: OverlayData::capture(&worktree.live, permit)?,
             generation: generation.cloned(),
-        };
-        checkpoint.persist(&destination)
+        })
     }
 
     fn checkpoint_destination(&self, path: &Path) -> Result<CheckpointDestination> {
@@ -175,6 +270,7 @@ impl SharedBase {
     /// fresh as the checkpoint: reconcile changes since it was saved before
     /// making the view available to searches.
     pub fn restore_worktree(&self, root: &Path, path: &Path) -> Result<HybridIndex> {
+        self.require_unmanaged_checkpoint()?;
         self.restore_worktree_with_generation(root, path, None)
     }
 
@@ -184,8 +280,31 @@ impl SharedBase {
         path: &Path,
         generation: Option<&crate::generations::GenerationKey>,
     ) -> Result<HybridIndex> {
+        self.require_unmanaged_checkpoint()?;
         let checkpoint: OverlayCheckpoint =
             serde_json::from_reader(BufReader::new(std::fs::File::open(path)?))?;
+        self.restore_checkpoint_value(root, checkpoint, generation)
+    }
+
+    pub(crate) fn restore_checkpoint_value(
+        &self,
+        root: &Path,
+        checkpoint: OverlayCheckpoint,
+        generation: Option<&crate::generations::GenerationKey>,
+    ) -> Result<HybridIndex> {
+        self.restore_checkpoint_controlled(root, checkpoint, generation, None)
+    }
+
+    pub(crate) fn restore_checkpoint_controlled(
+        &self,
+        root: &Path,
+        checkpoint: OverlayCheckpoint,
+        generation: Option<&crate::generations::GenerationKey>,
+        permit: Option<&Arc<WorkPermit>>,
+    ) -> Result<HybridIndex> {
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
         if checkpoint.version != OVERLAY_VERSION {
             return Err(invalid("unsupported worktree overlay version"));
         }
@@ -203,7 +322,7 @@ impl SharedBase {
         if checkpoint.root != CheckpointRoot::from_path(&root)? {
             return Err(invalid("worktree overlay belongs to a different root"));
         }
-        let live = checkpoint.overlay.into_live()?;
+        let live = checkpoint.overlay.into_live(permit)?;
         let mut worktree = HybridIndex::from_reader(Arc::clone(&self.reader), &root);
         worktree.live = live;
         Ok(worktree)
@@ -306,7 +425,7 @@ impl CheckpointDestination {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OverlayCheckpoint {
+pub(crate) struct OverlayCheckpoint {
     version: u32,
     base_id: [u8; 32],
     root: CheckpointRoot,
@@ -356,27 +475,27 @@ impl OverlayCheckpoint {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
-enum CheckpointRoot {
+pub enum CheckpointRoot {
     Unicode(String),
     Native(NativeRoot),
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
     tag = "encoding",
     content = "units",
     rename_all = "kebab-case",
     deny_unknown_fields
 )]
-enum NativeRoot {
+pub enum NativeRoot {
     UnixBytes(Vec<u8>),
     WindowsWide(Vec<u16>),
 }
 
 impl CheckpointRoot {
-    fn from_path(path: &Path) -> Result<Self> {
+    pub fn from_path(path: &Path) -> Result<Self> {
         if let Some(path) = path.to_str() {
             return Ok(Self::Unicode(path.to_string()));
         }
@@ -403,6 +522,23 @@ impl CheckpointRoot {
             .into())
         }
     }
+
+    pub fn to_path(&self) -> Result<PathBuf> {
+        match self {
+            Self::Unicode(path) => Ok(path.into()),
+            #[cfg(unix)]
+            Self::Native(NativeRoot::UnixBytes(bytes)) => {
+                use std::os::unix::ffi::OsStringExt;
+                Ok(OsString::from_vec(bytes.clone()).into())
+            }
+            #[cfg(windows)]
+            Self::Native(NativeRoot::WindowsWide(units)) => {
+                use std::os::windows::ffi::OsStringExt;
+                Ok(OsString::from_wide(units).into())
+            }
+            _ => Err(invalid("native path encoding belongs to another platform")),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -421,17 +557,20 @@ struct OverlayFile {
 }
 
 impl OverlayData {
-    fn capture(live: &LiveIndex) -> Result<Self> {
-        let mut files: BTreeMap<&str, Vec<(u32, u8, u8)>> = live
-            .all_paths_ordered()
-            .into_iter()
-            .map(|path| (path, Vec::new()))
-            .collect();
-        for path in files.keys() {
+    fn capture(live: &LiveIndex, permit: Option<&Arc<WorkPermit>>) -> Result<Self> {
+        let mut files: BTreeMap<&str, Vec<(u32, u8, u8)>> = BTreeMap::new();
+        for path in live.active_paths() {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
             validate_path(path)?;
+            files.insert(path, Vec::new());
         }
         for (&trigram, ids) in live.inverted_index() {
             for &id in ids {
+                if let Some(permit) = permit {
+                    permit.check()?;
+                }
                 let path = live
                     .file_path(id)
                     .ok_or_else(|| invalid("overlay posting has no file path"))?;
@@ -443,39 +582,67 @@ impl OverlayData {
                     .push((trigram, masks.loc_mask, masks.next_mask));
             }
         }
-        let mut deleted = live.tombstone_paths();
-        for path in &deleted {
+        let mut deleted = std::collections::BTreeSet::new();
+        for path in live.deleted_paths() {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
             validate_path(path)?;
+            deleted.insert(path.to_owned());
         }
-        deleted.sort_unstable();
+        let mut ordered_files = Vec::with_capacity(files.len());
+        for (path, mut trigrams) in files {
+            if let Some(permit) = permit {
+                let mut ordered = std::collections::BTreeSet::new();
+                for value in trigrams {
+                    permit.check()?;
+                    ordered.insert(value);
+                }
+                trigrams = Vec::with_capacity(ordered.len());
+                for value in ordered {
+                    permit.check()?;
+                    trigrams.push(value);
+                }
+            } else {
+                trigrams.sort_unstable();
+            }
+            ordered_files.push(OverlayFile {
+                path: path.to_owned(),
+                trigrams,
+            });
+        }
+        let mut ordered_deleted = Vec::with_capacity(deleted.len());
+        for path in deleted {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
+            ordered_deleted.push(path);
+        }
         Ok(Self {
-            files: files
-                .into_iter()
-                .map(|(path, mut trigrams)| {
-                    trigrams.sort_unstable();
-                    OverlayFile {
-                        path: path.to_string(),
-                        trigrams,
-                    }
-                })
-                .collect(),
-            deleted,
+            files: ordered_files,
+            deleted: ordered_deleted,
         })
     }
 
-    fn into_live(self) -> Result<LiveIndex> {
+    fn into_live(self, permit: Option<&Arc<WorkPermit>>) -> Result<LiveIndex> {
         if self.files.len() >= OVERLAY_BIT as usize {
             return Err(invalid("too many files in worktree overlay"));
         }
         let mut live = LiveIndex::new();
         let mut paths = HashSet::new();
         for file in self.files {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
             validate_path(&file.path)?;
             if !paths.insert(file.path.clone()) {
                 return Err(invalid("duplicate path in worktree overlay"));
             }
             let mut trigrams = TrigramMaskMap::default();
             for (trigram, loc_mask, next_mask) in file.trigrams {
+                if let Some(permit) = permit {
+                    permit.check()?;
+                }
                 validate_trigram(trigram, loc_mask)?;
                 if trigrams
                     .insert(
@@ -491,8 +658,14 @@ impl OverlayData {
                 }
             }
             live.commit_upsert(&file.path, trigrams);
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
         }
         for path in self.deleted {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
             validate_path(&path)?;
             if !paths.insert(path.clone()) {
                 return Err(invalid(

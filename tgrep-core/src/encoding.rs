@@ -211,6 +211,7 @@ pub fn decode_for_index(bytes: &[u8]) -> Cow<'_, [u8]> {
             if std::str::from_utf8(body).is_ok() {
                 return Cow::Borrowed(body);
             }
+
             // A file that will be rejected as binary is not worth repairing,
             // and repairing it first could push a NUL past the window
             // `is_binary` looks at, changing how it is classified.
@@ -224,6 +225,87 @@ pub fn decode_for_index(bytes: &[u8]) -> Cow<'_, [u8]> {
             Cow::Owned(lossy_utf8_into(body, None).into_bytes())
         }
     }
+}
+
+pub(crate) fn decode_for_index_controlled<'a>(
+    bytes: &'a [u8],
+    permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
+) -> crate::managed::Result<Cow<'a, [u8]>> {
+    match permit {
+        None => Ok(decode_for_index(bytes)),
+        Some(permit) => decode_index_checked(bytes, || permit.check()),
+    }
+}
+
+fn decode_index_checked(
+    bytes: &[u8],
+    mut check: impl FnMut() -> crate::managed::Result<()>,
+) -> crate::managed::Result<Cow<'_, [u8]>> {
+    check()?;
+    let (encoding, body) = Encoding::for_bom(bytes)
+        .map(|(encoding, skip)| (encoding, &bytes[skip..]))
+        .unwrap_or((encoding_rs::UTF_8, bytes));
+    if encoding == encoding_rs::UTF_8 {
+        if crate::trigram::is_binary(body) {
+            return Ok(Cow::Borrowed(body));
+        }
+        let mut offset = 0;
+        while offset < body.len() {
+            check()?;
+            let end = offset + (64 * 1024).min(body.len() - offset);
+            match std::str::from_utf8(&body[offset..end]) {
+                Ok(_) => offset = end,
+                Err(error) if error.error_len().is_none() && end < body.len() => {
+                    offset += error.valid_up_to()
+                }
+                Err(_) => break,
+            }
+        }
+        if offset == body.len() {
+            return Ok(Cow::Borrowed(body));
+        }
+    }
+    let capacity = body
+        .len()
+        .checked_mul(3)
+        .ok_or_else(|| crate::managed::Error::pressure("decoded-byte-overflow"))?;
+    let mut decoded = Vec::new();
+    decoded.try_reserve_exact(capacity).map_err(|error| {
+        crate::managed::Error::new(
+            crate::managed::ErrorCategory::ResourcePressure,
+            "decoded-allocation",
+            error.to_string(),
+        )
+    })?;
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut offset = 0;
+    let mut output = [0_u8; 64 * 1024];
+    loop {
+        check()?;
+        let end = offset + (64 * 1024).min(body.len() - offset);
+        let last = end == body.len();
+        let (result, read, written, _) =
+            decoder.decode_to_utf8(&body[offset..end], &mut output, last);
+        if decoded
+            .len()
+            .checked_add(written)
+            .is_none_or(|length| length > capacity)
+        {
+            return Err(crate::managed::Error::corrupt(
+                "decoder exceeded the admitted expansion bound",
+            ));
+        }
+        decoded.extend_from_slice(&output[..written]);
+        offset += read;
+        if result == encoding_rs::CoderResult::InputEmpty && last {
+            break;
+        }
+        if read == 0 && written == 0 {
+            return Err(crate::managed::Error::corrupt("decoder made no progress"));
+        }
+    }
+    check()?;
+    Ok(Cow::Owned(decoded))
 }
 
 fn transcode(enc: &'static Encoding, bytes: &[u8]) -> String {
@@ -349,6 +431,71 @@ mod tests {
         assert_eq!(parse_encoding("auto").unwrap(), EncodingMode::Auto);
         assert_eq!(parse_encoding("").unwrap(), EncodingMode::Auto);
         assert_eq!(parse_encoding("none").unwrap(), EncodingMode::None);
+    }
+
+    #[test]
+    fn controlled_index_decoding_preserves_boundaries_and_repair_bytes() {
+        let mut inputs = vec![
+            Vec::new(),
+            vec![0xff, 0xfe],
+            vec![0xfe, 0xff, 0xd8, 0x00, 0x00],
+            utf16le_with_bom(&"\u{1f642}\u{feff}a".repeat(40_000)),
+            utf16be_with_bom(&"\u{1f642}\u{feff}a".repeat(40_000)),
+        ];
+        for tail in [
+            &b"\xf0\x9f\x99\x82"[..],
+            &b"\xf0\x9f"[..],
+            &b"\xed\xa0\x80"[..],
+            &b"\xc0\x80"[..],
+            &b"\xef\xbb\xbf"[..],
+            &b"\xff\0"[..],
+        ] {
+            for offset in 65_532..65_539 {
+                let mut bytes = vec![b'a'; offset];
+                bytes.extend_from_slice(tail);
+                bytes.extend_from_slice(b"z");
+                inputs.push(bytes);
+            }
+        }
+        for first in 0..=255 {
+            for second in 0..=255 {
+                let bytes = [first, second];
+                assert_eq!(
+                    decode_index_checked(&bytes, || Ok(())).unwrap(),
+                    decode_for_index(&bytes)
+                );
+            }
+        }
+        for input in inputs {
+            let decoded = decode_index_checked(&input, || Ok(())).unwrap();
+            assert_eq!(decoded, decode_for_index(&input));
+        }
+    }
+
+    #[test]
+    fn controlled_index_decoding_cooperates_with_cancellation() {
+        for input in [
+            vec![b'a'; 256 * 1024],
+            utf16le_with_bom(&"a".repeat(256 * 1024)),
+            vec![0xff; 256 * 1024],
+        ] {
+            let mut checks = 0;
+            let error = decode_index_checked(&input, || {
+                checks += 1;
+                if checks == 3 {
+                    Err(crate::managed::Error::new(
+                        crate::managed::ErrorCategory::Cancelled,
+                        "test-cancelled",
+                        "cancelled",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error.category, crate::managed::ErrorCategory::Cancelled);
+            assert_eq!(checks, 3);
+        }
     }
 
     #[test]

@@ -89,6 +89,7 @@ fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
 /// silently, because a foreign segment is still a structurally valid segment.
 struct SpillDir {
     path: PathBuf,
+    managed: Option<crate::output::Output>,
 }
 
 /// Distinguishes spill directories created by different sorters in this
@@ -106,13 +107,34 @@ impl SpillDir {
         // unique among live sorters.
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            managed: None,
+        })
+    }
+
+    fn for_output(output: &crate::output::Output) -> Result<Self> {
+        match output.spill()? {
+            Some(managed) => Ok(Self {
+                path: managed.path().to_path_buf(),
+                managed: Some(managed),
+            }),
+            None => Self::create(output.path()),
+        }
+    }
+
+    fn output(&self) -> crate::output::Output {
+        self.managed
+            .clone()
+            .unwrap_or_else(|| crate::output::Output::legacy(&self.path))
     }
 }
 
 impl Drop for SpillDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if self.managed.is_none() {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -126,8 +148,9 @@ pub(crate) struct ExternalSorter {
     budget_bytes: usize,
     spill: Option<SpillDir>,
     segments: Vec<PathBuf>,
-    index_dir: PathBuf,
+    output: crate::output::Output,
     scratch: Vec<u8>,
+    segment_memory: Option<crate::managed::work::MemoryCharge>,
 }
 
 impl ExternalSorter {
@@ -148,9 +171,16 @@ impl ExternalSorter {
             budget_bytes,
             spill: None,
             segments: Vec::new(),
-            index_dir: index_dir.to_path_buf(),
+            output: crate::output::Output::legacy(index_dir),
             scratch: Vec::new(),
+            segment_memory: None,
         }
+    }
+
+    pub(crate) fn with_output(output: crate::output::Output, budget_bytes: usize) -> Self {
+        let mut sorter = Self::new(output.path(), budget_bytes);
+        sorter.output = output;
+        sorter
     }
 
     /// Number of segments spilled so far, excluding the arena tail that
@@ -163,6 +193,9 @@ impl ExternalSorter {
 
     /// Append one posting, spilling first if the arena is full.
     pub(crate) fn push(&mut self, posting: TrigramPosting) -> Result<()> {
+        if self.arena.len().is_multiple_of(4096) {
+            self.output.check()?;
+        }
         if self.arena.len() >= self.capacity {
             self.spill_arena()?;
         }
@@ -188,12 +221,12 @@ impl ExternalSorter {
         Ok(())
     }
 
-    fn sort_arena(&mut self) {
-        self.arena.sort_unstable_by(|a, b| {
-            a.trigram
-                .cmp(&b.trigram)
-                .then_with(|| a.entry.file_id.cmp(&b.entry.file_id))
-        });
+    fn sort_arena(&mut self) -> Result<()> {
+        sort_controlled(
+            &mut self.arena,
+            |entry| (entry.trigram, entry.entry.file_id),
+            &self.output,
+        )
     }
 
     /// Sort the arena and write it out as a compact segment, then clear it.
@@ -201,22 +234,35 @@ impl ExternalSorter {
     /// The arena's backing allocation is deliberately retained (`clear`, not
     /// `drop`) so steady-state indexing performs no further large allocations.
     fn spill_arena(&mut self) -> Result<()> {
+        self.output.check()?;
         if self.arena.is_empty() {
             return Ok(());
         }
-        self.sort_arena();
+        self.sort_arena()?;
 
         let spill = match &self.spill {
             Some(dir) => dir,
             None => {
-                self.spill = Some(SpillDir::create(&self.index_dir)?);
+                self.spill = Some(SpillDir::for_output(&self.output)?);
                 self.spill.as_ref().unwrap()
             }
         };
-        let path = spill
-            .path
-            .join(format!("seg-{:05}.bin", self.segments.len()));
-        let mut writer = BufWriter::with_capacity(SEGMENT_BUFFER_BYTES, File::create(&path)?);
+        let name = format!("seg-{:05}.bin", self.segments.len());
+        let path = spill.path.join(&name);
+        if let Some(permit) = self.output.control() {
+            let memory = match &mut self.segment_memory {
+                Some(memory) => memory,
+                None => self.segment_memory.insert(permit.memory(0)?),
+            };
+            memory.grow(
+                (path.as_os_str().as_encoded_bytes().len() as u64)
+                    .checked_mul(4)
+                    .and_then(|bytes| bytes.checked_add(128))
+                    .ok_or_else(|| crate::managed::Error::pressure("spill-path-memory-overflow"))?,
+            )?;
+        }
+        let mut writer =
+            BufWriter::with_capacity(SEGMENT_BUFFER_BYTES, spill.output().create(&name)?);
 
         // Segment layout, groups ordered by ascending trigram:
         //   varint(trigram - prev_trigram)
@@ -230,9 +276,13 @@ impl ExternalSorter {
         let mut prev_trigram: u32 = 0;
         let mut idx = 0usize;
         while idx < self.arena.len() {
+            self.output.check()?;
             let trigram = self.arena[idx].trigram;
             let mut end = idx + 1;
             while end < self.arena.len() && self.arena[end].trigram == trigram {
+                if end.is_multiple_of(4096) {
+                    self.output.check()?;
+                }
                 end += 1;
             }
 
@@ -241,7 +291,10 @@ impl ExternalSorter {
             prev_trigram = trigram;
 
             let mut prev_file_id: u32 = 0;
-            for posting in &self.arena[idx..end] {
+            for (index, posting) in self.arena[idx..end].iter().enumerate() {
+                if index.is_multiple_of(4096) {
+                    self.output.check()?;
+                }
                 let entry = posting.entry;
                 write_varint(scratch, (entry.file_id - prev_file_id) as u64);
                 scratch.push(entry.loc_mask);
@@ -260,6 +313,7 @@ impl ExternalSorter {
             scratch.clear();
         }
         writer.flush()?;
+        writer.get_ref().sync()?;
         // Release the encode buffer's capacity — it is only needed during a
         // spill and holding it would count against the caller's budget.
         self.scratch = Vec::new();
@@ -274,12 +328,20 @@ impl ExternalSorter {
     /// Returns `(distinct trigram count, spill segments merged)`. Consumes the
     /// sorter so the arena and every spill segment are released before the
     /// caller proceeds.
-    pub(crate) fn write_postings(mut self, index_dir: &Path) -> Result<(usize, usize)> {
+    pub(crate) fn write_postings(self, index_dir: &Path) -> Result<(usize, usize)> {
+        self.write_postings_to(&crate::output::Output::legacy(index_dir))
+    }
+
+    pub(crate) fn write_postings_to(
+        mut self,
+        output: &crate::output::Output,
+    ) -> Result<(usize, usize)> {
+        output.check()?;
         if self.segments.is_empty() {
             // Never exceeded the budget: identical to the in-memory path.
-            self.sort_arena();
+            self.sort_arena()?;
             let arena = std::mem::take(&mut self.arena);
-            return Ok((write_sorted_arena(index_dir, &arena)?, 0));
+            return Ok((write_sorted_arena_to(output, &arena)?, 0));
         }
 
         // Fold the tail into a final segment so the merge has a single
@@ -289,17 +351,75 @@ impl ExternalSorter {
 
         let segments = self.segments.len();
         eprintln!("Merging {segments} spill segment(s) into the index...");
+        let source = self
+            .spill
+            .as_ref()
+            .ok_or_else(|| Error::IndexCorrupted("spill segments have no owned source".into()))?
+            .output();
         Ok((
-            merge_segments(index_dir, &self.segments, self.budget_bytes)?,
+            merge_segments(output, &source, &self.segments, self.budget_bytes)?,
             segments,
         ))
     }
 }
 
+fn sort_controlled<T: Copy, K: Ord>(
+    values: &mut Vec<T>,
+    key: impl Fn(&T) -> K,
+    output: &crate::output::Output,
+) -> Result<()> {
+    let Some(permit) = output.control() else {
+        values.sort_unstable_by_key(key);
+        return Ok(());
+    };
+    const CHUNK: usize = 4096;
+    for chunk in values.chunks_mut(CHUNK) {
+        permit.check()?;
+        chunk.sort_unstable_by_key(&key);
+    }
+    if values.len() <= CHUNK {
+        return output.check();
+    }
+    let amount = values
+        .capacity()
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|bytes| {
+            values
+                .len()
+                .div_ceil(CHUNK)
+                .checked_mul(2 * std::mem::size_of::<(K, usize, usize)>())
+                .and_then(|heap| bytes.checked_add(heap))
+        })
+        .ok_or_else(|| crate::managed::Error::pressure("sort-merge-memory-overflow"))?;
+    let _memory = permit.memory(amount as u64)?;
+    let mut ordered = Vec::with_capacity(values.capacity());
+    let mut heap = BinaryHeap::with_capacity(values.len().div_ceil(CHUNK));
+    for start in (0..values.len()).step_by(CHUNK) {
+        permit.check()?;
+        heap.push(Reverse((
+            key(&values[start]),
+            start,
+            (start + CHUNK).min(values.len()),
+        )));
+    }
+    while let Some(Reverse((_, index, end))) = heap.pop() {
+        if ordered.len().is_multiple_of(CHUNK) {
+            permit.check()?;
+        }
+        ordered.push(values[index]);
+        let next = index + 1;
+        if next < end {
+            heap.push(Reverse((key(&values[next]), next, end)));
+        }
+    }
+    *values = ordered;
+    output.check()
+}
+
 /// Shared writer for `index.bin` + `lookup.bin`.
 struct IndexWriter {
-    postings: BufWriter<File>,
-    lookup: BufWriter<File>,
+    postings: BufWriter<crate::output::OutputFile>,
+    lookup: BufWriter<crate::output::OutputFile>,
     posting_scratch: Vec<u8>,
     lookup_scratch: Vec<u8>,
     offset: u64,
@@ -307,11 +427,10 @@ struct IndexWriter {
 }
 
 impl IndexWriter {
-    fn create(index_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(index_dir)?;
+    fn create(output: &crate::output::Output) -> Result<Self> {
         Ok(Self {
-            postings: BufWriter::new(File::create(index_dir.join("index.bin"))?),
-            lookup: BufWriter::new(File::create(index_dir.join("lookup.bin"))?),
+            postings: BufWriter::new(output.create(output.layout().postings())?),
+            lookup: BufWriter::new(output.create(output.layout().lookup())?),
             posting_scratch: Vec::with_capacity(
                 POSTING_WRITE_CHUNK_ENTRIES * ondisk::POSTING_ENTRY_SIZE,
             ),
@@ -354,19 +473,33 @@ impl IndexWriter {
         flush_lookup_entries(&mut self.lookup, &mut self.lookup_scratch)?;
         self.postings.flush()?;
         self.lookup.flush()?;
+        self.postings.get_ref().sync()?;
+        self.lookup.get_ref().sync()?;
         Ok(self.trigram_count)
     }
 }
 
 /// Write an already-sorted arena directly, without any spill round trip.
+#[cfg(test)]
 fn write_sorted_arena(index_dir: &Path, arena: &[TrigramPosting]) -> Result<usize> {
-    let mut writer = IndexWriter::create(index_dir)?;
+    write_sorted_arena_to(&crate::output::Output::legacy(index_dir), arena)
+}
+
+fn write_sorted_arena_to(
+    output: &crate::output::Output,
+    arena: &[TrigramPosting],
+) -> Result<usize> {
+    let mut writer = IndexWriter::create(output)?;
     let mut group: Vec<PostingEntry> = Vec::new();
     let mut idx = 0usize;
     while idx < arena.len() {
+        output.check()?;
         let trigram = arena[idx].trigram;
         let mut end = idx + 1;
         while end < arena.len() && arena[end].trigram == trigram {
+            if end.is_multiple_of(4096) {
+                output.check()?;
+            }
             end += 1;
         }
         group.clear();
@@ -383,16 +516,26 @@ struct ByteSource {
     buf: Vec<u8>,
     pos: usize,
     filled: usize,
+    permit: Option<std::sync::Arc<crate::managed::WorkPermit>>,
 }
 
 impl ByteSource {
     fn open(path: &Path, capacity: usize) -> Result<Self> {
-        Ok(Self {
-            file: File::open(path)?,
+        Ok(Self::from_file(File::open(path)?, capacity, None))
+    }
+
+    fn from_file(
+        file: File,
+        capacity: usize,
+        permit: Option<std::sync::Arc<crate::managed::WorkPermit>>,
+    ) -> Self {
+        Self {
+            file,
             buf: vec![0u8; capacity.max(MAX_VARINT_LEN)],
             pos: 0,
             filled: 0,
-        })
+            permit,
+        }
     }
 
     /// Make at least `want` bytes available if the file still has them.
@@ -406,6 +549,9 @@ impl ByteSource {
         self.filled -= self.pos;
         self.pos = 0;
         while self.filled < want {
+            if let Some(permit) = &self.permit {
+                permit.check()?;
+            }
             let read = self.file.read(&mut self.buf[self.filled..])?;
             if read == 0 {
                 break;
@@ -490,9 +636,18 @@ impl SegmentCursor {
     }
 
     /// Decode the pending group's postings, appending them to `out`.
-    fn take_group(&mut self, out: &mut Vec<PostingEntry>) -> Result<()> {
+    fn take_group(
+        &mut self,
+        out: &mut Vec<PostingEntry>,
+        mut memory: Option<&mut crate::managed::work::MemoryCharge>,
+    ) -> Result<()> {
         let mut prev_file_id: u32 = 0;
-        for _ in 0..self.pending_count {
+        for index in 0..self.pending_count {
+            if index.is_multiple_of(4096)
+                && let Some(permit) = &self.src.permit
+            {
+                permit.check()?;
+            }
             let delta = self
                 .src
                 .read_varint()?
@@ -501,6 +656,21 @@ impl SegmentCursor {
                 .map_err(|_| Error::IndexCorrupted("spill segment file id overflow".into()))?;
             let loc_mask = self.src.read_u8()?;
             let next_mask = self.src.read_u8()?;
+            if out.len() == out.capacity()
+                && let Some(memory) = &mut memory
+            {
+                let capacity = out.capacity().max(512).checked_mul(2).ok_or_else(|| {
+                    crate::managed::Error::pressure("posting-group-capacity-overflow")
+                })?;
+                let bytes = capacity
+                    .checked_mul(std::mem::size_of::<PostingEntry>())
+                    .ok_or_else(|| {
+                        crate::managed::Error::pressure("posting-group-memory-overflow")
+                    })?;
+                memory.resize(bytes as u64)?;
+                out.try_reserve_exact(capacity - out.len())
+                    .map_err(|_| crate::managed::Error::pressure("posting-group-allocation"))?;
+            }
             out.push(PostingEntry {
                 file_id,
                 loc_mask,
@@ -535,11 +705,26 @@ fn segment_buffer_bytes(read_budget_bytes: usize, segments: usize) -> usize {
 /// for. The arena has already been released by this point, so the full budget
 /// is available.
 fn merge_segments(
-    index_dir: &Path,
+    output: &crate::output::Output,
+    source: &crate::output::Output,
     segments: &[PathBuf],
     read_budget_bytes: usize,
 ) -> Result<usize> {
     let per_segment = segment_buffer_bytes(read_budget_bytes, segments.len());
+    let _memory = output
+        .control()
+        .map(|permit| -> Result<_> {
+            let bytes = per_segment
+                .checked_add(std::mem::size_of::<SegmentCursor>() + 64)
+                .and_then(|bytes| bytes.checked_mul(segments.len()))
+                .ok_or_else(|| crate::managed::Error::pressure("segment-cursor-memory-overflow"))?;
+            Ok(permit.memory(bytes as u64)?)
+        })
+        .transpose()?;
+    let mut group_memory = output
+        .control()
+        .map(|permit| permit.memory(0))
+        .transpose()?;
     let mut cursors: Vec<SegmentCursor> = Vec::with_capacity(segments.len());
     // Min-heap keyed by (trigram, segment index). Ordering by segment index as
     // the tiebreak matters: file IDs are assigned in walk order and segments
@@ -549,17 +734,35 @@ fn merge_segments(
     let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::with_capacity(segments.len());
 
     for (idx, path) in segments.iter().enumerate() {
-        let mut cursor = SegmentCursor::open(path, per_segment)?;
+        output.check()?;
+        let mut cursor = if let Some(permit) = source.control() {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| Error::IndexCorrupted("invalid segment member name".into()))?;
+            SegmentCursor {
+                src: ByteSource::from_file(
+                    source.open_file(name)?,
+                    per_segment,
+                    Some(std::sync::Arc::clone(permit)),
+                ),
+                prev_trigram: 0,
+                pending_count: 0,
+            }
+        } else {
+            SegmentCursor::open(path, per_segment)?
+        };
         if let Some(trigram) = cursor.advance()? {
             heap.push(Reverse((trigram, idx)));
         }
         cursors.push(cursor);
     }
 
-    let mut writer = IndexWriter::create(index_dir)?;
+    let mut writer = IndexWriter::create(output)?;
     let mut group: Vec<PostingEntry> = Vec::new();
 
     while let Some(&Reverse((trigram, _))) = heap.peek() {
+        output.check()?;
         group.clear();
         let mut needs_sort = false;
         let mut last_file_id: Option<u32> = None;
@@ -571,7 +774,7 @@ fn merge_segments(
             heap.pop();
 
             let before = group.len();
-            cursors[idx].take_group(&mut group)?;
+            cursors[idx].take_group(&mut group, group_memory.as_mut())?;
             // Defensive: if the append-in-segment-order invariant is ever
             // broken (e.g. a caller assigns file IDs out of walk order), fall
             // back to sorting rather than emitting an unsorted posting list,
@@ -589,7 +792,7 @@ fn merge_segments(
         }
 
         if needs_sort {
-            group.sort_unstable_by_key(|entry| entry.file_id);
+            sort_controlled(&mut group, |entry| entry.file_id, output)?;
         }
         writer.write_group(trigram, &group)?;
     }

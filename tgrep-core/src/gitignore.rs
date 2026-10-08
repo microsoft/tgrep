@@ -10,7 +10,9 @@
 
 use crate::walker::walker_thread_count;
 use ignore::WalkBuilder;
+use ignore::gitignore::FileReadControl;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const P4IGNORE_FILENAME: &str = "p4ignore.ini";
 
@@ -130,7 +132,7 @@ impl IgnoreMatcher {
         nested: Vec<(String, IgnoreKind, Gitignore)>,
         global: Gitignore,
     ) -> Option<Self> {
-        Self::with_all_sources(local, false, nested, Vec::new(), None, global, None)
+        Self::with_all_sources(local, false, nested, Vec::new(), None, global, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -142,6 +144,7 @@ impl IgnoreMatcher {
         repo_exclude: Option<(String, Gitignore)>,
         global: Gitignore,
         ignorecase: Option<std::sync::Arc<CaseInsensitiveIgnore>>,
+        read_control: Option<&Arc<dyn FileReadControl>>,
     ) -> Option<Self> {
         let mut nested: Vec<NestedIgnore> = nested
             .into_iter()
@@ -155,14 +158,35 @@ impl IgnoreMatcher {
         // Deepest first, so the innermost ignore file decides — that is the
         // precedence git applies between levels. Within one directory,
         // `.ignore` is consulted before `.gitignore` so it wins.
-        nested.sort_by(|a, b| {
-            b.dir
-                .matches('/')
-                .count()
-                .cmp(&a.dir.matches('/').count())
-                .then_with(|| b.dir.len().cmp(&a.dir.len()))
-                .then_with(|| a.kind.cmp(&b.kind))
-        });
+        if let Some(control) = read_control {
+            let mut ordered = std::collections::BTreeMap::new();
+            for (sequence, entry) in nested.into_iter().enumerate() {
+                control.check().ok()?;
+                ordered.insert(
+                    (
+                        std::cmp::Reverse(entry.dir.matches('/').count()),
+                        std::cmp::Reverse(entry.dir.len()),
+                        entry.kind,
+                        sequence,
+                    ),
+                    entry,
+                );
+            }
+            nested = Vec::with_capacity(ordered.len());
+            for entry in ordered.into_values() {
+                control.check().ok()?;
+                nested.push(entry);
+            }
+        } else {
+            nested.sort_by(|a, b| {
+                b.dir
+                    .matches('/')
+                    .count()
+                    .cmp(&a.dir.matches('/').count())
+                    .then_with(|| b.dir.len().cmp(&a.dir.len()))
+                    .then_with(|| a.kind.cmp(&b.kind))
+            });
+        }
 
         let ancestors = ancestors
             .into_iter()
@@ -332,18 +356,49 @@ fn strip_dir_prefix<'a>(rel: &'a str, dir: &str) -> Option<&'a str> {
 }
 
 pub fn build_global_matcher(root: &Path) -> Gitignore {
-    let builder = ignore::gitignore::GitignoreBuilder::new(root);
+    build_global_matcher_controlled(root, None)
+}
+
+fn build_global_matcher_controlled(
+    root: &Path,
+    control: Option<&Arc<dyn FileReadControl>>,
+) -> Gitignore {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    builder.file_read_control(control.cloned());
     builder.build_global().0
 }
 
-fn p4ignore_lines(root: &Path) -> Option<(std::path::PathBuf, Vec<String>)> {
+fn p4ignore_lines_controlled(
+    root: &Path,
+    control: Option<&Arc<dyn FileReadControl>>,
+) -> Option<(std::path::PathBuf, Vec<String>)> {
     let path = root.join(P4IGNORE_FILENAME);
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let lines = contents
-        .lines()
-        .map(|line| line.replace('\\', "/"))
-        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-        .collect();
+    let contents = match control {
+        None => std::fs::read_to_string(&path).ok()?,
+        Some(control) => {
+            let bytes = control.read_file(&path).ok()?;
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => text.to_string(),
+                Err(error) => {
+                    control.report_error(&ignore::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        error,
+                    )));
+                    return None;
+                }
+            }
+        }
+    };
+    let mut lines = Vec::new();
+    for line in contents.lines() {
+        if let Some(control) = control {
+            control.check().ok()?;
+        }
+        let line = line.replace('\\', "/");
+        if !line.trim().is_empty() && !line.trim_start().starts_with('#') {
+            lines.push(line);
+        }
+    }
     Some((path, lines))
 }
 
@@ -354,14 +409,28 @@ fn p4ignore_lines(root: &Path) -> Option<(std::path::PathBuf, Vec<String>)> {
 /// before adding each rule. Comments, globs, and `!` negations then retain
 /// their usual ignore-file semantics.
 pub fn add_p4ignore_rules(builder: &mut ignore::gitignore::GitignoreBuilder, root: &Path) -> bool {
-    let Some((path, lines)) = p4ignore_lines(root) else {
+    add_p4ignore_rules_controlled(builder, root, None)
+}
+
+fn add_p4ignore_rules_controlled(
+    builder: &mut ignore::gitignore::GitignoreBuilder,
+    root: &Path,
+    control: Option<&Arc<dyn FileReadControl>>,
+) -> bool {
+    let Some((path, lines)) = p4ignore_lines_controlled(root, control) else {
         return false;
     };
 
     let mut added = false;
     for line in lines {
-        if builder.add_line(Some(path.clone()), &line).is_ok() {
-            added = true;
+        match builder.add_line(Some(path.clone()), &line) {
+            Ok(_) => added = true,
+            Err(error) => {
+                if let Some(control) = control {
+                    control.report_error(&error);
+                    return false;
+                }
+            }
         }
     }
     added
@@ -394,10 +463,18 @@ impl P4IgnoreMatcher {
 
 /// Build a matcher containing only root-level `p4ignore.ini` rules.
 pub fn build_p4ignore_matcher(root: &Path) -> Option<P4IgnoreMatcher> {
+    build_p4ignore_matcher_controlled(root, None)
+}
+
+pub(crate) fn build_p4ignore_matcher_controlled(
+    root: &Path,
+    control: Option<&Arc<dyn FileReadControl>>,
+) -> Option<P4IgnoreMatcher> {
     use ignore::gitignore::GitignoreBuilder;
-    let (_, lines) = p4ignore_lines(root)?;
+    let (_, lines) = p4ignore_lines_controlled(root, control)?;
     let mut builder = GitignoreBuilder::new(root);
-    if !add_p4ignore_rules(&mut builder, root) {
+    builder.file_read_control(control.cloned());
+    if !add_p4ignore_rules_controlled(&mut builder, root, control) {
         return None;
     }
     let matcher = builder.build().ok()?;
@@ -577,6 +654,41 @@ impl CaseInsensitiveIgnore {
             fingerprint,
         });
         Ok(Some(matcher))
+    }
+
+    pub(crate) fn frozen_snapshot_controlled(
+        root: &Path,
+        repository: &crate::generations::Repository,
+        permit: &Arc<crate::managed::WorkPermit>,
+        control: &Arc<dyn FileReadControl>,
+    ) -> crate::managed::Result<Option<Self>> {
+        use ignore::gitignore::GitignoreBuilder;
+        if !crate::git_index::ignores_case_controlled(repository, control.as_ref())? {
+            return Ok(None);
+        }
+        let mut builder = GitignoreBuilder::new(root);
+        builder.file_read_control(Some(control.clone()));
+        builder
+            .case_insensitive(true)
+            .map_err(crate::managed::Error::from)?;
+        let _ = builder.add(root.join(GITIGNORE_FILENAME));
+        let _ = builder.add(repository.common_dir().join("info").join("exclude"));
+        let matcher = builder.build().map_err(crate::managed::Error::from)?;
+        if matcher.is_empty() {
+            return Ok(None);
+        }
+        let tracked = crate::git_index::load_tracked_controlled(root, permit)?;
+        let fingerprint =
+            TrackedMembershipFingerprint(Some(tracked.fingerprint_controlled(permit)?));
+        Ok(Some(Self {
+            matcher,
+            repo_root: root.to_path_buf(),
+            tracked: TrackedMembership::Frozen(TrackedSnapshot {
+                tracked: Some(tracked),
+                fingerprint,
+            }),
+            current: std::sync::RwLock::new(TrackedFingerprintCache::default()),
+        }))
     }
 
     fn build(
@@ -777,6 +889,14 @@ pub fn repo_exclude_candidate(root: &Path) -> Option<PathBuf> {
 /// stop after the nearest repository root; with `--no-require-git` they
 /// continue to the filesystem root.
 pub fn ancestor_ignore_paths(root: &Path, no_require_git: bool) -> Vec<(PathBuf, IgnoreKind)> {
+    ancestor_ignore_paths_inner(root, no_require_git, true)
+}
+
+fn ancestor_ignore_paths_inner(
+    root: &Path,
+    no_require_git: bool,
+    probe: bool,
+) -> Vec<(PathBuf, IgnoreKind)> {
     let repo_root = git_repo_root(root);
     let mut found = Vec::new();
     for dir in root.ancestors().skip(1) {
@@ -788,7 +908,7 @@ pub fn ancestor_ignore_paths(root: &Path, no_require_git: bool) -> Vec<(PathBuf,
                 no_require_git || repo_root.is_some_and(|repo| dir.starts_with(repo)),
             ),
         ] {
-            if enabled && path.is_file() {
+            if enabled && (!probe || path.is_file()) {
                 found.push((path, kind));
             }
         }
@@ -836,6 +956,24 @@ pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
     no_require_git: bool,
     ignorecase: Option<std::sync::Arc<CaseInsensitiveIgnore>>,
 ) -> Option<IgnoreMatcher> {
+    matcher_from_ignore_paths_controlled(
+        root,
+        gitignore_files,
+        ignore_files,
+        no_require_git,
+        ignorecase,
+        None,
+    )
+}
+
+pub(crate) fn matcher_from_ignore_paths_controlled(
+    root: &Path,
+    gitignore_files: &[PathBuf],
+    ignore_files: &[PathBuf],
+    no_require_git: bool,
+    ignorecase: Option<Arc<CaseInsensitiveIgnore>>,
+    control: Option<&Arc<dyn FileReadControl>>,
+) -> Option<IgnoreMatcher> {
     use ignore::gitignore::GitignoreBuilder;
 
     // `root` is inside a git repo if it or any ancestor holds a `.git` entry.
@@ -843,7 +981,8 @@ pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
     let git_rules_enabled = repo_root.is_some() || no_require_git;
 
     let mut root_builder = GitignoreBuilder::new(root);
-    add_p4ignore_rules(&mut root_builder, root);
+    root_builder.file_read_control(control.cloned());
+    add_p4ignore_rules_controlled(&mut root_builder, root, control);
 
     let mut nested: Vec<(String, IgnoreKind, Gitignore)> = Vec::new();
 
@@ -856,7 +995,10 @@ pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
             continue;
         }
         for path in paths {
-            if !path.is_file() {
+            if let Some(control) = control {
+                control.check().ok()?;
+            }
+            if control.is_none() && !path.is_file() {
                 continue;
             }
             let dir = path.parent().unwrap_or(root);
@@ -878,6 +1020,7 @@ pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
             let rel_dir = rel_dir.trim_matches('/');
 
             let mut builder = GitignoreBuilder::new(dir);
+            builder.file_read_control(control.cloned());
             let _ = builder.add(path);
             if let Ok(matcher) = builder.build() {
                 nested.push((rel_dir.to_string(), kind, matcher));
@@ -888,7 +1031,10 @@ pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
     // WalkBuilder applies `.ignore` files from every ancestor, with its own
     // git boundary — see [`ancestor_ignore_paths`].
     let mut ancestors = Vec::new();
-    for (path, kind) in ancestor_ignore_paths(root, no_require_git) {
+    for (path, kind) in ancestor_ignore_paths_inner(root, no_require_git, control.is_none()) {
+        if let Some(control) = control {
+            control.check().ok()?;
+        }
         let Some(dir) = path.parent() else {
             continue;
         };
@@ -898,6 +1044,7 @@ pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
             .to_string_lossy()
             .replace('\\', "/");
         let mut builder = GitignoreBuilder::new(dir);
+        builder.file_read_control(control.cloned());
         let _ = builder.add(&path);
         if let Ok(matcher) = builder.build() {
             ancestors.push((prefix, kind, matcher));
@@ -905,8 +1052,20 @@ pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
     }
 
     let repo_exclude = repo_root.and_then(|repo| {
-        let path = repo_exclude_path(root)?;
+        let path = match control {
+            None => repo_exclude_path(root)?,
+            Some(control) => {
+                match crate::git_index::read_repository_dirs_controlled(repo, control.as_ref()) {
+                    Ok((_, common)) => common.join("info").join("exclude"),
+                    Err(error) => {
+                        control.report_error(&ignore::Error::Io(error));
+                        return None;
+                    }
+                }
+            }
+        };
         let mut builder = GitignoreBuilder::new(repo);
+        builder.file_read_control(control.cloned());
         let _ = builder.add(&path);
         let matcher = builder.build().ok()?;
         let prefix = root
@@ -919,7 +1078,7 @@ pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
 
     let local = root_builder.build().ok()?;
     let global = if git_rules_enabled {
-        build_global_matcher(root)
+        build_global_matcher_controlled(root, control)
     } else {
         GitignoreBuilder::new(root).build().ok()?
     };
@@ -931,6 +1090,7 @@ pub fn matcher_from_ignore_paths_with_options_and_ignorecase(
         repo_exclude,
         global,
         ignorecase,
+        control,
     )
 }
 

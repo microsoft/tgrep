@@ -1,10 +1,20 @@
 //! Explicit repository daemon. Never reads/writes legacy `serve.json` or merges
 //! a worktree overlay into a generation. Disk storage and its ancestors are trusted.
+mod managed;
 mod protocol;
+mod protocol_v2;
 mod server;
 
 pub use protocol::{Client, Lifecycle, MARKER, PROTOCOL, run_lifecycle};
 pub use server::{Options, run};
+
+pub fn run_managed(
+    root: &std::path::Path,
+    options: Options<'_>,
+    policy: &std::path::Path,
+) -> anyhow::Result<()> {
+    managed::run(root, options, protocol_v2::read_policy(policy)?)
+}
 
 use anyhow::{Context, Result, bail, ensure};
 use std::path::{Path, PathBuf};

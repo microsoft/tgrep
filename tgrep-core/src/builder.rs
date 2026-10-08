@@ -1159,13 +1159,36 @@ pub(crate) fn write_files_and_meta<'a>(
     trigram_count: usize,
     complete: Option<bool>,
 ) -> Result<()> {
-    let mut files_file =
-        std::io::BufWriter::new(std::fs::File::create(index_dir.join("files.bin"))?);
-    ondisk::write_file_table_header(&mut files_file)?;
+    write_files_and_meta_to(
+        &crate::output::Output::legacy(index_dir),
+        root,
+        path_count,
+        paths,
+        trigram_count,
+        complete,
+        false,
+    )
+}
+
+pub(crate) fn write_files_and_meta_to<'a>(
+    output: &crate::output::Output,
+    root: &Path,
+    path_count: usize,
+    paths: impl IntoIterator<Item = &'a str>,
+    trigram_count: usize,
+    complete: Option<bool>,
+    hidden_complete: bool,
+) -> Result<()> {
+    let mut files_file = std::io::BufWriter::new(output.create(output.layout().files())?);
+    ondisk::write_file_table_header_for(&mut files_file, output.layout())?;
     for (id, path) in paths.into_iter().enumerate() {
+        if id.is_multiple_of(4096) {
+            output.check()?;
+        }
         ondisk::write_file_entry(&mut files_file, id as u32, path)?;
     }
     files_file.flush()?;
+    files_file.get_ref().sync()?;
 
     let canon_root = std::fs::canonicalize(root)?;
     let mut meta = IndexMeta::new(
@@ -1176,8 +1199,12 @@ pub(crate) fn write_files_and_meta<'a>(
     if let Some(c) = complete {
         meta.complete = c;
     }
-    meta.file_table_id = Some(meta::read_file_table_id(index_dir)?);
-    meta.save(index_dir)?;
+    meta.hidden_complete = hidden_complete;
+    meta.file_table_id = Some(meta::read_file_table_id_controlled(
+        output.open_file(output.layout().files())?,
+        output.control(),
+    )?);
+    output.write_json(output.layout().meta(), &meta)?;
 
     Ok(())
 }

@@ -9,6 +9,9 @@ description = "Trigram index library for fast full-text search on large codebase
 keywords = ["trigram", "search", "index", "grep", "full-text"]
 categories = ["text-processing", "algorithms"]
 
+[features]
+managed-test-hooks = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -25,6 +28,8 @@ encoding_rs = "0.8"
 fs2 = "0.4.3"
 tempfile = "3"
 same-file = "1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+getrandom = "0.4.2"
 
 [target.'cfg(unix)'.dependencies]
 cap-std = "4"
@@ -32,7 +37,7 @@ cap-tempfile = "4"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 criterion = "0.5"

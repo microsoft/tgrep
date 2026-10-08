@@ -10,6 +10,9 @@ keywords = ["grep", "search", "regex", "trigram", "cli"]
 categories = ["command-line-utilities", "text-processing"]
 readme = "../README.md"
 
+[features]
+managed-test-hooks = ["tgrep-core/managed-test-hooks"]
+
 [[bin]]
 name = "tgrep"
 path = "src/main.rs"

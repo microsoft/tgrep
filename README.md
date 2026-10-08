@@ -659,6 +659,9 @@ An agent runtime can explicitly attach linked Git worktrees to one repository
 daemon. They share an immutable committed-tree index and keep private overlays.
 Ordinary `serve`/`index` and unattached queries retain their existing behavior.
 Do **not** point ordinary servers at a shared `--index-path`.
+The commands in this section use the default **v1 retain-all, fixed-pin**
+contract. [Managed v2](#managed-shared-lifecycle-opt-in) adds explicit/adaptive
+advancement, owner lifetimes and collection without changing those defaults.
 
 ```bash
 mkdir /trusted/external/tgrep-cache
@@ -758,7 +761,7 @@ exact base/root key. Restart the same daemon, then reattach with the same starti
 revision: old leases/instance IDs are invalid and restored checkpoints undergo
 full validation before readiness. Corrupt checkpoints/generations are explicit
 errors, not base-only results. Published generations/checkpoints are retained:
-there is **no online GC**, automatic migration, or checkpoint eviction.
+the **v1 store has no online GC**, automatic migration, or checkpoint eviction.
 Shared JSON RPC requires UTF-8 canonical worktree roots; unsupported roots,
 including symlink aliases to them, fail before attachment or generation publication.
 
@@ -773,11 +776,74 @@ verification reuses those overlays with zero new extractions. Smudge/encoding
 transformations may similarly require full overlays. See the [wire contract and design](SHARED_WORKTREE_INDEXES.md#daemon-wire-contract-v1)
 for generic runtime integration.
 
+### Managed shared lifecycle (opt-in)
+
+For active base advancement and reference-aware reclamation, start a v2 daemon
+with a complete [managed policy](SHARED_WORKTREE_INDEXES.md#managed-policy):
+
+```bash
+tgrep serve --shared /repo --shared-storage /trusted/external/tgrep-cache \
+  --shared-policy /trusted/managed-policy.json
+tgrep shared manage /repo hello
+tgrep shared manage /repo namespace.status
+tgrep shared manage /repo maintenance.status
+```
+
+The policy selects `managed` storage or `compatibility-retain-all`. Managed
+generations/checkpoints live in an isolated namespace with a transactional
+catalog and OS-backed reader protection. Old binaries and unguarded core readers
+cannot open its data, even when files are renamed to legacy names. Compatibility
+mode supports v1 clients but **never collects legacy generations**. Storage mode
+is immutable; omitting `--shared-policy` still selects the existing v1 daemon.
+Ordinary indexing, non-Git directories and unborn repositories are unchanged.
+
+A generic managed client persists its operation and lease tokens, prepares an
+instance-bound owner, holds the issued guard with `tgrep shared owner-hold`,
+registers that claim, then calls `views.attach` through `shared manage`. Operations
+are asynchronous: inspect their receipts and wait for a reconciled ready view.
+After attachment, normal search and `--files` discover that view. Do not use
+the v1 `shared attach` command to create a managed lease.
+The [v2 client contract](SHARED_WORKTREE_INDEXES.md#managed-client-contract)
+specifies complete request shapes, recovery and token acknowledgement.
+
+`views.advance` prepares and reconciles a complete replacement while unrelated
+ready views continue serving. The current exact commit, physical generation,
+view version and checkpoint commit together before acknowledgement. Queries
+already holding an old snapshot retain it. Adaptive advancement is optional,
+uses the worktree's own exact `HEAD`, and requires measured benefit, hysteresis
+and cooldown; untracked-only or ineffective transformed changes do not repeatedly
+rebuild the base. Any fixed-pin participant blocks advancement.
+
+Collection withdraws eligible checkpoints before releasing their generation
+references, then retires and removes unprotected physical incarnations in bounded
+passes. Live readers, active ownership and persistent cache references take
+precedence over byte targets. A shortfall is reported, not solved by deleting
+live data. Owner death requires acquisition of the original OS guard; missing,
+replaced or inaccessible proof is **unknown**, not death. Legacy leases never
+gain a timeout. Releasing a lease does not imply escaped readers or worktree
+handles have drained: inspect detach results before removing a worktree.
+
+External storage remains manageable after the repository is gone:
+
+```bash
+tgrep shared discover /trusted/external/tgrep-cache
+tgrep shared maintenance /trusted/external/tgrep-cache/tgrep-managed-v2/<repository-id> namespace.status
+tgrep shared maintenance /trusted/external/tgrep-cache/tgrep-managed-v2/<repository-id> collections.preview
+```
+
+Preview is not deletion authorization. Mutation requires `--apply`, persisted
+namespace-scoped tokens, current policy/allocation versions and bounded
+`collections.run` or `maintenance.recover` requests. A maintenance `session`
+keeps paginated inspection under one ownership lifetime. Startup and maintenance
+share the namespace's exclusive lock; foreign entries are preserved, not swept.
+See [offline maintenance and durability](SHARED_WORKTREE_INDEXES.md#managed-maintenance-and-durability)
+and [native qualification](CONTRIBUTING.md#managed-lifecycle-qualification).
+
 ### Shared worktree core APIs
 
 See the [shared worktree index design](SHARED_WORKTREE_INDEXES.md) for
 architecture diagrams, the agent runtime boundary, base-generation lifecycle,
-and the staged implementation plan.
+and both the legacy and managed lifecycle contracts.
 
 `tgrep-core::generations` manages immutable committed-tree bases:
 

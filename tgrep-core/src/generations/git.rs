@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use super::{GenerationError, Repository, Result, TrackedEntry};
+use crate::managed::process::{Control, PipedProcess};
 
-pub(super) fn command() -> Command {
+pub(crate) fn command() -> Command {
     let mut command = Command::new("git");
     // Ambient Git state must not redirect a request to another repository.
     for (key, _) in std::env::vars_os() {
@@ -36,7 +37,30 @@ fn output(command: &mut Command, operation: &'static str) -> Result<Vec<u8>> {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
+
     Ok(output.stdout)
+}
+
+fn controlled_output(
+    command: &mut Command,
+    operation: &'static str,
+    control: Option<&Control>,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let Some(control) = control else {
+        return output(command, operation);
+    };
+    let mut process = PipedProcess::spawn(command, control.clone(), false)?;
+    let bytes = process.read_output(limit)?;
+    let (status, stderr) = process.finish()?;
+    if !status.success() {
+        return Err(GenerationError::Git {
+            operation,
+            code: status.code(),
+            stderr,
+        });
+    }
+    Ok(bytes)
 }
 
 fn path(bytes: Vec<u8>) -> Result<PathBuf> {
@@ -55,24 +79,22 @@ fn path(bytes: Vec<u8>) -> Result<PathBuf> {
     }
 }
 
-pub(super) fn common_dir(root: &Path) -> Result<PathBuf> {
-    discover_directory(root, "--git-common-dir")
-}
-
-pub(super) fn worktree_git_dir(root: &Path) -> Result<PathBuf> {
-    discover_directory(root, "--absolute-git-dir")
-}
-
 pub(super) fn worktree_root(root: &Path) -> Result<PathBuf> {
-    discover_directory(root, "--show-toplevel")
+    discover_directory(root, "--show-toplevel", None)
 }
 
-fn discover_directory(root: &Path, option: &str) -> Result<PathBuf> {
-    let mut bytes = output(
+pub(super) fn discover_directory(
+    root: &Path,
+    option: &str,
+    control: Option<&Control>,
+) -> Result<PathBuf> {
+    let mut bytes = controlled_output(
         command()
             .current_dir(root)
             .args(["rev-parse", "--path-format=absolute", option]),
         "discover common directory",
+        control,
+        128 * 1024,
     )?;
     if bytes.pop() != Some(b'\n') {
         return Err(GenerationError::Unsupported("unterminated Git path".into()));
@@ -101,9 +123,18 @@ pub(super) fn repository_command(repository: &Repository) -> Command {
 }
 
 pub(super) fn worktrees(repository: &Repository) -> Result<Vec<PathBuf>> {
-    let bytes = output(
+    worktrees_controlled(repository, None)
+}
+
+pub(super) fn worktrees_controlled(
+    repository: &Repository,
+    control: Option<&Control>,
+) -> Result<Vec<PathBuf>> {
+    let bytes = controlled_output(
         repository_command(repository).args(["worktree", "list", "--porcelain", "-z"]),
         "list worktrees",
+        control,
+        1024 * 1024,
     )?;
     bytes
         .split(|&byte| byte == 0)
@@ -119,10 +150,15 @@ pub(super) fn valid_oid(oid: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub(super) fn object_format(repository: &Repository) -> Result<usize> {
-    let bytes = output(
+pub(super) fn object_format_controlled(
+    repository: &Repository,
+    control: Option<&Control>,
+) -> Result<usize> {
+    let bytes = controlled_output(
         repository_command(repository).args(["rev-parse", "--show-object-format"]),
         "read object format",
+        control,
+        128,
     )?;
     match bytes.as_slice() {
         b"sha1\n" => Ok(40),
@@ -133,12 +169,14 @@ pub(super) fn object_format(repository: &Repository) -> Result<usize> {
     }
 }
 
-fn resolve(repository: &Repository, revision: &str) -> Result<String> {
-    let bytes = output(
+fn resolve(repository: &Repository, revision: &str, control: Option<&Control>) -> Result<String> {
+    let bytes = controlled_output(
         repository_command(repository)
             .current_dir(repository.git_dir())
             .args(["rev-parse", "--verify", "--end-of-options", revision]),
         "resolve committed revision",
+        control,
+        128,
     )?;
     let oid = String::from_utf8(bytes)
         .map_err(|_| GenerationError::InvalidMetadata("non-ASCII object ID".into()))?;
@@ -152,16 +190,97 @@ fn resolve(repository: &Repository, revision: &str) -> Result<String> {
 }
 
 pub(super) fn commit_tree(repository: &Repository, revision: &str) -> Result<(String, String)> {
-    let commit = resolve(repository, &format!("{revision}^{{commit}}"))?;
-    let tree = resolve(repository, &format!("{commit}^{{tree}}"))?;
+    commit_tree_controlled(repository, revision, None)
+}
+
+pub(super) fn commit_tree_controlled(
+    repository: &Repository,
+    revision: &str,
+    control: Option<&Control>,
+) -> Result<(String, String)> {
+    let commit = resolve(repository, &format!("{revision}^{{commit}}"), control)?;
+    let tree = resolve(repository, &format!("{commit}^{{tree}}"), control)?;
     Ok((commit, tree))
 }
 
-pub(super) fn entries(repository: &Repository, tree: &str) -> Result<Vec<TrackedEntry>> {
-    let bytes = output(
-        repository_command(repository).args(["ls-tree", "-r", "-z", "-l", "--full-tree", tree]),
-        "enumerate committed tree",
-    )?;
+pub(crate) fn entries_controlled(
+    repository: &Repository,
+    tree: &str,
+    control: Option<&Control>,
+    limit: usize,
+    memory: Option<&mut crate::managed::work::MemoryCharge>,
+) -> Result<Vec<TrackedEntry>> {
+    let mut command = repository_command(repository);
+    command.args(["ls-tree", "-r", "-z", "-l", "--full-tree", tree]);
+    let bytes = if let Some(control) = control {
+        let mut process = PipedProcess::spawn(&mut command, control.clone(), false)?;
+        let bytes = process.read_output_accounted(limit, memory, 32)?;
+        let (status, stderr) = process.finish()?;
+        if !status.success() {
+            return Err(GenerationError::Git {
+                operation: "enumerate committed tree",
+                code: status.code(),
+                stderr,
+            });
+        }
+        bytes
+    } else {
+        output(&mut command, "enumerate committed tree")?
+    };
+    parse_entries(repository, &bytes, control)
+}
+
+pub(crate) fn entries_for_paths(
+    repository: &Repository,
+    tree: &str,
+    paths: &[&str],
+    control: &Control,
+    limit: usize,
+    max_paths: u32,
+) -> Result<Vec<TrackedEntry>> {
+    let mut entries = Vec::new();
+    let mut start = 0;
+    let mut remaining = limit;
+    while start < paths.len() {
+        let mut end = start;
+        let mut command_bytes = 0;
+        while end < paths.len() {
+            let bytes = paths[end].len().saturating_mul(2).saturating_add(4);
+            if bytes > 16384 {
+                return Err(crate::managed::Error::pressure("adaptive-path-argument-limit").into());
+            }
+            if command_bytes + bytes > 16384 {
+                break;
+            }
+            command_bytes += bytes;
+            end += 1;
+        }
+        let bytes = controlled_output(
+            repository_command(repository)
+                .arg("--literal-pathspecs")
+                .args(["ls-tree", "-r", "-z", "-l", "--full-tree", tree, "--"])
+                .args(&paths[start..end]),
+            "inspect adaptive target paths",
+            Some(control),
+            remaining,
+        )?;
+        remaining -= bytes.len();
+        entries.extend(parse_entries(repository, &bytes, Some(control))?);
+        if entries.len() > max_paths as usize {
+            return Err(crate::managed::Error::pressure("adaptive-target-path-limit").into());
+        }
+        start = end;
+    }
+    entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    entries.dedup_by(|a, b| a.path == b.path);
+    Ok(entries)
+}
+
+fn parse_entries(
+    repository: &Repository,
+    bytes: &[u8],
+    control: Option<&Control>,
+) -> Result<Vec<TrackedEntry>> {
     let mut entries = Vec::new();
     if !bytes.is_empty() && !bytes.ends_with(&[0]) {
         return Err(GenerationError::InvalidMetadata(
@@ -172,6 +291,9 @@ pub(super) fn entries(repository: &Repository, tree: &str) -> Result<Vec<Tracked
         .split(|&byte| byte == 0)
         .filter(|record| !record.is_empty())
     {
+        if let Some(control) = control {
+            control.check()?;
+        }
         let tab = record
             .iter()
             .position(|&byte| byte == b'\t')
@@ -225,24 +347,40 @@ pub(super) fn entries(repository: &Repository, tree: &str) -> Result<Vec<Tracked
             content: super::EntryContent::NotRegular,
         });
     }
-    entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    if entries.windows(2).any(|pair| pair[0].path == pair[1].path) {
-        return Err(GenerationError::InvalidMetadata(
-            "duplicate tracked path".into(),
-        ));
+    if let Some(control) = control {
+        let mut ordered = std::collections::BTreeMap::new();
+        for entry in entries.drain(..) {
+            control.check()?;
+            if ordered.insert(entry.path.clone(), entry).is_some() {
+                return Err(GenerationError::InvalidMetadata(
+                    "duplicate tracked path".into(),
+                ));
+            }
+        }
+        for entry in ordered.into_values() {
+            control.check()?;
+            entries.push(entry);
+        }
+    } else {
+        entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        if entries.windows(2).any(|pair| pair[0].path == pair[1].path) {
+            return Err(GenerationError::InvalidMetadata(
+                "duplicate tracked path".into(),
+            ));
+        }
     }
     Ok(entries)
 }
 
 /// A single batch-plumbing process; stderr is spooled to avoid pipe deadlock.
-pub(super) struct Blobs {
+pub(crate) struct LegacyBlobs {
     child: Option<Child>,
     input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
     stderr: tempfile::NamedTempFile,
 }
 
-impl Blobs {
+impl LegacyBlobs {
     pub(super) fn new(repository: &Repository) -> Result<Self> {
         let stderr = tempfile::NamedTempFile::new()?;
         let mut child = repository_command(repository)
@@ -309,11 +447,89 @@ impl Blobs {
     }
 }
 
-impl Drop for Blobs {
+impl Drop for LegacyBlobs {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+pub(crate) enum Blobs {
+    Legacy(LegacyBlobs),
+    Controlled(PipedProcess),
+}
+
+impl Blobs {
+    pub(crate) fn new(repository: &Repository) -> Result<Self> {
+        Ok(Self::Legacy(LegacyBlobs::new(repository)?))
+    }
+
+    pub(crate) fn controlled(repository: &Repository, control: Control) -> Result<Self> {
+        Ok(Self::Controlled(PipedProcess::spawn(
+            repository_command(repository).args(["cat-file", "--batch"]),
+            control,
+            true,
+        )?))
+    }
+
+    pub(crate) fn read(&mut self, oid: &str, size: u64) -> Result<Vec<u8>> {
+        let Self::Controlled(process) = self else {
+            let Self::Legacy(process) = self else {
+                unreachable!()
+            };
+            return process.read(oid, size);
+        };
+        let input = process
+            .input
+            .as_mut()
+            .ok_or_else(|| GenerationError::InvalidMetadata("Git batch input closed".into()))?;
+        writeln!(input, "{oid}")?;
+        input.flush()?;
+        let output = process
+            .output
+            .as_mut()
+            .ok_or_else(|| GenerationError::InvalidMetadata("Git batch output closed".into()))?;
+        let mut header = Vec::new();
+        (&mut *output).take(256).read_until(b'\n', &mut header)?;
+        if header != format!("{oid} blob {size}\n").as_bytes() {
+            return Err(GenerationError::InvalidMetadata(
+                "unexpected bounded cat-file response".into(),
+            ));
+        }
+        let length = usize::try_from(size)
+            .map_err(|_| crate::managed::Error::pressure("blob-address-range"))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| crate::managed::Error::pressure("blob-memory"))?;
+        bytes.resize(length, 0);
+        output.read_exact(&mut bytes)?;
+        let mut newline = [0];
+        output.read_exact(&mut newline)?;
+        if newline != *b"\n" {
+            return Err(GenerationError::InvalidMetadata(
+                "unterminated cat-file blob".into(),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn finish(self) -> Result<()> {
+        match self {
+            Self::Legacy(process) => process.finish(),
+            Self::Controlled(process) => {
+                let (status, stderr) = process.finish()?;
+                if !status.success() {
+                    return Err(GenerationError::Git {
+                        operation: "read committed blobs",
+                        code: status.code(),
+                        stderr,
+                    });
+                }
+                Ok(())
+            }
         }
     }
 }

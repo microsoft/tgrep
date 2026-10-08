@@ -17,6 +17,23 @@ pub struct PathVisibility {
 }
 
 impl PathVisibility {
+    pub(crate) fn private_memory_estimate(
+        &self,
+        permit: &std::sync::Arc<crate::managed::WorkPermit>,
+    ) -> crate::managed::Result<u64> {
+        self.hidden
+            .keys()
+            .try_fold(std::mem::size_of::<Self>() as u64, |bytes, path| {
+                permit.check()?;
+                bytes
+                    .checked_add(path.capacity() as u64)
+                    .and_then(|bytes| bytes.checked_add(192))
+                    .ok_or_else(|| {
+                        crate::managed::Error::pressure("visibility-memory-account-overflow")
+                    })
+            })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.hidden.is_empty()
     }
@@ -50,6 +67,22 @@ impl PathVisibility {
             self.hidden
                 .retain(|path, is_dir| !ignore.is_whitelisted(Path::new(path), *is_dir));
         }
+    }
+
+    pub(crate) fn apply_ignore_rules_controlled(
+        &mut self,
+        ignore: Option<&IgnoreMatcher>,
+        permit: &std::sync::Arc<crate::managed::WorkPermit>,
+    ) -> crate::managed::Result<()> {
+        if let Some(ignore) = ignore {
+            for (path, is_dir) in std::mem::take(&mut self.hidden) {
+                permit.check()?;
+                if !ignore.is_whitelisted(Path::new(&path), is_dir) {
+                    self.hidden.insert(path, is_dir);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `prefix` is the search-root-relative slice of the index root, with a

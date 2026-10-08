@@ -16,7 +16,7 @@
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
-    fs::{File, FileType},
+    fs::FileType,
     io::{self, BufRead},
     path::{Path, PathBuf},
     sync::{Arc, RwLock, Weak},
@@ -95,6 +95,7 @@ pub(crate) struct Ignore(Arc<IgnoreInner>);
 
 #[derive(Clone, Debug)]
 struct IgnoreInner {
+    read_control: Option<Arc<dyn crate::gitignore::FileReadControl>>,
     /// A map of all existing directories that have already been
     /// compiled into matchers.
     ///
@@ -151,6 +152,13 @@ struct IgnoreInner {
 }
 
 impl Ignore {
+    pub(crate) fn check_control(&self) -> Result<(), Error> {
+        match &self.0.read_control {
+            Some(control) => control.check().map_err(Error::Io),
+            None => Ok(()),
+        }
+    }
+
     /// Return the directory path of this matcher.
     pub(crate) fn path(&self) -> &Path {
         &self.0.dir
@@ -275,6 +283,7 @@ impl Ignore {
                 &dir,
                 &self.0.custom_ignore_filenames,
                 self.0.opts.ignore_case_insensitive,
+                self.0.read_control.clone(),
             );
             errs.maybe_push(err);
             m
@@ -287,6 +296,7 @@ impl Ignore {
                 &dir,
                 &[".ignore"],
                 self.0.opts.ignore_case_insensitive,
+                self.0.read_control.clone(),
             );
             errs.maybe_push(err);
             m
@@ -299,6 +309,7 @@ impl Ignore {
                 &dir,
                 &[".gitignore"],
                 self.0.opts.ignore_case_insensitive,
+                self.0.read_control.clone(),
             );
             errs.maybe_push(err);
             m
@@ -307,13 +318,18 @@ impl Ignore {
         let gi_exclude_matcher = if !self.0.opts.git_exclude {
             Gitignore::empty()
         } else {
-            match resolve_git_commondir(dir, git_type) {
+            match resolve_git_commondir(
+                dir,
+                git_type,
+                self.0.read_control.as_ref(),
+            ) {
                 Ok(git_dir) => {
                     let (m, err) = create_gitignore(
                         &dir,
                         &git_dir,
                         &["info/exclude"],
                         self.0.opts.ignore_case_insensitive,
+                        self.0.read_control.clone(),
                     );
                     errs.maybe_push(err);
                     m
@@ -325,6 +341,7 @@ impl Ignore {
             }
         };
         let ig = IgnoreInner {
+            read_control: self.0.read_control.clone(),
             compiled: self.0.compiled.clone(),
             dir: dir.to_path_buf(),
             overrides: self.0.overrides.clone(),
@@ -589,6 +606,8 @@ impl<'a> Iterator for Parents<'a> {
 /// A builder for creating an Ignore matcher.
 #[derive(Clone, Debug)]
 pub(crate) struct IgnoreBuilder {
+    pub(crate) read_control:
+        Option<Arc<dyn crate::gitignore::FileReadControl>>,
     /// The root directory path for this ignore matcher.
     dir: PathBuf,
     /// An override matcher (default is empty).
@@ -621,6 +640,7 @@ impl IgnoreBuilder {
     /// abstraction and it's annoying to update tests.
     pub(crate) fn new() -> IgnoreBuilder {
         IgnoreBuilder {
+            read_control: None,
             dir: Path::new("").to_path_buf(),
             overrides: Arc::new(Override::empty()),
             types: Arc::new(Types::empty()),
@@ -659,6 +679,7 @@ impl IgnoreBuilder {
             Gitignore::empty()
         } else if let Some(ref cwd) = global_gitignores_relative_to {
             let mut builder = GitignoreBuilder::new(cwd);
+            builder.file_read_control(self.read_control.clone());
             builder
                 .case_insensitive(self.opts.ignore_case_insensitive)
                 .unwrap();
@@ -675,6 +696,7 @@ impl IgnoreBuilder {
         };
 
         Ignore(Arc::new(IgnoreInner {
+            read_control: self.read_control.clone(),
             compiled: Arc::new(RwLock::new(HashMap::new())),
             dir: self.dir.clone(),
             overrides: self.overrides.clone(),
@@ -849,8 +871,10 @@ pub(crate) fn create_gitignore<T: AsRef<OsStr>>(
     dir_for_ignorefile: &Path,
     names: &[T],
     case_insensitive: bool,
+    read_control: Option<Arc<dyn crate::gitignore::FileReadControl>>,
 ) -> (Gitignore, Option<Error>) {
     let mut builder = GitignoreBuilder::new(dir);
+    builder.file_read_control(read_control.clone());
     let mut errs = PartialErrorBuilder::default();
     builder.case_insensitive(case_insensitive).unwrap();
     for name in names {
@@ -867,7 +891,7 @@ pub(crate) fn create_gitignore<T: AsRef<OsStr>>(
         // makes sense on Windows.
         //
         // For more details: https://github.com/BurntSushi/ripgrep/pull/1381
-        if cfg!(windows) || gipath.exists() {
+        if read_control.is_some() || cfg!(windows) || gipath.exists() {
             errs.maybe_push_ignore_io(builder.add(gipath));
         }
     }
@@ -892,14 +916,15 @@ pub(crate) fn create_gitignore<T: AsRef<OsStr>>(
 fn resolve_git_commondir(
     dir: &Path,
     git_type: Option<FileType>,
+    read_control: Option<&Arc<dyn crate::gitignore::FileReadControl>>,
 ) -> Result<PathBuf, Option<Error>> {
     let git_dir_path = || dir.join(".git");
     let git_dir = git_dir_path();
     if !git_type.map_or(false, |ft| ft.is_file()) {
         return Ok(git_dir);
     }
-    let file = match File::open(git_dir) {
-        Ok(file) => io::BufReader::new(file),
+    let file = match crate::gitignore::read_input(&git_dir, read_control) {
+        Ok(file) => file,
         Err(err) => {
             return Err(Some(Error::Io(err).with_path(git_dir_path())));
         }
@@ -917,8 +942,11 @@ fn resolve_git_commondir(
     let real_git_dir = native_git_path(&dot_git_line[b"gitdir: ".len()..])
         .map_err(|err| Some(Error::Io(err).with_path(git_dir_path())))?;
     let git_commondir_file = || real_git_dir.join("commondir");
-    let file = match File::open(git_commondir_file()) {
-        Ok(file) => io::BufReader::new(file),
+    let file = match crate::gitignore::read_input(
+        &git_commondir_file(),
+        read_control,
+    ) {
+        Ok(file) => file,
         Err(_) => return Err(None),
     };
     let commondir_line = match file.split(b'\n').next() {

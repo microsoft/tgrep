@@ -1205,116 +1205,167 @@ impl State {
     }
 
     fn search(&self, entry: &Entry, query: &Value, files: bool, id: &Value) -> Result<Value> {
-        validate_query(query, files)?;
-        let scope = crate::serve::SearchScope::parse(query).map_err(anyhow::Error::msg)?;
-        let scoped_root = entry.view.root().join(&scope.prefix);
-        ensure!(scoped_root.is_dir(), "scope must be an existing directory");
-        ensure!(
-            super::worktree_root(&scoped_root)? == entry.view.root()
-                && fs::canonicalize(&scoped_root)?.starts_with(entry.view.root()),
-            "scope crosses a repository boundary"
-        );
-        let start = Instant::now();
         let metadata = json!({
             "root":entry.view.root(), "view":entry.id, "generation":entry.view.generation().key(),
             "ready":true, "hidden_complete":true, "backend":"shared-v1",
             "protocol":PROTOCOL, "instance":self.registration.instance,
             "repository":self.registration.repository
         });
-        let mut budget = crate::serve::JsonBudget {
-            remaining: MAX_RESPONSE as usize - 1024,
-        };
-        budget.charge(&json!({"jsonrpc":"2.0","id":id,"result":metadata}))?;
-        let (mut result, epoch) = if files {
-            let (paths, epoch) = self.query_snapshot(entry, |snapshot| -> Result<_> {
-                let mut paths = Vec::new();
-                for path in snapshot.files(&scope.prefix, scope.hidden) {
-                    if scope.relative(&path).is_some() {
-                        budget.charge(&path)?;
-                        paths.push(path);
-                    }
-                }
-                Ok((paths, snapshot.epoch()))
-            })??;
-            (json!({"files":paths, "epoch":epoch}), epoch)
-        } else {
-            let request = crate::serve::parse_search_params(query).map_err(anyhow::Error::msg)?;
-            let (paths, total, epoch) = self.query_snapshot(entry, |snapshot| {
-                (
-                    snapshot.candidates(&request.plan, &scope.prefix, scope.hidden),
-                    request.opts.stats.then(|| snapshot.files("", true).len()),
-                    snapshot.epoch(),
-                )
-            })?;
-            let raw_count = paths.len();
-            let paths: Vec<_> = paths
-                .into_iter()
-                .filter(|path| {
-                    scope.relative(path).is_some_and(|relative| {
-                        request.type_filter.matches(relative)
-                            && request.glob_filter.matches(relative)
-                    })
-                })
-                .collect();
-            let index_stats = json!({"query_plan":crate::search::plan_summary(&request.plan),
-                "raw_candidates":raw_count,"candidates":paths.len(),"total_files":total});
-            budget.charge(&index_stats)?;
-            let mut rows = Vec::new();
-            let mut stats = Vec::new();
-            for relative in &paths {
-                let read = (|| -> Result<Vec<u8>> {
-                    let file =
-                        self.query_snapshot(entry, |snapshot| snapshot.open_file(relative))??;
-                    ensure!(
-                        file.metadata()?.is_file(),
-                        "candidate is no longer a regular file: {relative}"
-                    );
-                    let mut bytes = Vec::new();
-                    file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-                    Ok(bytes)
-                })();
-                let bytes = match read {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        entry.view.invalidate_all()?;
-                        entry.metrics.lock().expect("metrics").error =
-                            Some(format!("reading shared candidate {relative}: {error:#}"));
-                        return Err(error.context(format!("reading shared candidate {relative}")));
-                    }
-                };
-                if bytes.len() > 64 * 1024 * 1024 {
-                    continue;
-                }
-                let decoded = crate::serve::DecodedFile::new(bytes, request.encoding);
-                let found = crate::serve::search_file_matches_bounded(
-                    relative,
-                    &decoded,
-                    &request.matcher,
-                    &request.opts,
-                    Some(&mut budget),
-                )?;
-                rows.extend(found.rows);
-                stats.extend(found.stats);
-            }
-            (
-                json!({
-                    "matches":rows, "file_stats":stats, "epoch":epoch,
-                    "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
-                    "index_stats":index_stats
-                }),
-                epoch,
-            )
-        };
-        ensure!(
-            self.query_snapshot(entry, |snapshot| snapshot.epoch() == epoch)?,
-            "view changed during query; retry or scan"
-        );
-        for (key, value) in metadata.as_object().expect("metadata object") {
-            result[key] = value.clone();
-        }
+        let result = search_snapshot(
+            &LegacyQuery { state: self, entry },
+            query,
+            files,
+            id,
+            metadata,
+        )?;
         entry.queries.fetch_add(1, Ordering::SeqCst);
         Ok(result)
     }
+}
+
+pub(super) trait QuerySource {
+    fn root(&self) -> &Path;
+    fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T>;
+    fn invalidate(&self, error: &anyhow::Error) -> Result<()>;
+    fn check(&self) -> Result<()> {
+        self.snapshot(|_| ())
+    }
+}
+
+struct LegacyQuery<'a> {
+    state: &'a State,
+    entry: &'a Entry,
+}
+
+impl QuerySource for LegacyQuery<'_> {
+    fn root(&self) -> &Path {
+        self.entry.view.root()
+    }
+    fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
+        self.state.query_snapshot(self.entry, read)
+    }
+    fn invalidate(&self, error: &anyhow::Error) -> Result<()> {
+        self.entry.view.invalidate_all()?;
+        self.entry.metrics.lock().expect("metrics").error =
+            Some(format!("reading shared candidate: {error:#}"));
+        Ok(())
+    }
+}
+
+pub(super) fn search_snapshot(
+    source: &impl QuerySource,
+    query: &Value,
+    files: bool,
+    id: &Value,
+    metadata: Value,
+) -> Result<Value> {
+    validate_query(query, files)?;
+    let scope = crate::serve::SearchScope::parse(query).map_err(anyhow::Error::msg)?;
+    let scoped_root = source.root().join(&scope.prefix);
+    ensure!(scoped_root.is_dir(), "scope must be an existing directory");
+    ensure!(
+        super::worktree_root(&scoped_root)? == source.root()
+            && fs::canonicalize(&scoped_root)?.starts_with(source.root()),
+        "scope crosses a repository boundary"
+    );
+    let start = Instant::now();
+    let mut budget = crate::serve::JsonBudget {
+        remaining: MAX_RESPONSE as usize - 1024,
+    };
+    budget.charge(&json!({"jsonrpc":"2.0","id":id,"result":metadata}))?;
+    let (mut result, epoch) = if files {
+        let (paths, epoch) = source.snapshot(|snapshot| -> Result<_> {
+            let mut paths = Vec::new();
+            for path in snapshot.files(&scope.prefix, scope.hidden) {
+                if scope.relative(&path).is_some() {
+                    budget.charge(&path)?;
+                    paths.push(path);
+                }
+            }
+            Ok((paths, snapshot.epoch()))
+        })??;
+        (json!({"files":paths, "epoch":epoch}), epoch)
+    } else {
+        let request = crate::serve::parse_search_params(query).map_err(anyhow::Error::msg)?;
+        let (paths, total, epoch) = source.snapshot(|snapshot| {
+            (
+                snapshot.candidates(&request.plan, &scope.prefix, scope.hidden),
+                request.opts.stats.then(|| snapshot.files("", true).len()),
+                snapshot.epoch(),
+            )
+        })?;
+        let raw_count = paths.len();
+        let paths: Vec<_> = paths
+            .into_iter()
+            .filter(|path| {
+                scope.relative(path).is_some_and(|relative| {
+                    request.type_filter.matches(relative) && request.glob_filter.matches(relative)
+                })
+            })
+            .collect();
+        let index_stats = json!({"query_plan":crate::search::plan_summary(&request.plan),
+                "raw_candidates":raw_count,"candidates":paths.len(),"total_files":total});
+        budget.charge(&index_stats)?;
+        let mut rows = Vec::new();
+        let mut stats = Vec::new();
+        for relative in &paths {
+            let read = (|| -> Result<Vec<u8>> {
+                let file = source.snapshot(|snapshot| snapshot.open_candidate(relative))??;
+                ensure!(
+                    file.metadata()?.is_file(),
+                    "candidate is no longer a regular file: {relative}"
+                );
+                let mut bytes = Vec::new();
+                let mut file = file.take(64 * 1024 * 1024 + 1);
+                let mut chunk = [0_u8; 64 * 1024];
+                loop {
+                    source.check()?;
+                    let count = file.read(&mut chunk)?;
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                Ok(bytes)
+            })();
+            let bytes = match read {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    source.invalidate(&error)?;
+                    return Err(error.context(format!("reading shared candidate {relative}")));
+                }
+            };
+            if bytes.len() > 64 * 1024 * 1024 {
+                continue;
+            }
+            let decoded = crate::serve::DecodedFile::new(bytes, request.encoding);
+            let found = crate::serve::search_file_matches_bounded(
+                relative,
+                &decoded,
+                &request.matcher,
+                &request.opts,
+                Some(&mut budget),
+            )?;
+            rows.extend(found.rows);
+            stats.extend(found.stats);
+        }
+        (
+            json!({
+                "matches":rows, "file_stats":stats, "epoch":epoch,
+                "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
+                "index_stats":index_stats
+            }),
+            epoch,
+        )
+    };
+    ensure!(
+        source.snapshot(|snapshot| snapshot.epoch() == epoch)?,
+        "view changed during query; retry or scan"
+    );
+    for (key, value) in metadata.as_object().expect("metadata object") {
+        result[key] = value.clone();
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

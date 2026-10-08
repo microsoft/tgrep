@@ -163,9 +163,40 @@ pub fn check_next_byte(masks: &TrigramMasks, next_byte: u8) -> bool {
 /// merging masks per trigram. This is the standard extraction used by both
 /// the on-disk builder and the live index overlay.
 pub fn extract_merged_masks(content: &[u8]) -> TrigramMaskMap {
+    extract_merged_masks_inner(content, |_, _| Ok::<(), std::convert::Infallible>(()))
+        .unwrap_or_else(|never| match never {})
+}
+
+pub(crate) fn extract_merged_masks_controlled(
+    content: &[u8],
+    permit: &std::sync::Arc<crate::managed::WorkPermit>,
+    memory: &mut crate::managed::work::MemoryCharge,
+) -> crate::managed::Result<TrigramMaskMap> {
+    let mut charged = 0_u64;
+    extract_merged_masks_inner(content, |map, windows| {
+        permit.check()?;
+        let bytes = (map.len() as u64)
+            .checked_add(windows as u64 * 2)
+            .and_then(|keys| keys.checked_add(1))
+            .and_then(u64::checked_next_power_of_two)
+            .and_then(|capacity| capacity.checked_mul(64))
+            .ok_or_else(|| crate::managed::Error::pressure("trigram-table-memory-overflow"))?;
+        if bytes > charged {
+            memory.grow(bytes - charged)?;
+            charged = bytes;
+        }
+        Ok(())
+    })
+}
+
+fn extract_merged_masks_inner<E>(
+    content: &[u8],
+    mut check: impl FnMut(&TrigramMaskMap, usize) -> std::result::Result<(), E>,
+) -> std::result::Result<TrigramMaskMap, E> {
     let mut per_tri = TrigramMaskMap::default();
+    check(&per_tri, 0)?;
     if content.len() < 3 {
-        return per_tri;
+        return Ok(per_tri);
     }
 
     // Folding the case conversion into the window rather than materialising a
@@ -184,10 +215,20 @@ pub fn extract_merged_masks(content: &[u8]) -> TrigramMaskMap {
     // second pass's hash and probe into a single extra `|=` on an entry that is
     // already in hand, and leaves genuine work only for windows that actually
     // contain an uppercase byte.
-    let has_upper = content.iter().any(|byte| byte.is_ascii_uppercase());
+    let mut has_upper = false;
+    for chunk in content.chunks(64 * 1024) {
+        check(&per_tri, 0)?;
+        if chunk.iter().any(|byte| byte.is_ascii_uppercase()) {
+            has_upper = true;
+            break;
+        }
+    }
     let len = content.len();
 
     for (i, window) in content.windows(3).enumerate() {
+        if i % 1024 == 0 {
+            check(&per_tri, (len - 2 - i).min(1024))?;
+        }
         let trigram = hash(window[0], window[1], window[2]);
         let loc = loc_bit(i);
         let next = if i + 3 < len {
@@ -232,7 +273,7 @@ pub fn extract_merged_masks(content: &[u8]) -> TrigramMaskMap {
         lowered_entry.next_mask |= next_lowered;
     }
 
-    per_tri
+    Ok(per_tri)
 }
 
 /// Extract trigrams from a string pattern (for query planning).
@@ -249,6 +290,42 @@ pub fn is_binary(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_extraction_preserves_masks_and_checks_bounded_batches() {
+        let bytes = b"MixedCase\xC3\xBC Text\n".repeat(12_000);
+        let mut batches = Vec::new();
+        let masks = extract_merged_masks_inner(&bytes, |_, windows| {
+            batches.push(windows);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(masks, merged_masks_via_materialised_copy(&bytes));
+        assert!(batches.iter().all(|windows| *windows <= 1024));
+        assert_eq!(batches.iter().sum::<usize>(), bytes.len() - 2);
+        let mut batches = 0;
+        let cancelled = extract_merged_masks_inner(&bytes, |_, windows| {
+            batches += usize::from(windows != 0);
+            if batches == 3 {
+                Err("cancelled")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(cancelled, Err("cancelled"));
+        assert_eq!(batches, 3);
+        let lowercase = vec![b'a'; 256 * 1024];
+        let mut checks = 0;
+        let cancelled = extract_merged_masks_inner(&lowercase, |_, _| {
+            checks += 1;
+            if checks == 3 {
+                Err("cancelled")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(cancelled, Err("cancelled"));
+    }
 
     #[test]
     fn test_hash_packing() {

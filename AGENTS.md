@@ -99,7 +99,27 @@ A linked worktree also indexes its ordinary `.git` pointer file in the private
 overlay; it is visible with `--hidden`, unlike a real Git metadata directory.
 See [shared mode](README.md#shared-repository-daemon-opt-in) for budgets, profile
 compatibility and retain-all storage. The runtime owns process lifetime and
-offline cleanup; tgrep does not implement online GC.
+offline cleanup for this default v1 mode; its leases do not expire and its
+published cache is not collected.
+
+**Managed v2 is a separate opt-in.** A supervisor may supply `--shared-policy`
+to select the [managed lifecycle contract](SHARED_WORKTREE_INDEXES.md#managed-client-contract).
+Use `shared manage` to negotiate capabilities and effective policy, persist
+operation/lease tokens, register an instance-bound owner guard, and attach a
+versioned view. `shared owner-hold --claim <issued-claim.json>` retains ownership
+until stdin closes; supervise that process too. Do not replace its guard with a
+PID check or inactivity timeout. Unknown ownership proof protects the lease.
+Normal queries discover a ready managed attachment without new search flags.
+
+Managed advancement is version-checked and may be adaptive under explicit
+policy. Recover the authoritative current exact commit/version after a lost
+response or restart, rather than replaying the original starting commit as the
+current pin. New instances require new ownership and lease tokens. Detach all
+leases and wait for reader/root-handle drain before deleting the worktree.
+`shared discover` and `shared maintenance` inspect external namespaces even
+after Git is gone; collection requires explicit authorization and current
+versions. Never delete a cache directory as a substitute for managed collection.
+Legacy/unmanaged v1 storage remains retain-all.
 
 If your agent framework cannot keep a background process alive, skip `serve`
 and run `tgrep index .` instead. Searches then use the on-disk index. That

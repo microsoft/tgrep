@@ -1,3 +1,5 @@
+#![deny(unnameable_test_items)]
+
 /// tgrep — trigram-indexed grep with client/server architecture.
 ///
 /// Usage:
@@ -630,6 +632,10 @@ enum Command {
         #[arg(long, requires = "shared")]
         shared_storage: Option<PathBuf>,
 
+        /// Opt into the v2 lifecycle with an explicit validated policy JSON file.
+        #[arg(long, requires_all = ["shared", "shared_storage"], conflicts_with_all = ["shared_max_views", "shared_max_leases", "max_memory_mb", "max_cpu_percent"])]
+        shared_policy: Option<PathBuf>,
+
         /// Maximum shared views; native watches and hint slots are divided by this.
         #[arg(long, requires = "shared", default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=1024))]
         shared_max_views: u32,
@@ -1191,6 +1197,7 @@ fn run_cli() {
         Some(Command::Serve {
             path,
             shared_storage,
+            shared_policy,
             shared_max_views,
             shared_max_leases,
             no_watch,
@@ -1209,9 +1216,8 @@ fn run_cli() {
             let index_threads = cpu::index_thread_count(max_cpu_percent.unwrap_or(50));
             if cli.shared {
                 match shared_storage {
-                    Some(storage) => serve::shared::run(
-                        &path,
-                        serve::shared::Options {
+                    Some(storage) => {
+                        let options = serve::shared::Options {
                             storage: &storage,
                             no_watch,
                             watch_mode,
@@ -1220,8 +1226,12 @@ fn run_cli() {
                             hint_budget: watcher_queue_cap.unwrap_or(16384) as usize,
                             max_views: shared_max_views as usize,
                             max_leases: shared_max_leases as usize,
-                        },
-                    ),
+                        };
+                        match shared_policy {
+                            Some(policy) => serve::shared::run_managed(&path, options, &policy),
+                            None => serve::shared::run(&path, options),
+                        }
+                    }
                     None => Err(anyhow::anyhow!(
                         "serve --shared requires --shared-storage <existing external directory>"
                     )),

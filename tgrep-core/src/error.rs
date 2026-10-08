@@ -8,6 +8,7 @@ pub enum Error {
     IndexCorrupted(String),
     Regex(String),
     Server(String),
+    Managed(Box<crate::managed::Error>),
 }
 
 impl fmt::Display for Error {
@@ -19,6 +20,7 @@ impl fmt::Display for Error {
             Self::IndexCorrupted(msg) => write!(f, "corrupted index: {msg}"),
             Self::Regex(msg) => write!(f, "regex error: {msg}"),
             Self::Server(msg) => write!(f, "server error: {msg}"),
+            Self::Managed(error) => error.fmt(f),
         }
     }
 }
@@ -28,6 +30,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::Managed(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -42,6 +45,12 @@ impl From<std::io::Error> for Error {
 impl From<serde_json::Error> for Error {
     fn from(e: serde_json::Error) -> Self {
         Self::Json(e)
+    }
+}
+
+impl From<crate::managed::Error> for Error {
+    fn from(error: crate::managed::Error) -> Self {
+        Self::Managed(Box::new(error))
     }
 }
 

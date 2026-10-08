@@ -6,22 +6,22 @@ use std::io::{Read, Seek, SeekFrom};
 const DEADLINE: Duration = Duration::from_secs(30);
 
 // File-backed output cannot deadlock on a full pipe while waiting for a child.
-struct Process {
+pub(super) struct Process {
     child: Child,
-    stdout: fs::File,
-    stderr: fs::File,
+    stdout: tempfile::NamedTempFile,
+    stderr: tempfile::NamedTempFile,
 }
 
 impl Process {
-    fn start(command: &mut Command) -> Self {
-        let stdout = tempfile::tempfile().unwrap();
-        let stderr = tempfile::tempfile().unwrap();
-        let child = command
-            .stdin(Stdio::piped())
-            .stdout(stdout.try_clone().unwrap())
-            .stderr(stderr.try_clone().unwrap())
-            .spawn()
-            .unwrap();
+    pub(super) fn start(command: &mut Command) -> Self {
+        let stdout = tempfile::NamedTempFile::new().unwrap();
+        let stderr = tempfile::NamedTempFile::new().unwrap();
+        let child = spawn(
+            command
+                .stdin(Stdio::piped())
+                .stdout(stdout.reopen().unwrap())
+                .stderr(stderr.reopen().unwrap()),
+        );
         Self {
             child,
             stdout,
@@ -29,7 +29,7 @@ impl Process {
         }
     }
 
-    fn cancel(&mut self) {
+    pub(super) fn cancel(&mut self) {
         if self.child.try_wait().unwrap().is_none()
             && let Err(error) = self.child.kill()
         {
@@ -42,7 +42,7 @@ impl Process {
         self.child.wait().unwrap();
     }
 
-    fn finish(&mut self, timeout: Duration) -> Result<Output, String> {
+    pub(super) fn finish(&mut self, timeout: Duration) -> Result<Output, String> {
         let started = Instant::now();
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
@@ -65,11 +65,34 @@ impl Process {
         }
     }
 
-    fn read(file: &mut fs::File) -> Vec<u8> {
+    fn read(file: &mut tempfile::NamedTempFile) -> Vec<u8> {
+        let file = file.as_file_mut();
         file.seek(SeekFrom::Start(0)).unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         bytes
+    }
+
+    #[cfg(feature = "managed-test-hooks")]
+    pub(super) fn stdout(&mut self) -> Vec<u8> {
+        Self::read(&mut self.stdout)
+    }
+
+    #[cfg(feature = "managed-test-hooks")]
+    pub(super) fn running(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+
+    pub(super) fn send(&mut self, line: &str) {
+        #[cfg(feature = "managed-test-hooks")]
+        writeln!(self.child.stdin().expect("owned input"), "{line}").unwrap();
+        #[cfg(not(feature = "managed-test-hooks"))]
+        writeln!(self.child.stdin.as_mut().expect("owned input"), "{line}").unwrap();
+    }
+
+    #[cfg(feature = "managed-test-hooks")]
+    pub(super) fn close_input(&mut self) {
+        self.child.close_stdin();
     }
 }
 
@@ -204,7 +227,7 @@ impl Client {
     }
 
     fn end(&mut self) {
-        writeln!(self.process.child.stdin.as_mut().unwrap(), "detach").unwrap();
+        self.process.send("detach");
         success(self.process.finish(DEADLINE).unwrap());
     }
 }

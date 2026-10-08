@@ -3,8 +3,78 @@
 [`scripts/benchmark_shared.py`](scripts/benchmark_shared.py) compares **one ordinary
 server and index per worktree** against **one repository daemon with private
 views**. This is separate from the [large-repository search benchmarks](BENCHMARKS.md).
-It measures the currently implemented sharing, not a proposed cache, base
-migration, garbage collector, or runtime integration.
+The historical measurements below cover legacy v1 sharing, not managed
+migration/collection or runtime integration. The separate
+[managed lifecycle protocol](#managed-lifecycle-measurements) qualifies the
+new lifecycle without relabeling these baseline results.
+
+## Managed lifecycle measurements
+
+[`managed_performance.rs`](tgrep-cli/tests/shared_daemon/managed_performance.rs)
+uses real managed daemons and public versioned RPC with independent CLI/scan
+parity checks. It measures a bounded representative workload, not a
+machine-independent latency/storage threshold or a replacement for the historical
+ordinary-versus-v1 comparison below.
+
+The normal functional test uses twelve 1024-byte generated files per repository
+and injected lifecycle barriers to prove query progress while preparation and
+retirement are paused. Do **not** publish its debug/barrier durations as
+performance. The deliberate ignored release test uses 256 files of 4096 bytes
+per repository with no injected pauses. See the
+[exact invocation](CONTRIBUTING.md#native-lifecycle-measurements).
+
+| Phase | Observations and correctness gates |
+| --- | --- |
+| Fresh initialization | Two independent daemons under one external cache parent; routing-ready time and attach-to-reconciled-ready time recorded separately |
+| Shared worktrees | Four initial ready views; first attachments publish, subsequent attachments reuse with zero generation blob reads; private reconciliation still reads actual contents |
+| Successor build | A fifth worktree changes the first quarter of generated files; unrelated ready views answer shared-v2 queries during observed work |
+| Migration | Two existing views atomically advance to that exact published successor; generation reuse and zero blob reads are required |
+| Collection | A bounded 1-byte retention target makes obsolete data eligible; physical removal and exact nonzero reclaimed-byte receipts are required while ready views continue serving |
+| Warm initialization | Release/drain, stop and restart; exact successor reuse, zero generation blob reads and scan parity before accepting readiness |
+
+Periodic maintenance remains enabled in the sibling namespace during explicit
+collection. The collecting namespace temporarily disables/drains scheduled
+collection so receipt measurements do not accidentally attribute an automatic
+pass's work to a requested pass; its configured policy is restored afterward.
+The target is deliberately below protected data, so it is not asserted as an
+achievable final cache size.
+
+Each schema-1 JSON report records:
+
+- Source-input fingerprints, exact executable BLAKE3, available Git revision,
+  tool versions, architecture, available parallelism, filesystem type, build
+  profile and presence of test hooks.
+- End-to-end observed operation times and query sample count/min/p50/p95/max/mean.
+  Queries include fresh-connection lookup plus search RPC, not CLI spawn time.
+  Observation overhead is included. Small sample p95 is descriptive, not a
+  statistically robust tail estimate.
+- Actual generation build/reuse, blob read/byte/extraction and posting reuse
+  counters, plus private reconciliation counters. Published-generation and
+  checkpoint logical sizes are sealed output sizes, **not** physical device I/O,
+  sort spill or repeated write volume.
+- Storage, mappings, retained-private estimates and reservation sample maxima
+  during cold/warm attachment and every work phase. These are sampled lower
+  bounds, not an unsampled global peak. `charged_overlap_logical_bytes` is a
+  current charge at each observation, not intrinsically a peak counter.
+- Native daemon resident current/peak and private-memory observations. Windows
+  exposes private committed high-water; Linux private anonymous-resident
+  high-water is sampled; unsupported macOS private memory is explicitly
+  unavailable. These are process measurements, not per-namespace physical
+  attribution or a process-tree RSS cap. Git-child peak memory and physical
+  device I/O remain explicitly unavailable rather than invented zeros.
+- Every requested collection pass's actual examined/removed/pages/reclaimed
+  bytes, elapsed time and budget exhaustion flags. Staging/private/work-slot
+  reservations and observed retained-private charges must respect the effective
+  policy/allocation. Completed passes must honor their requested count/byte/page
+  bounds.
+
+The driver permits at most 512 sample batches per phase and 64 collection passes;
+polling has a 5 ms interval and phases have a 60-second safety deadline. A real
+operation may finish before a sample can prove overlap. Reports preserve that
+zero overlap count; deterministic functional barriers provide the separate
+progress proof. Fresh means a new managed store, **not** an OS cache purge.
+Measure stable final source on a quiet native host and retain exact reports;
+do not combine observations from different source hashes or overlapping builds.
 
 ## Measured baseline: 6 October 2026
 

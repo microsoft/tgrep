@@ -394,6 +394,8 @@ impl OwnedChild {
 
     #[cfg(target_os = "macos")]
     fn only_exited_leader_in_group(&mut self) -> Result<bool> {
+        // sys/proc_info.h selector; libc exposes proc_listpids but not this constant.
+        const PROC_PGRP_ONLY: libc::c_uint = 2;
         if !self.exited()? {
             return Ok(false);
         }
@@ -406,11 +408,11 @@ impl OwnedChild {
         // an otherwise empty group. Its locked group inventory includes zombies.
         // Two entries distinguish our sole unreaped leader from any other member
         // without a truncated inventory ever becoming proof of quiescence.
-        let mut members = [0 as libc::pid_t; 2];
+        let mut members: [libc::pid_t; 2] = [0; 2];
         let capacity = std::mem::size_of_val(&members);
         let copied = unsafe {
             libc::proc_listpids(
-                libc::PROC_PGRP_ONLY,
+                PROC_PGRP_ONLY,
                 id,
                 members.as_mut_ptr().cast(),
                 capacity as libc::c_int,

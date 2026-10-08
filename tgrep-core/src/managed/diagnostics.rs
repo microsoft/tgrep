@@ -29,6 +29,10 @@ pub struct PassDiagnostics {
     pub observed_duration_nanos: u64,
     pub completed_pass_logical_bytes_reclaimed: u64,
     pub completed_pass_recovered_logical_bytes: u64,
+    pub completed_pass_verification_bytes: u64,
+    pub completed_pass_proof_rows_verified: u64,
+    pub completed_pass_verification_pages: u64,
+    pub completed_pass_verification_restarts: u64,
     pub failure_categories: BTreeMap<String, u64>,
     pub last_successful_pass: Option<SuccessfulPass>,
 }
@@ -158,6 +162,29 @@ impl Pass<'_> {
     }
 
     pub(super) fn collection(mut self, result: &Result<CollectionProgress>) -> Result<()> {
+        if let Ok(progress) = result {
+            let mut observations = self
+                .observations
+                .lock()
+                .map_err(|_| Error::corrupt("maintenance observations poisoned"))?;
+            let pass = observations.pass(self.kind);
+            add(
+                &mut pass.completed_pass_verification_bytes,
+                progress.verification_bytes,
+            )?;
+            add(
+                &mut pass.completed_pass_proof_rows_verified,
+                progress.proof_rows_verified,
+            )?;
+            add(
+                &mut pass.completed_pass_verification_pages,
+                u64::from(progress.verification_pages),
+            )?;
+            add(
+                &mut pass.completed_pass_verification_restarts,
+                u64::from(progress.verification_restarts),
+            )?;
+        }
         match result {
             Ok(progress) => self.finish(
                 None,
@@ -249,6 +276,7 @@ impl Namespace {
     }
 
     pub fn maintenance_diagnostics(&self) -> Result<MaintenanceDiagnostics> {
+        let verification = self.verification_diagnostics()?;
         let observations = self
             .observations
             .lock()
@@ -265,6 +293,7 @@ impl Namespace {
                 "last_recovery_error":observations.recovery_error,
                 "last_catalog_error":observations.catalog_error,
                 "last_catalog_write":observations.catalog_write,
+                "verification": verification,
             }),
         })
     }

@@ -8,6 +8,7 @@
 mod accounting;
 mod adaptive;
 mod authentication;
+mod authentication_native;
 mod catalog;
 mod catalog_io;
 mod checkpoints;
@@ -30,6 +31,7 @@ pub mod policy;
 pub(crate) mod process;
 pub(crate) mod roots;
 pub(crate) mod storage;
+mod verification;
 mod views;
 pub(crate) mod work;
 

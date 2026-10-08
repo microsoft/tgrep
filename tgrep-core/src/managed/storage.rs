@@ -26,7 +26,31 @@ pub(crate) const SECURITY_BYTES: usize = 64 * 1024;
 
 impl Ownership {
     pub(crate) fn capture(file: &File) -> Result<Self> {
-        plain(&file.metadata()?, false)?;
+        Self::capture_with_link_state(file, false)
+    }
+
+    pub(crate) fn after_unlink(file: &File) -> Result<Self> {
+        Self::capture_with_link_state(file, true)
+    }
+
+    fn capture_with_link_state(file: &File, unlinked: bool) -> Result<Self> {
+        let metadata = file.metadata()?;
+        #[cfg(unix)]
+        if unlinked {
+            use std::os::unix::fs::MetadataExt;
+            if !metadata.is_file() || metadata.nlink() != 0 {
+                return Err(Error::corrupt(
+                    "unlinked verification handle has an unexpected type or links",
+                ));
+            }
+        } else {
+            plain(&metadata, false)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = unlinked;
+            plain(&metadata, false)?;
+        }
         let mut hash = blake3::Hasher::new();
         hash.update(b"tgrep/managed/member-ownership/v1\0");
         #[cfg(windows)]
@@ -406,6 +430,15 @@ impl Directory {
         self.open_native(name, write, false, false)
     }
 
+    pub(crate) fn open_verification_file(&self, name: &str) -> Result<File> {
+        if sqlite_file(name) {
+            return Err(Error::invalid(
+                "catalog files cannot be collected as ordinary members",
+            ));
+        }
+        self.open_native_options(name, true, false, false, true)
+    }
+
     /// Closing any independently opened descriptor releases this process's POSIX
     /// locks on that inode, including SQLite's database and shared-memory locks.
     pub(crate) fn observe_file(&self, name: &str) -> Result<FileObservation> {
@@ -474,10 +507,22 @@ impl Directory {
     }
 
     fn open_native(&self, name: &str, write: bool, create: bool, directory: bool) -> Result<File> {
+        self.open_native_options(name, write, create, directory, false)
+    }
+
+    fn open_native_options(
+        &self,
+        name: &str,
+        write: bool,
+        create: bool,
+        directory: bool,
+        protect_contents: bool,
+    ) -> Result<File> {
         component(name)?;
         self.verify()?;
         #[cfg(unix)]
         let file = {
+            let _ = protect_contents;
             use std::os::fd::{AsRawFd, FromRawFd};
             let name = std::ffi::CString::new(name).map_err(|_| Error::invalid("NUL in name"))?;
             let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
@@ -500,19 +545,25 @@ impl Directory {
         let file = {
             use std::os::windows::fs::OpenOptionsExt;
             use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
-                FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+                FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
             };
             let mut options = File::options();
             options
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-                .share_mode(
+                .share_mode(if protect_contents {
+                    FILE_SHARE_READ
+                } else {
                     FILE_SHARE_READ
                         | FILE_SHARE_WRITE
-                        | if directory { 0 } else { FILE_SHARE_DELETE },
-                );
+                        | if directory { 0 } else { FILE_SHARE_DELETE }
+                });
             if directory {
                 options.access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES);
+            } else if protect_contents {
+                use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+                options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE);
             } else {
                 options.read(true).write(write).create_new(create);
             }
@@ -546,6 +597,65 @@ impl Directory {
         }
         self.verify()?;
         Ok(file)
+    }
+
+    pub(crate) fn unlink_verified_file(
+        &self,
+        name: &str,
+        expected: &FileIdentity,
+        file: &File,
+    ) -> Result<()> {
+        component(name)?;
+        self.verify()?;
+        if FileIdentity::of(file)? != *expected || self.observe_file(name)?.identity != *expected {
+            return Err(Error::new(
+                ErrorCategory::StaleIdentity,
+                "deletion-target-replaced",
+                "the pinned and named deletion identities no longer agree",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+            };
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            // SAFETY: this is the original read/write/delete verification handle,
+            // with write/delete sharing excluded throughout authentication.
+            if unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileDispositionInfo,
+                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        #[cfg(not(windows))]
+        self.unlink(name, false)?;
+        Ok(())
+    }
+
+    pub(crate) fn confirm_unlinked_file(&self, name: &str) -> Result<()> {
+        match self.observe_file(name) {
+            Err(error) if error.source_io_kind() == Some(std::io::ErrorKind::NotFound) => {
+                self.sync()
+            }
+            Err(error) => Err(Error::new(
+                ErrorCategory::Busy,
+                "deletion-not-yet-observed",
+                format!("physical removal is not confirmed: {error}"),
+            )),
+            Ok(_) => Err(Error::new(
+                ErrorCategory::StaleIdentity,
+                "deletion-name-still-present",
+                "the deletion name remains or was recreated; reclaimed bytes are not confirmed",
+            )),
+        }
     }
 
     pub(crate) fn read_json<T: serde::de::DeserializeOwned>(

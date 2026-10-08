@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 
 use super::lifetime::{ActivityGuard, ObjectGuard};
-use super::storage::{Directory, allocated_bytes, file_change};
+use super::storage::{Directory, allocated_bytes};
 use super::{
     Error, ErrorCategory, FileRecord, Id, Measurement, Namespace, NamespaceHeader, NativePath,
     Result,
@@ -30,6 +30,7 @@ pub struct InventoryEntry {
     pub classification: String,
     pub logical_bytes: Measurement<u64>,
     pub allocated_bytes: Measurement<u64>,
+    pub content_authenticated: Measurement<bool>,
     pub error: Option<serde_json::Value>,
 }
 
@@ -205,6 +206,9 @@ impl Namespace {
                         allocated_bytes: Measurement::Unavailable {
                             reason: "not-safely-observed".into(),
                         },
+                        content_authenticated: Measurement::Unavailable {
+                            reason: "inspection-does-not-authenticate-payload".into(),
+                        },
                         error: Some(serde_json::to_value(error)?),
                     });
                 }
@@ -243,6 +247,9 @@ impl Namespace {
                 reason: "unowned-entry-not-opened".into(),
             },
             error: None,
+            content_authenticated: Measurement::Unavailable {
+                reason: "inspection-does-not-authenticate-payload".into(),
+            },
         };
         let Some(name) = native_name.to_str() else {
             return Ok((finding, None));
@@ -373,18 +380,25 @@ impl Namespace {
             }
         }
         let file = frame.directory.open_file(name, false)?;
-        if let Some(expected) = expected
-            && (super::FileIdentity::of(&file)? != expected.identity
+        if let Some(expected) = expected {
+            let _memory = self.verification_scratch(super::storage::SECURITY_BYTES as u64)?;
+            let length = file.metadata()?.len();
+            if super::FileIdentity::of(&file)? != expected.identity
+                || super::Ownership::capture(&file)? != expected.ownership
                 || (!expected.producer_open
-                    && expected.pending_length.is_none()
-                    && (file_change(&file)? != expected.change
-                        || file.metadata()?.len() != expected.logical_bytes)))
-        {
-            return Err(Error::new(
-                ErrorCategory::StaleIdentity,
-                "inventory-file-modified",
-                "owned file differs from its catalog evidence",
-            ));
+                    && length != expected.logical_bytes
+                    && !(expected.pending_length.filter(|length| *length != 0) == Some(length)
+                        && expected
+                            .seal
+                            .as_ref()
+                            .is_some_and(|seal| expected.pending_manifest == Some(seal.manifest))))
+            {
+                return Err(Error::new(
+                    ErrorCategory::StaleIdentity,
+                    "inventory-file-modified",
+                    "owned file differs from its catalog evidence",
+                ));
+            }
         }
         finding.classification = if matches!(frame.area, Area::Root) {
             let identity = super::FileIdentity::of(&file)?;

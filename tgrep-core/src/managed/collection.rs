@@ -46,6 +46,429 @@ mod tests {
         namespace.collect_pass(&operation.id, &request).unwrap()
     }
 
+    fn authenticated_fixture(
+        bytes: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        Arc<Namespace>,
+        ObjectRecord,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = crate::managed::policy::fixture_policy();
+        policy.collection.max_pages = 64;
+        policy.collection.chunk_bytes = 4096;
+        let namespace =
+            Namespace::initialize_identity(&"a".repeat(64), temp.path(), policy).unwrap();
+        namespace.activate().unwrap();
+        let operation = namespace
+            .accept_system_operation(
+                Token::parse("authentication-input").unwrap(),
+                "build",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let permit = namespace
+            .reserve(
+                &operation.id,
+                None,
+                WorkRequest {
+                    allocation_version: 1,
+                    staging_bytes: 1024 * 1024,
+                    private_bytes: 1024 * 1024,
+                    slots: 1,
+                },
+            )
+            .unwrap();
+        let (object, pin) = namespace
+            .create_object(ObjectKind::BuildStage, None, &permit)
+            .unwrap();
+        let path = pin.directory.path().join("payload.bin");
+        let mut writer = crate::managed::work::ChargedWriter::new(
+            Arc::clone(&pin),
+            "payload.bin",
+            Arc::clone(&permit),
+        )
+        .unwrap();
+        writer.write_all(bytes).unwrap();
+        writer.sync_all().unwrap();
+        drop((writer, pin, permit));
+        namespace
+            .transaction(|transaction| {
+                let mut object = object_row(transaction, &object.id)?;
+                object.state = ObjectState::Retired;
+                save_object(transaction, &mut object)
+            })
+            .unwrap();
+        let object = namespace.object(&object.id).unwrap();
+        (temp, namespace, object, path)
+    }
+
+    fn request_pass(
+        namespace: &Arc<Namespace>,
+        request: &CollectionRequest,
+        token: &str,
+    ) -> CollectionProgress {
+        let operation = namespace
+            .accept_system_operation(
+                Token::parse(token).unwrap(),
+                "collection",
+                serde_json::to_value(request).unwrap(),
+            )
+            .unwrap();
+        namespace.collect_pass(&operation.id, request).unwrap()
+    }
+
+    #[test]
+    fn timestamp_drift_is_not_authority_and_original_payload_still_collects() {
+        let (_temp, namespace, object, path) = authenticated_fixture(&[b'a'; 8193]);
+        let file = File::options().write(true).open(&path).unwrap();
+        let before = super::super::storage::file_change(&file).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000)),
+        )
+        .unwrap();
+        assert_ne!(super::super::storage::file_change(&file).unwrap(), before);
+        drop(file);
+        let result = pass(&namespace, "changed-timestamp");
+        assert_eq!(result.errors, 0, "{result:?}");
+        assert_eq!(result.removed, 1);
+        assert_eq!(result.logical_bytes_reclaimed, object.logical_bytes);
+        assert!(result.verification_bytes >= 8193);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn discarded_verification_restarts_before_accepting_a_changed_earlier_prefix() {
+        let original = vec![b'a'; 128 * 1024 + 17];
+        let (_temp, namespace, _object, path) = authenticated_fixture(&original);
+        let mut request = CollectionRequest {
+            policy_version: 1,
+            allocation_version: 1,
+            bounds: CollectionBounds {
+                max_duration_ms: 1000,
+                max_examined: 1,
+                max_removed: 1,
+                max_delete_bytes: 4096,
+                max_pages: 1,
+            },
+            cursor: None,
+        };
+        let mut bytes = 0;
+        for sequence in 0..8 {
+            let result = request_pass(&namespace, &request, &format!("prefix-{sequence}"));
+            assert_eq!(result.errors, 0, "{result:?}");
+            assert_eq!(result.logical_bytes_reclaimed, 0);
+            assert!(result.verification_bytes <= 4096);
+            bytes += result.verification_bytes;
+            request.cursor = result.next;
+            if result.verification_context_retained && bytes >= 4096 {
+                break;
+            }
+        }
+        assert_eq!(bytes, 4096);
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"],
+            4096
+        );
+        assert!(namespace.discard_idle_verification(false).unwrap());
+        let mut writer = File::options().write(true).open(&path).unwrap();
+        writer.write_all(b"changed prefix").unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        let result = request_pass(&namespace, &request, "changed-prefix");
+        assert_eq!(result.errors, 1, "{result:?}");
+        assert_eq!(
+            result.logical_bytes_reclaimed + result.recovered_logical_bytes,
+            0
+        );
+        assert!(!result.verification_context_retained);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            original.len() as u64
+        );
+        assert!(std::fs::read(&path).unwrap().starts_with(b"changed prefix"));
+    }
+
+    #[test]
+    fn missing_or_corrupt_producer_rows_never_authorize_destructive_io() {
+        for missing in [false, true] {
+            let original = [b'a'; 8192];
+            let (_temp, namespace, object, path) = authenticated_fixture(&original);
+            namespace.transaction(|transaction| {
+                transaction.execute(if missing {
+                    "DELETE FROM member_seals WHERE object_id=?1 AND name='payload.bin' AND block_index=0"
+                } else {
+                    "UPDATE member_seals SET digest=zeroblob(32) WHERE object_id=?1 AND name='payload.bin' AND block_index=0"
+                }, [object.id.as_str()])?;
+                Ok(())
+            }).unwrap();
+            let result = pass(&namespace, "invalid-proof");
+            assert_eq!(result.errors, 1, "{result:?}");
+            assert_eq!(
+                result.logical_bytes_reclaimed + result.recovered_logical_bytes,
+                0
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn ownership_mutation_at_verified_page_and_final_validation_barriers_has_zero_credit() {
+        for point in [Point::MemberVerificationPage, Point::MemberBeforeIo] {
+            let original = vec![b'a'; 96 * 1024];
+            let (_temp, namespace, _object, path) = authenticated_fixture(&original);
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            let mut changed = permissions.clone();
+            changed.set_readonly(true);
+            let fault = namespace
+                .install_test_fault(Specification {
+                    point,
+                    operation: None,
+                    skip_hits: 0,
+                    action: Action::Pause { timeout_ms: 10_000 },
+                })
+                .unwrap();
+            let result = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| pass(&namespace, "ownership-barrier"));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut reached = false;
+                while Instant::now() < deadline {
+                    if namespace.test_fault_status().unwrap().unwrap().stage
+                        == crate::managed::faults::Stage::Waiting
+                    {
+                        reached = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let mutation = std::fs::set_permissions(&path, changed);
+                namespace.release_test_fault(&fault.ticket).unwrap();
+                let result = worker.join().unwrap();
+                assert!(
+                    reached,
+                    "required native validation boundary was not exercised"
+                );
+                mutation.unwrap();
+                result
+            });
+            std::fs::set_permissions(&path, permissions).unwrap();
+            assert_eq!(result.errors, 1, "{point:?}: {result:?}");
+            assert_eq!(
+                result.logical_bytes_reclaimed + result.recovered_logical_bytes,
+                0
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn payload_rewrite_with_all_basic_timestamps_restored_is_not_authenticated() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+            SetFileInformationByHandle,
+        };
+        let original = [b'a'; 8192];
+        let (_temp, namespace, _object, path) = authenticated_fixture(&original);
+        let mut file = File::options().read(true).write(true).open(&path).unwrap();
+        let mut before: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: the owned fixture handle and matching native output structure.
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileBasicInfo,
+                    (&mut before as *mut FILE_BASIC_INFO).cast(),
+                    std::mem::size_of_val(&before) as u32,
+                )
+            },
+            0
+        );
+        file.write_all(&[b'b'; 8192]).unwrap();
+        file.sync_all().unwrap();
+        // SAFETY: restore only this disposable fixture's previously observed basic information.
+        assert_ne!(
+            unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    FileBasicInfo,
+                    (&before as *const FILE_BASIC_INFO).cast(),
+                    std::mem::size_of_val(&before) as u32,
+                )
+            },
+            0
+        );
+        drop(file);
+        let file = File::open(&path).unwrap();
+        let mut after: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: the owned fixture handle and matching native output structure.
+        assert_ne!(
+            unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileBasicInfo,
+                    (&mut after as *mut FILE_BASIC_INFO).cast(),
+                    std::mem::size_of_val(&after) as u32,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            [
+                after.CreationTime,
+                after.LastAccessTime,
+                after.LastWriteTime,
+                after.ChangeTime,
+                i64::from(after.FileAttributes)
+            ],
+            [
+                before.CreationTime,
+                before.LastAccessTime,
+                before.LastWriteTime,
+                before.ChangeTime,
+                i64::from(before.FileAttributes)
+            ]
+        );
+        drop(file);
+        let result = pass(&namespace, "restored-all-timestamps");
+        assert_eq!(result.errors, 1, "{result:?}");
+        assert_eq!(
+            result.logical_bytes_reclaimed + result.recovered_logical_bytes,
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), [b'b'; 8192]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_detects_late_prefix_writes_before_validation_and_after_own_io() {
+        for (point, skip_hits) in [
+            (Point::MemberVerificationPage, 1),
+            (Point::MemberBeforeIo, 0),
+            (Point::MemberAfterIo, 0),
+        ] {
+            let original = vec![b'a'; 96 * 1024];
+            let (_temp, namespace, _object, path) = authenticated_fixture(&original);
+            let fault = namespace
+                .install_test_fault(Specification {
+                    point,
+                    operation: None,
+                    skip_hits,
+                    action: Action::Pause { timeout_ms: 10_000 },
+                })
+                .unwrap();
+            let result = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| pass(&namespace, "macos-prefix-barrier"));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut reached = false;
+                while Instant::now() < deadline {
+                    if namespace.test_fault_status().unwrap().unwrap().stage
+                        == crate::managed::faults::Stage::Waiting
+                    {
+                        reached = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let mutation = (|| -> std::io::Result<()> {
+                    let mut writer = File::options().write(true).open(&path)?;
+                    let modified = writer.metadata()?.modified()?;
+                    writer.write_all(b"changed previously verified prefix")?;
+                    writer.sync_all()?;
+                    writer.set_times(std::fs::FileTimes::new().set_modified(modified))?;
+                    Ok(())
+                })();
+                namespace.release_test_fault(&fault.ticket).unwrap();
+                let result = worker.join().unwrap();
+                assert!(
+                    reached,
+                    "the required native content boundary was not exercised"
+                );
+                mutation.unwrap();
+                result
+            });
+            assert_eq!(result.errors, 1, "{point:?}: {result:?}");
+            assert_eq!(
+                result.logical_bytes_reclaimed + result.recovered_logical_bytes,
+                0
+            );
+            assert!(!result.verification_context_retained);
+            let recovered = pass(&namespace, "macos-prefix-recovery");
+            assert_eq!(recovered.errors, 1, "{point:?}: {recovered:?}");
+            assert_eq!(
+                recovered.logical_bytes_reclaimed + recovered.recovered_logical_bytes,
+                0
+            );
+            assert!(
+                std::fs::read(&path)
+                    .unwrap()
+                    .starts_with(b"changed previously verified prefix")
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn benign_owned_ea_changes_require_content_authentication_without_an_ea_allowlist() {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct IoStatus {
+            status: usize,
+            information: usize,
+        }
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtSetEaFile(
+                file: *mut std::ffi::c_void,
+                status: *mut IoStatus,
+                buffer: *const std::ffi::c_void,
+                length: u32,
+            ) -> i32;
+        }
+        let original = [b'a'; 8192];
+        let (_temp, namespace, object, path) = authenticated_fixture(&original);
+        let file = File::options().read(true).write(true).open(&path).unwrap();
+        let before = super::super::storage::file_change(&file).unwrap();
+        let ownership = super::super::Ownership::capture(&file).unwrap();
+        let name = b"TGREP_TEST_STAMP";
+        let value = b"owned fixture only";
+        let mut bytes = vec![0_u8; 8];
+        bytes[5] = name.len() as u8;
+        bytes[6..8].copy_from_slice(&(value.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.push(0);
+        bytes.extend_from_slice(value);
+        let mut status = IoStatus {
+            status: 0,
+            information: 0,
+        };
+        // SAFETY: one fully encoded bounded EA for an owned disposable fixture,
+        // with a synchronous live handle and native status output.
+        assert_eq!(
+            unsafe {
+                NtSetEaFile(
+                    file.as_raw_handle(),
+                    &mut status,
+                    bytes.as_ptr().cast(),
+                    bytes.len() as u32,
+                )
+            },
+            0
+        );
+        assert_eq!(super::super::Ownership::capture(&file).unwrap(), ownership);
+        assert_ne!(super::super::storage::file_change(&file).unwrap(), before);
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let result = pass(&namespace, "benign-ea");
+        assert_eq!(result.errors, 0, "{result:?}");
+        assert_eq!(result.logical_bytes_reclaimed, object.logical_bytes);
+        assert_eq!(result.removed, 1);
+        assert!(result.verification_bytes >= original.len() as u64);
+    }
+
     #[test]
     fn single_page_passes_resume_member_deletion_without_spending_the_page_on_a_cached_id() {
         let temp = tempfile::tempdir().unwrap();
@@ -320,7 +743,14 @@ mod tests {
 
     #[test]
     fn pending_intent_preserves_unexpected_mutations_and_recovers_only_its_exact_truncation() {
-        for changed_length in [8192, 8193, 4095, 0, 4096] {
+        for (changed_length, authentic_truncation) in [
+            (8192, false),
+            (8193, false),
+            (4095, false),
+            (0, false),
+            (4096, true),
+            (4096, false),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let mut policy = crate::managed::policy::fixture_policy();
             policy.collection.chunk_bytes = 4096;
@@ -384,7 +814,7 @@ mod tests {
                 .join("objects")
                 .join(object.id.as_str())
                 .join("payload.bin");
-            if changed_length == 4096 {
+            if authentic_truncation {
                 let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
                 file.set_len(changed_length).unwrap();
                 file.sync_all().unwrap();
@@ -392,7 +822,7 @@ mod tests {
                 std::fs::write(&path, vec![b'b'; changed_length as usize]).unwrap();
             }
             let resumed = pass(&namespace, "resume");
-            if changed_length == 4096 {
+            if authentic_truncation {
                 assert_eq!(resumed.errors, 0, "{resumed:?}");
                 assert_eq!(resumed.recovered_logical_bytes, 4096);
                 assert_eq!(
@@ -577,6 +1007,11 @@ pub struct CollectionProgress {
     pub removed: u32,
     pub recovered_objects: u32,
     pub pages: u32,
+    pub verification_bytes: u64,
+    pub proof_rows_verified: u64,
+    pub verification_pages: u32,
+    pub verification_restarts: u32,
+    pub verification_context_retained: bool,
     pub logical_bytes_reclaimed: u64,
     pub allocated_bytes_reclaimed: u64,
     pub recovered_logical_bytes: u64,
@@ -931,13 +1366,19 @@ impl Namespace {
             return Err(Error::stale_version(allocation.version));
         }
         request.bounds.validate(&policy.policy.collection)?;
-        let _permit = self.reserve(
+        let mut verification = self.active_verification()?;
+        let permit = self.reserve(
             operation,
             None,
             super::WorkRequest {
                 allocation_version: allocation.version,
                 staging_bytes: 0,
-                private_bytes: 2 * 1024 * 1024,
+                private_bytes: 2 * 1024 * 1024
+                    - if verification.context.is_some() {
+                        super::verification::MEMORY_BYTES
+                    } else {
+                        0
+                    },
                 slots: 1,
             },
         )?;
@@ -1034,8 +1475,16 @@ impl Namespace {
             }
             progress.next = Some(cursor.clone());
             self.save_collection_progress(operation, &progress, false)?;
-            let result =
-                self.collect_object(operation, &id, &request.bounds, &mut progress, deadline);
+            let result = self.collect_object(
+                &id,
+                &mut super::verification::Pass {
+                    request,
+                    progress: &mut progress,
+                    permit: &permit,
+                    deadline,
+                    context: &mut verification.context,
+                },
+            );
             match result {
                 Ok(true) => {
                     cursor.current = None;
@@ -1047,6 +1496,13 @@ impl Namespace {
                 }
                 Ok(false) => break,
                 Err(error) => {
+                    if verification.context.take().is_some() {
+                        progress.verification_restarts += 1;
+                    }
+                    if error.category == ErrorCategory::Cancelled {
+                        progress.cancelled = true;
+                        break;
+                    }
                     if error.reason_code == "collection-journal-update"
                         || (matches!(error.category, ErrorCategory::CorruptMetadata)
                             && error.reason_code == "catalog-io")
@@ -1089,24 +1545,25 @@ impl Namespace {
         );
         progress.elapsed_budget_exceeded =
             Some(start.elapsed() > Duration::from_millis(request.bounds.max_duration_ms));
+        if progress.cancelled {
+            verification.context.take();
+        }
+        progress.verification_context_retained = verification.context.is_some();
         self.save_collection_progress(operation, &progress, true)?;
+        verification.keep = !progress.cancelled;
         Ok(progress)
     }
 
-    fn collect_object(
-        &self,
-        operation: &Id,
-        id: &Id,
-        bounds: &CollectionBounds,
-        progress: &mut CollectionProgress,
-        deadline: Instant,
-    ) -> Result<bool> {
+    fn collect_object(&self, id: &Id, pass: &mut super::verification::Pass<'_>) -> Result<bool> {
+        let operation = pass.permit.operation_id().clone();
+        let operation = &operation;
+        let bounds = &pass.request.bounds;
         let object = self.object(id)?;
         if object.state == ObjectState::Removed {
             return Ok(true);
         }
         if object.state == ObjectState::PendingDeletion
-            && self.finish_missing_container(operation, &object, progress)?
+            && self.finish_missing_container(operation, &object, pass.progress, pass.permit)?
         {
             return Ok(true);
         }
@@ -1116,15 +1573,15 @@ impl Namespace {
                 if error.category == ErrorCategory::Busy
                     && error.reason_code == "object-readers-active" =>
             {
-                progress.skipped += 1;
-                if progress.details.len() < self.policy()?.policy.work.page_objects as usize {
-                    progress.details.push(CollectionSkip {
+                pass.progress.skipped += 1;
+                if pass.progress.details.len() < self.policy()?.policy.work.page_objects as usize {
+                    pass.progress.details.push(CollectionSkip {
                         object: id.clone(),
                         reasons: vec![error.reason_code],
                         error: None,
                     });
                 } else {
-                    progress.omitted_skip_details += 1;
+                    pass.progress.omitted_skip_details += 1;
                 }
                 return Ok(true);
             }
@@ -1133,15 +1590,15 @@ impl Namespace {
         let mut object = self.object(id)?;
         let eligibility = self.eligibility_locked(&object, true)?;
         if !eligibility.eligible {
-            progress.skipped += 1;
-            if progress.details.len() < self.policy()?.policy.work.page_objects as usize {
-                progress.details.push(CollectionSkip {
+            pass.progress.skipped += 1;
+            if pass.progress.details.len() < self.policy()?.policy.work.page_objects as usize {
+                pass.progress.details.push(CollectionSkip {
                     object: id.clone(),
                     reasons: eligibility.reasons,
                     error: None,
                 });
             } else {
-                progress.omitted_skip_details += 1;
+                pass.progress.omitted_skip_details += 1;
             }
             return Ok(true);
         }
@@ -1150,7 +1607,7 @@ impl Namespace {
             object.state,
             ObjectState::Retired | ObjectState::PendingDeletion
         ) {
-            self.collection_transaction(operation, progress, |transaction, progress| {
+            self.collection_transaction(operation, pass.progress, |transaction, progress| {
                 let references: bool = transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM refs WHERE target=?1)",
                     [id.as_str()],
@@ -1175,24 +1632,25 @@ impl Namespace {
             self.fault(super::faults::Point::ObjectWithdrawn, Some(operation))?;
         }
         if object.state == ObjectState::Retired {
-            self.collection_transaction(operation, progress, |transaction, _progress| {
+            self.collection_transaction(operation, pass.progress, |transaction, _progress| {
                 object.state = ObjectState::PendingDeletion;
                 save_object(transaction, &mut object)
             })?;
             self.fault(super::faults::Point::ObjectPendingDeletion, Some(operation))?;
         }
         loop {
-            if Instant::now() >= deadline
-                || progress.pages >= bounds.max_pages
-                || progress.logical_bytes_reclaimed >= bounds.max_delete_bytes
+            if Instant::now() >= pass.deadline
+                || pass.progress.pages >= bounds.max_pages
+                || pass.progress.logical_bytes_reclaimed >= bounds.max_delete_bytes
             {
                 return Ok(false);
             }
             if self.operation(operation)?.cancelled {
-                progress.cancelled = true;
+                pass.progress.cancelled = true;
                 return Ok(false);
             }
-            progress.pages += 1;
+            pass.recheck(self)?;
+            pass.progress.pages += 1;
             let member: Option<FileRecord> = self.read(|connection| {
                 let record: Option<String> = connection.query_row(
                     "SELECT record FROM members WHERE object_id=?1 AND json_extract(record,'$.removed')=0
@@ -1204,7 +1662,7 @@ impl Namespace {
             let Some(member) = member else {
                 break;
             };
-            if !self.delete_member(operation, &object, &directory, member, bounds, progress)? {
+            if !self.delete_member(&object, &directory, member, pass)? {
                 return Ok(false);
             }
         }
@@ -1228,9 +1686,9 @@ impl Namespace {
         // Catalog withdrawal already forbids new readers. Close our own handle
         // before confirming Windows has physically removed its lock file.
         drop(_guard);
-        self.remove_owned_control("guards", &format!("{id}.lock"))?;
+        self.remove_owned_control_with_permit("guards", &format!("{id}.lock"), Some(pass.permit))?;
         self.fault(super::faults::Point::GuardAfterRemove, Some(operation))?;
-        self.collection_transaction(operation, progress, |transaction, progress| {
+        self.collection_transaction(operation, pass.progress, |transaction, progress| {
             object.state = ObjectState::Removed;
             object.logical_bytes = 0;
             object.allocated_bytes = Measurement::Observed { value: 0 };
@@ -1248,6 +1706,7 @@ impl Namespace {
         operation: &Id,
         object: &ObjectRecord,
         progress: &mut CollectionProgress,
+        permit: &Arc<super::WorkPermit>,
     ) -> Result<bool> {
         match self.objects.child(object.id.as_str()) {
             Ok(_) => return Ok(false),
@@ -1279,10 +1738,10 @@ impl Namespace {
                 fs2::FileExt::try_lock_exclusive(&file)
                     .map_err(|error| lock_error(error, "recovery-reader-active"))?;
                 drop(file);
-                self.remove_owned_control("guards", &name)?;
+                self.remove_owned_control_with_permit("guards", &name, Some(permit))?;
             }
             Err(error) if error.source_io_kind() == Some(std::io::ErrorKind::NotFound) => {
-                self.remove_owned_control("guards", &name)?;
+                self.remove_owned_control_with_permit("guards", &name, Some(permit))?;
             }
             Err(error) => return Err(error),
         }
@@ -1343,57 +1802,77 @@ impl Namespace {
 
     fn delete_member(
         &self,
-        operation: &Id,
         object: &ObjectRecord,
         directory: &Directory,
         mut member: FileRecord,
-        bounds: &CollectionBounds,
-        progress: &mut CollectionProgress,
+        pass: &mut super::verification::Pass<'_>,
     ) -> Result<bool> {
-        let file = match directory.open_file(&member.name, true) {
-            Ok(file) => Some(file),
+        let operation = pass.permit.operation_id().clone();
+        let operation = &operation;
+        let seal = member.seal.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorCategory::RecoveryRequired,
+                "member-content-unsealed",
+                "producer content proof is missing",
+            )
+        })?;
+        seal.validate()?;
+        if member.pending_length.is_some() != member.pending_manifest.is_some()
+            || member
+                .pending_manifest
+                .is_some_and(|manifest| manifest != seal.manifest)
+        {
+            return Err(Error::new(
+                ErrorCategory::RecoveryRequired,
+                "deletion-intent-unauthenticated",
+                "a deletion intent without matching producer authentication cannot be recovered",
+            ));
+        }
+        let exists = match directory.observe_file(&member.name) {
+            Ok(_) => true,
             Err(error)
                 if member.pending_length == Some(0)
                     && error.source_io_kind() == Some(std::io::ErrorKind::NotFound) =>
             {
-                None
+                false
             }
             Err(error) => return Err(error),
         };
-        if let Some(file) = &file {
-            if FileIdentity::of(file)? != member.identity {
-                return Err(Error::new(
-                    ErrorCategory::StaleIdentity,
-                    "member-replaced",
-                    "refusing to delete a different physical member",
-                ));
-            }
-            let current = file.metadata()?.len();
-            let expected_truncation = member.pending_length.is_some_and(|target| {
-                target != 0 && target < member.logical_bytes && current == target
-            });
-            if !expected_truncation
-                && (super::storage::file_change(file)? != member.change
-                    || current != member.logical_bytes)
-            {
-                return Err(Error::new(
-                    ErrorCategory::StaleIdentity,
-                    "member-modified",
-                    "the inventoried file was externally modified and has been preserved",
-                ));
-            }
-        }
-        let current = file
+        let mut verification = pass.context.take();
+        if verification
             .as_ref()
-            .map(|file| file.metadata().map(|metadata| metadata.len()))
-            .transpose()?
-            .unwrap_or(0);
-        let remaining = bounds.max_delete_bytes - progress.logical_bytes_reclaimed;
-        let chunk = self.policy()?.policy.collection.chunk_bytes.min(remaining);
-        if current > chunk && chunk < 4096 {
-            return Ok(false);
+            .is_some_and(|context| !context.matches(&object.id, &member, pass.request))
+        {
+            verification.take();
+            pass.progress.verification_restarts += 1;
         }
-        let mut recovered = file.is_none();
+        if exists {
+            if verification.is_none() {
+                verification = Some(super::verification::Verification::new(
+                    self, directory, &object.id, &member, pass,
+                )?);
+            }
+            let ready = verification
+                .as_mut()
+                .expect("existing member owns a verifier")
+                .page(self, directory, pass)
+                .inspect_err(|_| {
+                    pass.progress.verification_restarts += 1;
+                })?;
+            if !ready || Instant::now() >= pass.deadline {
+                *pass.context = verification;
+                return Ok(pass.progress.pages < pass.request.bounds.max_pages
+                    && pass.progress.verification_bytes < pass.request.bounds.max_delete_bytes
+                    && Instant::now() < pass.deadline);
+            }
+        } else {
+            verification.take();
+        }
+        pass.recheck(self)?;
+        let current = verification
+            .as_ref()
+            .map_or(0, |context| context.current_length);
+        let mut recovered = !exists;
         if let Some(target) = member.pending_length
             && current < member.logical_bytes
         {
@@ -1404,25 +1883,39 @@ impl Namespace {
             }
             recovered = true;
         }
-        if !recovered && let Some(file) = file.as_ref() {
-            // Observe and journal the exact identity/length before destructive I/O.
-            let before_allocation = allocated_bytes(file)?;
-            let old_accounted = member.logical_bytes;
-            member.logical_bytes = current;
-            member.allocated_bytes = before_allocation;
-            member.pending_length = Some(current.saturating_sub(chunk));
-            self.collection_transaction(operation, progress, |transaction, _progress| {
-                let mut object = object_row(transaction, &object.id)?;
-                object.logical_bytes = object
-                    .logical_bytes
-                    .checked_sub(old_accounted)
-                    .and_then(|value| value.checked_add(current))
-                    .ok_or_else(|| Error::corrupt("pre-deletion accounting overflow"))?;
+        if !recovered {
+            let context = verification
+                .as_ref()
+                .ok_or_else(|| Error::corrupt("existing member has no authenticated handle"))?;
+            context.check(directory)?;
+            let remaining =
+                pass.request.bounds.max_delete_bytes - pass.progress.logical_bytes_reclaimed;
+            let chunk = self.policy()?.policy.collection.chunk_bytes.min(remaining);
+            let target = if current <= chunk {
+                0
+            } else {
+                current
+                    .saturating_sub(chunk)
+                    .div_ceil(super::authentication::BLOCK_BYTES as u64)
+                    .checked_mul(super::authentication::BLOCK_BYTES as u64)
+                    .ok_or_else(|| {
+                        Error::corrupt("authentication-aligned deletion length overflow")
+                    })?
+            };
+            if target >= current && current != 0 {
+                return Err(Error::pressure(
+                    "collection-byte-bound-below-authentication-block",
+                ));
+            }
+            member.allocated_bytes = allocated_bytes(&context.native.file)?;
+            member.pending_length = Some(target);
+            member.pending_manifest = Some(seal.manifest);
+            self.collection_transaction(operation, pass.progress, |transaction, _progress| {
                 transaction.execute(
                     "UPDATE members SET record=?3 WHERE object_id=?1 AND name=?2",
                     params![object.id.as_str(), member.name, text(&member)?],
                 )?;
-                save_object(transaction, &mut object)
+                Ok(())
             })?;
             self.fault(super::faults::Point::MemberIntentSaved, Some(operation))?;
         }
@@ -1434,45 +1927,83 @@ impl Namespace {
         let after_allocation;
         let after_change;
         let removed;
-        match (recovered, file) {
-            (false, Some(file)) if target != 0 => {
-                self.fault(super::faults::Point::MemberBeforeIo, Some(operation))?;
-                file.set_len(target)?;
-                file.sync_all()?;
+        if !recovered {
+            pass.recheck(self)?;
+            self.fault(super::faults::Point::MemberBeforeIo, Some(operation))?;
+            let context = verification
+                .as_mut()
+                .ok_or_else(|| Error::corrupt("destructive step lost its authenticated handle"))?;
+            context.check(directory)?;
+            if target != 0 {
+                context.native.file.set_len(target)?;
+                context.native.file.sync_all()?;
+                let retained = context
+                    .after_truncation(directory, target)
+                    .map_err(|error| error.committed(CommitState::Unknown))?;
                 self.fault(super::faults::Point::MemberAfterIo, Some(operation))?;
-                after = file.metadata()?.len();
+                context
+                    .check(directory)
+                    .map_err(|error| error.committed(CommitState::Unknown))?;
+                after = context.native.file.metadata()?.len();
                 if after != target {
                     return Err(Error::corrupt(
                         "truncate did not reach its journaled length",
                     ));
                 }
                 removed = false;
-                after_allocation = allocated_bytes(&file)?;
-                after_change = super::storage::file_change(&file)?;
-            }
-            (false, Some(file)) => {
-                drop(file);
-                self.fault(super::faults::Point::MemberBeforeIo, Some(operation))?;
-                directory.remove_file(&member.name, &member.identity)?;
+                after_allocation = allocated_bytes(&context.native.file)?;
+                after_change = super::storage::file_change(&context.native.file)?;
+                if !retained {
+                    verification.take();
+                    pass.progress.verification_restarts += 1;
+                }
+            } else {
+                directory.unlink_verified_file(
+                    &member.name,
+                    &member.identity,
+                    &context.native.file,
+                )?;
+                context
+                    .native
+                    .after_unlink()
+                    .map_err(|error| error.committed(CommitState::Unknown))?;
                 self.fault(super::faults::Point::MemberAfterIo, Some(operation))?;
+                context
+                    .native
+                    .check()
+                    .map_err(|error| error.committed(CommitState::Unknown))?;
+                if FileIdentity::of(&context.native.file)? != member.identity
+                    || super::Ownership::after_unlink(&context.native.file)? != member.ownership
+                {
+                    return Err(Error::new(
+                        ErrorCategory::StaleIdentity,
+                        "member-modified",
+                        "identity or ownership changed during unlink",
+                    )
+                    .committed(CommitState::Unknown));
+                }
+                verification.take();
+                directory.confirm_unlinked_file(&member.name)?;
                 after = 0;
                 removed = true;
                 after_allocation = Measurement::Observed { value: 0 };
                 after_change = member.change;
             }
-            (_, file) => {
-                after = current;
-                removed = file.is_none();
-                after_allocation = match &file {
-                    Some(file) => allocated_bytes(file)?,
-                    None => Measurement::Observed { value: 0 },
-                };
-                after_change = file
-                    .as_ref()
-                    .map(super::storage::file_change)
-                    .transpose()?
-                    .unwrap_or(member.change);
+        } else {
+            if let Some(context) = &verification {
+                context.check(directory)?;
             }
+            after = current;
+            removed = !exists;
+            after_allocation = match &verification {
+                Some(context) => allocated_bytes(&context.native.file)?,
+                None => Measurement::Observed { value: 0 },
+            };
+            after_change = verification
+                .as_ref()
+                .map(|context| super::storage::file_change(&context.native.file))
+                .transpose()?
+                .unwrap_or(member.change);
         }
         let logical = before
             .checked_sub(after)
@@ -1489,6 +2020,7 @@ impl Namespace {
         member.change = after_change;
         member.allocated_bytes = after_allocation;
         member.pending_length = None;
+        member.pending_manifest = None;
         member.removed = removed;
         member.credited_logical_bytes = member
             .credited_logical_bytes
@@ -1500,7 +2032,7 @@ impl Namespace {
                 .checked_add(allocated)
                 .ok_or_else(|| Error::corrupt("allocation credit overflow"))?;
         }
-        self.collection_transaction(operation, progress, |transaction, progress| {
+        self.collection_transaction(operation, pass.progress, |transaction, progress| {
             self.fault(super::faults::Point::MemberBeforeCredit, Some(operation))?;
             let mut object = object_row(transaction, &object.id)?;
             object.logical_bytes = object
@@ -1553,6 +2085,7 @@ impl Namespace {
             Ok(())
         })?;
         self.fault(super::faults::Point::MemberAfterCredit, Some(operation))?;
+        *pass.context = verification;
         Ok(true)
     }
 }

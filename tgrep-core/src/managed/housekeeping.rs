@@ -9,6 +9,8 @@ use super::{
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +31,7 @@ pub struct CleanupCounts {
     pub control_logical_bytes_reclaimed: u64,
     pub control_recovered_logical_bytes: u64,
     pub control_files_removed: u32,
+    pub control_verification_bytes: u64,
 }
 
 #[derive(Default)]
@@ -36,6 +39,7 @@ pub(super) struct ControlRemoval {
     pub removed: bool,
     pub logical_bytes: u64,
     pub recovered_logical_bytes: u64,
+    pub verification_bytes: u64,
 }
 
 impl CleanupCounts {
@@ -43,6 +47,7 @@ impl CleanupCounts {
         self.control_files_removed += u32::from(removal.removed);
         self.control_logical_bytes_reclaimed += removal.logical_bytes;
         self.control_recovered_logical_bytes += removal.recovered_logical_bytes;
+        self.control_verification_bytes += removal.verification_bytes;
     }
 
     fn root_retired(&mut self, retirement: (bool, ControlRemoval)) {
@@ -367,6 +372,74 @@ mod tests {
         }
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn independent_control_permission_changes_are_preserved() {
+        for changed in [false, true] {
+            let (_temp, namespace, owner) = namespace();
+            let name = format!("{}.json", owner.registration().owner);
+            namespace.release_owner(owner.registration()).unwrap();
+            drop(owner);
+            let path = namespace.owners.path().join(&name);
+            let contents = std::fs::read(&path).unwrap();
+            let before = namespace
+                .read(|connection| control_row(connection, "owners", &name))
+                .unwrap();
+            if changed {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode ^ 0o040))
+                        .unwrap();
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+                    use windows_sys::Win32::Storage::FileSystem::{
+                        FILE_ATTRIBUTE_ARCHIVE, SetFileAttributesW,
+                    };
+                    let attributes = std::fs::metadata(&path).unwrap().file_attributes();
+                    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                    // SAFETY: the owned fixture path is NUL-terminated and remains live.
+                    assert_ne!(
+                        unsafe {
+                            SetFileAttributesW(path.as_ptr(), attributes ^ FILE_ATTRIBUTE_ARCHIVE)
+                        },
+                        0,
+                        "{}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                let file = std::fs::File::open(&path).unwrap();
+                assert_ne!(
+                    super::super::Ownership::capture(&file).unwrap(),
+                    before.file.ownership
+                );
+            }
+            let result = namespace.remove_owned_control("owners", &name);
+            if changed {
+                assert!(
+                    result.is_err(),
+                    "control cleanup deleted a file whose sealed ownership metadata changed"
+                );
+                assert!(path.exists());
+                assert_eq!(std::fs::read(&path).unwrap(), contents);
+                let after = namespace
+                    .read(|connection| control_row(connection, "owners", &name))
+                    .unwrap();
+                assert!(!after.file.removed);
+                assert!(after.file.pending_length.is_none());
+                assert_eq!(after.file.credited_logical_bytes, 0);
+            } else {
+                let removed = result.unwrap();
+                assert!(removed.removed);
+                assert!(!path.exists());
+                assert_eq!(removed.logical_bytes, before.file.logical_bytes);
+            }
+        }
+    }
+
     #[test]
     fn missing_retired_root_guard_does_not_block_cleanup_or_alias_a_new_root_guard() {
         use super::super::faults::{Action, Point, Specification};
@@ -459,6 +532,7 @@ pub(super) fn register_control(
             logical_bytes: bytes.len() as u64,
             allocated_bytes: allocated_bytes(&file)?,
             pending_length: None,
+            pending_manifest: None,
             removed: false,
             credited_logical_bytes: 0,
             credited_allocated_bytes: 0,
@@ -489,6 +563,15 @@ impl Namespace {
     /// An unlink intent remains until its once-only credit is durable. A missing
     /// file without that intent is not evidence that this collector reclaimed it.
     pub(super) fn remove_owned_control(&self, area: &str, name: &str) -> Result<ControlRemoval> {
+        self.remove_owned_control_with_permit(area, name, None)
+    }
+
+    pub(super) fn remove_owned_control_with_permit(
+        &self,
+        area: &str,
+        name: &str,
+        permit: Option<&Arc<super::WorkPermit>>,
+    ) -> Result<ControlRemoval> {
         if !matches!(area, "guards" | "owners") {
             return Err(Error::invalid("unknown control-file area"));
         }
@@ -497,12 +580,69 @@ impl Namespace {
         if record.file.removed {
             return Ok(ControlRemoval::default());
         }
-        let recovered = match directory.open_file(name, false) {
-            Ok(file) => {
-                if FileIdentity::of(&file)? != record.file.identity
-                    || file.metadata()?.len() != record.file.logical_bytes
-                    || *blake3::hash(&directory.read_bytes(name, 4096)?).as_bytes()
-                        != record.checksum
+        let seal = record.file.seal.clone().ok_or_else(|| {
+            Error::new(
+                ErrorCategory::RecoveryRequired,
+                "control-content-unsealed",
+                "control deletion requires complete producer-intended content proof",
+            )
+        })?;
+        seal.validate()?;
+        if seal.length != record.file.logical_bytes
+            || seal.length > 4096
+            || record.file.pending_length.is_some() != record.file.pending_manifest.is_some()
+            || record
+                .file
+                .pending_manifest
+                .is_some_and(|manifest| manifest != seal.manifest)
+        {
+            return Err(Error::corrupt(
+                "control deletion intent or original seal differs",
+            ));
+        }
+        let policy = self.policy()?;
+        let allocation = self.allocation()?;
+        let _memory = match permit {
+            Some(permit) => permit
+                .memory(super::verification::MEMORY_BYTES)?
+                .retain(0)?,
+            None => self.read(|connection| {
+                self.memory.retain_unreserved(
+                    connection,
+                    super::verification::MEMORY_BYTES,
+                    0,
+                    policy
+                        .policy
+                        .work
+                        .private_work_bytes
+                        .min(allocation.private_work_bytes),
+                )
+            })?,
+        };
+        let recheck = |native: &super::authentication_native::NativeFile| -> Result<()> {
+            native.check()?;
+            if FileIdentity::of(&native.file)? != record.file.identity
+                || native.file.metadata()?.len() != record.file.logical_bytes
+                || super::Ownership::capture(&native.file)? != record.file.ownership
+                || directory.observe_file(name)?.identity != record.file.identity
+            {
+                return Err(Error::new(
+                    ErrorCategory::StaleIdentity,
+                    "control-file-modified",
+                    "the control file identity, ownership or length changed and was preserved",
+                ));
+            }
+            native.check()
+        };
+        let mut verification_bytes = 0;
+        let recovered = match super::authentication_native::NativeFile::open(&directory, name) {
+            Ok(mut native) => {
+                recheck(&native)?;
+                let mut bytes = vec![0; seal.length as usize];
+                native.file.read_exact(&mut bytes)?;
+                verification_bytes = bytes.len() as u64;
+                if *blake3::hash(&bytes).as_bytes() != record.checksum
+                    || super::MemberSeal::bounded(&bytes)? != seal
                 {
                     return Err(Error::new(
                         ErrorCategory::StaleIdentity,
@@ -510,13 +650,14 @@ impl Namespace {
                         "the inventoried control file was externally modified; it was preserved",
                     ));
                 }
-                drop(file);
+                recheck(&native)?;
                 self.transaction(|transaction| {
                     let mut current = control_row(transaction, area, name)?;
                     if current.file.removed {
                         return Ok(());
                     }
                     current.file.pending_length = Some(current.file.logical_bytes);
+                    current.file.pending_manifest = Some(seal.manifest);
                     transaction.execute(
                         "UPDATE control_files SET record=?3 WHERE area=?1 AND name=?2",
                         params![area, name, text(&current)?],
@@ -525,11 +666,43 @@ impl Namespace {
                 })?;
                 self.fault(super::faults::Point::ControlIntentSaved, None)
                     .map_err(|error| error.committed(super::CommitState::Committed))?;
+                if let Some(permit) = permit {
+                    permit.check()?;
+                }
+                let current_policy = self.policy()?.version;
+                let current_allocation = self.allocation()?.version;
+                if current_policy != policy.version || current_allocation != allocation.version {
+                    return Err(Error::stale_version(if current_policy != policy.version {
+                        current_policy
+                    } else {
+                        current_allocation
+                    })
+                    .committed(super::CommitState::Committed));
+                }
+                recheck(&native)?;
                 directory
-                    .remove_file(name, &record.file.identity)
+                    .unlink_verified_file(name, &record.file.identity, &native.file)
                     .map_err(|error| error.committed(super::CommitState::Committed))?;
+                native
+                    .after_unlink()
+                    .map_err(|error| error.committed(super::CommitState::Unknown))?;
                 self.fault(super::faults::Point::ControlAfterRemove, None)
                     .map_err(|error| error.committed(super::CommitState::Committed))?;
+                native
+                    .check()
+                    .map_err(|error| error.committed(super::CommitState::Unknown))?;
+                if FileIdentity::of(&native.file)? != record.file.identity
+                    || super::Ownership::after_unlink(&native.file)? != record.file.ownership
+                {
+                    return Err(Error::new(
+                        ErrorCategory::StaleIdentity,
+                        "control-file-modified",
+                        "control identity or ownership changed during unlink",
+                    )
+                    .committed(super::CommitState::Unknown));
+                }
+                drop(native);
+                directory.confirm_unlinked_file(name)?;
                 false
             }
             Err(error)
@@ -553,6 +726,7 @@ impl Namespace {
                 .ok_or_else(|| Error::corrupt("control unlink lost its intent"))?;
             record.file.removed = true;
             record.file.pending_length = None;
+            record.file.pending_manifest = None;
             record.file.credited_logical_bytes = bytes;
             record.file.credited_allocated_bytes = match record.file.allocated_bytes {
                 Measurement::Observed { value } => value,
@@ -590,6 +764,7 @@ impl Namespace {
                 removed: true,
                 logical_bytes: if recovered { 0 } else { bytes },
                 recovered_logical_bytes: if recovered { bytes } else { 0 },
+                verification_bytes,
             })
         })
         .map_err(|error| error.committed(super::CommitState::Committed))

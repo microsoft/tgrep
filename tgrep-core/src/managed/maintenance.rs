@@ -95,6 +95,7 @@ pub struct IdleOutcome {
     pub operations: u64,
     pub operation_readers: u64,
     pub namespace_readers_or_work: bool,
+    pub verification_active: bool,
     pub external: ExternalWork,
     pub committed_state: CommitState,
 }
@@ -263,6 +264,7 @@ impl Namespace {
                 Ok(())
             })?;
             self.fault(super::faults::Point::IdleAdmissionClosed, operation)?;
+            let verification_active = !self.discard_idle_verification(false)?;
             let (leases, owners, reservations, operations) = self.read(|connection| {
                 Ok(connection.query_row(
                     "SELECT
@@ -304,6 +306,7 @@ impl Namespace {
                 && operations == 0
                 && operation_readers == 0
                 && !namespace_readers_or_work
+                && !verification_active
                 && external.queries == 0
                 && external.queued_jobs == 0
                 && external.requests == 0
@@ -318,6 +321,7 @@ impl Namespace {
                 operations,
                 operation_readers,
                 namespace_readers_or_work,
+                verification_active,
                 external,
                 committed_state: if stopping {
                     CommitState::Committed

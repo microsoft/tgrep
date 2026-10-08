@@ -167,6 +167,8 @@ pub struct FileRecord {
     pub logical_bytes: u64,
     pub allocated_bytes: Measurement<u64>,
     pub pending_length: Option<u64>,
+    #[serde(default)]
+    pub pending_manifest: Option<[u8; 32]>,
     pub removed: bool,
     pub credited_logical_bytes: u64,
     pub credited_allocated_bytes: u64,
@@ -234,6 +236,7 @@ pub struct Namespace {
     pub(super) cursors: Mutex<HashMap<Id, CursorLifetime>>,
     pub(super) inventories: super::inventory::Inventories,
     pub(super) observations: Mutex<super::diagnostics::Observations>,
+    pub(super) verification: Mutex<Option<super::verification::Verification>>,
     pub(crate) maintenance: Mutex<()>,
     pub(crate) metadata_operations: Mutex<()>,
     pub(crate) system_operations: Mutex<()>,
@@ -457,6 +460,7 @@ impl Namespace {
             cursors: Mutex::new(HashMap::new()),
             inventories: Mutex::new(HashMap::new()),
             observations: Mutex::new(super::diagnostics::Observations::default()),
+            verification: Mutex::new(None),
             maintenance: Mutex::new(()),
             metadata_operations: Mutex::new(()),
             system_operations: Mutex::new(()),
@@ -535,6 +539,7 @@ impl Namespace {
             cursors: Mutex::new(HashMap::new()),
             inventories: Mutex::new(HashMap::new()),
             observations: Mutex::new(super::diagnostics::Observations::default()),
+            verification: Mutex::new(None),
             maintenance: Mutex::new(()),
             metadata_operations: Mutex::new(()),
             system_operations: Mutex::new(()),
@@ -1006,6 +1011,7 @@ impl Namespace {
             logical_bytes: file.metadata()?.len(),
             allocated_bytes: allocated_bytes(file)?,
             pending_length: None,
+            pending_manifest: None,
             removed: false,
             credited_logical_bytes: 0,
             credited_allocated_bytes: 0,
@@ -1613,6 +1619,7 @@ impl Namespace {
     }
 
     pub(crate) fn expire_cursors(&self) -> Result<()> {
+        self.discard_idle_verification(true)?;
         self.cursors
             .lock()
             .map_err(|_| Error::corrupt("cursor lock poisoned"))?
@@ -1653,6 +1660,39 @@ mod tests {
         )
         .unwrap();
         (temp, namespace)
+    }
+
+    #[test]
+    fn independent_authentication_boundary_rejects_missing_zero_and_future_formats() {
+        let (_temp, namespace) = namespace();
+        let claim = namespace.prepare_owner().unwrap().claim;
+        let path = namespace.path().join("namespace.json");
+        let original = std::fs::read(&path).unwrap();
+        for authentication in [None, Some(0), Some(u32::MAX)] {
+            let mut header: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            if let Some(format) = authentication {
+                header["authentication"] = serde_json::json!(format);
+            } else {
+                header.as_object_mut().unwrap().remove("authentication");
+            }
+            let modified = serde_json::to_vec(&header).unwrap();
+            std::fs::write(&path, &modified).unwrap();
+            for error in [
+                Namespace::open(namespace.path()).err().unwrap(),
+                super::super::open_generation(namespace.path(), &Id::new().unwrap())
+                    .err()
+                    .unwrap(),
+                OwnerGuard::claim(claim.clone()).err().unwrap(),
+                ActivityGuard::acquire(&namespace.directory).err().unwrap(),
+            ] {
+                assert_eq!(error.category, ErrorCategory::Incompatible, "{error}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), modified);
+        }
+        std::fs::write(&path, original).unwrap();
+        let guard = OwnerGuard::claim(claim).unwrap();
+        namespace.register_owner(guard.registration()).unwrap();
+        namespace.release_owner(guard.registration()).unwrap();
     }
 
     #[test]

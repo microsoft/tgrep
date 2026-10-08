@@ -780,6 +780,11 @@ Managed generation files use `paths.tgm`, `lookup.tgm`, `postings.tgm`,
 filenames. No legacy-readable intermediate is published inside the managed
 namespace. Existing v1 stores are not converted or retroactively made collectible.
 
+Managed namespaces also require a supported content-authentication format.
+Missing or incompatible producer proof is not upgraded by hashing whatever
+bytes happen to be present. This boundary is separate from protocol negotiation:
+ordinary indexes and default v1 retain-all namespaces keep their existing format.
+
 Each publication has a fresh physical incarnation independent of its logical
 repository/tree/profile key. A delayed deletion of an old incarnation cannot
 delete a replacement for the same logical key. IDs are opaque 32-character
@@ -802,6 +807,39 @@ validated directory handles, with native Windows sharing/reparse checks and
 Unix no-follow identity checks. Unknown files, symlinks, reparse points, hard
 links, replaced members and foreign directories are preserved with diagnostics.
 There is no broad directory sweep and no online deletion of another namespace.
+
+Managed storage must remain private to tgrep. Clients use the management API;
+they must not edit catalog records, member files or ownership guards. Native
+locks coordinate cooperating tgrep readers and writers. Content verification
+additionally detects external changes, but the storage owner is not a security
+boundary against another process able to alter its files and authoritative
+catalog. In particular, a final identity/content-version check followed by a
+filesystem operation is not an atomic conditional deletion against an arbitrary
+concurrent foreign writer. Do not modify the namespace while maintenance runs.
+This limitation never authorizes ignoring detected changes: modified, unknown
+or incompatible entries encountered before a destructive unit are preserved
+and reported, even when doing so leaves a storage-budget shortfall.
+
+### Producer-content authentication
+
+Immutable members have producer-origin BLAKE3 proof for fixed 4096-byte blocks,
+including the exact length of a partial final block. Their complete descriptor
+binds the intended total length, block count and ordered proof manifest to the
+physical incarnation and member. Proof is derived from byte slices accepted by
+the writer, not later filesystem observations. An empty member also requires a
+complete descriptor; an absent descriptor is not evidence of an empty file.
+
+Proof rows consume catalog/database/WAL capacity, and bounded hash buffers and
+proof batches consume charged private working memory. They are not an uncounted
+sidecar or a second full payload copy. Admission can therefore fail on metadata
+or private-work limits before the payload storage target is reached.
+
+The original creation handle establishes file identity and ownership-sensitive
+metadata. Verification checks regular-file/single-link structure, permissions,
+owner/group or security descriptor, and relevant native attributes as well as
+content. Basic timestamps, including Windows ChangeTime, are neither a seal nor
+an unchanged-content fast path. Bookkeeping-only metadata drift can be accepted
+only when producer content and ownership-sensitive metadata still match.
 
 ## Managed policy
 
@@ -1146,14 +1184,55 @@ live old readers, restores and persistent retains protect their objects.
 
 Creation intent precedes filesystem creation. Writers are not sealed merely
 because a file was synced; open/unfinished producers cannot be published.
-Unsealed or unexpectedly changed objects remain quarantined and charged.
+An interrupted producer can leave payload bytes with only a prefix of durable
+proof. Such unsealed or unexpectedly changed objects remain quarantined and
+conservatively charged; proving producer death alone does not make missing
+content proof trustworthy. Recovery may validate an already complete intended
+seal, but never synthesizes one from the abandoned bytes.
 Deletion journals exact owned identities and each bounded physical step before
-performing it, then records the result. Recovery accepts only the journaled
-expected truncation/unlink outcome; arbitrary changed content is preserved.
+performing it, then records the result. Authentication-block-aligned tail
+truncations and final unlink cannot exceed the remaining deletion-byte budget.
+After interruption, the exact journaled target length alone is not success:
+recovery verifies every surviving prefix block against the original producer
+proof before crediting the removed tail. A rewritten prefix at that same length
+is preserved with no recovered credit. A missing member is recoverable only
+from the corresponding authenticated unlink intent, not from an existing
+zero-length file or a generic missing-file error.
 Reclaimed logical/allocated bytes are credited only from verified physical
 results. Sharing violations, retained Windows mappings, permission failures,
 unknown owners and missing evidence remain explicit skips/errors, not fake
 successful reclamation. Retrying uses a fresh bounded pass.
+
+Content verification is separately bounded work, not reclaimed space. A pass
+uses `max_delete_bytes` as a separate verification-byte allowance, with proof
+pages also subject to page, duration, cancellation and allocation checks.
+Consequently, deletion-byte limits are not a claim about total physical I/O.
+A member larger than one pass can resume verification using a bounded, volatile
+context; verification bytes, invalidations and retained resources are reported
+separately. Restart, cancellation, expiration or loss of valid native evidence
+discards that context. Durable deletion intents do not preserve authority over
+an earlier verified prefix.
+
+Native evidence is checked around each verification page and immediately before
+destructive I/O:
+
+- Windows retains the same deny-write/delete-sharing handle through verification
+  and the destructive unit. Conflicting handles or retained writable mappings
+  leave explicit pending work rather than weakening the sharing mode.
+- Linux uses an exclusive native file lease where supported. Break requests or
+  forced revocation invalidate the context; an old successful acquisition is
+  not proof that the lease is still held.
+- macOS uses a supported, nonzero native content generation and pinned-vnode
+  notifications. Missing evidence or a writable-mapped/zero-generation state
+  prevents collection. These are change observations, not writer exclusion.
+  The context is discarded after each tgrep truncation too: adopting its new
+  generation could otherwise hide an interleaved foreign prefix write. The
+  remaining prefix is authenticated again over subsequent bounded passes.
+
+Identity, ownership and actual length are rechecked around physical work.
+Detected interference or uncertainty is reported, not adopted as a new trusted
+seal for the next unit. Reverification can add substantial read work even when
+few bytes are deleted; diagnostics and measurements must include that cost.
 
 Grace is conservatively re-established after restart, clock rollback or missing
 age evidence. Byte targets are best effort under safety constraints; shortfalls
@@ -1232,8 +1311,10 @@ authorization. Recover the retained token and exact current state.
 
 `stop-if-idle` first closes admission, then accounts for leases, owners,
 reservations, operations and receipt readers, independent namespace/root/object
-guards, requests, queries, queued jobs and background batches. A busy decision
-reopens admission; a committed stop leaves it closed before exit. A terminal
+guards, requests, queries, queued jobs and background batches. Idle verifier
+caches are discarded while active verification remains protected by its work
+lifetime. A retained cache alone does not make a daemon permanently busy.
+A busy decision reopens admission; a committed stop leaves it closed before exit. A terminal
 busy receipt is replayable, so a later probe needs a new token. Disconnecting
 the final client or checking the lease count alone is not atomic shutdown.
 Committed operation acceptance or bookkeeping alone does not authorize exit.

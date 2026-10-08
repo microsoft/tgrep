@@ -725,7 +725,7 @@ impl Namespace {
                 let committed = |error: Error| error.committed(super::CommitState::Committed);
                 let uncertain = |error: Error| error.committed(super::CommitState::Unknown);
                 if let Some(permit) = permit {
-                    permit.check().map_err(committed)?;
+                    permit.check_now().map_err(committed)?;
                 }
                 let current_policy = self.policy().map_err(committed)?.version;
                 let current_allocation = self.allocation().map_err(committed)?.version;

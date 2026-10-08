@@ -44,7 +44,7 @@ pub(super) struct Pass<'a> {
 
 impl Pass<'_> {
     pub(super) fn recheck(&self, namespace: &Namespace) -> Result<()> {
-        self.permit.check()?;
+        self.permit.check_now()?;
         let policy = namespace.policy()?.version;
         let allocation = namespace.allocation()?.version;
         if policy != self.request.policy_version {
@@ -172,16 +172,48 @@ impl Verification {
         member: &FileRecord,
         request: &CollectionRequest,
     ) -> bool {
+        self.same_member(object, member)
+            && self.policy_version == request.policy_version
+            && self.allocation_version == request.allocation_version
+            && self.expires > Instant::now()
+    }
+
+    fn same_member(&self, object: &Id, member: &FileRecord) -> bool {
         self.object == *object
             && self.name == member.name
             && self.identity == member.identity
             && self.ownership == member.ownership
             && member.seal.as_ref() == Some(&self.seal)
-            && self.policy_version == request.policy_version
-            && self.allocation_version == request.allocation_version
-            && self.expires > Instant::now()
             && (self.current_length == member.logical_bytes
                 || member.pending_length == Some(self.current_length))
+    }
+
+    pub(super) fn rebind(
+        &mut self,
+        namespace: &Namespace,
+        directory: &Directory,
+        object: &Id,
+        member: &FileRecord,
+        request: &CollectionRequest,
+    ) -> Result<bool> {
+        if !self.same_member(object, member) || self.expires <= Instant::now() {
+            return Ok(false);
+        }
+        self.check(directory)?;
+        self.reset_proof();
+        self.policy_version = request.policy_version;
+        self.allocation_version = request.allocation_version;
+        self.expires = Self::expiration(namespace)?;
+        Ok(true)
+    }
+
+    fn reset_proof(&mut self) {
+        self.complete = false;
+        self.next_block = 0;
+        self.partial = 0;
+        self.partial_hash.reset();
+        self.manifest = manifest_hasher();
+        self.pending.clear();
     }
 
     pub(super) fn check(&self, directory: &Directory) -> Result<()> {
@@ -350,12 +382,7 @@ impl Verification {
         let retained = self.native.after_truncation()?;
         self.current_length = length;
         if !retained {
-            self.complete = false;
-            self.next_block = 0;
-            self.partial = 0;
-            self.partial_hash.reset();
-            self.manifest = manifest_hasher();
-            self.pending.clear();
+            self.reset_proof();
         }
         self.check(directory)?;
         Ok(retained)

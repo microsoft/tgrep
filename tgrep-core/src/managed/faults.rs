@@ -34,6 +34,7 @@ pub enum Point {
     MemberAfterIo,
     MemberBeforeCredit,
     MemberAfterCredit,
+    CollectionBeforeComplete,
     ObjectBeforeRemove,
     ObjectAfterRemove,
     GuardAfterRemove,

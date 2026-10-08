@@ -686,6 +686,14 @@ impl WorkPermit {
     }
 
     pub fn check(&self) -> Result<()> {
+        self.check_control(false)
+    }
+
+    pub(crate) fn check_now(&self) -> Result<()> {
+        self.check_control(true)
+    }
+
+    fn check_control(&self, refresh: bool) -> Result<()> {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(Error::new(
                 ErrorCategory::Cancelled,
@@ -707,7 +715,7 @@ impl WorkPermit {
             .last_check
             .lock()
             .map_err(|_| Error::corrupt("work control lock poisoned"))?;
-        if last.is_none_or(|time| time.elapsed() >= Duration::from_millis(10)) {
+        if refresh || last.is_none_or(|time| time.elapsed() >= Duration::from_millis(10)) {
             if self.namespace.operation(&self.record.operation)?.cancelled {
                 self.cancelled.store(true, Ordering::Release);
                 return Err(Error::new(

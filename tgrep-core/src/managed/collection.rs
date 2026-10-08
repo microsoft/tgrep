@@ -244,6 +244,19 @@ mod tests {
             let (_temp, namespace, _object, _path) =
                 authenticated_fixture(&vec![b'a'; 128 * 1024 + 17]);
             cached_prefix(&namespace, "initial");
+            let inspection = {
+                let mut active = namespace.active_verification().unwrap();
+                let file = active
+                    .context
+                    .as_ref()
+                    .unwrap()
+                    .native
+                    .file
+                    .try_clone()
+                    .unwrap();
+                active.keep = true;
+                file
+            };
             if policy_change {
                 let policy = namespace.policy().unwrap();
                 namespace
@@ -257,6 +270,7 @@ mod tests {
             }
             let (_, restarts) = cached_prefix(&namespace, "after-version-change");
             assert_eq!(restarts, 1);
+            drop(inspection);
         }
     }
 
@@ -318,64 +332,80 @@ mod tests {
 
     #[test]
     fn cancellation_at_a_verified_page_discards_all_cached_proof_without_delete_credit() {
-        let original = vec![b'a'; 128 * 1024 + 17];
-        let (_temp, namespace, _object, path) = authenticated_fixture(&original);
-        let (request, _) = cached_prefix(&namespace, "initial");
-        let operation = namespace
-            .accept_system_operation(
-                Token::parse("cancel-verifier").unwrap(),
-                "collection",
-                serde_json::to_value(&request).unwrap(),
-            )
-            .unwrap();
-        let fault = namespace
-            .install_test_fault(Specification {
-                point: Point::MemberVerificationPage,
-                operation: Some(operation.id.clone()),
-                skip_hits: 0,
-                action: Action::Pause { timeout_ms: 10_000 },
-            })
-            .unwrap();
-        let result = std::thread::scope(|scope| {
-            let worker = scope.spawn(|| namespace.collect_pass(&operation.id, &request));
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let reached = loop {
-                if namespace.test_fault_status().unwrap().unwrap().stage
-                    == crate::managed::faults::Stage::Waiting
-                {
-                    break true;
-                }
-                if Instant::now() >= deadline {
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            };
-            let cancelled = namespace.cancel_operation(&operation.id);
-            namespace.release_test_fault(&fault.ticket).unwrap();
-            let result = worker.join().unwrap().unwrap();
-            assert!(reached, "the active verification page was not exercised");
-            assert!(cancelled.unwrap().cancelled);
-            result
-        });
-        assert!(result.cancelled, "{result:?}");
-        assert_eq!(
-            result.logical_bytes_reclaimed + result.recovered_logical_bytes,
-            0
-        );
-        assert!(!result.verification_context_retained);
-        assert_eq!(
-            namespace.verification_diagnostics().unwrap()["state"],
-            "empty"
-        );
-        assert_eq!(
-            namespace
-                .work_usage()
-                .unwrap()
-                .memory
-                .retained_private_estimate_bytes,
-            0
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), original);
+        for point in [
+            Point::MemberVerificationPage,
+            Point::MemberBeforeIo,
+            Point::CollectionBeforeComplete,
+        ] {
+            let original = vec![b'a'; 128 * 1024 + 17];
+            let (_temp, namespace, _object, path) = authenticated_fixture(&original);
+            let (mut request, _) = cached_prefix(&namespace, "initial");
+            if point == Point::MemberBeforeIo {
+                request.bounds.max_delete_bytes = 256 * 1024;
+                request.bounds.max_pages = 64;
+            }
+            let operation = namespace
+                .accept_system_operation(
+                    Token::parse("cancel-verifier").unwrap(),
+                    "collection",
+                    serde_json::to_value(&request).unwrap(),
+                )
+                .unwrap();
+            let fault = namespace
+                .install_test_fault(Specification {
+                    point,
+                    operation: Some(operation.id.clone()),
+                    skip_hits: 0,
+                    action: Action::Pause { timeout_ms: 10_000 },
+                })
+                .unwrap();
+            let result = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| namespace.collect_pass(&operation.id, &request));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let reached = loop {
+                    if namespace.test_fault_status().unwrap().unwrap().stage
+                        == crate::managed::faults::Stage::Waiting
+                    {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                };
+                let cancelled = namespace.cancel_operation(&operation.id);
+                namespace.release_test_fault(&fault.ticket).unwrap();
+                let result = worker.join().unwrap().unwrap();
+                assert!(
+                    reached,
+                    "the {point:?} cancellation boundary was not exercised"
+                );
+                assert!(cancelled.unwrap().cancelled);
+                result
+            });
+            assert!(result.cancelled, "{result:?}");
+            assert_eq!(
+                result.logical_bytes_reclaimed + result.recovered_logical_bytes,
+                0
+            );
+            assert!(!result.verification_context_retained);
+            assert_eq!(
+                namespace.verification_diagnostics().unwrap()["state"],
+                "empty"
+            );
+            assert_eq!(
+                namespace
+                    .work_usage()
+                    .unwrap()
+                    .memory
+                    .retained_private_estimate_bytes,
+                0
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            let saved = namespace.operation(&operation.id).unwrap();
+            assert_eq!(saved.state, OperationState::Cancelled);
+            assert_eq!(saved.result, Some(serde_json::to_value(&result).unwrap()));
+        }
     }
 
     #[test]
@@ -1470,22 +1500,26 @@ impl Namespace {
     fn save_collection_progress(
         &self,
         operation: &Id,
-        progress: &CollectionProgress,
+        progress: &mut CollectionProgress,
         finished: bool,
     ) -> Result<()> {
-        self.transaction(|transaction| {
+        let next = self.transaction(|transaction| {
             let encoded: String = transaction.query_row(
                 "SELECT record FROM operations WHERE id=?1",
                 [operation.as_str()],
                 |row| row.get(0),
             )?;
             let mut record: OperationRecord = serde_json::from_str(&encoded)?;
-            record.progress = serde_json::to_value(progress)?;
-            if progress.retired > 0 || progress.removed > 0 || progress.logical_bytes_reclaimed > 0
-            {
+            let mut next = progress.clone();
+            if record.cancelled {
+                next.cancelled = true;
+                next.verification_context_retained = false;
+            }
+            record.progress = serde_json::to_value(&next)?;
+            if next.retired > 0 || next.removed > 0 || next.logical_bytes_reclaimed > 0 {
                 record.committed_state = CommitState::Committed;
             }
-            record.state = if progress.cancelled {
+            record.state = if next.cancelled {
                 OperationState::Cancelled
             } else if finished {
                 OperationState::Completed
@@ -1493,10 +1527,13 @@ impl Namespace {
                 OperationState::Preparing
             };
             if finished {
-                record.result = Some(serde_json::to_value(progress)?);
+                record.result = Some(serde_json::to_value(&next)?);
             }
-            Self::save_operation(transaction, &record)
-        })
+            Self::save_operation(transaction, &record)?;
+            Ok(next)
+        })?;
+        *progress = next;
+        Ok(())
     }
 
     /// Execute one bounded, resumable pass. Replaying the operation returns its saved result.
@@ -1661,7 +1698,10 @@ impl Namespace {
                 Err(error) => return Err(error),
             }
             progress.next = Some(cursor.clone());
-            self.save_collection_progress(operation, &progress, false)?;
+            self.save_collection_progress(operation, &mut progress, false)?;
+            if progress.cancelled {
+                break;
+            }
             let result = self.collect_object(
                 &id,
                 &mut super::verification::Pass {
@@ -1736,7 +1776,14 @@ impl Namespace {
             verification.context.take();
         }
         progress.verification_context_retained = verification.context.is_some();
-        self.save_collection_progress(operation, &progress, true)?;
+        self.fault(
+            super::faults::Point::CollectionBeforeComplete,
+            Some(operation),
+        )?;
+        self.save_collection_progress(operation, &mut progress, true)?;
+        if progress.cancelled {
+            verification.context.take();
+        }
         verification.keep = !progress.cancelled;
         Ok(progress)
     }
@@ -1856,6 +1903,7 @@ impl Namespace {
         let expected = directory.identity()?;
         drop(directory);
         self.fault(super::faults::Point::ObjectBeforeRemove, Some(operation))?;
+        pass.recheck(self)?;
         self.objects
             .remove_child(id.as_str(), &expected)
             .map_err(|error| {
@@ -2026,12 +2074,13 @@ impl Namespace {
             Err(error) => return Err(error),
         };
         let mut verification = pass.context.take();
-        if verification
-            .as_ref()
-            .is_some_and(|context| !context.matches(&object.id, &member, pass.request))
+        if let Some(context) = verification.as_mut()
+            && !context.matches(&object.id, &member, pass.request)
         {
-            verification.take();
             pass.progress.verification_restarts += 1;
+            if !context.rebind(self, directory, &object.id, &member, pass.request)? {
+                verification.take();
+            }
         }
         if exists {
             if verification.is_none() {
@@ -2115,8 +2164,8 @@ impl Namespace {
         let after_change;
         let removed;
         if !recovered {
-            pass.recheck(self)?;
             self.fault(super::faults::Point::MemberBeforeIo, Some(operation))?;
+            pass.recheck(self)?;
             let context = verification
                 .as_mut()
                 .ok_or_else(|| Error::corrupt("destructive step lost its authenticated handle"))?;

@@ -3,6 +3,7 @@
 use super::*;
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BATCHES: usize = 512;
 const MAX_COLLECTION_PASSES: usize = 64;
@@ -16,6 +17,15 @@ fn number(value: &Value, pointer: &str) -> u64 {
 
 fn micros(started: Instant) -> u64 {
     started.elapsed().as_micros().try_into().unwrap()
+}
+
+fn utc_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
 }
 
 fn distribution(samples: &[u64]) -> Value {
@@ -482,6 +492,8 @@ fn provenance() -> Value {
 }
 
 fn qualification(files: usize, bytes: usize, instrumented: bool) -> Value {
+    let started_utc = utc_millis();
+    let run_start = Instant::now();
     let provenance = provenance();
     let mut first = extend_fixture(files, bytes, 0);
     let second = extend_fixture(files, bytes, 1);
@@ -741,8 +753,22 @@ fn qualification(files: usize, bytes: usize, instrumented: bool) -> Value {
     warm.rpc("owners.release", json!({"claim":claim}));
     drop(guard);
     stop(&mut warm);
+    drop((a, b, warm));
+    let cleanup =
+        [("repository-a", first.temp), ("repository-b", second.temp)].map(|(fixture, temp)| {
+            match temp.close() {
+                Ok(()) => json!({"fixture":fixture,"status":"removed","method":"TempDir::close"}),
+                Err(error) => json!({"fixture":fixture,"status":"error","method":"TempDir::close",
+                "error_kind":format!("{:?}",error.kind()),"detail":error.to_string()}),
+            }
+        });
+    let ended_utc = utc_millis();
     json!({
         "schema":1,"provenance":provenance,"filesystem":filesystem,
+        "run_window":{"started_utc_unix_ms":started_utc,"ended_utc_unix_ms":ended_utc,
+            "wall_clock_ordered":ended_utc>=started_utc,"monotonic_elapsed_us":micros(run_start),
+            "scope":"provenance, fixture setup, lifecycle phases, owned-child shutdown and checked fixture cleanup"},
+        "fixture_cleanup":cleanup,
         "fixture":{"repositories":2,"initial_ready_worktrees":4,"additional_worktrees":1,
             "generated_files_per_repository":files,"generated_bytes_per_file":bytes,
             "base_fixture_files_per_repository":3,"modified_fraction":"first ceil(files/4)",
@@ -761,9 +787,20 @@ fn qualification(files: usize, bytes: usize, instrumented: bool) -> Value {
     })
 }
 
+fn assert_finalized(report: &Value) {
+    assert_eq!(report["run_window"]["wall_clock_ordered"], true);
+    assert!(number(report, "/run_window/monotonic_elapsed_us") > 0);
+    let cleanup = report["fixture_cleanup"].as_array().unwrap();
+    assert_eq!(cleanup.len(), 2);
+    for fixture in cleanup {
+        assert_eq!(fixture["status"], "removed", "{fixture}");
+    }
+}
+
 #[test]
 fn bounded_lifecycle_queries_and_measurement_shape() {
     let report = qualification(12, 1024, true);
+    assert_finalized(&report);
     assert_eq!(report["schema"], 1);
     assert!(report["phases"].as_array().unwrap().len() >= 4);
     assert!(
@@ -803,4 +840,5 @@ fn native_managed_lifecycle_measurement() {
     file.write_all(&bytes).unwrap();
     file.sync_all().unwrap();
     println!("Managed native measurement: {}", path.display());
+    assert_finalized(&report);
 }

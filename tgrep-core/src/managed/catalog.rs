@@ -568,6 +568,8 @@ impl Namespace {
         }
         let max_pages = (policy.work.metadata_bytes / 3 / page_size).max(32);
         connection.pragma_update(None, "max_page_count", sql_integer(max_pages)?)?;
+        // FULL-synchronous WAL commitment is durable without truncation. Keep
+        // reader contention before the mutation, not after its successful commit.
         self.checkpoint_wal(&connection, policy.work.metadata_bytes)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = action(&transaction)?;
@@ -576,8 +578,6 @@ impl Namespace {
             .commit()
             .map_err(|error| Error::from(error).committed(CommitState::Unknown))?;
         self.fault(super::faults::Point::CatalogAfterCommit, None)
-            .map_err(|error| error.committed(CommitState::Committed))?;
-        self.checkpoint_wal(&connection, policy.work.metadata_bytes)
             .map_err(|error| error.committed(CommitState::Committed))?;
         self.directory
             .verify()
@@ -608,10 +608,19 @@ impl Namespace {
             Err(error) => return Err(error),
         };
         if bytes >= limit / 4 {
-            let busy: u32 =
-                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            let (busy, frames, checkpointed): (u32, i64, i64) =
+                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
             if busy != 0 {
-                return Err(Error::busy("catalog-checkpoint-readers-active"));
+                return Err(Error::new(
+                    ErrorCategory::Busy,
+                    "catalog-checkpoint-readers-active",
+                    format!(
+                        "catalog WAL truncation is busy: {bytes} bytes, \
+                         {frames} frames, {checkpointed} checkpointed"
+                    ),
+                ));
             }
         }
         Ok(())
@@ -1570,6 +1579,80 @@ mod tests {
         (temp, namespace)
     }
 
+    #[test]
+    fn wal_checkpoint_contention_precedes_mutation_not_a_successful_commit() {
+        let (_temp, namespace) = namespace();
+        let mut configured = namespace.policy().unwrap();
+        configured.policy.work.metadata_bytes = 1024 * 1024;
+        let limit = configured.policy.work.metadata_bytes;
+        namespace
+            .update_policy(configured.version, configured.policy)
+            .unwrap();
+        namespace
+            .read(|connection| {
+                let busy: u32 =
+                    connection
+                        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+                assert_eq!(busy, 0);
+                Ok(())
+            })
+            .unwrap();
+        let reader = connect(&namespace.directory, true).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT namespace FROM state")
+            .unwrap();
+        let mut crossed = false;
+        for sequence in 0..256 {
+            let bytes = namespace
+                .directory
+                .observe_file("catalog.sqlite-wal")
+                .unwrap()
+                .logical_bytes;
+            if bytes >= limit / 4 {
+                crossed = true;
+                break;
+            }
+            namespace
+                .transaction(|transaction| {
+                    transaction.execute(
+                        "INSERT INTO records VALUES('probe','wal',1,?1)
+                         ON CONFLICT(kind,id) DO UPDATE SET version=version+1,record=excluded.record",
+                        [text(&serde_json::json!({"sequence":sequence,"padding":"x".repeat(8192)}))?],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(crossed, "fixture did not reach the bounded WAL threshold");
+        let mutation = |transaction: &Transaction<'_>| -> Result<()> {
+            transaction.execute("INSERT INTO records VALUES('probe','next',1,'{}')", [])?;
+            Ok(())
+        };
+        let blocked = namespace.transaction(mutation).unwrap_err();
+        assert_eq!(blocked.reason_code, "catalog-checkpoint-readers-active");
+        assert_eq!(blocked.committed_state, CommitState::NotCommitted);
+        assert!(
+            !namespace
+                .read(|connection| Ok(connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM records WHERE kind='probe' AND id='next')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?))
+                .unwrap()
+        );
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        namespace.transaction(mutation).unwrap();
+        assert!(
+            namespace
+                .directory
+                .observe_file("catalog.sqlite-wal")
+                .unwrap()
+                .logical_bytes
+                < limit / 4
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn catalog_probes_preserve_sqlite_posix_locks() {
@@ -1599,8 +1682,8 @@ mod tests {
                 std::io::Error::last_os_error()
             );
             assert_ne!(
-                i32::from(lock.l_type),
-                libc::F_UNLCK,
+                i64::from(lock.l_type),
+                i64::from(libc::F_UNLCK),
                 "SQLite lock was released"
             );
             assert_eq!(

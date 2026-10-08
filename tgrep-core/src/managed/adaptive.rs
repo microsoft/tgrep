@@ -6,7 +6,7 @@ use super::policy::Advancement;
 use super::{Error, Id, MigrationRequest, OperationRecord, OperationToken, Result, ViewManager};
 use crate::generations::git;
 use crate::meta::ContentId;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -54,6 +54,32 @@ pub(crate) fn sufficient(before: u64, after: u64, absolute: u64, percent: u8) ->
         reduction >= absolute
             && u128::from(reduction) * 100 >= u128::from(before) * u128::from(percent)
     })
+}
+
+fn save_state(transaction: &Transaction<'_>, view: &Id, state: &AdaptiveState) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO records VALUES('adaptive',?1,1,?2) ON CONFLICT(kind,id)
+         DO UPDATE SET version=version+1,record=excluded.record",
+        params![view.as_str(), text(state)?],
+    )?;
+    Ok(())
+}
+
+fn save_decision(
+    transaction: &Transaction<'_>,
+    operation: &Id,
+    decision: &AdaptiveDecision,
+    input_epoch: u64,
+) -> Result<()> {
+    let record: String = transaction.query_row(
+        "SELECT record FROM operations WHERE id=?1",
+        [operation.as_str()],
+        |row| row.get(0),
+    )?;
+    let mut current: OperationRecord = serde_json::from_str(&record)?;
+    current.progress["adaptive"] = serde_json::to_value(decision)?;
+    current.progress["adaptive_input_epoch"] = json!(input_epoch);
+    super::Namespace::save_operation(transaction, &current)
 }
 
 impl ViewManager {
@@ -171,25 +197,31 @@ impl ViewManager {
         operation: &OperationRecord,
         request: AdaptiveRequest,
     ) -> Result<()> {
-        let input_epoch = self.slot(&request.view)?.current()?.record.input_epoch;
-        let decision = match self.evaluate_adaptive(operation, &request) {
-            Ok(decision) => decision,
-            Err(error) => {
-                self.record_adaptive_failure(&request, &error, false, input_epoch)?;
-                return Err(error);
+        let mut input_epoch = self.slot(&request.view)?.current()?.record.input_epoch;
+        let saved = operation
+            .progress
+            .get("adaptive")
+            .map(|value| serde_json::from_value::<AdaptiveDecision>(value.clone()))
+            .transpose()?;
+        let decision = match saved {
+            Some(decision) if decision.eligible => {
+                input_epoch = operation.progress["adaptive_input_epoch"]
+                    .as_u64()
+                    .ok_or_else(|| Error::corrupt("adaptive intent has no captured input epoch"))?;
+                decision
             }
+            _ => match self.evaluate_adaptive(operation, &request) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    self.record_adaptive_failure(&request, &error, false, input_epoch)?;
+                    return Err(error);
+                }
+            },
         };
-        self.namespace().transaction(|transaction| {
-            let record: String = transaction.query_row(
-                "SELECT record FROM operations WHERE id=?1",
-                [operation.id.as_str()],
-                |row| row.get(0),
-            )?;
-            let mut current: OperationRecord = serde_json::from_str(&record)?;
-            current.progress["adaptive"] = serde_json::to_value(&decision)?;
-            super::Namespace::save_operation(transaction, &current)
-        })?;
         if !decision.eligible {
+            self.namespace().transaction(|transaction| {
+                save_decision(transaction, &operation.id, &decision, input_epoch)
+            })?;
             self.namespace().record_operation_result(
                 &operation.id,
                 Ok(json!({"adaptive":decision,"current":self.recover(&request.view)?})),
@@ -554,17 +586,17 @@ impl ViewManager {
         }
         query.validate()?;
         state.decision = Some(decision.clone());
-        self.save_adaptive(&request.view, &state)?;
+        // One eligible evaluation is one logical attempt. Persist its exact
+        // target with the attempt count before any bounded worker deferral.
+        self.namespace().transaction(|transaction| {
+            save_state(transaction, &request.view, &state)?;
+            save_decision(transaction, &operation.id, &decision, state.input_epoch)
+        })?;
         Ok(decision)
     }
 
     fn save_adaptive(&self, view: &Id, state: &AdaptiveState) -> Result<()> {
-        self.namespace().transaction(|transaction| {
-            transaction.execute(
-                "INSERT INTO records VALUES('adaptive',?1,1,?2) ON CONFLICT(kind,id) DO UPDATE SET version=version+1,record=excluded.record",
-                params![view.as_str(), text(state)?],
-            )?;
-            Ok(())
-        })
+        self.namespace()
+            .transaction(|transaction| save_state(transaction, view, state))
     }
 }

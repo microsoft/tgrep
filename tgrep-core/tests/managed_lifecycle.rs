@@ -633,6 +633,147 @@ fn pending_inputs_do_not_exhaust_adaptive_work_before_reconciliation() {
 }
 
 #[test]
+fn deferred_adaptive_migration_retains_its_target_and_single_attempt_budget() {
+    use tgrep_core::managed::{AdaptiveRequest, OperationState, RefreshRequest};
+    let mut fixture = Fixture::new();
+    let mut configured = fixture.namespace.policy().unwrap();
+    configured.policy.advancement = tgrep_core::managed::policy::Advancement::Adaptive {
+        high_bytes: 1,
+        low_bytes: 0,
+        min_reduction_bytes: 1,
+        min_reduction_percent: 1,
+        cooldown_ms: 60000,
+        max_paths: 32,
+        max_read_bytes: 1048576,
+        max_attempts: 1,
+    };
+    fixture
+        .namespace
+        .update_policy(configured.version, configured.policy)
+        .unwrap();
+    let manager = fixture.manager();
+    let view = fixture.attach(&manager);
+    let owner = fixture.owner.registration().owner.clone();
+    fs::write(fixture.root.join("source.txt"), "adaptive target needle\n").unwrap();
+    git(
+        &fixture.root,
+        &["commit", "--quiet", "-am", "adaptive target"],
+    );
+    let target = git(&fixture.root, &["rev-parse", "HEAD"]);
+    manager
+        .invalidate(&view.id, &owner, view.version, &[], true)
+        .unwrap();
+    let refresh = manager
+        .accept_refresh(
+            fixture.token("adaptive-source-refresh"),
+            RefreshRequest {
+                view: view.id.clone(),
+                owner: owner.clone(),
+                expected_version: view.version,
+                allocation_version: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        manager.execute(&refresh.id).unwrap().state,
+        OperationState::Completed
+    );
+    let permit = fixture.permit(8 * 1024 * 1024);
+    let built = fixture
+        .namespace
+        .ensure_generation(
+            &fixture.repository,
+            &target,
+            IndexingProfile::default(),
+            None,
+            &permit,
+        )
+        .unwrap();
+    let incarnation = built.descriptor.incarnation.clone();
+    drop((built, permit));
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            fixture
+                .namespace
+                .path()
+                .join("guards")
+                .join(format!("{incarnation}.lock")),
+        )
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    let operation = manager
+        .accept_adaptive(
+            fixture.token("contended-adaptive"),
+            AdaptiveRequest {
+                view: view.id.clone(),
+                owner,
+                expected_version: view.version,
+                allocation_version: 1,
+            },
+        )
+        .unwrap();
+    let deferred = manager.execute(&operation.id).unwrap();
+    assert!(matches!(
+        deferred.state,
+        OperationState::Accepted | OperationState::Preparing
+    ));
+    assert_eq!(deferred.progress["adaptive"]["target_commit"], target);
+    assert_eq!(
+        deferred.progress["waiting_reason"],
+        "object-retirement-in-progress"
+    );
+    assert!(manager.status(&view.id).unwrap().ready);
+    git(
+        &fixture.root,
+        &[
+            "commit",
+            "--allow-empty",
+            "--quiet",
+            "-m",
+            "later exact HEAD",
+        ],
+    );
+    assert_ne!(git(&fixture.root, &["rev-parse", "HEAD"]), target);
+    fs2::FileExt::unlock(&guard).unwrap();
+    drop(guard);
+    let completed = manager.execute(&operation.id).unwrap();
+    assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+    let current = manager.recover(&view.id).unwrap();
+    assert_eq!(current.version, view.version + 1, "{completed:?}");
+    assert_eq!(current.pin().unwrap().commit, target);
+    assert_eq!(
+        current.pin().unwrap().incarnation.as_ref(),
+        Some(&incarnation)
+    );
+    assert!(manager.status(&view.id).unwrap().ready);
+    let cooldown = manager
+        .accept_adaptive(
+            fixture.token("adaptive-cooldown"),
+            AdaptiveRequest {
+                view: view.id.clone(),
+                owner: fixture.owner.registration().owner.clone(),
+                expected_version: current.version,
+                allocation_version: 1,
+            },
+        )
+        .unwrap();
+    let cooldown = manager.execute(&cooldown.id).unwrap();
+    assert_eq!(cooldown.state, OperationState::Completed);
+    assert_eq!(cooldown.progress["adaptive"]["eligible"], false);
+    assert_eq!(
+        cooldown.progress["adaptive"]["reason_code"],
+        "adaptive-cooldown"
+    );
+    assert_eq!(
+        cooldown.progress["adaptive"],
+        cooldown.result.as_ref().unwrap()["adaptive"]
+    );
+    assert_eq!(manager.recover(&view.id).unwrap().version, current.version);
+}
+
+#[test]
 #[cfg(feature = "managed-test-hooks")]
 fn changed_allocation_rearms_exhausted_adaptive_work_without_changing_the_target() {
     use tgrep_core::managed::faults::{Action, Point, Specification};
@@ -900,6 +1041,87 @@ fn managed_publication_reuses_one_guarded_generation() {
     assert!(Arc::ptr_eq(&first.generation, &external));
     assert!(permit.bytes_written() > 0);
     assert!(permit.peak_private_bytes() > 0);
+}
+
+#[test]
+fn transient_retirement_locks_defer_attachment_without_changing_its_exact_intent() {
+    use tgrep_core::managed::{AttachRequest, OperationState, ViewRecord};
+    let mut fixture = Fixture::new();
+    let commit = git(&fixture.root, &["rev-parse", "HEAD"]);
+    let permit = fixture.permit(8 * 1024 * 1024);
+    let built = fixture
+        .namespace
+        .ensure_generation(
+            &fixture.repository,
+            &commit,
+            IndexingProfile::default(),
+            None,
+            &permit,
+        )
+        .unwrap();
+    let incarnation = built.descriptor.incarnation.clone();
+    drop((built, permit));
+    let guard = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            fixture
+                .namespace
+                .path()
+                .join("guards")
+                .join(format!("{incarnation}.lock")),
+        )
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    let manager = fixture.manager();
+    let operation = manager
+        .accept_attach(
+            fixture.token("contended-attach"),
+            AttachRequest {
+                root: fixture.root.clone(),
+                revision: Some("HEAD".into()),
+                profile: IndexingProfile::default(),
+                lease: Token::parse("contended-lease").unwrap(),
+                owner: fixture.owner.registration().owner.clone(),
+                accept_current: None,
+                migratable: true,
+                allocation_version: 1,
+            },
+        )
+        .unwrap();
+    let deferred = manager.execute(&operation.id).unwrap();
+    assert!(matches!(
+        deferred.state,
+        OperationState::Accepted | OperationState::Preparing
+    ));
+    assert_eq!(
+        deferred.progress["waiting_reason"],
+        "object-retirement-in-progress"
+    );
+    assert_eq!(deferred.progress["resolved_commit"], commit);
+    fs::write(fixture.root.join("source.txt"), "a later committed head\n").unwrap();
+    git(&fixture.root, &["commit", "--quiet", "-am", "later head"]);
+    fs2::FileExt::unlock(&guard).unwrap();
+    drop(guard);
+    let completed = manager.execute(&operation.id).unwrap();
+    assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+    assert_eq!(completed.id, operation.id);
+    let view: ViewRecord =
+        serde_json::from_value(completed.result.unwrap()["current"].clone()).unwrap();
+    assert_eq!(view.pin().unwrap().commit, commit);
+    assert_eq!(view.pin().unwrap().incarnation.as_ref(), Some(&incarnation));
+    let query = manager.slot(&view.id).unwrap().query(view.version).unwrap();
+    let mut candidate = query
+        .with_snapshot(|snapshot| snapshot.open_candidate("source.txt"))
+        .unwrap()
+        .unwrap();
+    let mut bytes = String::new();
+    std::io::Read::read_to_string(&mut candidate, &mut bytes).unwrap();
+    assert_eq!(
+        bytes,
+        fs::read_to_string(fixture.root.join("source.txt")).unwrap()
+    );
+    query.validate().unwrap();
 }
 
 #[test]
@@ -1602,6 +1824,189 @@ fn checkpoint_withdrawal_precedes_generation_collection_without_stopping_readers
 }
 
 #[test]
+fn retained_checkpoints_release_independent_edges_and_stale_preview_cannot_authorize_deletion() {
+    use tgrep_core::managed::{CurrentPin, Id, MetadataMutation, ObjectState, OperationState};
+    use tgrep_core::worktrees::{WorktreeOptions, WorktreeView};
+    let mut fixture = Fixture::new();
+    let current = fixture.namespace.policy().unwrap();
+    let mut bounded = current.policy;
+    bounded.retention = tgrep_core::managed::policy::Retention::Bounded { target_bytes: 1 };
+    bounded.collection.max_pages = 64;
+    fixture
+        .namespace
+        .update_policy(current.version, bounded)
+        .unwrap();
+    let permit = fixture.permit(16 * 1024 * 1024);
+    let built = fixture
+        .namespace
+        .ensure_generation(
+            &fixture.repository,
+            &git(&fixture.root, &["rev-parse", "HEAD"]),
+            IndexingProfile::default(),
+            None,
+            &permit,
+        )
+        .unwrap();
+    let view = WorktreeView::new(
+        &fixture.root,
+        Arc::clone(&built.generation),
+        WorktreeOptions::default(),
+    )
+    .unwrap();
+    view.refresh_controlled(&permit).unwrap();
+    let view_id = Id::new().unwrap();
+    let pin = CurrentPin::from_materialization(&built);
+    let first = fixture
+        .namespace
+        .save_checkpoint(&view, &view_id, 1, 0, &pin, &permit)
+        .unwrap();
+    fs::write(
+        fixture.root.join("private.txt"),
+        "private checkpoint needle\n",
+    )
+    .unwrap();
+    view.invalidate_all().unwrap();
+    view.refresh_controlled(&permit).unwrap();
+    let second = fixture
+        .namespace
+        .save_checkpoint(&view, &view_id, 2, 1, &pin, &permit)
+        .unwrap();
+    let first_id = first.descriptor.incarnation.clone();
+    let second_id = second.descriptor.incarnation.clone();
+    let generation = built.descriptor.incarnation.clone();
+    let expected: u64 = [&first_id, &second_id, &generation]
+        .into_iter()
+        .map(|id| fixture.namespace.object(id).unwrap().logical_bytes)
+        .sum();
+    let mutate = |fixture: &mut Fixture, mutation: MetadataMutation| {
+        let token = fixture.token("checkpoint-reference");
+        let operation = fixture
+            .namespace
+            .accept_operation(token, "metadata", serde_json::to_value(mutation).unwrap())
+            .unwrap();
+        let completed = fixture
+            .namespace
+            .execute_metadata_mutation(&operation.id)
+            .unwrap();
+        assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+        completed.result.unwrap()
+    };
+    let first_ref: Id = serde_json::from_value(
+        mutate(
+            &mut fixture,
+            MetadataMutation::Retain {
+                object: first_id.clone(),
+            },
+        )["reference"]
+            .clone(),
+    )
+    .unwrap();
+    let second_ref: Id = serde_json::from_value(
+        mutate(
+            &mut fixture,
+            MetadataMutation::Retain {
+                object: second_id.clone(),
+            },
+        )["reference"]
+            .clone(),
+    )
+    .unwrap();
+    drop((first, second, view, built, permit));
+    let references = fixture.namespace.reference_counts(&generation).unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].kind, "checkpoint");
+    assert_eq!(references[0].count, 2);
+    assert_eq!(collect(&mut fixture, None).logical_bytes_reclaimed, 0);
+    mutate(
+        &mut fixture,
+        MetadataMutation::Release {
+            reference: first_ref,
+        },
+    );
+    let mut reclaimed = 0;
+    let mut cursor = None;
+    for _ in 0..16 {
+        let progress = collect(&mut fixture, cursor);
+        assert_eq!(progress.errors, 0, "{progress:?}");
+        reclaimed += progress.logical_bytes_reclaimed;
+        cursor = progress.next;
+        if fixture.namespace.object(&first_id).unwrap().state == ObjectState::Removed {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture.namespace.object(&first_id).unwrap().state,
+        ObjectState::Removed
+    );
+    assert_eq!(
+        fixture.namespace.object(&generation).unwrap().state,
+        ObjectState::Published
+    );
+    assert_eq!(
+        fixture.namespace.reference_counts(&generation).unwrap()[0].count,
+        1
+    );
+    mutate(
+        &mut fixture,
+        MetadataMutation::Release {
+            reference: second_ref,
+        },
+    );
+    let preview = fixture.namespace.preview_collection(None).unwrap();
+    assert!(preview.next.is_none());
+    assert!(
+        preview
+            .objects
+            .iter()
+            .any(|object| object.object == second_id && object.eligible)
+    );
+    let protection: Id = serde_json::from_value(
+        mutate(
+            &mut fixture,
+            MetadataMutation::Retain {
+                object: second_id.clone(),
+            },
+        )["reference"]
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(collect(&mut fixture, None).logical_bytes_reclaimed, 0);
+    assert_eq!(
+        fixture.namespace.object(&second_id).unwrap().state,
+        ObjectState::Published
+    );
+    assert_eq!(
+        fixture.namespace.object(&generation).unwrap().state,
+        ObjectState::Published
+    );
+    mutate(
+        &mut fixture,
+        MetadataMutation::Release {
+            reference: protection,
+        },
+    );
+    let mut cursor = None;
+    for _ in 0..16 {
+        let progress = collect(&mut fixture, cursor);
+        assert_eq!(progress.errors, 0, "{progress:?}");
+        reclaimed += progress.logical_bytes_reclaimed;
+        cursor = progress.next;
+        if fixture.namespace.object(&generation).unwrap().state == ObjectState::Removed {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture.namespace.object(&second_id).unwrap().state,
+        ObjectState::Removed
+    );
+    assert_eq!(
+        fixture.namespace.object(&generation).unwrap().state,
+        ObjectState::Removed
+    );
+    assert_eq!(reclaimed, expected);
+}
+
+#[test]
 #[cfg(windows)]
 fn native_sharing_and_mapping_failures_stay_pending_without_false_reclaimed_bytes() {
     use std::os::windows::fs::OpenOptionsExt;
@@ -1767,6 +2172,93 @@ fn disk_full_during_member_creation_preserves_the_prior_ready_pin_and_conservati
             .storage
             .charged_overlap_logical_bytes
             > before
+    );
+}
+
+#[test]
+#[cfg(feature = "managed-test-hooks")]
+fn catalog_errors_do_not_leave_a_busy_idle_stop_with_closed_admission() {
+    use tgrep_core::managed::faults::{Action, Point, Specification};
+    use tgrep_core::managed::{CommitState, ExternalWork};
+    let mut fixture = Fixture::new();
+    fixture.namespace.activate().unwrap();
+    let manager = fixture.manager();
+    let view = fixture.attach(&manager);
+    let generation = view.pin().unwrap().incarnation.as_ref().unwrap();
+    for skip_hits in 0..=2 {
+        fixture
+            .namespace
+            .install_test_fault(Specification {
+                point: Point::CatalogAfterCommit,
+                operation: None,
+                skip_hits,
+                action: Action::Error {
+                    category: ErrorCategory::Io,
+                },
+            })
+            .unwrap();
+        let token = OperationToken {
+            scope: fixture.namespace.header().namespace.clone(),
+            sequence: u64::from(skip_hits) + 1,
+            token: Token::parse(format!("idle-catalog-error-{skip_hits}")).unwrap(),
+        };
+        let error = fixture
+            .namespace
+            .stop_if_idle_with_token(token.clone(), ExternalWork::default())
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::Io);
+        assert_eq!(error.committed_state, CommitState::Committed);
+        assert!(!fixture.namespace.stop_is_committed().unwrap());
+        let reader = fixture.namespace.open_generation(generation).unwrap();
+        assert_eq!(reader.base().reader().all_paths(), ["source.txt"]);
+        let query = manager.slot(&view.id).unwrap().query(view.version).unwrap();
+        query.validate().unwrap();
+        match fixture
+            .namespace
+            .stop_if_idle_with_token(token, ExternalWork::default())
+        {
+            Ok(outcome) => assert!(!outcome.stopping),
+            Err(error) => assert_eq!(error.category, ErrorCategory::Io),
+        }
+    }
+    fixture
+        .namespace
+        .release_owner(fixture.owner.registration())
+        .unwrap();
+    manager.drain_released().unwrap();
+    drop(fixture.owner);
+    fixture
+        .namespace
+        .install_test_fault(Specification {
+            point: Point::IdleCommitted,
+            operation: None,
+            skip_hits: 0,
+            action: Action::Error {
+                category: ErrorCategory::Io,
+            },
+        })
+        .unwrap();
+    let token = OperationToken {
+        scope: fixture.namespace.header().namespace.clone(),
+        sequence: 4,
+        token: Token::parse("actual-idle-commit").unwrap(),
+    };
+    let error = fixture
+        .namespace
+        .stop_if_idle_with_token(token.clone(), ExternalWork::default())
+        .unwrap_err();
+    assert_eq!(error.committed_state, CommitState::Committed);
+    assert!(fixture.namespace.stop_is_committed().unwrap());
+    assert_eq!(
+        fixture.namespace.prepare_owner().unwrap_err().category,
+        ErrorCategory::Busy
+    );
+    assert!(
+        fixture
+            .namespace
+            .stop_if_idle_with_token(token, ExternalWork::default())
+            .unwrap()
+            .stopping
     );
 }
 
@@ -2388,6 +2880,11 @@ fn view_commit_boundaries_preserve_exact_authority_and_replay() {
             manager.execute(&refresh.id).unwrap().state,
             OperationState::Completed
         );
+        let old_query = manager.slot(&first.id).unwrap().query(1).unwrap();
+        let mut old_candidate = old_query
+            .with_snapshot(|snapshot| snapshot.open_candidate("source.txt"))
+            .unwrap()
+            .unwrap();
         let token = fixture.token("migration");
         let request = MigrationRequest {
             view: first.id.clone(),
@@ -2442,6 +2939,55 @@ fn view_commit_boundaries_preserve_exact_authority_and_replay() {
             manager.execute(&replay.id).unwrap().result,
             completed.result
         );
+        fs::write(
+            fixture.root.join("after-failure.txt"),
+            "private recovery input\n",
+        )
+        .unwrap();
+        manager
+            .invalidate(
+                &first.id,
+                &fixture.owner.registration().owner,
+                current.version,
+                &[PathBuf::from("after-failure.txt")],
+                false,
+            )
+            .unwrap();
+        let repair = manager
+            .accept_refresh(
+                fixture.token("repair-committed-publication"),
+                RefreshRequest {
+                    view: first.id.clone(),
+                    expected_version: current.version,
+                    owner: fixture.owner.registration().owner.clone(),
+                    allocation_version: 1,
+                },
+            )
+            .unwrap();
+        let repaired = manager.execute(&repair.id).unwrap();
+        assert_eq!(
+            repaired.state,
+            OperationState::Completed,
+            "{point:?}: {repaired:?}"
+        );
+        assert_eq!(manager.recover(&first.id).unwrap().current, current.current);
+        assert!(manager.status(&first.id).unwrap().ready);
+        let query = manager
+            .slot(&first.id)
+            .unwrap()
+            .query(current.version)
+            .unwrap();
+        drop(
+            query
+                .with_snapshot(|snapshot| snapshot.open_candidate("after-failure.txt"))
+                .unwrap()
+                .unwrap(),
+        );
+        query.complete().unwrap();
+        let mut bytes = String::new();
+        std::io::Read::read_to_string(&mut old_candidate, &mut bytes).unwrap();
+        assert_eq!(bytes, "successor committed needle\n");
+        drop((old_candidate, old_query));
         if committed {
             assert_eq!(completed.state, OperationState::Completed);
             assert_eq!(
@@ -2453,6 +2999,88 @@ fn view_commit_boundaries_preserve_exact_authority_and_replay() {
                 OperationState::Completed
             );
         }
+    }
+}
+
+#[cfg(feature = "managed-test-hooks")]
+#[test]
+fn first_attach_and_same_version_refresh_recover_their_committed_publications() {
+    use tgrep_core::managed::faults::{Action, Point, Specification};
+    use tgrep_core::managed::{CommitState, OperationState, RefreshRequest};
+    for initial_attach in [true, false] {
+        let mut fixture = Fixture::new();
+        let manager = fixture.manager();
+        let install = |namespace: &Namespace| {
+            namespace
+                .install_test_fault(Specification {
+                    point: Point::ViewAfterCommit,
+                    operation: None,
+                    skip_hits: 0,
+                    action: Action::Error {
+                        category: ErrorCategory::Io,
+                    },
+                })
+                .unwrap()
+        };
+        if initial_attach {
+            install(&fixture.namespace);
+        }
+        let first = fixture.attach(&manager);
+        let owner = fixture.owner.registration().owner.clone();
+        if !initial_attach {
+            fs::write(
+                fixture.root.join("source.txt"),
+                "uncommitted refresh input\n",
+            )
+            .unwrap();
+            manager
+                .invalidate(&first.id, &owner, first.version, &[], true)
+                .unwrap();
+            install(&fixture.namespace);
+            let failed = manager
+                .accept_refresh(
+                    fixture.token("same-version-commit"),
+                    RefreshRequest {
+                        view: first.id.clone(),
+                        owner: owner.clone(),
+                        expected_version: first.version,
+                        allocation_version: 1,
+                    },
+                )
+                .unwrap();
+            let failed = manager.execute(&failed.id).unwrap();
+            assert_eq!(failed.state, OperationState::Completed);
+            assert_eq!(failed.committed_state, CommitState::Committed);
+        }
+        let durable = manager.recover(&first.id).unwrap();
+        assert_eq!(durable.version, first.version);
+        assert_eq!(durable.current, first.current);
+        if !initial_attach {
+            assert_ne!(durable.checkpoint, first.checkpoint);
+        }
+        assert!(!manager.status(&first.id).unwrap().ready);
+        let repair = manager
+            .accept_refresh(
+                fixture.token("restore-committed-view"),
+                RefreshRequest {
+                    view: first.id.clone(),
+                    owner,
+                    expected_version: durable.version,
+                    allocation_version: 1,
+                },
+            )
+            .unwrap();
+        let repaired = manager.execute(&repair.id).unwrap();
+        assert_eq!(repaired.state, OperationState::Completed, "{repaired:?}");
+        assert_eq!(manager.recover(&first.id).unwrap().current, durable.current);
+        assert!(manager.status(&first.id).unwrap().ready);
+        manager
+            .slot(&first.id)
+            .unwrap()
+            .query(durable.version)
+            .unwrap()
+            .complete()
+            .unwrap();
     }
 }
 

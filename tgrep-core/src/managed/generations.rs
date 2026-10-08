@@ -215,7 +215,7 @@ impl Namespace {
         self.open_generation_controlled(incarnation, None)
     }
 
-    fn open_generation_controlled(
+    pub(crate) fn open_generation_controlled(
         &self,
         incarnation: &Id,
         permit: Option<&Arc<WorkPermit>>,

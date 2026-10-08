@@ -69,6 +69,164 @@ fn reconnect(
 }
 
 #[test]
+fn committed_idle_acceptance_error_does_not_stop_a_busy_daemon() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let hook = daemon.rpc(
+        "testing.install",
+        json!({
+            "point":"idle-accepted","operation":null,"skip_hits":0,
+            "action":{"mode":"error","category":"io"}
+        }),
+    );
+    let input = idle_request(&daemon);
+    let response = retry_busy_response(&daemon, "stop-if-idle", input.clone());
+    assert_eq!(response["error"]["data"]["category"], "io", "{response}");
+    assert_eq!(response["error"]["data"]["committed_state"], "committed");
+    let hit = daemon.rpc("testing.status", json!({}));
+    assert_eq!(hit["ticket"], hook["ticket"]);
+    assert_eq!(hit["stage"], "fired");
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    let replay = retry_busy(&daemon, "stop-if-idle", input);
+    assert_eq!(replay["stopping"], false);
+    assert!(replay["leases"].as_u64().unwrap() > 0);
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
+fn live_post_commit_recovery_restores_attach_refresh_and_migration_without_restart() {
+    use super::live::wait_for;
+
+    for mode in ["attach", "refresh", "migrate"] {
+        let fixture = Fixture::new();
+        let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+        let (claim, guard) = owner(&daemon);
+        let install = || {
+            daemon.rpc(
+                "testing.install",
+                json!({
+                    "point":"view-after-commit","operation":null,"skip_hits":0,
+                    "action":{"mode":"error","category":"io"}
+                }),
+            )
+        };
+        let mut hook = (mode == "attach").then(install);
+        let mut affected = completed(
+            &daemon,
+            &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+        );
+        let first = affected["result"]["current"].clone();
+        if mode != "attach" {
+            wait_for(
+                &daemon,
+                "views.status",
+                json!({"id":first["id"]}),
+                |status| status["ready"] == true && status["work"].is_null(),
+            );
+            fs::write(
+                fixture.a.join("notes.txt"),
+                "shared_term publication recovery input\n",
+            )
+            .unwrap();
+            let refresh = json!({"token":token(&claim,2),"request":{
+                "view":first["id"],"expected_version":first["version"],
+                "owner":claim.owner,"allocation_version":1
+            }});
+            if mode == "migrate" {
+                git(&fixture.a, &["add", "notes.txt"]);
+                git(&fixture.a, &["commit", "-qm", "recovery target"]);
+                let target = git(&fixture.a, &["rev-parse", "HEAD"]);
+                completed(&daemon, &daemon.rpc("views.refresh", refresh));
+                wait_for(
+                    &daemon,
+                    "views.status",
+                    json!({"id":first["id"]}),
+                    |status| status["ready"] == true && status["work"].is_null(),
+                );
+                hook = Some(install());
+                affected = completed(&daemon, &daemon.rpc("views.advance", json!({
+                    "token":token(&claim,3),"request":{
+                        "view":first["id"],"root":first["root"],"expected_version":first["version"],
+                        "target_commit":target,"profile":serde_json::from_str::<Value>(PROFILE).unwrap(),
+                        "owner":claim.owner,"allocation_version":1
+                    }
+                })));
+            } else {
+                hook = Some(install());
+                affected = completed(&daemon, &daemon.rpc("views.refresh", refresh));
+            }
+        }
+        let hit = daemon.rpc("testing.status", json!({}));
+        assert_eq!(hit["ticket"], hook.unwrap()["ticket"]);
+        assert_eq!(hit["stage"], "fired");
+        assert_eq!(hit["reached_operation"], affected["id"]);
+        let error_wait = Instant::now();
+        while affected["error"].is_null() {
+            assert!(
+                error_wait.elapsed() < Duration::from_secs(20),
+                "post-commit failure was not recorded: {affected}"
+            );
+            thread::sleep(Duration::from_millis(5));
+            affected = daemon.rpc("operations.inspect", json!({"id":affected["id"]}));
+        }
+        assert_eq!(affected["error"]["category"], "io", "{mode}: {affected}");
+        assert_eq!(affected["committed_state"], "committed");
+        let committed = &affected["result"]["current"];
+        assert_eq!(
+            committed["version"],
+            json!(if mode == "migrate" { 2 } else { 1 })
+        );
+        if mode == "refresh" {
+            assert_ne!(committed["checkpoint"], first["checkpoint"]);
+        }
+        fs::write(
+            fixture.a.join("after-client.txt"),
+            "shared_term input after lost publication response\n",
+        )
+        .unwrap();
+        daemon.rpc(
+            "views.invalidate",
+            json!({
+                "view":first["id"],"owner":claim.owner,"expected_version":committed["version"],
+                "changed":["after-client.txt"],"full":false
+            }),
+        );
+        let ready = wait_for(
+            &daemon,
+            "views.status",
+            json!({"id":first["id"]}),
+            |status| status["ready"] == true && status["work"].is_null(),
+        );
+        assert_eq!(ready["authoritative"]["version"], committed["version"]);
+        assert_eq!(ready["authoritative"]["current"], committed["current"]);
+        assert_eq!(ready["authoritative"]["instance"], json!(claim.instance));
+        assert_ne!(
+            ready["authoritative"]["checkpoint"],
+            committed["checkpoint"]
+        );
+        assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+        daemon.rpc(
+            "views.detach",
+            json!({"owner":claim.owner,"lease":"managed-client"}),
+        );
+        daemon.rpc("owners.release", json!({"claim":claim}));
+        drop(guard);
+        stop(&mut daemon);
+    }
+}
+
+#[test]
 fn process_crashes_at_generation_and_view_boundaries_recover_the_exact_pin() {
     for point in [
         "object-intent-saved",
@@ -105,12 +263,15 @@ fn process_crashes_at_generation_and_view_boundaries_recover_the_exact_pin() {
         git(&fixture.a, &["add", "notes.txt"]);
         git(&fixture.a, &["commit", "-qm", "target"]);
         let target = git(&fixture.a, &["rev-parse", "HEAD"]);
-        daemon.rpc("views.invalidate", json!({
-            "view":before["view"],"expected_version":1,"owner":claim.owner,"changed":[],"full":true
-        }));
         completed(&daemon, &daemon.rpc("views.refresh", json!({"token":token(&claim,2),"request":{
             "view":before["view"],"expected_version":1,"owner":claim.owner,"allocation_version":1
         }})));
+        super::live::wait_for(
+            &daemon,
+            "views.status",
+            json!({"id":before["view"]}),
+            |status| status["ready"] == true && status["work"].is_null(),
+        );
         let hook = pause(&daemon, point);
         let operation = daemon.rpc("views.advance", json!({"token":token(&claim,3),"request":{
             "view":before["view"],"root":before["root"],"expected_version":1,"target_commit":target,

@@ -724,7 +724,7 @@ impl WorkPermit {
     pub(crate) fn charge_write(&self, amount: u64) -> Result<()> {
         self.check()?;
         self.bytes_written
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(amount)
                     .filter(|total| *total <= self.staging_limit())
             })
@@ -746,7 +746,7 @@ impl WorkPermit {
         self.check()?;
         let before = self
             .private_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|total| *total <= self.private_limit())
             })
@@ -885,7 +885,7 @@ impl MemoryCharge {
         let before = self
             .permit
             .private_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|total| *total <= self.permit.private_limit())
             })

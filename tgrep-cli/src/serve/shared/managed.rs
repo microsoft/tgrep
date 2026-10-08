@@ -1133,10 +1133,19 @@ impl State {
                         Ok(serde_json::to_value(outcome)?)
                     }
                     Err(error) => {
-                        if error.committed_state == managed::CommitState::NotCommitted {
-                            *admission = true;
-                        } else {
-                            self.stopping.store(true, Ordering::Release);
+                        match self.namespace.stop_is_committed() {
+                            Ok(true) => self.stopping.store(true, Ordering::Release),
+                            Ok(false) => *admission = true,
+                            Err(state_error) => {
+                                let mut unresolved = Error::new(
+                                    ErrorCategory::RecoveryRequired,
+                                    "idle-state-unavailable",
+                                    format!("idle attempt: {error}; reading shutdown authorization: {state_error}"),
+                                )
+                                .committed(managed::CommitState::Unknown);
+                                unresolved.operation_id = error.operation_id;
+                                return Err(unresolved.into());
+                            }
                         }
                         Err(error.into())
                     }

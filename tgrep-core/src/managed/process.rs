@@ -392,15 +392,55 @@ impl OwnedChild {
         }
     }
 
-    fn terminate_group(&self) -> Result<()> {
-        let Some(child) = &self.child else {
+    #[cfg(target_os = "macos")]
+    fn only_exited_leader_in_group(&mut self) -> Result<bool> {
+        if !self.exited()? {
+            return Ok(false);
+        }
+        let id = self
+            .child
+            .as_ref()
+            .ok_or_else(|| Error::corrupt("process-group leader is already reaped"))?
+            .id();
+        // XNU's group-signal filter excludes zombies and can return EPERM for
+        // an otherwise empty group. Its locked group inventory includes zombies.
+        // Two entries distinguish our sole unreaped leader from any other member
+        // without a truncated inventory ever becoming proof of quiescence.
+        let mut members = [0 as libc::pid_t; 2];
+        let capacity = std::mem::size_of_val(&members);
+        let copied = unsafe {
+            libc::proc_listpids(
+                libc::PROC_PGRP_ONLY,
+                id,
+                members.as_mut_ptr().cast(),
+                capacity as libc::c_int,
+            )
+        };
+        if copied < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let copied = copied as usize;
+        if copied > capacity || !copied.is_multiple_of(std::mem::size_of::<libc::pid_t>()) {
+            return Err(Error::corrupt("invalid native process-group inventory"));
+        }
+        Ok(copied == std::mem::size_of::<libc::pid_t>() && members[0] == id as libc::pid_t)
+    }
+
+    fn terminate_group(&mut self) -> Result<()> {
+        let Some(id) = self.child.as_ref().map(Child::id) else {
             return Ok(());
         };
         #[cfg(unix)]
         {
             // The unreaped, directly owned leader prevents process-group ID reuse.
-            if unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) } != 0 {
+            if unsafe { libc::killpg(id as libc::pid_t, libc::SIGKILL) } != 0 {
                 let error = std::io::Error::last_os_error();
+                #[cfg(target_os = "macos")]
+                if error.raw_os_error() == Some(libc::EPERM)
+                    && self.only_exited_leader_in_group()?
+                {
+                    return Ok(());
+                }
                 if error.raw_os_error() != Some(libc::ESRCH) {
                     return Err(error.into());
                 }
@@ -409,7 +449,7 @@ impl OwnedChild {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            let _ = child;
+            let _ = id;
             if unsafe {
                 windows_sys::Win32::System::JobObjects::TerminateJobObject(
                     self.job.as_raw_handle(),
@@ -541,6 +581,9 @@ mod tests {
         let Ok(mode) = std::env::var("TGREP_OWNED_PROCESS_TEST") else {
             return;
         };
+        if mode == "exit" {
+            return;
+        }
         if mode == "bytes" {
             std::io::stdout()
                 .write_all(&vec![b'x'; 128 * 1024])
@@ -560,7 +603,7 @@ mod tests {
                 thread::sleep(Duration::from_secs(60));
             }
         }
-        assert_eq!(mode, "parent");
+        assert!(matches!(mode.as_str(), "parent" | "orphan"));
         let mut command = helper("descendant");
         command.stdout(Stdio::null()).stderr(Stdio::null());
         let mut child = command.spawn().unwrap();
@@ -578,8 +621,57 @@ mod tests {
         }
         println!("OWNED_DESCENDANT_READY");
         std::io::stdout().flush().unwrap();
+        if mode == "orphan" {
+            return;
+        }
         loop {
             thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn exited_leaders_are_reaped_without_losing_live_descendant_cleanup() {
+        for mode in ["exit", "orphan"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("descendant.lock");
+            let guard = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let mut command = helper(mode);
+            command
+                .env("TGREP_OWNED_PROCESS_GUARD", &path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut process = OwnedChild::spawn(&mut command).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !process.exited().unwrap() {
+                assert!(Instant::now() < deadline, "owned leader did not exit");
+                thread::sleep(Duration::from_millis(5));
+            }
+            #[cfg(target_os = "macos")]
+            assert_eq!(
+                process.only_exited_leader_in_group().unwrap(),
+                mode == "exit"
+            );
+            if mode == "orphan" {
+                assert!(fs2::FileExt::try_lock_exclusive(&guard).is_err());
+            }
+            assert!(process.finish().unwrap().success());
+            loop {
+                match fs2::FileExt::try_lock_exclusive(&guard) {
+                    Ok(()) => break,
+                    Err(error) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "owned descendant retained its lifetime guard: {error}"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
         }
     }
 

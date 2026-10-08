@@ -145,11 +145,20 @@ fn idle_request(daemon: &Daemon) -> Value {
 }
 
 fn retry_busy(daemon: &Daemon, method: &str, params: Value) -> Value {
+    let response = retry_busy_response(daemon, method, params);
+    assert!(response.get("error").is_none(), "{method}: {response}");
+    assert_eq!(response["result"]["instance"], daemon.marker["instance"]);
+    assert_eq!(response["result"]["namespace"], daemon.marker["namespace"]);
+    response["result"]["data"].clone()
+}
+
+fn retry_busy_response(daemon: &Daemon, method: &str, params: Value) -> Value {
     let started = Instant::now();
     loop {
         let response = daemon.try_rpc(method, params.clone()).unwrap();
-        if let Some(error) = response.get("error") {
-            assert_eq!(error["data"]["category"], "busy", "{response}");
+        if let Some(error) = response.get("error")
+            && error["data"]["category"] == "busy"
+        {
             assert_eq!(error["data"]["retryable"], true, "{response}");
             assert_eq!(
                 error["data"]["committed_state"], "not-committed",
@@ -161,9 +170,7 @@ fn retry_busy(daemon: &Daemon, method: &str, params: Value) -> Value {
             );
             thread::sleep(Duration::from_millis(20));
         } else {
-            assert_eq!(response["result"]["instance"], daemon.marker["instance"]);
-            assert_eq!(response["result"]["namespace"], daemon.marker["namespace"]);
-            return response["result"]["data"].clone();
+            return response;
         }
     }
 }

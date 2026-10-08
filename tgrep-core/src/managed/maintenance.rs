@@ -99,6 +99,13 @@ pub struct IdleOutcome {
     pub committed_state: CommitState,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceRecord {
+    instance: Id,
+    stopping: bool,
+}
+
 impl Namespace {
     /// The caller already holds external namespace ownership. Activating a new
     /// instance does not restore readiness or expire old managed owners.
@@ -167,6 +174,38 @@ impl Namespace {
         self.stop_if_idle_inner(external, None)
     }
 
+    /// Resolve shutdown authorization for the activated instance. A committed
+    /// operation receipt or other catalog transaction alone is not a stop.
+    pub fn stop_is_committed(&self) -> Result<bool> {
+        self.read(|connection| {
+            let state: Option<(String, String)> = connection
+                .query_row(
+                    "SELECT s.admission,r.record FROM state s JOIN records r
+                     ON r.kind='service' AND r.id='current' WHERE s.singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (admission, record) =
+                state.ok_or_else(|| Error::corrupt("activated service record is missing"))?;
+            let record: ServiceRecord = serde_json::from_str(&record)
+                .map_err(|error| Error::corrupt(format!("invalid service record: {error}")))?;
+            if record.instance != *self.instance() {
+                return Err(Error::new(
+                    ErrorCategory::StaleIdentity,
+                    "service-instance-mismatch",
+                    "the service record belongs to a different namespace instance",
+                ));
+            }
+            if !matches!(admission.as_str(), "open" | "closed")
+                || (record.stopping && admission != "closed")
+            {
+                return Err(Error::corrupt("service and admission state disagree"));
+            }
+            Ok(record.stopping)
+        })
+    }
+
     pub fn stop_if_idle_with_token(
         &self,
         token: super::OperationToken,
@@ -175,6 +214,12 @@ impl Namespace {
         let operation =
             self.accept_maintenance_operation(token, "idle-stop", serde_json::json!({}))?;
         let _receipt = self.hold_operation(&operation.id)?;
+        self.fault(super::faults::Point::IdleAccepted, Some(&operation.id))
+            .map_err(|error| {
+                error
+                    .committed(CommitState::Committed)
+                    .operation(operation.id.to_string())
+            })?;
         if let Some(result) = operation.result {
             return Ok(serde_json::from_value(result)?);
         }
@@ -212,11 +257,11 @@ impl Namespace {
             .try_lock()
             .map_err(|_| Error::busy("namespace-maintenance-active"))?;
         self.expire_cursors()?;
-        self.transaction(|transaction| {
-            transaction.execute("UPDATE state SET admission='closed' WHERE singleton=1", [])?;
-            Ok(())
-        })?;
         let result = (|| {
+            self.transaction(|transaction| {
+                transaction.execute("UPDATE state SET admission='closed' WHERE singleton=1", [])?;
+                Ok(())
+            })?;
             self.fault(super::faults::Point::IdleAdmissionClosed, operation)?;
             let (leases, owners, reservations, operations) = self.read(|connection| {
                 Ok(connection.query_row(
@@ -307,11 +352,28 @@ impl Namespace {
                 .map_err(|error| error.committed(outcome.committed_state))?;
             Ok(outcome)
         })();
-        if matches!(&result, Err(error) if error.committed_state == CommitState::NotCommitted) {
-            self.transaction(|transaction| {
-                transaction.execute("UPDATE state SET admission='open' WHERE singleton=1", [])?;
-                Ok(())
+        if let Err(original) = &result {
+            let stopping = self.stop_is_committed().map_err(|error| {
+                Error::new(
+                    ErrorCategory::RecoveryRequired,
+                    "idle-state-unavailable",
+                    format!("idle attempt: {original}; reading shutdown authorization: {error}"),
+                )
+                .committed(CommitState::Unknown)
             })?;
+            if !stopping {
+                self.transaction(|transaction| {
+                    transaction.execute("UPDATE state SET admission='open' WHERE singleton=1", [])?;
+                    Ok(())
+                })
+                .map_err(|error| {
+                    Error::new(
+                        ErrorCategory::RecoveryRequired,
+                        "idle-admission-recovery",
+                        format!("stop was not committed; idle attempt: {original}; restoring admission: {error}"),
+                    )
+                })?;
+            }
         }
         result
     }

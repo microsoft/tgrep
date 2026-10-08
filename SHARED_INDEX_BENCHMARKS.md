@@ -44,6 +44,11 @@ Each schema-1 JSON report records:
 - Source-input fingerprints, exact executable BLAKE3, available Git revision,
   tool versions, architecture, available parallelism, filesystem type, build
   profile and presence of test hooks.
+- A UTC run window in Unix milliseconds and monotonic elapsed time, covering
+  provenance, fixture setup, measurement, owned-child shutdown and cleanup.
+  Both temporary fixture trees are explicitly closed after all owned daemons
+  and guards are dropped. Cleanup errors are retained in the report and fail
+  qualification; implicit temporary-directory destruction is not cleanup proof.
 - End-to-end observed operation times and query sample count/min/p50/p95/max/mean.
   Queries include fresh-connection lookup plus search RPC, not CLI spawn time.
   Observation overhead is included. Small sample p95 is descriptive, not a

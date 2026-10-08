@@ -106,7 +106,7 @@ pub struct LeaseRecord {
     pub operation: Id,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PinIntent {
     pub commit: String,
@@ -134,6 +134,21 @@ pub struct ViewRecord {
 }
 
 impl ViewRecord {
+    fn same_publication(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.version == other.version
+            && self.root == other.root
+            && self.root_identity == other.root_identity
+            && self.root_anchor == other.root_anchor
+            && self.current == other.current
+            && self.pending == other.pending
+            && self.checkpoint == other.checkpoint
+            && self.checkpoint_binding == other.checkpoint_binding
+            && self.input_epoch == other.input_epoch
+            && self.reconciled_epoch == other.reconciled_epoch
+            && self.committed == other.committed
+    }
+
     pub fn pin(&self) -> Result<&CurrentPin> {
         self.current
             .as_ref()
@@ -715,6 +730,8 @@ impl ViewManager {
                     "view-work-active"
                         | "generation-already-materializing"
                         | "view-attachment-preparing"
+                        | "object-retirement-in-progress"
+                        | "catalog-checkpoint-readers-active"
                 )
             {
                 match self.namespace.defer_operation(id, &error.reason_code) {
@@ -1002,7 +1019,7 @@ impl ViewManager {
         operation: &OperationRecord,
         request: &AttachRequest,
         lease: &LeaseRecord,
-        mut record: ViewRecord,
+        record: ViewRecord,
         root: &Path,
     ) -> Result<()> {
         let slot = self.install_slot(&record, root)?;
@@ -1016,55 +1033,7 @@ impl ViewManager {
             request.allocation_version,
         )?;
         let _work = slot.begin_work(operation)?;
-        let repository =
-            Repository::discover_controlled(root, &super::process::Control::work(&permit))?;
-        let intent = record.intent()?;
-        let (pin, generation, stats) = self.materialize(
-            &repository,
-            &intent.commit,
-            *intent.key.profile(),
-            None,
-            &permit,
-        )?;
-        let view = match (&record.checkpoint, &record.checkpoint_binding) {
-            (Some(checkpoint), Some(binding)) if record.current.as_ref() == Some(&pin) => {
-                match self.namespace.restore_checkpoint(
-                    checkpoint,
-                    binding,
-                    root,
-                    Arc::clone(&generation),
-                    self.options.clone(),
-                    &permit,
-                ) {
-                    Ok(view) => view,
-                    Err(error)
-                        if matches!(
-                            error.category,
-                            ErrorCategory::CacheEvicted | ErrorCategory::CacheMissing
-                        ) =>
-                    {
-                        WorktreeView::new_controlled(
-                            root,
-                            generation,
-                            self.options.clone(),
-                            &permit,
-                        )?
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            (None, None) | (Some(_), Some(_)) => {
-                WorktreeView::new_controlled(root, generation, self.options.clone(), &permit)?
-            }
-            _ => {
-                return Err(Error::corrupt(
-                    "authoritative checkpoint identity and binding disagree",
-                ));
-            }
-        };
-        record.current = Some(pin);
-        record.pending = None;
-        let view = Arc::new(view);
+        let (record, view, stats) = self.materialize_view(record, root, &permit)?;
         slot.install_preparing(Arc::clone(&view))?;
         let (checkpoint, reconcile, input) =
             self.prepare_checkpoint(&slot, &view, &record, &permit)?;
@@ -1079,8 +1048,102 @@ impl ViewManager {
             json!({"lease":lease,"build":stats}),
             &permit,
             false,
-        )?;
-        Ok(())
+        )
+    }
+
+    fn materialize_view(
+        &self,
+        mut record: ViewRecord,
+        root: &Path,
+        permit: &Arc<WorkPermit>,
+    ) -> Result<(ViewRecord, Arc<WorktreeView>, BuildStats)> {
+        let repository =
+            Repository::discover_controlled(root, &super::process::Control::work(permit))?;
+        let intent = record.intent()?;
+        let cached = record.current.as_ref().map(|pin| -> Result<_> {
+            let generation = match (&self.legacy, &pin.incarnation) {
+                (Some(legacy), None) => legacy.open_controlled(&pin.key, permit)?,
+                (None, Some(incarnation)) => self
+                    .namespace
+                    .open_generation_controlled(incarnation, Some(permit))?,
+                _ => return Err(Error::incompatible("current pin uses another storage mode")),
+            };
+            pin.validate_generation(&generation)?;
+            let stats = BuildStats {
+                reused_generation: true,
+                tracked_entries: generation.entries().len(),
+                ..BuildStats::default()
+            };
+            Ok((pin.clone(), generation, stats))
+        });
+        let cached = match cached.transpose() {
+            Ok(cached) => cached,
+            Err(error)
+                if matches!(
+                    error.category,
+                    ErrorCategory::CacheEvicted | ErrorCategory::CacheMissing
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let (pin, generation, stats) = match cached {
+            Some(cached) => cached,
+            None => self.materialize(
+                &repository,
+                &intent.commit,
+                *intent.key.profile(),
+                None,
+                permit,
+            )?,
+        };
+        let view = match (&record.checkpoint, &record.checkpoint_binding) {
+            (Some(checkpoint), Some(binding)) if record.current.as_ref() == Some(&pin) => {
+                match self.namespace.restore_checkpoint(
+                    checkpoint,
+                    binding,
+                    root,
+                    Arc::clone(&generation),
+                    self.options.clone(),
+                    permit,
+                ) {
+                    Ok(view) => view,
+                    Err(error)
+                        if matches!(
+                            error.category,
+                            ErrorCategory::CacheEvicted | ErrorCategory::CacheMissing
+                        ) =>
+                    {
+                        WorktreeView::new_controlled(
+                            root,
+                            generation,
+                            self.options.clone(),
+                            permit,
+                        )?
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            (None, None) | (Some(_), Some(_)) => {
+                WorktreeView::new_controlled(root, generation, self.options.clone(), permit)?
+            }
+            _ => {
+                return Err(Error::corrupt(
+                    "authoritative checkpoint identity and binding disagree",
+                ));
+            }
+        };
+        if view.root_identity()? != record.root_identity {
+            return Err(Error::new(
+                ErrorCategory::StaleIdentity,
+                "worktree-replaced",
+                "the restored view does not use the authoritative worktree identity",
+            ));
+        }
+        record.current = Some(pin);
+        record.pending = None;
+        Ok((record, Arc::new(view), stats))
     }
 
     fn materialize(
@@ -1181,9 +1244,17 @@ impl ViewManager {
             .serial
             .try_lock()
             .map_err(|_| Error::busy("view-work-active"))?;
+        let authoritative = self.recover(&request.view)?;
+        if authoritative.version != request.expected_version {
+            return Err(Error::stale_version(authoritative.version));
+        }
         let current = slot.current()?;
-        if current.record.version != request.expected_version {
-            return Err(Error::stale_version(current.record.version));
+        if !current.record.same_publication(&authoritative) {
+            return Err(Error::new(
+                ErrorCategory::RecoveryRequired,
+                "view-publication-needs-recovery",
+                "refresh the authoritative publication before advancing it again",
+            ));
         }
         if request.profile != *current.record.pin()?.key.profile() {
             return Err(Error::incompatible(
@@ -1230,7 +1301,7 @@ impl ViewManager {
             &permit,
         )?;
         let replacement = Arc::new(current.view.replacement(generation, &permit)?);
-        let mut record = current.record.clone();
+        let mut record = authoritative;
         record.version = record
             .version
             .checked_add(1)
@@ -1314,25 +1385,42 @@ impl ViewManager {
             .serial
             .try_lock()
             .map_err(|_| Error::busy("view-work-active"))?;
-        let current = slot.current()?;
-        if current.record.version != expected_version {
-            return Err(Error::stale_version(current.record.version));
+        let mut record = self.recover(view)?;
+        if record.version != expected_version {
+            return Err(Error::stale_version(record.version));
         }
         let permit = self.reserve(&operation.id, owner, allocation_version)?;
         let _work = slot.begin_work(operation)?;
+        let current = slot
+            .state
+            .lock()
+            .map_err(|_| Error::corrupt("view lock poisoned"))?
+            .current
+            .clone();
+        let (view, result) = match current {
+            Some(current) if current.record.same_publication(&record) => {
+                (Arc::clone(&current.view), json!({}))
+            }
+            _ => {
+                let expected_pin = record.current.clone();
+                let (restored, view, stats) =
+                    self.materialize_view(record, slot.root(), &permit)?;
+                if expected_pin.is_some() && restored.current != expected_pin {
+                    return Err(Error::new(
+                        ErrorCategory::RecoveryRequired,
+                        "committed-generation-unavailable",
+                        "refresh cannot replace the physical incarnation of a committed pin",
+                    ));
+                }
+                record = restored;
+                slot.install_preparing(Arc::clone(&view))?;
+                (view, json!({"build":stats}))
+            }
+        };
         let (checkpoint, reconcile, input) =
-            self.prepare_checkpoint(&slot, &current.view, &current.record, &permit)?;
+            self.prepare_checkpoint(&slot, &view, &record, &permit)?;
         self.publish(
-            &slot,
-            operation,
-            current.record.clone(),
-            Arc::clone(&current.view),
-            checkpoint,
-            reconcile,
-            input,
-            json!({}),
-            &permit,
-            false,
+            &slot, operation, record, view, checkpoint, reconcile, input, result, &permit, false,
         )
     }
 
@@ -1419,6 +1507,16 @@ impl ViewManager {
             return Err(Error::busy("checkpoint-epoch-changed"));
         }
         permit.check()?;
+        let expected_publication = if migration {
+            state
+                .current
+                .as_ref()
+                .ok_or_else(|| Error::busy("view-not-ready"))?
+                .record
+                .clone()
+        } else {
+            record.clone()
+        };
         record.checkpoint = Some(checkpoint.descriptor.incarnation.clone());
         record.checkpoint_binding = Some(checkpoint.descriptor.binding.clone());
         record.root_anchor = view.root_anchor().cloned();
@@ -1434,12 +1532,9 @@ impl ViewManager {
                 return Err(Error::stale_version(previous.version));
             }
             if previous.revision != record.revision {
-                let metadata_only = state.current.as_ref().is_some_and(|current|
-                    previous.current == current.record.current && previous.checkpoint == current.record.checkpoint
-                    && previous.input_epoch == current.record.input_epoch
-                    && previous.reconciled_epoch == current.record.reconciled_epoch
-                    && previous.root_identity == current.record.root_identity);
-                if !metadata_only { return Err(Error::busy("publication-state-changed")); }
+                if !previous.same_publication(&expected_publication) {
+                    return Err(Error::busy("publication-state-changed"));
+                }
                 record.revision = previous.revision;
             }
             if lease_count(transaction, Some(&record.id))? == 0 { return Err(Error::busy("view-has-no-leases")); }
@@ -1520,6 +1615,7 @@ impl ViewManager {
         let ready = if let Some(current) = &state.current {
             let status = current.view.status()?;
             !state.closing
+                && current.record.same_publication(&authoritative)
                 && current.record.input_epoch == slot.epoch.load(Ordering::Acquire)
                 && status.ready
                 && status.published_epoch == current.record.reconciled_epoch
@@ -1766,17 +1862,16 @@ impl ViewSlot {
             .lock()
             .map_err(|_| Error::corrupt("view lock poisoned"))?;
         if let Some(version) = expected_version {
-            let current = state
-                .current
-                .as_ref()
-                .ok_or_else(|| Error::busy("view-not-ready"))?;
-            if current.record.version != version {
-                return Err(Error::stale_version(current.record.version));
+            let current = self
+                .namespace
+                .read(|connection| view_row(connection, &self.id))?;
+            if current.version != version {
+                return Err(Error::stale_version(current.version));
             }
         }
         let before = self
             .epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| Error::corrupt("view input epoch exhausted"))?;

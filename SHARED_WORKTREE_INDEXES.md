@@ -1037,6 +1037,14 @@ operation and authoritative record. Failed/concurrently invalidated preparation
 has bounded retry and releases or conservatively charges its staging; it never
 publishes a base-only or partially reconciled ready view.
 
+If commitment succeeds but the in-memory swap fails, readiness stays closed
+until reconciliation restores the authoritative publication. Recovery compares
+the full pin/checkpoint/epoch binding, not just the view version: an ordinary
+refresh can commit a new checkpoint without advancing the version. The live
+scheduler and explicit refresh can repair this state without restarting.
+Version-checked invalidations use the durable current version throughout repair;
+already-issued readers retain their original protections.
+
 `views.refresh` takes `view`, `expected_version`, `owner`, `allocation_version`
 in an operation envelope and performs full verification. `views.invalidate`
 directly accepts `view`, `expected_version`, `owner`, `changed` (relative paths)
@@ -1052,6 +1060,10 @@ high/low watermarks, minimum absolute/percentage reduction, cooldown and attempt
 limits, then invokes the same migration engine. Fixed-pin participants block
 it. Untracked-only churn, unchanged targets, and ineffective checkout
 transformations do not repeatedly publish ineffective generations.
+An eligible decision and its exact target/input epoch are persisted with the
+logical attempt count. Transient worker or object-guard contention can defer
+that same operation within its deadline without consuming another adaptive
+attempt, reapplying cooldown, or selecting a later `HEAD`.
 
 ### Management method reference
 
@@ -1177,6 +1189,10 @@ guarantees. Recovery validates identities and sealed state before serving.
 On POSIX, catalog identity/accounting probes use no-open metadata observation:
 closing an independently opened database/sidecar descriptor can otherwise
 release SQLite's process-wide record locks.
+WAL checkpointing is bounded and occurs before catalog mutations, not after a
+successful commit. Reader contention produces an explicit retryable busy
+outcome before mutation; a durable WAL commit does not become a failed
+publication merely because truncation would have to wait for a reader.
 
 All managed failures have `category`, stable `reason_code`, `retryable`,
 `committed_state` (`not-committed`, `committed`, `unknown`) and local `detail`;
@@ -1193,6 +1209,9 @@ guards, requests, queries, queued jobs and background batches. A busy decision
 reopens admission; a committed stop leaves it closed before exit. A terminal
 busy receipt is replayable, so a later probe needs a new token. Disconnecting
 the final client or checking the lease count alone is not atomic shutdown.
+Committed operation acceptance or bookkeeping alone does not authorize exit.
+Error recovery checks the current instance's durable stop decision together
+with closed admission; a busy or uncommitted decision restores admission.
 
 `maintenance.status` exposes bounded per-instance aggregate counters separately
 from free-form last-error diagnostics. Live status also reports native resident

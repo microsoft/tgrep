@@ -36,6 +36,7 @@ pub enum Point {
     ControlIntentSaved,
     ControlAfterRemove,
     ControlBeforeCredit,
+    IdleAccepted,
     IdleAdmissionClosed,
     IdleCommitted,
 }

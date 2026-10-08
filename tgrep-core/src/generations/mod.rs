@@ -658,16 +658,24 @@ impl GenerationManager {
         predecessor: Option<&Arc<Generation>>,
         permit: &Arc<crate::managed::WorkPermit>,
     ) -> Result<EnsureResult> {
+        self.validate_compatibility_permit(permit)?;
+        self.ensure_inner(revision, profile, predecessor, Some(permit))
+    }
+
+    fn validate_compatibility_permit(
+        &self,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<()> {
         if permit.namespace.header().repository != self.repository.identity
             || permit.namespace.header().storage
                 != crate::managed::policy::StorageMode::CompatibilityRetainAll
         {
             return Err(crate::managed::Error::incompatible(
-                "legacy construction requires this repository's compatibility namespace",
+                "legacy access requires this repository's compatibility namespace",
             )
             .into());
         }
-        self.ensure_inner(revision, profile, predecessor, Some(permit))
+        Ok(())
     }
 
     fn ensure_inner(
@@ -721,6 +729,17 @@ impl GenerationManager {
         self.validate_key(key)?;
         let _lock = self.lock()?;
         self.open_locked(key)
+    }
+
+    pub(crate) fn open_controlled(
+        &self,
+        key: &GenerationKey,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<Arc<Generation>> {
+        self.validate_compatibility_permit(permit)?;
+        self.validate_key(key)?;
+        let _lock = self.lock_controlled(Some(permit))?;
+        self.open_locked_controlled(key, Some(permit))
     }
 
     /// Published keys only; interrupted `.stage-*` directories are not candidates.

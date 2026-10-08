@@ -51,7 +51,7 @@ fn published_generations(daemon: &Daemon) -> Vec<Value> {
     panic!("catalog traversal did not converge");
 }
 
-fn wait_for(
+pub(super) fn wait_for(
     daemon: &Daemon,
     method: &str,
     params: Value,

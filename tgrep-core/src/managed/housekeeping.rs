@@ -16,6 +16,7 @@ use std::time::Instant;
 pub struct CleanupCounts {
     pub history_rows: u32,
     pub member_rows: u32,
+    pub proof_rows: u32,
     pub objects: u32,
     pub receipts: u32,
     pub leases: u32,
@@ -420,12 +421,22 @@ pub(super) fn register_control(
     area: &str,
     name: &str,
     source: &str,
+    producer: &std::fs::File,
+    intended: &[u8],
 ) -> Result<()> {
     if !matches!(area, "guards" | "owners") {
         return Err(Error::invalid("unknown control-file area"));
     }
     let file = directory.open_file(name, false)?;
     let bytes = directory.read_bytes(name, 4096)?;
+    let seal = super::MemberSeal::bounded(intended)?;
+    if FileIdentity::of(&file)? != FileIdentity::of(producer)? || bytes != intended {
+        return Err(Error::new(
+            ErrorCategory::StaleIdentity,
+            "control-file-modified",
+            "control content or identity differs from its original producer",
+        ));
+    }
     let policy: String =
         transaction.query_row("SELECT policy FROM state WHERE singleton=1", [], |row| {
             row.get(0)
@@ -443,6 +454,8 @@ pub(super) fn register_control(
             identity: FileIdentity::of(&file)?,
             change: super::storage::file_change(&file)?,
             producer_open: false,
+            seal: Some(seal),
+            ownership: super::Ownership::capture(producer)?,
             logical_bytes: bytes.len() as u64,
             allocated_bytes: allocated_bytes(&file)?,
             pending_length: None,
@@ -450,7 +463,7 @@ pub(super) fn register_control(
             credited_logical_bytes: 0,
             credited_allocated_bytes: 0,
         },
-        checksum: *blake3::hash(&bytes).as_bytes(),
+        checksum: *blake3::hash(intended).as_bytes(),
     };
     transaction.execute(
         "INSERT INTO control_files VALUES(?1,?2,?3,?4)",
@@ -684,9 +697,20 @@ impl Namespace {
                 )? as u32))?;
             }
             5 => {
+                counts.proof_rows += self.transaction(|transaction| Ok(transaction.execute(
+                    "DELETE FROM member_seals WHERE rowid IN (
+                      SELECT s.rowid FROM member_seals s
+                      JOIN members m ON m.object_id=s.object_id AND m.name=s.name
+                      JOIN objects o ON o.id=m.object_id
+                      WHERE m.rowid=CAST(?1 AS INTEGER) AND
+                        (o.state='removed' OR (o.state='quarantined' AND json_extract(m.record,'$.seal') IS NULL))
+                      ORDER BY s.block_index LIMIT ?2)",
+                    params![id, super::authentication::PROOF_BATCH as u32],
+                )? as u32))?;
                 counts.member_rows += self.transaction(|transaction| Ok(transaction.execute(
                     "DELETE FROM members WHERE rowid=CAST(?1 AS INTEGER)
-                     AND EXISTS(SELECT 1 FROM objects WHERE id=members.object_id AND state='removed')", [id],
+                     AND EXISTS(SELECT 1 FROM objects WHERE id=members.object_id AND state='removed')
+                     AND NOT EXISTS(SELECT 1 FROM member_seals WHERE object_id=members.object_id AND name=members.name)", [id],
                 )? as u32))?;
             }
             6 => {

@@ -911,6 +911,8 @@ pub(crate) struct ChargedWriter {
     permit: Arc<WorkPermit>,
     _pin: Arc<super::lifetime::ObjectGuard>,
     name: String,
+    authentication: Mutex<Option<Box<super::authentication::ProducerSeal>>>,
+    _authentication_memory: MemoryCharge,
 }
 
 impl ChargedWriter {
@@ -920,6 +922,7 @@ impl ChargedWriter {
         permit: Arc<WorkPermit>,
     ) -> Result<Self> {
         permit.check()?;
+        let authentication_memory = permit.memory(super::authentication::PRODUCER_MEMORY)?;
         let created = (|| {
             permit.namespace.begin_member(&pin.id, name)?;
             permit.namespace.fault(
@@ -931,7 +934,9 @@ impl ChargedWriter {
                 super::faults::Point::MemberCreated,
                 Some(permit.operation_id()),
             )?;
-            permit.namespace.record_file_state(&pin.id, name, true)?;
+            permit
+                .namespace
+                .record_open_file_state(&pin.id, name, &file, true)?;
             Ok(file)
         })();
         let file = match created {
@@ -946,27 +951,52 @@ impl ChargedWriter {
             permit,
             _pin: pin,
             name: name.into(),
+            authentication: Mutex::new(Some(Box::new(super::authentication::ProducerSeal::new()))),
+            _authentication_memory: authentication_memory,
         })
     }
 
     pub(crate) fn sync_all(&self) -> Result<()> {
+        self.authentication
+            .lock()
+            .map_err(|_| Error::corrupt("producer authentication lock poisoned"))?
+            .as_mut()
+            .expect("writer owns its authentication until drop")
+            .flush(&self.permit.namespace, &self._pin.id, &self.name)?;
         self.file
             .as_ref()
             .expect("writer owns its file until drop")
             .sync_all()?;
-        self.permit
-            .namespace
-            .record_file_state(&self._pin.id, &self.name, true)?;
+        self.permit.namespace.record_open_file_state(
+            &self._pin.id,
+            &self.name,
+            self.file.as_ref().expect("writer owns its file until drop"),
+            true,
+        )?;
         Ok(())
     }
 }
 
 impl Write for ChargedWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.permit.write(
+        let authentication = self
+            .authentication
+            .get_mut()
+            .map_err(|_| std::io::Error::other("producer authentication lock poisoned"))?
+            .as_mut()
+            .expect("writer owns its authentication until drop");
+        if authentication.available() == 0 {
+            authentication
+                .flush(&self.permit.namespace, &self._pin.id, &self.name)
+                .map_err(std::io::Error::other)?;
+        }
+        let bytes = &bytes[..bytes.len().min(authentication.available())];
+        let written = self.permit.write(
             self.file.as_mut().expect("writer owns its file until drop"),
             bytes,
-        )
+        )?;
+        authentication.accepted(&bytes[..written]);
+        Ok(written)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.permit.check().map_err(std::io::Error::other)?;
@@ -980,7 +1010,20 @@ impl Write for ChargedWriter {
 impl Drop for ChargedWriter {
     fn drop(&mut self) {
         drop(self.file.take());
-        if let Err(error) = self.permit.namespace.record_file(&self._pin.id, &self.name) {
+        let result = (|| {
+            let seal = self
+                .authentication
+                .get_mut()
+                .map_err(|_| Error::corrupt("producer authentication lock poisoned"))?
+                .take()
+                .ok_or_else(|| Error::corrupt("producer authentication was already consumed"))?
+                .finish(&self.permit.namespace, &self._pin.id, &self.name)?;
+            self.permit
+                .namespace
+                .complete_member_seal(&self._pin.id, &self.name, seal)?;
+            self.permit.namespace.record_file(&self._pin.id, &self.name)
+        })();
+        if let Err(error) = result {
             self.permit.inventory_failed.store(true, Ordering::Release);
             eprintln!(
                 "managed producer {} keeps its reservation after inventory failure: {error}",
@@ -1039,6 +1082,175 @@ mod tests {
             }
         }
         panic!("producer recovery did not complete its bounded traversal");
+    }
+
+    fn member(namespace: &Namespace, object: &Id) -> crate::managed::FileRecord {
+        namespace
+            .read(|connection| {
+                let encoded: String = connection.query_row(
+                    "SELECT record FROM members WHERE object_id=?1 AND name='payload'",
+                    [object.as_str()],
+                    |row| row.get(0),
+                )?;
+                Ok(serde_json::from_str(&encoded)?)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn intended_proof_hashes_every_accepted_byte_across_bounded_batches() {
+        let (_temp, namespace, permit) = fixture();
+        let (object, pin) = namespace
+            .create_object(ObjectKind::BuildStage, None, &permit)
+            .unwrap();
+        let mut writer =
+            ChargedWriter::new(Arc::clone(&pin), "payload", Arc::clone(&permit)).unwrap();
+        let bytes: Vec<u8> = (0..(crate::managed::authentication::BLOCK_BYTES * 67 + 3))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        for fragment in bytes.chunks(3079) {
+            writer.write_all(fragment).unwrap();
+        }
+        writer.sync_all().unwrap();
+        assert!(member(&namespace, &object.id).seal.is_none());
+        drop(writer);
+        let record = member(&namespace, &object.id);
+        assert!(!record.producer_open);
+        let seal = record.seal.unwrap();
+        assert_eq!(seal.length, bytes.len() as u64);
+        assert_eq!(seal.blocks, 68);
+        let mut manifest = crate::managed::authentication::manifest_hasher();
+        namespace.read(|connection| {
+            for (index, chunk) in bytes.chunks(crate::managed::authentication::BLOCK_BYTES).enumerate() {
+                let (length, digest): (u32, Vec<u8>) = connection.query_row(
+                    "SELECT length,digest FROM member_seals WHERE object_id=?1 AND name='payload' AND block_index=?2",
+                    rusqlite::params![object.id.as_str(), i64::try_from(index).unwrap()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(length as usize, chunk.len());
+                assert_eq!(digest.as_slice(), blake3::hash(chunk).as_bytes());
+                crate::managed::authentication::hash_block(&mut manifest,
+                    &crate::managed::authentication::Block {
+                        index: index as u64, length,
+                        digest: digest.try_into().unwrap(),
+                    });
+            }
+            Ok(())
+        }).unwrap();
+        assert_eq!(seal.manifest, *manifest.finalize().as_bytes());
+        assert!(
+            permit.peak_private_bytes.load(Ordering::Acquire)
+                >= crate::managed::authentication::PRODUCER_MEMORY
+        );
+    }
+
+    #[test]
+    fn intended_proof_does_not_adopt_changed_output_before_producer_close() {
+        let (_temp, namespace, permit) = fixture();
+        let (object, pin) = namespace
+            .create_object(ObjectKind::BuildStage, None, &permit)
+            .unwrap();
+        let mut writer =
+            ChargedWriter::new(Arc::clone(&pin), "payload", Arc::clone(&permit)).unwrap();
+        let intended = b"original producer bytes";
+        writer.write_all(intended).unwrap();
+        writer.sync_all().unwrap();
+        let changed = vec![b'x'; intended.len()];
+        std::fs::write(pin.directory.path().join("payload"), &changed).unwrap();
+        drop(writer);
+        assert_eq!(
+            member(&namespace, &object.id).seal,
+            Some(crate::managed::MemberSeal::bounded(intended).unwrap())
+        );
+        assert_ne!(
+            member(&namespace, &object.id).seal,
+            Some(crate::managed::MemberSeal::bounded(&changed).unwrap())
+        );
+    }
+
+    #[test]
+    fn intended_proof_retries_exact_rows_after_postcommit_response_loss() {
+        let (_temp, namespace, permit) = fixture();
+        let (object, pin) = namespace
+            .create_object(ObjectKind::BuildStage, None, &permit)
+            .unwrap();
+        let mut writer =
+            ChargedWriter::new(Arc::clone(&pin), "payload", Arc::clone(&permit)).unwrap();
+        let bytes = [b'x'; crate::managed::authentication::BLOCK_BYTES];
+        writer.write_all(&bytes).unwrap();
+        namespace
+            .install_test_fault(Specification {
+                point: Point::CatalogAfterCommit,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Error {
+                    category: ErrorCategory::Io,
+                },
+            })
+            .unwrap();
+        let error = writer.sync_all().unwrap_err();
+        assert_eq!(error.committed_state, super::super::CommitState::Committed);
+        writer.sync_all().unwrap();
+        drop(writer);
+        assert_eq!(
+            member(&namespace, &object.id).seal,
+            Some(crate::managed::MemberSeal::bounded(&bytes).unwrap())
+        );
+        let blocks: u64 = namespace
+            .read(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM member_seals WHERE object_id=?1 AND name='payload'",
+                    [object.id.as_str()],
+                    |row| super::super::catalog::unsigned(row, 0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(blocks, 1);
+    }
+
+    #[test]
+    fn intended_proof_completion_crashes_never_invent_missing_content_evidence() {
+        for point in [Point::MemberSealBeforeCommit, Point::MemberSealAfterCommit] {
+            let (_temp, namespace, permit) = fixture();
+            let (object, pin) = namespace
+                .create_object(ObjectKind::BuildStage, None, &permit)
+                .unwrap();
+            let mut writer =
+                ChargedWriter::new(Arc::clone(&pin), "payload", Arc::clone(&permit)).unwrap();
+            writer.write_all(b"intended output").unwrap();
+            writer.sync_all().unwrap();
+            namespace
+                .install_test_fault(Specification {
+                    point,
+                    operation: Some(permit.operation_id().clone()),
+                    skip_hits: 0,
+                    action: Action::Error {
+                        category: ErrorCategory::Io,
+                    },
+                })
+                .unwrap();
+            drop(writer);
+            assert!(member(&namespace, &object.id).producer_open);
+            drop((pin, permit));
+            assert_eq!(namespace.work_usage().unwrap().reservations, 1);
+            let issues = recover(&namespace);
+            let expected = if point == Point::MemberSealBeforeCommit {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].error["reason_code"], "member-content-unsealed");
+                assert!(member(&namespace, &object.id).seal.is_none());
+                ObjectState::Quarantined
+            } else {
+                assert!(issues.is_empty());
+                assert!(!member(&namespace, &object.id).producer_open);
+                assert_eq!(
+                    member(&namespace, &object.id).seal,
+                    Some(crate::managed::MemberSeal::bounded(b"intended output").unwrap())
+                );
+                ObjectState::Retired
+            };
+            assert_eq!(namespace.object(&object.id).unwrap().state, expected);
+            assert_eq!(namespace.work_usage().unwrap().reservations, 0);
+        }
     }
 
     #[test]

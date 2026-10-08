@@ -15,6 +15,153 @@ pub struct FileIdentity {
     pub file: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ownership {
+    pub format: u32,
+    pub digest: [u8; 32],
+}
+
+pub(crate) const SECURITY_BYTES: usize = 64 * 1024;
+
+impl Ownership {
+    pub(crate) fn capture(file: &File) -> Result<Self> {
+        plain(&file.metadata()?, false)?;
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"tgrep/managed/member-ownership/v1\0");
+        #[cfg(windows)]
+        {
+            use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+            use windows_sys::Win32::Security::{
+                DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetKernelObjectSecurity,
+                OWNER_SECURITY_INFORMATION,
+            };
+            hash.update(b"windows\0");
+            hash.update(&file.metadata()?.file_attributes().to_le_bytes());
+            let mut bytes = [0_u8; SECURITY_BYTES];
+            let mut needed = 0;
+            // SAFETY: the pinned handle and bounded security descriptor buffer
+            // remain valid. No SACL privilege or host security change is needed.
+            if unsafe {
+                GetKernelObjectSecurity(
+                    file.as_raw_handle(),
+                    OWNER_SECURITY_INFORMATION
+                        | GROUP_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION,
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len() as u32,
+                    &mut needed,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let size = usize::try_from(needed)
+                .ok()
+                .filter(|size| *size <= bytes.len())
+                .ok_or_else(|| Error::corrupt("native security descriptor exceeds its bound"))?;
+            hash.update(&bytes[..size]);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+            let metadata = file.metadata()?;
+            hash.update(b"linux\0");
+            hash.update(&metadata.uid().to_le_bytes());
+            hash.update(&metadata.gid().to_le_bytes());
+            hash.update(&metadata.mode().to_le_bytes());
+            for name in [c"system.posix_acl_access", c"security.selinux"] {
+                let mut bytes = [0_u8; SECURITY_BYTES];
+                // SAFETY: a live descriptor, constant NUL-terminated name and
+                // bounded native output buffer.
+                let size = unsafe {
+                    libc::fgetxattr(
+                        file.as_raw_fd(),
+                        name.as_ptr(),
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                    )
+                };
+                hash.update(name.to_bytes_with_nul());
+                if size < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ENODATA) {
+                        hash.update(&0_u64.to_le_bytes());
+                    } else {
+                        return Err(error.into());
+                    }
+                } else {
+                    let size =
+                        usize::try_from(size).map_err(|_| Error::corrupt("invalid ACL size"))?;
+                    hash.update(&(size as u64).to_le_bytes());
+                    hash.update(&bytes[..size]);
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::{fd::AsRawFd, macos::fs::MetadataExt};
+            unsafe extern "C" {
+                fn acl_get_fd(fd: libc::c_int) -> *mut libc::c_void;
+                fn acl_size(acl: *mut libc::c_void) -> libc::ssize_t;
+                fn acl_copy_ext(
+                    buffer: *mut libc::c_void,
+                    acl: *mut libc::c_void,
+                    size: libc::ssize_t,
+                ) -> libc::ssize_t;
+                fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+            }
+            struct Acl(*mut libc::c_void);
+            impl Drop for Acl {
+                fn drop(&mut self) {
+                    // SAFETY: this wrapper owns the ACL returned by acl_get_fd.
+                    unsafe {
+                        acl_free(self.0);
+                    }
+                }
+            }
+            let metadata = file.metadata()?;
+            hash.update(b"macos\0");
+            hash.update(&metadata.st_uid().to_le_bytes());
+            hash.update(&metadata.st_gid().to_le_bytes());
+            hash.update(&metadata.st_mode().to_le_bytes());
+            hash.update(&metadata.st_flags().to_le_bytes());
+            // SAFETY: a live pinned file descriptor.
+            let acl = Acl(unsafe { acl_get_fd(file.as_raw_fd()) });
+            if acl.0.is_null() {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            // SAFETY: a live native ACL owned by the wrapper.
+            let size = unsafe { acl_size(acl.0) };
+            if size < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let size =
+                usize::try_from(size).map_err(|_| Error::corrupt("native ACL size overflow"))?;
+            if size > SECURITY_BYTES {
+                return Err(Error::incompatible(
+                    "native ACL exceeds the supported ownership bound",
+                ));
+            }
+            let mut bytes = [0_u8; SECURITY_BYTES];
+            // SAFETY: the bounded output and owned ACL remain alive for the call.
+            if unsafe { acl_copy_ext(bytes.as_mut_ptr().cast(), acl.0, size as libc::ssize_t) } < 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            hash.update(&bytes[..size]);
+        }
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        return Err(Error::incompatible(
+            "native ownership evidence is unsupported",
+        ));
+        Ok(Self {
+            format: 1,
+            digest: *hash.finalize().as_bytes(),
+        })
+    }
+}
+
 pub(crate) struct FileObservation {
     pub identity: FileIdentity,
     pub logical_bytes: u64,

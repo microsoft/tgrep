@@ -7,6 +7,7 @@
 
 mod accounting;
 mod adaptive;
+mod authentication;
 mod catalog;
 mod catalog_io;
 mod checkpoints;
@@ -35,6 +36,7 @@ pub(crate) mod work;
 pub use crate::shared::CheckpointRoot as NativePath;
 pub use accounting::{InspectedObject, InspectionTotals, StorageInspection, StorageUsage};
 pub use adaptive::{AdaptiveDecision, AdaptiveRequest};
+pub use authentication::MemberSeal;
 pub use catalog::{
     CatalogCursor, CatalogPage, FileRecord, Namespace, NamespaceHeader, ObjectRecord,
     OperationRecord, OwnerRecord, VersionedPolicy,
@@ -68,7 +70,7 @@ pub use policy::Policy;
 #[doc(hidden)]
 pub use process::SupervisedChild;
 pub use roots::RootAnchor;
-pub use storage::FileIdentity;
+pub use storage::{FileIdentity, Ownership};
 pub use views::{
     AttachRequest, DetachResult, LeaseRecord, LegacyAttachRequest, MigrationRequest, ObserveView,
     OriginalAttachment, PinIntent, PublishedView, ReconcileRequest, RefreshRequest, ViewManager,

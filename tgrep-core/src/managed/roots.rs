@@ -130,6 +130,8 @@ impl RootProtection {
                     "guards",
                     &format!("root-{guard}.lock"),
                     guard.as_str(),
+                    &file,
+                    &[],
                 )?;
                 let version = previous
                     .map(|previous| {

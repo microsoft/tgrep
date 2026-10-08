@@ -512,6 +512,7 @@ impl NamespaceDiscovery {
                 let directory = self.directory.child(name)?;
                 let header: NamespaceHeader = directory.read_json("namespace.json", 64 * 1024)?;
                 if header.schema != super::STORAGE_VERSION
+                    || header.authentication != super::authentication::FORMAT
                     || header.repository != name
                     || header.directory_identity != directory.identity()?
                 {

@@ -548,6 +548,8 @@ impl Namespace {
                     continue;
                 };
                 progress.examined += 1;
+                let before_proofs = progress.cleanup.proof_rows;
+                let before_members = progress.cleanup.member_rows;
                 if let Err(error) =
                     self.cleanup_row(cursor.phase, &id, &encoded, &mut progress.cleanup)
                 {
@@ -560,6 +562,11 @@ impl Namespace {
                         identity: id.clone(),
                         error: serde_json::to_value(error)?,
                     });
+                } else if cursor.phase == 5
+                    && progress.cleanup.proof_rows > before_proofs
+                    && progress.cleanup.member_rows == before_members
+                {
+                    continue;
                 }
                 cursor.after = id;
                 continue;
@@ -742,12 +749,35 @@ impl Namespace {
                                             "known producer output was physically replaced",
                                         ));
                                     }
+                                    if member.seal.is_none() {
+                                        let error = Error::new(
+                                            ErrorCategory::RecoveryRequired,
+                                            "member-content-unsealed",
+                                            "interrupted producer has no complete intended-content proof; observed bytes were not adopted",
+                                        );
+                                        self.quarantine_object(
+                                            &object_id,
+                                            reservation.request.staging_bytes,
+                                            &error,
+                                        )?;
+                                        progress.objects_quarantined += 1;
+                                        progress.issues.push(MaintenanceIssue {
+                                            kind: "staging".into(),
+                                            identity: object_id.to_string(),
+                                            error: serde_json::to_value(error)?,
+                                        });
+                                        cursor.object = None;
+                                        cursor.member_after.clear();
+                                        cursor.object_after = object;
+                                        return Ok(false);
+                                    }
                                     if member.producer_open {
                                         self.record_file(&object_id, &member.name)?;
                                         progress.members_refreshed += 1;
                                     } else if member.pending_length.is_none()
                                         && (file.metadata()?.len() != member.logical_bytes
-                                            || super::storage::file_change(&file)? != member.change)
+                                            || super::Ownership::capture(&file)?
+                                                != member.ownership)
                                     {
                                         let error = Error::new(
                                             ErrorCategory::StaleIdentity,

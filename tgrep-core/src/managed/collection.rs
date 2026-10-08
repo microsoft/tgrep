@@ -679,8 +679,9 @@ impl Namespace {
         }
         let unsealed: bool = self.read(|connection| Ok(connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM member_creations WHERE object_id=?1)
-             OR EXISTS(SELECT 1 FROM members WHERE object_id=?1 AND json_extract(record,'$.producer_open')=1)",
-            [object.id.as_str()], |row| row.get(0),
+             OR EXISTS(SELECT 1 FROM members WHERE object_id=?1 AND
+               (json_extract(record,'$.producer_open')=1 OR json_extract(record,'$.seal.format') IS NOT ?2))",
+            params![object.id.as_str(), super::authentication::FORMAT], |row| row.get(0),
         )?))?;
         if unsealed {
             result.reasons.push("producer-inventory-incomplete".into());

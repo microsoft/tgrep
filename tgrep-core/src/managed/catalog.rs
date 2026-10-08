@@ -22,6 +22,7 @@ CREATE TABLE state (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  namespace TEXT NOT NULL,
  schema INTEGER NOT NULL,
+ authentication INTEGER NOT NULL CHECK(authentication=1),
  revision INTEGER NOT NULL CHECK(revision>=0),
  policy_version INTEGER NOT NULL CHECK(policy_version>0),
  policy TEXT NOT NULL,
@@ -58,6 +59,15 @@ CREATE TABLE member_creations (
  object_id TEXT NOT NULL REFERENCES objects(id),
  name TEXT NOT NULL,
  PRIMARY KEY(object_id,name)
+);
+CREATE TABLE member_seals (
+ object_id TEXT NOT NULL,
+ name TEXT NOT NULL,
+ block_index INTEGER NOT NULL CHECK(block_index>=0),
+ length INTEGER NOT NULL CHECK(length>0 AND length<=4096),
+ digest BLOB NOT NULL CHECK(length(digest)=32),
+ PRIMARY KEY(object_id,name,block_index),
+ FOREIGN KEY(object_id,name) REFERENCES members(object_id,name) ON DELETE CASCADE
 );
 CREATE TABLE refs (
  id TEXT PRIMARY KEY,
@@ -105,6 +115,8 @@ CREATE TABLE reservations (
 #[serde(deny_unknown_fields)]
 pub struct NamespaceHeader {
     pub schema: u32,
+    #[serde(default)]
+    pub authentication: u32,
     pub namespace: Id,
     pub repository: String,
     pub storage: StorageMode,
@@ -150,6 +162,8 @@ pub struct FileRecord {
     pub identity: FileIdentity,
     pub change: [i64; 4],
     pub producer_open: bool,
+    pub seal: Option<super::MemberSeal>,
+    pub ownership: super::Ownership,
     pub logical_bytes: u64,
     pub allocated_bytes: Measurement<u64>,
     pub pending_length: Option<u64>,
@@ -243,8 +257,9 @@ pub(crate) fn sql_integer(value: u64) -> Result<i64> {
 pub(crate) fn ensure_object_sealed(connection: &Connection, id: &Id) -> Result<()> {
     let incomplete: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM member_creations WHERE object_id=?1)
-         OR EXISTS(SELECT 1 FROM members WHERE object_id=?1 AND json_extract(record,'$.producer_open')=1)",
-        [id.as_str()], |row| row.get(0),
+         OR EXISTS(SELECT 1 FROM members WHERE object_id=?1 AND
+           (json_extract(record,'$.producer_open')=1 OR json_extract(record,'$.seal.format') IS NOT ?2))",
+        params![id.as_str(), super::authentication::FORMAT], |row| row.get(0),
     )?;
     if incomplete {
         return Err(Error::busy("object-producers-not-sealed"));
@@ -406,6 +421,7 @@ impl Namespace {
         let owners = directory.create_child("owners")?;
         let header = NamespaceHeader {
             schema: STORAGE_VERSION,
+            authentication: super::authentication::FORMAT,
             namespace: Id::new()?,
             repository: repository.into(),
             storage: policy.storage,
@@ -420,8 +436,8 @@ impl Namespace {
         transaction.execute_batch(SCHEMA)?;
         super::accounting::install_counters(&transaction)?;
         transaction.execute(
-            "INSERT INTO state(singleton,namespace,schema,revision,policy_version,policy,admission) VALUES(1,?1,?2,0,1,?3,'open')",
-            params![header.namespace.as_str(), STORAGE_VERSION, text(&policy)?],
+            "INSERT INTO state(singleton,namespace,schema,authentication,revision,policy_version,policy,admission) VALUES(1,?1,?2,?3,0,1,?4,'open')",
+            params![header.namespace.as_str(), STORAGE_VERSION, super::authentication::FORMAT, text(&policy)?],
         )?;
         transaction.execute(
             "INSERT INTO records VALUES('allocation','namespace',1,?1)",
@@ -476,7 +492,10 @@ impl Namespace {
     pub fn open(path: &Path) -> Result<Arc<Self>> {
         let directory = Directory::open(path)?;
         let header: NamespaceHeader = directory.read_json("namespace.json", 64 * 1024)?;
-        if header.schema != STORAGE_VERSION || header.directory_identity != directory.identity()? {
+        if header.schema != STORAGE_VERSION
+            || header.authentication != super::authentication::FORMAT
+            || header.directory_identity != directory.identity()?
+        {
             return Err(Error::incompatible(
                 "namespace schema or physical identity differs",
             ));
@@ -492,12 +511,15 @@ impl Namespace {
             return Err(Error::corrupt("namespace catalog was replaced"));
         }
         Self::configure_database(&connection)?;
-        let (namespace, schema): (String, u32) = connection.query_row(
-            "SELECT namespace,schema FROM state WHERE singleton=1",
+        let (namespace, schema, authentication): (String, u32, u32) = connection.query_row(
+            "SELECT namespace,schema,authentication FROM state WHERE singleton=1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        if namespace != header.namespace.as_str() || schema != header.schema {
+        if namespace != header.namespace.as_str()
+            || schema != header.schema
+            || authentication != header.authentication
+        {
             return Err(Error::corrupt("namespace and catalog identities differ"));
         }
         super::accounting::counters(&connection)?;
@@ -787,6 +809,8 @@ impl Namespace {
                     "guards",
                     &format!("{id}.lock"),
                     id.as_str(),
+                    &guard,
+                    &[],
                 )?;
                 save_object(transaction, &mut object)
             })?;
@@ -808,7 +832,25 @@ impl Namespace {
                 writer.sync_all()?;
             } else {
                 self.begin_member(&id, "object.json")?;
-                directory.create_json("object.json", &seal)?;
+                let bytes = serde_json::to_vec(&seal)?;
+                if bytes.len() > super::authentication::BLOCK_BYTES {
+                    return Err(Error::corrupt(
+                        "owned object header exceeds its fixed bound",
+                    ));
+                }
+                let mut file = directory.create_file("object.json")?;
+                self.record_open_file_state(&id, "object.json", &file, true)?;
+                use std::io::Write;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                drop(file);
+                let mut authentication = super::authentication::ProducerSeal::new();
+                authentication.accepted(&bytes);
+                self.complete_member_seal(
+                    &id,
+                    "object.json",
+                    authentication.finish(self, &id, "object.json")?,
+                )?;
                 self.record_file(&id, "object.json")?;
             }
             Ok((self.object(&id)?, pin))
@@ -930,13 +972,39 @@ impl Namespace {
     ) -> Result<FileRecord> {
         let directory = self.objects.child(id.as_str())?;
         let file = directory.open_file(name, false)?;
-        let record = FileRecord {
+        self.record_open_file_state(id, name, &file, producer_open)
+    }
+
+    pub(crate) fn record_open_file_state(
+        &self,
+        id: &Id,
+        name: &str,
+        file: &File,
+        producer_open: bool,
+    ) -> Result<FileRecord> {
+        let identity = FileIdentity::of(file)?;
+        if self
+            .objects
+            .child(id.as_str())?
+            .observe_file(name)?
+            .identity
+            != identity
+        {
+            return Err(Error::new(
+                ErrorCategory::StaleIdentity,
+                "producer-member-replaced",
+                "the named output no longer identifies its original producer handle",
+            ));
+        }
+        let mut record = FileRecord {
             name: name.into(),
-            identity: FileIdentity::of(&file)?,
-            change: super::storage::file_change(&file)?,
+            identity,
+            change: super::storage::file_change(file)?,
             producer_open,
+            seal: None,
+            ownership: super::Ownership::capture(file)?,
             logical_bytes: file.metadata()?.len(),
-            allocated_bytes: allocated_bytes(&file)?,
+            allocated_bytes: allocated_bytes(file)?,
             pending_length: None,
             removed: false,
             credited_logical_bytes: 0,
@@ -949,7 +1017,7 @@ impl Namespace {
             ).optional()?;
             if let Some(previous) = previous {
                 let previous: FileRecord = serde_json::from_str(&previous)?;
-                if previous.identity != record.identity || previous.removed || previous.pending_length.is_some()
+                if previous.identity != record.identity || previous.ownership != record.ownership || previous.removed || previous.pending_length.is_some()
                     || previous.credited_logical_bytes != 0
                     || (!previous.producer_open && (previous.change != record.change
                         || previous.logical_bytes != record.logical_bytes || producer_open))
@@ -957,12 +1025,24 @@ impl Namespace {
                     return Err(Error::new(ErrorCategory::StaleIdentity, "producer-member-modified",
                         "sealed or withdrawn output differs from its producer inventory"));
                 }
+                record.seal = previous.seal;
             } else {
                 let creating: bool = transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM member_creations WHERE object_id=?1 AND name=?2)",
                     params![id.as_str(), name], |row| row.get(0),
                 )?;
                 if !creating { return Err(Error::corrupt("producer file has no creation intent")); }
+            }
+            if !producer_open {
+                let seal = record.seal.as_ref().ok_or_else(|| Error::new(
+                    ErrorCategory::RecoveryRequired, "member-content-unsealed",
+                    "producer-intended content proof is absent; observed bytes cannot establish ownership",
+                ))?;
+                seal.validate()?;
+                if seal.length != record.logical_bytes {
+                    return Err(Error::new(ErrorCategory::StaleIdentity, "producer-member-modified",
+                        "producer output length differs from its intended seal"));
+                }
             }
             let mut object = object_row(transaction, id)?;
             if matches!(object.state, ObjectState::PendingDeletion | ObjectState::Removed | ObjectState::Quarantined) {
@@ -1142,22 +1222,28 @@ impl Namespace {
                 storage: self.path().to_path_buf(),
                 guard_identity: FileIdentity::of(&file)?,
             };
-            self.owners.create_json(
-                &format!("{id}.json"),
-                &OwnerSeal {
-                    namespace: claim.namespace.clone(),
-                    instance: claim.instance.clone(),
-                    owner: id.clone(),
-                    challenge: claim.challenge.clone(),
-                },
-            )?;
-            for name in [format!("{id}.lock"), format!("{id}.json")] {
+            let bytes = serde_json::to_vec(&OwnerSeal {
+                namespace: claim.namespace.clone(),
+                instance: claim.instance.clone(),
+                owner: id.clone(),
+                challenge: claim.challenge.clone(),
+            })?;
+            let mut seal_file = self.owners.create_file(&format!("{id}.json"))?;
+            use std::io::Write;
+            seal_file.write_all(&bytes)?;
+            seal_file.sync_all()?;
+            for (name, producer, contents) in [
+                (format!("{id}.lock"), &file, &[][..]),
+                (format!("{id}.json"), &seal_file, bytes.as_slice()),
+            ] {
                 super::housekeeping::register_control(
                     transaction,
                     &self.owners,
                     "owners",
                     &name,
                     id.as_str(),
+                    producer,
+                    contents,
                 )?;
             }
             let owner = OwnerRecord {

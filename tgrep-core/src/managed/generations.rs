@@ -123,6 +123,7 @@ pub fn open_generation(namespace: &Path, incarnation: &Id) -> Result<Arc<Generat
     let directory = Directory::open(namespace)?;
     let header: NamespaceHeader = directory.read_json("namespace.json", 64 * 1024)?;
     if header.schema != super::STORAGE_VERSION
+        || header.authentication != super::authentication::FORMAT
         || header.directory_identity != directory.identity()?
     {
         return Err(Error::incompatible("namespace schema or identity differs"));

@@ -16,6 +16,13 @@ pub(crate) struct ActivityGuard {
 impl ActivityGuard {
     pub(crate) fn acquire(directory: &Arc<Directory>) -> Result<Self> {
         let header: super::NamespaceHeader = directory.read_json("namespace.json", 64 * 1024)?;
+        if header.schema != super::STORAGE_VERSION
+            || header.authentication != super::authentication::FORMAT
+        {
+            return Err(Error::incompatible(
+                "unsupported namespace authentication format",
+            ));
+        }
         let file = directory.open_file("activity.lock", true)?;
         if FileIdentity::of(&file)? != header.activity_identity {
             return Err(Error::corrupt("namespace activity lock was replaced"));
@@ -121,6 +128,13 @@ impl OwnerGuard {
     pub fn claim(claim: OwnerClaim) -> Result<Self> {
         let namespace = Directory::open(&claim.storage)?;
         let header: super::NamespaceHeader = namespace.read_json("namespace.json", 64 * 1024)?;
+        if header.schema != super::STORAGE_VERSION
+            || header.authentication != super::authentication::FORMAT
+        {
+            return Err(Error::incompatible(
+                "unsupported namespace authentication format",
+            ));
+        }
         if header.namespace != claim.namespace
             || header.directory_identity != namespace.identity()?
         {

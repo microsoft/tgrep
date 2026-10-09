@@ -215,8 +215,8 @@ Building B2 should reuse compatible unchanged postings and extract only changed
 content. It can still require streaming/writing a new full index generation;
 avoiding extraction does not eliminate publication I/O.
 
-Initially, do not migrate active sessions automatically. A checkout or rebase
-can be represented by recomputing that worktree's overlay against its pinned
+In default v1 mode, active sessions do not migrate automatically. A checkout or
+rebase can be represented by recomputing that worktree's overlay against its pinned
 base. An explicit base migration must instead recompute the delta against the
 new base and atomically publish the new base-and-overlay pair. Swapping only
 the reader would give the overlay the wrong meaning.
@@ -226,14 +226,15 @@ restorable checkpoint needs them. A retention policy may evict idle checkpoints
 and release their pins; restoration must then rebuild/reconcile, not silently
 substitute another base. Defer removal of mapped generations on Windows.
 
-The current core manager deliberately implements **retain-all**, not online GC:
+The legacy `GenerationManager` implements **retain-all**, not online GC:
 it never deletes or rewrites a published generation, even when its last
 `Arc<Generation>` pin is dropped. This also protects escaped readers/views and
 restorable checkpoints across process restarts. There is no deletion API or
-automatic active-session migration. Reclaiming storage offline requires stopping
-all users and discarding dependent checkpoints. A later daemon can introduce
-ownership-aware retention and resource budgets; absence of a live in-process pin
-alone is not proof that a generation is deletable.
+automatic active-session migration in that manager. Reclaiming legacy storage
+offline requires stopping all users and discarding dependent checkpoints. The
+managed v2 adapter described below adds ownership-aware retention and resource
+budgets in a separate namespace; absence of a live in-process pin alone is not
+proof that a generation is deletable.
 
 ## Persistence and compatibility
 
@@ -479,11 +480,13 @@ contents are not followed as a filesystem link.
 Restoration validates the exact generation key, base bytes and canonical root but
 does not restore readiness or trusted read evidence; first reconciliation may
 re-extract restored private postings. Missing/stale/invalid state is an explicit
-recoverable error, not an empty overlay. Bases remain immutable and retain-all.
+recoverable error, not an empty overlay. Legacy bases remain immutable and
+retain-all.
 
-This core layer does **not** own native watchers, automatic shared CLI serving,
-daemon routing/wire schemas or content caches. Existing CLI/server behavior is
-unchanged unless a worktree is explicitly attached to the daemon described below.
+This fixed-generation `WorktreeView` layer does **not** own native watchers,
+automatic shared CLI serving, daemon routing/wire schemas or content caches.
+Existing CLI/server behavior is unchanged unless a worktree is explicitly
+attached to the daemon described below.
 
 ## Daemon wire contract v1
 

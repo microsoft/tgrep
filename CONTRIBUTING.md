@@ -131,6 +131,12 @@ are not compiled into normal binaries. Do not replace a barrier with a whole-tes
 retry, count scan fallback as indexed success, or disable a platform's lifetime
 coverage.
 
+Arm asynchronous operation hooks with `pause-token` or `error-token` and the
+operation's persisted scope/sequence/token before submitting it. Admission binds
+the hook to the exact operation ID before background dispatch can observe it;
+global hooks can capture unrelated reconciliation or housekeeping instead.
+Keep unscoped hooks only for automatic work whose token is not known in advance.
+
 Compatibility tests require **original**, separately built v1 CLI and core
 reader executables. They are not current binaries with a version label changed.
 In a new scratch directory, prepare the pinned control sources:
@@ -200,6 +206,11 @@ routing and actual CLI/scan parity while exercising reuse, migration, collection
 and warm initialization. All children are owned and reaped. Report files remain
 for review; scratch data is not installed into a user's cache.
 See [measurement interpretation](SHARED_INDEX_BENCHMARKS.md#managed-lifecycle-measurements).
+
+Native CI selects the CLI and test harness from the build's Cargo JSON records,
+runs those exact executables, and retains both with their selection/SHA-256
+manifest alongside the report. These are qualification artifacts, not signed
+releases; no executable is selected by globbing an existing target directory.
 
 ## Pre-commit Hook
 

@@ -100,8 +100,9 @@ fn actual_legacy_core_readers_reject_staged_and_published_managed_storage() {
     fs::write(fixture.a.join("late.txt"), "managed_compatibility_fresh\n").unwrap();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    let hook = super::faults::pause(&daemon, "generation-built");
-    let operation = daemon.rpc("views.attach", attach_input(&fixture, &claim));
+    let input = attach_input(&fixture, &claim);
+    let hook = super::faults::pause_for_operation(&daemon, "generation-built", &input["token"]);
+    let operation = daemon.rpc("views.attach", input);
     super::faults::reached(&daemon, &hook);
     let page = daemon.rpc("objects.page", json!({"cursor":null}));
     let stage = page["objects"]

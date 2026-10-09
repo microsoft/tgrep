@@ -95,17 +95,27 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build release measurement before timing
-        run: cargo test --locked --release -p tgrep-cli --features managed-test-hooks --test shared_daemon --no-run
+        shell: bash
+        run: cargo test --locked --release -p tgrep-cli --features managed-test-hooks --test shared_daemon --no-run --message-format=json > "$RUNNER_TEMP/managed-native-build.jsonl"
+      - name: Select and preserve exact measurement executables
+        id: measurement
+        shell: bash
+        run: python -B scripts/qualification/capture_managed_artifacts.py "$RUNNER_TEMP/managed-native-build.jsonl" "$RUNNER_TEMP/managed-native-artifacts" --github-output "$GITHUB_OUTPUT"
       - name: Measure bounded native lifecycle without injected pauses
+        shell: bash
         env:
           TGREP_MANAGED_PERFORMANCE_REPORT: ${{ runner.temp }}/managed-native.json
-        run: cargo test --locked --release -p tgrep-cli --features managed-test-hooks --test shared_daemon managed::performance::native_managed_lifecycle_measurement -- --ignored --exact --test-threads=1 --nocapture
+          TGREP_MEASUREMENT_HARNESS: ${{ steps.measurement.outputs.harness }}
+          CARGO_BIN_EXE_tgrep: ${{ steps.measurement.outputs.cli }}
+        run: '"$TGREP_MEASUREMENT_HARNESS" managed::performance::native_managed_lifecycle_measurement --ignored --exact --test-threads=1 --nocapture'
       - name: Preserve native measurement
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: managed-lifecycle-${{ runner.os }}-${{ runner.arch }}
-          path: ${{ runner.temp }}/managed-native.json
+          path: |
+            ${{ runner.temp }}/managed-native.json
+            ${{ runner.temp }}/managed-native-artifacts/
           if-no-files-found: error
       - name: Verify measurement did not change lockfiles
         if: always()

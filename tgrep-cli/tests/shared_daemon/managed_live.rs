@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 
 use super::clients::{held_owner, manage};
-use super::faults::{pause, reached};
+use super::faults::{pause, pause_for_operation, reached};
 use super::*;
 
 fn advance(claim: &OwnerClaim, sequence: u64, view: &Value, target: &str) -> Value {
@@ -150,8 +150,9 @@ fn ready_views_and_migration_continue_while_a_catalog_reader_pins_the_wal() {
     wait_for(&daemon, "views.status", json!({"id":id}), |status| {
         status["ready"] == true && status["work"].is_null()
     });
-    let hook = pause(&daemon, "generation-built");
-    let operation = daemon.rpc("views.advance", advance(&claim, 4, &view, &target));
+    let input = advance(&claim, 4, &view, &target);
+    let hook = pause_for_operation(&daemon, "generation-built", &input["token"]);
+    let operation = daemon.rpc("views.advance", input);
     reached(&daemon, &hook);
     assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
     release(&daemon, &hook);
@@ -231,12 +232,12 @@ fn concurrent_clients_share_one_new_publication_with_distinct_exact_commits_and_
     .unwrap();
     fs::write(third.join("notes.txt"), "shared_term private third view\n").unwrap();
     fs::write(third.join(".ignore"), ".hidden\n").unwrap();
-    let hook = pause(&daemon, "generation-built");
     let mut input = attach_input(&fixture, &claim);
     input["token"] = token(&claim, 2);
     input["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
     input["request"]["revision"] = json!(newer);
     input["request"]["lease"] = json!("newer-view");
+    let hook = pause_for_operation(&daemon, "generation-built", &input["token"]);
     let second = manage(&fixture.a, "views.attach", input.clone());
     assert_eq!(reached(&daemon, &hook)["reached_operation"], second["id"]);
     assert_eq!(
@@ -336,8 +337,8 @@ fn conflicting_process_migrations_commit_once_and_replay_each_original_receipt()
     git(&fixture.a, &["commit", "-qam", "second target"]);
     let later = git(&fixture.a, &["rev-parse", "HEAD"]);
     refresh(&daemon, &first, 2, &view);
-    let hook = pause(&daemon, "migration-prepared");
     let winner_input = advance(&first, 3, &view, &target);
+    let hook = pause_for_operation(&daemon, "migration-prepared", &winner_input["token"]);
     let winner = manage(&fixture.a, "views.advance", winner_input.clone());
     assert_eq!(reached(&daemon, &hook)["reached_operation"], winner["id"]);
     let loser_input = advance(&second, 2, &view, &later);
@@ -409,8 +410,9 @@ fn preparation_invalidations_close_readiness_without_mixing_or_disrupting_a_sibl
     git(&fixture.a, &["commit", "-qam", "target"]);
     let target = git(&fixture.a, &["rev-parse", "HEAD"]);
     refresh(&daemon, &claim, 3, &view);
-    let hook = pause(&daemon, "migration-prepared");
-    let operation = daemon.rpc("views.advance", advance(&claim, 4, &view, &target));
+    let input = advance(&claim, 4, &view, &target);
+    let hook = pause_for_operation(&daemon, "migration-prepared", &input["token"]);
+    let operation = daemon.rpc("views.advance", input);
     reached(&daemon, &hook);
     assert_eq!(search(&daemon, &fixture.a)["version"], 1);
     fs::rename(fixture.a.join("notes.txt"), fixture.a.join("renamed.txt")).unwrap();

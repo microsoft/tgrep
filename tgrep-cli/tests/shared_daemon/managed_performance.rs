@@ -207,7 +207,8 @@ fn measure(
     survey: &Survey<'_>,
     barrier: Option<&str>,
 ) -> Value {
-    let hook = barrier.map(|point| super::faults::pause(daemon, point));
+    let hook = barrier
+        .map(|point| super::faults::pause_for_operation(daemon, point, &token(claim, *sequence)));
     let started = Instant::now();
     let operation = issue(daemon, claim, sequence, method, request);
     let mut observations = Observations::new(survey);

@@ -1374,6 +1374,8 @@ impl Namespace {
                 if previous_digest != digest || operation.token != token {
                     return Err(Error::new(ErrorCategory::StaleVersion, "operation-token-conflict", "token/sequence already identifies different work"));
                 }
+                #[cfg(any(test, feature = "managed-test-hooks"))]
+                self.faults.bind_operation(&operation)?;
                 return Ok(operation);
             }
             if closed {
@@ -1407,6 +1409,9 @@ impl Namespace {
             transaction.execute("INSERT INTO operations VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![operation.id.as_str(), operation.token.scope.as_str(), sql_integer(operation.token.sequence)?,
                     operation.token.token.as_str(), digest, tag(&operation.state)?, text(&operation)?])?;
+            // Bind before a background dispatcher can observe the accepted row.
+            #[cfg(any(test, feature = "managed-test-hooks"))]
+            self.faults.bind_operation(&operation)?;
             Ok(operation)
         })
     }

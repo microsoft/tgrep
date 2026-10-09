@@ -12,6 +12,16 @@ pub(super) fn pause(daemon: &Daemon, point: &str) -> Value {
     )
 }
 
+pub(super) fn pause_for_operation(daemon: &Daemon, point: &str, token: &Value) -> Value {
+    daemon.rpc(
+        "testing.install",
+        json!({
+            "point":point,"operation":null,"skip_hits":0,
+            "action":{"mode":"pause-token","timeout_ms":30000,"token":token}
+        }),
+    )
+}
+
 pub(super) fn reached(daemon: &Daemon, hook: &Value) -> Value {
     let started = Instant::now();
     loop {
@@ -77,14 +87,14 @@ fn committed_idle_acceptance_error_does_not_stop_a_busy_daemon() {
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
+    let input = idle_request(&daemon);
     let hook = daemon.rpc(
         "testing.install",
         json!({
             "point":"idle-accepted","operation":null,"skip_hits":0,
-            "action":{"mode":"error","category":"io"}
+            "action":{"mode":"error-token","category":"io","token":input["token"]}
         }),
     );
-    let input = idle_request(&daemon);
     let response = retry_busy_response(&daemon, "stop-if-idle", input.clone());
     assert_eq!(response["error"]["data"]["category"], "io", "{response}");
     assert_eq!(response["error"]["data"]["committed_state"], "committed");
@@ -112,20 +122,18 @@ fn live_post_commit_recovery_restores_attach_refresh_and_migration_without_resta
         let fixture = Fixture::new();
         let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
         let (claim, guard) = owner(&daemon);
-        let install = || {
+        let install = |token: &Value| {
             daemon.rpc(
                 "testing.install",
                 json!({
                     "point":"view-after-commit","operation":null,"skip_hits":0,
-                    "action":{"mode":"error","category":"io"}
+                    "action":{"mode":"error-token","category":"io","token":token}
                 }),
             )
         };
-        let mut hook = (mode == "attach").then(install);
-        let mut affected = completed(
-            &daemon,
-            &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
-        );
+        let attach = attach_input(&fixture, &claim);
+        let mut hook = (mode == "attach").then(|| install(&attach["token"]));
+        let mut affected = completed(&daemon, &daemon.rpc("views.attach", attach));
         let first = affected["result"]["current"].clone();
         if mode != "attach" {
             wait_for(
@@ -154,16 +162,17 @@ fn live_post_commit_recovery_restores_attach_refresh_and_migration_without_resta
                     json!({"id":first["id"]}),
                     |status| status["ready"] == true && status["work"].is_null(),
                 );
-                hook = Some(install());
-                affected = completed(&daemon, &daemon.rpc("views.advance", json!({
+                let migration = json!({
                     "token":token(&claim,3),"request":{
                         "view":first["id"],"root":first["root"],"expected_version":first["version"],
                         "target_commit":target,"profile":serde_json::from_str::<Value>(PROFILE).unwrap(),
                         "owner":claim.owner,"allocation_version":1
                     }
-                })));
+                });
+                hook = Some(install(&migration["token"]));
+                affected = completed(&daemon, &daemon.rpc("views.advance", migration));
             } else {
-                hook = Some(install());
+                hook = Some(install(&refresh["token"]));
                 affected = completed(&daemon, &daemon.rpc("views.refresh", refresh));
             }
         }
@@ -227,6 +236,96 @@ fn live_post_commit_recovery_restores_attach_refresh_and_migration_without_resta
 }
 
 #[test]
+fn independent_migration_crash_hook_preserves_background_reconciliation() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    let attached = completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let current = &attached["result"]["current"];
+    fs::write(
+        fixture.a.join("notes.txt"),
+        "shared_term migration target\n",
+    )
+    .unwrap();
+    git(&fixture.a, &["add", "notes.txt"]);
+    git(&fixture.a, &["commit", "-qm", "target"]);
+    let target = git(&fixture.a, &["rev-parse", "HEAD"]);
+    completed(
+        &daemon,
+        &daemon.rpc(
+            "views.refresh",
+            json!({"token":token(&claim,2),"request":{
+                "view":current["id"],"expected_version":1,"owner":claim.owner,"allocation_version":1
+            }}),
+        ),
+    );
+    let before = super::live::wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":current["id"]}),
+        |status| status["ready"] == true && status["work"].is_null(),
+    );
+    let migration_token = token(&claim, 3);
+    let hook = pause_for_operation(&daemon, "object-intent-saved", &migration_token);
+    let invalidated = daemon.rpc(
+        "views.invalidate",
+        json!({
+            "view":current["id"],"owner":claim.owner,"expected_version":1,
+            "changed":[],"full":true
+        }),
+    );
+    let started = Instant::now();
+    let premature = loop {
+        let observed = daemon.rpc("testing.status", json!({}));
+        assert_eq!(observed["ticket"], hook["ticket"]);
+        if observed["stage"] == "waiting" {
+            break Some(observed);
+        }
+        assert_eq!(observed["stage"], "armed", "{observed}");
+        let status = daemon.rpc("views.status", json!({"id":current["id"]}));
+        if status["ready"] == true
+            && status["work"].is_null()
+            && status["authoritative"]["input_epoch"] == invalidated["input_epoch"]
+            && status["authoritative"]["checkpoint"] != before["authoritative"]["checkpoint"]
+        {
+            break None;
+        }
+        assert!(started.elapsed() < Duration::from_secs(20), "{status}");
+        thread::sleep(Duration::from_millis(5));
+    };
+    let operation = daemon.rpc("views.advance", json!({"token":migration_token,"request":{
+        "view":current["id"],"root":current["root"],"expected_version":1,"target_commit":target,
+        "profile":serde_json::from_str::<Value>(PROFILE).unwrap(),"owner":claim.owner,"allocation_version":1
+    }}));
+    let fired_before_admission = premature.is_some();
+    let barrier = premature.unwrap_or_else(|| reached(&daemon, &hook));
+    let captured = daemon.rpc(
+        "operations.inspect",
+        json!({"id":barrier["reached_operation"]}),
+    );
+    assert_eq!(
+        barrier["reached_operation"], operation["id"],
+        "crash hook captured unrelated work before migration admission: {captured}"
+    );
+    assert!(!fired_before_admission);
+    assert_eq!(captured["kind"], "migrate");
+    daemon.rpc("testing.release", json!({"id":hook["ticket"]}));
+    let completed = completed(&daemon, &operation);
+    assert_eq!(completed["result"]["current"]["current"]["commit"], target);
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
 fn process_crashes_at_generation_and_view_boundaries_recover_the_exact_pin() {
     for point in [
         "object-intent-saved",
@@ -272,8 +371,9 @@ fn process_crashes_at_generation_and_view_boundaries_recover_the_exact_pin() {
             json!({"id":before["view"]}),
             |status| status["ready"] == true && status["work"].is_null(),
         );
-        let hook = pause(&daemon, point);
-        let operation = daemon.rpc("views.advance", json!({"token":token(&claim,3),"request":{
+        let migration_token = token(&claim, 3);
+        let hook = pause_for_operation(&daemon, point, &migration_token);
+        let operation = daemon.rpc("views.advance", json!({"token":migration_token,"request":{
             "view":before["view"],"root":before["root"],"expected_version":1,"target_commit":target,
             "profile":serde_json::from_str::<Value>(PROFILE).unwrap(),"owner":claim.owner,"allocation_version":1
         }}));
@@ -381,10 +481,11 @@ fn collection_crash_boundaries_preserve_live_views_and_resumable_progress() {
             "policy_version":1,"allocation_version":1,"cursor":null,
             "bounds":{"max_duration_ms":5000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,"max_pages":64}
         });
-        let hook = pause(&daemon, point);
+        let collection_token = token(&claim, 3);
+        let hook = pause_for_operation(&daemon, point, &collection_token);
         let operation = daemon.rpc(
             "collections.start",
-            json!({"token":token(&claim,3),"request":request}),
+            json!({"token":collection_token,"request":request}),
         );
         assert_eq!(
             reached(&daemon, &hook)["reached_operation"],

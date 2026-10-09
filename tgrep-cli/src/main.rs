@@ -57,7 +57,7 @@ struct Cli {
     #[arg(short = 's', long = "case-sensitive", global = true)]
     case_sensitive: bool,
 
-    /// Smart case: case-insensitive if pattern is all lowercase.
+    /// Smart case: case-insensitive when patterns have literals but no uppercase literals.
     #[arg(short = 'S', long = "smart-case", global = true)]
     smart_case: bool,
 
@@ -65,8 +65,14 @@ struct Cli {
     #[arg(short = 'F', long = "fixed-strings", global = true)]
     fixed_strings: bool,
 
-    /// Match whole words only.
-    #[arg(short = 'w', long = "word-regexp", global = true)]
+    /// Match only when neither adjacent character is a word character. Overrides -x.
+    #[arg(
+        short = 'w',
+        long = "word-regexp",
+        global = true,
+        group = "match_boundary",
+        overrides_with = "line_regexp"
+    )]
     word_regexp: bool,
 
     /// Invert match: show lines that do NOT match.
@@ -77,7 +83,7 @@ struct Cli {
     #[arg(short = 'e', long = "regexp", global = true)]
     regexp: Vec<String>,
 
-    /// Read patterns from a file (one per line).
+    /// Read patterns verbatim, one per line. Empty lines match every input line.
     #[arg(short = 'f', long = "file", global = true)]
     pattern_file: Option<String>,
 
@@ -291,8 +297,14 @@ struct Cli {
     binary: bool,
 
     // ── Matching ─────────────────────────────────────
-    /// Only match when the whole line matches the pattern.
-    #[arg(short = 'x', long = "line-regexp", global = true)]
+    /// Only match when the whole line matches the pattern. Overrides -w.
+    #[arg(
+        short = 'x',
+        long = "line-regexp",
+        global = true,
+        group = "match_boundary",
+        overrides_with = "word_regexp"
+    )]
     line_regexp: bool,
 
     /// Use the PCRE-style engine, enabling lookaround and backreferences.
@@ -762,7 +774,22 @@ impl Cli {
                     "--watch-budget cannot be used with --watch-mode poll",
                 ));
         }
-        Self::from_arg_matches(&matches)
+        let mut cli = Self::from_arg_matches(&matches)?;
+        // Global booleans propagate across subcommands without applying their
+        // mutual overrides. Groups retain the locally supplied choice, so the
+        // deepest command's boundary flag wins over a parent command's flag.
+        let mut scope = &matches;
+        while let Some((_, subcommand)) = scope.subcommand() {
+            if let Some(boundary) = subcommand
+                .get_many::<clap::Id>("match_boundary")
+                .and_then(|mut choices| choices.next_back())
+            {
+                cli.word_regexp = boundary == "word_regexp";
+                cli.line_regexp = boundary == "line_regexp";
+            }
+            scope = subcommand;
+        }
+        Ok(cli)
     }
 
     /// Resolve `--max-filesize` once, so a malformed value is reported instead
@@ -1411,6 +1438,9 @@ fn run_search(
     resolved: &ResolvedArgs,
 ) -> anyhow::Result<()> {
     let mut opts = cli.build_search_opts(pattern, resolved);
+    if !opts.resolve_patterns()? && !opts.invert_match {
+        process::exit(1);
+    }
     let mut had_matches = false;
 
     // ripgrep decides these once, from the whole argument list: file names are
@@ -1482,6 +1512,26 @@ mod tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    #[test]
+    fn word_and_line_regexp_override_each_other_in_argument_order() {
+        for (args, word) in [
+            (vec!["-x", "-w", "foo"], true),
+            (vec!["-w", "-x", "foo"], false),
+            (vec!["-x", "search", "-w", "foo"], true),
+            (vec!["-w", "search", "-x", "foo"], false),
+            (vec!["search", "-xw", "foo"], true),
+            (vec!["search", "-wx", "foo"], false),
+            (vec!["-w", "search", "-xw", "foo"], true),
+            (vec!["-x", "search", "-wx", "foo"], false),
+            (vec!["-w", "search", "foo"], true),
+            (vec!["-x", "search", "foo"], false),
+        ] {
+            let cli = parse(&args).unwrap();
+            assert_eq!(cli.word_regexp, word, "{args:?}");
+            assert_eq!(cli.line_regexp, !word, "{args:?}");
+        }
     }
 
     #[test]

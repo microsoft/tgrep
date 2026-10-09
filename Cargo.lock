@@ -1278,6 +1278,7 @@ dependencies = [
  "predicates",
  "rayon",
  "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "tempfile",

@@ -265,6 +265,369 @@ fn with_stats_backends(
 }
 
 #[test]
+fn reported_pattern_files_preserve_blank_lines_and_whitespace() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("input.txt"),
+        "alpha\nbeta\n test \nplain test\n\ttab \t\n",
+    )
+    .unwrap();
+    let cases = [
+        (
+            "alpha\n\n",
+            false,
+            "1:alpha\n2:beta\n3: test \n4:plain test\n5:\ttab \t\n",
+        ),
+        (
+            "\n",
+            false,
+            "1:alpha\n2:beta\n3: test \n4:plain test\n5:\ttab \t\n",
+        ),
+        (" test \n", true, "3: test \n"),
+        ("\ttab \t\n", true, "5:\ttab \t\n"),
+        ("alpha\r\n", false, "1:alpha\n"),
+        ("beta", false, "2:beta\n"),
+    ];
+    let pattern_files: Vec<_> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (patterns, _, _))| {
+            let path = dir.path().join(format!("patterns-{i}.txt"));
+            fs::write(&path, patterns).unwrap();
+            path
+        })
+        .collect();
+
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for ((_, only_matching, expected), path) in cases.iter().zip(&pattern_files) {
+            let mut cmd = tgrep();
+            cmd.args(backend)
+                .args([
+                    "--stats",
+                    "--color",
+                    "never",
+                    "--no-heading",
+                    "--no-filename",
+                    "-n",
+                    "-f",
+                ])
+                .arg(path);
+            if *only_matching {
+                cmd.arg("-o");
+            }
+            let output = cmd.arg(&root).assert().success().get_output().clone();
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                *expected,
+                "{marker}"
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains(marker));
+        }
+    });
+}
+
+#[test]
+fn reported_empty_pattern_file_is_not_an_empty_pattern() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("input.txt"), "alpha\nbeta\n").unwrap();
+    let empty = dir.path().join("empty.txt");
+    fs::write(&empty, "").unwrap();
+
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for flags in [
+            vec![],
+            vec!["-F"],
+            vec!["-P"],
+            vec!["--count"],
+            vec!["--count-matches"],
+            vec!["--json"],
+            vec!["--files-without-match"],
+            vec!["--passthru"],
+        ] {
+            tgrep()
+                .args(backend)
+                .args(&flags)
+                .arg("-f")
+                .arg(&empty)
+                .arg(&root)
+                .assert()
+                .code(1)
+                .stdout("");
+        }
+        for engine in ["auto", "default", "pcre2"] {
+            tgrep()
+                .args(backend)
+                .args([
+                    "--engine",
+                    engine,
+                    "--stats",
+                    "-F",
+                    "-v",
+                    "--no-filename",
+                    "-n",
+                    "-f",
+                ])
+                .arg(&empty)
+                .arg(&root)
+                .assert()
+                .success()
+                .stdout("1:alpha\n2:beta\n")
+                .stderr(predicate::str::contains(marker));
+        }
+        tgrep()
+            .args(backend)
+            .args(["--stats", "--no-filename", "-n", "-e", "beta", "-f"])
+            .arg(&empty)
+            .arg(&root)
+            .assert()
+            .success()
+            .stdout("2:beta\n")
+            .stderr(predicate::str::contains(marker));
+    });
+}
+
+#[test]
+fn reported_inline_flags_are_scoped_to_each_pattern() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("bar.txt"), "bar\n").unwrap();
+    let sensitive = dir.path().join("sensitive.txt");
+    let insensitive = dir.path().join("insensitive.txt");
+    fs::write(&sensitive, "(?-i)foo\nBAR\n").unwrap();
+    fs::write(&insensitive, "(?i)foo\nBAR\n").unwrap();
+    let cases: &[(&[&str], i32, &str)] = &[
+        (&["-i", "-e", "(?-i)foo", "-e", "BAR"], 0, "bar\n"),
+        (&["-e", "(?i)foo", "-e", "BAR"], 1, ""),
+        (&["-e", "BAR", "-e", "(?i)foo"], 1, ""),
+        (&["-i", "-f", sensitive.to_str().unwrap()], 0, "bar\n"),
+        (&["-f", insensitive.to_str().unwrap()], 1, ""),
+    ];
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for engine in ["auto", "default", "pcre2"] {
+            for (flags, code, expected) in cases {
+                tgrep()
+                    .args(backend)
+                    .args([
+                        "--engine",
+                        engine,
+                        "--stats",
+                        "--color",
+                        "never",
+                        "--no-filename",
+                    ])
+                    .args(*flags)
+                    .arg(&root)
+                    .assert()
+                    .code(*code)
+                    .stdout(*expected)
+                    .stderr(predicate::str::contains(marker));
+            }
+        }
+    });
+}
+
+#[test]
+fn reported_smart_case_uses_literals_from_all_patterns() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("input.txt"), "abc\nABC\na-c\nA-C\n").unwrap();
+    fs::write(root.join("literal.txt"), "a\\Sc\nA\\SC\n").unwrap();
+    let patterns = dir.path().join("patterns.txt");
+    fs::write(&patterns, "ABC\n").unwrap();
+    let cases: &[(&[&str], &str)] = &[
+        (&["-e", "ABC"], "ABC\n"),
+        (&["-f", patterns.to_str().unwrap()], "ABC\n"),
+        (&["-e", "abc", "-e", "XYZ"], "abc\n"),
+        (&["-e", r"a\Sc"], "abc\nABC\na-c\nA-C\n"),
+        (&["-e", r"a\Dc"], "abc\nABC\na-c\nA-C\n"),
+        (&["-e", r"a\Wc"], "a-c\nA-C\n"),
+        (&["-e", r"a\pLc"], "abc\nABC\n"),
+        (&["-e", r"\x41BC"], "ABC\n"),
+        (&["-e", r"\x61bc"], "abc\nABC\n"),
+        (&["-e", "(?P<UPPER>abc)"], "abc\nABC\n"),
+        (&["-F", "-e", r"a\Sc"], "a\\Sc\n"),
+        (&["-s", "-e", "abc"], "abc\n"),
+        (&["-i", "-e", "ABC"], "abc\nABC\n"),
+    ];
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for engine in ["auto", "default", "pcre2"] {
+            for (flags, expected) in cases {
+                tgrep()
+                    .args(backend)
+                    .args([
+                        "--engine",
+                        engine,
+                        "--stats",
+                        "--color",
+                        "never",
+                        "--sort",
+                        "path",
+                        "--no-filename",
+                        "-S",
+                    ])
+                    .args(*flags)
+                    .arg(&root)
+                    .assert()
+                    .success()
+                    .stdout(*expected)
+                    .stderr(predicate::str::contains(marker));
+            }
+        }
+    });
+}
+
+#[test]
+fn reported_word_matching_accepts_nonword_pattern_edges() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("input.txt"),
+        "a- x\nx -a\nxa- x\nx -ax\na-x\nx-a\n\u{e9}a- x\nx -a\u{e9}\n",
+    )
+    .unwrap();
+    fs::write(root.join("punct.txt"), "---\na---\n---a\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for engine in ["auto", "default", "pcre2"] {
+            for fixed in [false, true] {
+                for (pattern, glob, expected) in [
+                    ("a-", "input.txt", "1:a- x\n"),
+                    ("-a", "input.txt", "2:x -a\n"),
+                    ("---", "punct.txt", "1:---\n"),
+                ] {
+                    let mut cmd = tgrep();
+                    cmd.args(backend).args([
+                        "--engine",
+                        engine,
+                        "--stats",
+                        "--color",
+                        "never",
+                        "-w",
+                        "--no-filename",
+                        "-n",
+                        "-g",
+                        glob,
+                    ]);
+                    if fixed {
+                        cmd.arg("-F");
+                    }
+                    cmd.args(["--", pattern])
+                        .arg(&root)
+                        .assert()
+                        .success()
+                        .stdout(expected)
+                        .stderr(predicate::str::contains(marker));
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn reported_word_and_line_flags_use_the_last_occurrence() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("input.txt"), "foo bar\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, code, expected) in [
+            (vec!["-x", "-w"], 0, "foo bar\n"),
+            (vec!["-w", "-x"], 1, ""),
+            (vec!["-xw"], 0, "foo bar\n"),
+            (vec!["-wx"], 1, ""),
+            (vec!["--line-regexp", "--word-regexp"], 0, "foo bar\n"),
+            (vec!["--word-regexp", "--line-regexp"], 1, ""),
+        ] {
+            tgrep()
+                .args(backend)
+                .args(["--stats", "--color", "never", "--no-filename"])
+                .args(flags)
+                .args(["--", "foo"])
+                .arg(&root)
+                .assert()
+                .code(code)
+                .stdout(expected)
+                .stderr(predicate::str::contains(marker));
+        }
+    });
+}
+
+#[test]
+fn reported_multiline_preserves_adjacent_matches_in_every_output() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "aa\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, expected) in [
+            (vec!["-o", "-n", "--no-filename"], "1:a\n1:a\n".to_string()),
+            (vec!["--count-matches", "--no-filename"], "2\n".to_string()),
+            (
+                vec!["--vimgrep"],
+                format!("{0}:1:1:aa\n{0}:1:2:aa\n", root.join("a.txt").display()),
+            ),
+        ] {
+            tgrep()
+                .args(backend)
+                .args(["--stats", "--color", "never", "-U"])
+                .args(flags)
+                .args(["--", "a"])
+                .arg(&root)
+                .assert()
+                .success()
+                .stdout(expected)
+                .stderr(predicate::str::contains("2 matches (1 matched lines)"))
+                .stderr(predicate::str::contains(marker));
+        }
+
+        for (pattern, spans) in [
+            ("a", vec![(0, 1), (1, 2)]),
+            ("", vec![(0, 0), (1, 1), (2, 2)]),
+        ] {
+            let output = tgrep()
+                .args(backend)
+                .args(["--stats", "-U", "--json", "-e", pattern])
+                .arg(&root)
+                .assert()
+                .success()
+                .stderr(predicate::str::contains(marker))
+                .get_output()
+                .clone();
+            let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let hits: Vec<_> = rows.iter().filter(|row| row["type"] == "match").collect();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0]["data"]["lines"]["text"], "aa\n");
+            let submatches: Vec<_> = spans
+                .iter()
+                .map(|&(start, end)| {
+                    serde_json::json!({"match": {"text": pattern}, "start": start, "end": end})
+                })
+                .collect();
+            assert_eq!(hits[0]["data"]["submatches"], serde_json::json!(submatches));
+            for kind in ["end", "summary"] {
+                let row = rows.iter().find(|row| row["type"] == kind).unwrap();
+                assert_eq!(
+                    row["data"]["stats"]["matches"],
+                    spans.len(),
+                    "{marker}: {kind}"
+                );
+                assert_eq!(row["data"]["stats"]["matched_lines"], 1, "{marker}: {kind}");
+            }
+        }
+    });
+}
+
+#[test]
 fn indexed_json_preserves_utf8_match_and_context_offsets() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");
@@ -5783,19 +6146,18 @@ fn line_regexp_requires_a_whole_line_match() {
 }
 
 #[test]
-fn line_regexp_beats_word_regexp() {
+fn whole_line_matching_allows_punctuation() {
     let dir = TempDir::new().unwrap();
     let sub = dir.path().join("testdata");
     fs::create_dir_all(&sub).unwrap();
     fs::write(sub.join("p.txt"), "(flag)\n").unwrap();
 
-    // `-w` alone would reject a line that starts and ends with punctuation.
     tgrep()
         .args([
             "--no-index",
             "--no-heading",
-            "-x",
             "-w",
+            "-x",
             r"\(flag\)",
             &fixture_path(&dir),
         ])

@@ -223,19 +223,22 @@ fn metadata_time_key(md: &std::fs::Metadata, key: SortKey) -> Option<std::time::
 }
 
 impl SearchOptions {
-    /// Resolve smart-case: case-insensitive if pattern is all lowercase.
-    pub fn effective_case_insensitive(&self) -> bool {
+    /// Resolve smart-case from literals in every supplied pattern.
+    pub fn effective_case_insensitive(&self) -> Result<bool> {
         // `-s` wins over `-S`, matching ripgrep, but `-i` still wins over `-s`.
         if self.case_insensitive {
-            return true;
+            return Ok(true);
         }
         if self.case_sensitive {
-            return false;
+            return Ok(false);
         }
         if self.smart_case {
-            return !self.pattern.chars().any(|c| c.is_uppercase());
+            return crate::matching::smart_case_insensitive(
+                &self.all_patterns()?,
+                self.fixed_string,
+            );
         }
-        false
+        Ok(false)
     }
 
     /// Whether `.` should match a newline. ripgrep keeps this separate from
@@ -426,6 +429,23 @@ impl SearchOptions {
         }
     }
 
+    /// Snapshot pattern files once, before case analysis, planning or server dispatch.
+    /// Returns whether any patterns were supplied.
+    pub fn resolve_patterns(&mut self) -> Result<bool> {
+        let patterns = self.all_patterns()?;
+        self.pattern_file = None;
+        self.pattern.clear();
+        self.extra_patterns = patterns;
+        if self.extra_patterns.is_empty() {
+            // Inversion still needs to search: an empty pattern set rejects every
+            // line, unlike an empty pattern, which accepts every line.
+            self.pattern = crate::matching::NEVER_MATCH_PATTERN.to_string();
+            self.fixed_string = false;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Collect all patterns (primary + -e extras + -f file patterns).
     fn all_patterns(&self) -> Result<Vec<String>> {
         let has_extra = !self.extra_patterns.is_empty() || self.pattern_file.is_some();
@@ -441,10 +461,7 @@ impl SearchOptions {
         if let Some(ref path) = self.pattern_file {
             let content = std::fs::read_to_string(path)?;
             for line in content.lines() {
-                let line = line.trim();
-                if !line.is_empty() {
-                    patterns.push(line.to_string());
-                }
+                patterns.push(line.to_string());
             }
         }
         Ok(patterns)
@@ -814,7 +831,7 @@ pub fn run(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| builder::default_index_dir(&root));
 
-    let ci = opts.effective_case_insensitive();
+    let ci = opts.effective_case_insensitive()?;
 
     let selected = crate::serve::shared::Client::selected(&root, opts.shared, index_path);
     if !matches!(selected, Ok(false)) {
@@ -2302,6 +2319,49 @@ pub(crate) fn plan_summary(plan: &QueryPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pattern_file_lines_are_verbatim_except_for_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("patterns.txt");
+        let opts = SearchOptions {
+            pattern_file: Some(path.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        for (contents, expected) in [
+            ("", vec![]),
+            ("\n", vec![""]),
+            ("\r\n", vec![""]),
+            ("alpha\n\n", vec!["alpha", ""]),
+            ("alpha\r\nbeta\r\n", vec!["alpha", "beta"]),
+            (" \ttest \t", vec![" \ttest \t"]),
+            ("alpha\r", vec!["alpha\r"]),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(opts.all_patterns().unwrap(), expected, "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn resolved_patterns_keep_empty_alternatives_and_do_not_reread_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("patterns.txt");
+        std::fs::write(&path, "\n UPPER \n").unwrap();
+        let mut opts = SearchOptions {
+            extra_patterns: vec!["lower".into()],
+            pattern_file: Some(path.to_str().unwrap().to_string()),
+            smart_case: true,
+            ..Default::default()
+        };
+        assert!(opts.resolve_patterns().unwrap());
+        std::fs::write(&path, "changed\n").unwrap();
+        assert_eq!(opts.all_patterns().unwrap(), ["lower", "", " UPPER "]);
+        assert!(!opts.effective_case_insensitive().unwrap());
+
+        let mut empty = SearchOptions::default();
+        assert!(empty.resolve_patterns().unwrap());
+        assert_eq!(empty.all_patterns().unwrap(), [""]);
+    }
 
     #[test]
     fn bounded_reads_stop_at_the_limit_plus_one_and_preserve_boundaries() {

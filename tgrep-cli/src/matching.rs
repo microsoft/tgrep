@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use regex::RegexBuilder;
+use regex_syntax::ast::{self, Ast, ClassSetItem};
 
 /// Byte offsets of the start of every line in a buffer.
 ///
@@ -214,7 +215,7 @@ pub fn group_spans_by_line(index: &LineIndex<'_>, spans: &[(usize, usize)]) -> V
             let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
             for span in spans {
                 match merged.last_mut() {
-                    Some(last) if span.0 <= last.1 => last.1 = last.1.max(span.1),
+                    Some(last) if span.0 < last.1 => last.1 = last.1.max(span.1),
                     _ => merged.push(span),
                 }
             }
@@ -440,19 +441,13 @@ pub struct MatcherConfig {
 /// so `-U` alone does not silently turn `.` into a line-crossing wildcard,
 /// matching ripgrep's split between `--multiline` and `--multiline-dotall`.
 pub fn build_search_matcher(patterns: &[String], cfg: &MatcherConfig) -> Result<SearchMatcher> {
-    let combined = combine_patterns(
-        patterns,
-        cfg.fixed_string,
-        cfg.word_boundary,
-        cfg.line_regexp,
-    );
-
     if cfg.engine == RegexEngine::Pcre2 {
-        return build_fancy(&combined, cfg).map_err(|e| {
+        return build_fancy(patterns, cfg).map_err(|e| {
             anyhow::anyhow!("regex error: PCRE-style engine rejected the pattern: {e}")
         });
     }
 
+    let combined = combine_patterns(patterns, cfg, false);
     match build_regex(&combined, cfg) {
         Ok(re) => Ok(SearchMatcher::Standard(re)),
         // Exceeding `--regex-size-limit`/`--dfa-size-limit` is a resource error,
@@ -460,7 +455,7 @@ pub fn build_search_matcher(patterns: &[String], cfg: &MatcherConfig) -> Result<
         // would silently ignore the limit the user asked for.
         Err(e @ regex::Error::CompiledTooBig(_)) => Err(anyhow::anyhow!("regex error: {e}")),
         Err(regex_err) if !cfg.fixed_string && cfg.engine == RegexEngine::Auto => {
-            build_fancy(&combined, cfg).map_err(|fancy_err| {
+            build_fancy(patterns, cfg).map_err(|fancy_err| {
                 anyhow::anyhow!("regex error: {regex_err}; PCRE-style fallback failed: {fancy_err}")
             })
         }
@@ -468,7 +463,8 @@ pub fn build_search_matcher(patterns: &[String], cfg: &MatcherConfig) -> Result<
     }
 }
 
-fn build_fancy(combined: &str, cfg: &MatcherConfig) -> Result<SearchMatcher> {
+fn build_fancy(patterns: &[String], cfg: &MatcherConfig) -> Result<SearchMatcher> {
+    let combined = combine_patterns(patterns, cfg, true);
     let mut flags = String::new();
     if cfg.case_insensitive {
         flags.push('i');
@@ -486,11 +482,11 @@ fn build_fancy(combined: &str, cfg: &MatcherConfig) -> Result<SearchMatcher> {
             format!("(?{flags}:{body})")
         }
     };
-    let pattern = wrap(combined);
+    let pattern = wrap(&combined);
     let re = fancy_regex::Regex::new(&pattern).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(SearchMatcher::Fancy {
         re,
-        prefilter: build_fancy_prefilter(combined, &wrap),
+        prefilter: build_fancy_prefilter(&combined, &wrap),
     })
 }
 
@@ -509,26 +505,39 @@ fn build_fancy_prefilter(combined: &str, wrap: &dyn Fn(&str) -> String) -> Optio
     regex::Regex::new(&wrap(&relaxed)).ok()
 }
 
-fn combine_patterns(
-    patterns: &[String],
-    fixed_string: bool,
-    word_boundary: bool,
-    line_regexp: bool,
-) -> String {
+/// An empty character-class intersection matches nothing in either engine.
+pub const NEVER_MATCH_PATTERN: &str = "[a&&b]";
+
+fn combine_patterns(patterns: &[String], cfg: &MatcherConfig, fancy: bool) -> String {
+    if patterns.is_empty() {
+        return NEVER_MATCH_PATTERN.to_string();
+    }
     let wrap = |p: &String| {
-        let mut p = if fixed_string {
+        let p = if cfg.fixed_string {
             regex::escape(p)
         } else {
             p.clone()
         };
-        // `-x` beats `-w`: a whole-line match is already at word boundaries,
-        // and applying both would reject lines starting with punctuation.
-        if line_regexp {
-            p = format!(r"^(?:{p})$");
-        } else if word_boundary {
-            p = format!(r"\b(?:{p})\b");
+        if cfg.line_regexp {
+            format!(r"^(?:{p})$")
+        } else if cfg.word_boundary {
+            if fancy {
+                // fancy-regex does not support half-boundary syntax.
+                let word = if cfg.no_unicode {
+                    "[a-zA-Z0-9_]"
+                } else {
+                    r"\w"
+                };
+                format!(r"(?<!{word})(?:{p})(?!{word})")
+            } else {
+                format!(r"\b{{start-half}}(?:{p})\b{{end-half}}")
+            }
+        } else if patterns.len() > 1 {
+            // Bare inline flags must not reach a different pattern's branch.
+            format!("(?:{p})")
+        } else {
+            p
         }
-        p
     };
 
     if patterns.len() == 1 {
@@ -536,6 +545,115 @@ fn combine_patterns(
     } else {
         let parts: Vec<String> = patterns.iter().map(wrap).collect();
         format!("(?:{})", parts.join("|"))
+    }
+}
+
+/// Smart case considers literals, not uppercase letters in regex syntax.
+pub fn smart_case_insensitive(patterns: &[String], fixed_string: bool) -> Result<bool> {
+    let mut case = SmartCase::default();
+    for pattern in patterns {
+        if fixed_string {
+            for c in pattern.chars() {
+                case.literal(c);
+            }
+        } else if case.add_ast(pattern).is_err() {
+            // Lookaround and backreferences need the same fallback as matching.
+            case.add_fancy(pattern)
+                .map_err(|error| anyhow::anyhow!("regex error: {error}"))?;
+        }
+    }
+    Ok(case.has_literal && !case.has_uppercase)
+}
+
+#[derive(Default)]
+struct SmartCase {
+    has_literal: bool,
+    has_uppercase: bool,
+}
+
+impl SmartCase {
+    fn literal(&mut self, c: char) {
+        self.has_literal = true;
+        self.has_uppercase |= c.is_uppercase();
+    }
+
+    fn add_ast(&mut self, pattern: &str) -> Result<()> {
+        let ast = ast::parse::ParserBuilder::new()
+            .nest_limit(250)
+            .build()
+            .parse(pattern)?;
+        ast::visit(&ast, self)?;
+        Ok(())
+    }
+
+    fn add_fancy(&mut self, pattern: &str) -> Result<()> {
+        use fancy_regex::Expr;
+
+        let tree = Expr::parse_tree(pattern)?;
+        let mut pending = vec![&tree.expr];
+        while let Some(expr) = pending.pop() {
+            match expr {
+                Expr::Literal { val, .. } => {
+                    for c in val.chars() {
+                        self.literal(c);
+                    }
+                }
+                Expr::Concat(children) | Expr::Alt(children) => pending.extend(children),
+                Expr::Group(child)
+                | Expr::LookAround(child, _)
+                | Expr::AtomicGroup(child)
+                | Expr::Repeat { child, .. } => pending.push(child),
+                Expr::Delegate { inner, .. } => self.add_ast(inner)?,
+                Expr::Conditional {
+                    condition,
+                    true_branch,
+                    false_branch,
+                } => pending.extend([
+                    condition.as_ref(),
+                    true_branch.as_ref(),
+                    false_branch.as_ref(),
+                ]),
+                Expr::Empty
+                | Expr::Any { .. }
+                | Expr::Assertion(_)
+                | Expr::Backref(_)
+                | Expr::KeepOut
+                | Expr::ContinueFromPreviousMatchEnd
+                | Expr::BackrefExistsCondition(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ast::Visitor for &mut SmartCase {
+    type Output = ();
+    type Err = std::convert::Infallible;
+
+    fn finish(self) -> std::result::Result<(), Self::Err> {
+        Ok(())
+    }
+
+    fn visit_pre(&mut self, ast: &Ast) -> std::result::Result<(), Self::Err> {
+        if let Ast::Literal(literal) = ast {
+            self.literal(literal.c);
+        }
+        Ok(())
+    }
+
+    fn visit_class_set_item_pre(
+        &mut self,
+        item: &ClassSetItem,
+    ) -> std::result::Result<(), Self::Err> {
+        match item {
+            ClassSetItem::Literal(literal) => self.literal(literal.c),
+            ClassSetItem::Range(range) => {
+                self.literal(range.start.c);
+                self.literal(range.end.c);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -637,7 +755,14 @@ impl<'a> FileMatches<'a> {
         } else if opts.multiline && !opts.invert_match {
             // Count original matches after the search limit, but before
             // splitting, merging or clipping their spans for presentation.
-            let spans = matcher.find_spans(content)?;
+            let mut spans = matcher.find_spans(content)?;
+            // EOF after a terminator is not another physical line. Keeping its
+            // empty match would duplicate the last line's end-of-line match.
+            if (content.is_empty() || content.ends_with('\n'))
+                && spans.last() == Some(&(content.len(), content.len()))
+            {
+                spans.pop();
+            }
             let spans = limit_to_line_blocks(&index, &spans, opts.max_count);
             let hits = group_spans_by_line(&index, &spans);
             let totals = (spans.len() as u64, hits.len() as u64);
@@ -1005,6 +1130,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn smart_case_distinguishes_literals_from_regex_syntax() {
+        for (pattern, insensitive) in [
+            ("abc", true),
+            ("ABC", false),
+            (r"a\Sc", true),
+            (r"a\Wc", true),
+            (r"a\Dc", true),
+            (r"a\pLc", true),
+            (r"\w+", false),
+            (r"\p{Lu}", false),
+            ("", false),
+            ("^$", false),
+            ("[[:upper:]]", false),
+            ("[a-z]", true),
+            ("[a-zA]", false),
+            ("[A-Z]", false),
+            (r"\x41", false),
+            (r"\x61", true),
+            ("\u{e9}", true),
+            ("\u{c9}", false),
+            (r"\u{00C9}", false),
+            ("(?P<UPPER>abc)", true),
+            ("(?U)abc", true),
+            ("(?x) abc # UPPER", true),
+            ("abc(?=d)", true),
+            ("abc(?=D)", false),
+            ("(?<=A)abc", false),
+            ("(?>abc)", true),
+            ("(?=a)[a-z]+", true),
+            ("(?=a)[A-Z]+", false),
+            (r"(abc)\1", true),
+            (r"(ABC)\1", false),
+        ] {
+            assert_eq!(
+                smart_case_insensitive(&[pattern.to_string()], false).unwrap(),
+                insensitive,
+                "{pattern:?}"
+            );
+        }
+        assert!(smart_case_insensitive(&["abc".into(), r"\S".into()], false).unwrap());
+        assert!(!smart_case_insensitive(&["abc".into(), "XYZ".into()], false).unwrap());
+        assert!(!smart_case_insensitive(&[r"a\Sc".into()], true).unwrap());
+        assert!(smart_case_insensitive(&[r"a\sc".into()], true).unwrap());
+        assert!(smart_case_insensitive(&["abc".into(), "[".into()], false).is_err());
+    }
+
+    #[test]
+    fn an_empty_pattern_set_never_matches_in_either_engine() {
+        for engine in [RegexEngine::Auto, RegexEngine::Default, RegexEngine::Pcre2] {
+            for fixed_string in [false, true] {
+                let matcher = build_search_matcher(
+                    &[],
+                    &MatcherConfig {
+                        engine,
+                        fixed_string,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                for content in ["", "a", "b", "anything", NEVER_MATCH_PATTERN] {
+                    assert!(
+                        !matcher.is_match(content).unwrap(),
+                        "{engine:?}: {content:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_fancy_fallback_preserves_half_word_boundaries() {
+        let matcher = build_search_matcher(
+            &[r"a-(?= x)".into()],
+            &MatcherConfig {
+                word_boundary: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(matcher.find_spans("a- x").unwrap(), vec![(0, 2)]);
+        assert!(!matcher.is_match("xa- x").unwrap());
+    }
+
+    #[test]
     fn stats_keep_original_multiline_matches_and_physical_lines() {
         let matcher = SearchMatcher::Standard(regex::Regex::new(r"hello\nworld").unwrap());
         for vimgrep in [false, true] {
@@ -1021,6 +1230,28 @@ mod tests {
             .unwrap();
             assert_eq!(found.match_totals(), (1, 2));
             assert_eq!(found.matched_lines(), if vimgrep { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn multiline_empty_matches_do_not_create_a_phantom_trailing_line() {
+        let matcher = SearchMatcher::Standard(regex::Regex::new("").unwrap());
+        for (content, matches, lines) in [("", 0, 0), ("\n", 1, 1), ("aa\n", 3, 1), ("aa", 3, 1)] {
+            for max_count in [None, Some(1)] {
+                let found = FileMatches::find(
+                    content,
+                    &matcher,
+                    &MatchOptions {
+                        multiline: true,
+                        max_count,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(found.match_totals(), (matches, lines), "{content:?}");
+                assert_eq!(found.match_count() as u64, matches, "{content:?}");
+                assert_eq!(found.matched_lines() as u64, lines, "{content:?}");
+            }
         }
     }
 
@@ -1545,6 +1776,19 @@ mod tests {
             vec![LineHit {
                 idx: 0,
                 spans: vec![(0, 3), (8, 11)]
+            }]
+        );
+    }
+
+    #[test]
+    fn group_spans_keeps_touching_ranges_apart() {
+        let index = LineIndex::new("aa\n");
+        let hits = group_spans_by_line(&index, &[(1, 2), (0, 1)]);
+        assert_eq!(
+            hits,
+            vec![LineHit {
+                idx: 0,
+                spans: vec![(0, 1), (1, 2)]
             }]
         );
     }

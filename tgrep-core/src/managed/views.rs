@@ -783,6 +783,10 @@ impl ViewManager {
                     "released or old-instance tokens cannot attach again",
                 ));
             }
+            self.namespace.fault(
+                super::faults::Point::AttachBeforeResume,
+                Some(&operation.id),
+            )?;
             let record = self.recover(&previous.view)?;
             let loaded = self
                 .optional_slot(&record.id)?
@@ -984,6 +988,10 @@ impl ViewManager {
             Namespace::save_operation(transaction, &accepted)?;
             Ok(())
         })?;
+        self.namespace.fault(
+            super::faults::Point::AttachBeforeResume,
+            Some(&operation.id),
+        )?;
         let slot = self.install_slot(&record, &root)?;
         slot.state
             .lock()

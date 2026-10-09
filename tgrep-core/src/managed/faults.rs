@@ -24,6 +24,7 @@ pub enum Point {
     GenerationPublished,
     CheckpointPublished,
     MigrationPrepared,
+    AttachBeforeResume,
     ViewBeforeCommit,
     ViewAfterCommit,
     ViewAfterSwap,
@@ -88,6 +89,9 @@ mod enabled {
             category: ErrorCategory,
             token: OperationToken,
         },
+        CatalogBusyToken {
+            token: OperationToken,
+        },
         OsError {
             code: i32,
         },
@@ -96,7 +100,9 @@ mod enabled {
     impl Action {
         fn token(&self) -> Option<&OperationToken> {
             match self {
-                Self::PauseToken { token, .. } | Self::ErrorToken { token, .. } => Some(token),
+                Self::PauseToken { token, .. }
+                | Self::ErrorToken { token, .. }
+                | Self::CatalogBusyToken { token } => Some(token),
                 _ => None,
             }
         }
@@ -253,6 +259,13 @@ mod enabled {
                         "injected-test-failure",
                         format!("namespace test boundary {point:?}"),
                     ))
+                }
+                Action::CatalogBusyToken { .. } => {
+                    status.stage = Stage::Fired;
+                    Err(Error::from(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                        Some(format!("injected catalog contention at {point:?}")),
+                    )))
                 }
                 Action::OsError { code } => {
                     status.stage = Stage::Fired;

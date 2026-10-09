@@ -67,15 +67,242 @@ fn reconnect(
     daemon: &Daemon,
     view: &Value,
     old: &OwnerClaim,
+    point: &str,
 ) -> (OwnerClaim, OwnerGuard) {
     let (claim, guard) = owner(daemon);
     let mut attach = attach_input(fixture, &claim);
     attach["request"]["revision"] = Value::Null;
     attach["request"]["lease"] = json!("reconnected-client");
     attach["request"]["accept_current"] = json!({"view":view["id"],"version":view["version"]});
-    completed(daemon, &daemon.rpc("views.attach", attach));
+    retry_reconnect(
+        daemon,
+        &claim,
+        view,
+        attach,
+        point,
+        Instant::now() + Duration::from_secs(30),
+        |_| {},
+    )
+    .unwrap_or_else(|failures| {
+        panic!("{point}: reconnect exhausted its retry bound: {failures:?}")
+    });
     daemon.rpc("owners.release", json!({"claim":old}));
     (claim, guard)
+}
+
+fn retry_reconnect(
+    daemon: &Daemon,
+    claim: &OwnerClaim,
+    view: &Value,
+    mut attach: Value,
+    point: &str,
+    deadline: Instant,
+    mut before_attempt: impl FnMut(&Value),
+) -> Result<Value, Vec<Value>> {
+    let mut failures: Vec<Value> = Vec::new();
+    for sequence in 1..=8 {
+        if Instant::now() >= deadline {
+            break;
+        }
+        attach["token"] = token(claim, sequence);
+        before_attempt(&attach);
+        let accepted = daemon.rpc("views.attach", attach.clone());
+        let record = terminal_before(daemon, &accepted, deadline);
+        assert_eq!(record["request"], attach["request"], "{point}: {record}");
+        assert_eq!(record["token"], attach["token"], "{point}: {record}");
+        if record["state"] == "completed" {
+            assert_eq!(record["committed_state"], "committed", "{point}: {record}");
+            assert_eq!(record["result"]["current"]["id"], view["id"], "{point}");
+            assert_eq!(
+                record["result"]["current"]["version"], view["version"],
+                "{point}"
+            );
+            assert_eq!(
+                record["result"]["current"]["current"], view["current"],
+                "{point}"
+            );
+            for failed in failures {
+                assert_eq!(
+                    daemon.rpc(
+                        "views.attach",
+                        json!({
+                            "token":failed["token"],"request":failed["request"]
+                        })
+                    ),
+                    failed,
+                    "{point}: a new attempt must not rewrite a failed receipt"
+                );
+            }
+            return Ok(record);
+        }
+        assert!(
+            retryable_reconnect_catalog_error(&record),
+            "{point}: reconnect failed without safe retry authorization: {record}"
+        );
+        assert_eq!(
+            daemon.rpc("views.attach", attach.clone()),
+            record,
+            "{point}: a failed token must replay its original receipt"
+        );
+        let current = daemon.rpc("views.recover", json!({"id":view["id"]}));
+        assert_eq!(current["version"], view["version"], "{point}: {current}");
+        assert_eq!(current["current"], view["current"], "{point}: {current}");
+        eprintln!("{point}: reconnect attempt {sequence} had uncommitted catalog contention");
+        failures.push(record);
+        if sequence < 8 {
+            thread::sleep(
+                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+    Err(failures)
+}
+
+fn retryable_reconnect_catalog_error(record: &Value) -> bool {
+    record["kind"] == "attach"
+        && record["state"] == "failed"
+        && record["cancelled"] == false
+        && record["committed_state"] == "not-committed"
+        && record["error"]["category"] == "busy"
+        && record["error"]["reason_code"] == "catalog-io"
+        && record["error"]["retryable"] == true
+        && record["error"]["committed_state"] == "not-committed"
+}
+
+#[test]
+fn reconnect_retry_requires_exact_uncommitted_catalog_contention() {
+    let permitted = json!({
+        "kind":"attach","state":"failed","cancelled":false,"committed_state":"not-committed",
+        "error":{"category":"busy","reason_code":"catalog-io","retryable":true,"committed_state":"not-committed"}
+    });
+    assert!(retryable_reconnect_catalog_error(&permitted));
+    for (pointer, value) in [
+        ("/kind", json!("migrate")),
+        ("/state", json!("accepted")),
+        ("/state", json!("completed")),
+        ("/state", json!("cancelled")),
+        ("/cancelled", json!(true)),
+        ("/committed_state", json!("committed")),
+        ("/committed_state", json!("unknown")),
+        ("/error/category", json!("io")),
+        ("/error/reason_code", json!("view-work-active")),
+        ("/error/retryable", json!(false)),
+        ("/error/committed_state", json!("committed")),
+        ("/error/committed_state", json!("unknown")),
+        ("/error", Value::Null),
+    ] {
+        let mut rejected = permitted.clone();
+        *rejected.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            !retryable_reconnect_catalog_error(&rejected),
+            "{pointer}: {rejected}"
+        );
+    }
+}
+
+#[test]
+fn reconnect_retries_injected_catalog_busy_with_fresh_tokens_and_bounded_attempts() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (original, original_guard) = owner(&daemon);
+    let first = completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &original)),
+    );
+    let view = &first["result"]["current"];
+    for fail_attempts in [1, 8] {
+        let (claim, guard) = owner(&daemon);
+        let mut attach = attach_input(&fixture, &claim);
+        attach["request"]["revision"] = Value::Null;
+        attach["request"]["lease"] = json!("reconnected-client");
+        attach["request"]["accept_current"] = json!({"view":view["id"],"version":view["version"]});
+        let request = attach["request"].clone();
+        let mut submitted = Vec::new();
+        let result = retry_reconnect(
+            &daemon,
+            &claim,
+            view,
+            attach,
+            "injected-catalog-busy",
+            Instant::now() + Duration::from_secs(30),
+            |input| {
+                submitted.push(input.clone());
+                if submitted.len() <= fail_attempts {
+                    daemon.rpc(
+                        "testing.install",
+                        json!({
+                            "point":"attach-before-resume","operation":null,"skip_hits":0,
+                            "action":{"mode":"catalog-busy-token","token":input["token"]}
+                        }),
+                    );
+                }
+            },
+        );
+        assert_eq!(submitted.len(), if fail_attempts == 1 { 2 } else { 8 });
+        for (index, input) in submitted.iter().enumerate() {
+            assert_eq!(input["request"], request);
+            assert_eq!(input["token"], token(&claim, index as u64 + 1));
+        }
+        let failed = daemon.rpc("operations.lookup", submitted[0]["token"].clone());
+        assert!(retryable_reconnect_catalog_error(&failed), "{failed}");
+        assert_eq!(failed["progress"]["view"], view["id"]);
+        assert_eq!(
+            failed["progress"]["resolved_commit"],
+            view["current"]["commit"]
+        );
+        assert!(
+            failed["error"]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("injected catalog contention"),
+            "{failed}"
+        );
+        let last_injected = daemon.rpc(
+            "operations.lookup",
+            submitted[fail_attempts - 1]["token"].clone(),
+        );
+        let hook = daemon.rpc("testing.status", json!({}));
+        assert_eq!(hook["stage"], "fired", "{hook}");
+        assert_eq!(hook["reached_operation"], last_injected["id"], "{hook}");
+        if fail_attempts == 1 {
+            let attached = result.unwrap();
+            assert_ne!(attached["id"], failed["id"]);
+            assert_eq!(attached["token"], submitted[1]["token"]);
+            assert_eq!(attached["result"]["lease"]["token"], request["lease"]);
+            assert_eq!(attached["result"]["lease"]["operation"], failed["id"]);
+            assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+        } else {
+            let failures = result.unwrap_err();
+            assert_eq!(failures.len(), 8);
+            for failure in failures {
+                assert_eq!(
+                    daemon.rpc("operations.lookup", failure["token"].clone()),
+                    failure
+                );
+            }
+        }
+        assert_eq!(
+            daemon.rpc("operations.lookup", submitted[0]["token"].clone()),
+            failed
+        );
+        let expired = retry_reconnect(
+            &daemon,
+            &claim,
+            view,
+            submitted[0].clone(),
+            "expired-before-submission",
+            Instant::now(),
+            |_| panic!("an expired deadline must not submit another attempt"),
+        );
+        assert!(expired.unwrap_err().is_empty());
+        daemon.rpc("owners.release", json!({"claim":claim}));
+        drop(guard);
+    }
+    daemon.rpc("owners.release", json!({"claim":original}));
+    drop(original_guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
 }
 
 #[test]
@@ -407,7 +634,7 @@ fn process_crashes_at_generation_and_view_boundaries_recover_the_exact_pin() {
                 json!(fixture.revision)
             }
         );
-        let (new_claim, new_guard) = reconnect(&fixture, &restarted, &recovered, &claim);
+        let (new_claim, new_guard) = reconnect(&fixture, &restarted, &recovered, &claim, point);
         let terminal = terminal(&restarted, &operation);
         assert_eq!(
             terminal["committed_state"],
@@ -500,7 +727,7 @@ fn collection_crash_boundaries_preserve_live_views_and_resumable_progress() {
         let mut restarted = start(&fixture, &configured, &["--no-watch"]);
         let recovered = restarted.rpc("views.recover", json!({"id":current["id"]}));
         assert_eq!(recovered["current"], current["current"], "{point}");
-        let (new_claim, new_guard) = reconnect(&fixture, &restarted, &recovered, &claim);
+        let (new_claim, new_guard) = reconnect(&fixture, &restarted, &recovered, &claim, point);
         let recovered_operation = terminal(&restarted, &operation);
         assert_eq!(
             recovered_operation["committed_state"], "committed",
@@ -678,7 +905,7 @@ fn control_unlink_crashes_preserve_sibling_proofs_and_credit_only_the_ended_owne
         let mut restarted = start(&fixture, &configured, &["--no-watch"]);
         let recovered = restarted.rpc("views.recover", json!({"id":current["id"]}));
         assert_eq!(recovered["current"], current["current"]);
-        let (new_claim, new_guard) = reconnect(&fixture, &restarted, &recovered, &claim);
+        let (new_claim, new_guard) = reconnect(&fixture, &restarted, &recovered, &claim, point);
         let started = Instant::now();
         loop {
             let result = restarted

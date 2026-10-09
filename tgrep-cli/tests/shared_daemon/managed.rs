@@ -80,13 +80,16 @@ fn completed(daemon: &Daemon, operation: &Value) -> Value {
 }
 
 fn terminal(daemon: &Daemon, operation: &Value) -> Value {
-    let started = Instant::now();
+    terminal_before(daemon, operation, Instant::now() + Duration::from_secs(30))
+}
+
+fn terminal_before(daemon: &Daemon, operation: &Value, deadline: Instant) -> Value {
     loop {
         let record = daemon.rpc("operations.inspect", json!({"id":operation["id"]}));
         match record["state"].as_str().unwrap() {
             "completed" | "failed" | "cancelled" => return record,
             _ => assert!(
-                started.elapsed() < Duration::from_secs(30),
+                Instant::now() < deadline,
                 "operation did not complete: {record}"
             ),
         }

@@ -1039,6 +1039,17 @@ request is invalid. Persist terminal results before advancing
 receipt floor prevents an acknowledged old token from being interpreted as new
 work. Receipt expiration is an explicit error, never proof that nothing committed.
 
+A failed or cancelled receipt is terminal: replaying its token does not execute
+another attempt. A retryable failure with authoritative `not-committed` state
+permits a bounded new attempt with a fresh operation token, after checking that
+the expected view/version and exact pin still hold. Keep the original lease
+token and attachment inputs unchanged; do not silently accept a newer version.
+An uncommitted operation can already have saved lease intent and progress; the
+fresh operation token resumes that same lease rather than duplicating it.
+For example, native catalog writer contention can return `busy`/`catalog-io`
+without committing a view. Committed or unknown outcomes require recovery, not
+retry-as-new. Bound both attempts and total waiting time.
+
 Ownership is bound to an issued namespace/instance challenge and the identity
 of an OS-locked guard. Death is positively proved only by acquiring that same
 guard. Missing/replaced/inaccessible files, PID reuse, disconnected clients and

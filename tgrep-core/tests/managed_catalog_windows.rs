@@ -71,6 +71,9 @@ impl Rendezvous {
 struct LockProbe {
     identity: (u64, [u8; 16]),
     calls: AtomicU32,
+    shared_slots: [AtomicU32; 8],
+    allocating: AtomicBool,
+    allocation: Rendezvous,
     before: Rendezvous,
     after: Rendezvous,
 }
@@ -89,31 +92,46 @@ unsafe extern "system" fn lock(
     overlapped: *mut OVERLAPPED,
 ) -> i32 {
     let probe = installed().lock().unwrap().clone();
-    let selected = probe.as_ref().filter(|probe| {
-        if flags & LOCKFILE_EXCLUSIVE_LOCK != 0 || low != 1 || high != 0 {
-            return false;
-        }
-        // SAFETY: the VFS supplies a live OVERLAPPED for the native call.
-        let offset = unsafe { (*overlapped).Anonymous.Anonymous.Offset };
-        // WAL_READ_LOCK(1) is WALINDEX_LOCK_OFFSET + 4.
-        if offset != 124 {
+    // SAFETY: the VFS supplies a live OVERLAPPED for the native call.
+    let offset = unsafe { (*overlapped).Anonymous.Anonymous.Offset };
+    let shared = flags & LOCKFILE_EXCLUSIVE_LOCK == 0;
+    let matching = probe.as_ref().filter(|probe| {
+        if low != 1 || high != 0 || !(120..128).contains(&offset) {
             return false;
         }
         // SAFETY: borrow the VFS's live handle for identity only, never close it.
         let file = ManuallyDrop::new(unsafe { File::from_raw_handle(handle) });
-        identity(&file) == probe.identity && probe.calls.fetch_add(1, Ordering::SeqCst) < 2
+        identity(&file) == probe.identity
+    });
+    if let Some(probe) = matching
+        && shared
+    {
+        probe.shared_slots[(offset - 120) as usize].fetch_add(1, Ordering::SeqCst);
+    }
+    let selected = matching.filter(|probe| {
+        // WAL_READ_LOCK(1) is WALINDEX_LOCK_OFFSET + 4.
+        shared && offset == 124 && probe.calls.fetch_add(1, Ordering::SeqCst) < 2
     });
     if let Some(probe) = selected {
         probe.before.wait();
     }
     // SAFETY: all parameters are forwarded unchanged to the original OS API.
     let result = unsafe { LockFileEx(handle, flags, reserved, low, high, overlapped) };
-    if let Some(probe) = selected {
-        // Preserve the native error across the diagnostic synchronization.
-        let error = unsafe { GetLastError() };
-        probe.after.wait();
-        unsafe { SetLastError(error) };
+    // Preserve the native error across all diagnostic synchronization.
+    let error = unsafe { GetLastError() };
+    if let Some(probe) = matching
+        && result != 0
+        && ((!shared && offset == 124 && !probe.allocating.swap(true, Ordering::SeqCst))
+            || (shared && offset > 124))
+    {
+        // Hold an uninitialized read mark until the other reader selects
+        // another slot, rather than relying on scheduler timing.
+        probe.allocation.wait();
     }
+    if let Some(probe) = selected {
+        probe.after.wait();
+    }
+    unsafe { SetLastError(error) };
     result
 }
 
@@ -173,8 +191,9 @@ fn native_rendezvous_records_timeout() {
     assert!(rendezvous.timed_out.load(Ordering::SeqCst));
 }
 
-#[test]
-fn canonical_windows_catalog_readers_release_native_wal_locks() {
+fn native_reader_probe(prime_readers: bool) -> (Arc<LockProbe>, (u32, i64, i64)) {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _serial = SERIAL.lock().unwrap();
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().canonicalize().unwrap().join("catalog.sqlite");
     let connection = Connection::open(&path).unwrap();
@@ -190,9 +209,24 @@ fn canonical_windows_catalog_readers_release_native_wal_locks() {
         Connection::open(&path).unwrap(),
         Connection::open(&path).unwrap(),
     ];
+    if prime_readers {
+        // Publish the final WAL read mark and load both schemas before the
+        // native shared-lock gates; concurrent initialization can use slot 2.
+        for reader in &readers {
+            assert_eq!(
+                reader
+                    .query_row("SELECT value FROM probe", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
     let probe = Arc::new(LockProbe {
         identity,
         calls: AtomicU32::new(0),
+        shared_slots: std::array::from_fn(|_| AtomicU32::new(0)),
+        allocating: AtomicBool::new(false),
+        allocation: Rendezvous::new(),
         before: Rendezvous::new(),
         after: Rendezvous::new(),
     });
@@ -230,14 +264,29 @@ fn canonical_windows_catalog_readers_release_native_wal_locks() {
             task.join().unwrap();
         }
     });
+    drop(hook);
     let checkpoint: (u32, i64, i64) = connection
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .unwrap();
+    connection.close().unwrap();
+    temp.close().unwrap();
+    (probe, checkpoint)
+}
+
+#[test]
+fn canonical_windows_catalog_readers_release_native_wal_locks() {
+    let (probe, checkpoint) = native_reader_probe(true);
     let calls = probe.calls.load(Ordering::SeqCst);
-    drop(hook);
-    assert!(calls >= 2, "native overlapping-reader gate was not reached");
+    let slots = probe
+        .shared_slots
+        .each_ref()
+        .map(|calls| calls.load(Ordering::SeqCst));
+    assert!(
+        calls >= 2,
+        "native overlapping-reader gate was not reached: callbacks={calls}, shared slots={slots:?}"
+    );
     assert!(
         !probe.before.timed_out.load(Ordering::SeqCst)
             && !probe.after.timed_out.load(Ordering::SeqCst),
@@ -245,12 +294,25 @@ fn canonical_windows_catalog_readers_release_native_wal_locks() {
         probe.before.timed_out.load(Ordering::SeqCst),
         probe.after.timed_out.load(Ordering::SeqCst),
     );
+    assert!(!probe.allocating.load(Ordering::SeqCst));
+    assert_eq!(*probe.allocation.arrived.lock().unwrap(), 0);
     assert_eq!(
         checkpoint,
         (0, 0, 0),
         "closed native readers left WAL locks: SQLite {}, callbacks {calls}",
         rusqlite::version(),
     );
-    connection.close().unwrap();
-    temp.close().unwrap();
+}
+
+#[test]
+fn concurrent_readmark_initialization_is_not_native_reader_overlap() {
+    let (probe, checkpoint) = native_reader_probe(false);
+    assert!(!probe.allocation.timed_out.load(Ordering::SeqCst));
+    assert!(*probe.allocation.arrived.lock().unwrap() >= 2);
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.shared_slots[4].load(Ordering::SeqCst), 1);
+    assert!(probe.shared_slots[5].load(Ordering::SeqCst) > 0);
+    assert!(probe.before.timed_out.load(Ordering::SeqCst));
+    assert!(probe.after.timed_out.load(Ordering::SeqCst));
+    assert_eq!(checkpoint, (0, 0, 0));
 }

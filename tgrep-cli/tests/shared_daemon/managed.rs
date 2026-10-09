@@ -216,6 +216,7 @@ fn canonical_matches(output: Output) -> Vec<Value> {
     rows
 }
 
+#[track_caller]
 fn assert_scan_parity(daemon: &Daemon, root: &Path, home: &Path) {
     let path_key = |path: &str| {
         Path::new(path)
@@ -272,7 +273,7 @@ fn assert_scan_parity(daemon: &Daemon, root: &Path, home: &Path) {
         let scan = invoke(&args);
         assert!(
             String::from_utf8_lossy(&indexed.stderr).contains("(via shared daemon v2)"),
-            "CLI did not prove shared-v2 service: {}",
+            "CLI did not prove shared-v2 service for {root:?} (hidden={hidden}, lookup={view}): {}",
             String::from_utf8_lossy(&indexed.stderr)
         );
         assert_eq!(canonical_matches(indexed), canonical_matches(scan));
@@ -291,7 +292,7 @@ fn assert_scan_parity(daemon: &Daemon, root: &Path, home: &Path) {
         };
         assert!(
             indexed.stderr.is_empty(),
-            "{}",
+            "CLI file listing diagnostics for {root:?} (hidden={hidden}, lookup={view}): {}",
             String::from_utf8_lossy(&indexed.stderr)
         );
         let scanned = paths(scan);

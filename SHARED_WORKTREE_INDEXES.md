@@ -1115,6 +1115,16 @@ directory nested under the common directory; lock-file traffic is ignored.
 `--no-index` remains the way to search
 current disk bytes without relying on watcher delivery.
 
+Queued background reconciliation can be satisfied by a later completed refresh.
+Under the view's work/publication gates, tgrep checks the exact current pin,
+checkpoint and input epoch before completing such a job without changing the
+ready view or invalidating its readers. Its original token/request is retained;
+the terminal receipt reports `coalesced: true`, the existing reconciled epoch
+and zero new reconciliation work. This does not postpone periodic verification.
+Explicit refresh always verifies; periodic repair, watcher uncertainty and
+rescan events invalidate for full verification before queuing reconciliation.
+A newer invalidation therefore cannot be skipped by the coalescing check.
+
 `views.adaptive` takes `view`, `owner`, `expected_version`, `allocation_version`
 in an operation envelope. Adaptive policy evaluates the worktree's captured
 exact `HEAD`, not another branch tip. It uses bounded actual-content work,

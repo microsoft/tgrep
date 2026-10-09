@@ -1308,6 +1308,10 @@ impl State {
                             operation.kind.as_str(),
                             "attach" | "legacy-attach" | "migrate" | "refresh" | "reconcile"
                         )
+                        && !final_operation
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result["coalesced"] == true)
                     {
                         state.last_reconcile = Instant::now();
                     }

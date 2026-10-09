@@ -437,6 +437,8 @@ impl ViewManager {
             .accept_operation(token, "refresh", serde_json::to_value(request)?)
     }
 
+    /// Queue reconciliation of invalidated or unready state. Callers requesting
+    /// a full repair must invalidate first; `accept_refresh` always verifies.
     pub fn accept_reconciliation(
         &self,
         token: Token,
@@ -1399,6 +1401,11 @@ impl ViewManager {
         }
         let permit = self.reserve(&operation.id, owner, allocation_version)?;
         let _work = slot.begin_work(operation)?;
+        if operation.kind == "reconcile"
+            && self.complete_current_reconciliation(&slot, operation, &record, &permit)?
+        {
+            return Ok(());
+        }
         let current = slot
             .state
             .lock()
@@ -1430,6 +1437,83 @@ impl ViewManager {
         self.publish(
             &slot, operation, record, view, checkpoint, reconcile, input, result, &permit, false,
         )
+    }
+
+    fn complete_current_reconciliation(
+        &self,
+        slot: &ViewSlot,
+        operation: &OperationRecord,
+        record: &ViewRecord,
+        permit: &WorkPermit,
+    ) -> Result<bool> {
+        let state = slot
+            .state
+            .lock()
+            .map_err(|_| Error::corrupt("view lock poisoned"))?;
+        if state.closing {
+            return Err(Error::busy("view-closing"));
+        }
+        let Some(current) = &state.current else {
+            return Ok(false);
+        };
+        let status = current.view.status()?;
+        if !current.record.same_publication(record)
+            || slot.epoch.load(Ordering::Acquire) != record.input_epoch
+            || !status.ready
+            || status.published_epoch != record.reconciled_epoch
+        {
+            return Ok(false);
+        }
+        let stats = ReconcileStats {
+            epoch: record
+                .reconciled_epoch
+                .ok_or_else(|| Error::corrupt("ready view has no reconciled epoch"))?,
+            ..ReconcileStats::default()
+        };
+        self.namespace.fault(
+            super::faults::Point::ReconcileBeforeComplete,
+            Some(&operation.id),
+        )?;
+        permit.check_now()?;
+        self.namespace.transaction(|transaction| {
+            super::work::ensure_admission(transaction)?;
+            let allocation = super::work::allocation_row(transaction)?;
+            if allocation.version != permit.record.request.allocation_version {
+                return Err(Error::stale_version(allocation.version));
+            }
+            let previous = view_row(transaction, &record.id)?;
+            if previous.version != record.version {
+                return Err(Error::stale_version(previous.version));
+            }
+            if !previous.same_publication(record) {
+                return Err(Error::busy("publication-state-changed"));
+            }
+            if lease_count(transaction, Some(&record.id))? == 0 {
+                return Err(Error::busy("view-has-no-leases"));
+            }
+            let mut receipt: OperationRecord =
+                serde_json::from_str(&transaction.query_row::<String, _, _>(
+                    "SELECT record FROM operations WHERE id=?1",
+                    [operation.id.as_str()],
+                    |row| row.get(0),
+                )?)?;
+            if receipt.cancelled {
+                return Err(Error::new(
+                    ErrorCategory::Cancelled,
+                    "operation-cancelled",
+                    "cancelled before reconciliation completion",
+                ));
+            }
+            receipt.committed_state = CommitState::Committed;
+            receipt.state = OperationState::Completed;
+            receipt.result = Some(json!({
+                "current": previous,
+                "reconcile": stats,
+                "coalesced": true,
+            }));
+            Namespace::save_operation(transaction, &receipt)
+        })?;
+        Ok(true)
     }
 
     fn prepare_checkpoint(

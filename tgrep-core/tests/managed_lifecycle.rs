@@ -178,6 +178,338 @@ impl Fixture {
 }
 
 #[test]
+fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
+    use tgrep_core::managed::{OperationState, ReconcileRequest, RefreshRequest};
+    let mut fixture = Fixture::new();
+    fixture.namespace.activate().unwrap();
+    let manager = fixture.manager();
+    let first = fixture.attach(&manager);
+    let slot = manager.slot(&first.id).unwrap();
+    slot.invalidate(&[], true).unwrap();
+    let token = Token::parse("queued-before-explicit-refresh").unwrap();
+    let request = ReconcileRequest {
+        view: first.id.clone(),
+        expected_version: first.version,
+        allocation_version: 1,
+    };
+    let queued = manager
+        .accept_reconciliation(token.clone(), request.clone())
+        .unwrap();
+    let refresh = manager
+        .accept_refresh(
+            fixture.token("explicit-refresh"),
+            RefreshRequest {
+                view: first.id.clone(),
+                expected_version: first.version,
+                owner: fixture.owner.registration().owner.clone(),
+                allocation_version: 1,
+            },
+        )
+        .unwrap();
+    let refreshed = manager.execute(&refresh.id).unwrap();
+    assert_eq!(refreshed.state, OperationState::Completed, "{refreshed:?}");
+    let before = manager.recover(&first.id).unwrap();
+    let query = slot.query(before.version).unwrap();
+    let completed = manager.execute(&queued.id).unwrap();
+    assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+    assert_eq!(
+        query
+            .with_snapshot(|snapshot| snapshot.files("", false))
+            .unwrap(),
+        ["source.txt"]
+    );
+    query.complete().unwrap();
+    let current = manager.recover(&first.id).unwrap();
+    assert_eq!(current.current, before.current);
+    assert_eq!(current.checkpoint, before.checkpoint);
+    assert_eq!(current.reconciled_epoch, before.reconciled_epoch);
+    assert_eq!(current.input_epoch, before.input_epoch);
+    let result = completed.result.as_ref().unwrap();
+    assert_eq!(result["coalesced"], true);
+    assert_eq!(result["reconcile"]["files_read"], 0);
+    assert_eq!(result["reconcile"]["bytes_read"], 0);
+    assert_eq!(result["reconcile"]["files_extracted"], 0);
+    let replay = || {
+        let accepted = manager
+            .accept_reconciliation(token.clone(), request.clone())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&accepted).unwrap(),
+            serde_json::to_value(&completed).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(manager.execute(&accepted.id).unwrap()).unwrap(),
+            serde_json::to_value(&completed).unwrap()
+        );
+    };
+    replay();
+
+    let newer = manager
+        .accept_reconciliation(
+            Token::parse("queued-before-new-invalidation").unwrap(),
+            ReconcileRequest {
+                view: first.id.clone(),
+                expected_version: first.version,
+                allocation_version: 1,
+            },
+        )
+        .unwrap();
+    fs::write(
+        fixture.root.join("source.txt"),
+        "newly invalidated needle\n",
+    )
+    .unwrap();
+    let input = slot.invalidate(&[], true).unwrap();
+    replay();
+    assert!(!manager.status(&first.id).unwrap().ready);
+    let updated = manager.execute(&newer.id).unwrap();
+    assert_eq!(updated.state, OperationState::Completed, "{updated:?}");
+    assert!(updated.result.as_ref().unwrap().get("coalesced").is_none());
+    assert!(
+        updated.result.as_ref().unwrap()["reconcile"]["bytes_read"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let current = manager.recover(&first.id).unwrap();
+    assert_eq!(current.current, before.current);
+    assert_eq!(current.input_epoch, input);
+    assert_ne!(current.checkpoint, before.checkpoint);
+    assert!(manager.status(&first.id).unwrap().ready);
+    let query = slot.query(first.version).unwrap();
+    let mut candidate = query
+        .with_snapshot(|snapshot| snapshot.open_candidate("source.txt"))
+        .unwrap()
+        .unwrap();
+    let mut bytes = String::new();
+    std::io::Read::read_to_string(&mut candidate, &mut bytes).unwrap();
+    assert_eq!(bytes, "newly invalidated needle\n");
+    query.complete().unwrap();
+    replay();
+}
+
+#[test]
+fn ready_reconciliation_preserves_forced_repairs_and_rejects_invalid_work() {
+    use tgrep_core::managed::{CommitState, OperationState, ReconcileRequest, RefreshRequest};
+    let mut fixture = Fixture::new();
+    fixture.namespace.activate().unwrap();
+    let manager = fixture.manager();
+    let first = fixture.attach(&manager);
+    let slot = manager.slot(&first.id).unwrap();
+    let input = slot.input_epoch();
+    fs::write(
+        fixture.root.join("source.txt"),
+        "missed notification needle\n",
+    )
+    .unwrap();
+    let refresh = manager
+        .accept_refresh(
+            fixture.token("forced-repair"),
+            RefreshRequest {
+                view: first.id.clone(),
+                expected_version: first.version,
+                owner: fixture.owner.registration().owner.clone(),
+                allocation_version: 1,
+            },
+        )
+        .unwrap();
+    let repaired = manager.execute(&refresh.id).unwrap();
+    assert_eq!(repaired.state, OperationState::Completed, "{repaired:?}");
+    assert_eq!(slot.input_epoch(), input);
+    let stats = &repaired.result.as_ref().unwrap()["reconcile"];
+    assert_eq!(stats["full"], true);
+    assert!(stats["bytes_read"].as_u64().unwrap() > 0);
+    assert!(repaired.result.as_ref().unwrap().get("coalesced").is_none());
+    assert_ne!(
+        manager.recover(&first.id).unwrap().checkpoint,
+        first.checkpoint
+    );
+
+    for reason in ["periodic-repair", "watcher-uncertainty"] {
+        let name = format!("{reason}.txt");
+        fs::write(fixture.root.join(&name), "missed untracked needle\n").unwrap();
+        let input = slot.invalidate(&[], true).unwrap();
+        let operation = manager
+            .accept_reconciliation(
+                Token::parse(reason).unwrap(),
+                ReconcileRequest {
+                    view: first.id.clone(),
+                    expected_version: first.version,
+                    allocation_version: 1,
+                },
+            )
+            .unwrap();
+        let completed = manager.execute(&operation.id).unwrap();
+        assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+        let result = completed.result.as_ref().unwrap();
+        assert!(result.get("coalesced").is_none());
+        assert_eq!(result["reconcile"]["full"], true);
+        assert!(result["reconcile"]["bytes_read"].as_u64().unwrap() > 0);
+        assert_eq!(manager.recover(&first.id).unwrap().input_epoch, input);
+        let query = slot.query(first.version).unwrap();
+        assert!(
+            query
+                .with_snapshot(|snapshot| snapshot.files("", false))
+                .unwrap()
+                .contains(&name)
+        );
+        query.complete().unwrap();
+    }
+
+    let before = manager.recover(&first.id).unwrap();
+    for (name, version, allocation, cancelled, category) in [
+        ("stale-view", 2, 1, false, ErrorCategory::StaleVersion),
+        ("stale-allocation", 1, 2, false, ErrorCategory::StaleVersion),
+        ("cancelled", 1, 1, true, ErrorCategory::Busy),
+    ] {
+        let operation = manager
+            .accept_reconciliation(
+                Token::parse(name).unwrap(),
+                ReconcileRequest {
+                    view: first.id.clone(),
+                    expected_version: version,
+                    allocation_version: allocation,
+                },
+            )
+            .unwrap();
+        if cancelled {
+            fixture.namespace.cancel_operation(&operation.id).unwrap();
+        }
+        let failed = manager.execute(&operation.id).unwrap();
+        assert_eq!(failed.state, OperationState::Failed, "{failed:?}");
+        assert_eq!(failed.cancelled, cancelled);
+        assert_eq!(failed.committed_state, CommitState::NotCommitted);
+        assert_eq!(
+            failed.error.as_ref().unwrap()["category"],
+            serde_json::to_value(category).unwrap()
+        );
+        if cancelled {
+            assert_eq!(
+                failed.error.as_ref().unwrap()["reason_code"],
+                "operation-is-not-admissible"
+            );
+        }
+        assert!(failed.result.is_none());
+        let current = manager.recover(&first.id).unwrap();
+        assert_eq!(current.current, before.current);
+        assert_eq!(current.checkpoint, before.checkpoint);
+        assert_eq!(current.input_epoch, before.input_epoch);
+        assert!(manager.status(&first.id).unwrap().ready);
+        assert_eq!(fixture.namespace.work_usage().unwrap().reservations, 0);
+    }
+}
+
+#[cfg(feature = "managed-test-hooks")]
+#[test]
+fn coalesced_reconciliation_rechecks_cancellation_and_allocation_before_receipt() {
+    use std::time::{Duration, Instant};
+    use tgrep_core::managed::faults::{Action, Point, Specification, Stage};
+    use tgrep_core::managed::{CommitState, OperationState, ReconcileRequest};
+
+    for cancelled in [true, false] {
+        let mut fixture = Fixture::new();
+        fixture.namespace.activate().unwrap();
+        let manager = fixture.manager();
+        let first = fixture.attach(&manager);
+        let slot = manager.slot(&first.id).unwrap();
+        let query = slot.query(first.version).unwrap();
+        let operation = manager
+            .accept_reconciliation(
+                Token::parse("coalesced-receipt-race").unwrap(),
+                ReconcileRequest {
+                    view: first.id.clone(),
+                    expected_version: first.version,
+                    allocation_version: 1,
+                },
+            )
+            .unwrap();
+        let barrier = fixture
+            .namespace
+            .install_test_fault(Specification {
+                point: Point::ReconcileBeforeComplete,
+                operation: Some(operation.id.clone()),
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 30_000 },
+            })
+            .unwrap();
+        let failed = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| manager.execute(&operation.id));
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let reached = loop {
+                let status = fixture.namespace.test_fault_status().unwrap().unwrap();
+                if status.stage == Stage::Waiting {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let changed = if reached.is_some() {
+                if cancelled {
+                    fixture
+                        .namespace
+                        .cancel_operation(&operation.id)
+                        .map(|_| ())
+                } else {
+                    fixture.namespace.allocation().and_then(|allocation| {
+                        fixture
+                            .namespace
+                            .update_allocation(allocation.version, allocation)
+                            .map(|_| ())
+                    })
+                }
+            } else {
+                Ok(())
+            };
+            let released = fixture.namespace.release_test_fault(&barrier.ticket);
+            let result = worker.join().unwrap();
+            let reached = reached.expect("coalescing did not reach its receipt boundary");
+            assert_eq!(reached.reached_operation.as_ref(), Some(&operation.id));
+            changed.unwrap();
+            released.unwrap();
+            result.unwrap()
+        });
+        assert_eq!(
+            failed.state,
+            if cancelled {
+                OperationState::Cancelled
+            } else {
+                OperationState::Failed
+            },
+            "{failed:?}"
+        );
+        assert_eq!(failed.committed_state, CommitState::NotCommitted);
+        assert_eq!(
+            failed.error.as_ref().unwrap()["category"],
+            serde_json::to_value(if cancelled {
+                ErrorCategory::Cancelled
+            } else {
+                ErrorCategory::StaleVersion
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            query
+                .with_snapshot(|snapshot| snapshot.files("", false))
+                .unwrap(),
+            ["source.txt"]
+        );
+        query.complete().unwrap();
+        let current = manager.recover(&first.id).unwrap();
+        assert_eq!(current.current, first.current);
+        assert_eq!(current.checkpoint, first.checkpoint);
+        assert_eq!(current.input_epoch, first.input_epoch);
+        assert!(manager.status(&first.id).unwrap().ready);
+        assert_eq!(fixture.namespace.work_usage().unwrap().reservations, 0);
+        assert_eq!(
+            serde_json::to_value(manager.execute(&operation.id).unwrap()).unwrap(),
+            serde_json::to_value(failed).unwrap()
+        );
+    }
+}
+
+#[test]
 fn metadata_walk_reserves_directory_queue_before_retaining_a_wide_tree() {
     use tgrep_core::worktrees::{WorktreeOptions, WorktreeView};
     let mut fixture = Fixture::new();

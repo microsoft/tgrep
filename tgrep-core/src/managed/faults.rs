@@ -25,6 +25,7 @@ pub enum Point {
     CheckpointPublished,
     MigrationPrepared,
     AttachBeforeResume,
+    ReconcileBeforeComplete,
     ViewBeforeCommit,
     ViewAfterCommit,
     ViewAfterSwap,

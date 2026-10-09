@@ -1377,6 +1377,7 @@ dependencies = [
  "predicates",
  "rayon",
  "regex",
+ "regex-syntax",
  "rusqlite",
  "serde",
  "serde_json",

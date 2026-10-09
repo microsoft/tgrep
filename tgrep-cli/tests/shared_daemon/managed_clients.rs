@@ -65,6 +65,100 @@ pub(super) fn held_owner(fixture: &Fixture, daemon: &Daemon) -> (OwnerClaim, run
 }
 
 #[test]
+fn managed_search_preserves_pattern_files_boundaries_and_multiline_spans() {
+    let mut fixture = Fixture::new();
+    fs::write(
+        fixture.a.join("corpus.txt"),
+        "alpha\nALPHA\nbeta\nBETA\n test \nplain test\na_c\nA_C\na- x\nxa- x\na-\naa\n",
+    )
+    .unwrap();
+    git(&fixture.a, &["add", "corpus.txt"]);
+    git(
+        &fixture.a,
+        &["commit", "-qm", "search compatibility corpus"],
+    );
+    fixture.revision = git(&fixture.a, &["rev-parse", "HEAD"]);
+    let whitespace = fixture.temp.path().join("whitespace-patterns");
+    let blank = fixture.temp.path().join("blank-patterns");
+    let empty = fixture.temp.path().join("empty-patterns");
+    let uppercase = fixture.temp.path().join("uppercase-patterns");
+    fs::write(&whitespace, " test \r\n").unwrap();
+    fs::write(&blank, "alpha\n\n").unwrap();
+    fs::write(&empty, "").unwrap();
+    fs::write(&uppercase, "alpha\r\nBETA\r\n").unwrap();
+
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    let cases: &[&[&str]] = &[
+        &["-F", "-f", whitespace.to_str().unwrap()],
+        &["-F", "-f", blank.to_str().unwrap()],
+        &["-F", "-v", "-f", empty.to_str().unwrap()],
+        &["-S", "-f", uppercase.to_str().unwrap()],
+        &["-e", "(?i)alpha", "-e", "beta"],
+        &["-S", "-e", r"a\Sc"],
+        &["-S", "-e", r"a\Sc", "-e", "BETA"],
+        &["-w", "-e", "a-"],
+        &["-w", "-x", "-e", "a-"],
+        &["-x", "-w", "-e", "a-"],
+        &["-U", "-o", "-e", "a"],
+        &["-U", "-e", ""],
+    ];
+    for engine in ["auto", "pcre2"] {
+        for flags in cases {
+            let mut args = vec![
+                "--stats",
+                "--json",
+                "--engine",
+                engine,
+                "--glob",
+                "corpus.txt",
+            ];
+            args.extend_from_slice(flags);
+            args.extend(["--", "."]);
+            let indexed = cli(&fixture.a, &args);
+            args.insert(0, "--no-index");
+            let scanned = cli(&fixture.a, &args);
+            assert!(
+                String::from_utf8_lossy(&indexed.stderr).contains("(via shared daemon v2)"),
+                "managed backend was not used for {engine} {flags:?}: {}",
+                String::from_utf8_lossy(&indexed.stderr)
+            );
+            assert_eq!(
+                canonical_matches(indexed),
+                canonical_matches(scanned),
+                "{engine} {flags:?}"
+            );
+        }
+        let no_query = cli(
+            &fixture.a,
+            &[
+                "--stats",
+                "--json",
+                "--engine",
+                engine,
+                "-f",
+                empty.to_str().unwrap(),
+                "--",
+                ".",
+            ],
+        );
+        assert_eq!(no_query.status.code(), Some(1), "{no_query:?}");
+        assert!(no_query.stdout.is_empty(), "{no_query:?}");
+        assert!(no_query.stderr.is_empty(), "{no_query:?}");
+    }
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
 fn actual_legacy_core_readers_reject_staged_and_published_managed_storage() {
     let reader =
         PathBuf::from(std::env::var_os("TGREP_V1_READER").expect(

@@ -337,13 +337,13 @@ These tables describe search flags. Use `tgrep index --help` and
 |------|-------------|
 | `-i, --ignore-case` | Case-insensitive matching |
 | `-s, --case-sensitive` | Force case-sensitive matching (overrides `-S`) |
-| `-S, --smart-case` | Case-insensitive if pattern is all lowercase |
+| `-S, --smart-case` | Case-insensitive when the patterns contain literals and none are uppercase |
 | `-F, --fixed-strings` | Treat pattern as a literal string |
-| `-w, --word-regexp` | Match whole words only |
+| `-w, --word-regexp` | Require non-word characters or text boundaries on both sides of the match; overrides earlier `-x` |
 | `-v, --invert-match` | Show lines that do NOT match |
 | `-o, --only-matching` | Print only the matched parts |
 | `-e, --regexp <PAT>` | Additional pattern (repeatable for OR) |
-| `-f, --file <FILE>` | Read patterns from file (one per line) |
+| `-f, --file <FILE>` | Read patterns verbatim, one per line; blank lines are empty patterns |
 | `-U, --multiline` | Enable multiline matching (`.` still excludes `\n`) |
 | `--multiline-dotall` | Make `.` match `\n`; implies `-U` |
 | `-n, --line-number` | Show line numbers (default: on when stdout is a terminal) |
@@ -392,7 +392,7 @@ These tables describe search flags. Use `tgrep index --help` and
 
 | Flag | Description |
 |------|-------------|
-| `-x, --line-regexp` | The pattern must match a whole line (beats `-w`) |
+| `-x, --line-regexp` | The pattern must match a whole line; overrides earlier `-w` |
 | `-P, --pcre2` | Use the backtracking engine (lookaround, backreferences) |
 | `--engine <auto\|default\|pcre2>` | Pick the regex engine explicitly; `auto` falls back to `pcre2` |
 | `--pcre2-version` | Print the backtracking engine in use and exit |
@@ -407,6 +407,16 @@ These tables describe search flags. Use `tgrep index --help` and
 `fancy-regex` for lookaround and backreferences. `-P` and `--engine pcre2`
 select `fancy-regex`, not the PCRE2 library; they do not promise full PCRE2
 syntax compatibility.
+
+Each `-e` or `-f` pattern has its own inline-flag scope: `(?i)` in one does
+not make the others case-insensitive. Smart case considers all supplied patterns
+together, counting literal characters rather than escapes such as `\S` or
+Unicode property names. With `-F`, every pattern character is literal.
+
+Pattern files preserve leading and trailing whitespace and accept LF or CRLF
+line endings. A blank line supplies an empty pattern that matches every input
+line. An empty file supplies no patterns: the search produces no output and
+exits 1, unless `-e` supplies another pattern or `-v` inverts the selection.
 
 **Output formatting**
 
@@ -525,6 +535,8 @@ can therefore exceed ripgrep's.
 
 `-U/--multiline` allows matches across line boundaries and prints every covered
 line. `--vimgrep` reports one row per match, on its starting line.
+Adjacent matches remain separate for `-o`, `--vimgrep`, `--count-matches`
+and JSON submatches.
 Unlike ripgrep, tgrep reports columns relative to each printed line rather
 than repeating the starting column on continuation lines.
 

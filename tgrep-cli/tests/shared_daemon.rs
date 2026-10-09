@@ -274,15 +274,19 @@ impl Daemon {
         result
     }
 
-    fn attach_without_response(&self, params: Value) {
+    fn without_response(&self, method: &str, params: Value) {
         let mut stream =
             TcpStream::connect(("127.0.0.1", self.marker["port"].as_u64().unwrap() as u16))
                 .unwrap();
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        writeln!(stream, "{}", self.request("attach", params.clone())).unwrap();
+        writeln!(stream, "{}", self.request(method, params)).unwrap();
         drop(stream);
+    }
+
+    fn attach_without_response(&self, params: Value) {
+        self.without_response("attach", params.clone());
         let started = Instant::now();
         loop {
             let response = self

@@ -1050,6 +1050,16 @@ For example, native catalog writer contention can return `busy`/`catalog-io`
 without committing a view. Committed or unknown outcomes require recovery, not
 retry-as-new. Bound both attempts and total waiting time.
 
+For an initial attachment there may be no committed pin yet. Use the catalog
+`lookup` and `views.recover` results to distinguish an absent root from a saved
+pending exact intent; neither a failed receipt nor an absent root proves that
+all preparation state was rolled back. Retain the owner and lease identity,
+check any saved pending view/version/target, and retry only an already captured
+exact commit, not a freshly resolved symbolic name. An acceptance or completion
+whose response was lost still requires the original operation token, even if
+the view is now published. Reserve a fresh sequence for each authorized new
+attempt and start subsequent operations after the last sequence consumed.
+
 Ownership is bound to an issued namespace/instance challenge and the identity
 of an OS-locked guard. Death is positively proved only by acquiring that same
 guard. Missing/replaced/inaccessible files, PID reuse, disconnected clients and

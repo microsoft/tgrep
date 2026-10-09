@@ -978,6 +978,9 @@ impl ViewManager {
             record.active = true;
             record.instance = self.namespace.instance().clone();
             save_view(transaction, &mut record)?;
+            self.namespace.fault(
+                super::faults::Point::AttachBeforeLease, Some(&operation.id),
+            )?;
             transaction.execute("INSERT INTO records VALUES('lease',?1,1,?2)", params![key, text(&lease)?])?;
             transaction.execute("INSERT INTO records VALUES('view-root',?1,1,?2) ON CONFLICT(kind,id) DO UPDATE SET record=excluded.record",
                 params![root_key, text(&record.id)?])?;

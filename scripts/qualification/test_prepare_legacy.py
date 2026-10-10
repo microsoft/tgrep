@@ -51,6 +51,28 @@ class LegacyPreparationTests(unittest.TestCase):
                     prepare_legacy.prepare(archive, root / "baseline")
                 self.assertFalse((root / "baseline").exists())
 
+    def test_rejects_file_and_child_conflicts_before_writing_any_source(self):
+        for members in (
+            ("conflict", "conflict/child"),
+            ("conflict/child", "conflict"),
+            ("Conflict", "conflict/nested/child"),
+            ("tgrep-core/examples",),
+            ("tgrep-core/examples/legacy_reader.rs",),
+            ("TGREP-CORE/Examples/Legacy_Reader.rs",),
+        ):
+            with self.subTest(members=members), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archive = self.archive(root, members)
+                with self.assertRaises(ValueError):
+                    prepare_legacy.prepare(archive, root / "baseline")
+                self.assertFalse((root / "baseline").exists())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = self.archive(root, ("tgrep-core/examples/", "nested/", "nested/child"))
+            result = prepare_legacy.prepare(archive, root / "baseline")
+            self.assertTrue(Path(result["probe"]).is_file())
+            self.assertTrue((root / "baseline" / "nested" / "child").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

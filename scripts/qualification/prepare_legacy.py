@@ -17,6 +17,7 @@ import zipfile
 BASELINE = "1120aca41dd192ae61bdd996e9886cb354a78a27"
 MAX_ENTRIES = 50000
 MAX_BYTES = 256 * 1024 * 1024
+PROBE_PATH = "tgrep-core/examples/legacy_reader.rs"
 PROBE = r"""// Copyright (c) Microsoft Corporation. All rights reserved.
 use std::path::PathBuf;
 
@@ -49,6 +50,7 @@ def prepare(archive, destination):
         if len(members) > MAX_ENTRIES or sum(item.file_size for item in members) > MAX_BYTES:
             raise ValueError("baseline archive exceeds the extraction bounds")
         seen = set()
+        files = set()
         for item in members:
             path = PurePosixPath(item.filename)
             kind = stat.S_IFMT(item.external_attr >> 16)
@@ -61,9 +63,21 @@ def prepare(archive, destination):
             if key in seen:
                 raise ValueError(f"archive has aliased entries: {item.filename}")
             seen.add(key)
+            if not item.is_dir():
+                files.add(key)
         required = ("cargo.toml", "cargo.lock", "tgrep-core/cargo.toml", "tgrep-cli/cargo.toml")
         if not all(name in seen for name in required):
             raise ValueError("baseline archive lacks the complete locked workspace")
+        if PROBE_PATH.casefold() in seen:
+            raise ValueError(f"baseline archive already has {PROBE_PATH}")
+        # Reject every file/child conflict, including the generated probe,
+        # before creating the destination, so extraction cannot fail partway.
+        for key in seen | {PROBE_PATH.casefold()}:
+            parent = PurePosixPath(key).parent
+            while parent.parts:
+                if str(parent) in files:
+                    raise ValueError(f"archive entry is beneath a file entry: {key}")
+                parent = parent.parent
         destination.mkdir(parents=True, exist_ok=False)
         for item in members:
             path = destination.joinpath(*PurePosixPath(item.filename).parts)
@@ -73,7 +87,7 @@ def prepare(archive, destination):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with source.open(item) as reader, path.open("xb") as writer:
                     shutil.copyfileobj(reader, writer, length=1024 * 1024)
-        example = destination / "tgrep-core" / "examples" / "legacy_reader.rs"
+        example = destination.joinpath(*PurePosixPath(PROBE_PATH).parts)
         example.parent.mkdir(parents=True, exist_ok=True)
         with example.open("x", encoding="utf-8", newline="\n") as writer:
             writer.write(PROBE)

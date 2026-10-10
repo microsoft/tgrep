@@ -659,6 +659,63 @@ fn escaped_cross_process_readers_block_collection_and_idle_stop_then_allow_exact
 }
 
 #[test]
+fn owner_holder_enforces_claim_file_size_limit() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let limit = tgrep_core::managed::MAX_REQUEST_BYTES;
+    let path = fixture.temp.path().join("owner.claim.json");
+    for (name, padded_size, suffix) in [
+        ("oversized-whitespace", limit, " "),
+        ("oversized-trailing-data", limit, "{}"),
+        ("compact", 0, ""),
+        ("below-limit", limit - 1, ""),
+        ("at-limit", limit, ""),
+    ] {
+        let prepared = daemon.rpc("owners.prepare", json!({"token":name}));
+        let claim: OwnerClaim = serde_json::from_value(prepared["claim"].clone()).unwrap();
+        let mut bytes = serde_json::to_vec(&claim).unwrap();
+        if padded_size != 0 {
+            assert!(bytes.len() < padded_size);
+            bytes.resize(padded_size, b' ');
+        }
+        bytes.extend_from_slice(suffix.as_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let mut child =
+            runtime::Process::start(Command::new(assert_cmd::cargo::cargo_bin("tgrep")).args([
+                "shared",
+                "owner-hold",
+                "--claim",
+                path.to_str().unwrap(),
+            ]));
+        if bytes.len() > limit {
+            child.close_input();
+            let output = child.finish(Duration::from_secs(30)).unwrap();
+            assert!(!output.status.success(), "{name}: {output:?}");
+            assert!(output.stdout.is_empty(), "{name}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("managed owner claim exceeds its size limit"),
+                "{name}: {output:?}"
+            );
+            let guard = OwnerGuard::claim(claim.clone()).unwrap();
+            daemon.rpc("owners.register", json!({"claim":claim}));
+            daemon.rpc("owners.release", json!({"claim":claim}));
+            drop(guard);
+        } else {
+            let holding = wait_json(&mut child, "holding");
+            assert_eq!(holding["claim"], prepared["claim"], "{name}");
+            daemon.rpc("owners.register", json!({"claim":claim}));
+            daemon.rpc("owners.release", json!({"claim":claim}));
+            child.close_input();
+            success(child.finish(Duration::from_secs(30)).unwrap());
+        }
+    }
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
 fn owner_holder_graceful_eof_releases_its_os_proof_without_guessing_process_identity() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);

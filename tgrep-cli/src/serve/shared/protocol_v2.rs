@@ -214,8 +214,15 @@ pub(super) fn manage(root: &Path, method: &str, params: &str) -> Result<()> {
 }
 
 pub(super) fn owner_hold(path: &Path) -> Result<()> {
-    let claim: OwnerClaim =
-        serde_json::from_reader(File::open(path)?.take(managed::MAX_REQUEST_BYTES as u64))?;
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(managed::MAX_REQUEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= managed::MAX_REQUEST_BYTES,
+        "managed owner claim exceeds its size limit"
+    );
+    let claim: OwnerClaim = serde_json::from_slice(&bytes)?;
     let guard = OwnerGuard::claim(claim)?;
     println!("{}", json!({"holding":true,"claim":guard.registration()}));
     std::io::stdout().flush()?;

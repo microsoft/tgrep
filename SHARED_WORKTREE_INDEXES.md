@@ -996,6 +996,8 @@ mismatch is an error, not a silently different corpus.
    `{"token":"<bootstrap-token>"}`. Retry that token to recover the same issued
    claim after response loss. Persist the result's `claim` object outside the
    worktree, not the whole owner record or CLI envelope.
+   Claim files are limited to 1 MiB, including whitespace; larger files are
+   rejected before deserialization or acquiring the owner guard.
 2. Start and supervise `tgrep shared owner-hold --claim CLAIM_FILE`, keeping its
    stdin open. After its `holding:true` response, call `owners.register` with
    `{"claim":<issued-claim>}`. A Rust client can instead retain `OwnerGuard`.

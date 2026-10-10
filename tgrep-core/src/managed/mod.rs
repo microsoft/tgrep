@@ -90,19 +90,53 @@ pub const STORE_DIRECTORY: &str = "tgrep-managed-v2";
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Refuses ordinary index access to managed storage. Besides managed generation
+/// files, only a store directory itself and paths below one of its repository
+/// namespaces are reserved, so an unrelated directory that merely shares the
+/// store name stays usable. The absolute path is checked lexically after
+/// `.`/`..` normalization, without following links.
 pub(crate) fn reject_unguarded(path: &std::path::Path) -> crate::Result<()> {
-    if path.join("paths.tgm").try_exists()?
-        || path.ancestors().any(|ancestor| {
-            ancestor
-                .file_name()
-                .is_some_and(|name| name == STORE_DIRECTORY)
-        })
-    {
+    if reserved_store_path(path)? || path.join("paths.tgm").try_exists()? {
         return Err(
             Error::incompatible("managed storage requires a protected managed reader").into(),
         );
     }
     Ok(())
+}
+
+fn reserved_store_path(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::path::Component;
+    // `Path::join` treats an empty index directory as the current directory.
+    let path = if path.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        path
+    };
+    let absolute = std::path::absolute(path)?;
+    let mut names = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::Normal(name) => names.push(name),
+            Component::ParentDir => {
+                names.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+        }
+    }
+    // Case-insensitive volumes resolve either spelling to the same directory.
+    let store = |name: &std::ffi::OsStr| {
+        name.to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(STORE_DIRECTORY))
+    };
+    let namespace = |name: &std::ffi::OsStr| {
+        name.to_str().is_some_and(|name| {
+            name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    };
+    Ok(names.last().is_some_and(|name| store(name))
+        || names
+            .windows(2)
+            .any(|pair| store(pair[0]) && namespace(pair[1])))
 }
 
 /// A physical incarnation, never a logical generation key or a filesystem path.
@@ -301,5 +335,39 @@ mod tests {
         let json = serde_json::to_value(value).unwrap();
         assert_eq!(json["status"], "unavailable");
         assert!(json.get("value").is_none());
+    }
+
+    #[test]
+    fn only_store_and_namespace_paths_are_reserved_from_unguarded_access() {
+        use std::path::PathBuf;
+        let namespace = "0123456789abcdef".repeat(4);
+        let base = std::env::temp_dir().join("parent");
+        let store = base.join(STORE_DIRECTORY);
+        let relative = PathBuf::from(STORE_DIRECTORY);
+        for (path, reserved) in [
+            (store.clone(), true),
+            (store.join(&namespace), true),
+            (
+                store.join(&namespace).join("objects").join("preparing"),
+                true,
+            ),
+            (
+                base.join(STORE_DIRECTORY.to_ascii_uppercase())
+                    .join(namespace.to_ascii_uppercase()),
+                true,
+            ),
+            (store.join("project").join("..").join(&namespace), true),
+            (relative.join(&namespace).join("objects"), true),
+            (store.join("project"), false),
+            (store.join("project").join(".tgrep"), false),
+            (store.join("project").join(&namespace), false),
+            (store.join(&namespace).join("..").join("project"), false),
+            (store.join(&namespace[..63]), false),
+            (base.join("other").join(&namespace), false),
+            (relative.join("project").join(".tgrep"), false),
+            (PathBuf::new(), false),
+        ] {
+            assert_eq!(reserved_store_path(&path).unwrap(), reserved, "{path:?}");
+        }
     }
 }

@@ -1616,6 +1616,51 @@ fn managed_format_and_escaped_reader_cannot_bypass_ownership() {
 }
 
 #[test]
+fn unrelated_store_named_directories_keep_ordinary_indexes_usable() {
+    let fixture = Fixture::new();
+    let unrelated = fixture
+        .temp
+        .path()
+        .join("checkout")
+        .join(tgrep_core::managed::STORE_DIRECTORY);
+    let project = unrelated.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("note.txt"), b"ordinary needle\n").unwrap();
+    let index = project.join(".tgrep");
+    tgrep_core::builder::build_index(&project, Some(&index), true, false, &[]).unwrap();
+    tgrep_core::reader::IndexReader::open(&index).unwrap();
+    let meta = tgrep_core::meta::IndexMeta::load(&index).unwrap();
+    meta.save(&index).unwrap();
+    let legacy = unrelated.join("legacy-shared");
+    fs::create_dir(&legacy).unwrap();
+    tgrep_core::generations::GenerationManager::with_storage(fixture.repository.clone(), &legacy)
+        .unwrap();
+
+    let namespace = fixture.namespace.path();
+    let store = namespace.parent().unwrap();
+    for reserved in [
+        store.to_path_buf(),
+        namespace.to_path_buf(),
+        namespace.join("objects"),
+        namespace.join("objects").join("preparing"),
+    ] {
+        let error = meta.save(&reserved).unwrap_err().to_string();
+        assert!(
+            error.contains("protected managed reader"),
+            "{reserved:?}: {error}"
+        );
+        assert!(!reserved.join("meta.json").exists(), "{reserved:?}");
+        assert!(tgrep_core::reader::IndexReader::open(&reserved).is_err());
+    }
+    let error =
+        tgrep_core::generations::GenerationManager::with_storage(fixture.repository.clone(), store)
+            .err()
+            .expect("legacy storage cannot be the managed store directory")
+            .to_string();
+    assert!(error.contains("protected managed reader"), "{error}");
+}
+
+#[test]
 fn staging_exhaustion_is_typed_and_never_published() {
     let mut fixture = Fixture::new();
     let commit = git(&fixture.root, &["rev-parse", "HEAD"]);

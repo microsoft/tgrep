@@ -781,7 +781,10 @@ Managed generation files use `paths.tgm`, `lookup.tgm`, `postings.tgm`,
 `meta.tgm` and `generation.tgm`, incompatible magic and file-table format
 `0x4d320001`. Old and unguarded readers reject them even under renamed legacy
 filenames. No legacy-readable intermediate is published inside the managed
-namespace. Existing v1 stores are not converted or retroactively made collectible.
+namespace. Ordinary index commands also refuse a store directory itself and
+paths beneath its 64-hex repository namespaces, compared lexically and
+case-insensitively; an unrelated directory that merely shares the store name
+stays usable. Existing v1 stores are not converted or retroactively made collectible.
 
 Managed namespaces also require a supported content-authentication format.
 Missing or incompatible producer proof is not upgraded by hashing whatever

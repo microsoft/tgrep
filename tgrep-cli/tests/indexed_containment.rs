@@ -141,3 +141,41 @@ fn unavailable_relative_and_unrelated_metadata_roots_fall_back_to_scanning() {
         );
     }
 }
+
+#[test]
+fn ordinary_indexes_beneath_unrelated_store_named_directories_stay_indexed() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = temp.path().join("tgrep-managed-v2");
+    let root = store.join("project");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("kept.txt"), "needle kept\n").unwrap();
+    let tgrep = |args: &[&str]| {
+        Command::cargo_bin("tgrep")
+            .unwrap()
+            .timeout(Duration::from_secs(30))
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = tgrep(&["index", "."]);
+    assert!(output.status.success(), "{output:?}");
+    let output = tgrep(&["--stats", "-F", "--", "needle", "."]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("needle kept"), "{stdout}");
+    assert!(
+        stderr.contains("Query plan:"),
+        "must exercise the index: {stderr}"
+    );
+    assert!(!stderr.contains("scanning every file"), "{stderr}");
+
+    // A repository-namespace-shaped path beneath the same name stays reserved.
+    let reserved = store.join("0".repeat(64)).join("index");
+    let output = tgrep(&["index", ".", "--index-path", reserved.to_str().unwrap()]);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("protected managed reader"), "{stderr}");
+    assert!(!reserved.join("meta.json").exists());
+}

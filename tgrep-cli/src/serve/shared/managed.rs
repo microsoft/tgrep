@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 
-use super::protocol_v2::{MARKER, Registration, Request, VIEW_MARKER, ViewRegistration};
+use super::protocol_v2::{
+    AUTH_MARKER, Authentication, MARKER, Registration, Request, VIEW_MARKER, ViewRegistration,
+};
 use super::server::{Options, QuerySource};
 use anyhow::{Context, Result, ensure};
 use notify::{EventKind, Watcher};
@@ -106,7 +108,8 @@ fn hello(namespace: &Namespace) -> Result<Value> {
             "versioned-views","operation-replay","atomic-base-advancement","adaptive-evaluation",
             "instance-owner-guards","catalog-pages","reference-aware-collection",
             "versioned-allocations","bound-checkpoints","offline-maintenance","stop-if-idle",
-            "bounded-storage-inventory","namespace-discovery","maintenance-diagnostics"
+            "bounded-storage-inventory","namespace-discovery","maintenance-diagnostics",
+            "private-rpc-authentication"
         ],
         "profile":IndexingProfile::default(),
         "policy":namespace.policy()?,"allocation":namespace.allocation()?,
@@ -357,6 +360,7 @@ impl Drop for Observer {
 
 struct State {
     registration: Registration,
+    authentication: Authentication,
     namespace: Arc<Namespace>,
     views: ViewManager,
     watches: WatchSettings,
@@ -704,7 +708,7 @@ impl State {
     fn legacy_registration(&self) -> super::protocol::Registration {
         super::protocol::Registration {
             protocol: 1,
-            instance: self.registration.instance.to_string(),
+            instance: self.authentication.legacy_token.to_string(),
             repository: self.registration.repository.clone(),
             pid: self.registration.pid,
             port: self.registration.port,
@@ -1467,7 +1471,7 @@ fn respond(mut stream: TcpStream, request: Option<&Request>, state: &State, resu
     let response = match result {
         Ok(mut data) if request.is_some_and(|request| request.protocol == 1) => {
             data["protocol"] = json!(1);
-            data["instance"] = json!(state.registration.instance);
+            data["instance"] = json!(state.authentication.legacy_token);
             data["repository"] = json!(state.registration.repository);
             json!({"jsonrpc":"2.0","id":id,"result":data})
         }
@@ -1493,18 +1497,13 @@ fn respond(mut stream: TcpStream, request: Option<&Request>, state: &State, resu
 }
 
 struct DaemonRegistration {
-    path: PathBuf,
-    identity: managed::FileIdentity,
-    sentinel: (PathBuf, managed::FileIdentity),
+    files: Vec<(PathBuf, managed::FileIdentity)>,
     _git_lock: File,
 }
 
 impl Drop for DaemonRegistration {
     fn drop(&mut self) {
-        for (path, identity) in [
-            (&self.path, &self.identity),
-            (&self.sentinel.0, &self.sentinel.1),
-        ] {
+        for (path, identity) in self.files.iter().rev() {
             if let Err(error) = managed::remove_control_file(path, identity)
                 && error.source_io_kind() != Some(std::io::ErrorKind::NotFound)
             {
@@ -1545,6 +1544,8 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
         port: listener.local_addr()?.port(),
         storage: namespace.path().into(),
     };
+    let authentication = Authentication::new(registration.clone())?;
+    let legacy_instance = authentication.legacy_token.clone();
     let monitors = Arc::new(Mutex::new(HashMap::new()));
     let observer_registration = registration.clone();
     let observer_registry = Arc::clone(&monitors);
@@ -1590,7 +1591,7 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
             json!(super::protocol::ViewRegistration {
                 daemon: super::protocol::Registration {
                     protocol: 1,
-                    instance: observer_registration.instance.to_string(),
+                    instance: legacy_instance.to_string(),
                     repository: observer_registration.repository.clone(),
                     pid: observer_registration.pid,
                     port: observer_registration.port,
@@ -1604,7 +1605,7 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
             json!({"protocol":2,"namespace":observer_registration.namespace,"instance":observer_registration.instance,
                 "managed":true,"view":slot.id()})
         };
-        let sentinel_identity = managed::publish_control_file(&sentinel, &sentinel_value)?;
+        let sentinel_identity = managed::publish_private_control_file(&sentinel, &sentinel_value)?;
         let monitor = Arc::new(Mutex::new(Monitor {
             watcher: None,
             watched: HashSet::new(),
@@ -1660,6 +1661,7 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
     let (jobs, jobs_rx) = mpsc::sync_channel(policy.work.queue_items as usize);
     let state = Arc::new(State {
         registration: registration.clone(),
+        authentication,
         namespace,
         views,
         watches,
@@ -1675,21 +1677,29 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
         lifecycle_epoch: AtomicU64::new(1),
         scheduler_snapshot: Mutex::new(json!({"initializing":true})),
     });
+    let mut registration_guard = DaemonRegistration {
+        files: Vec::with_capacity(3),
+        _git_lock: git_lock,
+    };
+    let authentication_path = repository.common_dir().join(AUTH_MARKER);
+    let authentication_identity = managed::publish_private_control_file(
+        &authentication_path,
+        &serde_json::to_value(&state.authentication)?,
+    )?;
+    registration_guard
+        .files
+        .push((authentication_path, authentication_identity));
     let marker = repository.common_dir().join(MARKER);
     let marker_identity = managed::publish_control_file(&marker, &json!(registration))?;
+    registration_guard.files.push((marker, marker_identity));
     let sentinel = repository.common_dir().join(super::MARKER);
     let sentinel_value = if policy.storage == managed::policy::StorageMode::CompatibilityRetainAll {
         json!(state.legacy_registration())
     } else {
         json!({"protocol":2,"namespace":registration.namespace,"instance":registration.instance})
     };
-    let sentinel_identity = managed::publish_control_file(&sentinel, &sentinel_value)?;
-    let _registration = DaemonRegistration {
-        path: marker,
-        identity: marker_identity,
-        sentinel: (sentinel, sentinel_identity),
-        _git_lock: git_lock,
-    };
+    let sentinel_identity = managed::publish_private_control_file(&sentinel, &sentinel_value)?;
+    registration_guard.files.push((sentinel, sentinel_identity));
     eprintln!(
         "shared-v2 listening on {} (namespace {})",
         registration.port, registration.namespace
@@ -1796,7 +1806,24 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                             &mut stream,
                             managed::MAX_REQUEST_BYTES as u64,
                         )?;
-                        let value: Value = serde_json::from_slice(&line)?;
+                        let mut value: Value = serde_json::from_slice(&line)?;
+                        let legacy_protocol = value["protocol"] == 1;
+                        let authorization = if legacy_protocol {
+                            value["instance"].as_str()
+                        } else {
+                            value["authorization"].as_str()
+                        };
+                        if !state.authentication.accepts(authorization, legacy_protocol) {
+                            return Err(Error::new(
+                                ErrorCategory::Permission,
+                                "rpc-authentication-failed",
+                                "managed RPC requires the current private daemon credential",
+                            )
+                            .into());
+                        }
+                        if !legacy_protocol && let Some(object) = value.as_object_mut() {
+                            object.remove("authorization");
+                        }
                         let request: Request = if value["protocol"] == 1 {
                             if state.namespace.header().storage
                                 != managed::policy::StorageMode::CompatibilityRetainAll
@@ -1811,7 +1838,7 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                                 jsonrpc: legacy.jsonrpc,
                                 protocol: legacy.protocol,
                                 namespace: state.registration.namespace.clone(),
-                                instance: Id::parse(legacy.instance)?,
+                                instance: state.registration.instance.clone(),
                                 repository: legacy.repository,
                                 method: legacy.method,
                                 params: legacy.params,

@@ -790,8 +790,9 @@ ordinary indexes and default v1 retain-all namespaces keep their existing format
 
 Each publication has a fresh physical incarnation independent of its logical
 repository/tree/profile key. A delayed deletion of an old incarnation cannot
-delete a replacement for the same logical key. IDs are opaque 32-character
-lowercase hexadecimal identifiers, not paths or authorization credentials.
+delete a replacement for the same logical key. Catalog, namespace and instance
+IDs are opaque 32-character lowercase hexadecimal identifiers, not paths or
+authorization credentials.
 
 `managed::open_generation` and the managed generation/checkpoint adapters acquire
 OS-backed protection before opening data. Protection follows escaped
@@ -980,7 +981,8 @@ the daemon and emits one `{"ok":true,"result":...}` result or
 `{"ok":false,"error":...}` failure; failures also have a nonzero exit status.
 For direct loopback RPC, send a newline-terminated JSON-RPC 2.0 request containing
 `protocol:2`, the discovered `namespace`, `instance`, `repository`, `method`,
-`params` and `id`. Successful RPC results repeat those identities and place
+`params`, `id` and the private `authorization` credential described below.
+Successful RPC results repeat those identities and place
 method data in `result.data`. Never reuse a stale daemon registration solely
 because its PID or port still exists. Request/response limits are negotiated
 by `hello` (currently 1 MiB / 64 MiB).
@@ -989,6 +991,47 @@ Call `hello` before constructing requests. It returns capabilities, storage
 semantics, indexing profile, effective versioned policy/allocation and
 directory-sync capability. Copy its `profile` into view requests; a profile
 mismatch is an error, not a silently different corpus.
+
+### Per-user RPC authentication
+
+Loopback alone is not a per-user boundary. Every request to a managed daemon,
+including `hello`, queries and compatibility-v1 requests, must authenticate
+before dispatch. Each daemon creates a fresh 128-bit OS-random bearer credential
+and atomically publishes `tgrep-daemon-v2.auth.json` beside its public
+`tgrep-daemon-v2.json` registration in the Git common directory. The private file
+contains `{"registration":<complete-public-registration>,"token":"<credential>",
+"legacy_token":"<compatibility-credential>"}`.
+The v2 request's top-level `authorization` field carries that token. Namespace,
+instance, owner, lease and operation IDs are not substitutes for it.
+
+`shared manage` and normal managed queries load credentials automatically.
+A direct client must verify native owner-only access, read the bounded private
+file, and compare its **complete registration**, including endpoint and instance,
+with discovery before connecting. `tgrep_core::managed::read_private_control_file`
+performs the native file checks. The daemon advertises
+`private-rpc-authentication` in `hello`; clients must not fall back to
+unauthenticated RPC when a credential is missing, stale or inaccessible.
+Invalid credentials return `permission` / `rpc-authentication-failed`,
+non-retryable and `not-committed`. A changed public registration is rejected
+locally as `stale-identity` / `rpc-registration-mismatch`.
+
+Private files are created with owner-only access **before writing any secret**:
+Unix owner UID and mode `0600`, or a protected Windows DACL granting only the
+daemon's user SID. Readers reject symlinks, external hard links, foreign owners
+and broader permissions. Darwin extended ACLs are conservatively rejected,
+including inherited ACLs, rather than assuming mode bits exclude other users.
+Do not copy these files into logs or shared configuration. Credentials rotate
+at daemon restart and are removed by identity during normal shutdown.
+
+In `compatibility-retain-all`, genuine v1 clients continue to use their existing
+wire format. Their owner-only v1 daemon/view markers carry a separate private capability
+in the opaque v1 `instance` field; that value is **not** the public v2 instance ID.
+The adapter validates it before entering any legacy handler; it cannot authorize
+v2 requests. V1 responses echo this capability as their `instance`, so keep those
+responses private too. Default v1 daemons
+started without `--shared-policy` retain their existing transport and behavior.
+This boundary excludes privileged OS administrators and arbitrary same-user
+writers, as does the trusted-storage contract.
 
 ### Ownership, operation tokens and attachment
 

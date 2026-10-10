@@ -447,7 +447,7 @@ impl Directory {
                 "catalog files cannot be collected as ordinary members",
             ));
         }
-        self.open_native_options(name, true, false, false, true)
+        self.open_native_options(name, true, false, false, true, false)
     }
 
     /// Closing any independently opened descriptor releases this process's POSIX
@@ -518,7 +518,7 @@ impl Directory {
     }
 
     fn open_native(&self, name: &str, write: bool, create: bool, directory: bool) -> Result<File> {
-        self.open_native_options(name, write, create, directory, false)
+        self.open_native_options(name, write, create, directory, false, false)
     }
 
     fn open_native_options(
@@ -528,12 +528,13 @@ impl Directory {
         create: bool,
         directory: bool,
         protect_contents: bool,
+        private: bool,
     ) -> Result<File> {
         component(name)?;
         self.verify()?;
         #[cfg(unix)]
         let file = {
-            let _ = protect_contents;
+            let _ = (protect_contents, private);
             use std::os::fd::{AsRawFd, FromRawFd};
             let name = std::ffi::CString::new(name).map_err(|_| Error::invalid("NUL in name"))?;
             let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
@@ -578,7 +579,11 @@ impl Directory {
             } else {
                 options.read(true).write(write).create_new(create);
             }
-            let file = options.open(self.path.join(name))?;
+            let file = if private {
+                super::private_control::create_file(&self.path.join(name))?
+            } else {
+                options.open(self.path.join(name))?
+            };
             if crate::rooted::final_path_of(&file)?.parent()
                 != Some(crate::rooted::final_path_of(&self.handle)?.as_path())
             {
@@ -697,16 +702,36 @@ impl Directory {
     }
 
     pub(crate) fn publish_json(&self, name: &str, value: &impl Serialize) -> Result<FileIdentity> {
+        self.publish_json_with_access(name, value, false)
+    }
+
+    pub(crate) fn publish_private_json(
+        &self,
+        name: &str,
+        value: &impl Serialize,
+    ) -> Result<FileIdentity> {
+        self.publish_json_with_access(name, value, true)
+    }
+
+    fn publish_json_with_access(
+        &self,
+        name: &str,
+        value: &impl Serialize,
+        private: bool,
+    ) -> Result<FileIdentity> {
         component(name)?;
         let bytes = serde_json::to_vec(value)?;
         if bytes.len() > super::MAX_REQUEST_BYTES {
             return Err(Error::invalid("control file exceeds its size bound"));
         }
         let temporary = format!("{}.tmp", super::Id::new()?);
-        let mut file = self.create_file(&temporary)?;
+        let mut file = self.open_native_options(&temporary, true, true, false, false, private)?;
         let identity = FileIdentity::of(&file)?;
         let mut renamed = false;
         let result = (|| {
+            if private {
+                super::private_control::verify_private(&file)?;
+            }
             file.write_all(&bytes)?;
             file.sync_all()?;
             self.verify()?;

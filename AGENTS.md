@@ -110,6 +110,9 @@ versioned view. `shared owner-hold --claim <issued-claim.json>` retains ownershi
 until stdin closes; supervise that process too. Do not replace its guard with a
 PID check or inactivity timeout. Unknown ownership proof protects the lease.
 Normal queries discover a ready managed attachment without new search flags.
+Managed RPC also requires a per-daemon private credential; the CLI loads it
+automatically from an owner-only file. Public namespace/instance IDs are not
+credentials. Do not copy the private file into logs or bypass authentication.
 
 Managed advancement is version-checked and may be adaptive under explicit
 policy. Recover the authoritative current exact commit/version after a lost

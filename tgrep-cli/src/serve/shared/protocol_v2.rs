@@ -15,8 +15,9 @@ use tgrep_core::managed::{
 
 pub const MARKER: &str = "tgrep-daemon-v2.json";
 pub const VIEW_MARKER: &str = "tgrep-view-v2.json";
+pub const AUTH_MARKER: &str = "tgrep-daemon-v2.auth.json";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Registration {
     pub protocol: u32,
@@ -49,8 +50,54 @@ pub(super) struct Request {
     pub id: Value,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Authentication {
+    pub registration: Registration,
+    pub token: Id,
+    pub legacy_token: Id,
+}
+
+impl Authentication {
+    pub fn new(registration: Registration) -> Result<Self> {
+        Ok(Self {
+            registration,
+            token: Id::new()?,
+            legacy_token: Id::new()?,
+        })
+    }
+
+    pub fn read(repository: &Repository, registration: &Registration) -> Result<Self> {
+        let value = managed::read_private_control_file(&repository.common_dir().join(AUTH_MARKER))?;
+        let authentication: Self = serde_json::from_value(value)?;
+        if authentication.registration != *registration {
+            return Err(Error::new(
+                ErrorCategory::StaleIdentity,
+                "rpc-registration-mismatch",
+                "public daemon registration differs from its private credential",
+            )
+            .into());
+        }
+        Ok(authentication)
+    }
+
+    pub fn accepts(&self, token: Option<&str>, legacy: bool) -> bool {
+        let expected = if legacy {
+            &self.legacy_token
+        } else {
+            &self.token
+        };
+        token.is_some_and(|token| {
+            // Hash equality is constant-time; identity comparisons are not credentials.
+            token.len() == expected.as_str().len()
+                && blake3::hash(token.as_bytes()) == blake3::hash(expected.as_str().as_bytes())
+        })
+    }
+}
+
 pub(super) struct Client {
     pub registration: Registration,
+    authentication: Authentication,
 }
 
 impl Client {
@@ -65,15 +112,23 @@ impl Client {
                 && registration.port != 0,
             "incompatible managed daemon registration"
         );
-        let client = Self { registration };
+        let authentication = Authentication::read(repository, &registration)?;
+        let client = Self {
+            registration,
+            authentication,
+        };
         let hello = client.request("hello", json!({}))?;
         ensure!(
             hello["storage_schema"] == managed::STORAGE_VERSION
                 && hello["capabilities"]
                     .as_array()
-                    .is_some_and(|capabilities| capabilities
-                        .iter()
-                        .any(|capability| capability == "versioned-views")),
+                    .is_some_and(|capabilities| {
+                        ["versioned-views", "private-rpc-authentication"]
+                            .into_iter()
+                            .all(|required| {
+                                capabilities.iter().any(|capability| capability == required)
+                            })
+                    }),
             "daemon does not support managed view negotiation for {}",
             root.display()
         );
@@ -85,6 +140,7 @@ impl Client {
         let request = json!({
             "jsonrpc":"2.0","protocol":managed::PROTOCOL_VERSION,
             "namespace":registration.namespace,"instance":registration.instance,"repository":registration.repository,
+            "authorization":self.authentication.token,
             "id":1,"method":method,"params":params
         });
         let bytes = serde_json::to_vec(&request)?;

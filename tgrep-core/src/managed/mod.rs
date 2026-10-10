@@ -28,6 +28,7 @@ mod management;
 pub(crate) mod memory;
 mod owners;
 pub mod policy;
+mod private_control;
 pub(crate) mod process;
 pub(crate) mod roots;
 pub(crate) mod storage;
@@ -68,6 +69,7 @@ pub use management::{
 pub use memory::MemoryUsage;
 pub use owners::OwnerRelease;
 pub use policy::Policy;
+pub use private_control::{publish_private_control_file, read_private_control_file};
 #[cfg(feature = "managed-test-hooks")]
 #[doc(hidden)]
 pub use process::SupervisedChild;

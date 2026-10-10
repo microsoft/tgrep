@@ -148,6 +148,7 @@ impl Fixture {
 struct Daemon {
     child: Child,
     marker: Value,
+    authorization: Value,
     log: PathBuf,
 }
 
@@ -192,6 +193,7 @@ impl Daemon {
         let mut daemon = Self {
             child,
             marker: Value::Null,
+            authorization: Value::Null,
             log: log.clone(),
         };
         let started = Instant::now();
@@ -211,6 +213,14 @@ impl Daemon {
                 && marker["pid"] == daemon.child.id()
             {
                 daemon.marker = marker;
+                if daemon.marker["protocol"] == 2 {
+                    let authentication = tgrep_core::managed::read_private_control_file(
+                        &marker_path.with_file_name("tgrep-daemon-v2.auth.json"),
+                    )
+                    .unwrap();
+                    assert_eq!(authentication["registration"], daemon.marker);
+                    daemon.authorization = authentication["token"].clone();
+                }
                 if daemon
                     .try_rpc("hello", json!({}))
                     .is_ok_and(|v| v.get("result").is_some())
@@ -235,6 +245,7 @@ impl Daemon {
         });
         if self.marker["protocol"] == 2 {
             request["namespace"] = self.marker["namespace"].clone();
+            request["authorization"] = self.authorization.clone();
         }
         request
     }

@@ -809,6 +809,11 @@ mode supports v1 clients but **never collects legacy generations**. Storage mode
 is immutable; omitting `--shared-policy` still selects the existing v1 daemon.
 Ordinary indexing, non-Git directories and unborn repositories are unchanged.
 
+A managed daemon authenticates every RPC with a rotating per-daemon credential
+stored in an owner-only file; loopback and public namespace IDs alone do not
+authorize access. The CLI handles this automatically. Direct clients follow
+the [per-user authentication contract](SHARED_WORKTREE_INDEXES.md#per-user-rpc-authentication).
+
 A generic managed client persists its operation and lease tokens, prepares an
 instance-bound owner, holds the issued guard with `tgrep shared owner-hold`,
 registers that claim, then calls `views.attach` through `shared manage`. Operations

@@ -65,6 +65,184 @@ pub(super) fn held_owner(fixture: &Fixture, daemon: &Daemon) -> (OwnerClaim, run
 }
 
 #[test]
+fn management_rpc_rejects_public_identity_without_private_authorization() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    for authorization in [
+        Value::Null,
+        json!(Id::new().unwrap()),
+        daemon.marker["namespace"].clone(),
+        daemon.marker["instance"].clone(),
+    ] {
+        for (method, params) in [
+            ("owners.release", json!({"claim":claim})),
+            ("owners.page", json!({"after":null})),
+            ("owners.prepare", json!({"token":"unauthorized-owner"})),
+            ("operations.cancel", json!({"id":Id::new().unwrap()})),
+            ("collections.start", json!({})),
+            ("stop-if-idle", idle_request(&daemon)),
+            ("hello", json!({})),
+        ] {
+            let mut request = daemon.request(method, params);
+            request.as_object_mut().unwrap().remove("authorization");
+            if !authorization.is_null() {
+                request["authorization"] = authorization.clone();
+            }
+            let response = daemon.raw(&request).unwrap();
+            assert_eq!(
+                response["error"]["data"]["category"], "permission",
+                "{method}: {response}"
+            );
+            assert_eq!(
+                response["error"]["data"]["reason_code"], "rpc-authentication-failed",
+                "{method}: {response}"
+            );
+            assert_eq!(response["error"]["data"]["retryable"], false);
+            assert_eq!(
+                response["error"]["data"]["committed_state"],
+                "not-committed"
+            );
+        }
+    }
+    let owners = daemon.rpc("owners.page", json!({"after":null}));
+    assert_eq!(owners.as_array().unwrap().len(), 1, "{owners}");
+    assert_eq!(owners[0]["released"], false);
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn management_rpc_credentials_rotate_and_bind_discovery() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let common = tgrep_core::generations::Repository::discover(&fixture.a)
+        .unwrap()
+        .common_dir()
+        .to_path_buf();
+    let marker = common.join("tgrep-daemon-v2.json");
+    let credentials = common.join("tgrep-daemon-v2.auth.json");
+    let original = fs::read(&marker).unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut forged = daemon.marker.clone();
+    forged["port"] = json!(listener.local_addr().unwrap().port());
+    fs::write(&marker, serde_json::to_vec(&forged).unwrap()).unwrap();
+    let denied = cli(&fixture.a, &["shared", "manage", ".", "hello"]);
+    assert!(!denied.status.success(), "{denied:?}");
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("rpc-registration-mismatch"),
+        "{denied:?}"
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    fs::write(&marker, original).unwrap();
+    success(cli(&fixture.a, &["shared", "manage", ".", "hello"]));
+    let old_authorization = daemon.authorization.clone();
+    stop(&mut daemon);
+    drop(daemon);
+    assert!(!credentials.exists());
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    assert_ne!(daemon.authorization, old_authorization);
+    let mut request = daemon.request("hello", json!({}));
+    request["authorization"] = old_authorization;
+    let response = daemon.raw(&request).unwrap();
+    assert_eq!(
+        response["error"]["data"]["reason_code"], "rpc-authentication-failed",
+        "{response}"
+    );
+    success(cli(&fixture.a, &["shared", "manage", ".", "hello"]));
+    stop(&mut daemon);
+    drop(daemon);
+    drop(listener);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn management_rpc_legacy_route_requires_the_private_compatibility_credential() {
+    let fixture = Fixture::new();
+    let mut configured = policy();
+    configured["storage"] = json!("compatibility-retain-all");
+    let mut daemon = start(&fixture, &configured, &["--no-watch"]);
+    let common = tgrep_core::generations::Repository::discover(&fixture.a)
+        .unwrap()
+        .common_dir()
+        .to_path_buf();
+    let legacy =
+        tgrep_core::managed::read_private_control_file(&common.join("tgrep-daemon-v1.json"))
+            .unwrap();
+    assert_ne!(legacy["instance"], daemon.marker["instance"]);
+    let request = |instance: &Value| {
+        json!({
+            "jsonrpc":"2.0","protocol":1,"instance":instance,
+            "repository":daemon.marker["repository"],"id":1,"method":"hello","params":{}
+        })
+    };
+    for value in [&daemon.marker["instance"], &daemon.authorization] {
+        let denied = daemon.raw(&request(value)).unwrap();
+        assert_eq!(
+            denied["error"]["data"]["reason_code"], "rpc-authentication-failed",
+            "{denied}"
+        );
+    }
+    let mut v2 = daemon.request("hello", json!({}));
+    v2["authorization"] = legacy["instance"].clone();
+    let denied = daemon.raw(&v2).unwrap();
+    assert_eq!(
+        denied["error"]["data"]["reason_code"], "rpc-authentication-failed",
+        "{denied}"
+    );
+    let allowed = daemon.raw(&request(&legacy["instance"])).unwrap();
+    assert_eq!(allowed["result"]["protocol"], 1, "{allowed}");
+    assert_eq!(allowed["result"]["instance"], legacy["instance"]);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn management_rpc_registration_failure_cleans_private_credentials() {
+    let fixture = Fixture::new();
+    let common = tgrep_core::generations::Repository::discover(&fixture.a)
+        .unwrap()
+        .common_dir()
+        .to_path_buf();
+    let policy_file = fixture.storage.join("policy.json");
+    fs::write(&policy_file, serde_json::to_vec(&policy()).unwrap()).unwrap();
+    for name in ["tgrep-daemon-v2.json", "tgrep-daemon-v1.json"] {
+        let conflict = common.join(name);
+        fs::create_dir(&conflict).unwrap();
+        let result = cli(
+            &fixture.a,
+            &[
+                "serve",
+                "--shared",
+                ".",
+                "--shared-storage",
+                fixture.storage.to_str().unwrap(),
+                "--shared-policy",
+                policy_file.to_str().unwrap(),
+                "--no-watch",
+            ],
+        );
+        assert!(!result.status.success(), "{result:?}");
+        assert!(!common.join("tgrep-daemon-v2.auth.json").exists());
+        assert!(conflict.is_dir());
+        fs::remove_dir(conflict).unwrap();
+        assert!(!common.join("tgrep-daemon-v2.json").exists());
+    }
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
 fn managed_search_preserves_pattern_files_boundaries_and_multiline_spans() {
     let mut fixture = Fixture::new();
     fs::write(

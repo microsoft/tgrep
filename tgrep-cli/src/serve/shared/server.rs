@@ -1246,8 +1246,7 @@ impl QuerySource for LegacyQuery<'_> {
     }
     fn invalidate(&self, error: &anyhow::Error) -> Result<()> {
         self.entry.view.invalidate_all()?;
-        self.entry.metrics.lock().expect("metrics").error =
-            Some(format!("reading shared candidate: {error:#}"));
+        self.entry.metrics.lock().expect("metrics").error = Some(format!("{error:#}"));
         Ok(())
     }
 }
@@ -1309,32 +1308,7 @@ pub(super) fn search_snapshot(
         let mut rows = Vec::new();
         let mut stats = Vec::new();
         for relative in &paths {
-            let read = (|| -> Result<Vec<u8>> {
-                let file = source.snapshot(|snapshot| snapshot.open_candidate(relative))??;
-                ensure!(
-                    file.metadata()?.is_file(),
-                    "candidate is no longer a regular file: {relative}"
-                );
-                let mut bytes = Vec::new();
-                let mut file = file.take(64 * 1024 * 1024 + 1);
-                let mut chunk = [0_u8; 64 * 1024];
-                loop {
-                    source.check()?;
-                    let count = file.read(&mut chunk)?;
-                    if count == 0 {
-                        break;
-                    }
-                    bytes.extend_from_slice(&chunk[..count]);
-                }
-                Ok(bytes)
-            })();
-            let bytes = match read {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    source.invalidate(&error)?;
-                    return Err(error.context(format!("reading shared candidate {relative}")));
-                }
-            };
+            let bytes = read_candidate(source, relative)?;
             if bytes.len() > 64 * 1024 * 1024 {
                 continue;
             }
@@ -1366,6 +1340,52 @@ pub(super) fn search_snapshot(
         result[key] = value.clone();
     }
     Ok(result)
+}
+
+/// Only an open, stat or read failure of the candidate itself closes the view
+/// for full repair. Snapshot validation, deadline and cancellation failures say
+/// nothing about the file, so they propagate unchanged and leave the view ready.
+fn read_candidate(source: &impl QuerySource, relative: &str) -> Result<Vec<u8>> {
+    let failed = |error: anyhow::Error| -> Result<Vec<u8>> {
+        let error = error.context(format!("reading shared candidate {relative}"));
+        source.invalidate(&error)?;
+        Err(error)
+    };
+    let mut opened = None;
+    let snapshot = source.snapshot(|snapshot| opened = Some(snapshot.open_candidate(relative)));
+    let file = match opened {
+        // A failed open also fails the snapshot; keep the snapshot's typed error.
+        Some(Err(error)) => return failed(snapshot.err().unwrap_or_else(|| error.into())),
+        Some(Ok(file)) => {
+            snapshot?;
+            file
+        }
+        None => {
+            snapshot?;
+            bail!("shared snapshot did not open candidate {relative}");
+        }
+    };
+    match file.metadata() {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return failed(anyhow::anyhow!(
+                "candidate is no longer a regular file: {relative}"
+            ));
+        }
+        Err(error) => return failed(error.into()),
+    }
+    let mut file = file.take(64 * 1024 * 1024 + 1);
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        source.check()?;
+        match file.read(&mut chunk) {
+            Ok(0) => return Ok(bytes),
+            Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return failed(error.into()),
+        }
+    }
 }
 
 #[cfg(test)]

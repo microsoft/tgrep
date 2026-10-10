@@ -2343,3 +2343,224 @@ mod scheduling_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod candidate_read_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::process::Command;
+
+    fn git(root: &Path, arguments: &[&str]) {
+        let mut command = Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+            {
+                command.env_remove(key);
+            }
+        }
+        let output = command
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=Managed fixture",
+                "-c",
+                "user.email=managed@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.autocrlf=false",
+            ])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Snapshot call 0 lists candidates and call 1 opens the only candidate.
+    #[derive(Clone, Copy, Debug)]
+    enum Inject {
+        Nothing,
+        SnapshotBeforeRead(usize),
+        SnapshotAfterRead(usize),
+        Check,
+    }
+
+    /// Wraps the real managed source, injecting the typed failures that
+    /// `ViewQuery` validation reports, and counts view invalidations.
+    struct Scripted {
+        inner: ManagedQuery,
+        inject: Inject,
+        snapshots: Cell<usize>,
+        invalidations: Cell<usize>,
+    }
+
+    impl QuerySource for Scripted {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
+            let call = self.snapshots.get();
+            self.snapshots.set(call + 1);
+            match self.inject {
+                Inject::SnapshotBeforeRead(at) if at == call => {
+                    Err(Error::busy("query-input-changed").into())
+                }
+                Inject::SnapshotAfterRead(at) if at == call => {
+                    let _opened = self.inner.snapshot(read)?;
+                    Err(Error::busy("query-snapshot-changed").into())
+                }
+                _ => self.inner.snapshot(read),
+            }
+        }
+        fn invalidate(&self, error: &anyhow::Error) -> Result<()> {
+            self.invalidations.set(self.invalidations.get() + 1);
+            self.inner.invalidate(error)
+        }
+        fn check(&self) -> Result<()> {
+            if matches!(self.inject, Inject::Check) {
+                return Err(Error::new(
+                    ErrorCategory::Deadline,
+                    "query-deadline",
+                    "query time budget exhausted",
+                )
+                .into());
+            }
+            self.inner.check()
+        }
+    }
+
+    #[test]
+    fn only_candidate_read_failures_close_a_ready_managed_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&storage).unwrap();
+        git(&root, &["init", "--quiet"]);
+        std::fs::write(root.join("source.txt"), "shared_term\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--quiet", "-m", "initial"]);
+        let repository = Repository::discover(&root).unwrap();
+        let policy: Policy = serde_json::from_value(json!({
+            "schema":2,"storage":"managed","retention":{"mode":"retain-all"},"advancement":{"mode":"fixed"},
+            "work":{
+                "max_views":8,"max_leases":32,"workers":2,"queue_items":16,
+                "staging_bytes":67108864,"private_work_bytes":67108864,
+                "sort_buffer_bytes":1048576,"blob_bytes":1048576,"operation_timeout_ms":30000,
+                "page_objects":16,"max_cursors":8,"cursor_lifetime_ms":30000,"max_receipts":1024,
+                "metadata_bytes":16777216
+            },
+            "collection":{
+                "schedule":{"mode":"disabled"},"on_pressure":false,
+                "checkpoint_grace_ms":0,"generation_grace_ms":0,
+                "max_duration_ms":1000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,
+                "chunk_bytes":65536,"max_pages":4,"retry_ms":100
+            }
+        }))
+        .unwrap();
+        let namespace = Namespace::initialize(&repository, &storage, policy).unwrap();
+        let prepared = namespace.prepare_owner().unwrap();
+        let owner = managed::OwnerGuard::claim(prepared.claim).unwrap();
+        namespace.register_owner(owner.registration()).unwrap();
+        let manager = ViewManager::new(
+            Arc::clone(&namespace),
+            None,
+            WorktreeOptions::default(),
+            None,
+        )
+        .unwrap();
+        let operation = manager
+            .accept_attach(
+                OperationToken {
+                    scope: owner.registration().owner.clone(),
+                    sequence: 1,
+                    token: Token::parse("read-attach").unwrap(),
+                },
+                AttachRequest {
+                    root: root.clone(),
+                    revision: Some("HEAD".into()),
+                    profile: IndexingProfile::default(),
+                    lease: Token::parse("read-client").unwrap(),
+                    owner: owner.registration().owner.clone(),
+                    accept_current: None,
+                    migratable: true,
+                    allocation_version: 1,
+                },
+            )
+            .unwrap();
+        let completed = manager.execute(&operation.id).unwrap();
+        assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+        let record: managed::ViewRecord =
+            serde_json::from_value(completed.result.unwrap()["current"].clone()).unwrap();
+        let slot = manager.slot(&record.id).unwrap();
+        let run = |inject: Inject| {
+            let source = Scripted {
+                inner: ManagedQuery {
+                    query: slot.query(record.version).unwrap(),
+                    slot: Arc::clone(&slot),
+                },
+                inject,
+                snapshots: Cell::new(0),
+                invalidations: Cell::new(0),
+            };
+            let result = super::super::server::search_snapshot(
+                &source,
+                &json!({"pattern":"shared_term"}),
+                false,
+                &json!(1),
+                json!({}),
+            );
+            (result, source.snapshots.get(), source.invalidations.get())
+        };
+
+        let (result, snapshots, invalidations) = run(Inject::Nothing);
+        let result = result.unwrap();
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1, "{result}");
+        assert_eq!((snapshots, invalidations), (3, 0));
+        let epoch = slot.input_epoch();
+        for (inject, reason) in [
+            (Inject::SnapshotBeforeRead(1), "query-input-changed"),
+            (Inject::SnapshotAfterRead(1), "query-snapshot-changed"),
+            (Inject::Check, "query-deadline"),
+        ] {
+            let (result, _, invalidations) = run(inject);
+            let error = result.unwrap_err();
+            let typed = error
+                .downcast_ref::<Error>()
+                .unwrap_or_else(|| panic!("{inject:?}: {error:#}"));
+            assert_eq!(typed.reason_code, reason, "{inject:?}");
+            assert!(
+                !format!("{error:#}").contains("reading shared candidate"),
+                "{inject:?}: {error:#}"
+            );
+            assert_eq!(invalidations, 0, "{inject:?}");
+            assert_eq!(slot.input_epoch(), epoch, "{inject:?}");
+            assert!(manager.status(&record.id).unwrap().ready, "{inject:?}");
+        }
+        let (result, _, invalidations) = run(Inject::Nothing);
+        assert_eq!(result.unwrap()["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(invalidations, 0);
+
+        std::fs::remove_file(root.join("source.txt")).unwrap();
+        std::fs::create_dir(root.join("source.txt")).unwrap();
+        let (result, _, invalidations) = run(Inject::Nothing);
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reading shared candidate source.txt"),
+            "{error:#}"
+        );
+        assert_eq!(invalidations, 1);
+        assert_eq!(slot.input_epoch(), epoch + 1);
+        assert!(!manager.status(&record.id).unwrap().ready);
+        drop((slot, manager, owner, namespace, repository));
+        temp.close().unwrap();
+    }
+}

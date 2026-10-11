@@ -648,6 +648,8 @@ struct ServerState {
     /// snapshots) or swap readers out of order. Searches do **not**
     /// take this lock, so they continue uninterrupted during a publish.
     publish_lock: Mutex<()>,
+    /// Set under publish_lock when rollback fails; only startup recovery clears it.
+    publication_recovery_required: std::sync::atomic::AtomicBool,
     /// Last-known per-file stamps and trusted reader/live content identities. Used by the file
     /// watcher to ignore notify events that don't reflect a real
     /// content change (e.g. atime-only updates, attribute changes,
@@ -738,6 +740,21 @@ enum StaleRefreshPhase {
 type StaleRefreshHook = Arc<dyn Fn(StaleRefreshPhase) + Send + Sync>;
 
 impl ServerState {
+    fn publication_allowed(&self) -> bool {
+        if self.publication_recovery_required.load(Ordering::SeqCst) {
+            eprintln!("[trace] error: {PUBLICATION_RECOVERY_MESSAGE}");
+            false
+        } else {
+            true
+        }
+    }
+
+    fn require_publication_recovery(&self) {
+        self.publication_recovery_required
+            .store(true, Ordering::SeqCst);
+        eprintln!("[trace] error: {PUBLICATION_RECOVERY_MESSAGE}");
+    }
+
     fn note_search(&self) {
         self.last_search_ms
             .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -951,6 +968,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         max_file_size,
         index_dir: index_dir.clone(),
         publish_lock: Mutex::new(()),
+        publication_recovery_required: std::sync::atomic::AtomicBool::new(false),
         file_evidence: RwLock::new(
             tgrep_core::meta::read_file_evidence(&index_dir).unwrap_or_default(),
         ),
@@ -2385,6 +2403,7 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
         "reconcile_overdue": state.watch_enabled && (refresh.catch_up || refresh.finished.elapsed() >= if state.refresh.polling.load(Ordering::SeqCst) { state.refresh.poll_interval } else { RECONCILE_DEADLINE }),
         "indexing": indexing,
         "index_build_error": *state.index_build_error.lock().unwrap(),
+        "publication_recovery_required": state.publication_recovery_required.load(Ordering::SeqCst),
         "hidden_complete": state.hidden_complete.load(Ordering::SeqCst) && !indexing,
         "index_progress": state.index_progress.load(std::sync::atomic::Ordering::Relaxed),
         "index_total": state.index_total.load(std::sync::atomic::Ordering::Relaxed),
@@ -2402,12 +2421,18 @@ fn indexing_pool(state: &ServerState, label: &'static str) -> Result<rayon::Thre
 }
 
 fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> String {
+    if !state.publication_allowed() {
+        return json_rpc_error(id, -32000, PUBLICATION_RECOVERY_MESSAGE);
+    }
     let index_dir = state.index_dir.clone();
     while state.indexing.load(Ordering::SeqCst) || state.flushing.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(50));
     }
     let refresh = state.stale_refresh_lock.lock().unwrap();
     let gate = state.snapshot_gate.write().unwrap();
+    if !state.publication_allowed() {
+        return json_rpc_error(id, -32000, PUBLICATION_RECOVERY_MESSAGE);
+    }
     {
         let _deferred = match state.deferred_events.lock() {
             Ok(guard) => guard,
@@ -5659,6 +5684,9 @@ fn persist_pending_index_changes(state: &Arc<ServerState>) -> bool {
     // cannot race publication. Recheck after acquiring it: another publisher
     // may have drained either source while we waited.
     let _gate = state.snapshot_gate.write().unwrap();
+    if !state.publication_allowed() {
+        return false;
+    }
     if state.index.read().unwrap().live.has_pending_changes() {
         let evidence = state.file_evidence.read().unwrap().clone();
         return stream_merge_stale_changes(
@@ -5821,6 +5849,10 @@ fn persist_filename_discovery(
     index_dir: &Path,
     authoritative_coverage: Option<bool>,
 ) -> bool {
+    let _publish = state.publish_lock.lock().unwrap();
+    if !state.publication_allowed() {
+        return false;
+    }
     let staging_dir = index_dir.join(".filename-index-staging");
     index_cleanup::cleanup_staging(&staging_dir);
     let staged = (|| -> Result<tgrep_core::meta::IndexMeta> {
@@ -5857,7 +5889,6 @@ fn persist_filename_discovery(
     };
 
     let published = (|| -> Result<()> {
-        let _publish = state.publish_lock.lock().unwrap();
         let files = staging_dir.join("files.bin");
         if files.exists() {
             // Only the header changes; files.bin is read into memory, not mapped.
@@ -6894,6 +6925,10 @@ fn refresh_stale_locked(
 /// partway through can leave truncated files that the currently mmap'd reader
 /// no longer matches. Resetting gives the fallback build a clean base.
 fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
+    let _publish = state.publish_lock.lock().unwrap();
+    if !state.publication_allowed() {
+        return;
+    }
     state.hidden_complete.store(false, Ordering::SeqCst);
     state.file_evidence.write().unwrap().clear();
     if let Err(e) = create_empty_index(index_dir) {
@@ -6922,6 +6957,7 @@ fn publish_build_checkpoint(
     state: &ServerState,
     checkpoint: &builder::BuildCheckpoint<'_>,
 ) -> Result<()> {
+    anyhow::ensure!(state.publication_allowed(), PUBLICATION_RECOVERY_MESSAGE);
     let builder::BuildCheckpoint {
         delta_dir,
         evidence,
@@ -6993,6 +7029,7 @@ fn publish_build_checkpoint(
 /// Build or resume an index with bounded external sorting and durable partial
 /// publications. Never discard an existing checkpoint to retry in heap.
 fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> Result<bool> {
+    anyhow::ensure!(state.publication_allowed(), PUBLICATION_RECOVERY_MESSAGE);
     let start = Instant::now();
     let ignorecase = frozen_tracked_membership(state, root);
     // Anchors the recovery window at the start of the build's traversal, which
@@ -7764,6 +7801,7 @@ fn flush_append_only_overlay_locked(
     complete: bool,
     evidence: Option<&tgrep_core::meta::FileEvidence>,
 ) -> Result<bool> {
+    anyhow::ensure!(state.publication_allowed(), PUBLICATION_RECOVERY_MESSAGE);
     let flush_start = Instant::now();
 
     // Snapshot the overlay (bounded heap) and the current reader (cheap Arc).
@@ -7863,8 +7901,11 @@ impl PublishStatus {
     }
 }
 
+const PUBLICATION_RECOVERY_MESSAGE: &str =
+    "index publication is blocked after a failed rollback; restart the server to recover";
+
 /// Returns the publication outcome. A rollback failure preserves staging and
-/// the uncommitted backup directory for recovery.
+/// the uncommitted backup directory and blocks every publisher until restart.
 fn publish_staged_index(
     state: &ServerState,
     index_dir: &Path,
@@ -7874,6 +7915,12 @@ fn publish_staged_index(
     preserve_overlay_paths: &std::collections::HashSet<String>,
     filename_extra_paths: Option<&std::collections::HashSet<String>>,
 ) -> PublishStatus {
+    // Searches do not take this lock. Check the recovery latch only after
+    // acquiring it so a publisher waiting behind a failed rollback cannot proceed.
+    let _publish = state.publish_lock.lock().unwrap();
+    if !state.publication_allowed() {
+        return PublishStatus::RollbackFailed;
+    }
     let meta = match tgrep_core::meta::IndexMeta::load(staging_dir) {
         Ok(meta) => meta,
         Err(error) => {
@@ -7917,15 +7964,12 @@ fn publish_staged_index(
         return PublishStatus::Failed;
     }
 
-    // Held across move + open + swap so concurrent publishers (auto-save /
-    // background-build / watcher reindex flush) cannot interleave renames
-    // or swap readers out of order. Searches do not take this lock.
-    let _publish = state.publish_lock.lock().unwrap();
     let mut moved = match move_staged_files(staging_dir, index_dir) {
         Ok(moved) => moved,
         Err(e) => {
             eprintln!("[trace] warning: flush move failed: {e}");
             return if e.rollback_failed() {
+                state.require_publication_recovery();
                 PublishStatus::RollbackFailed
             } else {
                 PublishStatus::Failed
@@ -7943,6 +7987,7 @@ fn publish_staged_index(
             Err(e) => {
                 moved.preserve();
                 eprintln!("[trace] warning: failed to roll back index publication: {e}");
+                state.require_publication_recovery();
                 PublishStatus::RollbackFailed
             }
         };
@@ -7952,6 +7997,7 @@ fn publish_staged_index(
         let error = moved.fail(error);
         eprintln!("[trace] warning: index publication commit failed: {error}");
         return if error.rollback_failed() {
+            state.require_publication_recovery();
             PublishStatus::RollbackFailed
         } else {
             PublishStatus::Failed
@@ -7999,6 +8045,10 @@ fn publish_reloaded_index(
     staging_dir: &Path,
     num_files: usize,
 ) -> bool {
+    let _publish = state.publish_lock.lock().unwrap();
+    if !state.publication_allowed() {
+        return false;
+    }
     let meta = match tgrep_core::meta::IndexMeta::load(staging_dir) {
         Ok(meta) => meta,
         Err(error) => {
@@ -8020,11 +8070,13 @@ fn publish_reloaded_index(
             return false;
         }
     };
-    let _publish = state.publish_lock.lock().unwrap();
     let mut moved = match move_staged_files(staging_dir, index_dir) {
         Ok(moved) => moved,
         Err(e) => {
             eprintln!("[trace] warning: reload move failed: {e}");
+            if e.rollback_failed() {
+                state.require_publication_recovery();
+            }
             return false;
         }
     };
@@ -8038,6 +8090,7 @@ fn publish_reloaded_index(
             Err(e) => {
                 moved.preserve();
                 eprintln!("[trace] warning: failed to roll back reload publication: {e}");
+                state.require_publication_recovery();
             }
         }
         return false;
@@ -8047,6 +8100,9 @@ fn publish_reloaded_index(
         drop(new_reader);
         let error = moved.fail(error);
         eprintln!("[trace] warning: reload publication commit failed: {error}");
+        if error.rollback_failed() {
+            state.require_publication_recovery();
+        }
         return false;
     }
 
@@ -8164,6 +8220,8 @@ impl StagedFileMove {
         if self.finished {
             return Ok(());
         }
+        #[cfg(test)]
+        tests::publication_fault(tests::PublicationFailurePoint::Rollback)?;
         let mut first_error = None;
         let mut pending_published = Vec::new();
         for name in std::mem::take(&mut self.published).into_iter().rev() {
@@ -8219,6 +8277,8 @@ impl StagedFileMove {
     }
 
     fn commit(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        tests::publication_fault(tests::PublicationFailurePoint::Commit)?;
         self.backup.commit()?;
         self.finished = true;
         Ok(())
@@ -8332,6 +8392,11 @@ fn move_staged_files(
             }
             moved.backed_up.push(name);
         }
+    }
+
+    #[cfg(test)]
+    if let Err(error) = tests::publication_fault(tests::PublicationFailurePoint::Move) {
+        return Err(moved.fail(error));
     }
 
     for name in staged_publish_order() {
@@ -9117,7 +9182,11 @@ mod tests {
     /// rules enabled, which is the configuration `gitignore_pending` gates.
     pub(super) fn test_server_state(root: &Path, index_dir: &Path) -> Arc<ServerState> {
         create_empty_index(index_dir).expect("create empty index");
-        let hybrid = HybridIndex::open(index_dir, root).expect("open empty index");
+        test_server_state_from_index(root, index_dir)
+    }
+
+    fn test_server_state_from_index(root: &Path, index_dir: &Path) -> Arc<ServerState> {
+        let hybrid = HybridIndex::open(index_dir, root).expect("open index");
         Arc::new(ServerState {
             index: RwLock::new(hybrid),
             visibility: RwLock::new(Default::default()),
@@ -9162,6 +9231,7 @@ mod tests {
             max_file_size: None,
             index_dir: index_dir.to_path_buf(),
             publish_lock: Mutex::new(()),
+            publication_recovery_required: std::sync::atomic::AtomicBool::new(false),
             file_evidence: RwLock::new(Default::default()),
             snapshot_gate: RwLock::new(()),
             stale_refresh_lock: Mutex::new(()),
@@ -14639,6 +14709,203 @@ mod tests {
         std::fs::write(path, content).expect("write_file");
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum PublicationFailurePoint {
+        Move,
+        Commit,
+        Rollback,
+    }
+
+    thread_local! {
+        static PUBLICATION_FAULTS: std::cell::Cell<&'static [PublicationFailurePoint]> =
+            const { std::cell::Cell::new(&[]) };
+    }
+
+    struct PublicationFaults(&'static [PublicationFailurePoint]);
+
+    impl PublicationFaults {
+        fn new(points: &'static [PublicationFailurePoint]) -> Self {
+            Self(PUBLICATION_FAULTS.replace(points))
+        }
+    }
+
+    impl Drop for PublicationFaults {
+        fn drop(&mut self) {
+            PUBLICATION_FAULTS.set(self.0);
+        }
+    }
+
+    pub(super) fn publication_fault(point: PublicationFailurePoint) -> std::io::Result<()> {
+        if PUBLICATION_FAULTS.get().contains(&point) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected publication failure",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn publication_files(index_dir: &Path) -> Vec<Option<Vec<u8>>> {
+        staged_publish_order()
+            .map(|name| match std::fs::read(index_dir.join(name)) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("could not read {name}: {error}"),
+            })
+            .collect()
+    }
+
+    fn assert_rollback_failure_blocks_publication(
+        faults: &'static [PublicationFailurePoint],
+        reject_reader: bool,
+    ) {
+        for reload in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("root");
+            let index_dir = temp.path().join("index");
+            let staging = index_dir.join(".reload-build");
+            std::fs::create_dir(&root).unwrap();
+            let state = test_server_state(&root, &index_dir);
+            install_reader_file(
+                &state,
+                &root,
+                &index_dir,
+                "old.rs",
+                b"fn old_generation() {}\n",
+            );
+            let original = publication_files(&index_dir);
+            std::fs::write(root.join("new.rs"), b"fn new_generation() {}\n").unwrap();
+            let build = |path: &Path| {
+                builder::build_index_with_options_and_ignorecase(
+                    &root,
+                    Some(path),
+                    &builder::BuildOptions::default(),
+                    frozen_tracked_membership(&state, &root),
+                )
+                .unwrap()
+                .num_files
+            };
+            let count = build(&staging);
+            let injected = PublicationFaults::new(faults);
+            let expected = count + usize::from(reject_reader);
+            if reload {
+                assert!(!publish_reloaded_index(
+                    &state, &index_dir, &staging, expected
+                ));
+            } else {
+                assert_eq!(
+                    publish_staged_index(
+                        &state,
+                        &index_dir,
+                        &staging,
+                        expected,
+                        &[],
+                        &Default::default(),
+                        None,
+                    ),
+                    PublishStatus::RollbackFailed
+                );
+            }
+            drop(injected);
+            let pending: Vec<_> = std::fs::read_dir(index_dir.join(".retired"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.join("publication.json").exists())
+                .collect();
+            assert_eq!(pending.len(), 1);
+            let backup = publication_files(&pending[0]);
+            let interrupted = publication_files(&index_dir);
+            let later = index_dir.join(".bootstrap-merge");
+            let count = build(&later);
+            assert_eq!(
+                publish_staged_index(
+                    &state,
+                    &index_dir,
+                    &later,
+                    count,
+                    &[],
+                    &Default::default(),
+                    None,
+                ),
+                PublishStatus::RollbackFailed,
+                "a failed rollback must block even a valid later publication"
+            );
+            assert!(!publish_reloaded_index(&state, &index_dir, &later, count));
+            state.filename_index_ready.store(true, Ordering::SeqCst);
+            state.filename_index_dirty.store(true, Ordering::SeqCst);
+            assert!(!persist_filename_discovery(&state, &index_dir, Some(true)));
+            assert!(!persist_pending_index_changes(&state));
+            assert!(flush_append_only_overlay(&state, &index_dir, true, None).is_err());
+            reset_to_empty_index(&state, &root, &index_dir);
+            let response: serde_json::Value =
+                serde_json::from_str(&handle_reload(None, &state)).unwrap();
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("restart"),
+                "{response}"
+            );
+            let status: serde_json::Value =
+                serde_json::from_str(&handle_status(None, &state)).unwrap();
+            assert_eq!(status["result"]["publication_recovery_required"], true);
+            assert_eq!(publication_files(&index_dir), interrupted);
+            assert_eq!(publication_files(&pending[0]), backup);
+            assert_eq!(
+                std::fs::read_dir(index_dir.join(".retired"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            let old = query::build_literal_plan("old_generation", false);
+            assert_eq!(state.index.read().unwrap().execute_query(&old), vec![0]);
+            drop(state);
+
+            let writer = prepare_index_directory(&root, &index_dir).unwrap();
+            assert_eq!(publication_files(&index_dir), original);
+            assert!(!pending[0].exists());
+            let restarted = test_server_state_from_index(&root, &index_dir);
+            let response: serde_json::Value =
+                serde_json::from_str(&handle_reload(None, &restarted)).unwrap();
+            assert_eq!(response["result"]["status"], "reloaded", "{response}");
+            let new = query::build_literal_plan("new_generation", false);
+            assert_eq!(restarted.index.read().unwrap().execute_query(&new).len(), 1);
+            let committed = publication_files(&index_dir);
+            drop(restarted);
+            drop(writer);
+            let _writer = prepare_index_directory(&root, &index_dir).unwrap();
+            assert_eq!(publication_files(&index_dir), committed);
+        }
+    }
+
+    #[test]
+    fn move_rollback_failure_blocks_publication_until_restart() {
+        assert_rollback_failure_blocks_publication(
+            &[
+                PublicationFailurePoint::Move,
+                PublicationFailurePoint::Rollback,
+            ],
+            false,
+        );
+    }
+
+    #[test]
+    fn reader_rollback_failure_blocks_publication_until_restart() {
+        assert_rollback_failure_blocks_publication(&[PublicationFailurePoint::Rollback], true);
+    }
+
+    #[test]
+    fn commit_rollback_failure_blocks_publication_until_restart() {
+        assert_rollback_failure_blocks_publication(
+            &[
+                PublicationFailurePoint::Commit,
+                PublicationFailurePoint::Rollback,
+            ],
+            false,
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn publish_keeps_mapped_index_generation_named() {
@@ -14806,6 +15073,10 @@ mod tests {
                 .count(),
             0
         );
+        assert!(!state.publication_recovery_required.load(Ordering::SeqCst));
+        let response: serde_json::Value =
+            serde_json::from_str(&handle_reload(None, &state)).unwrap();
+        assert_eq!(response["result"]["status"], "reloaded", "{response}");
     }
 
     #[test]

@@ -168,6 +168,10 @@ Linked or unremovable fixed staging entries stop startup before writers can
 reuse them. Spill cleanup failures produce warnings; spill writers allocate
 fresh names instead of reusing leftovers. Windows files still mapped by readers
 are not force-unlinked, including during recovery.
+If publication and its rollback both fail, the server preserves the recovery
+journal and blocks further publications, including reloads and filename-only
+saves. `status` reports that a restart is required; recovery must finish before
+any later index can be published. Existing in-memory readers remain available.
 Managed shared storage uses its own lifecycle and is not cleaned by this path.
 
 Before extracting content, ordinary builds check available space on the index

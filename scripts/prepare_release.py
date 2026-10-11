@@ -4,6 +4,7 @@
 import argparse
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tomllib
@@ -47,6 +48,10 @@ def prepare_release(event, ref, sha, tag, *, verify_only=False):
     if not isinstance(version, str) or tag != f"v{version}":
         raise ValueError(f"release tag {tag!r} must match workspace version v{version}")
     git("check-ref-format", tag_ref)
+    if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", sha):
+        raise ValueError("workflow SHA must be a full Git object ID")
+    # Peel the captured object, never a tag ref that could have moved meanwhile.
+    sha = git("rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}")
     if git("rev-parse", "--verify", "HEAD^{commit}") != sha:
         raise ValueError("checkout does not match the workflow's exact commit")
 

@@ -103,8 +103,16 @@ class PrepareReleaseTests(unittest.TestCase):
                 self.assertEqual(self.git("ls-remote", "--tags", "origin"), "")
 
     def test_rejects_checkout_mismatching_workflow_sha(self):
-        self.assert_failure(self.run_release(sha="a" * 40), "exact commit")
+        self.assert_failure(self.run_release(sha=self.other_commit()), "exact commit")
         self.assertEqual(self.remote_tag(), "")
+
+    def test_rejects_non_commit_or_non_object_workflow_sha(self):
+        for sha in ("HEAD", "refs/heads/main", self.sha[:12], "0" * 40,
+                    self.git("rev-parse", "HEAD^{tree}"),
+                    self.git("rev-parse", "HEAD:Cargo.toml")):
+            with self.subTest(sha=sha):
+                self.assert_failure(self.run_release(sha=sha), "error:")
+                self.assertEqual(self.remote_tag(), "")
 
     def test_rejects_conflicting_existing_tag_without_moving_it(self):
         other = self.other_commit()
@@ -120,6 +128,38 @@ class PrepareReleaseTests(unittest.TestCase):
         self.assertIn(f"{self.sha}\t{TAG_REF}^{{}}", original)
         self.assert_success(self.run_release())
         self.assert_success(self.run_release(event="push", ref=TAG_REF))
+        self.assertEqual(self.remote_tag(), original)
+
+    def test_annotated_tag_object_sha_matches_shallow_checkout(self):
+        self.git("tag", "-a", TAG, self.sha, "-m", "Annotated release")
+        self.git("push", "origin", TAG_REF)
+        tag_sha = self.git("rev-parse", TAG_REF)
+        original = self.remote_tag()
+        self.assertNotEqual(tag_sha, self.sha)
+
+        self.checkout = self.root / "shallow"
+        self.checkout.mkdir()
+        self.git("init")
+        self.git("remote", "add", "origin", str(self.remote))
+        self.git("fetch", "--no-tags", "--depth=1", "origin", tag_sha)
+        self.git("checkout", "--detach", "FETCH_HEAD")
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        self.assertEqual(self.git("cat-file", "-t", tag_sha), "tag")
+        for verify_only in (False, True):
+            with self.subTest(verify_only=verify_only):
+                self.assert_success(self.run_release(
+                    event="push", ref=TAG_REF, sha=tag_sha, verify_only=verify_only
+                ))
+                self.assertEqual(self.remote_tag(), original)
+
+    def test_annotated_workflow_sha_must_match_checked_out_commit(self):
+        self.git("tag", "-a", TAG, self.other_commit(), "-m", "Different snapshot")
+        self.git("push", "origin", TAG_REF)
+        tag_sha = self.git("rev-parse", TAG_REF)
+        original = self.remote_tag()
+        self.assert_failure(
+            self.run_release(event="push", ref=TAG_REF, sha=tag_sha), "exact commit"
+        )
         self.assertEqual(self.remote_tag(), original)
 
     def test_matching_tag_push_uses_existing_tag(self):

@@ -52,7 +52,9 @@ The tag is checked again before publication, and runs for the same tag are
 serialized without cancelling an active release.
 
 Existing `v*` tag pushes still start the release workflow and must match the
-tagged workspace version. Manual runs build directly rather than relying on a
+tagged workspace version. Annotated-tag snapshot IDs are peeled to commits
+before checkout and remote-tag comparisons, using the captured object ID rather
+than a mutable tag ref. Manual runs build directly rather than relying on a
 second tag-push run: tags pushed with `GITHUB_TOKEN` do not trigger other workflows.
 No additional token is required.
 

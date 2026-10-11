@@ -14865,14 +14865,25 @@ mod tests {
             let writer = prepare_index_directory(&root, &index_dir).unwrap();
             assert_eq!(publication_files(&index_dir), original);
             assert!(!pending[0].exists());
-            let restarted = test_server_state_from_index(&root, &index_dir);
+            let mut restarted = test_server_state_from_index(&root, &index_dir);
+            // This fixture has no watcher to drain before the next simulated restart.
+            Arc::get_mut(&mut restarted).unwrap().watch_enabled = false;
             let response: serde_json::Value =
                 serde_json::from_str(&handle_reload(None, &restarted)).unwrap();
             assert_eq!(response["result"]["status"], "reloaded", "{response}");
             let new = query::build_literal_plan("new_generation", false);
             assert_eq!(restarted.index.read().unwrap().execute_query(&new).len(), 1);
             let committed = publication_files(&index_dir);
+            // A Unix fork can retain the same open-file description until exec.
+            let _inherited_writer = writer.1.try_clone().unwrap();
             drop(restarted);
+            assert!(
+                try_acquire_server_lock(&index_dir)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("another tgrep server")
+            );
+            fs2::FileExt::unlock(&writer.1).unwrap();
             drop(writer);
             let _writer = prepare_index_directory(&root, &index_dir).unwrap();
             assert_eq!(publication_files(&index_dir), committed);

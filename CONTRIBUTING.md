@@ -32,6 +32,35 @@ cargo clippy --all-targets
 cargo build --release
 ```
 
+## Creating a release
+
+After the version bump is merged and CI passes, open **Actions > Release >
+Run workflow**, select **main**, and enter the tag matching the workspace
+version in `Cargo.toml`, for example `v1.2.0`. The equivalent CLI command is:
+
+```bash
+gh workflow run release.yml --repo microsoft/tgrep --ref main -f tag=v1.2.0
+```
+
+The workflow validates the version, creates a missing tag at the exact commit
+captured by the dispatch, and builds and publishes Linux/macOS archives and
+checksums in the same run. It never moves an existing tag. A matching lightweight
+or annotated tag can be reused; a tag naming another commit fails before building.
+To retry after a failed build or lost tag-push response, rerun the original
+workflow run so it retains the original commit, even if `main` has advanced.
+The tag is checked again before publication, and runs for the same tag are
+serialized without cancelling an active release.
+
+Existing `v*` tag pushes still start the release workflow and must match the
+tagged workspace version. Manual runs build directly rather than relying on a
+second tag-push run: tags pushed with `GITHUB_TOKEN` do not trigger other workflows.
+No additional token is required.
+
+Windows signing remains a separate Azure DevOps OneBranch run. Select the same
+source commit and `ReleaseTag`; publish its signed archives/checksums to the
+existing GitHub release after verifying signing. The GitHub workflow does not
+start or change that pipeline.
+
 ## Recurring release qualification
 
 The CI workflow runs on PRs and pushes to `main`, weekly on Monday at 08:00 UTC,

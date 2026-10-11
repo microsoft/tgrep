@@ -4,10 +4,14 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+#[cfg(not(feature = "managed-test-hooks"))]
+use std::process::Child;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(feature = "managed-test-hooks")]
+use tgrep_core::managed::SupervisedChild as Child;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -15,10 +19,23 @@ use tempfile::TempDir;
 const PROFILE: &str = r#"{"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864}"#;
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+#[path = "shared_daemon/managed.rs"]
+mod managed;
 #[path = "shared_daemon/runtime.rs"]
 mod runtime;
 #[path = "shared_daemon/stateful.rs"]
 mod stateful;
+
+fn spawn(command: &mut Command) -> Child {
+    #[cfg(feature = "managed-test-hooks")]
+    {
+        Child::spawn(command).unwrap()
+    }
+    #[cfg(not(feature = "managed-test-hooks"))]
+    {
+        command.spawn().unwrap()
+    }
+}
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = runtime::output(
@@ -131,6 +148,8 @@ impl Fixture {
 struct Daemon {
     child: Child,
     marker: Value,
+    authorization: Value,
+    log: PathBuf,
 }
 
 impl Daemon {
@@ -139,11 +158,18 @@ impl Daemon {
     }
 
     fn start_with_home(root: &Path, storage: &Path, options: &[&str], home: Option<&Path>) -> Self {
-        let log = storage.join("daemon.log");
+        let log = storage.join(format!(
+            "daemon-{}.log",
+            LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let marker_path = tgrep_core::generations::Repository::discover(root)
             .unwrap()
             .common_dir()
-            .join("tgrep-daemon-v1.json");
+            .join(if options.contains(&"--shared-policy") {
+                "tgrep-daemon-v2.json"
+            } else {
+                "tgrep-daemon-v1.json"
+            });
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("tgrep"));
         if let Some(home) = home {
             command
@@ -151,22 +177,24 @@ impl Daemon {
                 .env("USERPROFILE", home)
                 .env("XDG_CONFIG_HOME", home);
         }
-        let child = command
-            .args([
-                "serve",
-                "--shared",
-                root.to_str().unwrap(),
-                "--shared-storage",
-                storage.to_str().unwrap(),
-            ])
-            .args(options)
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(&log).unwrap())
-            .spawn()
-            .unwrap();
+        let child = spawn(
+            command
+                .args([
+                    "serve",
+                    "--shared",
+                    root.to_str().unwrap(),
+                    "--shared-storage",
+                    storage.to_str().unwrap(),
+                ])
+                .args(options)
+                .stdout(Stdio::null())
+                .stderr(fs::File::create(&log).unwrap()),
+        );
         let mut daemon = Self {
             child,
             marker: Value::Null,
+            authorization: Value::Null,
+            log: log.clone(),
         };
         let started = Instant::now();
         loop {
@@ -185,6 +213,14 @@ impl Daemon {
                 && marker["pid"] == daemon.child.id()
             {
                 daemon.marker = marker;
+                if daemon.marker["protocol"] == 2 {
+                    let authentication = tgrep_core::managed::read_private_control_file(
+                        &marker_path.with_file_name("tgrep-daemon-v2.auth.json"),
+                    )
+                    .unwrap();
+                    assert_eq!(authentication["registration"], daemon.marker);
+                    daemon.authorization = authentication["token"].clone();
+                }
                 if daemon
                     .try_rpc("hello", json!({}))
                     .is_ok_and(|v| v.get("result").is_some())
@@ -203,10 +239,15 @@ impl Daemon {
                 LEASE_SEQUENCE.fetch_add(1, Ordering::SeqCst)
             ));
         }
-        json!({
-            "jsonrpc":"2.0","protocol":1, "instance":self.marker["instance"],
+        let mut request = json!({
+            "jsonrpc":"2.0","protocol":self.marker["protocol"], "instance":self.marker["instance"],
             "repository":self.marker["repository"], "id":1, "method":method,"params":params
-        })
+        });
+        if self.marker["protocol"] == 2 {
+            request["namespace"] = self.marker["namespace"].clone();
+            request["authorization"] = self.authorization.clone();
+        }
+        request
     }
 
     fn raw(&self, request: &Value) -> std::io::Result<Value> {
@@ -225,11 +266,17 @@ impl Daemon {
     }
 
     fn rpc(&self, method: &str, params: Value) -> Value {
-        let response = self.try_rpc(method, params).unwrap();
+        let response = self.try_rpc(method, params).unwrap_or_else(|error| {
+            panic!("{method}: {error}; daemon log: {}", self.log.display())
+        });
         assert!(response.get("error").is_none(), "{method}: {response}");
         assert_eq!(response["result"]["instance"], self.marker["instance"]);
-        assert_eq!(response["result"]["protocol"], 1);
-        response["result"].clone()
+        assert_eq!(response["result"]["protocol"], self.marker["protocol"]);
+        if self.marker["protocol"] == 2 {
+            response["result"]["data"].clone()
+        } else {
+            response["result"].clone()
+        }
     }
 
     fn attach(&self, root: &Path, revision: &str) -> Value {
@@ -238,15 +285,19 @@ impl Daemon {
         result
     }
 
-    fn attach_without_response(&self, params: Value) {
+    fn without_response(&self, method: &str, params: Value) {
         let mut stream =
             TcpStream::connect(("127.0.0.1", self.marker["port"].as_u64().unwrap() as u16))
                 .unwrap();
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        writeln!(stream, "{}", self.request("attach", params.clone())).unwrap();
+        writeln!(stream, "{}", self.request(method, params)).unwrap();
         drop(stream);
+    }
+
+    fn attach_without_response(&self, params: Value) {
+        self.without_response("attach", params.clone());
         let started = Instant::now();
         loop {
             let response = self
@@ -306,6 +357,14 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if thread::panicking() {
+            match fs::read_to_string(&self.log) {
+                Ok(log) => eprintln!("daemon log ({}):\n{log}", self.log.display()),
+                Err(error) => {
+                    eprintln!("cannot read daemon log {}: {error}", self.log.display())
+                }
+            }
+        }
     }
 }
 

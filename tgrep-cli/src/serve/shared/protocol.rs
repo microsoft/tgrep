@@ -44,6 +44,8 @@ pub struct View {
     pub root: PathBuf,
     pub view: String,
     pub generation: GenerationKey,
+    #[serde(default)]
+    pub version: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,6 +59,7 @@ pub(super) struct ViewRegistration {
 
 pub struct Client {
     registration: Registration,
+    managed: Option<super::protocol_v2::Client>,
     root: PathBuf,
 }
 
@@ -77,7 +80,10 @@ impl Client {
         if let Some(git_dir) = tgrep_core::git_index::git_dir(root) {
             // This only selects shared discovery, never establishes authority.
             // Unattached legacy queries should not spawn Git subprocesses.
-            return marker_present(&git_dir.join(VIEW_MARKER));
+            return Ok(
+                marker_present(&git_dir.join(super::protocol_v2::VIEW_MARKER))?
+                    || marker_present(&git_dir.join(VIEW_MARKER))?,
+            );
         }
         let repo = Repository::discover(root)?;
         marker_present(&repo.git_dir().join(VIEW_MARKER))
@@ -86,6 +92,29 @@ impl Client {
     pub fn registered(path: &Path) -> Result<(Self, View)> {
         let root = super::worktree_root(path)?;
         let repo = Repository::discover(&root)?;
+        if marker_present(&repo.git_dir().join(super::protocol_v2::VIEW_MARKER))? {
+            let marker: super::protocol_v2::ViewRegistration = serde_json::from_reader(
+                File::open(repo.git_dir().join(super::protocol_v2::VIEW_MARKER))?.take(MAX_REQUEST),
+            )?;
+            let client = Self::discover(root.clone(), &repo)?;
+            let managed = client
+                .managed
+                .as_ref()
+                .context("managed attachment has no compatible daemon")?;
+            ensure!(
+                marker.root == root
+                    && marker.daemon.namespace == managed.registration.namespace
+                    && marker.daemon.instance == managed.registration.instance
+                    && marker.daemon.port == managed.registration.port,
+                "stale managed attachment; recover and reattach"
+            );
+            let view = client.lookup()?;
+            ensure!(
+                view.view == marker.view.as_str() && view.version.is_some(),
+                "managed attachment/view mismatch"
+            );
+            return Ok((client, view));
+        }
         let marker: ViewRegistration = serde_json::from_reader(
             File::open(repo.git_dir().join(VIEW_MARKER))
                 .context("worktree has no shared attachment")?
@@ -109,6 +138,26 @@ impl Client {
     }
 
     fn discover(root: PathBuf, repo: &Repository) -> Result<Self> {
+        if marker_present(&repo.common_dir().join(super::protocol_v2::MARKER))? {
+            let managed = super::protocol_v2::Client::discover(&root, repo)?;
+            let registration = Registration {
+                protocol: managed.registration.protocol,
+                instance: managed.registration.instance.to_string(),
+                repository: managed.registration.repository.clone(),
+                pid: managed.registration.pid,
+                port: managed.registration.port,
+                storage: managed.registration.storage.clone(),
+            };
+            return Ok(Self {
+                registration,
+                managed: Some(managed),
+                root,
+            });
+        }
+        Self::discover_legacy(root, repo)
+    }
+
+    fn discover_legacy(root: PathBuf, repo: &Repository) -> Result<Self> {
         let registration: Registration = serde_json::from_reader(
             fs::File::open(repo.common_dir().join(MARKER))
                 .context("no shared daemon registration; start serve --shared")?
@@ -121,7 +170,11 @@ impl Client {
                 && registration.port != 0,
             "incompatible shared daemon registration"
         );
-        let client = Self { registration, root };
+        let client = Self {
+            registration,
+            managed: None,
+            root,
+        };
         let hello = client.request("hello", json!({}))?;
         ensure!(
             hello["capabilities"]
@@ -152,16 +205,24 @@ impl Client {
     }
 
     pub fn view_request(&self, method: &str, view: &View, query: Value) -> Result<Value> {
-        let result = self.request(
-            method,
-            json!({"root": view.root, "view": view.view, "query": query}),
-        )?;
+        let mut params = json!({"root": view.root, "view": view.view, "query": query});
+        if self.managed.is_some() {
+            params["expected_version"] =
+                json!(view.version.context("managed view has no version")?);
+        }
+        let result = self.request(method, params)?;
         ensure!(
             result["root"] == json!(view.root)
                 && result["view"] == view.view
                 && result["generation"] == json!(view.generation),
             "shared response view/base mismatch"
         );
+        if let Some(version) = view.version {
+            ensure!(
+                result["version"] == version,
+                "managed response view version changed"
+            );
+        }
         if method != "status" {
             ensure!(
                 result["ready"] == true && result["epoch"].is_u64(),
@@ -172,6 +233,9 @@ impl Client {
     }
 
     pub fn request(&self, method: &str, params: Value) -> Result<Value> {
+        if let Some(managed) = &self.managed {
+            return managed.request(method, params);
+        }
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, self.registration.port));
         let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
             .context("shared daemon unreachable")?;
@@ -244,6 +308,29 @@ pub(super) fn read_line(stream: &mut TcpStream, limit: u64) -> Result<Vec<u8>> {
 
 #[derive(Subcommand)]
 pub enum Lifecycle {
+    /// Enumerate a trusted cache parent's namespaces in bounded JSON pages.
+    Discover { cache_parent: PathBuf },
+    /// Invoke a versioned management method with a JSON parameter object.
+    Manage {
+        root: PathBuf,
+        method: String,
+        #[arg(long, default_value = "{}")]
+        params: String,
+    },
+    /// Hold an issued instance-bound ownership guard until stdin closes.
+    OwnerHold {
+        #[arg(long)]
+        claim: PathBuf,
+    },
+    /// Inspect external storage without Git; mutations require --apply.
+    Maintenance {
+        namespace: PathBuf,
+        method: String,
+        #[arg(long, default_value = "{}")]
+        params: String,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Pin a committed tree and lease a private view. Emits JSON; inspect ready.
     Attach {
         root: PathBuf,
@@ -273,6 +360,19 @@ pub enum Lifecycle {
 
 pub fn run_lifecycle(command: Lifecycle) -> Result<()> {
     let (root, method, mut params) = match command {
+        Lifecycle::Discover { cache_parent } => return super::protocol_v2::discover(&cache_parent),
+        Lifecycle::Manage {
+            root,
+            method,
+            params,
+        } => return super::protocol_v2::manage(&root, &method, &params),
+        Lifecycle::OwnerHold { claim } => return super::protocol_v2::owner_hold(&claim),
+        Lifecycle::Maintenance {
+            namespace,
+            method,
+            params,
+            apply,
+        } => return super::protocol_v2::maintenance(&namespace, &method, &params, apply),
         Lifecycle::Attach {
             root,
             revision,
@@ -308,7 +408,7 @@ pub fn run_lifecycle(command: Lifecycle) -> Result<()> {
         "lifecycle requires a worktree root"
     );
     let repo = Repository::discover(&root)?;
-    let client = Client::discover(root.clone(), &repo)?;
+    let client = Client::discover_legacy(root.clone(), &repo)?;
     params["root"] = json!(root);
     if method != "attach" {
         params["view"] = json!(client.lookup()?.view);
@@ -328,6 +428,7 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let client = Client {
+            managed: None,
             registration: Registration {
                 protocol: PROTOCOL,
                 instance: "test-instance".into(),

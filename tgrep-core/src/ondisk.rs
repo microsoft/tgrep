@@ -24,26 +24,88 @@ pub(crate) const POSTING_ENTRY_SIZE: usize = 6; // 4 + 1 + 1
 pub(crate) const POSTING_WRITE_CHUNK_ENTRIES: usize = 8192;
 pub(crate) const LOOKUP_WRITE_CHUNK_ENTRIES: usize = 4096;
 pub(crate) const INDEX_FORMAT_VERSION: u32 = 3;
+pub(crate) const MANAGED_FILE_TABLE_VERSION: u32 = 0x4d32_0001;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IndexLayout {
+    Legacy,
+    Managed,
+}
+
+impl IndexLayout {
+    pub(crate) fn files(self) -> &'static str {
+        match self {
+            Self::Legacy => "files.bin",
+            Self::Managed => "paths.tgm",
+        }
+    }
+
+    pub(crate) fn lookup(self) -> &'static str {
+        match self {
+            Self::Legacy => "lookup.bin",
+            Self::Managed => "lookup.tgm",
+        }
+    }
+
+    pub(crate) fn postings(self) -> &'static str {
+        match self {
+            Self::Legacy => "index.bin",
+            Self::Managed => "postings.tgm",
+        }
+    }
+
+    pub(crate) fn meta(self) -> &'static str {
+        match self {
+            Self::Legacy => "meta.json",
+            Self::Managed => "meta.tgm",
+        }
+    }
+}
 // Two duplicate reserved IDs make old dense-ID readers reject the table,
 // rather than exposing a hidden-inclusive corpus without visibility filtering.
 const FILE_TABLE_MAGIC: &[u8; 12] = b"\xff\xff\xff\xff\0\0\xff\xff\xff\xff\0\0";
 pub(crate) const FILE_TABLE_HEADER_LEN: usize = FILE_TABLE_MAGIC.len() + size_of::<u32>();
 
 pub(crate) fn write_file_table_header(writer: &mut impl std::io::Write) -> crate::Result<()> {
+    write_file_table_header_for(writer, IndexLayout::Legacy)
+}
+
+pub(crate) fn write_file_table_header_for(
+    writer: &mut impl std::io::Write,
+    layout: IndexLayout,
+) -> crate::Result<()> {
     writer.write_all(FILE_TABLE_MAGIC)?;
-    writer.write_all(&INDEX_FORMAT_VERSION.to_le_bytes())?;
+    let version = match layout {
+        IndexLayout::Legacy => INDEX_FORMAT_VERSION,
+        IndexLayout::Managed => MANAGED_FILE_TABLE_VERSION,
+    };
+    writer.write_all(&version.to_le_bytes())?;
     Ok(())
 }
 
 pub(crate) fn file_table_body(data: &[u8]) -> crate::Result<&[u8]> {
+    file_table_body_for(data, IndexLayout::Legacy)
+}
+
+pub(crate) fn file_table_body_for(data: &[u8], layout: IndexLayout) -> crate::Result<&[u8]> {
     if !data.starts_with(FILE_TABLE_MAGIC) {
-        return Ok(data);
+        return if layout == IndexLayout::Legacy {
+            Ok(data)
+        } else {
+            Err(crate::Error::IndexCorrupted(
+                "managed file table header is missing".into(),
+            ))
+        };
     }
     let version = data
         .get(FILE_TABLE_MAGIC.len()..FILE_TABLE_HEADER_LEN)
         .ok_or_else(|| crate::Error::IndexCorrupted("files.bin header is truncated".into()))?;
     let version = u32::from_le_bytes(version.try_into().unwrap());
-    if version != INDEX_FORMAT_VERSION {
+    let expected = match layout {
+        IndexLayout::Legacy => INDEX_FORMAT_VERSION,
+        IndexLayout::Managed => MANAGED_FILE_TABLE_VERSION,
+    };
+    if version != expected {
         return Err(crate::Error::IndexCorrupted(format!(
             "unsupported files.bin format version {version}"
         )));
@@ -214,9 +276,19 @@ pub(crate) fn write_file_entry(
 /// not enough bytes for a declared path or a partial header), or a path is not
 /// valid UTF-8 and normalized relative to the indexed root.
 pub(crate) fn decode_file_entries(data: &[u8]) -> crate::Result<Vec<(u32, String)>> {
+    decode_file_entries_controlled(data, None)
+}
+
+pub(crate) fn decode_file_entries_controlled(
+    data: &[u8],
+    permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
+) -> crate::Result<Vec<(u32, String)>> {
     let mut entries = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
         if pos + 6 > data.len() {
             return Err(crate::Error::IndexCorrupted(format!(
                 "files.bin truncated: {} trailing bytes < 6-byte header",

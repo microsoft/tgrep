@@ -475,6 +475,14 @@ pub fn new_writer(opts: &SearchOptions) -> OutputWriter {
     OutputWriter::new(opts.make_output_config())
 }
 
+fn server_backend_label(result: &serde_json::Value) -> &'static str {
+    match result.get("backend").and_then(|value| value.as_str()) {
+        Some("shared-v1") => "shared daemon v1",
+        Some("shared-v2") => "shared daemon v2",
+        _ => "server",
+    }
+}
+
 /// List files that would be searched (`--files` mode).
 pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Result<()> {
     let start = Instant::now();
@@ -523,10 +531,10 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
                     .ok_or_else(|| anyhow::anyhow!("shared response omitted files"))?
                     .clone(),
             )?;
-            Ok((view.root, scope, paths))
+            Ok((view.root, scope, paths, server_backend_label(&result)))
         })();
         match result {
-            Ok((index_root, scope, paths)) => {
+            Ok((index_root, scope, paths, backend)) => {
                 write_indexed_file_paths(
                     &index_root,
                     &root,
@@ -538,7 +546,7 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
                     opts,
                 )?;
                 if opts.stats {
-                    eprintln!("Filename search completed (via shared daemon v1)");
+                    eprintln!("Filename search completed (via {backend})");
                 }
                 return Ok(());
             }
@@ -1353,11 +1361,7 @@ fn render_server_result(
             print_index_stats(plan, raw, candidates, total);
             narrowing_note = index_narrowing_note(raw, total);
         }
-        let backend = if result.get("backend").and_then(|v| v.as_str()) == Some("shared-v1") {
-            "shared daemon v1"
-        } else {
-            "server"
-        };
+        let backend = server_backend_label(result);
         eprintln!(
             "{num} matches ({lines} matched lines) in {elapsed:.1}ms (via {backend}){narrowing_note}"
         );
@@ -2319,6 +2323,24 @@ pub(crate) fn plan_summary(plan: &QueryPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_labels_distinguish_managed_and_legacy_shared_responses() {
+        for (result, expected) in [
+            (
+                serde_json::json!({"backend":"shared-v1"}),
+                "shared daemon v1",
+            ),
+            (
+                serde_json::json!({"backend":"shared-v2"}),
+                "shared daemon v2",
+            ),
+            (serde_json::json!({}), "server"),
+            (serde_json::json!({"backend":"server"}), "server"),
+        ] {
+            assert_eq!(server_backend_label(&result), expected);
+        }
+    }
 
     #[test]
     fn pattern_file_lines_are_verbatim_except_for_line_endings() {

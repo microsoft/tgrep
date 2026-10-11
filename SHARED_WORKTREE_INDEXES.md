@@ -1,12 +1,12 @@
 # Shared worktree index design
 
-**Status:** end-state architecture with the shared-reader and overlay-checkpoint
-foundation implemented in [PR #168](https://github.com/microsoft/tgrep/pull/168),
-with [committed-tree base generations](tgrep-core/src/generations/mod.rs) and
-[core worktree synchronization](tgrep-core/src/worktrees.rs) implemented.
-The opt-in [repository daemon](tgrep-cli/src/serve/shared/mod.rs) now provides
-leases, native/poll synchronization and automatic query discovery after explicit
-attachment. Legacy single-root CLI/server behavior remains the default.
+**Status:** shared readers, committed-tree generations, private reconciliation
+and the opt-in repository daemon are implemented. The default shared **v1**
+contract remains retain-all and fixed-pin. Explicit **managed v2** additionally
+provides atomic advancement, owner guards, reference-aware collection, allocations
+and storage-only maintenance. See the [managed contract](#managed-client-contract)
+below; the earlier sections describe the architecture and legacy v1 behavior.
+Ordinary single-root CLI/server behavior remains the default.
 
 ## Goal and ownership
 
@@ -215,8 +215,8 @@ Building B2 should reuse compatible unchanged postings and extract only changed
 content. It can still require streaming/writing a new full index generation;
 avoiding extraction does not eliminate publication I/O.
 
-Initially, do not migrate active sessions automatically. A checkout or rebase
-can be represented by recomputing that worktree's overlay against its pinned
+In default v1 mode, active sessions do not migrate automatically. A checkout or
+rebase can be represented by recomputing that worktree's overlay against its pinned
 base. An explicit base migration must instead recompute the delta against the
 new base and atomically publish the new base-and-overlay pair. Swapping only
 the reader would give the overlay the wrong meaning.
@@ -226,14 +226,15 @@ restorable checkpoint needs them. A retention policy may evict idle checkpoints
 and release their pins; restoration must then rebuild/reconcile, not silently
 substitute another base. Defer removal of mapped generations on Windows.
 
-The current core manager deliberately implements **retain-all**, not online GC:
+The legacy `GenerationManager` implements **retain-all**, not online GC:
 it never deletes or rewrites a published generation, even when its last
 `Arc<Generation>` pin is dropped. This also protects escaped readers/views and
 restorable checkpoints across process restarts. There is no deletion API or
-automatic active-session migration. Reclaiming storage offline requires stopping
-all users and discarding dependent checkpoints. A later daemon can introduce
-ownership-aware retention and resource budgets; absence of a live in-process pin
-alone is not proof that a generation is deletable.
+automatic active-session migration in that manager. Reclaiming legacy storage
+offline requires stopping all users and discarding dependent checkpoints. The
+managed v2 adapter described below adds ownership-aware retention and resource
+budgets in a separate namespace; absence of a live in-process pin alone is not
+proof that a generation is deletable.
 
 ## Persistence and compatibility
 
@@ -479,11 +480,13 @@ contents are not followed as a filesystem link.
 Restoration validates the exact generation key, base bytes and canonical root but
 does not restore readiness or trusted read evidence; first reconciliation may
 re-extract restored private postings. Missing/stale/invalid state is an explicit
-recoverable error, not an empty overlay. Bases remain immutable and retain-all.
+recoverable error, not an empty overlay. Legacy bases remain immutable and
+retain-all.
 
-This core layer does **not** own native watchers, automatic shared CLI serving,
-daemon routing/wire schemas or content caches. Existing CLI/server behavior is
-unchanged unless a worktree is explicitly attached to the daemon described below.
+This fixed-generation `WorktreeView` layer does **not** own native watchers,
+automatic shared CLI serving, daemon routing/wire schemas or content caches.
+Existing CLI/server behavior is unchanged unless a worktree is explicitly
+attached to the daemon described below.
 
 ## Daemon wire contract v1
 
@@ -698,8 +701,8 @@ The supervisor persists caller-owned tokens outside worktrees before spawning
 actual client processes. It combines simultaneous callers, repeated/lost-response
 attach at the lease limit, explicit crash/timeout cancellation, journal-based
 abandoned-lease recovery, daemon restart with fresh tokens, budget release and
-detach-before-move/remove while a sibling keeps querying. Abandoned leases remain
-live until the runtime explicitly releases them; there is no expiry or GC.
+detach-before-move/remove while a sibling keeps querying. Abandoned v1 leases remain
+live until the runtime explicitly releases them; they have no expiry or GC.
 File-backed child output avoids pipe deadlocks, RPC/start/stop waits are bounded,
 and owned child guards kill/reap only their own PIDs on failure. The ignored
 `runtime::runtime_client_process` test is a subprocess entry point invoked by the
@@ -724,6 +727,8 @@ The implemented increments are additive; shared serving requires explicit opt-in
 | [`Worktree synchronization`](tgrep-core/src/worktrees.rs) | Pinned private views, actual-content verification, atomic readiness/membership, bounded invalidations, full repair and bound checkpoints |
 | [`Synchronization coverage`](tgrep-core/src/worktrees/tests.rs) | Real divergent worktrees, scan/candidate parity, CRLF/smudge/decoding, sparse/assume-unchanged, filtering, epochs, errors and extraction counts |
 | Shared CLI/daemon routing and native watchers | Versioned leases, discovery, bounded workers/watchers/hints, full repair, delta checkpoints, strict scan fallback |
+| [Managed lifecycle](tgrep-core/src/managed/mod.rs) | Isolated guarded storage, transactional catalog, owner lifetimes, versioned migration, allocation admission, bounded collection and offline maintenance |
+| [Managed CLI/RPC](tgrep-cli/src/serve/shared/managed.rs) | Negotiation, asynchronous operation receipts, owner holder, recovery, adaptive scheduling, live diagnostics and atomic idle shutdown |
 
 Shared-base validation rejects mismatched empty lookup/posting sections and
 metadata counts inconsistent with the opened sections, while allowing empty
@@ -740,23 +745,698 @@ cannot redirect publication into the base. Root identities preserve the existing
 JSON string encoding for Unicode paths and use tagged platform-native units for
 non-Unicode Unix/Windows paths; older readers reject the latter representation.
 
-Merge the foundation independently once its normal review and checks are
-satisfied; do not expand it into the entire feature. Keep follow-up work in
-reviewable increments, each with its own correctness coverage:
+Both modes keep one shared base plus one private overlay per worktree, using
+the same builder, matcher, rooted reads, reconciliation and query pipeline.
+Managed lifecycle does not introduce a second search engine or a shared mutable
+branch overlay.
 
-1. **Base generations (implemented):** Git tree/profile identity, immutable
-   build/publication, incremental reuse, pins and conservative retain-all.
-2. **Worktree synchronization (implemented):** complete delta discovery, private membership,
-   watchers/reconciliation, checkpoint recovery, and readiness gating.
-3. **Daemon and integration (implemented, opt-in):** worktree registration/routing, CLI discovery,
-   versioned agent runtime integration, resource budgets, and scan fallback.
+## Managed storage and lifetime boundary
 
-Before enabling automatic shared mode, verify isolated results against scans
-for divergent branches, edits/deletes/renames, ignore changes, checkout
-transformations, sparse worktrees, watcher loss, and restarts. Exercise existing
-single-root clients and formats on supported platforms. Measure content
-extraction, startup work, memory, and publication I/O separately.
+`serve --shared ROOT --shared-storage CACHE_PARENT --shared-policy POLICY_FILE`
+opts into protocol/storage schema 2. `CACHE_PARENT` must already exist and be
+trusted. The policy selects one immutable namespace storage kind:
 
-Keep the first implementation two-layered: one shared base plus one private
-overlay per worktree. Content-addressed caches, shared branch intermediates, and
-automatic base migration can follow only if measured workloads justify them.
+| Kind | Reader/storage contract |
+| --- | --- |
+| `managed` | Guarded generation/checkpoint format; published objects can be collected under bounded policy |
+| `compatibility-retain-all` | Adapter over legacy generation storage; v1 participants remain fixed-pin and legacy objects are never collected |
+| No policy file | Original v1 daemon, layout, flags, leases and retain-all behavior |
+
+The managed namespace is `CACHE_PARENT/tgrep-managed-v2/<repository-id>`.
+Repository identity derives from the canonical native Git common-directory
+identity, not a remote URL, branch name or disposable worktree. Two repositories
+may use the same cache parent without sharing catalogs, accounting or authority.
+
+```text
+namespace.json        schema, namespace/repository and filesystem identities
+owner.lock            exclusive namespace owner: daemon OR maintenance
+activity.lock         admission/idle boundary, including independent readers
+catalog.sqlite        transactional object/reference/operation/current-view catalog
+guards/               per-incarnation and worktree-root lifetime guards
+owners/               issued owner guard files and sealed instance challenges
+objects/<physical-id> managed generation or checkpoint incarnation
+```
+
+Managed generation files use `paths.tgm`, `lookup.tgm`, `postings.tgm`,
+`meta.tgm` and `generation.tgm`, incompatible magic and file-table format
+`0x4d320001`. Old and unguarded readers reject them even under renamed legacy
+filenames. No legacy-readable intermediate is published inside the managed
+namespace. Ordinary index commands also refuse a store directory itself and
+paths beneath its 64-hex repository namespaces, compared lexically and
+case-insensitively; an unrelated directory that merely shares the store name
+stays usable. Existing v1 stores are not converted or retroactively made collectible.
+
+Managed namespaces also require a supported content-authentication format.
+Missing or incompatible producer proof is not upgraded by hashing whatever
+bytes happen to be present. This boundary is separate from protocol negotiation:
+ordinary indexes and default v1 retain-all namespaces keep their existing format.
+
+Each publication has a fresh physical incarnation independent of its logical
+repository/tree/profile key. A delayed deletion of an old incarnation cannot
+delete a replacement for the same logical key. Catalog, namespace and instance
+IDs are opaque 32-character lowercase hexadecimal identifiers, not paths or
+authorization credentials.
+
+`managed::open_generation` and the managed generation/checkpoint adapters acquire
+OS-backed protection before opening data. Protection follows escaped
+`Arc<Generation>`, `SharedBase`, `IndexReader`, derived worktree views, snapshots
+and rooted candidate handles, including independent processes. It also covers
+build predecessors, checkpoint restore and both sides of migration. Local
+`Arc` counts alone are not reclamation evidence. Per-object guards allow an
+unrelated obsolete object to be collected while ready views continue serving;
+the namespace activity guard is used for idle shutdown, not to block all GC.
+Guard acquisition is authorized against the current catalog state while
+retirement is excluded. A stale root, owner claim or generation open cannot
+probe a retired guard and disrupt its physical reclamation. Releasing the last
+root handle withdraws that incarnation; bounded maintenance reclaims its control
+file separately, so successful handle release does not wait for physical GC.
+Owner release and released-view draining use that same withdrawal path. An
+unrelated control-file cleanup cannot fail a committed logical owner release;
+the retired root guard remains accounted for until bounded maintenance removes
+it. Root-lifetime verification and physical-cleanup failures remain explicit
+errors in their respective operations.
+
+Namespace ownership is rooted in external storage and survives repository
+deletion. Live startup also coordinates through the repository's common-directory
+ownership lock, excluding simultaneous legacy and managed daemons. Catalog and
+filesystem identities are checked together. Traversal/deletion is relative to
+validated directory handles, with native Windows sharing/reparse checks and
+Unix no-follow identity checks. Unknown files, symlinks, reparse points, hard
+links, replaced members and foreign directories are preserved with diagnostics.
+There is no broad directory sweep and no online deletion of another namespace.
+
+Managed storage must remain private to tgrep. Clients use the management API;
+they must not edit catalog records, member files or ownership guards. Native
+locks coordinate cooperating tgrep readers and writers. Content verification
+additionally detects external changes, but the storage owner is not a security
+boundary against another process able to alter its files and authoritative
+catalog. In particular, a final identity/content-version check followed by a
+filesystem operation is not an atomic conditional deletion against an arbitrary
+concurrent foreign writer. Do not modify the namespace while maintenance runs.
+This limitation never authorizes ignoring detected changes: modified, unknown
+or incompatible entries encountered before a destructive unit are preserved
+and reported, even when doing so leaves a storage-budget shortfall.
+
+### Producer-content authentication
+
+Immutable members have producer-origin BLAKE3 proof for fixed 4096-byte blocks,
+including the exact length of a partial final block. Their complete descriptor
+binds the intended total length, block count and ordered proof manifest to the
+physical incarnation and member. Proof is derived from byte slices accepted by
+the writer, not later filesystem observations. An empty member also requires a
+complete descriptor; an absent descriptor is not evidence of an empty file.
+
+Proof rows consume catalog/database/WAL capacity, and bounded hash buffers and
+proof batches consume charged private working memory. They are not an uncounted
+sidecar or a second full payload copy. Admission can therefore fail on metadata
+or private-work limits before the payload storage target is reached.
+
+The original creation handle establishes file identity and ownership-sensitive
+metadata. Verification checks regular-file/single-link structure, permissions,
+owner/group or security descriptor, and relevant native attributes as well as
+content. Basic timestamps, including Windows ChangeTime, are neither a seal nor
+an unchanged-content fast path. Bookkeeping-only metadata drift can be accepted
+only when producer content and ownership-sensitive metadata still match.
+
+## Managed policy
+
+The policy file is a complete JSON object; fields have no silent unlimited
+defaults, and unknown fields/unsupported schemas are errors. This illustrative
+policy opts into managed storage but retains fixed-pin/retain-all behavior:
+
+```json
+{
+  "schema": 2,
+  "storage": "managed",
+  "retention": {"mode": "retain-all"},
+  "advancement": {"mode": "fixed"},
+  "work": {
+    "max_views": 32,
+    "max_leases": 256,
+    "workers": 2,
+    "queue_items": 64,
+    "staging_bytes": 536870912,
+    "private_work_bytes": 134217728,
+    "sort_buffer_bytes": 1048576,
+    "blob_bytes": 8388608,
+    "operation_timeout_ms": 120000,
+    "page_objects": 128,
+    "max_cursors": 16,
+    "cursor_lifetime_ms": 30000,
+    "max_receipts": 4096,
+    "metadata_bytes": 67108864
+  },
+  "collection": {
+    "schedule": {"mode": "periodic", "interval_ms": 60000},
+    "on_pressure": true,
+    "checkpoint_grace_ms": 300000,
+    "generation_grace_ms": 3600000,
+    "max_duration_ms": 200,
+    "max_examined": 128,
+    "max_removed": 16,
+    "max_delete_bytes": 16777216,
+    "chunk_bytes": 65536,
+    "max_pages": 16,
+    "retry_ms": 1000
+  }
+}
+```
+
+These are example allocations, not machine-independent recommended budgets.
+Choose `blob_bytes` for the eligible corpus: a too-small input budget fails
+attachment rather than silently omitting an eligible large file.
+
+For bounded retention, replace `retention` with
+`{"mode":"bounded","target_bytes":1073741824}`. Only managed storage accepts it.
+For automatic advancement, replace `advancement` with:
+
+```json
+{
+  "mode": "adaptive",
+  "high_bytes": 67108864,
+  "low_bytes": 16777216,
+  "min_reduction_bytes": 8388608,
+  "min_reduction_percent": 50,
+  "cooldown_ms": 300000,
+  "max_paths": 10000,
+  "max_read_bytes": 134217728,
+  "max_attempts": 3
+}
+```
+
+`{"mode":"disabled"}` disables periodic collection; `on_pressure` separately
+controls pressure-triggered collection. Retain-all still permits safe recovery
+of abandoned staging/control state; it never authorizes reclaiming published
+generations or checkpoints.
+
+| Units/field | Accepted range or invariant |
+| --- | --- |
+| Bytes | Positive integers through signed 64-bit maximum unless stated otherwise; not percentages or free-space promises |
+| Durations | Integer milliseconds, positive and representable by the monotonic clock; grace intervals may be zero |
+| Views / leases | `1..1024` / `1..65536` |
+| Workers / queue items | `1..64` / `1..65536` |
+| Page objects / open cursors | Each `1..1024` |
+| Receipt count / metadata | `1..1000000` / at least 1 MiB |
+| Sort buffer | At least 16 KiB and representable by the platform address size |
+| Private admission | Must cover each worker's four sort buffers, six blob buffers and 256 KiB, plus subsequently admitted work/retained state |
+| Collection examined / removed / pages | Each `1..1000000`; all limits apply, not just successful removals |
+| Deletion chunk | At least 4096 bytes, no greater than `max_delete_bytes` |
+| Adaptive watermarks | `0 <= low_bytes < high_bytes` |
+| Adaptive reduction / paths / attempts | `1..100` percent / `1..1000000` paths / `1..64` attempts |
+
+Policy and allocation versions are separate compare-and-swap domains. The
+initial local allocation is version 1, has no coordinator or additional storage
+ceiling, and takes staging/private/work-slot ceilings from the policy. A
+coordinator can install:
+
+```json
+{
+  "version": 1,
+  "coordinator": "<coordinator-id-or-null>",
+  "storage_bytes": 2147483648,
+  "staging_bytes": 536870912,
+  "private_work_bytes": 134217728,
+  "work_slots": 2
+}
+```
+
+Use JSON `null`, not a string, for an absent coordinator or storage ceiling.
+The update's `expected_version` selects the current allocation; the server
+publishes the new allocation with that version plus one. Byte values are
+positive and work slots are `1..64`. Policy and allocation both constrain
+admission. Reducing an allocation does not revoke live readers or pretend
+already-admitted work vanished; later work can receive resource pressure.
+
+Reservations cover workers, private capacity, staging, predecessor/successor
+publication overlap and retained private state. `charged_overlap_logical_bytes`
+is the current retained-plus-unconsumed reservation charge, not a historical
+peak or physical disk consumption. Catalog/control storage, immutable data and
+staging have separate accounting. Allocated filesystem bytes use explicit
+observed/unavailable results; sparse/compressed allocation is not inferred from
+logical length. Namespace memory is process-local admitted/retained capacity
+and mappings, **not an RSS cap**. A coordinator must budget multiple namespaces
+and its other processes independently.
+
+## Managed client contract
+
+Use `tgrep shared manage ROOT METHOD --params JSON`. It discovers and validates
+the daemon and emits one `{"ok":true,"result":...}` result or
+`{"ok":false,"error":...}` failure; failures also have a nonzero exit status.
+For direct loopback RPC, send a newline-terminated JSON-RPC 2.0 request containing
+`protocol:2`, the discovered `namespace`, `instance`, `repository`, `method`,
+`params`, `id` and the private `authorization` credential described below.
+Successful RPC results repeat those identities and place
+method data in `result.data`. Never reuse a stale daemon registration solely
+because its PID or port still exists. Request/response limits are negotiated
+by `hello` (currently 1 MiB / 64 MiB).
+
+Call `hello` before constructing requests. It returns capabilities, storage
+semantics, indexing profile, effective versioned policy/allocation and
+directory-sync capability. Copy its `profile` into view requests; a profile
+mismatch is an error, not a silently different corpus.
+
+### Per-user RPC authentication
+
+Loopback alone is not a per-user boundary. Every request to a managed daemon,
+including `hello`, queries and compatibility-v1 requests, must authenticate
+before dispatch. Each daemon creates a fresh 128-bit OS-random bearer credential
+and atomically publishes `tgrep-daemon-v2.auth.json` beside its public
+`tgrep-daemon-v2.json` registration in the Git common directory. The private file
+contains `{"registration":<complete-public-registration>,"token":"<credential>",
+"legacy_token":"<compatibility-credential>"}`.
+The v2 request's top-level `authorization` field carries that token. Namespace,
+instance, owner, lease and operation IDs are not substitutes for it.
+
+`shared manage` and normal managed queries load credentials automatically.
+A direct client must verify native owner-only access, read the bounded private
+file, and compare its **complete registration**, including endpoint and instance,
+with discovery before connecting. `tgrep_core::managed::read_private_control_file`
+performs the native file checks. The daemon advertises
+`private-rpc-authentication` in `hello`; clients must not fall back to
+unauthenticated RPC when a credential is missing, stale or inaccessible.
+Invalid credentials return `permission` / `rpc-authentication-failed`,
+non-retryable and `not-committed`. A changed public registration is rejected
+locally as `stale-identity` / `rpc-registration-mismatch`.
+
+Private files are created with owner-only access **before writing any secret**:
+Unix owner UID and mode `0600`, or a protected Windows DACL granting only the
+daemon's user SID. Readers reject symlinks, external hard links, foreign owners
+and broader permissions. Darwin extended ACLs are conservatively rejected,
+including inherited ACLs, rather than assuming mode bits exclude other users.
+Do not copy these files into logs or shared configuration. Credentials rotate
+at daemon restart and are removed by identity during normal shutdown.
+
+In `compatibility-retain-all`, genuine v1 clients continue to use their existing
+wire format. Their owner-only v1 daemon/view markers carry a separate private capability
+in the opaque v1 `instance` field; that value is **not** the public v2 instance ID.
+The adapter validates it before entering any legacy handler; it cannot authorize
+v2 requests. V1 responses echo this capability as their `instance`, so keep those
+responses private too. Default v1 daemons
+started without `--shared-policy` retain their existing transport and behavior.
+This boundary excludes privileged OS administrators and arbitrary same-user
+writers, as does the trusted-storage contract.
+
+### Ownership, operation tokens and attachment
+
+1. Persist a bootstrap token, then call `owners.prepare` with
+   `{"token":"<bootstrap-token>"}`. Retry that token to recover the same issued
+   claim after response loss. Persist the result's `claim` object outside the
+   worktree, not the whole owner record or CLI envelope.
+   Claim files are limited to 1 MiB, including whitespace; larger files are
+   rejected before deserialization or acquiring the owner guard.
+2. Start and supervise `tgrep shared owner-hold --claim CLAIM_FILE`, keeping its
+   stdin open. After its `holding:true` response, call `owners.register` with
+   `{"claim":<issued-claim>}`. A Rust client can instead retain `OwnerGuard`.
+3. Persist a unique lease token and the complete operation token/request before
+   calling `views.attach`. Poll `operations.inspect`, then verify `views.status`
+   or `lookup` reports ready. A routing-ready daemon is not a search-ready view.
+4. On teardown, call `views.detach` for every lease and inspect its drain result,
+   then `owners.release` with the claim. Release the holder only when its owned
+   lifetime is over. Do not remove a worktree while retained readers/root handles
+   still protect it.
+
+Caller tokens contain 1..128 ASCII letters, digits, hyphens or underscores.
+Operation tokens have a monotonically allocated, persisted sequence within
+their owner scope:
+
+```json
+{
+  "token": {"scope": "<owner-id>", "sequence": 1, "token": "attach-session-a"},
+  "request": {
+    "root": "<canonical-worktree-root>",
+    "revision": "<exact-starting-commit>",
+    "profile": "<copy-the-hello-profile-object>",
+    "lease": "session-a",
+    "owner": "<owner-id>",
+    "accept_current": null,
+    "migratable": true,
+    "allocation_version": 1
+  }
+}
+```
+
+The profile placeholder above stands for the JSON object, not a string.
+`migratable:false` is a fixed-pin participant. Joining an already active view
+requires `accept_current:{"view":"<id>","version":N}` after reading its
+authoritative state. Legacy participants cannot acknowledge an advanced pin.
+An inactive view requires a fresh attachment with an explicit revision rather
+than `accept_current`.
+
+Reuse the **identical token, sequence, method and request** after response loss.
+`operations.lookup` accepts the operation token directly, even when the original
+response containing an operation ID was lost. Reusing a token for a different
+request is invalid. Persist terminal results before advancing
+`operations.acknowledge` with `{"scope":"<owner-id>","through":N}`. The durable
+receipt floor prevents an acknowledged old token from being interpreted as new
+work. Receipt expiration is an explicit error, never proof that nothing committed.
+
+A failed or cancelled receipt is terminal: replaying its token does not execute
+another attempt. A retryable failure with authoritative `not-committed` state
+permits a bounded new attempt with a fresh operation token, after checking that
+the expected view/version and exact pin still hold. Keep the original lease
+token and attachment inputs unchanged; do not silently accept a newer version.
+An uncommitted operation can already have saved lease intent and progress; the
+fresh operation token resumes that same lease rather than duplicating it.
+For example, native catalog writer contention can return `busy`/`catalog-io`
+without committing a view. Committed or unknown outcomes require recovery, not
+retry-as-new. Bound both attempts and total waiting time.
+
+For an initial attachment there may be no committed pin yet. Use the catalog
+`lookup` and `views.recover` results to distinguish an absent root from a saved
+pending exact intent; neither a failed receipt nor an absent root proves that
+all preparation state was rolled back. Retain the owner and lease identity,
+check any saved pending view/version/target, and retry only an already captured
+exact commit, not a freshly resolved symbolic name. An acceptance or completion
+whose response was lost still requires the original operation token, even if
+the view is now published. Reserve a fresh sequence for each authorized new
+attempt and start subsequent operations after the last sequence consumed.
+
+Ownership is bound to an issued namespace/instance challenge and the identity
+of an OS-locked guard. Death is positively proved only by acquiring that same
+guard. Missing/replaced/inaccessible files, PID reuse, disconnected clients and
+elapsed time are not death evidence. Unknown proof protects the owner. A
+registered lifetime cannot be reacquired after it ends. Prepared-but-unregistered
+claims are not automatically treated as dead. Legacy ownerless leases retain
+their original no-expiry semantics.
+
+On restart, negotiate the new instance and establish fresh owners/leases.
+`views.recover` returns the durable exact current pin/version/checkpoint separately
+from original attachment intent. Recover lost operation results as well; do not
+mistake the original starting revision for the current base or infer readiness
+from a saved checkpoint. Restored contents are reconciled before indexed use.
+Unavailable Git objects, absent/evicted cache and incompatible/corrupt metadata
+are distinguishable outcomes.
+
+### Advancing and reconciling views
+
+`views.advance` uses the operation envelope above with this request:
+
+```json
+{
+  "view": "<view-id>",
+  "root": "<canonical-worktree-root>",
+  "expected_version": 1,
+  "target_commit": "<exact-target-commit>",
+  "profile": "<copy-the-hello-profile-object>",
+  "owner": "<owner-id>",
+  "allocation_version": 1
+}
+```
+
+It deduplicates/reuses a compatible target generation, privately prepares a
+complete replacement overlay/membership/checkpoint and forwards invalidations
+to preparation. The old valid view and unrelated worktrees keep serving.
+Publication requires a reconciled input epoch and expected version; current
+commit/generation/version/checkpoint and the receipt commit transactionally
+before acknowledgement. The complete in-memory state then swaps atomically.
+Already-issued snapshots keep the old generation and root protection.
+
+Cancellation before commitment preserves the old authoritative view. Cancellation,
+timeout or response loss after commitment cannot undo the new pin: inspect the
+operation and authoritative record. Failed/concurrently invalidated preparation
+has bounded retry and releases or conservatively charges its staging; it never
+publishes a base-only or partially reconciled ready view.
+
+If commitment succeeds but the in-memory swap fails, readiness stays closed
+until reconciliation restores the authoritative publication. Recovery compares
+the full pin/checkpoint/epoch binding, not just the view version: an ordinary
+refresh can commit a new checkpoint without advancing the version. The live
+scheduler and explicit refresh can repair this state without restarting.
+Version-checked invalidations use the durable current version throughout repair;
+already-issued readers retain their original protections.
+
+`views.refresh` takes `view`, `expected_version`, `owner`, `allocation_version`
+in an operation envelope and performs full verification. `views.invalidate`
+directly accepts `view`, `expected_version`, `owner`, `changed` (relative paths)
+and `full`; include both rename paths. A processed epoch acknowledges observed
+inputs, not every concurrent filesystem write. Native/poll watching and full
+repair use the same reconciliation path. Git metadata events use the most
+specific matching metadata root, including a linked worktree's private Git
+directory nested under the common directory; lock-file traffic is ignored.
+`--no-index` remains the way to search
+current disk bytes without relying on watcher delivery.
+
+Queued background reconciliation can be satisfied by a later completed refresh.
+Under the view's work/publication gates, tgrep checks the exact current pin,
+checkpoint and input epoch before completing such a job without changing the
+ready view or invalidating its readers. Its original token/request is retained;
+the terminal receipt reports `coalesced: true`, the existing reconciled epoch
+and zero new reconciliation work. This does not postpone periodic verification.
+Explicit refresh always verifies; periodic repair, watcher uncertainty and
+rescan events invalidate for full verification before queuing reconciliation.
+A newer invalidation therefore cannot be skipped by the coalescing check.
+
+`views.adaptive` takes `view`, `owner`, `expected_version`, `allocation_version`
+in an operation envelope. Adaptive policy evaluates the worktree's captured
+exact `HEAD`, not another branch tip. It uses bounded actual-content work,
+high/low watermarks, minimum absolute/percentage reduction, cooldown and attempt
+limits, then invokes the same migration engine. Fixed-pin participants block
+it. Untracked-only churn, unchanged targets, and ineffective checkout
+transformations do not repeatedly publish ineffective generations.
+An eligible decision and its exact target/input epoch are persisted with the
+logical attempt count. Transient worker or object-guard contention can defer
+that same operation within its deadline without consuming another adaptive
+attempt, reapplying cooldown, or selecting a later `HEAD`.
+
+### Management method reference
+
+| Methods | Parameters / result purpose |
+| --- | --- |
+| `hello`, `namespace.status`, `maintenance.status` | `{}`; negotiated contract, accounting, native memory and bounded scheduler/recovery/collection diagnostics |
+| `lookup` | `{"root":<canonical-root>}`; live versioned routing/ready state |
+| `views.status` | `{"id":<view-id>}`; live view details |
+| `views.recover` | `{"id":<view-id>}`; authoritative persisted current state |
+| `objects.page`, `objects.inspect` | `{"cursor":null-or-returned-cursor}` / `{"id":<physical-id>}` |
+| `objects.references`, `objects.eligibility` | `{"id":<physical-id>}`; reference reasons and current eligibility |
+| `storage.inspect`, `storage.inventory` | `{"cursor":null-or-returned-cursor}`; bounded catalog accounting or actual filesystem inventory, including unknown entries |
+| `cursors.close`, `storage.inventory.close` | The returned cursor object directly; release its bounded lifetime |
+| `collections.preview` | `{"cursor":null-or-returned-cursor}`; candidate/reason/accounting page, not deletion authority |
+| `owners.inspect`, `owners.reap` | `{"id":<owner-id>}`; current proof, or explicit positive-proof reaping |
+| `owners.page`, `operations.pending` | `{"after":null-or-last-id}`; bounded keyset pages, not a stable catalog snapshot |
+| `operations.inspect`, `operations.cancel` | `{"id":<operation-id>}`; durable receipt/current cancellation outcome |
+| `operations.lookup` | Complete operation token directly |
+| `operations.acknowledge` | `{"scope":<scope-id>,"through":N}`; terminal receipt acknowledgement floor |
+| `views.detach` | `{"owner":<owner-id>,"lease":<lease-token>}`; idempotent lease release and remaining reader/root drain state |
+| `metadata.start`, `collections.start` | Owner-scoped operation envelope; asynchronous live admission |
+| `metadata.run`, `collections.run`, `maintenance.recover` | Namespace-scoped envelope; authorized bounded offline work |
+| `stop-if-idle` | `{"token":<namespace-scoped-operation-token>}`; live atomic admission closure and all-category idle decision |
+
+Metadata requests are tagged by `method` and `params`:
+
+```json
+{"method":"policy","params":{"expected_version":1,"policy":{}}}
+{"method":"allocation","params":{"expected_version":1,"allocation":{}}}
+{"method":"retain","params":{"object":"<physical-id>"}}
+{"method":"release","params":{"reference":"<persistent-reference-id>"}}
+```
+
+Replace the empty objects with complete validated policy/allocation objects.
+Retain creates an explicit persistent cache reference; release names that
+reference, not the object's original attach intent. Metadata changes and their
+original operation receipt commit together.
+
+## Managed maintenance and durability
+
+Catalog listing/inspection/preview cursors preserve bounded snapshot ordering
+while the live catalog changes. They are instance-bound, expire explicitly,
+consume cursor budget and can be closed. Collection continuation is separate:
+it stores bounded traversal/member progress and **rechecks current** references,
+identity, policy, allocation, grace and OS locks at each eligibility/deletion
+boundary. Replaying a preview page cannot authorize deletion.
+
+For a collection operation, use:
+
+```json
+{
+  "policy_version": 1,
+  "allocation_version": 1,
+  "bounds": {
+    "max_duration_ms": 200,
+    "max_examined": 128,
+    "max_removed": 16,
+    "max_delete_bytes": 16777216,
+    "max_pages": 16
+  },
+  "cursor": null
+}
+```
+
+Caller bounds may tighten, not enlarge, policy bounds. Persist the returned
+`next` cursor and use a new operation token for the next pass; retry the old token
+only to recover that pass's receipt. A one-page pass can resume an already
+selected object's members without spending its only page selecting it again.
+
+Checkpoints are delta-only, bound to exact namespace, repository, root identity,
+view/version, base key/incarnation/fingerprint and processed epoch. Publication
+atomically updates the current binding. Collection withdraws a checkpoint
+before releasing its generation edge. Generation/checkpoint lifecycle is:
+`Published -> Retired -> PendingDeletion -> Removed`. New references cannot
+resurrect a retired physical incarnation. Active views, migration/build inputs,
+live old readers, restores and persistent retains protect their objects.
+
+Creation intent precedes filesystem creation. Writers are not sealed merely
+because a file was synced; open/unfinished producers cannot be published.
+An interrupted producer can leave payload bytes with only a prefix of durable
+proof. Such unsealed or unexpectedly changed objects remain quarantined and
+conservatively charged; proving producer death alone does not make missing
+content proof trustworthy. Recovery may validate an already complete intended
+seal, but never synthesizes one from the abandoned bytes.
+Deletion journals exact owned identities and each bounded physical step before
+performing it, then records the result. Authentication-block-aligned tail
+truncations and final unlink cannot exceed the remaining deletion-byte budget.
+After interruption, the exact journaled target length alone is not success:
+recovery verifies every surviving prefix block against the original producer
+proof before crediting the removed tail. A rewritten prefix at that same length
+is preserved with no recovered credit. A missing member is recoverable only
+from the corresponding authenticated unlink intent, not from an existing
+zero-length file or a generic missing-file error.
+Reclaimed logical/allocated bytes are credited only from verified physical
+results. Sharing violations, retained Windows mappings, permission failures,
+unknown owners and missing evidence remain explicit skips/errors, not fake
+successful reclamation. Retrying uses a fresh bounded pass.
+
+Content verification is separately bounded work, not reclaimed space. A pass
+uses `max_delete_bytes` as a separate verification-byte allowance, with proof
+pages also subject to page, duration, cancellation and allocation checks.
+Consequently, deletion-byte limits are not a claim about total physical I/O.
+A member larger than one pass can resume verification using a bounded, volatile
+context; verification bytes, invalidations and retained resources are reported
+separately. Restart, cancellation, expiration or loss of valid native evidence
+discards that context. Policy/allocation version changes also discard all cached
+proof, but can keep a still-valid native guard for the same member while
+restarting authentication at the first byte. Durable deletion intents do not
+preserve authority over an earlier verified prefix. Read-only inventory
+duplicates a matching cached descriptor rather than breaking its native lease
+with a new open; an active verifier can produce a typed retryable busy finding.
+One short-lived control-file verifier per namespace holds an OS-backed activity
+guard. Open admission checks its exact directory/member identity. A competing
+cleaner, inventory pass or owner probe for that member reports retryable
+contention rather than attempting a new open that would break a Linux lease.
+Other control members remain accessible. This is not a persistent
+namespace-wide reader pin: unrelated ready views continue serving, and
+maintenance can retry after the bounded control operation ends.
+If this admission conflict interrupts a collection unit, its typed Busy detail
+is reported as a skip, not a failed deletion. The continuation retains that
+exact object, including any already credited member removals; it never reports
+the object's removal complete until its remaining control cleanup finishes.
+
+Native evidence is checked around each verification page and immediately before
+destructive I/O:
+
+- Windows retains the same deny-write/delete-sharing handle through verification
+  and the destructive unit. Conflicting handles or retained writable mappings
+  leave explicit pending work rather than weakening the sharing mode.
+- Linux uses an exclusive native file lease where supported. Break requests or
+  forced revocation invalidate the context; an old successful acquisition is
+  not proof that the lease is still held.
+- macOS uses a supported, nonzero native content generation and pinned-vnode
+  notifications. Missing evidence or a writable-mapped/zero-generation state
+  prevents collection. These are change observations, not writer exclusion.
+  The context is discarded after each tgrep truncation too: adopting its new
+  generation could otherwise hide an interleaved foreign prefix write. The
+  remaining prefix is authenticated again over subsequent bounded passes.
+
+Identity, ownership and actual length are rechecked around physical work.
+Detected interference or uncertainty is reported, not adopted as a new trusted
+seal for the next unit. Reverification can add substantial read work even when
+few bytes are deleted; diagnostics and measurements must include that cost.
+
+Grace is conservatively re-established after restart, clock rollback or missing
+age evidence. Byte targets are best effort under safety constraints; shortfalls
+include protected/unknown/retry reasons. Passes bound examined objects, successful
+removals, deletion bytes, pages and elapsed work, including partial-file
+continuations. In-flight OS calls may overrun a deadline; progress reports
+elapsed time and budget exhaustion rather than claiming hard real-time preemption.
+
+```bash
+tgrep shared discover /trusted/cache
+tgrep shared maintenance /trusted/cache/tgrep-managed-v2/<repository-id> hello
+tgrep shared maintenance /trusted/cache/tgrep-managed-v2/<repository-id> collections.preview
+tgrep shared maintenance /trusted/cache/tgrep-managed-v2/<repository-id> session --apply
+```
+
+Discovery streams bounded NDJSON pages. Maintenance opens storage directly,
+without Git or a surviving repository, under the same exclusive ownership lock
+as startup. Without `--apply` it cannot retire/delete objects or release
+references. With `--apply`, `metadata.run`, `collections.run` and
+`maintenance.recover` use persisted **namespace-scoped** operation tokens;
+live asynchronous `.start` is unavailable offline. Recovery requests are
+`{"cursor":null-or-returned-recovery-cursor}` and use policy bounds.
+Concurrent replay preserves the first completed, failed or cancelled recovery
+receipt. Newly eligible work requires a new token, not reuse of that receipt.
+
+A maintenance `session` accepts NDJSON
+`{"id":1,"method":"objects.page","params":{"cursor":null}}`
+and keeps one ownership/instance lifetime through EOF. Use it for cursor
+continuations; separate CLI invocations create different instances. Each reply
+has the caller's ID and an explicit `ok` result/error. It is not a background
+daemon and does not implicitly recreate a deleted repository.
+
+SQLite WAL transactions use FULL synchronization. Data is synced before catalog
+publication and directory entries are synced where the platform supports it.
+`hello.directory_sync` explicitly reports the Windows limitation; process-crash
+recovery is not a claim that unsupported directory flushes become power-loss
+guarantees. Recovery validates identities and sealed state before serving.
+On POSIX, catalog identity/accounting probes use no-open metadata observation:
+closing an independently opened database/sidecar descriptor can otherwise
+release SQLite's process-wide record locks.
+WAL truncation is attempted without waiting before catalog mutations, never
+after a successful commit. A retained SQLite snapshot does not reject indexed
+queries or lifecycle work while publication headroom remains. After acquiring
+the actual SQLite writer lock, every managed writer rechecks policy and
+physical lengths and reserves a complete publication: database growth, WAL
+headers and frames, worst-case FULL-sync sector padding (including VFSes
+without powersafe overwrite), and future WAL-index regions. Genuine exhausted
+headroom is a retryable, pre-mutation error; a durable WAL commit does not become
+a failed publication merely because truncation would have to wait for a reader.
+
+Within `metadata_bytes`, database page payload is capped at one third. SQLite
+files, including WAL, shared memory and any retained rollback journal, use at
+most five sixths; the remaining sixth covers bounded registered control files
+and the namespace header. New-work admission also checks observed total metadata.
+Externally enlarged anchors may exceed that target but do not prohibit bounded,
+reference-safe cleanup. Policy reductions must fit both existing pages and
+their own worst-case publication before commitment; a rejected reduction
+leaves the prior policy available for cleanup or a version-checked increase.
+
+All managed connections disable automatic checkpoints, page-cache spill and
+database mmap. The spill-disabled page payload bound is **per catalog
+connection**, with only one SQLite writer per namespace; the 256 KiB clean-cache
+setting is a soft target, not a hard memory limit. `maintenance.status` reports
+the latest primary writer's page/payload bounds, checkpoint result and observed
+native cache bytes before commit. Native cache bytes include pager headers but
+exclude other connections and non-pager SQLite allocations. These control-plane
+observations are separate from build-buffer reservations and are not aggregate
+RSS or process-heap limits.
+
+All managed failures have `category`, stable `reason_code`, `retryable`,
+`committed_state` (`not-committed`, `committed`, `unknown`) and local `detail`;
+operation ID/current version accompany relevant failures. Categories distinguish
+invalid input, busy, stale identity/version, evicted/missing cache, unavailable
+Git objects, incompatible/corrupt metadata, resource pressure, permission/I/O,
+cancelled/deadline, expired receipts and recovery-required. A transport failure
+after request transmission has unknown commitment, not automatic retry-as-new
+authorization. Recover the retained token and exact current state.
+
+`stop-if-idle` first closes admission, then accounts for leases, owners,
+reservations, operations and receipt readers, independent namespace/root/object
+guards, requests, queries, queued jobs and background batches. Idle verifier
+caches are discarded while active verification remains protected by its work
+lifetime. A retained cache alone does not make a daemon permanently busy.
+A busy decision reopens admission; a committed stop leaves it closed before exit.
+An uncommitted lock-admission Busy error leaves the accepted token pending;
+retry that same token rather than abandoning it and consuming another queue
+slot. A completed non-stopping decision is terminal and replayable, including
+concurrent uses of that token; a later idle probe needs a new token. Disconnecting
+the final client or checking the lease count alone is not atomic shutdown.
+Committed operation acceptance or bookkeeping alone does not authorize exit.
+Error recovery checks the current instance's durable stop decision together
+with closed admission; a busy or uncommitted decision restores admission.
+
+`maintenance.status` exposes bounded per-instance aggregate counters separately
+from free-form last-error diagnostics. Live status also reports native resident
+and private-memory observations, including whether a peak is OS-provided or only
+a sampled lower bound. Unsupported measurements are tagged unavailable, not
+zero. See [qualification commands](CONTRIBUTING.md#managed-lifecycle-qualification)
+and the [managed measurement protocol](SHARED_INDEX_BENCHMARKS.md#managed-lifecycle-measurements)
+for exact workloads and interpretation.

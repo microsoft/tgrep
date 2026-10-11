@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import qualify
 
@@ -95,6 +95,69 @@ class QualificationTests(unittest.TestCase):
     def test_command_failure_is_not_suppressed(self):
         with self.assertRaisesRegex(RuntimeError, "expected exit 0, got 2"):
             qualify.run([sys.executable, "-c", "raise SystemExit(2)"], cwd=Path.cwd())
+
+    def test_managed_parity_does_not_accept_v1_or_scan_results(self):
+        indexed = subprocess.CompletedProcess([], 0, "hit\n", "")
+        scanned = subprocess.CompletedProcess([], 0, "hit\n", "(via filesystem walk)")
+        for diagnostic in ("(via shared daemon v1)", "(via filesystem walk)", "(via local index)"):
+            indexed.stderr = diagnostic
+            with self.subTest(diagnostic=diagnostic), self.assertRaisesRegex(RuntimeError, "expected backend"):
+                qualify.assert_parity(indexed, scanned, "(via shared daemon v2)")
+        indexed.stderr = "(via shared daemon v2)"
+        qualify.assert_parity(indexed, scanned, "(via shared daemon v2)")
+
+    def test_owner_readiness_requires_complete_bounded_exact_claim(self):
+        claim = {"owner": "owned-claim"}
+        frame = json.dumps({"holding": True, "claim": claim}).encode()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "owner.log"
+            for partial in (b"", frame[:8], frame):
+                path.write_bytes(partial)
+                self.assertFalse(qualify.owner_holding(path, claim))
+            path.write_bytes(frame + b"\n")
+            self.assertTrue(qualify.owner_holding(path, claim))
+            with self.assertRaisesRegex(RuntimeError, "requested claim"):
+                qualify.owner_holding(path, {"owner": "different"})
+            path.write_bytes(b'{"holding":false,"claim":{"owner":"owned-claim"}}\n')
+            with self.assertRaisesRegex(RuntimeError, "requested claim"):
+                qualify.owner_holding(path, claim)
+            path.write_bytes(b"{invalid\n")
+            with self.assertRaises(json.JSONDecodeError):
+                qualify.owner_holding(path, claim)
+            path.write_bytes(b"x" * 65537)
+            with self.assertRaisesRegex(RuntimeError, "byte bound"):
+                qualify.owner_holding(path, claim)
+
+    def test_managed_completion_does_not_hide_failed_or_wrong_receipts(self):
+        child = Mock()
+        child.poll.return_value = None
+        accepted = {"id": "operation"}
+        complete = {"id": "operation", "state": "completed", "error": None}
+        manage = Mock(side_effect=[{"id": "operation", "state": "running"}, complete])
+        self.assertEqual(qualify.managed_completed(child, accepted, manage), complete)
+        self.assertEqual(manage.call_count, 2)
+        for record, message in (
+            ({**complete, "id": "different"}, "wrong operation receipt"),
+            ({**complete, "state": "failed"}, "did not succeed"),
+            ({**complete, "state": "cancelled"}, "did not succeed"),
+            ({**complete, "error": {"reason_code": "post-commit-error"}}, "reported an error"),
+        ):
+            with self.subTest(record=record), self.assertRaisesRegex(RuntimeError, message):
+                qualify.managed_completed(child, accepted, Mock(return_value=record))
+
+    def test_owned_stdin_can_hold_a_claim_until_explicit_eof(self):
+        with qualify.process(
+            [sys.executable, "-c", "import sys; print(sys.stdin.read())"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8",
+        ) as child:
+            stdout, stderr = child.communicate(input="owned lifetime", timeout=10)
+            self.assertEqual(child.returncode, 0)
+            self.assertEqual(stdout.strip(), "owned lifetime")
+            self.assertEqual(stderr, "")
+        self.assertTrue(child.stdin.closed)
+        self.assertTrue(child.stdout.closed)
+        self.assertTrue(child.stderr.closed)
 
     def test_local_content_diagnostic_rejects_server_and_scan_backends(self):
         indexed = subprocess.CompletedProcess([], 0, "hit\n", "Search completed in 1ms: 1 matches")
@@ -274,6 +337,19 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(command[:3], ["cargo", "install", "--path"])
         self.assertIn("--locked", command)
         self.assertEqual(command[-2:], ["--root", scratch / "install"])
+        self.assertFalse(scratch.exists())
+
+    def test_install_qualifies_managed_with_the_same_shipping_executable(self):
+        with patch.object(qualify, "run") as run, patch.object(qualify, "smoke") as ordinary, \
+                patch.object(qualify, "managed_smoke") as managed:
+            run.return_value.stderr = ""
+            qualify.installed(Path.cwd())
+        self.assertEqual(managed.call_args, ordinary.call_args)
+        binary, scratch = managed.call_args.args
+        self.assertEqual(binary, scratch / "install/bin" / ("tgrep.exe" if os.name == "nt" else "tgrep"))
+        command = run.call_args.args[0]
+        self.assertNotIn("--debug", command)
+        self.assertNotIn("--features", command)
         self.assertFalse(scratch.exists())
 
     @unittest.skipUnless(os.name == "nt", "Windows deferred executable image release")

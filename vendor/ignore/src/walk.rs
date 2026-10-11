@@ -725,6 +725,7 @@ impl WalkBuilder {
             return Some(err.into());
         };
         let mut builder = GitignoreBuilder::new(cwd);
+        builder.file_read_control(self.ig_builder.read_control.clone());
         let mut errs = PartialErrorBuilder::default();
         errs.maybe_push(builder.add(path));
         match builder.build() {
@@ -836,6 +837,15 @@ impl WalkBuilder {
     /// This is enabled by default.
     pub fn git_global(&mut self, yes: bool) -> &mut WalkBuilder {
         self.ig_builder.git_global(yes);
+        self
+    }
+
+    /// Set optional snapshots, cancellation, and bounds for ignore-file reads.
+    pub fn file_read_control(
+        &mut self,
+        control: Option<Arc<dyn crate::gitignore::FileReadControl>>,
+    ) -> &mut WalkBuilder {
+        self.ig_builder.read_control = control;
         self
     }
 
@@ -1055,6 +1065,7 @@ impl Walk {
     }
 
     fn skip_entry(&self, ent: &DirEntry) -> Result<bool, Error> {
+        self.ig.check_control()?;
         if ent.depth() == 0 {
             return Ok(false);
         }
@@ -1636,6 +1647,9 @@ impl<'s> Worker<'s> {
     }
 
     fn run_one(&mut self, mut work: Work) -> WalkState {
+        if let Err(error) = work.ignore.check_control() {
+            return self.visitor.visit(Err(error));
+        }
         let should_visit = self
             .min_depth
             .map(|min_depth| work.dent.depth() >= min_depth)
@@ -1735,6 +1749,9 @@ impl<'s> Worker<'s> {
         root_device: Option<u64>,
         result: Result<fs::DirEntry, io::Error>,
     ) -> WalkState {
+        if let Err(error) = ig.check_control() {
+            return self.visitor.visit(Err(error));
+        }
         let fs_dent = match result {
             Ok(fs_dent) => fs_dent,
             Err(err) => {

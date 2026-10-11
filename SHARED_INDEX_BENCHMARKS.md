@@ -3,8 +3,262 @@
 [`scripts/benchmark_shared.py`](scripts/benchmark_shared.py) compares **one ordinary
 server and index per worktree** against **one repository daemon with private
 views**. This is separate from the [large-repository search benchmarks](BENCHMARKS.md).
-It measures the currently implemented sharing, not a proposed cache, base
-migration, garbage collector, or runtime integration.
+The historical measurements below cover legacy v1 sharing, not managed
+migration/collection or runtime integration. The separate
+[managed lifecycle protocol](#managed-lifecycle-measurements) qualifies the
+new lifecycle without relabeling these baseline results.
+
+## Managed lifecycle measurements
+
+[`managed_performance.rs`](tgrep-cli/tests/shared_daemon/managed_performance.rs)
+uses real managed daemons and public versioned RPC with independent CLI/scan
+parity checks. It measures a bounded synthetic fixture, not a
+machine-independent latency/storage threshold or a replacement for the historical
+ordinary-versus-v1 comparison below.
+
+The normal functional test uses twelve 1024-byte generated files per repository
+and injected lifecycle barriers to prove query progress while preparation and
+retirement are paused. Do **not** publish its debug/barrier durations as
+performance. The deliberate ignored release test uses 256 files of 4096 bytes
+per repository with no injected pauses. See the
+[exact invocation](CONTRIBUTING.md#native-lifecycle-measurements).
+
+| Phase | Observations and correctness gates |
+| --- | --- |
+| Fresh initialization | Two independent daemons under one external cache parent; routing-ready time and attach-to-reconciled-ready time recorded separately |
+| Shared worktrees | Four initial ready views; first attachments publish, subsequent attachments reuse with zero generation blob reads; private reconciliation still reads actual contents |
+| Successor build | A fifth worktree changes the first quarter of generated files; unrelated ready views answer shared-v2 queries during observed work |
+| Migration | Two existing views atomically advance to that exact published successor; generation reuse and zero blob reads are required |
+| Collection | A bounded 1-byte retention target makes obsolete data eligible; physical removal and exact nonzero reclaimed-byte receipts are required while ready views continue serving |
+| Warm initialization | Release/drain, stop and restart; exact successor reuse, zero generation blob reads and scan parity before accepting readiness |
+
+Periodic maintenance remains enabled in the sibling namespace during explicit
+collection. The collecting namespace temporarily disables/drains scheduled
+collection so receipt measurements do not accidentally attribute an automatic
+pass's work to a requested pass; its configured policy is restored afterward.
+The target is deliberately below protected data, so it is not asserted as an
+achievable final cache size.
+
+Each schema-1 JSON report records:
+
+- Source-input fingerprints, exact executable BLAKE3, available Git revision,
+  tool versions, architecture, available parallelism, filesystem type, build
+  profile and presence of test hooks.
+- A UTC run window in Unix milliseconds and monotonic elapsed time, covering
+  provenance, fixture setup, measurement, owned-child shutdown and cleanup.
+  Both temporary fixture trees are explicitly closed after all owned daemons
+  and guards are dropped. Cleanup errors are retained in the report and fail
+  qualification; implicit temporary-directory destruction is not cleanup proof.
+- End-to-end observed operation times and query sample count/min/p50/p95/max/mean.
+  Queries include fresh-connection lookup plus search RPC, not CLI spawn time.
+  Observation overhead is included. Small sample p95 is descriptive, not a
+  statistically robust tail estimate.
+- Actual generation build/reuse, blob read/byte/extraction and posting reuse
+  counters, plus private reconciliation counters. Published-generation and
+  checkpoint logical sizes are sealed output sizes, **not** physical device I/O,
+  sort spill or repeated write volume.
+- Storage, mappings, retained-private estimates and reservation sample maxima
+  during cold/warm attachment and every work phase. These are sampled lower
+  bounds, not an unsampled global peak. `charged_overlap_logical_bytes` is a
+  current charge at each observation, not intrinsically a peak counter.
+- Native daemon resident current/peak and private-memory observations. Windows
+  exposes private committed high-water; Linux private anonymous-resident
+  high-water is sampled; unsupported macOS private memory is explicitly
+  unavailable. These are process measurements, not per-namespace physical
+  attribution or a process-tree RSS cap. Git-child peak memory and physical
+  device I/O remain explicitly unavailable rather than invented zeros.
+- Every requested collection pass's actual examined/removed/pages/reclaimed
+  bytes, elapsed time and budget exhaustion flags. Staging/private/work-slot
+  reservations and observed retained-private charges must respect the effective
+  policy/allocation. Completed passes must honor their requested count/byte/page
+  bounds.
+
+The driver permits at most 512 sample batches per phase and 64 collection passes;
+polling has a 5 ms interval and phases have a 60-second safety deadline. A real
+operation may finish before a sample can prove overlap. Reports preserve that
+zero overlap count; deterministic functional barriers provide the separate
+progress proof. Fresh means a new managed store, **not** an OS cache purge.
+Measure stable final source on a quiet native host and retain exact reports;
+do not combine observations from different source hashes or overlapping builds.
+
+### Measured managed lifecycle: 9 October 2026
+
+**These five bounded release runs reused published generations, preserved
+shared-v2/scan parity and reclaimed obsolete data while ready views remained
+available.** They are bounded synthetic fixtures, one run per environment, not
+confidence intervals, production-scale qualification or evidence that managed sharing improves query
+latency over ordinary indexing. In particular, the successor attachment in this
+fixture rebuilt all tracked blobs; it does not demonstrate incremental-build
+savings.
+
+The measured code and harness are
+[`87bdd224633ce4044fbbfa0a40c51e340c982c07`](https://github.com/microsoft/tgrep/commit/87bdd224633ce4044fbbfa0a40c51e340c982c07).
+All runs used Cargo-selected release executables with `managed-test-hooks`
+compiled in but **no injected pauses**. Later documentation-only commits do not
+reattribute these executions. These measurements are separate from hook-free
+default and normally installed release qualification. The three hosted reports
+and their captured executables are artifacts of
+[native qualification run 37883761891](https://github.com/microsoft/tgrep/actions/runs/37883761891).
+
+The two local runs used immutable source archives, Windows first and native
+WSL2 Linux second, after owned builds/tests and artifact preparation finished.
+Original and retained CLI/harness images matched before and after execution;
+all 204 archived files remained unchanged. Their reports explicitly mark Git
+revision unavailable: enclosing-checkout metadata is not used to label an
+archive. Archive/source fingerprints and Cargo capture records establish their
+relationship to the measured commit. Raw reports, invocation/environment
+records, pre/post image hashes and checked cleanup results were retained.
+Unrelated load on the shared local host was not controlled; no OS caches were
+purged.
+
+Every run used two repositories, four initial ready worktrees and one successor,
+with 256 generated 4096-byte files plus three base fixture files per repository.
+The successor changed the first quarter of the generated files. Each namespace
+had two work slots, a 16-item queue and 64 MiB staging/private-work budgets.
+Requested collection passes allowed 16 examined objects, two removals, 65,536
+deleted bytes, one page and 1,000 ms. The 1-byte retention target remained below
+protected data; reaching that target was not claimed.
+
+All UTC windows below are on **2026-10-09** and include fixture setup, lifecycle
+work, owned-child shutdown and successful checked removal of both fixture trees.
+Toolchain, hardware and filesystem differences make cross-row latency rankings
+inappropriate. Linux's reported native filesystem type is `0xef53`; local
+fixtures were on native ext4, not a Windows-mounted directory.
+
+| Run | Platform / filesystem | Visible CPUs | rustc / Git | UTC window |
+| --- | --- | ---: | --- | --- |
+| Local Windows | x86_64 / NTFS | 16 | 1.98.0 / 2.53.0.windows.4 | 05:15:35.666-05:17:26.378 |
+| Local Linux | WSL2 x86_64 / ext4 | 16 | 1.98.1 / 2.43.0 | 05:18:14.298-05:18:28.355 |
+| CI Windows | x86_64 / NTFS | 4 | 1.98.1 / 2.55.0.windows.5 | 04:27:14.003-04:27:48.658 |
+| CI Linux | x86_64 / `0xef53` | 4 | 1.99.0 / 2.55.0 | 04:27:05.783-04:27:15.654 |
+| CI macOS | aarch64 / APFS | 3 | 1.98.1 / 2.55.0 | 04:26:43.273-04:27:30.274 |
+
+#### Readiness and lifecycle times
+
+Times are **milliseconds**, rounded to one decimal. A/B pairs are the two
+repositories, not aggregated samples. First/reuse attachments are measured from
+request to reconciled readiness. Routing readiness is separate. Migration 1/2
+are sequential advances of existing views to the already published successor;
+warm values are routing/attachment after shutdown and restart. These are
+observed operation times including polling and observation costs, not pure
+builder or filesystem timers.
+
+| Run | Fresh routing A/B | First attach A/B | Reuse attach A/B | Successor attach | Migration 1/2 | Warm routing/attach |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Local Windows | 589.4 / 589.7 | 5331.7 / 4823.4 | 3350.2 / 3679.9 | 7909.5 | 4254.6 / 3173.2 | 590.6 / 4132.8 |
+| Local Linux | 128.6 / 75.5 | 595.0 / 532.6 | 329.7 / 475.9 | 818.5 | 162.4 / 365.8 | 71.8 / 191.3 |
+| CI Windows | 157.7 / 162.1 | 1664.0 / 1844.7 | 1006.7 / 1241.1 | 2372.8 | 1177.4 / 1141.3 | 127.2 / 1040.7 |
+| CI Linux | 36.8 / 44.2 | 278.7 / 271.1 | 126.8 / 117.3 | 277.4 | 151.2 / 151.2 | 37.4 / 130.6 |
+| CI macOS | 176.4 / 148.5 | 717.2 / 521.0 | 391.7 / 437.4 | 810.9 | 649.2 / 681.4 | 216.5 / 375.0 |
+
+In every run, the first repository's initial generation read/extracted 259 blobs
+(1,048,664 bytes). The successor read/extracted 259 blobs (1,049,102 bytes), with
+zero predecessor postings reused. Reuse attachments, both migrations and warm
+attachment instead reported existing-generation reuse and zero generation blob
+reads. That does **not** eliminate worktree verification: each migration/restart
+read 259 or 260 files and approximately 1 MiB of current worktree contents.
+
+The following are sealed logical publication sizes for repository A, in bytes,
+not physical device writes, sort spill or repeated-write totals.
+
+| Run | Initial/successor generation | Initial/successor checkpoint |
+| --- | ---: | ---: |
+| Local Windows | 313013 / 281926 | 1669 / 3169 |
+| Local Linux | 312938 / 281843 | 1530 / 2277 |
+| CI Windows | 313009 / 281921 | 1671 / 3261 |
+| CI Linux | 312937 / 281848 | 1533 / 2286 |
+| CI macOS | 312991 / 281910 | 1649 / 3245 |
+
+#### Queries during work
+
+Each cell below is **sample count; p50 / p95 milliseconds** for the first
+unaffected ready view surveyed in repository A during that phase. These are
+separate series, never pooled across views, phases or runs. Each query measures
+fresh-connection lookup plus search JSON-RPC, excluding CLI process startup.
+Other surveyed views and collection-phase series remain in the raw reports.
+With one sample, p50 and p95 are the same observation; these very small samples
+do not establish robust tail latency.
+
+The final column counts whole query/status batches bracketed by `preparing`
+operation states. Zero means that the sampler did not prove such overlap,
+not that queries were blocked or that no preparation occurred. Separate
+deterministic barrier tests establish progress during preparation/retirement.
+
+| Run | Successor | Migration 1 | Migration 2 | Preparing batches: successor/1/2 |
+| --- | ---: | ---: | ---: | ---: |
+| Local Windows | 7; 225.372 / 236.967 | 4; 201.140 / 238.741 | 3; 280.632 / 340.220 | 5 / 2 / 1 |
+| Local Linux | 5; 30.750 / 34.832 | 1; 30.505 / 30.505 | 2; 34.888 / 38.913 | 3 / 0 / 0 |
+| CI Windows | 6; 79.289 / 122.596 | 3; 88.346 / 111.254 | 3; 76.562 / 81.561 | 4 / 1 / 1 |
+| CI Linux | 2; 30.008 / 30.018 | 1; 33.562 / 33.562 | 1; 32.039 / 32.039 | 0 / 0 / 0 |
+| CI macOS | 1; 139.991 / 139.991 | 1; 56.801 / 56.801 | 1; 126.557 / 126.557 | 0 / 0 / 0 |
+
+#### Collection and resource observations
+
+Collection sums cover distinct sequential requested passes, not concurrent
+work or quantiles. Observed call time includes ready-view queries, status
+sampling and transport/polling; worker time is the sum of the core's recorded
+elapsed counters. All passes honored their count/byte/page bounds and reported
+no errors or elapsed-budget overruns. Each run's complete collection sequence
+physically removed the original generation. Reclaimed bytes below are the calls'
+actual logical-byte receipts, not an estimate of physical disk space returned.
+
+| Run | Passes | Observed call total ms | Worker total ms | Reclaimed logical bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Local Windows | 28 | 27555.0 | 2935.9 | 317,856 |
+| Local Linux | 28 | 4448.1 | 438.4 | 316,743 |
+| CI Windows | 28 | 9964.7 | 1170.6 | 317,939 |
+| CI Linux | 28 | 3760.1 | 120.5 | 316,761 |
+| CI macOS | 33 | 21869.3 | 292.7 | 317,891 |
+
+Authentication used 13 verification pages and no proof restarts in each
+Windows/Linux run. macOS used 21 pages and three proof restarts, verifying
+489,923 bytes for 317,891 reclaimed logical bytes. Verification work and
+reclamation are different quantities.
+
+The following **MiB** values are each field's largest sampled value for
+namespace A during successor attachment, migrations and collection; cold/warm
+samples remain separately available in the reports. Paired maxima need not
+occur together and must not be summed into a global peak. Storage includes
+known logical catalog/control/object data; charged overlap additionally
+includes outstanding reservations. Mapped and retained-private values are
+namespace accounting, while the final pair is native **daemon-process**
+resident/private memory, not namespace-attributed physical usage.
+
+| Run | Known/charged logical | Mapped/retained-private estimate | Reserved staging/private work | Daemon resident/private |
+| --- | ---: | ---: | ---: | ---: |
+| Local Windows | 4.84 / 36.55 | 0.45 / 1.75 | 32.00 / 34.00 | 24.93 / 7.33 |
+| Local Linux | 4.83 / 36.26 | 0.45 / 1.70 | 32.00 / 32.00 | 20.25 / 7.37 |
+| CI Windows | 4.96 / 36.45 | 0.45 / 1.75 | 32.00 / 34.00 | 17.05 / 6.42 |
+| CI Linux | 4.80 / 35.17 | 0.45 / 1.49 | 32.00 / 32.00 | 20.50 / 7.89 |
+| CI macOS | 4.97 / 4.97 | 0.45 / 1.52 | 0.00 / 0.00 | 19.80 / unavailable |
+
+The macOS reservation zeros mean no reservation was caught at these selected
+sample points, not zero actual allocation. All sample maxima are lower bounds;
+Windows private committed bytes and Linux anonymous-resident bytes have
+different meanings. macOS private memory, Git-child peak memory and physical
+device I/O are explicitly unavailable. These observations do not establish a
+process-tree RSS cap or an unsampled global peak.
+
+<details>
+<summary>Exact report, CLI and harness SHA-256 identities</summary>
+
+| Run | Report | CLI | Harness |
+| --- | --- | --- | --- |
+| Local Windows | `ffafc6576e667a9447062b4b41f69ea0c877a1b24d0c1559ebaf084b017aa083` | `e7e613a6ec31f10071457f805d01bf7504f1e50da6ad433cd369a293f932eca1` | `b5d99673b91c0ba815744417d89a50af0b66c985a2b7034c4d6ed0740bfd990b` |
+| Local Linux | `956c1f23becb878ecd89ba5dc2c23d56249239ff4775c7355332b1bacd2267ab` | `864755756a192bf7d38e4287cda19ddc2bdd4e3188c4e311aa826fe729964e8a` | `dfc3956a11b69b7a7739697267d9876c083552601e01017624f3bb846efc7d4a` |
+| CI Windows | `42562ecbd793034c0f9c759a06922d67f7e0aa2f8ee2463aa5530ea2388cb482` | `70a3b1b4e7eeeaa2633b3b4ca5ac910eebb8071436865898a5e88a7cad970c8f` | `e7c2264332fab6e5c22a616803778ecafea22445fa54db29e61632469d400360` |
+| CI Linux | `26fed0b524f99181adee68bfc731f521bd8bc70050fdb32ad10781aabd0fc9dc` | `76724fdfd6a68ef6083f998f8a0518d11500bc23d4cf26872911ebff975253c3` | `62063b9b0f93e096241e5f9741b2a3c94e6edac8d2406bb25a5c0cd556d2374d` |
+| CI macOS | `1d0fa3e8a7589355c599e8b0eea3b70cbad064e79a0fc2ea78598471c493f615` | `708b8b4a34f5c2fb30c520e0b393b982aa4f52e9467d5f9d1426ff25fa39f9ae` | `5daadbb0f05c9edaf7766e1b5a852b54131e93558fc6f13e1a0d623bbecef9e8` |
+
+The report-defined fingerprint covers 98 source inputs. Both local archives
+and hosted Windows have BLAKE3
+`038440b19d78ca4bb11943675e8151e99822d80a963c2f396ed20e439c29a418`
+(3,615,370 bytes); hosted Linux/macOS use LF checkout bytes with BLAKE3
+`d14d68dbc26b1ad47ef69f3b84a403974bc11f93e5038e04c1bfea95f16f74cb`
+(3,524,761 bytes). These distinct byte fingerprints were checked against their
+matching source archives rather than treated as interchangeable.
+
+</details>
 
 ## Measured baseline: 6 October 2026
 

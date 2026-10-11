@@ -24,6 +24,37 @@ use crate::{
     pathutil::{is_file_name, strip_prefix},
 };
 
+/// Optional caller-owned bounds and immutable snapshots for ignore inputs.
+pub trait FileReadControl: std::fmt::Debug + Send + Sync {
+    /// Read one input, preserving `NotFound` for an absent optional source.
+    fn read_file(&self, path: &Path) -> std::io::Result<Arc<[u8]>>;
+    /// Check cancellation and the caller's work deadline.
+    fn check(&self) -> std::io::Result<()>;
+    /// Admit a pattern before allocating or compiling it.
+    fn check_pattern(
+        &self,
+        _source: Option<&Path>,
+        _pattern: &str,
+    ) -> std::io::Result<()> {
+        self.check()
+    }
+    /// Observe errors even where the default walker tolerates partial input.
+    fn report_error(&self, _error: &Error) {}
+}
+
+pub(crate) fn read_input(
+    path: &Path,
+    control: Option<&Arc<dyn FileReadControl>>,
+) -> std::io::Result<Box<dyn BufRead>> {
+    match control {
+        Some(control) => {
+            control.check()?;
+            Ok(Box::new(std::io::Cursor::new(control.read_file(path)?)))
+        }
+        None => Ok(Box::new(BufReader::new(File::open(path)?))),
+    }
+}
+
 /// Glob represents a single glob in a gitignore file.
 ///
 /// This is used to report information about the highest precedent glob that
@@ -312,6 +343,7 @@ pub struct GitignoreBuilder {
     globs: Vec<Glob>,
     case_insensitive: bool,
     allow_unclosed_class: bool,
+    read_control: Option<Arc<dyn FileReadControl>>,
 }
 
 impl GitignoreBuilder {
@@ -329,6 +361,23 @@ impl GitignoreBuilder {
             globs: vec![],
             case_insensitive: false,
             allow_unclosed_class: true,
+            read_control: None,
+        }
+    }
+
+    /// Set optional input snapshots, work bounds, and error reporting.
+    pub fn file_read_control(
+        &mut self,
+        control: Option<Arc<dyn FileReadControl>>,
+    ) -> &mut Self {
+        self.read_control = control;
+        self
+    }
+
+    fn check_control(&self) -> Result<(), Error> {
+        match &self.read_control {
+            Some(control) => control.check().map_err(Error::Io),
+            None => Ok(()),
         }
     }
 
@@ -336,12 +385,17 @@ impl GitignoreBuilder {
     ///
     /// Once a matcher is built, no new globs can be added to it.
     pub fn build(&self) -> Result<Gitignore, Error> {
+        self.check_control()?;
         let nignore = self.globs.iter().filter(|g| !g.is_whitelist()).count();
         let nwhite = self.globs.iter().filter(|g| g.is_whitelist()).count();
-        let set = self
-            .builder
-            .build()
-            .map_err(|err| Error::Glob { glob: None, err: err.to_string() })?;
+        let set = self.builder.build().map_err(|err| {
+            let error = Error::Glob { glob: None, err: err.to_string() };
+            if let Some(control) = &self.read_control {
+                control.report_error(&error);
+            }
+            error
+        })?;
+        self.check_control()?;
         Ok(Gitignore {
             set,
             root: self.root.clone(),
@@ -362,10 +416,20 @@ impl GitignoreBuilder {
     /// and instead derives the path automatically from git's global
     /// configuration.
     pub fn build_global(mut self) -> (Gitignore, Option<Error>) {
-        match gitconfig_excludes_path() {
+        let path = match &self.read_control {
+            None => gitconfig_excludes_path(),
+            Some(control) => match controlled_excludes_path(control) {
+                Ok(path) => path,
+                Err(error) => {
+                    control.report_error(&error);
+                    return (Gitignore::empty(), Some(error));
+                }
+            },
+        };
+        match path {
             None => (Gitignore::empty(), None),
             Some(path) => {
-                if !path.is_file() {
+                if self.read_control.is_none() && !path.is_file() {
                     (Gitignore::empty(), None)
                 } else {
                     let mut errs = PartialErrorBuilder::default();
@@ -391,8 +455,17 @@ impl GitignoreBuilder {
     /// all other valid globs will still be added.
     pub fn add<P: AsRef<Path>>(&mut self, path: P) -> Option<Error> {
         let path = path.as_ref();
-        let file = match File::open(path) {
-            Err(err) => return Some(Error::Io(err).with_path(path)),
+        let file = match read_input(path, self.read_control.as_ref()) {
+            Err(err) => {
+                let absent = err.kind() == std::io::ErrorKind::NotFound;
+                let error = Error::Io(err).with_path(path);
+                if !absent {
+                    if let Some(control) = &self.read_control {
+                        control.report_error(&error);
+                    }
+                }
+                return Some(error);
+            }
             Ok(file) => file,
         };
         log::debug!("opened gitignore file: {}", path.display());
@@ -403,7 +476,11 @@ impl GitignoreBuilder {
             let line = match line {
                 Ok(line) => line,
                 Err(err) => {
-                    errs.push(Error::Io(err).tagged(path, lineno));
+                    let error = Error::Io(err).tagged(path, lineno);
+                    if let Some(control) = &self.read_control {
+                        control.report_error(&error);
+                    }
+                    errs.push(error);
                     break;
                 }
             };
@@ -414,6 +491,9 @@ impl GitignoreBuilder {
                 if i == 0 { line.trim_start_matches(UTF8_BOM) } else { &line };
 
             if let Err(err) = self.add_line(Some(path.to_path_buf()), &line) {
+                if let Some(control) = &self.read_control {
+                    control.report_error(&err);
+                }
                 errs.push(err.tagged(path, lineno));
             }
         }
@@ -451,6 +531,7 @@ impl GitignoreBuilder {
     ) -> Result<&mut GitignoreBuilder, Error> {
         #![allow(deprecated)]
 
+        self.check_control()?;
         if line.starts_with("#") {
             return Ok(self);
         }
@@ -459,6 +540,9 @@ impl GitignoreBuilder {
         }
         if line.is_empty() {
             return Ok(self);
+        }
+        if let Some(control) = &self.read_control {
+            control.check_pattern(from.as_deref(), line).map_err(Error::Io)?;
         }
         let mut glob = Glob {
             from,
@@ -581,6 +665,31 @@ pub fn gitconfig_excludes_path() -> Option<PathBuf> {
         None => {}
     }
     excludes_file_default()
+}
+
+fn controlled_excludes_path(
+    control: &Arc<dyn FileReadControl>,
+) -> Result<Option<PathBuf>, Error> {
+    let home = home_dir().map(|path| path.join(".gitconfig"));
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|path| path.join(".config")))
+        .map(|path| path.join("git/config"));
+    for path in [home, xdg].into_iter().flatten() {
+        control.check().map_err(Error::Io)?;
+        let bytes = match control.read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => return Err(Error::Io(error).with_path(path)),
+        };
+        if let Some(path) = parse_excludes_file(&bytes) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(excludes_file_default())
 }
 
 /// Returns the file contents of git's global config file, if one exists, in

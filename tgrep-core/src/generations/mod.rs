@@ -5,16 +5,15 @@
 //! must reconcile content and membership before searching a worktree view.
 //! Published generations are retained indefinitely; there is no online GC.
 
-mod git;
+pub(crate) mod git;
 
 pub(crate) fn worktree_root(root: &Path) -> Result<PathBuf> {
     git::worktree_root(root)
 }
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -22,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::builder;
 use crate::external::{ExternalSorter, TrigramPosting};
-use crate::meta::{ContentId, INDEX_FORMAT_VERSION, IndexMeta};
+use crate::meta::{ContentId, INDEX_FORMAT_VERSION};
 use crate::shared::SharedBase;
 use crate::{PostingEntry, encoding, trigram};
 
@@ -94,6 +93,12 @@ impl From<crate::Error> for GenerationError {
     }
 }
 
+impl From<crate::managed::Error> for GenerationError {
+    fn from(error: crate::managed::Error) -> Self {
+        Self::Index(error.into())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, GenerationError>;
 
 /// Identity is the canonical native Git common-directory path, not a remote.
@@ -109,9 +114,23 @@ impl Repository {
     /// Discover from a worktree, a subdirectory, or a bare Git repository.
     /// Git must be installed. Ambient `GIT_*` overrides are not inherited.
     pub fn discover(root: &Path) -> Result<Self> {
+        Self::discover_inner(root, None)
+    }
+
+    pub(crate) fn discover_controlled(
+        root: &Path,
+        control: &crate::managed::process::Control,
+    ) -> Result<Self> {
+        Self::discover_inner(root, Some(control))
+    }
+
+    fn discover_inner(
+        root: &Path,
+        control: Option<&crate::managed::process::Control>,
+    ) -> Result<Self> {
         let root = fs::canonicalize(root)?;
-        let common_dir = git::common_dir(&root)?;
-        let git_dir = git::worktree_git_dir(&root)?;
+        let common_dir = git::discover_directory(&root, "--git-common-dir", control)?;
+        let git_dir = git::discover_directory(&root, "--absolute-git-dir", control)?;
         let mut hash = blake3::Hasher::new();
         hash.update(b"tgrep-repository-v1\0");
         #[cfg(unix)]
@@ -138,7 +157,7 @@ impl Repository {
             identity: hash.finalize().to_hex().to_string(),
             oid_length: 0,
         };
-        repository.oid_length = git::object_format(&repository)?;
+        repository.oid_length = git::object_format_controlled(&repository, control)?;
         Ok(repository)
     }
 
@@ -158,6 +177,29 @@ impl Repository {
     /// publishing a generation. Symbolic revisions use this worktree's HEAD.
     pub fn resolve_commit_tree(&self, revision: &str) -> Result<(String, String)> {
         git::commit_tree(self, revision)
+    }
+
+    pub(crate) fn resolve_controlled(
+        &self,
+        revision: &str,
+        control: &crate::managed::process::Control,
+    ) -> Result<(String, String)> {
+        git::commit_tree_controlled(self, revision, Some(control))
+    }
+
+    pub(crate) fn root_controlled(
+        root: &Path,
+        control: &crate::managed::process::Control,
+    ) -> Result<PathBuf> {
+        git::discover_directory(root, "--show-toplevel", Some(control))
+    }
+
+    pub(crate) fn validate_managed_storage(&self, storage: &Path) -> Result<()> {
+        GenerationManager::validate_external_storage(
+            self,
+            storage,
+            &git::worktrees_controlled(self, Some(&crate::managed::process::Control::bootstrap()))?,
+        )
     }
 }
 
@@ -218,6 +260,34 @@ pub struct GenerationKey {
 }
 
 impl GenerationKey {
+    pub(crate) fn legacy(repository: &Repository, tree: String, profile: IndexingProfile) -> Self {
+        Self {
+            repository: repository.identity.clone(),
+            tree,
+            profile,
+            index_format: INDEX_FORMAT_VERSION,
+            schema: SCHEMA_VERSION,
+        }
+    }
+
+    pub(crate) fn managed(
+        repository: &Repository,
+        tree: String,
+        profile: IndexingProfile,
+    ) -> Result<Self> {
+        if !git::valid_oid(&tree, repository.oid_length) {
+            return Err(GenerationError::InvalidMetadata(
+                "invalid managed tree OID".into(),
+            ));
+        }
+        Ok(Self {
+            repository: repository.identity.clone(),
+            tree,
+            profile,
+            index_format: crate::ondisk::MANAGED_FILE_TABLE_VERSION,
+            schema: crate::managed::STORAGE_VERSION,
+        })
+    }
     pub fn repository_identity(&self) -> &str {
         &self.repository
     }
@@ -292,7 +362,7 @@ impl TrackedEntry {
 }
 
 /// Actual work performed by this request, not the generation's historical build.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildStats {
     pub published: bool,
     pub reused_generation: bool,
@@ -313,6 +383,8 @@ pub enum RetentionPolicy {
     /// No published directory is ever removed, including after all pins drop.
     /// Offline reclamation requires stopping all users and discarding checkpoints.
     RetainAll,
+    /// Managed references and OS reader guards determine physical eligibility.
+    Managed,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -333,7 +405,14 @@ struct SealedManifest {
 
 impl SealedManifest {
     fn seal(manifest: Manifest) -> Result<Self> {
-        let checksum = *blake3::hash(&serde_json::to_vec(&manifest)?).as_bytes();
+        Self::seal_controlled(manifest, None)
+    }
+
+    fn seal_controlled(
+        manifest: Manifest,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Self> {
+        let checksum = crate::output::checksum(&manifest, permit)?;
         Ok(Self { checksum, manifest })
     }
 }
@@ -371,7 +450,56 @@ impl Generation {
         &self.directory
     }
     pub fn retention(&self) -> RetentionPolicy {
-        RetentionPolicy::RetainAll
+        if self.base.reader().managed_identity().is_some() {
+            RetentionPolicy::Managed
+        } else {
+            RetentionPolicy::RetainAll
+        }
+    }
+
+    pub(crate) fn load_managed(
+        pin: Arc<crate::managed::lifetime::ObjectGuard>,
+        key: &GenerationKey,
+        manifest_limit: u64,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+        limits: &crate::reader::SnapshotLimits,
+    ) -> Result<Self> {
+        let sealed: SealedManifest = crate::managed::inputs::read_json(
+            pin.directory.open_file("generation.tgm", false)?,
+            manifest_limit,
+            permit,
+        )?;
+        if crate::output::checksum(&sealed.manifest, permit)? != sealed.checksum {
+            return Err(GenerationError::InvalidMetadata(
+                "managed manifest checksum mismatch".into(),
+            ));
+        }
+        let manifest = sealed.manifest;
+        let length = manifest.commit.len();
+        if &manifest.key != key
+            || !matches!(length, 40 | 64)
+            || !git::valid_oid(&manifest.commit, length)
+            || !git::valid_oid(&key.tree, length)
+            || key.schema != crate::managed::STORAGE_VERSION
+            || key.index_format != crate::ondisk::MANAGED_FILE_TABLE_VERSION
+        {
+            return Err(GenerationError::InvalidMetadata(
+                "managed manifest identity differs".into(),
+            ));
+        }
+        let directory = pin.directory.path().to_path_buf();
+        let base = Arc::new(SharedBase::open_managed(pin, permit, limits)?);
+        if base.snapshot_id() != manifest.base_id {
+            return Err(GenerationError::InvalidMetadata(
+                "managed manifest fingerprint differs".into(),
+            ));
+        }
+        validate_entries_controlled(&manifest, &base, length, permit)?;
+        Ok(Self {
+            directory,
+            manifest,
+            base,
+        })
     }
 }
 
@@ -382,27 +510,29 @@ pub struct EnsureResult {
     pub requested_commit: String,
 }
 
-type Cache = HashMap<PathBuf, Weak<Generation>>;
+type Cache = HashMap<(PathBuf, Option<crate::managed::Id>), Weak<Generation>>;
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
 fn cached_generation(
     directory: PathBuf,
+    namespace: Option<crate::managed::Id>,
     load: impl FnOnce() -> Result<Generation>,
 ) -> Result<Arc<Generation>> {
+    let identity = (directory, namespace);
     let cache = CACHE.get_or_init(Default::default);
     {
         let cache = cache.lock().map_err(|_| GenerationError::Synchronization)?;
-        if let Some(generation) = cache.get(&directory).and_then(Weak::upgrade) {
+        if let Some(generation) = cache.get(&identity).and_then(Weak::upgrade) {
             return Ok(generation);
         }
     }
     let generation = Arc::new(load()?);
     let mut cache = cache.lock().map_err(|_| GenerationError::Synchronization)?;
-    if let Some(existing) = cache.get(&directory).and_then(Weak::upgrade) {
+    if let Some(existing) = cache.get(&identity).and_then(Weak::upgrade) {
         return Ok(existing);
     }
     cache.retain(|_, value| value.strong_count() > 0);
-    cache.insert(directory, Arc::downgrade(&generation));
+    cache.insert(identity, Arc::downgrade(&generation));
     Ok(generation)
 }
 
@@ -485,6 +615,7 @@ impl GenerationManager {
     }
 
     fn validate_snapshot_boundary(storage: &Path) -> Result<()> {
+        crate::managed::reject_unguarded(storage)?;
         for ancestor in storage.ancestors() {
             if ancestor.join(MANIFEST).try_exists()?
                 || (ancestor.join("files.bin").try_exists()?
@@ -517,14 +648,47 @@ impl GenerationManager {
         profile: IndexingProfile,
         predecessor: Option<&Arc<Generation>>,
     ) -> Result<EnsureResult> {
-        let (commit, tree) = git::commit_tree(&self.repository, revision)?;
-        let key = GenerationKey {
-            repository: self.repository.identity.clone(),
-            tree,
-            profile,
-            index_format: INDEX_FORMAT_VERSION,
-            schema: SCHEMA_VERSION,
-        };
+        self.ensure_inner(revision, profile, predecessor, None)
+    }
+
+    pub(crate) fn ensure_controlled(
+        &self,
+        revision: &str,
+        profile: IndexingProfile,
+        predecessor: Option<&Arc<Generation>>,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<EnsureResult> {
+        self.validate_compatibility_permit(permit)?;
+        self.ensure_inner(revision, profile, predecessor, Some(permit))
+    }
+
+    fn validate_compatibility_permit(
+        &self,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<()> {
+        if permit.namespace.header().repository != self.repository.identity
+            || permit.namespace.header().storage
+                != crate::managed::policy::StorageMode::CompatibilityRetainAll
+        {
+            return Err(crate::managed::Error::incompatible(
+                "legacy access requires this repository's compatibility namespace",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn ensure_inner(
+        &self,
+        revision: &str,
+        profile: IndexingProfile,
+        predecessor: Option<&Arc<Generation>>,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<EnsureResult> {
+        let control = permit.map(crate::managed::process::Control::work);
+        let (commit, tree) =
+            git::commit_tree_controlled(&self.repository, revision, control.as_ref())?;
+        let key = GenerationKey::legacy(&self.repository, tree, profile);
         if let Some(previous) = predecessor {
             let mut expected = key.clone();
             expected.tree = previous.key().tree.clone();
@@ -534,10 +698,10 @@ impl GenerationManager {
                 ));
             }
         }
-        let _lock = self.lock()?;
+        let _lock = self.lock_controlled(permit)?;
         let directory = self.directory.join(key.storage_name());
         if directory.try_exists()? {
-            let generation = self.open_locked(&key)?;
+            let generation = self.open_locked_controlled(&key, permit)?;
             let stats = BuildStats {
                 reused_generation: true,
                 tracked_entries: generation.entries().len(),
@@ -549,8 +713,8 @@ impl GenerationManager {
                 requested_commit: commit,
             });
         }
-        let mut stats = self.build(&key, &commit, predecessor)?;
-        let generation = self.open_locked(&key)?;
+        let mut stats = self.build(&key, &commit, predecessor, permit)?;
+        let generation = self.open_locked_controlled(&key, permit)?;
         stats.published = true;
         Ok(EnsureResult {
             generation,
@@ -565,6 +729,17 @@ impl GenerationManager {
         self.validate_key(key)?;
         let _lock = self.lock()?;
         self.open_locked(key)
+    }
+
+    pub(crate) fn open_controlled(
+        &self,
+        key: &GenerationKey,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<Arc<Generation>> {
+        self.validate_compatibility_permit(permit)?;
+        self.validate_key(key)?;
+        let _lock = self.lock_controlled(Some(permit))?;
+        self.open_locked_controlled(key, Some(permit))
     }
 
     /// Published keys only; interrupted `.stage-*` directories are not candidates.
@@ -609,6 +784,10 @@ impl GenerationManager {
     }
 
     fn lock(&self) -> Result<File> {
+        self.lock_controlled(None)
+    }
+
+    fn lock_controlled(&self, permit: Option<&Arc<crate::managed::WorkPermit>>) -> Result<File> {
         check_plain(&self.directory, true)?;
         let path = self.directory.join("publication.lock");
         if path.try_exists()? {
@@ -621,38 +800,113 @@ impl GenerationManager {
             .truncate(false)
             .open(path)?;
         // Keep locking compatible with the Windows release pipeline's older Rust toolchain.
-        fs2::FileExt::lock_exclusive(&file)?;
+        if let Some(permit) = permit {
+            loop {
+                permit.check()?;
+                match fs2::FileExt::try_lock_exclusive(&file) {
+                    Ok(()) => break,
+                    Err(error) => {
+                        let error = crate::managed::Error::io(error);
+                        if error.category != crate::managed::ErrorCategory::Busy {
+                            return Err(error.into());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        } else {
+            fs2::FileExt::lock_exclusive(&file)?;
+        }
         Ok(file)
     }
 
     fn open_locked(&self, key: &GenerationKey) -> Result<Arc<Generation>> {
-        self.validate_key(key)?;
-        let directory = self.directory.join(key.storage_name());
-        cached_generation(directory.clone(), || self.load(&directory, key))
+        self.open_locked_controlled(key, None)
     }
 
-    fn load(&self, directory: &Path, key: &GenerationKey) -> Result<Generation> {
+    fn open_locked_controlled(
+        &self,
+        key: &GenerationKey,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Arc<Generation>> {
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
+        self.validate_key(key)?;
+        let directory = self.directory.join(key.storage_name());
+        cached_generation(
+            directory.clone(),
+            permit.map(|permit| permit.namespace.header().namespace.clone()),
+            || self.load(&directory, key, permit),
+        )
+    }
+
+    fn load(
+        &self,
+        directory: &Path,
+        key: &GenerationKey,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Generation> {
         check_plain(directory, true)?;
         for name in INDEX_FILES {
             check_plain(&directory.join(name), false)?;
         }
-        let manifest = read_manifest(directory)?;
+        let loading = permit
+            .map(|permit| -> Result<_> {
+                use std::io::{Seek, SeekFrom};
+                permit.check()?;
+                let directory = crate::managed::storage::Directory::open(directory)?;
+                let limits = crate::reader::SnapshotLimits::measure(
+                    crate::ondisk::IndexLayout::Legacy,
+                    |name| Ok(directory.open_file(name, false)?),
+                )?;
+                let manifest_size = directory
+                    .open_file(MANIFEST, false)?
+                    .seek(SeekFrom::End(0))?;
+                let base_private = limits.private_estimate()?;
+                let private = manifest_size
+                    .checked_mul(6)
+                    .and_then(|bytes| bytes.checked_add(base_private))
+                    .ok_or_else(|| {
+                        crate::managed::Error::pressure("generation-private-account-overflow")
+                    })?;
+                Ok((limits, manifest_size, permit.memory(private)?))
+            })
+            .transpose()?;
+        let manifest = read_manifest_controlled(
+            directory,
+            loading.as_ref().map_or(u64::MAX, |(_, size, _)| *size),
+            permit,
+        )?;
         if &manifest.key != key || !git::valid_oid(&manifest.commit, self.repository.oid_length) {
             return Err(GenerationError::InvalidMetadata(
                 "manifest key/commit mismatch".into(),
             ));
         }
-        let base = Arc::new(SharedBase::open(directory)?);
+        let mut base = match (&loading, permit) {
+            (Some((limits, _, _)), Some(permit)) => {
+                SharedBase::open_controlled(directory, permit, limits)?
+            }
+            _ => SharedBase::open(directory)?,
+        };
         if base.snapshot_id() != manifest.base_id {
             return Err(GenerationError::InvalidMetadata(
                 "manifest/index fingerprint mismatch".into(),
             ));
         }
-        validate_entries(&manifest, &base, self.repository.oid_length)?;
+        match permit {
+            Some(_) => {
+                validate_entries_controlled(&manifest, &base, self.repository.oid_length, permit)?
+            }
+            None => validate_entries(&manifest, &base, self.repository.oid_length)?,
+        }
+        if let Some((limits, _, memory)) = loading {
+            base.retain_memory(memory.retain(limits.mapped_bytes()?)?)?;
+        }
         Ok(Generation {
             directory: directory.to_path_buf(),
             manifest,
-            base,
+            base: Arc::new(base),
         })
     }
 
@@ -661,32 +915,88 @@ impl GenerationManager {
         key: &GenerationKey,
         commit: &str,
         predecessor: Option<&Arc<Generation>>,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
     ) -> Result<BuildStats> {
-        let mut entries = git::entries(&self.repository, &key.tree)?;
+        let stage = tempfile::Builder::new()
+            .prefix(".stage-")
+            .tempdir_in(&self.directory)?;
+        let output = match permit {
+            Some(permit) => crate::output::Output::compatibility(stage.path(), permit),
+            None => crate::output::Output::legacy(stage.path()),
+        };
+        let stats = Self::build_into(&self.repository, key, commit, predecessor, &output)?;
+        drop(output);
+        self.publish(stage, key, permit)?;
+        Ok(stats)
+    }
+
+    pub(crate) fn build_into(
+        repository: &Repository,
+        key: &GenerationKey,
+        commit: &str,
+        predecessor: Option<&Arc<Generation>>,
+        output: &crate::output::Output,
+    ) -> Result<BuildStats> {
+        output.check()?;
+        let metadata_limit = output.control().map(|permit| permit.private_limit() / 64);
+        let mut metadata_memory = output
+            .control()
+            .map(|permit| permit.memory(0))
+            .transpose()?;
+        let control = output.control().map(crate::managed::process::Control::work);
+        let mut entries = git::entries_controlled(
+            repository,
+            &key.tree,
+            control.as_ref(),
+            metadata_limit
+                .map_or(Ok(usize::MAX), usize::try_from)
+                .map_err(|_| crate::managed::Error::pressure("tree-metadata-address-range"))?,
+            metadata_memory.as_mut(),
+        )?;
         let mut stats = BuildStats {
             tracked_entries: entries.len(),
             ..BuildStats::default()
         };
-        let stage = tempfile::Builder::new()
-            .prefix(".stage-")
-            .tempdir_in(&self.directory)?;
-        let mut sorter = ExternalSorter::new(stage.path(), builder::DEFAULT_INDEX_BUFFER_BYTES);
+        let sort_bytes = match output.control() {
+            Some(permit) => {
+                usize::try_from(permit.namespace.policy()?.policy.work.sort_buffer_bytes).map_err(
+                    |_| crate::managed::Error::invalid("sort buffer exceeds addressable memory"),
+                )?
+            }
+            None => builder::DEFAULT_INDEX_BUFFER_BYTES,
+        };
+        let _sort_memory = output
+            .control()
+            .map(|permit| permit.memory((sort_bytes.max(16384) as u64).saturating_mul(4)))
+            .transpose()?;
+        let mut sorter = ExternalSorter::with_output(output.clone(), sort_bytes);
         let mut paths = Vec::new();
         let mut previous_blobs = HashMap::new();
         if let Some(previous) = predecessor {
+            if let Some(memory) = &mut metadata_memory {
+                memory.grow(
+                    (previous.entries().len() as u64)
+                        .checked_mul(128)
+                        .ok_or_else(|| {
+                            crate::managed::Error::pressure("predecessor-metadata-memory-overflow")
+                        })?,
+                )?;
+            }
             for entry in previous
                 .entries()
                 .iter()
                 .filter(|entry| entry.mode.is_regular())
             {
+                output.check()?;
                 previous_blobs.entry(entry.oid.as_str()).or_insert(entry);
             }
         }
         let mut reuse: HashMap<&str, Vec<u32>> = HashMap::new();
         let mut blobs = None;
         // Group by blob so repeated files also cause only one extraction.
-        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (index, entry) in entries.iter_mut().enumerate() {
+            output.check()?;
             if !entry.mode.is_regular() {
                 continue;
             }
@@ -698,9 +1008,8 @@ impl GenerationManager {
             }
         }
         // Stable file IDs make independent builds deterministic.
-        let mut groups: Vec<_> = groups.into_iter().collect();
-        groups.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         for (oid, indices) in groups {
+            output.check()?;
             let previous = previous_blobs.get(oid.as_str()).copied();
             if let (Some(previous), Some(generation)) = (previous, predecessor) {
                 match previous.content {
@@ -742,21 +1051,47 @@ impl GenerationManager {
             }
             let batch = match &mut blobs {
                 Some(batch) => batch,
-                None => blobs.insert(git::Blobs::new(&self.repository)?),
+                None => blobs.insert(match &control {
+                    Some(control) => git::Blobs::controlled(repository, control.clone())?,
+                    None => git::Blobs::new(repository)?,
+                }),
             };
             let size = entries[indices[0]].size.expect("regular blob size");
+            let _blob_memory = output
+                .control()
+                .map(|permit| {
+                    let limit = permit.namespace.policy()?.policy.work.blob_bytes;
+                    if size > limit {
+                        return Err(crate::managed::Error::pressure("blob-work-limit"));
+                    }
+                    let reservation = size
+                        .checked_mul(6)
+                        .and_then(|bytes| bytes.checked_add(64 * 1024))
+                        .ok_or_else(|| crate::managed::Error::pressure("blob-memory-overflow"))?;
+                    permit.memory(reservation)
+                })
+                .transpose()?;
             let bytes = batch.read(&oid, size)?;
             stats.blobs_read += 1;
             stats.blob_bytes_read += size;
-            let text = encoding::decode_for_index(&bytes);
+            let text = encoding::decode_for_index_controlled(&bytes, output.control())?;
             if trigram::is_binary(&text) {
                 for index in indices {
                     entries[index].content = EntryContent::Binary;
                 }
                 continue;
             }
-            let content_id = ContentId::from_indexed_bytes(&text);
-            let masks = trigram::extract_merged_masks(&text);
+            let content_id = ContentId::from_indexed_bytes_controlled(&text, output.control())?;
+            let mut extraction_memory = output
+                .control()
+                .map(|permit| permit.memory(0))
+                .transpose()?;
+            let masks = match (output.control(), &mut extraction_memory) {
+                (Some(permit), Some(memory)) => {
+                    trigram::extract_merged_masks_controlled(&text, permit, memory)?
+                }
+                _ => trigram::extract_merged_masks(&text),
+            };
             stats.blobs_extracted += 1;
             for index in indices {
                 let entry = &mut entries[index];
@@ -781,6 +1116,9 @@ impl GenerationManager {
                 .map(|path| reuse.get(path.as_str()))
                 .collect();
             for index in 0..reader.num_trigrams() {
+                if index.is_multiple_of(4096) {
+                    output.check()?;
+                }
                 stats.predecessor_posting_lists_read += 1;
                 let (trigram, postings) = reader.trigram_posting_at(index);
                 for posting in postings {
@@ -796,41 +1134,56 @@ impl GenerationManager {
                 }
             }
         }
-        let (trigram_count, _) = sorter.write_postings(stage.path())?;
-        builder::write_files_and_meta(
-            stage.path(),
-            self.repository.common_dir(),
+        let (trigram_count, _) = sorter.write_postings_to(output)?;
+        builder::write_files_and_meta_to(
+            output,
+            repository.common_dir(),
             paths.len(),
             paths.iter().map(String::as_str),
             trigram_count,
             Some(true),
+            true,
         )?;
-        let mut meta = IndexMeta::load(stage.path())?;
-        meta.hidden_complete = true;
-        meta.save(stage.path())?;
-        let base_id = SharedBase::open(stage.path())?.snapshot_id();
-        let manifest = SealedManifest::seal(Manifest {
+        let base_id = output.open_base()?.snapshot_id();
+        let manifest = Manifest {
             key: key.clone(),
             commit: commit.into(),
             base_id,
             entries,
-        })?;
-        let mut writer = BufWriter::new(File::create(stage.path().join(MANIFEST))?);
-        serde_json::to_writer(&mut writer, &manifest)?;
-        writer.flush()?;
-        drop(writer);
-        self.publish(stage, key)?;
+        };
+        let manifest = match output.control() {
+            Some(_) => SealedManifest::seal_controlled(manifest, output.control())?,
+            None => SealedManifest::seal(manifest)?,
+        };
+        let name = if output.layout() == crate::ondisk::IndexLayout::Managed {
+            "generation.tgm"
+        } else {
+            MANIFEST
+        };
+        output.write_json(name, &manifest)?;
+        output.check()?;
         Ok(stats)
     }
 
-    fn publish(&self, stage: tempfile::TempDir, key: &GenerationKey) -> Result<()> {
+    fn publish(
+        &self,
+        stage: tempfile::TempDir,
+        key: &GenerationKey,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<()> {
         // Validate the entire final representation before its name is discoverable.
-        drop(self.load(stage.path(), key)?);
+        drop(self.load(stage.path(), key, permit)?);
         for name in INDEX_FILES.into_iter().chain([MANIFEST]) {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
             OpenOptions::new()
                 .write(true)
                 .open(stage.path().join(name))?
                 .sync_all()?;
+        }
+        if let Some(permit) = permit {
+            permit.check()?;
         }
         fs::rename(stage.path(), self.directory.join(key.storage_name()))?;
         // Rename is atomic visibility, not a parent-directory power-loss guarantee.
@@ -850,10 +1203,23 @@ fn add_path(paths: &mut Vec<String>, path: &str) -> Result<u32> {
 }
 
 fn read_manifest(directory: &Path) -> Result<Manifest> {
+    read_manifest_controlled(directory, u64::MAX, None)
+}
+
+fn read_manifest_controlled(
+    directory: &Path,
+    limit: u64,
+    permit: Option<&Arc<crate::managed::WorkPermit>>,
+) -> Result<Manifest> {
     check_plain(&directory.join(MANIFEST), false)?;
-    let sealed: SealedManifest =
-        serde_json::from_reader(BufReader::new(File::open(directory.join(MANIFEST))?))?;
-    if blake3::hash(&serde_json::to_vec(&sealed.manifest)?).as_bytes() != &sealed.checksum {
+    let file = match permit {
+        Some(_) => {
+            crate::managed::storage::Directory::open(directory)?.open_file(MANIFEST, false)?
+        }
+        None => File::open(directory.join(MANIFEST))?,
+    };
+    let sealed: SealedManifest = crate::managed::inputs::read_json(file, limit, permit)?;
+    if crate::output::checksum(&sealed.manifest, permit)? != sealed.checksum {
         return Err(GenerationError::InvalidMetadata(
             "manifest checksum mismatch".into(),
         ));
@@ -889,7 +1255,7 @@ fn check_plain(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
-fn validate_tracked_path(path: &str) -> Result<()> {
+pub(crate) fn validate_tracked_path(path: &str) -> Result<()> {
     crate::shared::validate_path(path).map_err(|_| {
         GenerationError::Unsupported(format!("unrepresentable tracked path: {path:?}"))
     })?;
@@ -926,9 +1292,21 @@ fn validate_tracked_path(path: &str) -> Result<()> {
 }
 
 fn validate_entries(manifest: &Manifest, base: &SharedBase, oid_length: usize) -> Result<()> {
+    validate_entries_controlled(manifest, base, oid_length, None)
+}
+
+fn validate_entries_controlled(
+    manifest: &Manifest,
+    base: &SharedBase,
+    oid_length: usize,
+    permit: Option<&Arc<crate::managed::WorkPermit>>,
+) -> Result<()> {
     let mut indexed = HashSet::new();
     let mut previous: Option<&str> = None;
     for entry in &manifest.entries {
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
         validate_tracked_path(&entry.path)?;
         if previous.is_some_and(|path| path >= entry.path.as_str())
             || !git::valid_oid(&entry.oid, oid_length)
@@ -963,16 +1341,20 @@ fn validate_entries(manifest: &Manifest, base: &SharedBase, oid_length: usize) -
             ));
         }
     }
-    if indexed.len() != base.reader().num_files()
-        || base
-            .reader()
-            .all_paths()
-            .iter()
-            .any(|path| !indexed.contains(path.as_str()))
-    {
+    if indexed.len() != base.reader().num_files() {
         return Err(GenerationError::InvalidMetadata(
             "tracked content/index membership mismatch".into(),
         ));
+    }
+    for path in base.reader().all_paths() {
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
+        if !indexed.contains(path.as_str()) {
+            return Err(GenerationError::InvalidMetadata(
+                "tracked content/index membership mismatch".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -980,6 +1362,7 @@ fn validate_entries(manifest: &Manifest, base: &SharedBase, oid_length: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::IndexMeta;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -1044,7 +1427,7 @@ mod tests {
         let cold_directory = tempfile::tempdir().unwrap();
         let warm_directory = tempfile::tempdir().unwrap();
         let cold_generation = empty_generation(cold_directory.path());
-        let warm = cached_generation(warm_directory.path().to_path_buf(), || {
+        let warm = cached_generation(warm_directory.path().to_path_buf(), None, || {
             Ok(empty_generation(warm_directory.path()))
         })
         .unwrap();
@@ -1053,7 +1436,7 @@ mod tests {
         let (hit, observed) = mpsc::channel();
         let cold_path = cold_directory.path().to_path_buf();
         let cold = thread::spawn(move || {
-            cached_generation(cold_path, || {
+            cached_generation(cold_path, None, || {
                 loading.send(()).unwrap();
                 resume.recv_timeout(Duration::from_secs(15)).unwrap();
                 Ok(cold_generation)
@@ -1064,7 +1447,8 @@ mod tests {
         let warm_path = warm_directory.path().to_path_buf();
         let lookup = thread::spawn(move || {
             let result =
-                cached_generation(warm_path, || panic!("warm entry must not reload")).unwrap();
+                cached_generation(warm_path, None, || panic!("warm entry must not reload"))
+                    .unwrap();
             hit.send(()).unwrap();
             result
         });
@@ -1098,7 +1482,7 @@ mod tests {
                 let (release, resume) = mpsc::channel();
                 releases.push(release);
                 thread::spawn(move || {
-                    cached_generation(generation.directory.clone(), || {
+                    cached_generation(generation.directory.clone(), None, || {
                         loading.send(()).unwrap();
                         resume.recv_timeout(Duration::from_secs(15)).unwrap();
                         Ok(generation)
@@ -1176,7 +1560,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            manager.publish(stage, &key),
+            manager.publish(stage, &key, None),
             Err(GenerationError::InvalidMetadata(_))
         ));
         assert!(!manager.directory.join(key.storage_name()).exists());

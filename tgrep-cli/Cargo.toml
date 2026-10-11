@@ -10,6 +10,9 @@ keywords = ["grep", "search", "regex", "trigram", "cli"]
 categories = ["command-line-utilities", "text-processing"]
 readme = "../README.md"
 
+[features]
+managed-test-hooks = ["tgrep-core/managed-test-hooks"]
+
 [[bin]]
 name = "tgrep"
 path = "src/main.rs"
@@ -42,6 +45,7 @@ libc = "0.2"
 assert_cmd = "2"
 tempfile = "3"
 predicates = "3"
+rusqlite = { workspace = true }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

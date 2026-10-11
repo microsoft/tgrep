@@ -63,8 +63,9 @@ the daemon remains alive. Both indexed and scan-control backend diagnostics are
 required: matching results alone cannot qualify a broken indexed backend or a
 `--no-index` regression. No runtime integration, user-home installation, signing
 or release publication occurs.
-Only one release-profile build is added to normal PR CI; the existing builds
-share Cargo's checkout target directory and downloads where Cargo permits.
+Installed qualification adds one release-profile build on normal PR CI; the
+managed measurement matrix separately builds its release test on each native
+OS. Builds share Cargo's checkout target directory and downloads where Cargo permits.
 
 To reproduce in an isolated source checkout with Cargo, Git, Python 3.11+ and
 a C++ compiler available:
@@ -95,6 +96,121 @@ regressions, run the Rust suite on native Linux/macOS filesystems; under WSL use
 a native checkout and `TMPDIR`, not a Windows-mounted `/mnt/...` directory.
 These checks qualify checkout-based distribution, not crates.io packaging or
 the separate cross-build/signing pipelines.
+
+Managed catalogs pin `rusqlite` to upstream Git revision
+`2a71e35d94b2a02f7dd4a0c4cfd59c339370e747`, which bundles SQLite 3.53.3.
+SQLite 3.53.2 can retain native WAL read locks after readers close when a
+canonical Windows DOS-device path is mistaken for a UNC path. The upstream
+correction preserves canonical path and identity checks; a separate native
+integration test forces overlapping read-lock acquisition and requires
+reclamation after both readers close. Core and CLI test dependencies share this
+revision, including when core is consumed outside this workspace.
+
+Both root and fuzz lockfiles record the immutable Git source. A fresh locked
+checkout build, including the compliant internal pipeline, must retrieve that
+revision and its bundled sources from GitHub or an approved pre-populated Cargo
+Git cache; registry-feed access alone is insufficient. Configure that retrieval
+within the pipeline's existing dependency/feed policy. This does not change
+feed, signing or publication policy, and ordinary CI or checkout-install results
+do not qualify that separate pipeline.
+
+## Managed lifecycle qualification
+
+The `installed` qualification also exercises managed v2 through the public CLI
+of the normally installed release binary, without test hooks. It covers
+`owner-hold`, exact-generation reuse with no blob reads, independent private
+overlays, indexed RPC/CLI parity with forced scans, migration, exact receipt
+replay and explicit detach/owner release. Ordinary and default-v1 installed
+coverage remains enabled.
+
+The managed lifecycle suite uses actual CLI/RPC clients, temporary Git
+repositories, native filesystem/owner locks and the production owned-child
+supervisor. Enable `managed-test-hooks` for deterministic preparation,
+publication, retirement, deletion and recovery barriers/failures. The hook RPCs
+are not compiled into normal binaries. Do not replace a barrier with a whole-test
+retry, count scan fallback as indexed success, or disable a platform's lifetime
+coverage.
+
+Arm asynchronous operation hooks with `pause-token` or `error-token` and the
+operation's persisted scope/sequence/token before submitting it. Admission binds
+the hook to the exact operation ID before background dispatch can observe it;
+global hooks can capture unrelated reconciliation or housekeeping instead.
+Keep unscoped hooks only for automatic work whose token is not known in advance.
+
+Compatibility tests require **original**, separately built v1 CLI and core
+reader executables. They are not current binaries with a version label changed.
+In a new scratch directory, prepare the pinned control sources:
+
+```bash
+git fetch --no-tags --depth=1 origin 1120aca41dd192ae61bdd996e9886cb354a78a27
+git archive --format=zip --output="$SCRATCH/legacy.zip" 1120aca41dd192ae61bdd996e9886cb354a78a27
+python -B scripts/qualification/prepare_legacy.py "$SCRATCH/legacy.zip" "$SCRATCH/legacy-source"
+cargo build --locked --manifest-path "$SCRATCH/legacy-source/Cargo.toml" -p tgrep-cli --target-dir "$SCRATCH/legacy-target"
+cargo build --locked --manifest-path "$SCRATCH/legacy-source/Cargo.toml" -p tgrep-core --example legacy_reader --target-dir "$SCRATCH/legacy-target"
+export TGREP_V1_BINARY="$SCRATCH/legacy-target/debug/tgrep"
+export TGREP_V1_READER="$SCRATCH/legacy-target/debug/examples/legacy_reader"
+```
+
+Set `SCRATCH` to an existing absolute caller-owned directory first; the helper
+requires a new `legacy-source` destination, validates the Git archive's pinned
+commit and bounded safe entries, and adds only the standalone old-core probe.
+On Windows use the `.exe` suffix and PowerShell `$env:TGREP_V1_BINARY` /
+`$env:TGREP_V1_READER` assignments, or run the shell example in Git Bash.
+The native CI matrix supplies these controls automatically.
+
+Run targeted coverage before the full workspace:
+
+```bash
+cargo test --locked -p tgrep-core --features managed-test-hooks managed:: -- --test-threads=2
+cargo test --locked -p tgrep-core --features managed-test-hooks --test managed_lifecycle -- --test-threads=2
+cargo test --locked -p tgrep-cli --features managed-test-hooks --test shared_daemon managed:: -- --test-threads=2
+cargo test --locked --workspace
+cargo test --locked --workspace --features tgrep-cli/managed-test-hooks -- --test-threads=2
+cargo clippy --locked --workspace --all-targets --features tgrep-cli/managed-test-hooks -- -D warnings
+```
+
+Some ignored tests are subprocess entry points, not standalone cases. Do not
+run the entire suite with `--ignored`: their supervisors construct their
+environment and own cleanup. The explicitly named measurement below is a
+separate deliberate ignored test.
+
+### Native lifecycle measurements
+
+`managed::performance::bounded_lifecycle_queries_and_measurement_shape` is the
+small deterministic functional gate. Its injected pauses and debug timings are
+**not** performance results. For a deliberate unpaused release measurement,
+first build on stable source, then reserve a quiet host window with no concurrent
+heavy builds or benchmarks:
+
+```bash
+cargo test --locked --release -p tgrep-cli --features managed-test-hooks \
+  --test shared_daemon --no-run
+export TGREP_MANAGED_PERFORMANCE_REPORT="$SCRATCH/managed-native.json"
+cargo test --locked --release -p tgrep-cli --features managed-test-hooks \
+  --test shared_daemon managed::performance::native_managed_lifecycle_measurement \
+  -- --ignored --exact --test-threads=1 --nocapture
+```
+
+The report path must be absolute and new. PowerShell can set it with
+`$env:TGREP_MANAGED_PERFORMANCE_REPORT = 'C:\scratch\managed-native.json'`.
+Run on native Windows, Linux and macOS filesystems; WSL requires a native Linux
+source/build/fixture tree, not DrvFS. The report records source-input and binary
+fingerprints, toolchain, filesystem, query sample counts/distributions,
+read/extraction counters, sealed publication sizes, storage/reservation samples
+and platform-labeled process memory. A snapshot without Git history records that
+fact rather than inventing a commit.
+
+The fixture is bounded to two repositories, four initial views and one successor
+view, with 256 generated 4096-byte files per repository. It verifies shared-v2
+routing and actual CLI/scan parity while exercising reuse, migration, collection
+and warm initialization. All children are owned and reaped. Report files remain
+for review; scratch data is not installed into a user's cache.
+See [measurement interpretation](SHARED_INDEX_BENCHMARKS.md#managed-lifecycle-measurements).
+
+Native CI selects the CLI and test harness from the build's Cargo JSON records,
+runs those exact executables, and retains both with their selection/SHA-256
+manifest alongside the report. These are qualification artifacts, not signed
+releases; no executable is selected by globbing an existing target directory.
 
 ## Pre-commit Hook
 

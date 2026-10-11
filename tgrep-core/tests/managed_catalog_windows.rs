@@ -1,0 +1,318 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+
+#![cfg(windows)]
+
+// A separate test process isolates the temporary VFS syscall replacement from
+// other catalog tests. SQLite 3.53.2 confused canonical DOS paths with UNC paths
+// and could leak shared OS locks after all read transactions and readers ended.
+
+use rusqlite::{Connection, ffi};
+use std::fs::File;
+use std::mem::ManuallyDrop;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::time::Duration;
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE, SetLastError};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx, LOCKFILE_EXCLUSIVE_LOCK, LockFileEx,
+};
+use windows_sys::Win32::System::IO::OVERLAPPED;
+
+fn identity(file: &File) -> (u64, [u8; 16]) {
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the owned or synchronously borrowed handle and native output
+    // structure remain valid for the entire metadata query.
+    assert_ne!(
+        unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        },
+        0,
+        "{}",
+        std::io::Error::last_os_error(),
+    );
+    (info.VolumeSerialNumber, info.FileId.Identifier)
+}
+
+struct Rendezvous {
+    arrived: Mutex<u32>,
+    ready: Condvar,
+    timed_out: AtomicBool,
+}
+
+impl Rendezvous {
+    fn new() -> Self {
+        Self {
+            arrived: Mutex::new(0),
+            ready: Condvar::new(),
+            timed_out: AtomicBool::new(false),
+        }
+    }
+
+    fn wait(&self) {
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        self.ready.notify_all();
+        let (_arrived, timeout) = self
+            .ready
+            .wait_timeout_while(arrived, Duration::from_secs(1), |arrived| *arrived < 2)
+            .unwrap();
+        if timeout.timed_out() {
+            self.timed_out.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+struct LockProbe {
+    identity: (u64, [u8; 16]),
+    calls: AtomicU32,
+    shared_slots: [AtomicU32; 8],
+    allocating: AtomicBool,
+    allocation: Rendezvous,
+    before: Rendezvous,
+    after: Rendezvous,
+}
+
+fn installed() -> &'static Mutex<Option<Arc<LockProbe>>> {
+    static PROBE: OnceLock<Mutex<Option<Arc<LockProbe>>>> = OnceLock::new();
+    PROBE.get_or_init(|| Mutex::new(None))
+}
+
+unsafe extern "system" fn lock(
+    handle: HANDLE,
+    flags: u32,
+    reserved: u32,
+    low: u32,
+    high: u32,
+    overlapped: *mut OVERLAPPED,
+) -> i32 {
+    let probe = installed().lock().unwrap().clone();
+    // SAFETY: the VFS supplies a live OVERLAPPED for the native call.
+    let offset = unsafe { (*overlapped).Anonymous.Anonymous.Offset };
+    let shared = flags & LOCKFILE_EXCLUSIVE_LOCK == 0;
+    let matching = probe.as_ref().filter(|probe| {
+        if low != 1 || high != 0 || !(120..128).contains(&offset) {
+            return false;
+        }
+        // SAFETY: borrow the VFS's live handle for identity only, never close it.
+        let file = ManuallyDrop::new(unsafe { File::from_raw_handle(handle) });
+        identity(&file) == probe.identity
+    });
+    if let Some(probe) = matching
+        && shared
+    {
+        probe.shared_slots[(offset - 120) as usize].fetch_add(1, Ordering::SeqCst);
+    }
+    let selected = matching.filter(|probe| {
+        // WAL_READ_LOCK(1) is WALINDEX_LOCK_OFFSET + 4.
+        shared && offset == 124 && probe.calls.fetch_add(1, Ordering::SeqCst) < 2
+    });
+    if let Some(probe) = selected {
+        probe.before.wait();
+    }
+    // SAFETY: all parameters are forwarded unchanged to the original OS API.
+    let result = unsafe { LockFileEx(handle, flags, reserved, low, high, overlapped) };
+    // Preserve the native error across all diagnostic synchronization.
+    let error = unsafe { GetLastError() };
+    if let Some(probe) = matching
+        && result != 0
+        && ((!shared && offset == 124 && !probe.allocating.swap(true, Ordering::SeqCst))
+            || (shared && offset > 124))
+    {
+        // Hold an uninitialized read mark until the other reader selects
+        // another slot, rather than relying on scheduler timing.
+        probe.allocation.wait();
+    }
+    if let Some(probe) = selected {
+        probe.after.wait();
+    }
+    unsafe { SetLastError(error) };
+    result
+}
+
+struct Installed {
+    vfs: *mut ffi::sqlite3_vfs,
+    original: ffi::sqlite3_syscall_ptr,
+}
+
+impl Installed {
+    fn new(probe: Arc<LockProbe>) -> Self {
+        // SAFETY: the default Windows VFS is initialized and remains alive for
+        // this process. Installation precedes every concurrent SQLite call.
+        unsafe {
+            let vfs = ffi::sqlite3_vfs_find(std::ptr::null());
+            assert!(!vfs.is_null());
+            assert!((*vfs).iVersion >= 3);
+            let original = (*vfs).xGetSystemCall.unwrap()(vfs, c"LockFileEx".as_ptr());
+            assert!(original.is_some());
+            let replacement = std::mem::transmute::<
+                unsafe extern "system" fn(HANDLE, u32, u32, u32, u32, *mut OVERLAPPED) -> i32,
+                unsafe extern "C" fn(),
+            >(lock);
+            *installed().lock().unwrap() = Some(probe);
+            assert_eq!(
+                (*vfs).xSetSystemCall.unwrap()(vfs, c"LockFileEx".as_ptr(), Some(replacement)),
+                ffi::SQLITE_OK,
+            );
+            Self { vfs, original }
+        }
+    }
+}
+
+impl Drop for Installed {
+    fn drop(&mut self) {
+        // SAFETY: all reader threads have joined before the original, correctly
+        // typed syscall pointer is restored on the still-live VFS.
+        unsafe {
+            assert_eq!(
+                (*self.vfs).xSetSystemCall.unwrap()(
+                    self.vfs,
+                    c"LockFileEx".as_ptr(),
+                    self.original,
+                ),
+                ffi::SQLITE_OK,
+            );
+        }
+        *installed().lock().unwrap() = None;
+    }
+}
+
+#[test]
+fn native_rendezvous_records_timeout() {
+    let rendezvous = Rendezvous::new();
+    rendezvous.wait();
+    assert!(rendezvous.timed_out.load(Ordering::SeqCst));
+    rendezvous.wait();
+    assert!(rendezvous.timed_out.load(Ordering::SeqCst));
+}
+
+fn native_reader_probe(prime_readers: bool) -> (Arc<LockProbe>, (u32, i64, i64)) {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    let _serial = SERIAL.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().canonicalize().unwrap().join("catalog.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    connection.busy_timeout(Duration::ZERO).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE probe(value); INSERT INTO probe VALUES(1)",
+        )
+        .unwrap();
+    let identity = identity(&File::open(path.with_file_name("catalog.sqlite-shm")).unwrap());
+    let readers = [
+        Connection::open(&path).unwrap(),
+        Connection::open(&path).unwrap(),
+    ];
+    if prime_readers {
+        // Publish the final WAL read mark and load both schemas before the
+        // native shared-lock gates; concurrent initialization can use slot 2.
+        for reader in &readers {
+            assert_eq!(
+                reader
+                    .query_row("SELECT value FROM probe", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+    let probe = Arc::new(LockProbe {
+        identity,
+        calls: AtomicU32::new(0),
+        shared_slots: std::array::from_fn(|_| AtomicU32::new(0)),
+        allocating: AtomicBool::new(false),
+        allocation: Rendezvous::new(),
+        before: Rendezvous::new(),
+        after: Rendezvous::new(),
+    });
+    let hook = Installed::new(probe.clone());
+    std::thread::scope(|scope| {
+        let (ready, received) = mpsc::channel();
+        let mut release = Vec::new();
+        let mut tasks = Vec::new();
+        for reader in readers {
+            let (sender, receiver) = mpsc::channel();
+            release.push(sender);
+            let ready = ready.clone();
+            tasks.push(scope.spawn(move || {
+                reader
+                    .execute_batch("BEGIN; SELECT value FROM probe")
+                    .unwrap();
+                ready.send(()).unwrap();
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+                reader.execute_batch("ROLLBACK").unwrap();
+                // SAFETY: the owned connection is queried on its owning thread.
+                assert_eq!(
+                    unsafe { ffi::sqlite3_txn_state(reader.handle(), c"main".as_ptr()) },
+                    ffi::SQLITE_TXN_NONE,
+                );
+                reader.close().unwrap();
+            }));
+        }
+        for _ in 0..2 {
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        for sender in release {
+            sender.send(()).unwrap();
+        }
+        for task in tasks {
+            task.join().unwrap();
+        }
+    });
+    drop(hook);
+    let checkpoint: (u32, i64, i64) = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    connection.close().unwrap();
+    temp.close().unwrap();
+    (probe, checkpoint)
+}
+
+#[test]
+fn canonical_windows_catalog_readers_release_native_wal_locks() {
+    let (probe, checkpoint) = native_reader_probe(true);
+    let calls = probe.calls.load(Ordering::SeqCst);
+    let slots = probe
+        .shared_slots
+        .each_ref()
+        .map(|calls| calls.load(Ordering::SeqCst));
+    assert!(
+        calls >= 2,
+        "native overlapping-reader gate was not reached: callbacks={calls}, shared slots={slots:?}"
+    );
+    assert!(
+        !probe.before.timed_out.load(Ordering::SeqCst)
+            && !probe.after.timed_out.load(Ordering::SeqCst),
+        "native two-reader rendezvous timed out: before={}, after={}",
+        probe.before.timed_out.load(Ordering::SeqCst),
+        probe.after.timed_out.load(Ordering::SeqCst),
+    );
+    assert!(!probe.allocating.load(Ordering::SeqCst));
+    assert_eq!(*probe.allocation.arrived.lock().unwrap(), 0);
+    assert_eq!(
+        checkpoint,
+        (0, 0, 0),
+        "closed native readers left WAL locks: SQLite {}, callbacks {calls}",
+        rusqlite::version(),
+    );
+}
+
+#[test]
+fn concurrent_readmark_initialization_is_not_native_reader_overlap() {
+    let (probe, checkpoint) = native_reader_probe(false);
+    assert!(!probe.allocation.timed_out.load(Ordering::SeqCst));
+    assert!(*probe.allocation.arrived.lock().unwrap() >= 2);
+    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.shared_slots[4].load(Ordering::SeqCst), 1);
+    assert!(probe.shared_slots[5].load(Ordering::SeqCst) > 0);
+    assert!(probe.before.timed_out.load(Ordering::SeqCst));
+    assert!(probe.after.timed_out.load(Ordering::SeqCst));
+    assert_eq!(checkpoint, (0, 0, 0));
+}

@@ -1,3 +1,6 @@
+use crate::managed::WorkPermit;
+use crate::managed::lifetime::ObjectGuard;
+use crate::ondisk::IndexLayout;
 /// Mmap-based read-only index reader.
 ///
 /// Uses memory-mapped files for zero-copy access to `lookup.bin` and
@@ -6,9 +9,51 @@
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::Result;
 use crate::ondisk::{self, LOOKUP_ENTRY_SIZE, LookupEntry, POSTING_ENTRY_SIZE, PostingEntry};
+
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotLimits {
+    pub(crate) files: u64,
+    pub(crate) metadata: u64,
+    lookup: u64,
+    postings: u64,
+}
+
+impl SnapshotLimits {
+    pub(crate) fn measure(
+        layout: IndexLayout,
+        mut open: impl FnMut(&str) -> Result<File>,
+    ) -> Result<Self> {
+        use std::io::{Seek, SeekFrom};
+        Ok(Self {
+            files: open(layout.files())?.seek(SeekFrom::End(0))?,
+            metadata: open(layout.meta())?.seek(SeekFrom::End(0))?,
+            lookup: open(layout.lookup())?.seek(SeekFrom::End(0))?,
+            postings: open(layout.postings())?.seek(SeekFrom::End(0))?,
+        })
+    }
+
+    pub(crate) fn private_estimate(&self) -> crate::managed::Result<u64> {
+        self.files
+            .checked_mul(12)
+            .and_then(|bytes| {
+                self.metadata
+                    .checked_mul(8)
+                    .and_then(|meta| bytes.checked_add(meta))
+            })
+            .and_then(|bytes| bytes.checked_add(64 * 1024))
+            .ok_or_else(|| crate::managed::Error::pressure("base-private-account-overflow"))
+    }
+
+    pub(crate) fn mapped_bytes(&self) -> crate::managed::Result<u64> {
+        self.lookup
+            .checked_add(self.postings)
+            .ok_or_else(|| crate::managed::Error::pressure("generation-mapped-account-overflow"))
+    }
+}
 
 pub struct IndexReader {
     lookup: Option<Mmap>,
@@ -21,64 +66,114 @@ pub struct IndexReader {
     /// Populated only by strict snapshot validation, in its existing posting pass.
     snapshot_file_has_postings: Vec<bool>,
     num_entries: usize,
+    managed: Option<Arc<ObjectGuard>>,
+    retained: Vec<crate::managed::memory::RetainedMemory>,
 }
 
 impl IndexReader {
     pub fn open(index_dir: &Path) -> Result<Self> {
-        Self::open_impl(index_dir, false)
+        crate::managed::reject_unguarded(index_dir)?;
+        Self::open_impl(index_dir, false, IndexLayout::Legacy, None, None, None)
     }
 
     /// Open every section needed to identify an immutable snapshot. Ordinary
     /// readers retain their legacy empty-section handling.
     pub(crate) fn open_for_snapshot(index_dir: &Path) -> Result<Self> {
-        let mut reader = Self::open_impl(index_dir, true)?;
-        reader
-            .validate_lookup()
-            .map_err(crate::Error::IndexCorrupted)?;
-        reader.snapshot_file_has_postings = reader
-            .validate_snapshot_postings()
-            .map_err(crate::Error::IndexCorrupted)?;
+        crate::managed::reject_unguarded(index_dir)?;
+        Self::open_snapshot(index_dir, IndexLayout::Legacy, None, None, None)
+    }
+
+    pub(crate) fn open_for_snapshot_controlled(
+        index_dir: &Path,
+        permit: &Arc<WorkPermit>,
+        limits: &SnapshotLimits,
+    ) -> Result<Self> {
+        crate::managed::reject_unguarded(index_dir)?;
+        Self::open_snapshot(
+            index_dir,
+            IndexLayout::Legacy,
+            None,
+            Some(permit),
+            Some(limits),
+        )
+    }
+
+    pub(crate) fn open_managed(
+        guard: Arc<ObjectGuard>,
+        permit: Option<&Arc<WorkPermit>>,
+        limits: &SnapshotLimits,
+    ) -> Result<Self> {
+        let directory = guard.directory.path().to_path_buf();
+        Self::open_snapshot(
+            &directory,
+            IndexLayout::Managed,
+            Some(guard),
+            permit,
+            Some(limits),
+        )
+    }
+
+    fn open_snapshot(
+        index_dir: &Path,
+        layout: IndexLayout,
+        guard: Option<Arc<ObjectGuard>>,
+        permit: Option<&Arc<WorkPermit>>,
+        limits: Option<&SnapshotLimits>,
+    ) -> Result<Self> {
+        let mut reader = Self::open_impl(index_dir, true, layout, guard, permit, limits)?;
+        reader.validate_lookup_controlled(permit)?;
+        reader.snapshot_file_has_postings = reader.validate_snapshot_postings(permit)?;
         Ok(reader)
     }
 
-    fn validate_snapshot_postings(&self) -> std::result::Result<Vec<bool>, String> {
+    fn validate_snapshot_postings(&self, permit: Option<&Arc<WorkPermit>>) -> Result<Vec<bool>> {
         let mut file_has_postings = vec![false; self.file_paths.len()];
         let mut expected_offset = 0_u64;
         for i in 0..self.num_entries {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
             let entry = self.read_lookup_entry(i);
             if entry.trigram > 0x00ff_ffff {
-                return Err(format!(
+                return Err(crate::Error::IndexCorrupted(format!(
                     "shared base lookup entry {i} has an invalid trigram"
-                ));
+                )));
             }
             if entry.offset != expected_offset {
-                return Err(format!(
+                return Err(crate::Error::IndexCorrupted(format!(
                     "shared base lookup entry {i} has posting offset {}, expected {expected_offset}",
                     entry.offset
-                ));
+                )));
             }
             let (_, bytes) = self.nth_trigram_raw(i).ok_or_else(|| {
-                format!("shared base lookup entry {i} has an invalid posting range")
+                crate::Error::IndexCorrupted(format!(
+                    "shared base lookup entry {i} has an invalid posting range"
+                ))
             })?;
             let mut previous_file_id = None;
-            for raw in bytes.as_chunks::<POSTING_ENTRY_SIZE>().0 {
+            for (index, raw) in bytes.as_chunks::<POSTING_ENTRY_SIZE>().0.iter().enumerate() {
+                if index.is_multiple_of(4096)
+                    && let Some(permit) = permit
+                {
+                    permit.check()?;
+                }
                 let posting = PostingEntry::decode(raw);
                 if self.file_path(posting.file_id).is_none() {
-                    return Err(format!(
+                    return Err(crate::Error::IndexCorrupted(format!(
                         "shared base lookup entry {i} references out-of-range file_id {}",
                         posting.file_id
-                    ));
+                    )));
                 }
                 if previous_file_id.is_some_and(|previous| posting.file_id <= previous) {
-                    return Err(format!(
+                    return Err(crate::Error::IndexCorrupted(format!(
                         "shared base lookup entry {i} has non-increasing posting file IDs"
-                    ));
+                    )));
                 }
                 if posting.loc_mask == 0 {
-                    return Err(format!(
+                    return Err(crate::Error::IndexCorrupted(format!(
                         "shared base lookup entry {i} has a zero location mask for file_id {}",
                         posting.file_id
-                    ));
+                    )));
                 }
                 file_has_postings[posting.file_id as usize] = true;
                 previous_file_id = Some(posting.file_id);
@@ -87,17 +182,31 @@ impl IndexReader {
         }
         let postings_len = self.postings.as_ref().map_or(0, |postings| postings.len()) as u64;
         if expected_offset != postings_len {
-            return Err("shared base index.bin contains unreferenced posting bytes".to_string());
+            return Err(crate::Error::IndexCorrupted(
+                "shared base index.bin contains unreferenced posting bytes".to_string(),
+            ));
         }
         Ok(file_has_postings)
     }
 
-    fn open_impl(index_dir: &Path, require_complete_sections: bool) -> Result<Self> {
-        let lookup_path = index_dir.join("lookup.bin");
-        let postings_path = index_dir.join("index.bin");
-        let files_path = index_dir.join("files.bin");
+    fn open_impl(
+        index_dir: &Path,
+        require_complete_sections: bool,
+        layout: IndexLayout,
+        guard: Option<Arc<ObjectGuard>>,
+        permit: Option<&Arc<WorkPermit>>,
+        limits: Option<&SnapshotLimits>,
+    ) -> Result<Self> {
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
+        let lookup_path = index_dir.join(layout.lookup());
+        let postings_path = index_dir.join(layout.postings());
+        let files_path = index_dir.join(layout.files());
 
-        if !lookup_path.exists() || !postings_path.exists() || !files_path.exists() {
+        if guard.is_none()
+            && (!lookup_path.exists() || !postings_path.exists() || !files_path.exists())
+        {
             return Err(crate::Error::IndexNotFound(index_dir.display().to_string()));
         }
 
@@ -119,11 +228,24 @@ impl IndexReader {
         use memmap2::MmapOptions;
         use std::io::{Seek, SeekFrom};
 
-        let mut lookup_file = File::open(&lookup_path)?;
-        let mut postings_file = File::open(&postings_path)?;
+        let open = |name: &str| -> Result<File> {
+            match &guard {
+                Some(guard) => Ok(guard.directory.open_file(name, false)?),
+                None => Ok(File::open(index_dir.join(name))?),
+            }
+        };
+        let mut lookup_file = open(layout.lookup())?;
+        let mut postings_file = open(layout.postings())?;
 
         let lookup_len_u64 = lookup_file.seek(SeekFrom::End(0))?;
         let postings_len_u64 = postings_file.seek(SeekFrom::End(0))?;
+        if limits.is_some_and(|limits| {
+            limits.lookup != lookup_len_u64 || limits.postings != postings_len_u64
+        }) {
+            return Err(
+                crate::managed::Error::busy("snapshot-size-changed-after-admission").into(),
+            );
+        }
 
         if require_complete_sections && ((lookup_len_u64 == 0) != (postings_len_u64 == 0)) {
             return Err(crate::Error::IndexCorrupted(
@@ -170,9 +292,17 @@ impl IndexReader {
 
         // Load file paths. A truncated files.bin used to be silently accepted,
         // resulting in queries that returned empty file paths for high IDs.
-        let files_data = std::fs::read(&files_path)?;
-        let file_table_id = crate::meta::file_table_id(&files_data);
-        let file_entries = ondisk::decode_file_entries(ondisk::file_table_body(&files_data)?)?;
+        let files_data = crate::managed::inputs::read_bytes(
+            open(layout.files())?,
+            limits.map_or(u64::MAX, |limits| limits.files),
+            permit,
+        )?;
+        let file_table_id = crate::meta::file_table_id_controlled(&files_data, permit)?;
+        let body = ondisk::file_table_body_for(&files_data, layout)?;
+        let file_entries = match permit {
+            Some(_) => ondisk::decode_file_entries_controlled(body, permit)?,
+            None => ondisk::decode_file_entries(body)?,
+        };
 
         // Validate that file IDs are dense (0..N) with no duplicates.
         // Without this, a corrupted files.bin declaring an id like
@@ -183,6 +313,9 @@ impl IndexReader {
         let n = file_entries.len();
         let mut seen = vec![false; n];
         for (id, _) in &file_entries {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
             let idx = *id as usize;
             if idx >= n {
                 return Err(crate::Error::IndexCorrupted(format!(
@@ -199,10 +332,28 @@ impl IndexReader {
         }
         let mut file_paths = vec![String::new(); n];
         for (id, path) in file_entries {
+            if let Some(permit) = permit {
+                permit.check()?;
+            }
             file_paths[id as usize] = path;
         }
-        let mut path_order: Vec<usize> = (0..file_paths.len()).collect();
-        path_order.sort_unstable_by(|&a, &b| file_paths[a].cmp(&file_paths[b]));
+        let path_order = if let Some(permit) = permit {
+            let mut ordered = std::collections::BTreeSet::new();
+            for (index, path) in file_paths.iter().enumerate() {
+                permit.check()?;
+                ordered.insert((path.as_str(), index));
+            }
+            let mut order = Vec::with_capacity(ordered.len());
+            for (_, index) in ordered {
+                permit.check()?;
+                order.push(index);
+            }
+            order
+        } else {
+            let mut order: Vec<usize> = (0..file_paths.len()).collect();
+            order.sort_unstable_by(|&a, &b| file_paths[a].cmp(&file_paths[b]));
+            order
+        };
 
         Ok(Self {
             lookup,
@@ -212,6 +363,8 @@ impl IndexReader {
             path_order,
             snapshot_file_has_postings: Vec::new(),
             num_entries,
+            managed: guard,
+            retained: Vec::new(),
         })
     }
 
@@ -227,6 +380,8 @@ impl IndexReader {
             path_order: Vec::new(),
             snapshot_file_has_postings: Vec::new(),
             num_entries: 0,
+            managed: None,
+            retained: Vec::new(),
         }
     }
 
@@ -234,10 +389,36 @@ impl IndexReader {
     pub fn close(&mut self) {
         self.lookup = None;
         self.postings = None;
-        self.file_paths.clear();
-        self.path_order.clear();
-        self.snapshot_file_has_postings.clear();
+        self.file_paths = Vec::new();
+        self.path_order = Vec::new();
+        self.snapshot_file_has_postings = Vec::new();
         self.num_entries = 0;
+        self.managed = None;
+        self.retained = Vec::new();
+    }
+
+    pub(crate) fn retain_memory(&mut self, memory: crate::managed::memory::RetainedMemory) {
+        self.retained.push(memory);
+    }
+
+    pub fn managed_identity(&self) -> Option<(&crate::managed::Id, &crate::managed::Id)> {
+        self.managed
+            .as_ref()
+            .map(|guard| (&guard.namespace, &guard.id))
+    }
+
+    pub(crate) fn managed_guard(&self) -> Option<&Arc<ObjectGuard>> {
+        self.managed.as_ref()
+    }
+
+    pub fn mapped_bytes(&self) -> u64 {
+        self.lookup
+            .as_ref()
+            .map_or(0, |mapping| mapping.len() as u64)
+            + self
+                .postings
+                .as_ref()
+                .map_or(0, |mapping| mapping.len() as u64)
     }
 
     /// Binary search the lookup table for a trigram hash.
@@ -325,6 +506,14 @@ impl IndexReader {
     /// Identity of the path table, lookup table and postings, independent of
     /// their storage directory. Computed once when opening a shared base.
     pub(crate) fn snapshot_id(&self) -> [u8; 32] {
+        self.snapshot_id_controlled(None)
+            .expect("uncontrolled fingerprint has no work-budget failure")
+    }
+
+    pub(crate) fn snapshot_id_controlled(
+        &self,
+        permit: Option<&Arc<WorkPermit>>,
+    ) -> Result<[u8; 32]> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"tgrep/shared-base/v1\0");
         hasher.update(&self.file_table_id);
@@ -333,9 +522,16 @@ impl IndexReader {
             self.postings.as_deref().unwrap_or_default(),
         ] {
             hasher.update(&(bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
+            if let Some(permit) = permit {
+                for chunk in bytes.chunks(64 * 1024) {
+                    permit.check()?;
+                    hasher.update(chunk);
+                }
+            } else {
+                hasher.update(bytes);
+            }
         }
-        *hasher.finalize().as_bytes()
+        Ok(*hasher.finalize().as_bytes())
     }
 
     /// Total number of unique trigrams.
@@ -375,6 +571,14 @@ impl IndexReader {
     /// sequentially reads every lookup entry, warming the mmap pages into the
     /// OS page cache so that subsequent binary searches never hit cold pages.
     pub fn validate_lookup(&self) -> std::result::Result<(), String> {
+        self.validate_lookup_controlled(None)
+            .map_err(|error| match error {
+                crate::Error::IndexCorrupted(detail) => detail,
+                error => error.to_string(),
+            })
+    }
+
+    fn validate_lookup_controlled(&self, permit: Option<&Arc<WorkPermit>>) -> Result<()> {
         let lookup = match self.lookup.as_ref() {
             Some(l) => l,
             None => return Ok(()), // empty index, nothing to validate
@@ -382,14 +586,19 @@ impl IndexReader {
         let postings_len = self.postings.as_ref().map_or(0, |p| p.len());
         let mut prev_trigram: Option<u32> = None;
         for i in 0..self.num_entries {
+            if i.is_multiple_of(4096)
+                && let Some(permit) = permit
+            {
+                permit.check()?;
+            }
             let entry = self.read_lookup_entry(i);
             if let Some(prev) = prev_trigram
                 && entry.trigram <= prev
             {
-                return Err(format!(
+                return Err(crate::Error::IndexCorrupted(format!(
                     "lookup.bin not sorted at entry {i}: trigram {:#x} <= prev {:#x}",
                     entry.trigram, prev
-                ));
+                )));
             }
             // Perform range math in u64 to avoid truncation on 32-bit targets
             // or corrupted indexes with large offsets.
@@ -399,11 +608,11 @@ impl IndexReader {
             match end {
                 Some(e) if e <= postings_len_u64 => {}
                 _ => {
-                    return Err(format!(
+                    return Err(crate::Error::IndexCorrupted(format!(
                         "lookup entry {i} (trigram {:#x}): posting range \
                          [offset={}, length={}] exceeds index.bin length {postings_len}",
                         entry.trigram, entry.offset, entry.length
-                    ));
+                    )));
                 }
             }
             prev_trigram = Some(entry.trigram);
@@ -728,6 +937,8 @@ mod tests {
             path_order: opened.path_order,
             snapshot_file_has_postings: opened.snapshot_file_has_postings,
             num_entries: 0,
+            managed: opened.managed,
+            retained: opened.retained,
         };
         assert!(
             degenerate_reader.is_degenerate(),

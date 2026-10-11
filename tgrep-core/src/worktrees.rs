@@ -6,6 +6,7 @@
 //! require periodic [`WorktreeView::reconcile_full`] calls. No native watcher,
 //! CLI routing, content cache, base migration, or generation GC is provided.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
@@ -106,7 +107,7 @@ impl Default for WorktreeOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeStatus {
     pub ready: bool,
     /// Advances for invalidations and at the start of every reconciliation.
@@ -117,7 +118,7 @@ pub struct WorktreeStatus {
 }
 
 /// Work performed by one successful refresh (including no-op verification).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileStats {
     pub epoch: u64,
     pub full: bool,
@@ -172,6 +173,9 @@ struct State {
     evidence: BTreeMap<String, Evidence>,
     listed: BTreeSet<String>,
     visibility: PathVisibility,
+    restored_content: BTreeMap<String, ContentId>,
+    memory: Option<crate::managed::memory::RetainedMemory>,
+    cost: OverlayCost,
 }
 
 /// One canonical worktree identity and an exact, lifetime-pinned generation.
@@ -180,7 +184,8 @@ struct State {
 /// repository, or another clone). No mutable index/flush API is exposed.
 pub struct WorktreeView {
     root: PathBuf,
-    files: RootedDir,
+    files: Arc<RootedDir>,
+    root_protection: Option<Arc<crate::managed::roots::RootProtection>>,
     repository: Repository,
     generation: Arc<Generation>,
     options: WorktreeOptions,
@@ -190,15 +195,51 @@ pub struct WorktreeView {
 }
 
 impl WorktreeView {
-    pub fn new(
+    pub fn new(root: &Path, generation: Arc<Generation>, options: WorktreeOptions) -> Result<Self> {
+        Self::new_inner(root, generation, options, None)
+    }
+
+    pub(crate) fn new_controlled(
+        root: &Path,
+        generation: Arc<Generation>,
+        options: WorktreeOptions,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<Self> {
+        let mut view = Self::new_inner(
+            root,
+            generation,
+            options,
+            Some(&crate::managed::process::Control::work(permit)),
+        )?;
+        if view.root_protection.is_none() {
+            view.root_protection = Some(
+                crate::managed::roots::RootProtection::in_namespace(
+                    &permit.namespace.directory,
+                    &view.files,
+                    &view.root,
+                )
+                .map_err(|error| WorktreeError::Index(error.into()))?,
+            );
+        }
+        Ok(view)
+    }
+
+    fn new_inner(
         root: &Path,
         generation: Arc<Generation>,
         mut options: WorktreeOptions,
+        control: Option<&crate::managed::process::Control>,
     ) -> Result<Self> {
         let root = fs::canonicalize(root)?;
-        let repository = Repository::discover(&root)?;
-        if repository.identity() != generation.key().repository_identity()
-            || crate::generations::worktree_root(&root)? != root
+        let repository = match control {
+            Some(control) => Repository::discover_controlled(&root, control)?,
+            None => Repository::discover(&root)?,
+        };
+        let worktree_root = match control {
+            Some(control) => Repository::root_controlled(&root, control)?,
+            None => crate::generations::worktree_root(&root)?,
+        };
+        if repository.identity() != generation.key().repository_identity() || worktree_root != root
         {
             return Err(WorktreeError::InvalidInput(
                 "root must be a worktree root in the pinned repository".into(),
@@ -225,10 +266,20 @@ impl WorktreeView {
             options.walk.exclude_paths.push(directory.clone());
         }
         let index = generation.base().create_worktree(&root)?;
-        let files = RootedDir::open(&root)?;
+        let files = Arc::new(RootedDir::open(&root)?);
+        let root_protection = generation
+            .base()
+            .reader()
+            .managed_guard()
+            .map(|guard| {
+                crate::managed::roots::RootProtection::acquire(guard, &files, &root)
+                    .map_err(|error| WorktreeError::Index(error.into()))
+            })
+            .transpose()?;
         Ok(Self {
             root,
             files,
+            root_protection,
             repository,
             generation,
             options,
@@ -244,6 +295,9 @@ impl WorktreeView {
                 evidence: BTreeMap::new(),
                 listed: BTreeSet::new(),
                 visibility: PathVisibility::default(),
+                restored_content: BTreeMap::new(),
+                memory: None,
+                cost: OverlayCost::default(),
             }),
             reconcile: Mutex::new(()),
         })
@@ -259,6 +313,30 @@ impl WorktreeView {
 
     pub fn generation(&self) -> &Arc<Generation> {
         &self.generation
+    }
+
+    pub(crate) fn replacement(
+        &self,
+        generation: Arc<Generation>,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<Self> {
+        self.files.verify_root()?;
+        let mut replacement =
+            Self::new_controlled(&self.root, generation, self.options.clone(), permit)?;
+        self.files.verify_root()?;
+        replacement.files = Arc::clone(&self.files);
+        replacement.root_protection = self.root_protection.clone();
+        Ok(replacement)
+    }
+
+    pub fn root_anchor(&self) -> Option<&crate::managed::RootAnchor> {
+        self.root_protection
+            .as_ref()
+            .map(|protection| &protection.anchor)
+    }
+
+    pub(crate) fn root_identity(&self) -> crate::managed::Result<crate::managed::FileIdentity> {
+        crate::managed::FileIdentity::of(&self.files.directory_handle()?)
     }
 
     pub fn status(&self) -> Result<WorktreeStatus> {
@@ -347,10 +425,49 @@ impl WorktreeView {
         after_discovery: impl FnOnce(),
         before_publish: impl FnOnce(),
     ) -> Result<ReconcileStats> {
+        self.refresh_controlled_inner(after_discovery, before_publish, None)
+    }
+
+    /// Reconcile a managed view under its namespace's bounded work reservation.
+    /// Restored views must use this path before serving indexed queries.
+    pub fn refresh_controlled(
+        &self,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<ReconcileStats> {
+        if self
+            .root_protection
+            .as_ref()
+            .is_none_or(|root| root.namespace != permit.namespace.header().namespace)
+        {
+            return Err(WorktreeError::InvalidInput(
+                "reconciliation reservation belongs to another namespace".into(),
+            ));
+        }
+        self.refresh_controlled_inner(|| {}, || {}, Some(permit))
+    }
+
+    fn refresh_controlled_inner(
+        &self,
+        after_discovery: impl FnOnce(),
+        before_publish: impl FnOnce(),
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<ReconcileStats> {
         let _serial = self
             .reconcile
             .lock()
             .map_err(|_| WorktreeError::Synchronization)?;
+        if permit.is_none()
+            && self
+                .state
+                .read()
+                .map_err(|_| WorktreeError::Synchronization)?
+                .memory
+                .is_some()
+        {
+            return Err(WorktreeError::InvalidInput(
+                "managed views require a reserved reconciliation operation".into(),
+            ));
+        }
         let (epoch, full, hints) = {
             let mut control = self
                 .control
@@ -362,7 +479,7 @@ impl WorktreeView {
             control.full = true;
             (epoch, full, control.hints.clone())
         };
-        let prepared = self.prepare(full, &hints, after_discovery)?;
+        let prepared = self.prepare(full, &hints, after_discovery, permit)?;
         before_publish();
         self.files.verify_root()?;
         let mut control = self
@@ -384,39 +501,85 @@ impl WorktreeView {
             visibility,
             upserts,
             mut stats,
+            mut memory,
         } = prepared;
+        let mut replacement = match (permit, &mut memory) {
+            (Some(permit), Some(memory)) => Some(
+                state
+                    .index
+                    .live
+                    .clone_controlled(permit, memory)
+                    .map_err(crate::Error::from)?,
+            ),
+            _ => None,
+        };
+        let live = replacement.as_mut().unwrap_or(&mut state.index.live);
         let mut clear = Vec::new();
-        for path in state
-            .index
-            .live
-            .overlay_paths()
-            .into_iter()
-            .chain(state.index.live.tombstone_paths())
-        {
-            let content = evidence.get(&path).and_then(|entry| entry.content);
-            let base_content = self.base_content(&path);
+        for path in live.private_paths() {
+            let content = evidence.get(path).and_then(|entry| entry.content);
+            let base_content = self.base_content(path);
             if content == base_content {
-                clear.push(path);
+                if let Some(memory) = &mut memory {
+                    memory
+                        .grow(path.len() as u64 * 2 + 64)
+                        .map_err(crate::Error::from)?;
+                }
+                clear.push(path.to_owned());
             }
         }
-        state.index.live.clear_reconciled_paths(&clear);
+        live.clear_reconciled_paths(&clear);
         for path in self.generation.base().reader().all_paths() {
+            if let Some(permit) = permit {
+                permit.check().map_err(crate::Error::from)?;
+            }
             if evidence.get(path).and_then(|entry| entry.content).is_none()
-                && !state.index.live.is_deleted(path)
+                && !live.is_deleted(path)
             {
-                state.index.live.delete_file(path);
+                if let Some(memory) = &mut memory {
+                    memory
+                        .grow(path.len() as u64 * 4 + 256)
+                        .map_err(crate::Error::from)?;
+                }
+                live.delete_file(path);
             }
         }
         for (path, masks) in upserts {
-            state.index.live.commit_upsert(&path, masks);
+            if let Some(memory) = &mut memory {
+                let bytes = (masks.len() as u64)
+                    .checked_mul(256)
+                    .and_then(|bytes| bytes.checked_add(path.len() as u64 * 4 + 256))
+                    .ok_or_else(|| {
+                        crate::Error::from(crate::managed::Error::pressure(
+                            "overlay-publication-memory-overflow",
+                        ))
+                    })?;
+                memory.grow(bytes).map_err(crate::Error::from)?;
+            }
+            live.commit_upsert(&path, masks);
         }
-        state.listed = evidence
+        let listed = evidence
             .iter()
             .filter(|(_, entry)| entry.listed)
             .map(|(path, _)| path.clone())
             .collect();
+        let retained = match (permit, memory) {
+            (Some(permit), Some(mut memory)) => {
+                let bytes = retained_view_bytes(live, evidence.keys(), &visibility, permit)
+                    .map_err(crate::Error::from)?;
+                memory.resize(bytes).map_err(crate::Error::from)?;
+                Some(memory.retain(0).map_err(crate::Error::from)?)
+            }
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            state.index.live = replacement;
+        }
+        state.listed = listed;
         state.evidence = evidence;
         state.visibility = visibility;
+        state.restored_content.clear();
+        state.memory = retained;
+        state.cost = measure_overlay_cost(&state, permit).map_err(crate::Error::from)?;
         stats.epoch = epoch;
         control.published_epoch = Some(epoch);
         control.full = false;
@@ -436,19 +599,28 @@ impl WorktreeView {
         full: bool,
         hints: &BTreeSet<String>,
         after_discovery: impl FnOnce(),
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
     ) -> Result<Prepared> {
         self.files.verify_root()?;
-        let repository = Repository::discover(&self.root)?;
+        let process = permit.map(crate::managed::process::Control::work);
+        let repository = match &process {
+            Some(control) => Repository::discover_controlled(&self.root, control)?,
+            None => Repository::discover(&self.root)?,
+        };
+        let worktree_root = match &process {
+            Some(control) => Repository::root_controlled(&self.root, control)?,
+            None => crate::generations::worktree_root(&self.root)?,
+        };
         if fs::canonicalize(&self.root)? != self.root
             || repository != self.repository
             || repository.git_dir() != self.repository.git_dir()
-            || crate::generations::worktree_root(&self.root)? != self.root
+            || worktree_root != self.root
         {
             return Err(WorktreeError::InvalidInput(
                 "worktree identity changed".into(),
             ));
         }
-        let ignorecase = if self.options.walk.no_ignore {
+        let ignorecase = if self.options.walk.no_ignore || permit.is_some() {
             None
         } else {
             CaseInsensitiveIgnore::try_frozen_snapshot(&self.root)?.map(Arc::new)
@@ -457,12 +629,28 @@ impl WorktreeView {
         // Metadata alone must not permanently exclude a file whose actual
         // bytes have become small enough. Bound actual reads instead.
         options.max_file_size = None;
-        let walk = walker::walk_file_metadata_with_ignorecase(&self.root, &options, ignorecase);
+        let (walk, memory) = match permit {
+            Some(permit) => {
+                let (walk, memory) = walker::walk_file_metadata_controlled(
+                    &self.root,
+                    &options,
+                    &repository,
+                    permit,
+                )
+                .map_err(crate::Error::from)?;
+                (walk, Some(memory))
+            }
+            None => (
+                walker::walk_file_metadata_with_ignorecase(&self.root, &options, ignorecase),
+                None,
+            ),
+        };
         if walk.skipped_error != 0 {
             return Err(WorktreeError::IncompleteWalk(walk.skipped_error));
         }
         after_discovery();
         let mut prepared = Prepared {
+            memory,
             evidence: BTreeMap::new(),
             visibility: walk.visibility,
             upserts: BTreeMap::new(),
@@ -479,6 +667,9 @@ impl WorktreeView {
         let mut base_contents = None;
         let mut copies: HashMap<u32, Vec<String>> = HashMap::new();
         for path in walk.listed_files {
+            if let Some(permit) = permit {
+                permit.check().map_err(crate::Error::from)?;
+            }
             relative_path(Path::new(&path))?;
             let file = self.files.open_file(Path::new(&path))?;
             let metadata = file.metadata()?;
@@ -495,11 +686,12 @@ impl WorktreeView {
                 prepared.stats.content_reads_avoided += 1;
                 previous.expect("verified previous entry").clone()
             } else {
-                let (bytes, version) = read_file(
+                let (bytes, version, _content_memory) = read_file(
                     &self.files,
                     Path::new(&path),
                     file,
                     self.options.walk.max_file_size,
+                    permit,
                 )?;
                 prepared.stats.files_read += 1;
                 prepared.stats.bytes_read += bytes.len() as u64;
@@ -509,28 +701,57 @@ impl WorktreeView {
                     .max_file_size
                     .is_none_or(|limit| bytes.len() as u64 <= limit);
                 let content = if listed && !walker::is_binary_extension(Path::new(&path)) {
-                    let text = crate::encoding::decode_for_index(&bytes);
+                    let text = crate::encoding::decode_for_index_controlled(&bytes, permit)
+                        .map_err(crate::Error::from)?;
                     prepared.stats.files_decoded += 1;
                     if crate::trigram::is_binary(&text) {
                         None
                     } else {
-                        let id = ContentId::from_indexed_bytes(&text);
+                        let id = ContentId::from_indexed_bytes_controlled(&text, permit)
+                            .map_err(crate::Error::from)?;
                         if self.base_content(&path) != Some(id)
-                            && !(previous.is_some_and(|entry| entry.content == Some(id))
+                            && !(previous
+                                .and_then(|entry| entry.content)
+                                .or_else(|| state.restored_content.get(&path).copied())
+                                == Some(id)
                                 && state.index.live.has_path(&path))
                         {
-                            let contents = base_contents.get_or_insert_with(|| {
-                                self.generation
+                            if base_contents.is_none() {
+                                if let Some(memory) = &mut prepared.memory {
+                                    memory
+                                        .grow(
+                                            (self.generation.base().reader().all_paths().len()
+                                                as u64)
+                                                .checked_mul(128)
+                                                .ok_or_else(|| {
+                                                    crate::Error::from(
+                                                        crate::managed::Error::pressure(
+                                                            "base-copy-memory-overflow",
+                                                        ),
+                                                    )
+                                                })?,
+                                        )
+                                        .map_err(crate::Error::from)?;
+                                }
+                                let mut contents = HashMap::new();
+                                for (file_id, path) in self
+                                    .generation
                                     .base()
                                     .reader()
                                     .all_paths()
                                     .iter()
                                     .enumerate()
-                                    .filter_map(|(file_id, path)| {
-                                        self.base_content(path).map(|id| (id, file_id as u32))
-                                    })
-                                    .collect::<HashMap<_, _>>()
-                            });
+                                {
+                                    if let Some(permit) = permit {
+                                        permit.check().map_err(crate::Error::from)?;
+                                    }
+                                    if let Some(id) = self.base_content(path) {
+                                        contents.insert(id, file_id as u32);
+                                    }
+                                }
+                                base_contents = Some(contents);
+                            }
+                            let contents = base_contents.as_ref().expect("base content map");
                             if let Some(&file_id) = contents.get(&id) {
                                 copies.entry(file_id).or_default().push(path.clone());
                                 prepared.stats.base_files_copied += 1;
@@ -538,7 +759,15 @@ impl WorktreeView {
                                     .upserts
                                     .insert(path.clone(), TrigramMaskMap::default());
                             } else {
-                                let masks = LiveIndex::compute_trigram_masks(&text);
+                                let masks = match (permit, &mut prepared.memory) {
+                                    (Some(permit), Some(memory)) => {
+                                        crate::trigram::extract_merged_masks_controlled(
+                                            &text, permit, memory,
+                                        )
+                                        .map_err(crate::Error::from)?
+                                    }
+                                    _ => LiveIndex::compute_trigram_masks(&text),
+                                };
                                 prepared.stats.files_extracted += 1;
                                 prepared.upserts.insert(path.clone(), masks);
                             }
@@ -572,10 +801,16 @@ impl WorktreeView {
         if !copies.is_empty() {
             let reader = self.generation.base().reader();
             for index in 0..reader.num_trigrams() {
+                if let Some(permit) = permit {
+                    permit.check().map_err(crate::Error::from)?;
+                }
                 let (trigram, postings) = reader.trigram_posting_at(index);
                 for posting in postings {
                     if let Some(paths) = copies.get(&posting.file_id) {
                         for path in paths {
+                            if let Some(memory) = &mut prepared.memory {
+                                memory.grow(128).map_err(crate::Error::from)?;
+                            }
                             prepared
                                 .upserts
                                 .get_mut(path)
@@ -620,6 +855,8 @@ impl WorktreeView {
         let result = read(WorktreeSnapshot {
             root: &self.root,
             rooted: &self.files,
+            generation: &self.generation,
+            protection: &self.root_protection,
             state: &state,
             epoch: control.epoch,
             open_error: &open_error,
@@ -692,10 +929,14 @@ impl WorktreeView {
             &view.checkpoint_path()?,
             Some(view.generation.key()),
         )?;
-        view.state
-            .write()
-            .map_err(|_| WorktreeError::Synchronization)?
-            .index = index;
+        {
+            let mut state = view
+                .state
+                .write()
+                .map_err(|_| WorktreeError::Synchronization)?;
+            state.index = index;
+            state.cost = measure_overlay_cost(&state, None).map_err(crate::Error::from)?;
+        }
         Ok(view)
     }
 
@@ -708,12 +949,298 @@ impl WorktreeView {
                 WorktreeError::InvalidInput("no private checkpoint directory configured".into())
             })
     }
+
+    pub(crate) fn capture_checkpoint(
+        &self,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> crate::managed::Result<CapturedCheckpoint> {
+        let control = self
+            .control
+            .lock()
+            .map_err(|_| crate::managed::Error::corrupt("view lock poisoned"))?;
+        if !control.ready {
+            return Err(crate::managed::Error::busy("view-not-ready"));
+        }
+        self.files.verify_root()?;
+        let state = self
+            .state
+            .read()
+            .map_err(|_| crate::managed::Error::corrupt("view state poisoned"))?;
+        let cost = &state.cost;
+        let amount = cost
+            .bytes
+            .checked_mul(16)
+            .and_then(|bytes| {
+                bytes.checked_add(cost.files.checked_add(cost.tombstones)?.checked_mul(256)?)
+            })
+            .ok_or_else(|| crate::managed::Error::pressure("checkpoint-memory-overflow"))?;
+        let charge = permit.memory(amount)?;
+        let checkpoint = self.generation.base().capture_checkpoint_controlled(
+            &state.index,
+            Some(self.generation.key()),
+            Some(permit),
+        )?;
+        let mut contents = Vec::new();
+        for path in state.index.live.active_paths() {
+            permit.check()?;
+            let content = state
+                .evidence
+                .get(path)
+                .and_then(|entry| entry.content)
+                .ok_or_else(|| {
+                    crate::managed::Error::corrupt("ready overlay has no verified content identity")
+                })?;
+            contents.push((path.to_owned(), content));
+        }
+        self.files.verify_root()?;
+        Ok(CapturedCheckpoint {
+            checkpoint,
+            contents,
+            epoch: control.epoch,
+            _charge: charge,
+        })
+    }
+
+    pub(crate) fn restore_checkpoint_value(
+        &self,
+        checkpoint: crate::shared::OverlayCheckpoint,
+        contents: Vec<(String, ContentId)>,
+        permit: &Arc<crate::managed::WorkPermit>,
+        mut memory: crate::managed::work::MemoryCharge,
+    ) -> Result<()> {
+        let _serial = self
+            .reconcile
+            .lock()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        self.invalidate_all()?;
+        let index = self.generation.base().restore_checkpoint_controlled(
+            &self.root,
+            checkpoint,
+            Some(self.generation.key()),
+            Some(permit),
+        )?;
+        let mut restored_content = BTreeMap::new();
+        for (path, content) in contents {
+            permit.check().map_err(crate::Error::from)?;
+            if !index.live.has_path(&path) || restored_content.insert(path, content).is_some() {
+                return Err(WorktreeError::InvalidInput(
+                    "checkpoint content evidence does not match the private overlay".into(),
+                ));
+            }
+        }
+        let bytes = retained_view_bytes(
+            &index.live,
+            restored_content.keys(),
+            &PathVisibility::default(),
+            permit,
+        )
+        .map_err(crate::Error::from)?;
+        memory.resize(bytes).map_err(crate::Error::from)?;
+        let retained = memory.retain(0).map_err(crate::Error::from)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        state.index = index;
+        state.restored_content = restored_content;
+        state.memory = Some(retained);
+        state.cost = measure_overlay_cost(&state, Some(permit)).map_err(crate::Error::from)?;
+        Ok(())
+    }
+
+    pub fn overlay_cost(&self) -> crate::managed::Result<OverlayCost> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| crate::managed::Error::corrupt("view state poisoned"))?;
+        Ok(state.cost.clone())
+    }
+
+    pub(crate) fn private_evidence(
+        &self,
+        max_paths: u32,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> crate::managed::Result<Vec<PrivateEvidence>> {
+        let control = self
+            .control
+            .lock()
+            .map_err(|_| crate::managed::Error::corrupt("view lock poisoned"))?;
+        if !control.ready {
+            return Err(crate::managed::Error::busy("view-not-ready"));
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| crate::managed::Error::corrupt("view state poisoned"))?;
+        let mut paths: BTreeMap<String, PrivateEvidence> = BTreeMap::new();
+        for path in state.index.live.private_paths() {
+            permit.check()?;
+            if paths.len() >= max_paths as usize {
+                return Err(crate::managed::Error::pressure(
+                    "adaptive-private-path-limit",
+                ));
+            }
+            let content = state.evidence.get(path).and_then(|entry| entry.content);
+            paths.insert(
+                path.to_owned(),
+                PrivateEvidence {
+                    bytes: path.len() as u64,
+                    path: path.to_owned(),
+                    content,
+                },
+            );
+        }
+        for ids in state.index.live.inverted_index().values() {
+            permit.check()?;
+            for &id in ids {
+                permit.check()?;
+                if let Some(path) = state.index.live.file_path(id) {
+                    let evidence = paths.get_mut(path).ok_or_else(|| {
+                        crate::managed::Error::corrupt("overlay evidence mismatch")
+                    })?;
+                    evidence.bytes += crate::ondisk::POSTING_ENTRY_SIZE as u64;
+                }
+            }
+        }
+        Ok(paths.into_values().collect())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OverlayCost {
+    pub files: u64,
+    pub tombstones: u64,
+    pub postings: u64,
+    /// Exact path and posting payload bytes, not an RSS estimate.
+    pub bytes: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PrivateEvidence {
+    pub(crate) path: String,
+    pub(crate) content: Option<ContentId>,
+    pub(crate) bytes: u64,
+}
+
+pub(crate) struct CapturedCheckpoint {
+    pub(crate) checkpoint: crate::shared::OverlayCheckpoint,
+    pub(crate) contents: Vec<(String, ContentId)>,
+    pub(crate) epoch: u64,
+    _charge: crate::managed::work::MemoryCharge,
+}
+
+fn measure_overlay_cost(
+    state: &State,
+    permit: Option<&Arc<crate::managed::WorkPermit>>,
+) -> crate::managed::Result<OverlayCost> {
+    let mut files = 0_u64;
+    let mut tombstones = 0_u64;
+    let mut path_bytes = 0_u64;
+    for (path, deleted) in state
+        .index
+        .live
+        .active_paths()
+        .map(|path| (path, false))
+        .chain(state.index.live.deleted_paths().map(|path| (path, true)))
+    {
+        if let Some(permit) = permit {
+            permit.check()?;
+        }
+        path_bytes = path_bytes
+            .checked_add(path.len() as u64)
+            .ok_or_else(|| crate::managed::Error::corrupt("overlay path accounting overflow"))?;
+        if deleted {
+            tombstones += 1;
+        } else {
+            files += 1;
+        }
+    }
+    let mut postings = 0_u64;
+    for (position, ids) in state.index.live.inverted_index().values().enumerate() {
+        if position % 512 == 0
+            && let Some(permit) = permit
+        {
+            permit.check()?;
+        }
+        postings = postings
+            .checked_add(ids.len() as u64)
+            .ok_or_else(|| crate::managed::Error::corrupt("overlay posting accounting overflow"))?;
+    }
+    let bytes = postings
+        .checked_mul(crate::ondisk::POSTING_ENTRY_SIZE as u64)
+        .and_then(|bytes| bytes.checked_add(path_bytes))
+        .ok_or_else(|| crate::managed::Error::corrupt("overlay accounting overflow"))?;
+    Ok(OverlayCost {
+        files,
+        tombstones,
+        postings,
+        bytes,
+    })
+}
+
+fn retained_view_bytes<'a>(
+    live: &LiveIndex,
+    paths: impl Iterator<Item = &'a String>,
+    visibility: &PathVisibility,
+    permit: &Arc<crate::managed::WorkPermit>,
+) -> crate::managed::Result<u64> {
+    let mut bytes = live
+        .private_memory_estimate(permit)?
+        .checked_add(visibility.private_memory_estimate(permit)?)
+        .and_then(|bytes| bytes.checked_add(64 * 1024))
+        .ok_or_else(|| crate::managed::Error::pressure("view-memory-account-overflow"))?;
+    for path in paths {
+        permit.check()?;
+        bytes = (path.capacity() as u64)
+            .checked_mul(2)
+            .and_then(|path| path.checked_add(512))
+            .and_then(|path| bytes.checked_add(path))
+            .ok_or_else(|| crate::managed::Error::pressure("view-memory-account-overflow"))?;
+    }
+    Ok(bytes)
+}
+
+/// An escaped managed candidate retains both the base and the physical root.
+/// There is deliberately no conversion or Deref to an unguarded File.
+pub struct CandidateFile {
+    file: File,
+    _root: Arc<RootedDir>,
+    _generation: Arc<Generation>,
+    _protection: Option<Arc<crate::managed::roots::RootProtection>>,
+}
+
+impl CandidateFile {
+    pub fn metadata(&self) -> std::io::Result<fs::Metadata> {
+        self.file.metadata()
+    }
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            file: self.file.try_clone()?,
+            _root: Arc::clone(&self._root),
+            _generation: Arc::clone(&self._generation),
+            _protection: self._protection.clone(),
+        })
+    }
+}
+
+impl Read for CandidateFile {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(bytes)
+    }
+}
+
+impl std::io::Seek for CandidateFile {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.file, position)
+    }
 }
 
 /// Borrowed, query-only atomic view. Does not expose the mutable HybridIndex.
 pub struct WorktreeSnapshot<'a> {
     root: &'a Path,
-    rooted: &'a RootedDir,
+    rooted: &'a Arc<RootedDir>,
+    generation: &'a Arc<Generation>,
+    protection: &'a Option<Arc<crate::managed::roots::RootProtection>>,
     state: &'a State,
     epoch: u64,
     open_error: &'a Mutex<Option<std::io::Error>>,
@@ -731,6 +1258,25 @@ impl WorktreeSnapshot<'_> {
     /// An open failure also makes `with_snapshot` fail and invalidate readiness.
     /// Report later handle-read failures through the view after leaving the guard.
     pub fn open_file(&self, relative: &str) -> std::io::Result<File> {
+        if self.generation.base().reader().managed_identity().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "managed snapshots require open_candidate",
+            ));
+        }
+        self.open_inner(relative)
+    }
+
+    pub fn open_candidate(&self, relative: &str) -> std::io::Result<CandidateFile> {
+        Ok(CandidateFile {
+            file: self.open_inner(relative)?,
+            _root: Arc::clone(self.rooted),
+            _generation: Arc::clone(self.generation),
+            _protection: self.protection.clone(),
+        })
+    }
+
+    fn open_inner(&self, relative: &str) -> std::io::Result<File> {
         let result = self.rooted.open_file(Path::new(relative));
         if let Err(error) = &result {
             let mut first_error = self
@@ -788,13 +1334,14 @@ impl WorktreeSnapshot<'_> {
 }
 
 struct Prepared {
+    memory: Option<crate::managed::work::MemoryCharge>,
     evidence: BTreeMap<String, Evidence>,
     visibility: PathVisibility,
     upserts: BTreeMap<String, TrigramMaskMap>,
     stats: ReconcileStats,
 }
 
-fn relative_path(path: &Path) -> Result<String> {
+pub(crate) fn relative_path(path: &Path) -> Result<String> {
     if path.as_os_str().is_empty()
         || path
             .components()
@@ -896,13 +1443,52 @@ fn read_file(
     path: &Path,
     mut file: File,
     limit: Option<u64>,
-) -> Result<(Vec<u8>, FileVersion)> {
+    permit: Option<&Arc<crate::managed::WorkPermit>>,
+) -> Result<(
+    Vec<u8>,
+    FileVersion,
+    Option<crate::managed::work::MemoryCharge>,
+)> {
     let opened = file.metadata()?;
     let version = file_version(&opened);
     let mut bytes = Vec::new();
-    (&mut file)
-        .take(limit.map_or(u64::MAX, |limit| limit.saturating_add(1)))
-        .read_to_end(&mut bytes)?;
+    let mut memory = permit
+        .map(|permit| permit.memory(64 * 1024))
+        .transpose()
+        .map_err(crate::Error::from)?;
+    let work_limit = permit
+        .map(|permit| {
+            permit
+                .namespace
+                .policy()
+                .map(|policy| policy.policy.work.blob_bytes)
+        })
+        .transpose()
+        .map_err(crate::Error::from)?;
+    let read_limit = limit
+        .map_or(u64::MAX, |limit| limit.saturating_add(1))
+        .min(work_limit.map_or(u64::MAX, |limit| limit.saturating_add(1)));
+    let mut input = (&mut file).take(read_limit);
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        if let Some(permit) = permit {
+            permit.check().map_err(crate::Error::from)?;
+        }
+        let count = input.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        if work_limit.is_some_and(|limit| bytes.len() as u64 + count as u64 > limit) {
+            return Err(crate::Error::from(crate::managed::Error::pressure(
+                "checkout-blob-read-limit",
+            ))
+            .into());
+        }
+        if let Some(memory) = &mut memory {
+            memory.grow(count as u64 * 6).map_err(crate::Error::from)?;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
     let current = root.open_file(path)?;
     if version != file_version(&file.metadata()?)
         || version != file_version(&current.metadata()?)
@@ -912,7 +1498,7 @@ fn read_file(
     {
         return Err(WorktreeError::UnstableFile(path.into()));
     }
-    Ok((bytes, version))
+    Ok((bytes, version, memory))
 }
 
 #[cfg(test)]

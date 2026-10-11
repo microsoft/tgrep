@@ -26,7 +26,7 @@
 //! spells `QLogs` and the filesystem spells `qlogs`. Applying the exemption
 //! leaves exactly that one file excluded, and every tracked file in place.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The paths git has in its index, lowercased for case-insensitive lookup.
@@ -36,6 +36,8 @@ use std::path::{Path, PathBuf};
 pub struct TrackedFiles {
     /// Repo-relative, `/`-separated, lowercased.
     paths: HashSet<Box<str>>,
+    ordered: Option<BTreeSet<Box<str>>>,
+    _memory: Option<crate::managed::work::MemoryCharge>,
 }
 
 impl TrackedFiles {
@@ -68,6 +70,15 @@ impl TrackedFiles {
             return !self.paths.is_empty();
         }
         prefix.push('/');
+        if let Some(paths) = &self.ordered {
+            return paths
+                .range::<str, _>((
+                    std::ops::Bound::Included(prefix.as_str()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .is_some_and(|path| path.starts_with(prefix.as_str()));
+        }
         // Linear, but only ever reached for a directory an ignore rule already
         // matched — a handful per walk, not one per entry.
         self.paths.iter().any(|p| p.starts_with(prefix.as_str()))
@@ -90,6 +101,21 @@ impl TrackedFiles {
             sum = sum.wrapping_add(hash);
         }
         (count, xor, sum)
+    }
+
+    pub(crate) fn fingerprint_controlled(
+        &self,
+        permit: &std::sync::Arc<crate::managed::WorkPermit>,
+    ) -> crate::managed::Result<(usize, u64, u64)> {
+        let mut xor = 0;
+        let mut sum = 0_u64;
+        for path in &self.paths {
+            permit.check()?;
+            let hash = membership_hash(path);
+            xor ^= hash;
+            sum = sum.wrapping_add(hash);
+        }
+        Ok((self.paths.len(), xor, sum))
     }
 }
 
@@ -141,12 +167,19 @@ fn metadata_path(mut bytes: &[u8]) -> std::io::Result<&Path> {
 }
 
 fn read_git_dir(repo_root: &Path) -> std::io::Result<PathBuf> {
+    read_git_dir_using(repo_root, |path| std::fs::read(path))
+}
+
+fn read_git_dir_using(
+    repo_root: &Path,
+    read: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<PathBuf> {
     let dot_git = repo_root.join(".git");
     let meta = std::fs::metadata(&dot_git)?;
     if meta.is_dir() {
         return Ok(dot_git);
     }
-    let contents = std::fs::read(&dot_git)?;
+    let contents = read(&dot_git)?;
     let target = contents.strip_prefix(b"gitdir: ").ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid worktree gitfile")
     })?;
@@ -154,7 +187,14 @@ fn read_git_dir(repo_root: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn read_common_dir(git_dir: &Path) -> std::io::Result<PathBuf> {
-    match std::fs::read(git_dir.join("commondir")) {
+    read_common_dir_using(git_dir, |path| std::fs::read(path))
+}
+
+fn read_common_dir_using(
+    git_dir: &Path,
+    read: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+) -> std::io::Result<PathBuf> {
+    match read(&git_dir.join("commondir")) {
         Ok(target) => Ok(git_dir.join(metadata_path(&target)?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(git_dir.to_path_buf()),
         Err(error) => Err(error),
@@ -169,6 +209,43 @@ pub fn read_repository_dirs(repo_root: &Path) -> std::io::Result<(PathBuf, PathB
     let git_dir = read_git_dir(repo_root)?;
     let common_dir = read_common_dir(&git_dir)?;
     Ok((git_dir, common_dir))
+}
+
+/// Bound the small gitfile/commondir inputs used while registering watchers.
+pub fn read_repository_dirs_bounded(repo_root: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+    use std::io::Read;
+    let read = |path: &Path| {
+        const LIMIT: u64 = 128 * 1024;
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "nonregular Git pointer file",
+            ));
+        }
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Git pointer file exceeds watcher input bound",
+            ));
+        }
+        Ok(bytes)
+    };
+    let git_dir = read_git_dir_using(repo_root, read)?;
+    let common_dir = read_common_dir_using(&git_dir, read)?;
+    Ok((git_dir, common_dir))
+}
+
+pub(crate) fn read_repository_dirs_controlled(
+    root: &Path,
+    control: &dyn ignore::gitignore::FileReadControl,
+) -> std::io::Result<(PathBuf, PathBuf)> {
+    let read = |path: &Path| control.read_file(path).map(|bytes| bytes.to_vec());
+    let git_dir = read_git_dir_using(root, read)?;
+    let common = read_common_dir_using(&git_dir, read)?;
+    Ok((git_dir, common))
 }
 
 /// The repository metadata directory shared by all linked worktrees.
@@ -246,6 +323,31 @@ pub fn ignores_case(repo_root: &Path) -> bool {
         .unwrap_or(common_ignorecase)
 }
 
+pub(crate) fn ignores_case_controlled(
+    repository: &crate::generations::Repository,
+    control: &dyn ignore::gitignore::FileReadControl,
+) -> std::io::Result<bool> {
+    let read = |path: PathBuf| -> std::io::Result<Option<String>> {
+        match control.read_file(&path) {
+            Ok(bytes) => std::str::from_utf8(&bytes)
+                .map(|text| Some(text.to_string()))
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    };
+    let Some(config) = read(repository.common_dir().join("config"))? else {
+        return Ok(false);
+    };
+    let common = config_bool(&config, "core", "ignorecase").unwrap_or(false);
+    if !config_bool(&config, "extensions", "worktreeConfig").unwrap_or(false) {
+        return Ok(common);
+    }
+    Ok(read(repository.git_dir().join("config.worktree"))?
+        .and_then(|config| config_bool(&config, "core", "ignorecase"))
+        .unwrap_or(common))
+}
+
 /// Read the tracked paths from `.git/index`.
 ///
 /// Returns `None` when there is no readable index, which the caller must treat
@@ -258,6 +360,55 @@ pub(crate) fn index_path(repo_root: &Path) -> Option<PathBuf> {
 pub fn load_tracked(repo_root: &Path) -> Option<TrackedFiles> {
     let bytes = std::fs::read(index_path(repo_root)?).ok()?;
     parse_index(&bytes)
+}
+
+pub(crate) fn load_tracked_controlled(
+    root: &Path,
+    permit: &std::sync::Arc<crate::managed::WorkPermit>,
+) -> crate::managed::Result<TrackedFiles> {
+    use crate::managed::process::{Control, PipedProcess};
+    let mut command = crate::generations::git::command();
+    command
+        .current_dir(root)
+        .args(["ls-files", "--cached", "--deduplicate", "-z"]);
+    let mut memory = permit.memory(0)?;
+    let mut process = PipedProcess::spawn(&mut command, Control::work(permit), false)?;
+    let limit = usize::try_from(permit.private_limit() / 64)
+        .map_err(|_| crate::managed::Error::pressure("tracked-path-address-range"))?;
+    let bytes = process.read_output_accounted(limit, Some(&mut memory), 32)?;
+    let (status, stderr) = process.finish()?;
+    if !status.success() {
+        return Err(crate::generations::GenerationError::Git {
+            operation: "enumerate worktree tracked paths",
+            code: status.code(),
+            stderr,
+        }
+        .into());
+    }
+    if !bytes.is_empty() && !bytes.ends_with(&[0]) {
+        return Err(crate::managed::Error::corrupt(
+            "unterminated tracked-path output",
+        ));
+    }
+    let mut paths = HashSet::new();
+    let mut ordered = BTreeSet::new();
+    for path in bytes
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        permit.check()?;
+        let path = std::str::from_utf8(path)
+            .map_err(|_| crate::managed::Error::incompatible("tracked path is not UTF-8"))?;
+        crate::generations::validate_tracked_path(path)?;
+        let path = normalise(path).into_boxed_str();
+        ordered.insert(path.clone());
+        paths.insert(path);
+    }
+    Ok(TrackedFiles {
+        paths,
+        ordered: Some(ordered),
+        _memory: Some(memory),
+    })
 }
 
 /// Parse the git index format.
@@ -341,7 +492,11 @@ fn parse_index(bytes: &[u8]) -> Option<TrackedFiles> {
             paths.insert(normalise(&text).into_boxed_str());
         }
     }
-    Some(TrackedFiles { paths })
+    Some(TrackedFiles {
+        paths,
+        ordered: None,
+        _memory: None,
+    })
 }
 
 /// git's offset-encoded varint, as used by index version 4.

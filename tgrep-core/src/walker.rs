@@ -462,7 +462,10 @@ pub fn walk_dir_with_ignorecase(
         &ignore_files,
         visibility.into_inner().unwrap(),
         visibility_ignorecase,
-    );
+        None,
+        None,
+    )
+    .expect("uncontrolled visibility has no work-budget failure");
     WalkResult {
         files: files.into_inner().unwrap(),
         listed_files: listed_files.into_inner().unwrap(),
@@ -497,6 +500,7 @@ fn record_visibility(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_visibility(
     root: &Path,
     no_ignore: bool,
@@ -505,18 +509,24 @@ fn finish_visibility(
     ignore_files: &[PathBuf],
     mut visibility: crate::visibility::PathVisibility,
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
-) -> crate::visibility::PathVisibility {
+    read_control: Option<&std::sync::Arc<dyn ignore::gitignore::FileReadControl>>,
+    permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
+) -> crate::managed::Result<crate::visibility::PathVisibility> {
     if !no_ignore && !visibility.is_empty() {
-        let matcher = build_gitignore_matcher_from_files_with_ignorecase(
+        let matcher = crate::gitignore::matcher_from_ignore_paths_controlled(
             root,
             gitignore_files,
             ignore_files,
             no_require_git,
             ignorecase,
+            read_control,
         );
-        visibility.apply_ignore_rules(matcher.as_ref());
+        match permit {
+            Some(permit) => visibility.apply_ignore_rules_controlled(matcher.as_ref(), permit)?,
+            None => visibility.apply_ignore_rules(matcher.as_ref()),
+        }
     }
-    visibility
+    Ok(visibility)
 }
 
 /// Build a point-query ignore matcher from `.gitignore` and `.ignore` files
@@ -645,6 +655,53 @@ pub fn walk_file_metadata_with_ignorecase(
     opts: &MetaWalkOptions,
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
 ) -> MetaWalkResult {
+    walk_metadata_inner(root, opts, ignorecase, None, None)
+        .expect("an uncontrolled metadata walk has no work-budget failure")
+        .0
+}
+
+pub(crate) fn walk_file_metadata_controlled(
+    root: &Path,
+    opts: &MetaWalkOptions,
+    repository: &crate::generations::Repository,
+    permit: &std::sync::Arc<crate::managed::WorkPermit>,
+) -> crate::managed::Result<(MetaWalkResult, crate::managed::work::MemoryCharge)> {
+    let inputs = crate::managed::inputs::InputControl::new(permit)?;
+    let control: std::sync::Arc<dyn ignore::gitignore::FileReadControl> = inputs.clone();
+    let result = (|| {
+        let ignorecase = if opts.no_ignore {
+            None
+        } else {
+            crate::gitignore::CaseInsensitiveIgnore::frozen_snapshot_controlled(
+                root, repository, permit, &control,
+            )?
+            .map(std::sync::Arc::new)
+        };
+        let (walk, charge) =
+            walk_metadata_inner(root, opts, ignorecase, Some(permit), Some(control))?;
+        Ok((
+            walk,
+            charge.expect("controlled walk owns its memory charge"),
+        ))
+    })();
+    inputs.finish(result)
+}
+
+fn walk_metadata_inner(
+    root: &Path,
+    opts: &MetaWalkOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+    permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
+    read_control: Option<std::sync::Arc<dyn ignore::gitignore::FileReadControl>>,
+) -> crate::managed::Result<(MetaWalkResult, Option<crate::managed::work::MemoryCharge>)> {
+    let memory = std::sync::Arc::new(std::sync::Mutex::new(
+        permit.map(|permit| permit.memory(0)).transpose()?,
+    ));
+    let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let filter_memory = memory.clone();
+    let filter_failure = failure.clone();
+    let controlled_inputs = read_control.is_some();
+    let filter_permit = permit.cloned();
     let no_ignore = opts.no_ignore;
     let max_file_size = opts.max_file_size;
     let results = std::sync::Mutex::new(Vec::new());
@@ -655,8 +712,9 @@ pub fn walk_file_metadata_with_ignorecase(
     let visibility_ignorecase = ignorecase.clone();
     let skipped_error = std::sync::atomic::AtomicUsize::new(0);
     let exclude: std::sync::Arc<Vec<String>> = std::sync::Arc::new(opts.exclude_dirs.clone());
+    let filter_exclude = exclude.clone();
     let p4ignore = (!no_ignore)
-        .then(|| crate::gitignore::build_p4ignore_matcher(root))
+        .then(|| crate::gitignore::build_p4ignore_matcher_controlled(root, read_control.as_ref()))
         .flatten()
         .map(std::sync::Arc::new);
     let match_root = root.to_path_buf();
@@ -664,6 +722,7 @@ pub fn walk_file_metadata_with_ignorecase(
     let exclude_paths = opts.exclude_paths.clone();
 
     let walker = WalkBuilder::new(&root)
+        .file_read_control(read_control.clone())
         .hidden(false)
         .ignore(!no_ignore)
         .parents(!no_ignore)
@@ -672,6 +731,16 @@ pub fn walk_file_metadata_with_ignorecase(
         .git_global(!no_ignore)
         .git_exclude(!no_ignore)
         .filter_entry(move |entry| {
+            if let Some(permit) = &filter_permit
+                && let Err(error) = permit.check()
+            {
+                filter_failure
+                    .lock()
+                    .expect("walk failure lock")
+                    .get_or_insert(error);
+                permit.cancel();
+                return false;
+            }
             if exclude_paths
                 .iter()
                 .any(|path| entry.path().starts_with(path))
@@ -679,20 +748,37 @@ pub fn walk_file_metadata_with_ignorecase(
                 return false;
             }
             let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if is_dir && should_skip_dir(entry, &filter_exclude) {
+                return false;
+            }
             if let Some(ignorecase) = &ignorecase
                 && ignorecase.excludes(entry.path(), is_dir)
             {
                 return false;
             }
-            let Some(matcher) = &p4ignore else {
-                return true;
-            };
-            let Ok(relative) = entry.path().strip_prefix(&match_root) else {
-                return true;
-            };
-            !matcher.is_ignored(relative, is_dir)
+            if let Some(matcher) = &p4ignore
+                && let Ok(relative) = entry.path().strip_prefix(&match_root)
+                && matcher.is_ignored(relative, is_dir)
+            {
+                return false;
+            }
+            if let Some(permit) = &filter_permit
+                && let Err(error) = charge_walk_path(&filter_memory, entry)
+            {
+                filter_failure
+                    .lock()
+                    .expect("walk failure lock")
+                    .get_or_insert(error);
+                permit.cancel();
+                return false;
+            }
+            true
         })
-        .threads(walker_thread_count())
+        .threads(if permit.is_some() {
+            1
+        } else {
+            walker_thread_count()
+        })
         .build_parallel();
 
     walker.run(|| {
@@ -704,7 +790,18 @@ pub fn walk_file_metadata_with_ignorecase(
         let ignore_files = &ignore_files;
         let visibility = &visibility;
         let skipped_error = &skipped_error;
+        let failure = &failure;
+        let memory = &memory;
         Box::new(move |entry| {
+            if let Some(permit) = permit
+                && let Err(error) = permit.check()
+            {
+                failure
+                    .lock()
+                    .expect("walk failure lock")
+                    .get_or_insert(error);
+                return ignore::WalkState::Quit;
+            }
             let entry = match entry {
                 Ok(e) => e,
                 Err(_) => {
@@ -724,6 +821,15 @@ pub fn walk_file_metadata_with_ignorecase(
             if !is_dir && !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 return ignore::WalkState::Continue;
             }
+            if entry.depth() == 0
+                && let Err(error) = charge_walk_path(memory, &entry)
+            {
+                failure
+                    .lock()
+                    .expect("walk failure lock")
+                    .get_or_insert(error);
+                return ignore::WalkState::Quit;
+            }
             // Never convert a native name into another file's path. Validate
             // directories too, before recording visibility or descending.
             let relative = match entry.path().strip_prefix(&root).ok().and_then(Path::to_str) {
@@ -742,7 +848,14 @@ pub fn walk_file_metadata_with_ignorecase(
                 record_visibility(visibility, &root, &entry);
                 // Probing each descended directory finds ignore files the walk
                 // itself filters out; see `gitignore::ignore_files_in`.
-                let (gitignore, dot_ignore) = crate::gitignore::ignore_files_in(entry.path());
+                let (gitignore, dot_ignore) = if controlled_inputs {
+                    (
+                        Some(entry.path().join(crate::gitignore::GITIGNORE_FILENAME)),
+                        Some(entry.path().join(crate::gitignore::DOT_IGNORE_FILENAME)),
+                    )
+                } else {
+                    crate::gitignore::ignore_files_in(entry.path())
+                };
                 if let Some(path) = gitignore {
                     gitignore_files.lock().unwrap().push(path);
                 }
@@ -796,6 +909,13 @@ pub fn walk_file_metadata_with_ignorecase(
         })
     });
 
+    if let Some(error) = failure.lock().expect("walk failure lock").take() {
+        return Err(error);
+    }
+    if let Some(permit) = permit {
+        permit.check()?;
+    }
+    let memory = memory.lock().expect("walk memory lock").take();
     let gitignore_files = gitignore_files.into_inner().unwrap();
     let ignore_files = ignore_files.into_inner().unwrap();
     let visibility = finish_visibility(
@@ -806,15 +926,41 @@ pub fn walk_file_metadata_with_ignorecase(
         &ignore_files,
         visibility.into_inner().unwrap(),
         visibility_ignorecase,
-    );
-    MetaWalkResult {
-        files: results.into_inner().unwrap(),
-        listed_files: listed_files.into_inner().unwrap(),
-        gitignore_files,
-        ignore_files,
-        visibility,
-        skipped_error: skipped_error.into_inner(),
+        read_control.as_ref(),
+        permit,
+    )?;
+    if let Some(permit) = permit {
+        permit.check()?;
     }
+    Ok((
+        MetaWalkResult {
+            files: results.into_inner().unwrap(),
+            listed_files: listed_files.into_inner().unwrap(),
+            gitignore_files,
+            ignore_files,
+            visibility,
+            skipped_error: skipped_error.into_inner(),
+        },
+        memory,
+    ))
+}
+
+fn charge_walk_path(
+    memory: &std::sync::Mutex<Option<crate::managed::work::MemoryCharge>>,
+    entry: &ignore::DirEntry,
+) -> crate::managed::Result<()> {
+    if let Some(memory) = memory
+        .lock()
+        .map_err(|_| crate::managed::Error::corrupt("walk memory lock poisoned"))?
+        .as_mut()
+    {
+        let bytes = (entry.path().as_os_str().as_encoded_bytes().len() as u64)
+            .checked_mul(16)
+            .and_then(|bytes| bytes.checked_add(1024))
+            .ok_or_else(|| crate::managed::Error::pressure("walk-path-memory-overflow"))?;
+        memory.grow(bytes)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

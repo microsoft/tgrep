@@ -1,8 +1,8 @@
 # Local patch to ignore 0.4.25
 
 This directory contains the existing locked `ignore` crate, not a version
-upgrade. All upstream files are preserved; the only upstream source change is
-in `src/dir.rs`. The upstream commit's root `rustfmt.toml` is also included
+upgrade. Upstream sources are preserved except for the deltas below in
+`src/dir.rs`, `src/gitignore.rs` and `src/walk.rs`. The upstream commit's root `rustfmt.toml` is also included
 so workspace formatting preserves the vendored source's original style.
 
 - Source: <https://crates.io/crates/ignore/0.4.25>
@@ -29,6 +29,22 @@ The real-Git shared-daemon regressions cover native gitfiles and independently
 native commondir files, full CLI/RPC lifecycle, global/info-exclude/gitignore/
 dot-ignore precedence, nested repositories, malformed ignore errors, and
 filesystem-scan parity. The upstream crate tests remain included.
+
+## Optional bounded-input hooks
+
+`GitignoreBuilder` and `WalkBuilder` accept an optional `FileReadControl`.
+The managed caller supplies immutable input snapshots, byte/pattern admission,
+cancellation/deadline checks and explicit error reporting. The control follows
+global Git configuration, global/info-exclude/local ignore inputs, native
+gitfile/commondir reads, nested matchers and serial/parallel walkers. It does not
+replace the upstream parser, glob matching or precedence rules.
+
+Without a control, the existing file-reading and partial-error behavior stays
+unchanged. Managed callers record tolerated upstream partial errors and refuse
+readiness instead of silently searching an incomplete ignore corpus. Their
+regressions cover cancellation, bounded oversized inputs, nested precedence,
+configuration changes, native paths and indexed/scan parity. No dependency
+version or upstream license changed.
 
 ## Distribution
 

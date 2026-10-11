@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 
 use super::*;
-use tgrep_core::managed::{OwnerClaim, OwnerGuard};
+use tgrep_core::managed::{CommitState, ErrorCategory, OwnerClaim, OwnerGuard};
 
 #[cfg(feature = "managed-test-hooks")]
 #[path = "managed_faults.rs"]
@@ -52,9 +52,162 @@ fn owner(daemon: &Daemon) -> (OwnerClaim, OwnerGuard) {
         json!({"token":format!("bootstrap-{}",LEASE_SEQUENCE.fetch_add(1,Ordering::Relaxed))}),
     );
     let claim: OwnerClaim = serde_json::from_value(prepared["claim"].clone()).unwrap();
-    let guard = OwnerGuard::claim(claim.clone()).unwrap();
+    let guard = retry_owner_claim(
+        || OwnerGuard::claim(claim.clone()),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
     daemon.rpc("owners.register", json!({"claim":claim}));
     (claim, guard)
+}
+
+fn retry_owner_claim(
+    mut claim: impl FnMut() -> tgrep_core::managed::Result<OwnerGuard>,
+    deadline: Instant,
+) -> tgrep_core::managed::Result<OwnerGuard> {
+    loop {
+        match claim() {
+            Err(error)
+                if error.category == ErrorCategory::Busy
+                    && error.reason_code == "catalog-io"
+                    && error.retryable
+                    && error.committed_state == CommitState::NotCommitted
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
+#[test]
+fn owner_fixture_retries_catalog_contention_without_replacing_the_claim() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let prepared = daemon.rpc("owners.prepare", json!({"token":"contended-owner"}));
+    let claim: OwnerClaim = serde_json::from_value(prepared["claim"].clone()).unwrap();
+    let guard = thread::scope(|scope| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let catalog = claim.storage.join("catalog.sqlite");
+        let holder = scope.spawn(move || {
+            let mut connection = rusqlite::Connection::open(catalog).unwrap();
+            connection.busy_timeout(Duration::from_secs(10)).unwrap();
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            transaction.rollback().unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut attempts = 0;
+        let guard = retry_owner_claim(
+            || {
+                attempts += 1;
+                let result = OwnerGuard::claim(claim.clone());
+                if attempts == 1 {
+                    let error = result
+                        .as_ref()
+                        .err()
+                        .expect("writer lock must block the claim");
+                    assert_eq!(error.category, ErrorCategory::Busy);
+                    assert_eq!(error.reason_code, "catalog-io");
+                    assert!(error.retryable);
+                    assert_eq!(error.committed_state, CommitState::NotCommitted);
+                    release_tx.send(()).unwrap();
+                }
+                result
+            },
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        holder.join().unwrap();
+        assert!(attempts >= 2);
+        guard
+    });
+    assert_eq!(
+        serde_json::to_value(guard.registration()).unwrap(),
+        prepared["claim"]
+    );
+    daemon.rpc("owners.register", json!({"claim":claim}));
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn owner_fixture_does_not_retry_unsafe_or_expired_claim_failures() {
+    for (category, reason, retryable, committed, expired) in [
+        (
+            ErrorCategory::Busy,
+            "catalog-io",
+            true,
+            CommitState::NotCommitted,
+            true,
+        ),
+        (
+            ErrorCategory::Busy,
+            "catalog-io",
+            false,
+            CommitState::NotCommitted,
+            false,
+        ),
+        (
+            ErrorCategory::Busy,
+            "catalog-io",
+            true,
+            CommitState::Committed,
+            false,
+        ),
+        (
+            ErrorCategory::Busy,
+            "catalog-io",
+            true,
+            CommitState::Unknown,
+            false,
+        ),
+        (
+            ErrorCategory::Busy,
+            "owner-guard-already-held",
+            true,
+            CommitState::NotCommitted,
+            false,
+        ),
+        (
+            ErrorCategory::Io,
+            "catalog-io",
+            true,
+            CommitState::NotCommitted,
+            false,
+        ),
+    ] {
+        let deadline = Instant::now()
+            + if expired {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(10)
+            };
+        let mut attempts = 0;
+        let result = retry_owner_claim(
+            || {
+                attempts += 1;
+                assert_eq!(attempts, 1, "unsafe claim retry: {reason}");
+                let mut error = tgrep_core::managed::Error::new(category, reason, "claim failed");
+                error.retryable = retryable;
+                error.committed_state = committed;
+                Err(error)
+            },
+            deadline,
+        );
+        let error = result.err().unwrap();
+        assert_eq!(error.category, category);
+        assert_eq!(error.reason_code, reason);
+        assert_eq!(error.committed_state, committed);
+    }
 }
 
 fn token(claim: &OwnerClaim, sequence: u64) -> Value {

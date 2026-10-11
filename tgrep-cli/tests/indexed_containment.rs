@@ -211,7 +211,7 @@ fn index_and_serve_preserve_temporary_output_owned_by_another_writer() {
         assert!(!output.status.success(), "{output:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(
-            stderr.contains("another tgrep server or index build"),
+            stderr.contains("another tgrep server is already running or an index build"),
             "{stderr}"
         );
         for path in [&spill, &stage] {

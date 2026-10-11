@@ -178,7 +178,7 @@ fn warm_start_cleans_abandoned_build_output_before_serving() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("another tgrep server or index build")
+            .contains("another tgrep server is already running or an index build")
     );
     assert_eq!(fs::read(active_spill).unwrap(), b"active server output");
 }

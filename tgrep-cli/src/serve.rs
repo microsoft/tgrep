@@ -39,6 +39,10 @@ mod recovery_tests;
 #[path = "serve/hidden_tests.rs"]
 mod hidden_tests;
 
+#[cfg(test)]
+#[path = "serve/build_tests.rs"]
+mod build_tests;
+
 const CACHE_CAPACITY: usize = 50_000;
 /// Total decoded bytes the content cache may hold. The entry-count limit above
 /// says nothing about memory; without this a handful of large files can pin
@@ -226,7 +230,8 @@ fn try_acquire_server_lock(index_dir: &Path) -> Result<File> {
                 String::new()
             };
             anyhow::bail!(
-                "another tgrep server or index build is already running for index directory `{}`{}. \
+                "another tgrep server is already running or an index build is in progress \
+                 for index directory `{}`{}. \
                  Stop the server or wait for the build to finish before starting another writer.",
                 index_dir.display(),
                 detail,
@@ -251,6 +256,8 @@ pub(crate) fn prepare_index_directory(root: &Path, index_dir: &Path) -> Result<(
         "index directory must not contain the source root"
     );
     let lock_file = try_acquire_server_lock(&index_dir)?;
+    index_cleanup::recover_pending(&index_dir)
+        .context("recovering an interrupted index publication")?;
     index_cleanup::cleanup_stale_builds(&index_dir);
     index_cleanup::cleanup_retired(&index_dir);
     Ok((index_dir, lock_file))
@@ -718,6 +725,7 @@ struct ServerState {
 enum StaleRefreshPhase {
     BeforeRefreshLock,
     BeforeWalk,
+    AfterBuildCheckpoint,
     AfterBuildBeforeStampPublish,
     BeforeCoverageReconcile,
     AfterFilenameSidecarPublish,
@@ -956,7 +964,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         started: serve_start,
         last_search_ms: std::sync::atomic::AtomicU64::new(0),
         #[cfg(test)]
-        stale_refresh_hook: Mutex::new(None),
+        stale_refresh_hook: Mutex::new(build_tests::startup_hook()),
     });
 
     // Bind TCP listener on a random port
@@ -2385,6 +2393,14 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
     json_rpc_result(id, result)
 }
 
+fn indexing_pool(state: &ServerState, label: &'static str) -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(state.index_threads)
+        .thread_name(move |i| format!("{label}-{i}"))
+        .build()
+        .context("cannot create the indexing worker pool")
+}
+
 fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> String {
     let index_dir = state.index_dir.clone();
     while state.indexing.load(Ordering::SeqCst) || state.flushing.load(Ordering::SeqCst) {
@@ -2409,20 +2425,25 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
     // both are published.
     let staging_dir = index_dir.join(".reload-build");
     index_cleanup::cleanup_staging(&staging_dir);
-    let outcome = match builder::build_index_with_options_and_ignorecase(
-        &state.root,
-        Some(&staging_dir),
-        &builder::BuildOptions {
-            no_ignore: state.no_ignore,
-            no_require_git: state.no_require_git,
-            max_file_size: state.max_file_size,
-            exclude_dirs: state.exclude_dirs.clone(),
-            exclude_paths: vec![state.index_dir.clone()],
-            collect_gitignore_files: !state.no_ignore,
-            ..Default::default()
-        },
-        ignorecase.clone(),
-    ) {
+    let build = || {
+        builder::build_index_with_options_and_ignorecase(
+            &state.root,
+            Some(&staging_dir),
+            &builder::BuildOptions {
+                no_ignore: state.no_ignore,
+                no_require_git: state.no_require_git,
+                max_file_size: state.max_file_size,
+                exclude_dirs: state.exclude_dirs.clone(),
+                exclude_paths: vec![state.index_dir.clone()],
+                collect_gitignore_files: !state.no_ignore,
+                ..Default::default()
+            },
+            ignorecase.clone(),
+        )
+    };
+    let outcome = match indexing_pool(state, "tgrep-reload-index")
+        .and_then(|pool| pool.install(build).map_err(Into::into))
+    {
         Ok(outcome) => outcome,
         Err(e) => {
             index_cleanup::cleanup_staging(&staging_dir);
@@ -5912,7 +5933,6 @@ fn create_empty_index(index_dir: &Path) -> Result<()> {
     // caller: the recovery path in `reset_to_empty_index` runs after a failed
     // build, which is exactly when the directory is least likely to be intact.
     std::fs::create_dir_all(index_dir)?;
-    builder::check_build_disk_space(index_dir, &[], builder::IndexStrategy::External)?;
     tgrep_core::meta::remove_file_evidence(index_dir)?;
     // Empty lookup.bin, index.bin, files.bin
     std::fs::write(index_dir.join("lookup.bin"), b"")?;
@@ -6241,14 +6261,7 @@ fn stream_merge_stale_changes(
                 builder::DEFAULT_INDEX_BUFFER_BYTES,
             )
         };
-        let outcome = match rayon::ThreadPoolBuilder::new()
-            .num_threads(state.index_threads)
-            .thread_name(|i| format!("tgrep-stale-index-{i}"))
-            .build()
-        {
-            Ok(pool) => pool.install(build)?,
-            Err(_) => build()?,
-        };
+        let outcome = indexing_pool(state, "tgrep-stale-index")?.install(build)?;
         let delta_count = outcome.indexed;
 
         // Withhold stamps for files the delta could not read. A published stamp
@@ -6905,24 +6918,80 @@ fn reset_to_empty_index(state: &ServerState, root: &Path, index_dir: &Path) {
     }
 }
 
-/// Bootstrap an empty index with the memory-bounded external merge sort.
-///
-/// The incremental path below accumulates every posting in the live overlay
-/// before flushing, so a cold start on a large repository holds the whole
-/// index in heap — on the Linux kernel tree that peaked at ~1.5 GiB. Handing a
-/// true bootstrap to the builder with [`builder::IndexStrategy::External`] bounds peak
-/// memory to the arena budget instead, and is also faster, because it writes
-/// the index once rather than growing an overlay and then flushing it.
-///
-/// Clients scan until complete coverage is published. Results from a fraction
-/// of the repository would be misleading, and `status` reports that indexing
-/// is in progress.
-///
-/// Only used when nothing has been indexed yet. Resuming a partial index still
-/// takes the incremental path, which can skip the files already on disk.
-///
-/// Returns `Ok(false)` to permit an in-heap retry, or an error when retrying
-/// would bypass a storage failure.
+fn publish_build_checkpoint(
+    state: &ServerState,
+    checkpoint: &builder::BuildCheckpoint<'_>,
+) -> Result<()> {
+    let builder::BuildCheckpoint {
+        delta_dir,
+        evidence,
+        processed,
+        total,
+        complete,
+        listed_files,
+        visibility,
+    } = *checkpoint;
+    let staging = state.index_dir.join(".bootstrap-merge");
+    index_cleanup::cleanup_staging(&staging);
+    let gate = state.snapshot_gate.write().unwrap();
+    state.flushing.store(true, Ordering::SeqCst);
+    let result = (|| -> Result<()> {
+        let reader = state.index.read().unwrap().reader_arc();
+        let delta = tgrep_core::reader::IndexReader::open(delta_dir)?;
+        let expected_files = reader.num_files() + delta.num_files();
+        builder::merge_index_with_delta(
+            &state.root,
+            &staging,
+            &reader,
+            &delta,
+            &std::collections::HashSet::new(),
+            complete,
+        )?;
+        stage_index_visibility(&staging, visibility, false)?;
+        tgrep_core::meta::write_file_evidence(evidence, &staging)?;
+        let extra_paths = complete.then(|| {
+            let content_paths: std::collections::HashSet<_> =
+                reader.all_paths().iter().chain(delta.all_paths()).collect();
+            listed_files
+                .iter()
+                .filter_map(|path| path.strip_prefix(&state.root).ok())
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .filter(|path| !content_paths.contains(path))
+                .collect::<std::collections::HashSet<_>>()
+        });
+        drop(delta);
+        drop(reader);
+        let published = publish_staged_index(
+            state,
+            &state.index_dir,
+            &staging,
+            expected_files,
+            &[],
+            &std::collections::HashSet::new(),
+            extra_paths.as_ref(),
+        );
+        if !published.is_published() {
+            anyhow::bail!("could not publish the build checkpoint ({published:?})");
+        }
+        *state.file_evidence.write().unwrap() = evidence.clone();
+        state
+            .index_progress
+            .store(processed as u64, Ordering::Relaxed);
+        state.index_total.store(total as u64, Ordering::Relaxed);
+        Ok(())
+    })();
+    state.flushing.store(false, Ordering::SeqCst);
+    drop(gate);
+    result?;
+    index_cleanup::cleanup_staging(delta_dir);
+    eprintln!("[trace] build checkpoint saved: {processed}/{total} files processed");
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::AfterBuildCheckpoint);
+    Ok(())
+}
+
+/// Build or resume an index with bounded external sorting and durable partial
+/// publications. Never discard an existing checkpoint to retry in heap.
 fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) -> Result<bool> {
     let start = Instant::now();
     let ignorecase = frozen_tracked_membership(state, root);
@@ -6933,15 +7002,18 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     // would exclude everything written while the build ran, which is precisely
     // the window that needs recovering.
     let since = SystemTime::now();
-    eprintln!("[trace] bootstrapping index with the external merge sort (memory-bounded)...");
+    eprintln!(
+        "[trace] building checkpointed index with the external merge sort (memory-bounded)..."
+    );
 
     // Dropped once the build is done so the sampled peak (on platforms without
     // a kernel high-water mark) covers the whole of it. Unlike the incremental
     // path below, nothing here polls memory on its own.
     let sampler = crate::mem::PrivatePeakSampler::start();
-    let outcome = match builder::build_index_with_options_and_ignorecase(
+    let mut checkpoint_attempted = false;
+    let outcome = match builder::build_index_with_checkpoints(
         root,
-        Some(index_dir),
+        index_dir,
         &builder::BuildOptions {
             include_hidden: true,
             no_ignore: state.no_ignore,
@@ -6954,9 +7026,19 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
             buffer_bytes: builder::DEFAULT_INDEX_BUFFER_BYTES,
         },
         ignorecase.clone(),
+        &mut |checkpoint| {
+            checkpoint_attempted = true;
+            publish_build_checkpoint(state, checkpoint)
+                .map_err(|error| tgrep_core::Error::Io(std::io::Error::other(error)))
+        },
     ) {
         Ok(outcome) => outcome,
-        Err(error) if builder::is_build_disk_error(&error) => {
+        Err(error)
+            if checkpoint_attempted
+                || state.index.read().unwrap().num_files() != 0
+                || !state.file_evidence.read().unwrap().versions.is_empty()
+                || builder::is_build_disk_error(&error) =>
+        {
             return Err(error.into());
         }
         Err(e) => {
@@ -6971,9 +7053,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
     let meta = match tgrep_core::meta::IndexMeta::load(index_dir) {
         Ok(meta) => meta,
         Err(error) => {
-            eprintln!("[trace] warning: bootstrapped coverage failed to load: {error}");
-            reset_to_empty_index(state, root, index_dir);
-            return Ok(false);
+            return Err(error.into());
         }
     };
     #[cfg(test)]
@@ -6988,12 +7068,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         Ok(index) => index,
         Err(e) => {
             drop(gate);
-            eprintln!(
-                "[trace] warning: bootstrapped index failed to open ({e}); \
-                 falling back to the in-heap build"
-            );
-            reset_to_empty_index(state, root, index_dir);
-            return Ok(false);
+            return Err(e.into());
         }
     };
     let indexed = opened.num_files() as u64;
@@ -7060,15 +7135,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         && let Err(e) = tgrep_core::meta::write_file_evidence(&evidence, index_dir)
     {
         drop(gate);
-        if builder::is_build_disk_error(&e) {
-            return Err(e.into());
-        }
-        eprintln!(
-            "[trace] warning: could not prepare unwatched bootstrap catch-up ({e}); \
-             falling back to the in-heap build"
-        );
-        reset_to_empty_index(state, root, index_dir);
-        return Ok(false);
+        return Err(e.into());
     }
     *state.file_evidence.write().unwrap() = evidence;
     let mut newly_watched = Vec::new();
@@ -7101,21 +7168,13 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
         spawn_recovery_scan(state, root, newly_watched, since);
     }
 
-    if state.watch_enabled {
-        state.indexing.store(false, Ordering::SeqCst);
-    }
     drop(gate);
-    if !state.watch_enabled {
-        if !catch_up_unwatched_build(state, root, index_dir) {
-            eprintln!(
-                "[trace] warning: unwatched bootstrap catch-up was incomplete; \
-                 falling back to the in-heap build"
-            );
-            reset_to_empty_index(state, root, index_dir);
-            return Ok(false);
-        }
-        state.indexing.store(false, Ordering::SeqCst);
+    #[cfg(test)]
+    run_stale_refresh_hook(state, StaleRefreshPhase::BeforeCoverageReconcile);
+    if !catch_up_unwatched_build(state, root, index_dir) {
+        anyhow::bail!("initial index reconciliation did not establish complete coverage");
     }
+    state.indexing.store(false, Ordering::SeqCst);
     let membership_changed = tracked_membership_changed(state);
     schedule_tracked_membership_correction(state, root, membership_changed);
 
@@ -7138,7 +7197,7 @@ fn bootstrap_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path
 fn fail_background_index_build(state: &ServerState, error: &dyn std::fmt::Display) {
     let message = format!(
         "{error}; initial indexing stopped, queries will scan; \
-         free space and reload or restart the server to retry"
+         resolve the error and reload or restart the server to retry"
     );
     eprintln!("[trace] warning: {message}");
     let _gate = state.snapshot_gate.write().unwrap();
@@ -7174,18 +7233,33 @@ fn complete_background_listed_files(
     )
 }
 
-/// Walk the repo and populate the LiveIndex in batches in a background thread.
-/// Uses rayon for parallel trigram extraction. The bulk build is held entirely
-/// in the live overlay; only one final flush to disk happens once the walk
-/// completes. This avoids the super-linear cost of repeatedly snapshotting an
-/// ever-growing reader+overlay during indexing, and lets us release the live
-/// overlay's allocations once the data is safely on disk.
-///
-/// Trade-off: a crash during the initial build loses all in-progress work
-/// (no intermediate checkpoint to fall back to). The file watcher and
-/// auto-save loop continue to protect ongoing changes after the initial
-/// build completes.
+/// Keep all initial-build work, including external sorting, in the CPU-budgeted
+/// pool. Search continues to use the independent global Rayon pool.
 fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Path) {
+    let index_pool = match indexing_pool(state, "tgrep-index") {
+        Ok(pool) => pool,
+        Err(error) => {
+            fail_background_index_build(state, &error);
+            return;
+        }
+    };
+    eprintln!(
+        "[trace] indexing with {} worker thread(s)",
+        index_pool.current_num_threads()
+    );
+    let build = || background_index_build_in_pool(state, root, index_dir);
+    #[cfg(all(test, feature = "managed-test-hooks"))]
+    let build = {
+        let probe = builder::disk_space_probe_for_test();
+        move || match probe {
+            Some(probe) => builder::with_disk_space_probe_for_test(probe, build),
+            None => build(),
+        }
+    };
+    index_pool.install(build);
+}
+
+fn background_index_build_in_pool(state: &Arc<ServerState>, root: &Path, index_dir: &Path) {
     use rayon::prelude::*;
     use tgrep_core::walker::{self, WalkOptions};
 
@@ -7193,6 +7267,15 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
 
     let start = Instant::now();
     eprintln!("[trace] background indexing started...");
+
+    match bootstrap_index_build(state, root, index_dir) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            fail_background_index_build(state, &error);
+            return;
+        }
+    }
 
     // Build skip set from existing on-disk reader (for incremental indexing)
     let skip_paths = {
@@ -7225,20 +7308,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         .filter(|(path, _)| skip_paths.contains(path.as_str()))
         .map(|(path, version)| (path.clone(), version.clone()))
         .collect();
-
-    // Nothing indexed yet: build straight to disk with bounded memory instead
-    // of accumulating the whole repo in the live overlay. Resuming a partial
-    // index falls through, since that path can skip what is already on disk.
-    if skip_paths.is_empty() {
-        match bootstrap_index_build(state, root, index_dir) {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                fail_background_index_build(state, &error);
-                return;
-            }
-        }
-    }
 
     // Phase 1: Walk file paths (no content reads)
     let t_walk = Instant::now();
@@ -7335,29 +7404,12 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         t_walk.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Phase 2: Process new files in parallel batches.
-    //
-    // Confine the CPU-heavy file-read + trigram-extraction work to a bounded
-    // worker pool (sized from the `--max-cpu` budget) so the initial build
-    // doesn't saturate every core and starve the host. Falls back to the
-    // global rayon pool if a dedicated pool can't be built.
-    let index_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(state.index_threads)
-        .thread_name(|i| format!("tgrep-index-{i}"))
-        .build()
-        .ok();
-    if index_pool.is_some() {
-        eprintln!(
-            "[trace] indexing with {} worker thread(s)",
-            state.index_threads
-        );
-    }
-
+    // Phase 2: Process new files in the same bounded pool as bootstrap.
     let mut incremental_flushes = 0u32;
+    let mut last_checkpoint = Instant::now();
     for (batch_idx, batch) in new_files.chunks(BATCH_SIZE).enumerate() {
-        // Parallel: read files + extract trigrams (no locks held). Run inside
-        // the bounded pool when available so indexing CPU stays capped.
-        let extract = || {
+        // Parallel: read files + extract trigrams (no locks held).
+        let batch_results = {
             batch
                 .par_iter()
                 .filter_map(|path| {
@@ -7412,11 +7464,6 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 })
                 .collect::<Vec<_>>()
         };
-        let batch_results = match &index_pool {
-            Some(pool) => pool.install(extract),
-            None => extract(),
-        };
-
         // Sequential: insert into LiveIndex (brief write lock per batch)
         {
             let mut index = state.index.write().unwrap();
@@ -7453,25 +7500,36 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
         // heap, and that is what a flush can give back. Mapped index pages sit
         // in the working set too but are file-backed, so counting them would
         // fire the cap on memory no flush can reclaim.
-        if let Some(used) = crate::mem::budgeted_memory_bytes()
-            && used > state.memory_cap_bytes
-        {
-            eprintln!(
-                "[trace] memory cap reached ({} MB in use > {} MB cap) — flushing \
-                 overlay to disk to reclaim memory and continuing",
-                used / (1024 * 1024),
-                state.memory_cap_bytes / (1024 * 1024),
-            );
-            match flush_append_only_overlay(state, index_dir, false, None) {
+        let used = crate::mem::budgeted_memory_bytes();
+        let over_budget = used.is_some_and(|used| used > state.memory_cap_bytes);
+        if over_budget || batch_idx == 0 || last_checkpoint.elapsed() >= Duration::from_secs(30) {
+            if let Some(used) = used.filter(|_| over_budget) {
+                eprintln!(
+                    "[trace] memory cap reached ({} MB in use > {} MB cap); saving a checkpoint",
+                    used / (1024 * 1024),
+                    state.memory_cap_bytes / (1024 * 1024),
+                );
+            }
+            let evidence = tgrep_core::meta::FileEvidence {
+                stamps: versions
+                    .iter()
+                    .map(|(path, version)| (path.clone(), version.stamp().clone()))
+                    .collect(),
+                content_ids: content_ids.clone(),
+                versions: versions.clone(),
+            };
+            match flush_append_only_overlay(state, index_dir, false, Some(&evidence)) {
                 Ok(true) => {
                     incremental_flushes += 1;
+                    last_checkpoint = Instant::now();
+                    *state.file_evidence.write().unwrap() = evidence;
                     let mut index = state.index.write().unwrap();
                     index.live.shrink_to_fit();
                 }
-                Ok(false) => eprintln!(
-                    "[trace] warning: incremental flush did not reclaim memory; \
-                     continuing (build may still exceed the budget)"
-                ),
+                Ok(false) => {
+                    fail_background_index_build(state, &"could not publish the build checkpoint");
+                    return;
+                }
                 Err(error) => {
                     fail_background_index_build(state, &error);
                     return;
@@ -7752,13 +7810,13 @@ fn flush_append_only_overlay_locked(
         return Ok(false);
     }
 
-    // Stage filestamps alongside the final complete index. If this fails we
-    // still publish the index: losing incremental stale-check state on next
-    // start is preferable to dropping the completed build.
+    // A checkpoint must retain read evidence as well as postings.
     if let Some(evidence) = evidence
         && let Err(e) = tgrep_core::meta::write_file_evidence(evidence, &staging_dir)
     {
         eprintln!("[trace] warning: failed to write staging filestamps: {e}");
+        index_cleanup::cleanup_staging(&staging_dir);
+        return Err(e.into());
     }
 
     let pruned = publish_staged_index(
@@ -7889,6 +7947,16 @@ fn publish_staged_index(
             }
         };
     };
+    if let Err(error) = moved.commit() {
+        drop(new_reader);
+        let error = moved.fail(error);
+        eprintln!("[trace] warning: index publication commit failed: {error}");
+        return if error.rollback_failed() {
+            PublishStatus::RollbackFailed
+        } else {
+            PublishStatus::Failed
+        };
+    }
 
     // Hold the index write lock through cache invalidation so searches cannot
     // observe the new posting set with bytes from the old cache generation.
@@ -7915,12 +7983,6 @@ fn publish_staged_index(
         if !invalidate_paths.is_empty() {
             state.cache_generation.fetch_add(1, Ordering::SeqCst);
         }
-    }
-    if let Err(error) = moved.commit() {
-        eprintln!(
-            "[trace] warning: index published but backups remain in {}: {error}",
-            moved.backup.path().display()
-        );
     }
     index_cleanup::cleanup_retired(index_dir);
     eprintln!(
@@ -7981,6 +8043,13 @@ fn publish_reloaded_index(
         return false;
     };
 
+    if let Err(error) = moved.commit() {
+        drop(new_reader);
+        let error = moved.fail(error);
+        eprintln!("[trace] warning: reload publication commit failed: {error}");
+        return false;
+    }
+
     // Searches take the outer index lock before consulting the cache. Holding
     // both in that order makes the complete reload visible as one generation.
     {
@@ -8000,12 +8069,6 @@ fn publish_reloaded_index(
         index.live.reset_dirty_count();
         cache.clear();
         state.cache_generation.fetch_add(1, Ordering::SeqCst);
-    }
-    if let Err(error) = moved.commit() {
-        eprintln!(
-            "[trace] warning: index reloaded but backups remain in {}: {error}",
-            moved.backup.path().display()
-        );
     }
     index_cleanup::cleanup_retired(index_dir);
     eprintln!(
@@ -8144,6 +8207,7 @@ impl StagedFileMove {
         if let Some(e) = first_error {
             return Err(e);
         }
+        self.backup.remove_record()?;
         self.finished = true;
         if let Err(error) = std::fs::remove_dir(self.backup.path()) {
             eprintln!(
@@ -8155,8 +8219,9 @@ impl StagedFileMove {
     }
 
     fn commit(&mut self) -> std::io::Result<()> {
+        self.backup.commit()?;
         self.finished = true;
-        self.backup.commit()
+        Ok(())
     }
 
     fn preserve(&mut self) {
@@ -8253,16 +8318,20 @@ fn move_staged_files(
         published: Vec::new(),
         finished: false,
     };
+    if let Err(error) = moved.backup.record_original_files(target) {
+        return Err(moved.fail(error));
+    }
 
-    // Evidence is generation-specific. Move the old file out of the active
-    // directory before publishing any core file, even when the staged
-    // generation has no replacement evidence.
-    let evidence_dst = target.join(EVIDENCE_FILE_NAME);
-    if evidence_dst.exists() {
-        if let Err(error) = publish_file(&evidence_dst, &moved.backup_path(EVIDENCE_FILE_NAME)) {
-            return Err(moved.fail(error));
+    // Withdraw coverage and evidence before replacing any core file. A client
+    // opening the directory after a kill must not trust a mixed generation.
+    for name in [EVIDENCE_FILE_NAME, "meta.json"] {
+        let dst = target.join(name);
+        if dst.exists() {
+            if let Err(error) = publish_file(&dst, &moved.backup_path(name)) {
+                return Err(moved.fail(error));
+            }
+            moved.backed_up.push(name);
         }
-        moved.backed_up.push(EVIDENCE_FILE_NAME);
     }
 
     for name in staged_publish_order() {
@@ -10559,6 +10628,7 @@ mod tests {
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
                 StaleRefreshPhase::BeforeConcreteCommit
+                | StaleRefreshPhase::AfterBuildCheckpoint
                 | StaleRefreshPhase::BeforeCoverageReconcile
                 | StaleRefreshPhase::AfterFilenameSidecarPublish => {}
             })
@@ -10701,6 +10771,7 @@ mod tests {
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
                 StaleRefreshPhase::BeforeConcreteCommit
+                | StaleRefreshPhase::AfterBuildCheckpoint
                 | StaleRefreshPhase::BeforeCoverageReconcile
                 | StaleRefreshPhase::AfterFilenameSidecarPublish => {}
             })
@@ -10885,6 +10956,7 @@ mod tests {
                 StaleRefreshPhase::AfterBuildBeforeStampPublish => {}
                 StaleRefreshPhase::AfterConcreteRead => {}
                 StaleRefreshPhase::BeforeConcreteCommit
+                | StaleRefreshPhase::AfterBuildCheckpoint
                 | StaleRefreshPhase::BeforeCoverageReconcile
                 | StaleRefreshPhase::AfterFilenameSidecarPublish => {}
             })
@@ -11090,6 +11162,106 @@ mod tests {
             &state,
         );
         assert!(response.contains("recovered_build_marker"), "{response}");
+    }
+
+    #[cfg(feature = "managed-test-hooks")]
+    #[test]
+    fn low_disk_bootstrap_keeps_the_server_available_for_status_and_reload() {
+        for probe in [Ok(0), Err(std::io::ErrorKind::PermissionDenied)] {
+            let tmp = TempDir::new().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            test_git(&root, &["init", "--quiet"]);
+            std::fs::write(root.join("source.rs"), "fn low_disk_marker() {}\n").unwrap();
+            let state = builder::with_disk_space_probe_for_test(probe, || {
+                // The startup skeleton must remain usable even when a full
+                // build cannot satisfy its headroom requirement.
+                let mut state = test_server_state(&root, &root.join(".tgrep"));
+                Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+                let before = std::fs::read(state.index_dir.join("meta.json")).unwrap();
+                state.indexing.store(true, Ordering::SeqCst);
+                background_index_build(&state, &root, &state.index_dir);
+                assert!(!state.indexing.load(Ordering::SeqCst));
+                assert!(!state.flushing.load(Ordering::SeqCst));
+                assert!(!state.index.read().unwrap().live.has_pending_changes());
+                assert_eq!(
+                    std::fs::read(state.index_dir.join("meta.json")).unwrap(),
+                    before
+                );
+                let status: serde_json::Value =
+                    serde_json::from_str(&handle_status(None, &state)).unwrap();
+                assert_eq!(status["result"]["hidden_complete"], false);
+                assert!(
+                    status["result"]["index_build_error"]
+                        .as_str()
+                        .unwrap()
+                        .contains(if probe.is_ok() {
+                            "insufficient free disk space"
+                        } else {
+                            "cannot check available disk space"
+                        })
+                );
+                let search: serde_json::Value = serde_json::from_str(&handle_search(
+                    None,
+                    &serde_json::json!({"pattern": "low_disk_marker"}),
+                    &state,
+                ))
+                .unwrap();
+                assert!(search.get("error").is_some(), "{search}");
+                state
+            });
+
+            let response = handle_reload(None, &state);
+            assert!(response.contains("\"status\":\"reloaded\""), "{response}");
+            assert!(state.index_build_error.lock().unwrap().is_none());
+            assert!(
+                handle_search(
+                    None,
+                    &serde_json::json!({"pattern": "low_disk_marker"}),
+                    &state,
+                )
+                .contains("low_disk_marker")
+            );
+        }
+    }
+
+    #[cfg(feature = "managed-test-hooks")]
+    #[test]
+    fn low_disk_resumed_build_and_flush_preserve_the_reader_and_overlay() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        test_git(&root, &["init", "--quiet"]);
+        let mut state = test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        std::fs::write(root.join("seeded.rs"), "fn seeded_marker() {}\n").unwrap();
+        builder::build_index(&root, Some(&state.index_dir), true, false, &[]).unwrap();
+        *state.index.write().unwrap() = HybridIndex::open(&state.index_dir, &root).unwrap();
+        let before = std::fs::read(state.index_dir.join("index.bin")).unwrap();
+        std::fs::write(root.join("new.rs"), "fn new_marker() {}\n").unwrap();
+        state.indexing.store(true, Ordering::SeqCst);
+
+        builder::with_disk_space_probe_for_test(Ok(0), || {
+            background_index_build(&state, &root, &state.index_dir);
+            assert!(!state.indexing.load(Ordering::SeqCst));
+            assert!(state.index_build_error.lock().unwrap().is_some());
+            assert_eq!(state.index.read().unwrap().num_files(), 1);
+            assert!(!state.index.read().unwrap().live.has_pending_changes());
+            state.index.write().unwrap().live.upsert_file_with_trigrams(
+                "new.rs",
+                tgrep_core::trigram::extract(b"fn new_marker() {}\n"),
+            );
+            let error =
+                flush_append_only_overlay(&state, &state.index_dir, false, None).unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<tgrep_core::Error>()
+                    .is_some_and(builder::is_build_disk_error)
+            );
+            assert!(state.index.read().unwrap().live.has_pending_changes());
+        });
+        assert_eq!(
+            std::fs::read(state.index_dir.join("index.bin")).unwrap(),
+            before
+        );
     }
 
     #[test]

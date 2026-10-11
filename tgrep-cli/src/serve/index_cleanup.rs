@@ -8,9 +8,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const RETIRED_DIR: &str = ".retired";
 const GENERATION_PREFIX: &str = "generation-";
 const COMMITTED_PREFIX: &str = "committed-";
+const PUBLICATION_RECORD: &str = "publication.json";
+const PUBLICATION_RECORD_TEMP: &str = "publication.json.tmp";
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PublicationRecord {
+    version: u32,
+    original_files: Vec<String>,
+}
+
 const STAGING_DIRS: &[&str] = &[
+    ".bootstrap-build",
+    ".bootstrap-merge",
     ".reload-build",
     ".filename-index-staging",
     ".stale-delta",
@@ -145,12 +155,187 @@ impl BackupDir {
         &self.path
     }
 
+    pub(super) fn record_original_files(&self, index_dir: &Path) -> io::Result<()> {
+        use std::io::Write;
+
+        let mut original_files = Vec::new();
+        for name in super::staged_publish_order() {
+            match fs::symlink_metadata(index_dir.join(name)) {
+                Ok(metadata) if metadata.is_file() && !is_link(&metadata) => {
+                    original_files.push(name.to_string());
+                }
+                Ok(_) => {
+                    return Err(io::Error::other(format!(
+                        "not an ordinary index file: {name}"
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let record = PublicationRecord {
+            version: 1,
+            original_files,
+        };
+        let temporary = self.path.join(PUBLICATION_RECORD_TEMP);
+        let mut file = fs::File::create_new(&temporary)?;
+        file.write_all(&serde_json::to_vec(&record)?)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(temporary, self.path.join(PUBLICATION_RECORD))
+    }
+
+    pub(super) fn remove_record(&self) -> io::Result<()> {
+        for name in [PUBLICATION_RECORD, PUBLICATION_RECORD_TEMP] {
+            match remove_file(&self.path.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn commit(&self) -> io::Result<()> {
         // Renaming a directory containing mapped files can fail on Windows. Use a
         // sibling marker instead, and keep it until the whole directory is
         // reclaimed so failed cleanup remains retryable across server restarts.
         fs::File::create_new(&self.committed).map(drop)
     }
+}
+
+fn generation_id(name: &str, prefix: &str) -> Option<String> {
+    let id = name.strip_prefix(prefix)?;
+    let (pid, sequence) = id.split_once('-')?;
+    if pid.is_empty()
+        || sequence.is_empty()
+        || !pid.bytes().all(|byte| byte.is_ascii_digit())
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        || pid.parse::<u32>().is_err()
+        || sequence.parse::<u64>().is_err()
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn ordinary_file_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !is_link(&metadata) => Ok(true),
+        Ok(_) => Err(io::Error::other(format!(
+            "not an ordinary index file: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Restore an interrupted publication before opening readers or removing scratch
+/// output. Only the holder of serve.lock may call this; unknown/legacy backups
+/// remain untouched.
+pub(super) fn recover_pending(index_dir: &Path) -> io::Result<()> {
+    let parent = index_dir.join(RETIRED_DIR);
+    match fs::symlink_metadata(&parent) {
+        Ok(metadata) if metadata.is_dir() && !is_link(&metadata) => {}
+        Ok(_) => {
+            return Err(io::Error::other(
+                "not an ordinary index retirement directory",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let mut pending = Vec::new();
+    for entry in fs::read_dir(&parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| generation_id(name, GENERATION_PREFIX))
+        else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() || is_link(&metadata) {
+            eprintln!(
+                "[trace] warning: ignoring non-directory publication backup {}",
+                entry.path().display()
+            );
+            continue;
+        }
+        if ordinary_file_exists(&parent.join(format!("{COMMITTED_PREFIX}{id}")))? {
+            continue;
+        }
+        let record_path = entry.path().join(PUBLICATION_RECORD);
+        if !ordinary_file_exists(&record_path)? {
+            eprintln!(
+                "[trace] warning: preserving unjournaled publication backup {}",
+                entry.path().display()
+            );
+            continue;
+        }
+        if fs::metadata(&record_path)?.len() > 16 * 1024 {
+            return Err(io::Error::other("index publication record is too large"));
+        }
+        let record: PublicationRecord = serde_json::from_slice(&fs::read(record_path)?)?;
+        let mut names = std::collections::HashSet::new();
+        if record.version != 1
+            || record.original_files.iter().any(|name| {
+                !super::staged_publish_order().any(|allowed| allowed == name) || !names.insert(name)
+            })
+        {
+            return Err(io::Error::other(
+                "invalid or unsupported index publication record",
+            ));
+        }
+        pending.push((entry.path(), record));
+    }
+    if pending.len() > 1 {
+        return Err(io::Error::other(
+            "multiple interrupted index publications; preserving backups rather than guessing their order",
+        ));
+    }
+    for (backup, record) in pending {
+        for name in super::staged_publish_order() {
+            let saved = backup.join(name);
+            let target = index_dir.join(name);
+            let original = record
+                .original_files
+                .iter()
+                .any(|original| original == name);
+            if ordinary_file_exists(&saved)? {
+                if !original {
+                    return Err(io::Error::other("backup contains an unrecorded index file"));
+                }
+                if ordinary_file_exists(&target)? {
+                    remove_file(&target)?;
+                }
+                super::publish_file(&saved, &target)?;
+            } else if !original {
+                if ordinary_file_exists(&target)? {
+                    remove_file(&target)?;
+                }
+            } else if !ordinary_file_exists(&target)? {
+                return Err(io::Error::other(format!(
+                    "publication recovery is missing {name}"
+                )));
+            }
+        }
+        remove_file(&backup.join(PUBLICATION_RECORD))?;
+        match fs::remove_dir(&backup) {
+            Ok(()) => {}
+            Err(error) => eprintln!(
+                "[trace] warning: keeping recovered backup {}: {error}",
+                backup.display()
+            ),
+        }
+        eprintln!(
+            "[trace] recovered interrupted index publication from {}",
+            backup.display()
+        );
+    }
+    Ok(())
 }
 
 /// Called under the index directory's server/publication lock, including on
@@ -229,7 +414,7 @@ fn remove_generation(path: &Path) -> io::Result<()> {
     }
     // Backups contain only these files. Do not follow directory links or
     // recursively remove unexpected contents in a recovery folder.
-    for name in super::staged_publish_order() {
+    for name in super::staged_publish_order().chain([PUBLICATION_RECORD, PUBLICATION_RECORD_TEMP]) {
         match remove_file(&path.join(name)) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -332,6 +517,111 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovery_restores_each_interrupted_publication_boundary() {
+        let names: Vec<_> = super::super::staged_publish_order().collect();
+        let original: Vec<_> = names
+            .iter()
+            .copied()
+            .filter(|name| *name != tgrep_core::path_index::EXTRA_PATHS_FILENAME)
+            .collect();
+        let mut steps = vec![
+            (true, super::super::EVIDENCE_FILE_NAME),
+            (true, "meta.json"),
+        ];
+        for name in &names {
+            if original.contains(name)
+                && ![super::super::EVIDENCE_FILE_NAME, "meta.json"].contains(name)
+            {
+                steps.push((true, *name));
+            }
+            steps.push((false, *name));
+        }
+        for boundary in 0..=steps.len() {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("index");
+            let staging = temp.path().join("staging");
+            fs::create_dir(&target).unwrap();
+            fs::create_dir(&staging).unwrap();
+            for name in &original {
+                fs::write(target.join(name), format!("old {name}")).unwrap();
+            }
+            for name in &names {
+                fs::write(staging.join(name), format!("new {name}")).unwrap();
+            }
+            let backup = BackupDir::create(&target).unwrap();
+            backup.record_original_files(&target).unwrap();
+            for (save, name) in steps.iter().take(boundary) {
+                let (from, to) = if *save {
+                    (target.join(name), backup.path().join(name))
+                } else {
+                    (staging.join(name), target.join(name))
+                };
+                super::super::publish_file(&from, &to).unwrap();
+            }
+            recover_pending(&target).unwrap();
+            for name in &original {
+                assert_eq!(
+                    fs::read_to_string(target.join(name)).unwrap(),
+                    format!("old {name}"),
+                    "boundary {boundary}"
+                );
+            }
+            assert!(
+                !target
+                    .join(tgrep_core::path_index::EXTRA_PATHS_FILENAME)
+                    .exists()
+            );
+            assert!(!backup.path().exists());
+            recover_pending(&target).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_untrusted_and_ambiguous_records_without_deleting() {
+        for record in [
+            serde_json::json!({"version": 2, "original_files": ["index.bin"]}),
+            serde_json::json!({"version": 1, "original_files": ["../outside"]}),
+            serde_json::json!({"version": 1, "original_files": ["index.bin", "index.bin"]}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("index.bin"), b"keep").unwrap();
+            let backup = BackupDir::create(temp.path()).unwrap();
+            fs::write(backup.path().join(PUBLICATION_RECORD), record.to_string()).unwrap();
+            assert!(recover_pending(temp.path()).is_err());
+            assert_eq!(fs::read(temp.path().join("index.bin")).unwrap(), b"keep");
+            assert!(backup.path().join(PUBLICATION_RECORD).exists());
+        }
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("index.bin"), b"keep").unwrap();
+        for _ in 0..2 {
+            BackupDir::create(temp.path())
+                .unwrap()
+                .record_original_files(temp.path())
+                .unwrap();
+        }
+        assert!(recover_pending(temp.path()).is_err());
+        assert_eq!(fs::read(temp.path().join("index.bin")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn failed_commit_leaves_rollback_armed() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("index");
+        let staging = temp.path().join("staging");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(target.join("index.bin"), b"old").unwrap();
+        fs::write(staging.join("index.bin"), b"new").unwrap();
+        let mut moved = super::super::move_staged_files(&staging, &target).unwrap();
+        fs::create_dir(&moved.backup.committed).unwrap();
+        assert!(moved.commit().is_err());
+        let marker = moved.backup.committed.clone();
+        drop(moved);
+        assert_eq!(fs::read(target.join("index.bin")).unwrap(), b"old");
+        fs::remove_dir(marker).unwrap();
+    }
+
+    #[test]
     fn stale_build_cleanup_only_removes_recognized_temporary_output() {
         let tmp = tempfile::tempdir().unwrap();
         for name in STAGING_DIRS.iter().copied().chain(["spill-123-4.tmp"]) {
@@ -391,7 +681,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("another tgrep server or index build")
+                .contains("another tgrep server is already running or an index build")
         );
         assert_eq!(fs::read(stage.join("index.bin")).unwrap(), b"active build");
 

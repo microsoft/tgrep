@@ -45,15 +45,38 @@ const MAX_OWNED_FILE_BYTES: u64 = INDEX_BUILD_BATCH_BYTES;
 
 const BUILD_DISK_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 const BUILD_DISK_BYTES_PER_PATH: u64 = 1024;
+const BUILD_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "managed-test-hooks"))]
 type DiskProbe = std::result::Result<u64, std::io::ErrorKind>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "managed-test-hooks"))]
 std::thread_local! {
     static TEST_DISK_PROBE: std::cell::Cell<Option<DiskProbe>> = const {
         std::cell::Cell::new(None)
     };
+}
+
+#[cfg(any(test, feature = "managed-test-hooks"))]
+#[doc(hidden)]
+pub fn disk_space_probe_for_test() -> Option<std::result::Result<u64, std::io::ErrorKind>> {
+    TEST_DISK_PROBE.get()
+}
+
+#[cfg(any(test, feature = "managed-test-hooks"))]
+#[doc(hidden)]
+pub fn with_disk_space_probe_for_test<T>(
+    probe: std::result::Result<u64, std::io::ErrorKind>,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<DiskProbe>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_DISK_PROBE.set(self.0);
+        }
+    }
+    let _restore = Restore(TEST_DISK_PROBE.replace(Some(probe)));
+    action()
 }
 
 #[derive(Debug)]
@@ -89,7 +112,7 @@ fn checked_disk_bytes(bytes: Option<u64>) -> Result<u64> {
 }
 
 fn available_disk_bytes(index_dir: &Path) -> std::io::Result<u64> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "managed-test-hooks"))]
     if let Some(probe) = TEST_DISK_PROBE.get() {
         return probe
             .map_err(|kind| std::io::Error::new(kind, "injected disk-space probe failure"));
@@ -262,6 +285,15 @@ enum PostingSink {
 }
 
 impl PostingSink {
+    fn new(index_dir: &Path, opts: &BuildOptions) -> Self {
+        match opts.strategy {
+            IndexStrategy::InMemory => Self::InMemory(Vec::new()),
+            IndexStrategy::External => {
+                Self::External(ExternalSorter::new(index_dir, opts.buffer_bytes))
+            }
+        }
+    }
+
     fn push_file(
         &mut self,
         file_id: u32,
@@ -284,6 +316,31 @@ impl PostingSink {
                 Ok(())
             }
             Self::External(sorter) => sorter.push_file(file_id, per_trigram),
+        }
+    }
+
+    fn finish(self, index_dir: &Path, root: &Path, files: &[(u32, String)]) -> Result<()> {
+        match self {
+            Self::InMemory(mut postings) => {
+                write_index_v2_from_postings(index_dir, root, files, &mut postings)
+            }
+            Self::External(sorter) => {
+                let (trigram_count, segments) = sorter.write_postings(index_dir)?;
+                eprintln!(
+                    "Writing index ({} trigrams, {} files, {} spill segment(s))...",
+                    trigram_count,
+                    files.len(),
+                    segments
+                );
+                write_files_and_meta(
+                    index_dir,
+                    root,
+                    files.len(),
+                    files.iter().map(|(_, path)| path.as_str()),
+                    trigram_count,
+                    None,
+                )
+            }
         }
     }
 }
@@ -779,6 +836,63 @@ pub fn build_index_with_options_and_ignorecase(
     opts: &BuildOptions,
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
 ) -> Result<BuildOutcome> {
+    build_index_impl(root, index_dir, opts, ignorecase, None)
+}
+
+/// One external-sort delta ready for an ordinary server's index publication.
+pub struct BuildCheckpoint<'a> {
+    pub delta_dir: &'a Path,
+    pub evidence: &'a meta::FileEvidence,
+    pub processed: usize,
+    pub total: usize,
+    /// Extraction has finished; indexed queries still require reconciliation.
+    pub complete: bool,
+    pub listed_files: &'a [std::path::PathBuf],
+    pub visibility: &'a crate::visibility::PathVisibility,
+}
+
+type CheckpointPublisher<'a> = dyn FnMut(&BuildCheckpoint<'_>) -> Result<()> + 'a;
+
+/// Resume a partial index and publish memory-bounded external-sort checkpoints.
+///
+/// The caller must hold the destination's exclusive writer lock. `publish`
+/// receives a delta index, cumulative read-bound evidence, and processed/total
+/// file counts. It must stream-merge the delta into the existing index, publish
+/// its completeness/filename metadata, and release all delta mappings before
+/// returning. Hidden coverage must remain false until reconciliation.
+/// The first extraction batch is checkpointed, then subsequent batches when
+/// thirty seconds have elapsed, and finally the remaining work. Walking, a
+/// single batch, and publication are not interrupted by this time target.
+///
+/// Existing reader paths are reused. Evidence alone does not prove that a
+/// missing reader entry was persisted, so other paths are read again.
+/// The final extraction marks the build complete, but leaves coverage
+/// incomplete: the caller must reconcile edits/deletions and current ignore
+/// rules before allowing indexed queries.
+pub fn build_index_with_checkpoints(
+    root: &Path,
+    index_dir: &Path,
+    opts: &BuildOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+    publish: &mut CheckpointPublisher<'_>,
+) -> Result<BuildOutcome> {
+    if opts.strategy != IndexStrategy::External {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "checkpointed builds require the external index strategy",
+        )
+        .into());
+    }
+    build_index_impl(root, Some(index_dir), opts, ignorecase, Some(publish))
+}
+
+fn build_index_impl(
+    root: &Path,
+    index_dir: Option<&Path>,
+    opts: &BuildOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+    mut publish: Option<&mut CheckpointPublisher<'_>>,
+) -> Result<BuildOutcome> {
     let include_hidden = opts.include_hidden;
     let no_ignore = opts.no_ignore;
     let exclude_dirs = index_exclude_dirs(&opts.exclude_dirs, opts.no_ignore);
@@ -828,21 +942,61 @@ pub fn build_index_with_options_and_ignorecase(
     let gitignore_files = walk.gitignore_files;
     let ignore_files = walk.ignore_files;
 
-    // Reuse these stats for extraction, and leave an existing index untouched
-    // when the destination cannot accommodate the build.
-    let (sizes, charges) = batch_sizes_and_charges(&walk.files);
+    let checkpointed = publish.is_some();
+    let (mut file_id_map, previous_evidence) = if checkpointed {
+        let reader = IndexReader::open(&index_dir)?;
+        let paths = reader
+            .all_paths()
+            .iter()
+            .enumerate()
+            .map(|(id, path)| (id as u32, path.clone()))
+            .collect::<Vec<_>>();
+        (paths, meta::read_file_evidence(&index_dir)?)
+    } else {
+        (Vec::new(), meta::FileEvidence::default())
+    };
+    let seeded: HashSet<&str> = file_id_map.iter().map(|(_, path)| path.as_str()).collect();
+    let files: std::borrow::Cow<'_, [std::path::PathBuf]> = if checkpointed {
+        std::borrow::Cow::Owned(
+            walk.files
+                .iter()
+                .filter(|path| {
+                    let relative = path
+                        .strip_prefix(&root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    !seeded.contains(relative.as_str())
+                })
+                .cloned()
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(&walk.files)
+    };
+    drop(seeded);
+    let resumed_files = walk.files.len() - files.len();
+    let (sizes, charges) = batch_sizes_and_charges(&files);
     check_build_disk_space_for_sizes(
         &index_dir,
         sizes.iter().copied(),
         walk.listed_files.len(),
         opts.strategy,
     )?;
-    let mut building_meta = IndexMeta::new(&root.to_string_lossy(), 0, 0);
-    building_meta.complete = false;
-    building_meta.save(&index_dir)?;
-    // Invalidate evidence before an in-place writer can truncate any core file.
-    meta::remove_file_evidence(&index_dir)?;
-    path_index::remove_extra_paths(&index_dir)?;
+    if !checkpointed {
+        let mut building_meta = IndexMeta::new(&root.to_string_lossy(), 0, 0);
+        building_meta.complete = false;
+        building_meta.save(&index_dir)?;
+        // Invalidate evidence before an in-place writer can truncate any core file.
+        meta::remove_file_evidence(&index_dir)?;
+        path_index::remove_extra_paths(&index_dir)?;
+    }
+    let output_dir = if checkpointed {
+        index_dir.join(".bootstrap-build")
+    } else {
+        index_dir.clone()
+    };
+    std::fs::create_dir_all(&output_dir)?;
 
     // Read files and extract trigrams with masks in bounded parallel batches.
     // Binary content check is done here (not in walker) to avoid an extra
@@ -855,22 +1009,25 @@ pub fn build_index_with_options_and_ignorecase(
     // retaining every file's per-trigram HashMap at once for large repos, and
     // bounding each batch by cumulative bytes caps how much raw file content is
     // resident at once, since the whole batch is read concurrently.
-    let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
-    let mut content_ids = HashMap::with_capacity(walk.files.len());
-    let mut versions = HashMap::with_capacity(walk.files.len());
-    let mut sink = match opts.strategy {
-        IndexStrategy::InMemory => PostingSink::InMemory(Vec::new()),
-        IndexStrategy::External => {
-            std::fs::create_dir_all(&index_dir)?;
-            PostingSink::External(ExternalSorter::new(&index_dir, opts.buffer_bytes))
-        }
-    };
+    file_id_map.reserve(files.len());
+    let mut content_ids = previous_evidence.content_ids;
+    let mut versions = previous_evidence.versions;
+    content_ids.reserve(files.len());
+    versions.reserve(files.len());
+    let mut checkpoint_start = file_id_map.len();
+    let mut sink = PostingSink::new(&output_dir, opts);
+    let mut last_checkpoint = std::time::Instant::now();
+    let mut checkpoints = 0usize;
 
     let raced_too_large = std::sync::Mutex::new(std::collections::HashSet::new());
 
-    for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
-        let batch = &walk.files[range.clone()];
-        let batch_sizes = &sizes[range];
+    let mut ranges = batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES);
+    if ranges.is_empty() {
+        ranges.push(0..0);
+    }
+    for range in ranges {
+        let batch = &files[range.clone()];
+        let batch_sizes = &sizes[range.clone()];
         let owned_budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
         let batch_data: Vec<ExtractedFile> = batch
             .par_iter()
@@ -910,7 +1067,40 @@ pub fn build_index_with_options_and_ignorecase(
                 content_ids.insert(path.clone(), content_id);
             }
             file_id_map.push((file_id, path));
-            sink.push_file(file_id, per_tri)?;
+            // Each delta has local IDs; the complete path table keeps its prefix.
+            sink.push_file(file_id - checkpoint_start as u32, per_tri)?;
+        }
+        if let Some(publish) = publish.as_deref_mut()
+            && (checkpoints == 0
+                || last_checkpoint.elapsed() >= BUILD_CHECKPOINT_INTERVAL
+                || range.end == files.len())
+        {
+            let chunk = std::mem::replace(&mut sink, PostingSink::InMemory(Vec::new()));
+            chunk.finish(&output_dir, &root, &file_id_map[checkpoint_start..])?;
+            let evidence = meta::FileEvidence {
+                stamps: versions
+                    .iter()
+                    .map(|(path, version)| (path.clone(), version.stamp().clone()))
+                    .collect(),
+                content_ids: content_ids.clone(),
+                versions: versions.clone(),
+            };
+            publish(&BuildCheckpoint {
+                delta_dir: &output_dir,
+                evidence: &evidence,
+                processed: resumed_files + range.end,
+                total: walk.files.len(),
+                complete: range.end == files.len(),
+                listed_files: &walk.listed_files,
+                visibility: &walk.visibility,
+            })?;
+            std::fs::create_dir_all(&output_dir)?;
+            if range.end < files.len() {
+                sink = PostingSink::new(&output_dir, opts);
+            }
+            checkpoint_start = file_id_map.len();
+            checkpoints += 1;
+            last_checkpoint = std::time::Instant::now();
         }
     }
 
@@ -922,27 +1112,8 @@ pub fn build_index_with_options_and_ignorecase(
         );
     }
 
-    match sink {
-        PostingSink::InMemory(mut postings) => {
-            write_index_v2_from_postings(&index_dir, &root, &file_id_map, &mut postings)?;
-        }
-        PostingSink::External(sorter) => {
-            let (trigram_count, segments) = sorter.write_postings(&index_dir)?;
-            eprintln!(
-                "Writing index ({} trigrams, {} files, {} spill segment(s))...",
-                trigram_count,
-                file_id_map.len(),
-                segments
-            );
-            write_files_and_meta(
-                &index_dir,
-                &root,
-                file_id_map.len(),
-                file_id_map.iter().map(|(_, p)| p.as_str()),
-                trigram_count,
-                None,
-            )?;
-        }
+    if !checkpointed {
+        sink.finish(&index_dir, &root, &file_id_map)?;
     }
 
     // Publish only read-bound stamps, including verified binary classifications.
@@ -953,6 +1124,22 @@ pub fn build_index_with_options_and_ignorecase(
             "Skipped {} files that grew past max-file-size during extraction",
             raced_too_large.len()
         );
+    }
+    if checkpointed {
+        return Ok(BuildOutcome {
+            num_files: file_id_map.len(),
+            versions,
+            gitignore_files: if opts.collect_gitignore_files {
+                gitignore_files
+            } else {
+                Vec::new()
+            },
+            ignore_files: if opts.collect_gitignore_files {
+                ignore_files
+            } else {
+                Vec::new()
+            },
+        });
     }
     let evidence = evidence_for_indexed_reads(
         walked_paths_for_stamps(&root, &walk.files, &raced_too_large),
@@ -1872,6 +2059,7 @@ fn count_sorted_trigrams(postings: &[TrigramPosting]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::with_disk_space_probe_for_test as with_disk_probe;
     use super::*;
     use crate::reader::IndexReader;
 
@@ -1879,17 +2067,6 @@ mod tests {
 
     fn with_available_disk_bytes<T>(bytes: u64, action: impl FnOnce() -> T) -> T {
         with_disk_probe(Ok(bytes), action)
-    }
-
-    fn with_disk_probe<T>(probe: DiskProbe, action: impl FnOnce() -> T) -> T {
-        struct Restore(Option<DiskProbe>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                TEST_DISK_PROBE.set(self.0);
-            }
-        }
-        let _restore = Restore(TEST_DISK_PROBE.replace(Some(probe)));
-        action()
     }
 
     fn assert_storage_full(error: Error) -> String {

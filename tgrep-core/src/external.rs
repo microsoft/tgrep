@@ -98,19 +98,30 @@ static SPILL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 
 impl SpillDir {
     fn create(index_dir: &Path) -> Result<Self> {
-        let seq = SPILL_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = index_dir.join(format!("spill-{}-{seq}.tmp", std::process::id()));
-        // A leftover directory from a killed build would make stale segments
-        // visible to this run's merge, silently corrupting the index. The PID
-        // can be recycled by the OS and the sequence restarts at zero in a new
-        // process, so this name is reusable across runs even though it is
-        // unique among live sorters.
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path)?;
-        Ok(Self {
-            path,
-            managed: None,
-        })
+        Self::create_with_sequence(index_dir, &SPILL_SEQUENCE)
+    }
+
+    fn create_with_sequence(
+        index_dir: &Path,
+        sequence: &std::sync::atomic::AtomicU64,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(index_dir)?;
+        loop {
+            let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = index_dir.join(format!("spill-{}-{seq}.tmp", std::process::id()));
+            // A recycled PID can collide with output that startup cleanup could
+            // not remove. Never reuse it or force-unlink a retained reader.
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        managed: None,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     fn for_output(output: &crate::output::Output) -> Result<Self> {
@@ -804,6 +815,38 @@ fn merge_segments(
 mod tests {
     use super::*;
     use crate::reader::IndexReader;
+
+    #[test]
+    fn spill_allocation_preserves_colliding_files_and_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sequence = std::sync::atomic::AtomicU64::new(0);
+        let old_file = tmp
+            .path()
+            .join(format!("spill-{}-0.tmp", std::process::id()));
+        let old_dir = tmp
+            .path()
+            .join(format!("spill-{}-1.tmp", std::process::id()));
+        std::fs::write(&old_file, b"retained legacy spill").unwrap();
+        std::fs::create_dir(&old_dir).unwrap();
+        std::fs::write(old_dir.join("seg-00000.bin"), b"retained segments").unwrap();
+
+        let spill = SpillDir::create_with_sequence(tmp.path(), &sequence).unwrap();
+        assert_eq!(
+            spill.path,
+            tmp.path()
+                .join(format!("spill-{}-2.tmp", std::process::id()))
+        );
+        assert_eq!(std::fs::read(&old_file).unwrap(), b"retained legacy spill");
+        assert_eq!(
+            std::fs::read(old_dir.join("seg-00000.bin")).unwrap(),
+            b"retained segments"
+        );
+        let created = spill.path.clone();
+        drop(spill);
+        assert!(!created.exists());
+        assert!(old_file.exists());
+        assert!(old_dir.exists());
+    }
 
     fn posting(trigram: u32, file_id: u32) -> TrigramPosting {
         TrigramPosting {

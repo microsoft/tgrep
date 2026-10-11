@@ -3,16 +3,45 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag matching Cargo.toml (for example, v1.2.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Prepare release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Validate snapshot and create or verify tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: python3 -B scripts/prepare_release.py
+
   build:
     name: Build (${{ matrix.target }})
+    needs: prepare
     strategy:
       matrix:
         include:
@@ -30,6 +59,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Preparation validates this immutable event SHA before creating the tag.
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: |
@@ -54,35 +87,52 @@ jobs:
         run: cross build --release --locked -p tgrep-cli --bin tgrep --target ${{ matrix.target }}
 
       - name: Package (unix)
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           staging=$(mktemp -d)
           cp target/${{ matrix.target }}/release/tgrep "$staging/"
           cp README.md "$staging/"
-          tar czf tgrep-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C "$staging" .
+          tar czf "tgrep-$RELEASE_TAG-${{ matrix.target }}.tar.gz" -C "$staging" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tgrep-${{ matrix.target }}
-          path: tgrep-${{ github.ref_name }}-*
+          path: tgrep-${{ needs.prepare.outputs.tag }}-*
 
   publish:
     name: Publish Release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify release tag still names the built commit
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 -B scripts/prepare_release.py --verify-only
+
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
+          path: release-artifacts
 
       - name: Generate checksums
+        working-directory: release-artifacts
         run: sha256sum tgrep-* > checksums.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: |
-            tgrep-*
-            checksums.txt
+            release-artifacts/tgrep-*
+            release-artifacts/checksums.txt

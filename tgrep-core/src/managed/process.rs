@@ -562,6 +562,7 @@ impl SupervisedChild {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed::lifetime::lock_error;
     use std::io::{BufRead, Write};
 
     const HELPER: &str = "managed::process::tests::owned_process_helper";
@@ -572,6 +573,26 @@ mod tests {
             .args(["--exact", HELPER, "--nocapture"])
             .env("TGREP_OWNED_PROCESS_TEST", mode);
         command
+    }
+
+    fn assert_guard_released(guard: &std::fs::File) {
+        // Reaping the group leader does not synchronously close descendant handles.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match fs2::FileExt::try_lock_exclusive(guard)
+                .map_err(|error| lock_error(error, "descendant-guard-held"))
+            {
+                Ok(()) => return,
+                Err(error) if error.category == ErrorCategory::Busy => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "owned descendant retained its lifetime guard: {error}"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("checking descendant lifetime guard failed: {error}"),
+            }
+        }
     }
 
     #[test]
@@ -659,21 +680,15 @@ mod tests {
                 mode == "exit"
             );
             if mode == "orphan" {
-                assert!(fs2::FileExt::try_lock_exclusive(&guard).is_err());
+                assert_eq!(
+                    fs2::FileExt::try_lock_exclusive(&guard)
+                        .unwrap_err()
+                        .raw_os_error(),
+                    fs2::lock_contended_error().raw_os_error()
+                );
             }
             assert!(process.finish().unwrap().success());
-            loop {
-                match fs2::FileExt::try_lock_exclusive(&guard) {
-                    Ok(()) => break,
-                    Err(error) => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "owned descendant retained its lifetime guard: {error}"
-                        );
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                }
-            }
+            assert_guard_released(&guard);
         }
     }
 
@@ -706,14 +721,19 @@ mod tests {
                 break;
             }
         }
-        assert!(fs2::FileExt::try_lock_exclusive(&guard).is_err());
+        assert_eq!(
+            fs2::FileExt::try_lock_exclusive(&guard)
+                .unwrap_err()
+                .raw_os_error(),
+            fs2::lock_contended_error().raw_os_error()
+        );
         control.cancelled.store(true, Ordering::Release);
         assert_eq!(
             process.read_output(1024).unwrap_err().category,
             ErrorCategory::Cancelled
         );
         drop(process);
-        fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+        assert_guard_released(&guard);
     }
 
     #[test]

@@ -66,12 +66,17 @@ pub fn run(opts: RunOptions<'_>) -> Result<()> {
     }
 
     let started = Instant::now();
+    let root = std::fs::canonicalize(root)?;
+    let index_dir = index_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| builder::default_index_dir(&root));
+    let (index_dir, _lock_file) = crate::serve::prepare_index_directory(&root, &index_dir)?;
     // Dropped after the build so the sampled peak (on platforms without a
     // kernel high-water mark) covers the whole of it.
     let sampler = mem::PrivatePeakSampler::start();
     builder::build_index_with_options(
-        root,
-        index_path,
+        &root,
+        Some(&index_dir),
         &BuildOptions {
             include_hidden,
             no_ignore,

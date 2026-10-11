@@ -179,3 +179,64 @@ fn ordinary_indexes_beneath_unrelated_store_named_directories_stay_indexed() {
     assert!(stderr.contains("protected managed reader"), "{stderr}");
     assert!(!reserved.join("meta.json").exists());
 }
+
+#[test]
+fn index_and_serve_preserve_temporary_output_owned_by_another_writer() {
+    let fixture = Fixture::new();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(fixture.index.join("serve.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    let spill = fixture.index.join("spill-123-0.tmp");
+    let stage = fixture.index.join(".reload-build");
+    fs::create_dir(&spill).unwrap();
+    fs::create_dir(&stage).unwrap();
+    for path in [&spill, &stage] {
+        fs::write(path.join("segment.bin"), b"active build").unwrap();
+    }
+    let before = fs::read(fixture.index.join("meta.json")).unwrap();
+
+    for command in ["index", "serve"] {
+        let output = Command::cargo_bin("tgrep")
+            .unwrap()
+            .timeout(Duration::from_secs(30))
+            .current_dir(&fixture.root)
+            .args([command, ".", "--index-path"])
+            .arg(&fixture.index)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("another tgrep server is already running or an index build"),
+            "{stderr}"
+        );
+        for path in [&spill, &stage] {
+            assert_eq!(fs::read(path.join("segment.bin")).unwrap(), b"active build");
+        }
+        assert_eq!(fs::read(fixture.index.join("meta.json")).unwrap(), before);
+    }
+
+    drop(lock);
+    let output = Command::cargo_bin("tgrep")
+        .unwrap()
+        .timeout(Duration::from_secs(30))
+        .current_dir(&fixture.root)
+        .args(["index", ".", "--index-path"])
+        .arg(&fixture.index)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!spill.exists());
+    assert!(!stage.exists());
+    let output = fixture.query(&fixture.root, &["-F", "--", "needle"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("Query plan:")
+    );
+}

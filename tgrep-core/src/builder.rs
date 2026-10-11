@@ -43,6 +43,163 @@ const INDEX_BUILD_BATCH_SIZE: usize = 1024;
 const INDEX_BUILD_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_OWNED_FILE_BYTES: u64 = INDEX_BUILD_BATCH_BYTES;
 
+const BUILD_DISK_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+const BUILD_DISK_BYTES_PER_PATH: u64 = 1024;
+const BUILD_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(any(test, feature = "managed-test-hooks"))]
+type DiskProbe = std::result::Result<u64, std::io::ErrorKind>;
+
+#[cfg(any(test, feature = "managed-test-hooks"))]
+std::thread_local! {
+    static TEST_DISK_PROBE: std::cell::Cell<Option<DiskProbe>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(any(test, feature = "managed-test-hooks"))]
+#[doc(hidden)]
+pub fn disk_space_probe_for_test() -> Option<std::result::Result<u64, std::io::ErrorKind>> {
+    TEST_DISK_PROBE.get()
+}
+
+#[cfg(any(test, feature = "managed-test-hooks"))]
+#[doc(hidden)]
+pub fn with_disk_space_probe_for_test<T>(
+    probe: std::result::Result<u64, std::io::ErrorKind>,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<DiskProbe>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_DISK_PROBE.set(self.0);
+        }
+    }
+    let _restore = Restore(TEST_DISK_PROBE.replace(Some(probe)));
+    action()
+}
+
+#[derive(Debug)]
+struct DiskPreflightError(String);
+
+impl std::fmt::Display for DiskPreflightError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DiskPreflightError {}
+
+fn disk_preflight_error(kind: std::io::ErrorKind, message: String) -> Error {
+    std::io::Error::new(kind, DiskPreflightError(message)).into()
+}
+
+/// A preflight rejection or native disk-full failure must not be retried by
+/// switching to an in-memory build, which still needs disk for publication.
+pub fn is_build_disk_error(error: &Error) -> bool {
+    matches!(error, Error::Io(error)
+        if error.kind() == std::io::ErrorKind::StorageFull
+            || error.get_ref().is_some_and(|source| source.is::<DiskPreflightError>()))
+}
+
+fn checked_disk_bytes(bytes: Option<u64>) -> Result<u64> {
+    bytes.ok_or_else(|| {
+        disk_preflight_error(
+            std::io::ErrorKind::InvalidInput,
+            "index build disk-space estimate exceeds u64 bytes".into(),
+        )
+    })
+}
+
+fn available_disk_bytes(index_dir: &Path) -> std::io::Result<u64> {
+    #[cfg(any(test, feature = "managed-test-hooks"))]
+    if let Some(probe) = TEST_DISK_PROBE.get() {
+        return probe
+            .map_err(|kind| std::io::Error::new(kind, "injected disk-space probe failure"));
+    }
+    fs2::available_space(index_dir)
+}
+
+fn check_disk_space(index_dir: &Path, payload_bytes: u64, paths: usize) -> Result<()> {
+    let path_bytes = checked_disk_bytes((paths as u64).checked_mul(BUILD_DISK_BYTES_PER_PATH))?;
+    let required = checked_disk_bytes(
+        payload_bytes
+            .checked_add(path_bytes)
+            .and_then(|bytes| bytes.checked_add(BUILD_DISK_HEADROOM_BYTES)),
+    )?;
+    let available = available_disk_bytes(index_dir).map_err(|error| {
+        disk_preflight_error(
+            error.kind(),
+            format!(
+                "cannot check available disk space at {}: {error}",
+                index_dir.display()
+            ),
+        )
+    })?;
+    if available < required {
+        return Err(disk_preflight_error(
+            std::io::ErrorKind::StorageFull,
+            format!(
+                "insufficient free disk space at {}: index build needs an estimated \
+                 {required} bytes, but only {available} bytes are available; \
+                 free disk space or use --index-path on another volume",
+                index_dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn check_build_disk_space_for_sizes(
+    index_dir: &Path,
+    sizes: impl IntoIterator<Item = u64>,
+    paths: usize,
+    strategy: IndexStrategy,
+) -> Result<()> {
+    let source_bytes = sizes.into_iter().try_fold(0_u64, |total, size| {
+        checked_disk_bytes(total.checked_add(size))
+    })?;
+    let copies = match strategy {
+        IndexStrategy::External => 3,
+        IndexStrategy::InMemory => 2,
+    };
+    check_disk_space(
+        index_dir,
+        checked_disk_bytes(source_bytes.checked_mul(copies))?,
+        paths,
+    )
+}
+
+/// Check the destination filesystem before an ordinary index build.
+///
+/// The estimate allows three source-size copies for external sorting, or two
+/// for in-memory sorting, plus 1 KiB per candidate path and 64 MiB of headroom.
+/// Missing metadata uses the same conservative size charge as extraction.
+/// This is a preflight estimate, not a reservation or a worst-case size bound.
+pub fn check_build_disk_space(
+    index_dir: &Path,
+    files: &[std::path::PathBuf],
+    strategy: IndexStrategy,
+) -> Result<()> {
+    check_build_disk_space_for_sizes(
+        index_dir,
+        files.iter().map(|path| {
+            std::fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(INDEX_BUILD_BATCH_BYTES)
+        }),
+        files.len(),
+        strategy,
+    )
+}
+
+fn index_payload_disk_bytes(postings: u64, trigrams: usize) -> Result<u64> {
+    let postings = checked_disk_bytes(postings.checked_mul(ondisk::POSTING_ENTRY_SIZE as u64))?;
+    let lookup =
+        checked_disk_bytes((trigrams as u64).checked_mul(ondisk::LOOKUP_ENTRY_SIZE as u64))?;
+    checked_disk_bytes(postings.checked_add(lookup))
+}
+
 /// Default arena budget for [`IndexStrategy::External`] before spilling.
 pub use crate::external::DEFAULT_BUFFER_BYTES as DEFAULT_INDEX_BUFFER_BYTES;
 
@@ -128,6 +285,15 @@ enum PostingSink {
 }
 
 impl PostingSink {
+    fn new(index_dir: &Path, opts: &BuildOptions) -> Self {
+        match opts.strategy {
+            IndexStrategy::InMemory => Self::InMemory(Vec::new()),
+            IndexStrategy::External => {
+                Self::External(ExternalSorter::new(index_dir, opts.buffer_bytes))
+            }
+        }
+    }
+
     fn push_file(
         &mut self,
         file_id: u32,
@@ -150,6 +316,31 @@ impl PostingSink {
                 Ok(())
             }
             Self::External(sorter) => sorter.push_file(file_id, per_trigram),
+        }
+    }
+
+    fn finish(self, index_dir: &Path, root: &Path, files: &[(u32, String)]) -> Result<()> {
+        match self {
+            Self::InMemory(mut postings) => {
+                write_index_v2_from_postings(index_dir, root, files, &mut postings)
+            }
+            Self::External(sorter) => {
+                let (trigram_count, segments) = sorter.write_postings(index_dir)?;
+                eprintln!(
+                    "Writing index ({} trigrams, {} files, {} spill segment(s))...",
+                    trigram_count,
+                    files.len(),
+                    segments
+                );
+                write_files_and_meta(
+                    index_dir,
+                    root,
+                    files.len(),
+                    files.iter().map(|(_, path)| path.as_str()),
+                    trigram_count,
+                    None,
+                )
+            }
         }
     }
 }
@@ -645,6 +836,63 @@ pub fn build_index_with_options_and_ignorecase(
     opts: &BuildOptions,
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
 ) -> Result<BuildOutcome> {
+    build_index_impl(root, index_dir, opts, ignorecase, None)
+}
+
+/// One external-sort delta ready for an ordinary server's index publication.
+pub struct BuildCheckpoint<'a> {
+    pub delta_dir: &'a Path,
+    pub evidence: &'a meta::FileEvidence,
+    pub processed: usize,
+    pub total: usize,
+    /// Extraction has finished; indexed queries still require reconciliation.
+    pub complete: bool,
+    pub listed_files: &'a [std::path::PathBuf],
+    pub visibility: &'a crate::visibility::PathVisibility,
+}
+
+type CheckpointPublisher<'a> = dyn FnMut(&BuildCheckpoint<'_>) -> Result<()> + 'a;
+
+/// Resume a partial index and publish memory-bounded external-sort checkpoints.
+///
+/// The caller must hold the destination's exclusive writer lock. `publish`
+/// receives a delta index, cumulative read-bound evidence, and processed/total
+/// file counts. It must stream-merge the delta into the existing index, publish
+/// its completeness/filename metadata, and release all delta mappings before
+/// returning. Hidden coverage must remain false until reconciliation.
+/// The first extraction batch is checkpointed, then subsequent batches when
+/// thirty seconds have elapsed, and finally the remaining work. Walking, a
+/// single batch, and publication are not interrupted by this time target.
+///
+/// Existing reader paths are reused. Evidence alone does not prove that a
+/// missing reader entry was persisted, so other paths are read again.
+/// The final extraction marks the build complete, but leaves coverage
+/// incomplete: the caller must reconcile edits/deletions and current ignore
+/// rules before allowing indexed queries.
+pub fn build_index_with_checkpoints(
+    root: &Path,
+    index_dir: &Path,
+    opts: &BuildOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+    publish: &mut CheckpointPublisher<'_>,
+) -> Result<BuildOutcome> {
+    if opts.strategy != IndexStrategy::External {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "checkpointed builds require the external index strategy",
+        )
+        .into());
+    }
+    build_index_impl(root, Some(index_dir), opts, ignorecase, Some(publish))
+}
+
+fn build_index_impl(
+    root: &Path,
+    index_dir: Option<&Path>,
+    opts: &BuildOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+    mut publish: Option<&mut CheckpointPublisher<'_>>,
+) -> Result<BuildOutcome> {
     let include_hidden = opts.include_hidden;
     let no_ignore = opts.no_ignore;
     let exclude_dirs = index_exclude_dirs(&opts.exclude_dirs, opts.no_ignore);
@@ -664,16 +912,6 @@ pub fn build_index_with_options_and_ignorecase(
     }
     let mut exclude_paths = opts.exclude_paths.clone();
     exclude_paths.push(storage_path);
-    let mut building_meta = IndexMeta::new(&root.to_string_lossy(), 0, 0);
-    building_meta.complete = false;
-    building_meta.save(&index_dir)?;
-    // Evidence belongs to the complete core generation. Invalidate it before
-    // an in-place writer can truncate any core file.
-    meta::remove_file_evidence(&index_dir)?;
-    // A failed in-place rebuild must not leave a valid-looking sidecar from a
-    // previous generation. Its absence makes `--files` fall back to walking.
-    path_index::remove_extra_paths(&index_dir)?;
-
     eprintln!("Walking {}...", root.display());
     if let Some(hint) = gitignore_gate_hint(&root, opts) {
         eprintln!("{hint}");
@@ -704,6 +942,62 @@ pub fn build_index_with_options_and_ignorecase(
     let gitignore_files = walk.gitignore_files;
     let ignore_files = walk.ignore_files;
 
+    let checkpointed = publish.is_some();
+    let (mut file_id_map, previous_evidence) = if checkpointed {
+        let reader = IndexReader::open(&index_dir)?;
+        let paths = reader
+            .all_paths()
+            .iter()
+            .enumerate()
+            .map(|(id, path)| (id as u32, path.clone()))
+            .collect::<Vec<_>>();
+        (paths, meta::read_file_evidence(&index_dir)?)
+    } else {
+        (Vec::new(), meta::FileEvidence::default())
+    };
+    let seeded: HashSet<&str> = file_id_map.iter().map(|(_, path)| path.as_str()).collect();
+    let files: std::borrow::Cow<'_, [std::path::PathBuf]> = if checkpointed {
+        std::borrow::Cow::Owned(
+            walk.files
+                .iter()
+                .filter(|path| {
+                    let relative = path
+                        .strip_prefix(&root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    !seeded.contains(relative.as_str())
+                })
+                .cloned()
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(&walk.files)
+    };
+    drop(seeded);
+    let resumed_files = walk.files.len() - files.len();
+    let (sizes, charges) = batch_sizes_and_charges(&files);
+    check_build_disk_space_for_sizes(
+        &index_dir,
+        sizes.iter().copied(),
+        walk.listed_files.len(),
+        opts.strategy,
+    )?;
+    if !checkpointed {
+        let mut building_meta = IndexMeta::new(&root.to_string_lossy(), 0, 0);
+        building_meta.complete = false;
+        building_meta.save(&index_dir)?;
+        // Invalidate evidence before an in-place writer can truncate any core file.
+        meta::remove_file_evidence(&index_dir)?;
+        path_index::remove_extra_paths(&index_dir)?;
+    }
+    let output_dir = if checkpointed {
+        index_dir.join(".bootstrap-build")
+    } else {
+        index_dir.clone()
+    };
+    std::fs::create_dir_all(&output_dir)?;
+
     // Read files and extract trigrams with masks in bounded parallel batches.
     // Binary content check is done here (not in walker) to avoid an extra
     // 8KB read per file — we're already reading the full file anyway.
@@ -715,25 +1009,25 @@ pub fn build_index_with_options_and_ignorecase(
     // retaining every file's per-trigram HashMap at once for large repos, and
     // bounding each batch by cumulative bytes caps how much raw file content is
     // resident at once, since the whole batch is read concurrently.
-    let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(walk.files.len());
-    let mut content_ids = HashMap::with_capacity(walk.files.len());
-    let mut versions = HashMap::with_capacity(walk.files.len());
-    let mut sink = match opts.strategy {
-        IndexStrategy::InMemory => PostingSink::InMemory(Vec::new()),
-        IndexStrategy::External => {
-            std::fs::create_dir_all(&index_dir)?;
-            PostingSink::External(ExternalSorter::new(&index_dir, opts.buffer_bytes))
-        }
-    };
+    file_id_map.reserve(files.len());
+    let mut content_ids = previous_evidence.content_ids;
+    let mut versions = previous_evidence.versions;
+    content_ids.reserve(files.len());
+    versions.reserve(files.len());
+    let mut checkpoint_start = file_id_map.len();
+    let mut sink = PostingSink::new(&output_dir, opts);
+    let mut last_checkpoint = std::time::Instant::now();
+    let mut checkpoints = 0usize;
 
-    // The walk already stats every entry but discards the size, so recover it
-    // here rather than widening WalkResult into the search and serve paths.
-    let (sizes, charges) = batch_sizes_and_charges(&walk.files);
     let raced_too_large = std::sync::Mutex::new(std::collections::HashSet::new());
 
-    for range in batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES) {
-        let batch = &walk.files[range.clone()];
-        let batch_sizes = &sizes[range];
+    let mut ranges = batch_ranges(&charges, INDEX_BUILD_BATCH_BYTES);
+    if ranges.is_empty() {
+        ranges.push(0..0);
+    }
+    for range in ranges {
+        let batch = &files[range.clone()];
+        let batch_sizes = &sizes[range.clone()];
         let owned_budget = OwnedReadBudget::new(INDEX_BUILD_BATCH_BYTES);
         let batch_data: Vec<ExtractedFile> = batch
             .par_iter()
@@ -773,7 +1067,40 @@ pub fn build_index_with_options_and_ignorecase(
                 content_ids.insert(path.clone(), content_id);
             }
             file_id_map.push((file_id, path));
-            sink.push_file(file_id, per_tri)?;
+            // Each delta has local IDs; the complete path table keeps its prefix.
+            sink.push_file(file_id - checkpoint_start as u32, per_tri)?;
+        }
+        if let Some(publish) = publish.as_deref_mut()
+            && (checkpoints == 0
+                || last_checkpoint.elapsed() >= BUILD_CHECKPOINT_INTERVAL
+                || range.end == files.len())
+        {
+            let chunk = std::mem::replace(&mut sink, PostingSink::InMemory(Vec::new()));
+            chunk.finish(&output_dir, &root, &file_id_map[checkpoint_start..])?;
+            let evidence = meta::FileEvidence {
+                stamps: versions
+                    .iter()
+                    .map(|(path, version)| (path.clone(), version.stamp().clone()))
+                    .collect(),
+                content_ids: content_ids.clone(),
+                versions: versions.clone(),
+            };
+            publish(&BuildCheckpoint {
+                delta_dir: &output_dir,
+                evidence: &evidence,
+                processed: resumed_files + range.end,
+                total: walk.files.len(),
+                complete: range.end == files.len(),
+                listed_files: &walk.listed_files,
+                visibility: &walk.visibility,
+            })?;
+            std::fs::create_dir_all(&output_dir)?;
+            if range.end < files.len() {
+                sink = PostingSink::new(&output_dir, opts);
+            }
+            checkpoint_start = file_id_map.len();
+            checkpoints += 1;
+            last_checkpoint = std::time::Instant::now();
         }
     }
 
@@ -785,27 +1112,8 @@ pub fn build_index_with_options_and_ignorecase(
         );
     }
 
-    match sink {
-        PostingSink::InMemory(mut postings) => {
-            write_index_v2_from_postings(&index_dir, &root, &file_id_map, &mut postings)?;
-        }
-        PostingSink::External(sorter) => {
-            let (trigram_count, segments) = sorter.write_postings(&index_dir)?;
-            eprintln!(
-                "Writing index ({} trigrams, {} files, {} spill segment(s))...",
-                trigram_count,
-                file_id_map.len(),
-                segments
-            );
-            write_files_and_meta(
-                &index_dir,
-                &root,
-                file_id_map.len(),
-                file_id_map.iter().map(|(_, p)| p.as_str()),
-                trigram_count,
-                None,
-            )?;
-        }
+    if !checkpointed {
+        sink.finish(&index_dir, &root, &file_id_map)?;
     }
 
     // Publish only read-bound stamps, including verified binary classifications.
@@ -816,6 +1124,22 @@ pub fn build_index_with_options_and_ignorecase(
             "Skipped {} files that grew past max-file-size during extraction",
             raced_too_large.len()
         );
+    }
+    if checkpointed {
+        return Ok(BuildOutcome {
+            num_files: file_id_map.len(),
+            versions,
+            gitignore_files: if opts.collect_gitignore_files {
+                gitignore_files
+            } else {
+                Vec::new()
+            },
+            ignore_files: if opts.collect_gitignore_files {
+                ignore_files
+            } else {
+                Vec::new()
+            },
+        });
     }
     let evidence = evidence_for_indexed_reads(
         walked_paths_for_stamps(&root, &walk.files, &raced_too_large),
@@ -933,6 +1257,12 @@ pub fn build_index_for_files(
     std::fs::create_dir_all(index_dir)?;
 
     let (sizes, charges) = batch_sizes_and_charges(files);
+    check_build_disk_space_for_sizes(
+        index_dir,
+        sizes.iter().copied(),
+        files.len(),
+        IndexStrategy::External,
+    )?;
     let mut file_id_map: Vec<(u32, String)> = Vec::with_capacity(files.len());
     let mut sorter = ExternalSorter::new(index_dir, buffer_bytes);
     let mut unreadable: Vec<std::path::PathBuf> = Vec::new();
@@ -1032,6 +1362,15 @@ fn write_index_files<'a>(
 ) -> Result<()> {
     std::fs::create_dir_all(index_dir)?;
 
+    let posting_count = inverted.values().try_fold(0_u64, |total, entries| {
+        checked_disk_bytes(total.checked_add(entries.len() as u64))
+    })?;
+    check_disk_space(
+        index_dir,
+        index_payload_disk_bytes(posting_count, inverted.len())?,
+        path_count,
+    )?;
+
     let mut sorted_trigrams: Vec<u32> = inverted.keys().copied().collect();
     sorted_trigrams.sort_unstable();
 
@@ -1087,6 +1426,11 @@ fn write_index_files_from_postings<'a>(
     complete: Option<bool>,
 ) -> Result<()> {
     std::fs::create_dir_all(index_dir)?;
+    check_disk_space(
+        index_dir,
+        index_payload_disk_bytes(postings.len() as u64, trigram_count)?,
+        path_count,
+    )?;
 
     let mut postings_file =
         std::io::BufWriter::new(std::fs::File::create(index_dir.join("index.bin"))?);
@@ -1224,6 +1568,16 @@ pub fn stage_file_table_upgrade(index_dir: &Path, staging_dir: &Path) -> Result<
     }
     source.seek(SeekFrom::Start(0))?;
     std::fs::create_dir_all(staging_dir)?;
+    check_disk_space(
+        staging_dir,
+        checked_disk_bytes(
+            source
+                .metadata()?
+                .len()
+                .checked_add(ondisk::FILE_TABLE_HEADER_LEN as u64),
+        )?,
+        0,
+    )?;
     let mut target = std::io::BufWriter::new(std::fs::File::create(staging_dir.join("files.bin"))?);
     ondisk::write_file_table_header(&mut target)?;
     std::io::copy(&mut source, &mut target)?;
@@ -1289,6 +1643,20 @@ pub fn append_overlay_to_index(
     complete: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
+    let overlay_postings = overlay_inverted
+        .values()
+        .try_fold(0_u64, |total, entries| {
+            checked_disk_bytes(total.checked_add(entries.len() as u64))
+        })?;
+    let overlay_bytes = index_payload_disk_bytes(overlay_postings, overlay_inverted.len())?;
+    check_disk_space(
+        out_dir,
+        checked_disk_bytes(reader.mapped_bytes().checked_add(overlay_bytes))?,
+        reader
+            .num_files()
+            .checked_add(overlay_paths.len())
+            .ok_or_else(|| Error::IndexCorrupted("file count overflow".into()))?,
+    )?;
 
     // File IDs are `u32` on disk. Fail loudly rather than truncate.
     let base = u32::try_from(reader.num_files()).map_err(|_| {
@@ -1478,6 +1846,11 @@ pub fn merge_index_with_delta(
         .ok_or_else(|| Error::IndexCorrupted("file count overflow".into()))?;
     u32::try_from(total_files)
         .map_err(|_| Error::IndexCorrupted("file count exceeds the u32 file-id limit".into()))?;
+    check_disk_space(
+        out_dir,
+        checked_disk_bytes(reader.mapped_bytes().checked_add(delta.mapped_bytes()))?,
+        total_files,
+    )?;
 
     let mut postings_file =
         std::io::BufWriter::new(std::fs::File::create(out_dir.join("index.bin"))?);
@@ -1686,10 +2059,233 @@ fn count_sorted_trigrams(postings: &[TrigramPosting]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::with_disk_space_probe_for_test as with_disk_probe;
     use super::*;
     use crate::reader::IndexReader;
 
     const MB: u64 = 1024 * 1024;
+
+    fn with_available_disk_bytes<T>(bytes: u64, action: impl FnOnce() -> T) -> T {
+        with_disk_probe(Ok(bytes), action)
+    }
+
+    fn assert_storage_full(error: Error) -> String {
+        assert!(is_build_disk_error(&error));
+        assert!(
+            matches!(&error, Error::Io(error) if error.kind() == std::io::ErrorKind::StorageFull),
+            "{error}"
+        );
+        error.to_string()
+    }
+
+    #[test]
+    fn disk_preflight_checks_exact_strategy_and_headroom_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (strategy, copies) in [(IndexStrategy::External, 3), (IndexStrategy::InMemory, 2)] {
+            let required = 30 * copies + 2 * BUILD_DISK_BYTES_PER_PATH + BUILD_DISK_HEADROOM_BYTES;
+            let error = with_available_disk_bytes(required - 1, || {
+                check_build_disk_space_for_sizes(tmp.path(), [10, 20], 2, strategy).unwrap_err()
+            });
+            let message = assert_storage_full(error);
+            assert!(message.contains(&required.to_string()), "{message}");
+            assert!(message.contains(&(required - 1).to_string()), "{message}");
+            assert!(
+                message.contains(&tmp.path().display().to_string()),
+                "{message}"
+            );
+            assert!(message.contains("--index-path"), "{message}");
+            with_available_disk_bytes(required, || {
+                check_build_disk_space_for_sizes(tmp.path(), [10, 20], 2, strategy).unwrap()
+            });
+        }
+        assert_eq!(index_payload_disk_bytes(10, 3).unwrap(), 108);
+    }
+
+    #[test]
+    fn disk_preflight_propagates_probe_failures_and_checked_overflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(available_disk_bytes(tmp.path()).unwrap() > 0);
+        let error = with_disk_probe(Err(std::io::ErrorKind::PermissionDenied), || {
+            check_disk_space(tmp.path(), 0, 0).unwrap_err()
+        });
+        assert!(
+            matches!(&error, Error::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        assert!(is_build_disk_error(&error));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot check available disk space")
+        );
+
+        for error in [
+            check_build_disk_space_for_sizes(tmp.path(), [u64::MAX, 1], 2, IndexStrategy::External)
+                .unwrap_err(),
+            check_build_disk_space_for_sizes(tmp.path(), [u64::MAX], 1, IndexStrategy::InMemory)
+                .unwrap_err(),
+            check_disk_space(tmp.path(), u64::MAX, 0).unwrap_err(),
+            index_payload_disk_bytes(u64::MAX, 0).unwrap_err(),
+        ] {
+            assert!(is_build_disk_error(&error));
+            assert!(
+                matches!(&error, Error::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput),
+                "{error}"
+            );
+            assert!(error.to_string().contains("estimate exceeds u64 bytes"));
+        }
+        assert!(!is_build_disk_error(
+            &std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unrelated input read failure",
+            )
+            .into()
+        ));
+        assert!(is_build_disk_error(
+            &std::io::Error::from(std::io::ErrorKind::StorageFull,).into()
+        ));
+    }
+
+    #[test]
+    fn disk_preflight_charges_unavailable_metadata_conservatively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let required =
+            3 * INDEX_BUILD_BATCH_BYTES + BUILD_DISK_BYTES_PER_PATH + BUILD_DISK_HEADROOM_BYTES;
+        let files = [tmp.path().join("missing")];
+        let error = with_available_disk_bytes(required - 1, || {
+            check_build_disk_space(tmp.path(), &files, IndexStrategy::External).unwrap_err()
+        });
+        assert_storage_full(error);
+        with_available_disk_bytes(required, || {
+            check_build_disk_space(tmp.path(), &files, IndexStrategy::External).unwrap()
+        });
+    }
+
+    fn index_bytes(index: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(index)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().into_string().unwrap(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn disk_preflight_rejects_rebuild_before_invalidating_the_existing_index() {
+        let repo = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let source = repo.path().join("text.rs");
+        std::fs::write(&source, "fn previous_index_marker() {}\n").unwrap();
+        build_index(repo.path(), Some(index.path()), true, false, &[]).unwrap();
+        let before = index_bytes(index.path());
+        std::fs::write(&source, "fn changed_after_publication_marker() {}\n").unwrap();
+
+        for strategy in [IndexStrategy::External, IndexStrategy::InMemory] {
+            for probe in [Ok(0), Err(std::io::ErrorKind::PermissionDenied)] {
+                let error = with_disk_probe(probe, || {
+                    build_index_with_options(
+                        repo.path(),
+                        Some(index.path()),
+                        &BuildOptions {
+                            strategy,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_err()
+                });
+                assert!(is_build_disk_error(&error), "{error}");
+                assert_eq!(index_bytes(index.path()), before);
+                assert!(IndexMeta::load(index.path()).unwrap().complete);
+                assert_eq!(IndexReader::open(index.path()).unwrap().num_files(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn disk_preflight_leaves_no_output_on_a_rejected_initial_build() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("text.rs"), "fn marker() {}\n").unwrap();
+        let index_dir = repo.path().join(".tgrep");
+        let error = with_available_disk_bytes(0, || {
+            build_index(repo.path(), Some(&index_dir), true, false, &[]).unwrap_err()
+        });
+        assert_storage_full(error);
+        assert_eq!(std::fs::read_dir(index_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn disk_preflight_keeps_staged_outputs_intact_on_every_writer_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let source = repo.path().join("text.rs");
+        std::fs::write(&source, "fn previous_marker() {}\n").unwrap();
+        build_index(repo.path(), Some(base.path()), true, false, &[]).unwrap();
+        let reader = IndexReader::open(base.path()).unwrap();
+        for name in ["index.bin", "lookup.bin", "files.bin", "meta.json"] {
+            std::fs::write(target.path().join(name), b"keep staged output").unwrap();
+        }
+        let before = index_bytes(target.path());
+        for writer in 0..5 {
+            let result = with_available_disk_bytes(0, || match writer {
+                0 => build_index_for_files(
+                    repo.path(),
+                    target.path(),
+                    std::slice::from_ref(&source),
+                    DEFAULT_INDEX_BUFFER_BYTES,
+                )
+                .map(|_| ()),
+                1 => write_index_from_snapshot(
+                    repo.path(),
+                    target.path(),
+                    &[],
+                    &HashMap::new(),
+                    true,
+                ),
+                2 => write_index_files_from_postings(
+                    target.path(),
+                    repo.path(),
+                    0,
+                    std::iter::empty::<&str>(),
+                    &[],
+                    0,
+                    Some(true),
+                ),
+                3 => append_overlay_to_index(
+                    repo.path(),
+                    target.path(),
+                    &reader,
+                    &[],
+                    &HashMap::new(),
+                    true,
+                ),
+                _ => merge_index_with_delta(
+                    repo.path(),
+                    target.path(),
+                    &reader,
+                    &reader,
+                    &HashSet::from(["text.rs".into()]),
+                    true,
+                ),
+            });
+            assert_storage_full(result.unwrap_err());
+            assert_eq!(index_bytes(target.path()), before, "writer {writer}");
+        }
+
+        let legacy = tempfile::tempdir().unwrap();
+        let mut table = std::fs::File::create(legacy.path().join("files.bin")).unwrap();
+        ondisk::write_file_entry(&mut table, 0, "text.rs").unwrap();
+        drop(table);
+        let error = with_available_disk_bytes(0, || {
+            stage_file_table_upgrade(legacy.path(), target.path()).unwrap_err()
+        });
+        assert_storage_full(error);
+        assert_eq!(index_bytes(target.path()), before);
+    }
 
     fn charges(sizes: &[u64]) -> Vec<BatchCharge> {
         sizes.iter().copied().map(batch_charge).collect()

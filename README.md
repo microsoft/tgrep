@@ -152,6 +152,34 @@ Large files can be memory-mapped, but files needing decoding or UTF-8 repair
 require heap buffers. Use `--max-filesize` to limit admitted file sizes.
 See [index-build benchmarks](BENCHMARKS.md#index-build-strategies).
 
+#### Temporary storage and free space
+
+Ordinary `index` and `serve` processes share an exclusive `serve.lock` in the
+index directory. Stop a server before running `index` against the same directory;
+use the server's `reload` RPC to rebuild without stopping it.
+Core API callers sharing an output directory with the CLI must hold the same lock.
+After acquiring the lock, both commands recover journaled interrupted index
+publications, then remove abandoned numeric `spill-<pid>[-<sequence>].tmp`
+artifacts and the known bootstrap, reload, filename, delta, merge, and flush
+staging directories. Published index files and unrelated entries are preserved.
+Legacy unjournaled backups are left untouched. Invalid or ambiguous recovery
+records stop startup rather than guessing which generation to restore.
+Linked or unremovable scratch artifacts produce warnings; Windows files still
+mapped by readers are not force-unlinked, including during recovery.
+Managed shared storage uses its own lifecycle and is not cleaned by this path.
+
+Before extracting content, ordinary builds check available space on the index
+filesystem. The estimate is three times candidate-file bytes for external
+sorting, or twice for in-memory sorting, plus 1 KiB per candidate path and
+64 MiB of headroom. An unavailable file size is charged as 64 MiB. Staged
+rewrites also check their known posting and lookup sizes before writing.
+These are estimates, not space reservations or worst-case bounds: content,
+path lengths, concurrent writers, and filesystem quotas can still cause later
+write failures. An initial preflight rejection leaves the existing index intact.
+Free space or choose `--index-path` on another volume if a check fails. A failed
+initial server build reports the error in `status` and leaves queries scanning;
+free space and reload or restart it to retry.
+
 ### Start the server
 
 ```bash
@@ -170,6 +198,20 @@ incomplete builds. Clients scan the filesystem until the full corpus is ready;
 indexes are upgraded by startup reconciliation. Multiple clients can connect
 simultaneously.
 
+Initial and resumed builds save a partial checkpoint after the first bounded
+extraction batch, then after approximately 30 seconds of extraction between
+checkpoints, and at the end. Restart reuses the checkpoint's indexed paths and
+read evidence; edits, deletions, and changed ignore rules are reconciled before
+indexed queries are enabled. Termination during publication is recovered under
+`serve.lock` on the next start, before scratch directories are cleaned.
+
+The checkpoint cadence is not a hard time limit: the filesystem walk, one
+extraction batch, streaming a checkpoint, or final reconciliation can take
+longer. Checkpoints stream existing postings into the replacement rather than
+loading them into heap, trading additional disk I/O for restart progress.
+`--no-watch` retains its full catch-up reads before completion. These guarantees
+cover process termination, not storage loss or power-failure durability.
+
 Index builds and server refreshes exclude `.git` directory subtrees by default,
 including nested repositories' Git internals. `--hidden` does not override this;
 use `--no-ignore` consistently on `index` and `serve` to include them. Explicit
@@ -178,21 +220,25 @@ Git metadata needed for ignore rules and tracked-file detection is still read.
 
 On Windows, replaced index generations stay in `.retired` while readers have
 them memory-mapped. Cleanup retries after publication, every minute, and on
-startup; uncommitted backups are preserved for recovery. This does not reclaim
+startup; journaled uncommitted backups are restored on startup. This does not reclaim
 storage already stranded in NTFS's `$Deleted` namespace by older versions.
 
 These tuning options apply only to `tgrep serve`:
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--max-memory <MB>` | 50% of RAM (512 MiB–16 GiB) | Overlay flush threshold for resumed partial builds and fallback in-memory builds; not a process-wide hard limit |
-| `--max-cpu <PERCENT>` | `50` | Size the worker pool for resumed/fallback builds and stale-delta builds as a share of logical cores, with at least one worker |
+| `--max-memory <MB>` | 50% of RAM (512 MiB–16 GiB) | Overlay flush threshold for fallback in-memory builds; not a process-wide hard limit |
+| `--max-cpu <PERCENT>` | `50` | Size the indexing worker pool for initial, resumed, fallback, reload, and stale-delta builds as a share of logical cores, with at least one worker |
 | `--auto-save-mutations <N>` | `5000` | Pending content mutations that trigger a background save |
 | `--watcher-queue-cap <N>` | `16384` | Buffered filesystem events; overflow triggers reconciliation |
 
-Fresh external builds use the default 64 MiB posting buffer and global Rayon
-pool, not `--max-memory` or `--max-cpu`. If external bootstrap fails, the server
-falls back to an in-memory build where these settings apply.
+Initial and resumed external builds use a 64 MiB posting buffer and the
+`--max-cpu` indexing pool. Search parallelism is independent: the server does
+not change `RAYON_NUM_THREADS` or resize the global search pool. `--max-cpu` is a
+worker-count budget, not an OS CPU quota. `--max-memory` applies only to the
+exceptional in-memory fallback, which is allowed only before any checkpoint
+publication is attempted and never for disk-space failures. Existing checkpoint
+progress is not discarded to enter that fallback.
 
 The server checks for pending saves once a minute. It saves at the mutation
 threshold, when filename-only membership changes, or when content changes

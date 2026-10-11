@@ -39,14 +39,7 @@ pub fn run(root: &Path, index_path: Option<&Path>) -> Result<()> {
             }
         );
         write_refresh_status(&mut std::io::stdout().lock(), &status)?;
-        if status.indexing {
-            println!(
-                "  Indexing:   {}/{} files",
-                status.index_progress, status.index_total
-            );
-        } else {
-            println!("  Indexing:   complete");
-        }
+        write_index_status(&mut std::io::stdout().lock(), &status)?;
         println!(
             "  Hidden coverage: {}",
             coverage_label(status.hidden_complete.unwrap_or(false))
@@ -113,6 +106,7 @@ struct StatusResult {
     reconcile_overdue: Option<bool>,
     #[serde(default)]
     indexing: bool,
+    index_build_error: Option<String>,
     #[serde(default)]
     index_progress: u64,
     #[serde(default)]
@@ -125,6 +119,20 @@ fn coverage_label(complete: bool) -> &'static str {
         "complete"
     } else {
         "unavailable (queries scan)"
+    }
+}
+
+fn write_index_status(writer: &mut impl Write, status: &StatusResult) -> std::io::Result<()> {
+    if status.indexing {
+        writeln!(
+            writer,
+            "  Indexing:   {}/{} files",
+            status.index_progress, status.index_total
+        )
+    } else if let Some(error) = &status.index_build_error {
+        writeln!(writer, "  Indexing:   failed ({error})")
+    } else {
+        writeln!(writer, "  Indexing:   complete")
     }
 }
 
@@ -259,6 +267,7 @@ mod tests {
         let status: StatusResult = serde_json::from_value(legacy_status()).unwrap();
         assert!(status.watcher_active);
         assert!(!status.indexing);
+        assert!(status.index_build_error.is_none());
         assert!(status.hidden_complete.is_none());
         assert!(!status.reconcile_running);
         assert!(status.watch_mode_requested.is_none());
@@ -268,6 +277,27 @@ mod tests {
         assert!(status.reconcile_pending.is_none());
         assert!(status.reconcile_overdue.is_none());
         assert_eq!(render(&status), "");
+    }
+
+    #[test]
+    fn disk_failure_status_is_not_reported_as_complete() {
+        let mut json = legacy_status();
+        json["index_build_error"] = "insufficient free disk space; reload to retry".into();
+        for (indexing, expected) in [
+            (
+                false,
+                "Indexing:   failed (insufficient free disk space; reload to retry)",
+            ),
+            (true, "Indexing:   0/0 files"),
+        ] {
+            json["indexing"] = indexing.into();
+            let status: StatusResult = serde_json::from_value(json.clone()).unwrap();
+            let mut output = Vec::new();
+            write_index_status(&mut output, &status).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains(expected), "{output}");
+            assert!(!output.contains("complete"), "{output}");
+        }
     }
 
     #[test]

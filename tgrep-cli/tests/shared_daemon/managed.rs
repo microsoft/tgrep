@@ -223,6 +223,28 @@ fn attach_input(fixture: &Fixture, claim: &OwnerClaim) -> Value {
     })
 }
 
+#[test]
+fn multiline_count_matches_uses_managed_per_file_totals() {
+    let mut fixture = Fixture::new();
+    prepare_multiline_counts(&mut fixture);
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    assert_multiline_counts(&fixture.a.join("counts"), "(via shared daemon v2)");
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
 fn completed(daemon: &Daemon, operation: &Value) -> Value {
     let record = terminal(daemon, operation);
     assert_eq!(

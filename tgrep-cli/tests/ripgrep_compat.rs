@@ -1495,6 +1495,305 @@ fn stats_are_scoped_to_each_root_without_colliding_relative_paths() {
 }
 
 #[test]
+fn multiline_count_matches_uses_original_per_file_totals() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    for (name, contents) in [
+        ("a.txt", "hello\nworld\n"),
+        ("b.txt", "hello\nworld hello\nworld\nmiss\nhello\nworld\n"),
+        ("adjacent.txt", "aa\n"),
+        ("none.txt", "miss\n"),
+        (
+            "unicode.txt",
+            "pr\u{e9}face\ncaf\u{e9}\n\u{4e16}\ncaf\u{e9}\n\u{4e16}\n",
+        ),
+    ] {
+        fs::write(root.join(name), contents).unwrap();
+    }
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for engine in ["default", "pcre2"] {
+            for (pattern, flags, counts, totals) in [
+                (r"hello\nworld", vec!["-g", "a.txt"], "a.txt:1\n", (1, 2)),
+                (r"hello\nworld", vec![], "a.txt:1\nb.txt:3\n", (4, 7)),
+                (r"hello\nworld", vec!["-m", "0"], "", (0, 0)),
+                (
+                    r"hello\nworld",
+                    vec!["-m", "1"],
+                    "a.txt:1\nb.txt:2\n",
+                    (3, 5),
+                ),
+                (
+                    r"hello\nworld",
+                    vec!["-m", "2"],
+                    "a.txt:1\nb.txt:3\n",
+                    (4, 7),
+                ),
+                (r"hello\nworld", vec!["-o"], "a.txt:1\nb.txt:3\n", (4, 7)),
+                (
+                    r"hello\nworld",
+                    vec!["--vimgrep"],
+                    "a.txt:1\nb.txt:3\n",
+                    (4, 7),
+                ),
+                (
+                    r"hello\nworld",
+                    vec!["--replace", ""],
+                    "a.txt:1\nb.txt:3\n",
+                    (4, 7),
+                ),
+                ("hello", vec!["-g", "a.txt"], "a.txt:1\n", (1, 1)),
+                ("hello|world", vec!["-g", "a.txt"], "a.txt:2\n", (2, 2)),
+                ("a", vec!["-g", "adjacent.txt"], "adjacent.txt:2\n", (2, 1)),
+                (
+                    "hello|world",
+                    vec!["-g", "b.txt", "-m", "2"],
+                    "b.txt:3\n",
+                    (3, 2),
+                ),
+                (
+                    "hello|world",
+                    vec!["-g", "b.txt", "-v"],
+                    "b.txt:1\n",
+                    (0, 1),
+                ),
+                (
+                    "hello",
+                    vec!["-g", "b.txt", "-v", "-m", "2"],
+                    "b.txt:2\n",
+                    (0, 2),
+                ),
+                (r"\n", vec!["-g", "a.txt"], "a.txt:2\n", (2, 2)),
+                ("caf\u{e9}\\n\u{4e16}", vec![], "unicode.txt:2\n", (2, 4)),
+                ("unfindable", vec![], "", (0, 0)),
+            ] {
+                let expected: String = counts
+                    .lines()
+                    .map(|line| format!("{}/{line}\n", root.to_string_lossy().replace('\\', "/")))
+                    .collect();
+                for stats in [false, true] {
+                    let mut cmd = tgrep();
+                    cmd.args(backend)
+                        .args(["-U", "--count-matches", "--engine", engine])
+                        .args([
+                            "--sort",
+                            "path",
+                            "--color",
+                            "never",
+                            "--path-separator",
+                            "/",
+                        ])
+                        .args(&flags);
+                    if stats {
+                        cmd.arg("--stats");
+                    }
+                    let output = cmd
+                        .args(["--", pattern])
+                        .arg(&root)
+                        .assert()
+                        .code(if counts.is_empty() { 1 } else { 0 })
+                        .get_output()
+                        .clone();
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stdout),
+                        expected,
+                        "{backend:?} {engine} {pattern:?} {flags:?} stats={stats}"
+                    );
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if stats {
+                        assert!(stderr.contains(marker), "{stderr}");
+                        assert_eq!(stats_totals(&output.stderr), [totals], "{stderr}");
+                        if marker != "Brute-force search completed" {
+                            assert!(!stderr.contains("Brute-force"), "{stderr}");
+                        }
+                        if marker == "Search completed" {
+                            assert!(!stderr.contains("(via server)"), "{stderr}");
+                        }
+                        assert!(!stderr.contains("falling back"), "{stderr}");
+                    } else {
+                        assert!(stderr.is_empty(), "{stderr}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn server_count_matches_returns_totals_without_stats() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "hello\nworld\n").unwrap();
+    fs::write(root.join("b.txt"), "hello\nworld\nhello\nworld\n").unwrap();
+    let index_dir = dir.path().join("idx");
+    let _server = start_passthru_server(&root, &index_dir);
+    let info: serde_json::Value =
+        serde_json::from_slice(&fs::read(index_dir.join("serve.json")).unwrap()).unwrap();
+    let port = info["port"].as_u64().unwrap() as u16;
+    for stats in [false, true] {
+        for count_matches in [false, true] {
+            let mut request = serde_json::json!({
+                "jsonrpc": "2.0", "method": "search", "id": 1,
+                "params": {
+                    "pattern": "hello\\nworld", "multiline": true,
+                    "stats": stats, "detail": false,
+                },
+            });
+            if count_matches {
+                request["params"]["count_matches"] = serde_json::json!(true);
+            }
+            let response: serde_json::Value =
+                serde_json::from_str(&send_rpc_request(port, &request.to_string()).unwrap())
+                    .unwrap();
+            assert!(response.get("error").is_none(), "{response}");
+            let result = &response["result"];
+            assert_eq!(result["hidden_complete"], true);
+            assert_eq!(result["num_matches"], 6);
+            assert_eq!(result.get("index_stats").is_some(), stats);
+            if stats || count_matches {
+                let mut totals = result["file_stats"].as_array().unwrap().clone();
+                totals.sort_by_key(|s| s["file"].as_str().unwrap().to_string());
+                assert_eq!(
+                    totals,
+                    [
+                        serde_json::json!({"file":"a.txt","matches":1,"matched_lines":2}),
+                        serde_json::json!({"file":"b.txt","matches":2,"matched_lines":4}),
+                    ]
+                );
+            } else {
+                assert!(result.get("file_stats").is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "hello\nworld\n").unwrap();
+    fs::write(root.join("b.txt"), "hello\nworld\nhello\nworld\n").unwrap();
+    let index_dir = dir.path().join("idx");
+    tgrep()
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    for (flag, metadata) in [
+        ("-c", None),
+        ("--count-matches", None),
+        ("--count-matches", Some(serde_json::json!(null))),
+        ("--count-matches", Some(serde_json::json!([]))),
+        (
+            "--count-matches",
+            Some(serde_json::json!([
+                {"file":"a.txt","matches":1,"matched_lines":2},
+            ])),
+        ),
+        (
+            "--count-matches",
+            Some(serde_json::json!([
+                {"file":"a.txt","matches":1,"matched_lines":2},
+                {"file":"b.txt","matches":2},
+            ])),
+        ),
+        (
+            "--count-matches",
+            Some(serde_json::json!([
+                {"file":"a.txt","matches":1,"matched_lines":2},
+                {"file":"a.txt","matches":1,"matched_lines":2},
+                {"file":"b.txt","matches":2,"matched_lines":4},
+            ])),
+        ),
+    ] {
+        for stats in [false, true] {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            fs::write(
+                index_dir.join("serve.json"),
+                serde_json::json!({"pid":std::process::id(),"port":listener.local_addr().unwrap().port()})
+                    .to_string(),
+            )
+            .unwrap();
+            let output = std::thread::scope(|scope| {
+                let server = scope.spawn(|| {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "client did not contact server");
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("accept: {error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+                    let mut line = String::new();
+                    BufReader::new(&stream).read_line(&mut line).unwrap();
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request["params"].get("count_matches").is_some(), flag != "-c");
+                    assert_eq!(request["params"]["stats"], stats);
+                    let rows: Vec<_> = [("a.txt", 2), ("b.txt", 4)]
+                        .into_iter()
+                        .flat_map(|(file, lines)| (1..=lines).map(move |line| {
+                            serde_json::json!({"file":file,"line":line,"spans":[[0,5]],"type":"match"})
+                        }))
+                        .collect();
+                    let mut result = serde_json::json!({
+                        "hidden_complete":true,"matches":rows,"elapsed_ms":1,
+                    });
+                    if let Some(metadata) = &metadata {
+                        result["file_stats"] = metadata.clone();
+                    }
+                    writeln!(stream, "{}", serde_json::json!({"jsonrpc":"2.0","id":1,"result":result})).unwrap();
+                });
+                let mut cmd = tgrep();
+                cmd.timeout(Duration::from_secs(30))
+                    .args(["--index-path", index_dir.to_str().unwrap()])
+                    .args(["-U", flag, "--no-filename", "--sort", "path"]);
+                if stats {
+                    cmd.arg("--stats");
+                }
+                let output = cmd
+                    .args(["--", r"hello\nworld"])
+                    .arg(&root)
+                    .output()
+                    .unwrap();
+                server.join().unwrap();
+                output
+            });
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                if flag == "-c" { "2\n4\n" } else { "1\n2\n" },
+                "{flag} {metadata:?} stats={stats}"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if flag == "-c" {
+                assert!(!stderr.contains("falling back"), "{stderr}");
+            } else {
+                assert!(stderr.contains("match totals"), "{stderr}");
+                assert!(stderr.contains("falling back to local index"), "{stderr}");
+                assert!(!stderr.contains("(via server)"), "{stderr}");
+                if stats {
+                    assert_eq!(stats_totals(&output.stderr), [(3, 6)]);
+                    assert!(stderr.contains("Search completed"), "{stderr}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn stats_multiline_counts_original_matches_before_rendering() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");
@@ -1517,6 +1816,7 @@ fn stats_multiline_counts_original_matches_before_rendering() {
             (vec!["-m", "1", "--vimgrep"], (2, 3)),
             (vec!["-c"], (3, 5)),
             (vec!["--count-matches"], (3, 5)),
+            (vec!["--count-matches", "-m", "1"], (2, 3)),
             (vec!["-l"], (3, 5)),
             (vec!["-q"], (2, 3)),
         ] {
@@ -1552,6 +1852,19 @@ fn stats_multiline_counts_original_matches_before_rendering() {
                 );
             } else {
                 assert_eq!(output.stdout, without_stats, "{backend:?} {flags:?}");
+                let count = if flags.contains(&"--count-matches") {
+                    Some(expected.0)
+                } else if flags.contains(&"-c") {
+                    Some(expected.1)
+                } else {
+                    None
+                };
+                if let Some(count) = count {
+                    assert_eq!(
+                        String::from_utf8_lossy(&output.stdout),
+                        format!("{}:{count}\n", root.join("multiline.txt").display())
+                    );
+                }
             }
         }
         let output = tgrep()

@@ -806,10 +806,11 @@ impl<'a> FileMatches<'a> {
     /// Total number of individual matches, which is what `--count-matches`
     /// reports. Inverted matches have no spans but still count as one.
     pub fn match_count(&self) -> usize {
-        self.hits
-            .iter()
-            .map(|h| h.spans.len().max(1))
-            .sum::<usize>()
+        if self.match_totals.0 == 0 {
+            self.hits.len()
+        } else {
+            self.match_totals.0 as usize
+        }
     }
 
     /// Walk the output in line order, expanding context and fanning
@@ -1229,6 +1230,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(found.match_totals(), (1, 2));
+            assert_eq!(found.match_count(), 1);
             assert_eq!(found.matched_lines(), if vimgrep { 1 } else { 2 });
         }
     }

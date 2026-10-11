@@ -1133,6 +1133,7 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             | "vimgrep"
             | "detail"
             | "positions"
+            | "count_matches"
             | "stats" => value.is_boolean(),
             _ => false,
         };

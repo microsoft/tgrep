@@ -806,8 +806,10 @@ struct SearchOpts {
     ///
     /// Only `-b/--byte-offset` and `-M/--max-columns` look at them.
     positions: bool,
-    /// Return original per-file match totals independently of rendered rows.
+    /// Return original per-file totals and index diagnostics.
     stats: bool,
+    /// Return original per-file totals even when diagnostics are not requested.
+    count_matches: bool,
 }
 
 impl SearchOpts {
@@ -828,7 +830,7 @@ impl SearchOpts {
             replace: self.replace.clone(),
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
-            all_spans: self.detail || self.stats,
+            all_spans: self.detail || self.stats || self.count_matches,
         }
     }
 }
@@ -1791,6 +1793,10 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
                 .get("stats")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            count_matches: params
+                .get("count_matches")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
     })
 }
@@ -2067,8 +2073,10 @@ fn handle_search(
         "elapsed_ms": elapsed_ms,
         "hidden_complete": true,
     });
-    if let Some(total_files) = total_files {
+    if opts.stats || opts.count_matches {
         result["file_stats"] = serde_json::json!(file_stats);
+    }
+    if let Some(total_files) = total_files {
         result["index_stats"] = serde_json::json!({
             "query_plan": crate::search::plan_summary(&plan),
             "raw_candidates": raw_candidate_count,
@@ -2216,7 +2224,7 @@ fn search_file_matches_bounded(
     }
     let mut result = FileSearchResult {
         rows: Vec::new(),
-        stats: opts.stats.then(|| {
+        stats: (opts.stats || opts.count_matches).then(|| {
             let (matches, matched_lines) = found.match_totals();
             crate::search::FileMatchStats {
                 file: rel_path.to_string(),
@@ -9706,6 +9714,22 @@ mod tests {
             "offset must be the byte on disk (9), not the decoded position \
              (13): {marker}"
         );
+    }
+
+    #[test]
+    fn count_matches_collects_all_spans_without_stats_or_row_detail() {
+        let request = parse_search_params(&serde_json::json!({
+            "pattern":"hello", "count_matches":true, "detail":false,
+        }))
+        .unwrap();
+        assert!(!request.opts.stats);
+        assert!(request.opts.match_options().all_spans);
+        let file = DecodedFile::new(b"hello hello\n".to_vec(), request.encoding);
+        let result = search_file_matches("a.txt", &file, &request.matcher, &request.opts).unwrap();
+        let totals = result.stats.unwrap();
+        assert_eq!((totals.matches, totals.matched_lines), (2, 1));
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0].get("spans").is_none());
     }
 
     #[test]

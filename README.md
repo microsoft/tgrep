@@ -591,6 +591,13 @@ can therefore exceed ripgrep's.
 line. `--vimgrep` reports one row per match, on its starting line.
 Adjacent matches remain separate for `-o`, `--vimgrep`, `--count-matches`
 and JSON submatches.
+`--count-matches` counts each original regex match once, after applying `-m`,
+even when the match spans several lines. This does not depend on `--stats`;
+`-c` retains its matching-line count and `-v` counts selected non-matching lines.
+Server counts use per-file totals, not the line fragments sent for display.
+Older servers without count metadata support cannot answer these requests:
+unsupported requests fall back with a diagnostic, and incomplete totals are
+rejected before any counts are printed.
 Unlike ripgrep, tgrep reports columns relative to each printed line rather
 than repeating the starting column on continuation lines.
 

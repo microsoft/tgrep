@@ -369,6 +369,108 @@ impl Drop for Daemon {
 }
 
 #[test]
+fn multiline_count_matches_uses_shared_per_file_totals() {
+    let mut f = Fixture::new();
+    prepare_multiline_counts(&mut f);
+    let d = f.start(&["--no-watch"]);
+    let lease = d.attach(&f.a, &f.revision);
+    let before = d.lookup(&f.a)["queries"].as_u64().unwrap();
+    let queries = assert_multiline_counts(&f.a.join("counts"), "(via shared daemon v1)");
+    assert_eq!(d.lookup(&f.a)["queries"], before + queries);
+    d.rpc(
+        "detach",
+        json!({"root":f.a,"view":lease["view"],"lease":lease["lease"]}),
+    );
+}
+
+fn prepare_multiline_counts(f: &mut Fixture) {
+    let root = f.a.join("counts");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "hello\nworld\n").unwrap();
+    fs::write(
+        root.join("b.txt"),
+        "hello\nworld hello\nworld\nmiss\nhello\nworld\n",
+    )
+    .unwrap();
+    git(&f.a, &["add", "counts"]);
+    git(&f.a, &["commit", "-qm", "multiline counts"]);
+    f.revision = git(&f.a, &["rev-parse", "HEAD"]);
+}
+
+fn assert_multiline_counts(root: &Path, marker: &str) -> u64 {
+    let mut queries = 0;
+    for engine in ["default", "pcre2"] {
+        for (pattern, flags, counts, totals) in [
+            (r"hello\nworld", vec![], "a.txt:1\nb.txt:3\n", (4, 7)),
+            (
+                r"hello\nworld",
+                vec!["-m", "1"],
+                "a.txt:1\nb.txt:2\n",
+                (3, 5),
+            ),
+            (r"hello\nworld", vec!["-m", "0"], "", (0, 0)),
+            (r"hello\nworld", vec!["-o"], "a.txt:1\nb.txt:3\n", (4, 7)),
+            (r"hello\nworld", vec!["-c"], "a.txt:2\nb.txt:5\n", (4, 7)),
+            ("hello|world", vec![], "a.txt:2\nb.txt:6\n", (8, 7)),
+            ("hello|world", vec!["-v"], "b.txt:1\n", (0, 1)),
+        ] {
+            let expected: String = counts
+                .lines()
+                .map(|line| format!("{}/{line}\n", root.to_string_lossy().replace('\\', "/")))
+                .collect();
+            for stats in [false, true] {
+                let mut args = vec![
+                    "-U",
+                    "--engine",
+                    engine,
+                    "--sort",
+                    "path",
+                    "--color",
+                    "never",
+                    "--path-separator",
+                    "/",
+                ];
+                if !flags.contains(&"-c") {
+                    args.push("--count-matches");
+                }
+                args.extend_from_slice(&flags);
+                if stats {
+                    args.push("--stats");
+                }
+                args.extend(["--", pattern, root.to_str().unwrap()]);
+                let output = cli(root, &args);
+                queries += 1;
+                assert_eq!(
+                    output.status.code(),
+                    Some(if counts.is_empty() { 1 } else { 0 })
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout),
+                    expected,
+                    "{marker} {args:?}"
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stats {
+                    assert!(stderr.contains(marker), "{stderr}");
+                    assert!(
+                        stderr.contains(&format!(
+                            "{} matches ({} matched lines)",
+                            totals.0, totals.1
+                        )),
+                        "{stderr}"
+                    );
+                    assert!(!stderr.contains("Brute-force"), "{stderr}");
+                    assert!(!stderr.contains("falling back"), "{stderr}");
+                } else {
+                    assert!(stderr.is_empty(), "{stderr}");
+                }
+            }
+        }
+    }
+    queries
+}
+
+#[test]
 fn exact_base_sharing_leases_and_revision_pins() {
     let f = Fixture::new();
     let d = f.start(&["--no-watch"]);

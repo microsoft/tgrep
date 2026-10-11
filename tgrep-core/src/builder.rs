@@ -94,12 +94,49 @@ fn disk_preflight_error(kind: std::io::ErrorKind, message: String) -> Error {
     std::io::Error::new(kind, DiskPreflightError(message)).into()
 }
 
-/// A preflight rejection or native disk-full failure must not be retried by
-/// switching to an in-memory build, which still needs disk for publication.
+#[derive(Debug)]
+struct BuildOutputError(std::io::Error);
+
+impl std::fmt::Display for BuildOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "index output failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for BuildOutputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn build_output_error(error: impl Into<Error>) -> Error {
+    let error = match error.into() {
+        Error::Json(error) if error.is_io() => Error::Io(error.into()),
+        error => error,
+    };
+    if is_build_disk_error(&error) {
+        return error;
+    }
+    let Error::Io(error) = error else {
+        return error;
+    };
+    // Managed writers carry typed commitment/retry state inside their I/O errors.
+    if error
+        .get_ref()
+        .is_some_and(|source| source.is::<crate::managed::Error>())
+    {
+        return Error::Io(error);
+    }
+    std::io::Error::new(error.kind(), BuildOutputError(error)).into()
+}
+
+/// Preflight, destination/spill I/O, and native disk-full failures must not be
+/// retried in memory: the replacement build still needs disk for publication.
 pub fn is_build_disk_error(error: &Error) -> bool {
     matches!(error, Error::Io(error)
         if error.kind() == std::io::ErrorKind::StorageFull
-            || error.get_ref().is_some_and(|source| source.is::<DiskPreflightError>()))
+            || error.get_ref().is_some_and(|source|
+                source.is::<DiskPreflightError>() || source.is::<BuildOutputError>()))
 }
 
 fn checked_disk_bytes(bytes: Option<u64>) -> Result<u64> {
@@ -209,10 +246,10 @@ pub enum IndexStrategy {
     /// Hold every posting in heap, sort once, write once.
     ///
     /// Peak memory grows linearly with repository size and is unbounded. Kept
-    /// as an escape hatch for environments where spilling to disk is
-    /// undesirable or impossible (read-only or full index volume), and as the
+    /// for callers explicitly choosing not to spill postings, and as the
     /// independent reference implementation that [`IndexStrategy::External`]
-    /// is differentially tested against.
+    /// is differentially tested against. Publication still requires usable
+    /// output storage; this is not an automatic retry for storage failures.
     InMemory,
     /// Bound peak memory with an external merge sort.
     ///
@@ -315,7 +352,9 @@ impl PostingSink {
                 );
                 Ok(())
             }
-            Self::External(sorter) => sorter.push_file(file_id, per_trigram),
+            Self::External(sorter) => sorter
+                .push_file(file_id, per_trigram)
+                .map_err(build_output_error),
         }
     }
 
@@ -323,9 +362,12 @@ impl PostingSink {
         match self {
             Self::InMemory(mut postings) => {
                 write_index_v2_from_postings(index_dir, root, files, &mut postings)
+                    .map_err(build_output_error)
             }
             Self::External(sorter) => {
-                let (trigram_count, segments) = sorter.write_postings(index_dir)?;
+                let (trigram_count, segments) = sorter
+                    .write_postings(index_dir)
+                    .map_err(build_output_error)?;
                 eprintln!(
                     "Writing index ({} trigrams, {} files, {} spill segment(s))...",
                     trigram_count,
@@ -340,6 +382,7 @@ impl PostingSink {
                     trigram_count,
                     None,
                 )
+                .map_err(build_output_error)
             }
         }
     }
@@ -901,8 +944,8 @@ fn build_index_impl(
         Some(d) => d.to_path_buf(),
         None => root.join(INDEX_DIR_NAME),
     };
-    std::fs::create_dir_all(&index_dir)?;
-    let storage_path = std::fs::canonicalize(&index_dir)?;
+    std::fs::create_dir_all(&index_dir).map_err(build_output_error)?;
+    let storage_path = std::fs::canonicalize(&index_dir).map_err(build_output_error)?;
     if root.starts_with(&storage_path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -944,14 +987,17 @@ fn build_index_impl(
 
     let checkpointed = publish.is_some();
     let (mut file_id_map, previous_evidence) = if checkpointed {
-        let reader = IndexReader::open(&index_dir)?;
+        let reader = IndexReader::open(&index_dir).map_err(build_output_error)?;
         let paths = reader
             .all_paths()
             .iter()
             .enumerate()
             .map(|(id, path)| (id as u32, path.clone()))
             .collect::<Vec<_>>();
-        (paths, meta::read_file_evidence(&index_dir)?)
+        (
+            paths,
+            meta::read_file_evidence(&index_dir).map_err(build_output_error)?,
+        )
     } else {
         (Vec::new(), meta::FileEvidence::default())
     };
@@ -986,17 +1032,17 @@ fn build_index_impl(
     if !checkpointed {
         let mut building_meta = IndexMeta::new(&root.to_string_lossy(), 0, 0);
         building_meta.complete = false;
-        building_meta.save(&index_dir)?;
+        building_meta.save(&index_dir).map_err(build_output_error)?;
         // Invalidate evidence before an in-place writer can truncate any core file.
-        meta::remove_file_evidence(&index_dir)?;
-        path_index::remove_extra_paths(&index_dir)?;
+        meta::remove_file_evidence(&index_dir).map_err(build_output_error)?;
+        path_index::remove_extra_paths(&index_dir).map_err(build_output_error)?;
     }
     let output_dir = if checkpointed {
         index_dir.join(".bootstrap-build")
     } else {
         index_dir.clone()
     };
-    std::fs::create_dir_all(&output_dir)?;
+    std::fs::create_dir_all(&output_dir).map_err(build_output_error)?;
 
     // Read files and extract trigrams with masks in bounded parallel batches.
     // Binary content check is done here (not in walker) to avoid an extra
@@ -1094,7 +1140,7 @@ fn build_index_impl(
                 listed_files: &walk.listed_files,
                 visibility: &walk.visibility,
             })?;
-            std::fs::create_dir_all(&output_dir)?;
+            std::fs::create_dir_all(&output_dir).map_err(build_output_error)?;
             if range.end < files.len() {
                 sink = PostingSink::new(&output_dir, opts);
             }
@@ -1156,7 +1202,7 @@ fn build_index_impl(
         .filter(|path| !indexed_paths.contains(path.as_str()))
         .collect();
     extra_paths.sort_unstable();
-    let mut meta = IndexMeta::load(&index_dir)?;
+    let mut meta = IndexMeta::load(&index_dir).map_err(build_output_error)?;
     let file_table_id = meta
         .file_table_id
         .ok_or_else(|| Error::IndexCorrupted("built index has no file-table identity".into()))?;
@@ -1168,12 +1214,13 @@ fn build_index_impl(
         &walk.visibility,
         file_table_id,
         hidden_complete,
-    )?;
-    meta::write_file_evidence(&evidence, &index_dir)?;
+    )
+    .map_err(build_output_error)?;
+    meta::write_file_evidence(&evidence, &index_dir).map_err(build_output_error)?;
     // `meta.json` remains the final publication marker for in-place builds.
     meta.hidden_complete = hidden_complete;
     meta.visibility = walk.visibility;
-    meta.save(&index_dir)?;
+    meta.save(&index_dir).map_err(build_output_error)?;
 
     eprintln!("Index built successfully at {}", index_dir.display());
     Ok(BuildOutcome {
@@ -1254,7 +1301,7 @@ pub fn build_index_for_files(
 ) -> Result<FileDeltaOutcome> {
     let input_root = root;
     let root = std::fs::canonicalize(root)?;
-    std::fs::create_dir_all(index_dir)?;
+    std::fs::create_dir_all(index_dir).map_err(build_output_error)?;
 
     let (sizes, charges) = batch_sizes_and_charges(files);
     check_build_disk_space_for_sizes(
@@ -1324,11 +1371,15 @@ pub fn build_index_for_files(
                 content_ids.insert(path.clone(), content_id);
             }
             file_id_map.push((file_id, path));
-            sorter.push_file(file_id, per_tri)?;
+            sorter
+                .push_file(file_id, per_tri)
+                .map_err(build_output_error)?;
         }
     }
 
-    let (trigram_count, _) = sorter.write_postings(index_dir)?;
+    let (trigram_count, _) = sorter
+        .write_postings(index_dir)
+        .map_err(build_output_error)?;
     write_files_and_meta(
         index_dir,
         &root,
@@ -1336,7 +1387,8 @@ pub fn build_index_for_files(
         file_id_map.iter().map(|(_, path)| path.as_str()),
         trigram_count,
         Some(true),
-    )?;
+    )
+    .map_err(build_output_error)?;
     Ok(FileDeltaOutcome {
         indexed: file_id_map.len(),
         unreadable,
@@ -2159,6 +2211,204 @@ mod tests {
         with_available_disk_bytes(required, || {
             check_build_disk_space(tmp.path(), &files, IndexStrategy::External).unwrap()
         });
+    }
+
+    #[test]
+    fn output_failure_preserves_native_io_kind_and_cause_including_json() {
+        use std::error::Error as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("read-only-output");
+        std::fs::write(&path, b"preserve").unwrap();
+        for json in [false, true] {
+            let mut writer = std::fs::File::open(&path).unwrap();
+            let original = writer.write_all(b"cannot write").unwrap_err();
+            let kind = original.kind();
+            let code = original.raw_os_error().unwrap();
+            let error = if json {
+                build_output_error(
+                    serde_json::to_writer(&mut writer, &["cannot write"]).unwrap_err(),
+                )
+            } else {
+                build_output_error(original)
+            };
+            assert!(is_build_disk_error(&error));
+            assert!(matches!(&error, Error::Io(error) if error.kind() == kind));
+            let mut source = error.source();
+            let mut original_found = false;
+            while let Some(cause) = source {
+                if let Some(io) = cause.downcast_ref::<std::io::Error>()
+                    && io.raw_os_error() == Some(code)
+                {
+                    assert_eq!(io.kind(), kind);
+                    original_found = true;
+                }
+                source = cause.source();
+            }
+            assert!(original_found, "{error}");
+            let message = error.to_string();
+            assert_eq!(build_output_error(error).to_string(), message);
+        }
+        assert_eq!(std::fs::read(path).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn output_failure_preserves_managed_commitment_and_non_io_errors() {
+        for representation in 0..3 {
+            let managed = crate::managed::Error::new(
+                crate::managed::ErrorCategory::Cancelled,
+                "controlled-output",
+                "cancelled at the output boundary",
+            )
+            .committed(crate::managed::CommitState::Unknown)
+            .operation("test-operation");
+            let expected = serde_json::to_value(&managed).unwrap();
+            let error = match representation {
+                0 => Error::from(managed),
+                1 => std::io::Error::other(managed).into(),
+                _ => serde_json::Error::io(std::io::Error::other(managed)).into(),
+            };
+            let error = build_output_error(error);
+            assert!(!is_build_disk_error(&error));
+            let managed = match error {
+                Error::Managed(error) => *error,
+                Error::Io(error) => crate::managed::Error::io(error),
+                error => panic!("lost managed error: {error}"),
+            };
+            assert_eq!(serde_json::to_value(managed).unwrap(), expected);
+        }
+        let json = serde_json::from_str::<serde_json::Value>("{invalid").unwrap_err();
+        assert!(matches!(build_output_error(json), Error::Json(_)));
+        assert!(matches!(
+            build_output_error(Error::IndexCorrupted("algorithm failure".into())),
+            Error::IndexCorrupted(_)
+        ));
+    }
+
+    #[test]
+    fn output_failure_distinguishes_destination_directory_from_input_root() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("blocked");
+        std::fs::write(&output, b"preserve").unwrap();
+        let error = build_index_with_options(root.path(), Some(&output), &BuildOptions::default())
+            .unwrap_err();
+        assert!(is_build_disk_error(&error), "{error}");
+        let error = build_index_for_files(root.path(), &output, &[], 1024).unwrap_err();
+        assert!(is_build_disk_error(&error), "{error}");
+        let error = build_index_with_options(
+            &root.path().join("missing-source"),
+            Some(&root.path().join("index")),
+            &BuildOptions::default(),
+        )
+        .unwrap_err();
+        assert!(!is_build_disk_error(&error), "{error}");
+        assert_eq!(std::fs::read(output).unwrap(), b"preserve");
+    }
+
+    fn test_postings(count: u32) -> impl Iterator<Item = (u32, TrigramMasks)> {
+        (0..count).map(|trigram| {
+            (
+                trigram,
+                TrigramMasks {
+                    loc_mask: 1,
+                    next_mask: 1,
+                },
+            )
+        })
+    }
+
+    #[test]
+    fn spill_creation_output_failure_is_not_fallback_eligible() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocked = temp.path().join("not-a-directory");
+        std::fs::write(&blocked, b"preserve").unwrap();
+        let mut sink = PostingSink::new(
+            &blocked,
+            &BuildOptions {
+                strategy: IndexStrategy::External,
+                buffer_bytes: 1024,
+                ..Default::default()
+            },
+        );
+        let error = sink.push_file(0, test_postings(1025)).unwrap_err();
+        assert!(is_build_disk_error(&error), "{error}");
+        assert_eq!(std::fs::read(blocked).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn spill_segment_output_failure_is_not_fallback_eligible() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut sink = PostingSink::new(
+            temp.path(),
+            &BuildOptions {
+                strategy: IndexStrategy::External,
+                buffer_bytes: 1024,
+                ..Default::default()
+            },
+        );
+        sink.push_file(0, test_postings(1025)).unwrap();
+        let spill = std::fs::read_dir(temp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(spill.join("seg-00000.bin").is_file());
+        std::fs::create_dir(spill.join("seg-00001.bin")).unwrap();
+        let error = sink.push_file(1, test_postings(1025)).unwrap_err();
+        assert!(is_build_disk_error(&error), "{error}");
+    }
+
+    #[test]
+    fn spill_read_output_failure_is_not_fallback_eligible() {
+        let root = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let mut sink = PostingSink::new(
+            index.path(),
+            &BuildOptions {
+                strategy: IndexStrategy::External,
+                buffer_bytes: 1024,
+                ..Default::default()
+            },
+        );
+        sink.push_file(0, test_postings(1025)).unwrap();
+        let spill = std::fs::read_dir(index.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let segment = spill.join("seg-00000.bin");
+        std::fs::remove_file(&segment).unwrap();
+        std::fs::create_dir(&segment).unwrap();
+        let error = sink
+            .finish(index.path(), root.path(), &[(0, "source.rs".into())])
+            .unwrap_err();
+        assert!(is_build_disk_error(&error), "{error}");
+    }
+
+    #[test]
+    fn index_file_output_failure_is_not_fallback_eligible() {
+        for strategy in [IndexStrategy::External, IndexStrategy::InMemory] {
+            for name in ["index.bin", "lookup.bin", "files.bin", "meta.json"] {
+                let root = tempfile::tempdir().unwrap();
+                let index = tempfile::tempdir().unwrap();
+                std::fs::create_dir(index.path().join(name)).unwrap();
+                let mut sink = PostingSink::new(
+                    index.path(),
+                    &BuildOptions {
+                        strategy,
+                        buffer_bytes: 1024,
+                        ..Default::default()
+                    },
+                );
+                sink.push_file(0, test_postings(3)).unwrap();
+                let error = sink
+                    .finish(index.path(), root.path(), &[(0, "source.rs".into())])
+                    .unwrap_err();
+                assert!(is_build_disk_error(&error), "{strategy:?} {name}: {error}");
+            }
+        }
     }
 
     fn index_bytes(index: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {

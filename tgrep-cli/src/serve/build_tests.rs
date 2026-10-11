@@ -181,6 +181,57 @@ fn checkpointed_build_accepts_empty_short_and_binary_only_files() {
     }
 }
 
+#[test]
+fn storage_output_failure_stops_cold_build_without_heap_fallback() {
+    for directory_failure in [true, false] {
+        let temp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(root.join("source.rs"), b"fn storage_failure_marker() {}\n").unwrap();
+        let mut state = tests::test_server_state(&root, &root.join(".tgrep"));
+        Arc::get_mut(&mut state).unwrap().watch_enabled = false;
+        let staging = state.index_dir.join(".bootstrap-build");
+        let blocked = if directory_failure {
+            std::fs::write(&staging, b"blocked destination").unwrap();
+            staging
+        } else {
+            let blocked = staging.join("index.bin");
+            std::fs::create_dir_all(&blocked).unwrap();
+            blocked
+        };
+        let original = std::fs::read(state.index_dir.join("meta.json")).unwrap();
+        state.indexing.store(true, Ordering::SeqCst);
+        background_index_build(&state, &root, &state.index_dir);
+        assert!(
+            state.index_build_error.lock().unwrap().is_some(),
+            "destination failure silently entered the heap fallback"
+        );
+        assert!(!state.indexing.load(Ordering::SeqCst));
+        assert_eq!(state.index.read().unwrap().num_files(), 0);
+        assert_eq!(
+            std::fs::read(state.index_dir.join("meta.json")).unwrap(),
+            original
+        );
+        assert!(
+            search(&state, "storage_failure_marker")
+                .get("error")
+                .is_some()
+        );
+
+        if directory_failure {
+            std::fs::remove_file(blocked).unwrap();
+        } else {
+            std::fs::remove_dir(blocked).unwrap();
+        }
+        state.indexing.store(true, Ordering::SeqCst);
+        background_index_build(&state, &root, &state.index_dir);
+        assert!(state.index_build_error.lock().unwrap().is_none());
+        assert_eq!(
+            search(&state, "storage_failure_marker")["result"]["num_matches"],
+            1
+        );
+    }
+}
+
 struct ServerChild {
     child: Child,
     log: PathBuf,

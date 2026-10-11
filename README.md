@@ -181,10 +181,12 @@ sorting, or twice for in-memory sorting, plus 1 KiB per candidate path and
 rewrites also check their known posting and lookup sizes before writing.
 These are estimates, not space reservations or worst-case bounds: content,
 path lengths, concurrent writers, and filesystem quotas can still cause later
-write failures. An initial preflight rejection leaves the existing index intact.
+write failures. Destination and spill I/O failures, including permission errors,
+stop the build instead of triggering an in-memory retry. An initial preflight
+rejection leaves the existing index intact.
 Free space or choose `--index-path` on another volume if a check fails. A failed
 initial server build reports the error in `status` and leaves queries scanning;
-free space and reload or restart it to retry.
+fix the storage issue and reload or restart it to retry.
 
 ### Start the server
 
@@ -243,8 +245,8 @@ Initial and resumed external builds use a 64 MiB posting buffer and the
 not change `RAYON_NUM_THREADS` or resize the global search pool. `--max-cpu` is a
 worker-count budget, not an OS CPU quota. `--max-memory` applies only to the
 exceptional in-memory fallback, which is allowed only before any checkpoint
-publication is attempted and never for disk-space failures. Existing checkpoint
-progress is not discarded to enter that fallback.
+publication is attempted and never for destination, spill, or disk-space
+failures. Existing checkpoint progress is not discarded to enter that fallback.
 
 The server checks for pending saves once a minute. It saves at the mutation
 threshold, when filename-only membership changes, or when content changes

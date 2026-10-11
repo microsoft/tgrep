@@ -234,6 +234,7 @@ fn multiline_count_matches_uses_managed_per_file_totals() {
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
     assert_multiline_counts(&fixture.a.join("counts"), "(via shared daemon v2)");
+    assert_compact_shared_count_responses(&daemon, &fixture.a);
     daemon.rpc(
         "views.detach",
         json!({"owner":claim.owner,"lease":"managed-client"}),

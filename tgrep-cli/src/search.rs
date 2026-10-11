@@ -280,13 +280,10 @@ impl SearchOptions {
         crate::glob_filter::GlobFilter::new(&self.glob, &self.iglob, self.glob_case_insensitive)
     }
 
-    /// The matching-relevant subset, shared with the server path.
-    /// Whether the reply has to carry per-match spans and columns.
+    /// Whether local matching must retain every span on each line.
     ///
-    /// Every consumer of that data is listed here; anything else prints the
-    /// line as the server rendered it, so the arrays would be built, sent,
-    /// parsed and dropped. The check is conservative — when in doubt the data
-    /// is requested, because missing spans degrade output silently.
+    /// Server requests also use this as the default row-detail policy, but
+    /// count-only replies consume per-file totals instead.
     fn wants_match_detail(&self) -> bool {
         self.color.is_enabled()      // highlighting brackets each span
             || self.json             // reports them as `submatches`
@@ -1030,7 +1027,8 @@ fn server_search_request(
     // match — and most searches never read them. Asking for them only when
     // something will consume them keeps a 21k-hit query from building, sending
     // and parsing 21k arrays that are then dropped.
-    let detail = opts.wants_match_detail();
+    // Counts consume per-file totals; the server still collects every span.
+    let detail = !opts.count_matches && opts.wants_match_detail();
     let positions = opts.wants_position_detail();
 
     let mut request = serde_json::json!({
@@ -2825,14 +2823,60 @@ mod tests {
 
     #[test]
     fn count_matches_requests_totals_without_changing_legacy_queries() {
-        let mut opts = SearchOptions::default();
-        let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
-        assert!(request["params"].get("count_matches").is_none());
-        opts.count_matches = true;
-        let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
-        assert_eq!(request["params"]["count_matches"], true);
-        assert_eq!(request["params"]["stats"], false);
-        assert!(opts.match_options().all_spans);
+        for mut opts in [
+            SearchOptions::default(),
+            SearchOptions {
+                color: ColorMode::Always,
+                ..Default::default()
+            },
+            SearchOptions {
+                json: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                vimgrep: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                column: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                only_matching: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                replace: Some("replacement".into()),
+                ..Default::default()
+            },
+            SearchOptions {
+                count: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                files_only: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                quiet: true,
+                ..Default::default()
+            },
+        ] {
+            for stats in [false, true] {
+                opts.stats = stats;
+                opts.count_matches = false;
+                let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+                assert!(request["params"].get("count_matches").is_none());
+                assert_eq!(request["params"]["detail"], opts.wants_match_detail());
+                opts.count_matches = true;
+                let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+                assert_eq!(request["params"]["count_matches"], true);
+                assert_eq!(request["params"]["stats"], stats);
+                assert_eq!(request["params"]["detail"], false);
+                assert_eq!(request["params"]["positions"], opts.wants_position_detail());
+                assert!(opts.match_options().all_spans);
+            }
+        }
     }
 
     #[test]

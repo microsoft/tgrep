@@ -1626,6 +1626,12 @@ fn server_count_matches_returns_totals_without_stats() {
     fs::create_dir(&root).unwrap();
     fs::write(root.join("a.txt"), "hello\nworld\n").unwrap();
     fs::write(root.join("b.txt"), "hello\nworld\nhello\nworld\n").unwrap();
+    let repeats = 32 * 1024;
+    fs::write(
+        root.join("count-heavy.txt"),
+        format!("{}\nb\n", "a".repeat(repeats)),
+    )
+    .unwrap();
     let index_dir = dir.path().join("idx");
     let _server = start_passthru_server(&root, &index_dir);
     let info: serde_json::Value =
@@ -1666,6 +1672,57 @@ fn server_count_matches_returns_totals_without_stats() {
             }
         }
     }
+    for engine in ["default", "pcre2"] {
+        for stats in [false, true] {
+            for (pattern, multiline, matches, lines) in
+                [("a", false, repeats, 1), (r"a|\nb", true, repeats + 1, 2)]
+            {
+                let request = serde_json::json!({
+                    "jsonrpc": "2.0", "method": "search", "id": 1,
+                    "params": {
+                        "pattern": pattern, "multiline": multiline, "engine": engine,
+                        "glob": ["count-heavy.txt"], "count_matches": true,
+                        "stats": stats, "detail": false,
+                    },
+                });
+                let raw = send_rpc_request(port, &request.to_string()).unwrap();
+                assert!(raw.len() < 40 * 1024, "count response: {} bytes", raw.len());
+                let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert!(response.get("error").is_none(), "{response}");
+                let result = &response["result"];
+                assert_eq!(result["hidden_complete"], true);
+                assert_eq!(result.get("index_stats").is_some(), stats);
+                assert_eq!(
+                    result["file_stats"],
+                    serde_json::json!([{
+                        "file":"count-heavy.txt","matches":matches,"matched_lines":lines,
+                    }])
+                );
+                let rows = result["matches"].as_array().unwrap();
+                assert_eq!(rows.len(), lines);
+                for row in rows {
+                    assert!(row.get("spans").is_none());
+                    assert!(row.get("columns").is_none());
+                }
+            }
+        }
+    }
+    let legacy = serde_json::json!({
+        "jsonrpc":"2.0","method":"search","id":1,
+        "params":{"pattern":"a","glob":["count-heavy.txt"]},
+    });
+    let raw = send_rpc_request(port, &legacy.to_string()).unwrap();
+    assert!(raw.len() > 40 * 1024);
+    let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].get("file_stats").is_none());
+    assert_eq!(
+        response["result"]["matches"][0]["spans"]
+            .as_array()
+            .unwrap()
+            .len(),
+        repeats
+    );
 }
 
 #[test]
@@ -1742,6 +1799,9 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                     let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                     assert_eq!(request["params"].get("count_matches").is_some(), flag != "-c");
                     assert_eq!(request["params"]["stats"], stats);
+                    if flag == "--count-matches" {
+                        assert_eq!(request["params"]["detail"], false);
+                    }
                     let rows: Vec<_> = [("a.txt", 2), ("b.txt", 4)]
                         .into_iter()
                         .flat_map(|(file, lines)| (1..=lines).map(move |line| {

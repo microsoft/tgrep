@@ -5,6 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::Context;
+
 const RETIRED_DIR: &str = ".retired";
 const GENERATION_PREFIX: &str = "generation-";
 const COMMITTED_PREFIX: &str = "committed-";
@@ -59,39 +61,32 @@ fn is_link(metadata: &fs::Metadata) -> bool {
 /// Startup only, with serve.lock held and before any indexing worker starts.
 /// Published files and the independently recovered .retired directory are not
 /// scratch output, even when their publication was interrupted.
-pub(super) fn cleanup_stale_builds(index_dir: &Path) {
-    let entries = match fs::read_dir(index_dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            eprintln!(
-                "[trace] warning: could not list stale build output in {}: {error}",
-                index_dir.display()
-            );
-            return;
-        }
-    };
+pub(super) fn cleanup_stale_builds(index_dir: &Path) -> anyhow::Result<()> {
+    let entries = fs::read_dir(index_dir).with_context(|| {
+        format!(
+            "could not inspect index scratch directory {}",
+            index_dir.display()
+        )
+    })?;
     let mut removed = 0usize;
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                eprintln!(
-                    "[trace] warning: could not inspect stale build output in {}: {error}",
-                    index_dir.display()
-                );
-                continue;
-            }
-        };
+        let entry = entry.with_context(|| {
+            format!(
+                "could not inspect index scratch entry in {}",
+                index_dir.display()
+            )
+        })?;
         let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let spill = is_spill_name(name);
+        let staging = STAGING_DIRS.contains(&name);
+        if !spill && !staging {
+            continue;
+        }
         let result = (|| -> io::Result<()> {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                return Ok(());
-            };
-            let spill = is_spill_name(name);
-            if !spill && !STAGING_DIRS.contains(&name) {
-                return Ok(());
-            }
             let metadata = fs::symlink_metadata(&path)?;
             if is_link(&metadata) {
                 return Err(io::Error::new(
@@ -113,6 +108,11 @@ pub(super) fn cleanup_stale_builds(index_dir: &Path) {
             Ok(())
         })();
         if let Err(error) = result {
+            if staging {
+                return Err(error).with_context(|| {
+                    format!("cannot prepare fixed index staging path {}", path.display())
+                });
+            }
             eprintln!(
                 "[trace] warning: stale build cleanup deferred for {}: {error}",
                 path.display()
@@ -122,6 +122,7 @@ pub(super) fn cleanup_stale_builds(index_dir: &Path) {
     if removed != 0 {
         eprintln!("[trace] removed {removed} stale build artifact(s)");
     }
+    Ok(())
 }
 
 pub(super) struct BackupDir {
@@ -649,7 +650,7 @@ mod tests {
         let pending = BackupDir::create(tmp.path()).unwrap();
         fs::write(pending.path().join("index.bin"), b"recover").unwrap();
 
-        cleanup_stale_builds(tmp.path());
+        cleanup_stale_builds(tmp.path()).unwrap();
 
         for name in STAGING_DIRS
             .iter()
@@ -729,6 +730,51 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
+    fn preparation_rejects_linked_fixed_staging_before_writers_start() {
+        for name in STAGING_DIRS {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(tmp.path()).unwrap().join("repo");
+            let index_dir = root.join(".tgrep");
+            let outside = tmp.path().join("outside");
+            fs::create_dir_all(&index_dir).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("index.bin"), b"external sentinel").unwrap();
+            link_directory(&outside, &index_dir.join(name));
+
+            let error = crate::serve::prepare_index_directory(&root, &index_dir).unwrap_err();
+            assert!(
+                error.to_string().contains("fixed index staging path"),
+                "{error:#}"
+            );
+            assert_eq!(
+                fs::read(outside.join("index.bin")).unwrap(),
+                b"external sentinel"
+            );
+            assert!(!index_dir.join("meta.json").exists());
+        }
+    }
+
+    #[test]
+    fn preparation_rejects_non_directory_fixed_staging() {
+        for name in STAGING_DIRS {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(tmp.path()).unwrap().join("repo");
+            let index_dir = root.join(".tgrep");
+            fs::create_dir_all(&index_dir).unwrap();
+            fs::write(index_dir.join(name), b"unexpected file").unwrap();
+
+            let error = crate::serve::prepare_index_directory(&root, &index_dir).unwrap_err();
+            assert!(
+                error.to_string().contains("fixed index staging path"),
+                "{error:#}"
+            );
+            assert_eq!(fs::read(index_dir.join(name)).unwrap(), b"unexpected file");
+            assert!(!index_dir.join("meta.json").exists());
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
     fn stale_build_cleanup_does_not_follow_directory_links() {
         let tmp = tempfile::tempdir().unwrap();
         let index_dir = tmp.path().join("index");
@@ -742,7 +788,7 @@ mod tests {
         fs::create_dir(index_dir.join(".flush-staging")).unwrap();
         link_directory(&outside, &index_dir.join(".flush-staging").join("nested"));
 
-        cleanup_stale_builds(&index_dir);
+        assert!(cleanup_stale_builds(&index_dir).is_err());
         cleanup_retired(&index_dir);
 
         assert_eq!(
@@ -870,11 +916,12 @@ mod tests {
             fs::write(&file, b"mapped build output").unwrap();
             let mapping = map_file(&file);
 
-            cleanup_stale_builds(tmp.path());
+            let result = cleanup_stale_builds(tmp.path());
+            assert_eq!(result.is_err(), STAGING_DIRS.contains(&name));
             assert_eq!(fs::read(&file).unwrap(), &mapping[..]);
 
             drop(mapping);
-            cleanup_stale_builds(tmp.path());
+            cleanup_stale_builds(tmp.path()).unwrap();
             assert!(!path.exists());
         }
     }

@@ -258,7 +258,7 @@ pub(crate) fn prepare_index_directory(root: &Path, index_dir: &Path) -> Result<(
     let lock_file = try_acquire_server_lock(&index_dir)?;
     index_cleanup::recover_pending(&index_dir)
         .context("recovering an interrupted index publication")?;
-    index_cleanup::cleanup_stale_builds(&index_dir);
+    index_cleanup::cleanup_stale_builds(&index_dir)?;
     index_cleanup::cleanup_retired(&index_dir);
     Ok((index_dir, lock_file))
 }

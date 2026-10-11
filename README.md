@@ -164,8 +164,10 @@ artifacts and the known bootstrap, reload, filename, delta, merge, and flush
 staging directories. Published index files and unrelated entries are preserved.
 Legacy unjournaled backups are left untouched. Invalid or ambiguous recovery
 records stop startup rather than guessing which generation to restore.
-Linked or unremovable scratch artifacts produce warnings; Windows files still
-mapped by readers are not force-unlinked, including during recovery.
+Linked or unremovable fixed staging entries stop startup before writers can
+reuse them. Spill cleanup failures produce warnings; spill writers allocate
+fresh names instead of reusing leftovers. Windows files still mapped by readers
+are not force-unlinked, including during recovery.
 Managed shared storage uses its own lifecycle and is not cleaned by this path.
 
 Before extracting content, ordinary builds check available space on the index

@@ -39,6 +39,21 @@ impl Fixture {
     }
 }
 
+fn link_directory(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/j"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+}
+
 #[test]
 fn local_index_rejects_directory_links_in_whole_and_subtree_searches() {
     let fixture = Fixture::new();
@@ -47,18 +62,7 @@ fn local_index_rejects_directory_links_in_whole_and_subtree_searches() {
     fs::write(outside.join("file.txt"), "needle OUTSIDE_SENTINEL\n").unwrap();
     let link = fixture.root.join("nested").join("dir");
     fs::rename(&link, fixture.temp.path().join("saved")).unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&outside, &link).unwrap();
-    #[cfg(windows)]
-    {
-        let output = std::process::Command::new("cmd.exe")
-            .args(["/d", "/c", "mklink", "/j"])
-            .arg(&link)
-            .arg(&outside)
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-    }
+    link_directory(&outside, &link);
     for root in [&fixture.root, &fixture.root.join("nested")] {
         for args in [
             vec!["-F", "--", "needle"],
@@ -239,4 +243,38 @@ fn index_and_serve_preserve_temporary_output_owned_by_another_writer() {
             .unwrap()
             .contains("Query plan:")
     );
+}
+
+#[test]
+fn index_and_serve_reject_linked_staging_without_touching_external_files() {
+    let fixture = Fixture::new();
+    let outside = fixture.temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("index.bin"), b"external sentinel").unwrap();
+    link_directory(&outside, &fixture.index.join(".bootstrap-build"));
+    let mut metadata = IndexMeta::load(&fixture.index).unwrap();
+    metadata.complete = false;
+    metadata.save(&fixture.index).unwrap();
+    let before = fs::read(fixture.index.join("meta.json")).unwrap();
+
+    for command in ["index", "serve"] {
+        let output = Command::cargo_bin("tgrep")
+            .unwrap()
+            .timeout(Duration::from_secs(30))
+            .current_dir(&fixture.root)
+            .args([command, ".", "--index-path"])
+            .arg(&fixture.index)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("fixed index staging path"), "{stderr}");
+        assert_eq!(
+            fs::read(outside.join("index.bin")).unwrap(),
+            b"external sentinel"
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        assert_eq!(fs::read(fixture.index.join("meta.json")).unwrap(), before);
+        assert!(!fixture.index.join("serve.json").exists());
+    }
 }

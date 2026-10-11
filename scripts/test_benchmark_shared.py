@@ -2,6 +2,7 @@
 
 import copy
 import contextlib
+import errno
 import gzip
 import io
 import json
@@ -12,7 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import benchmark_shared as bench
 
@@ -369,6 +370,64 @@ class MetricsTests(unittest.TestCase):
 
 
 class ProcessTests(unittest.TestCase):
+    def fake_unix_process(self):
+        owned = bench.OwnedProcess.__new__(bench.OwnedProcess)
+        owned.job = None
+        owned.stopped = False
+        owned.process = Mock(pid=12345)
+        owned.process.wait.return_value = 0
+        owned.process.poll.return_value = 0
+        return owned
+
+    @unittest.skipIf(os.name == "nt", "Unix process-group signaling")
+    def test_darwin_permission_race_requires_confirmed_group_disappearance(self):
+        for first_signal in (True, False):
+            owned = self.fake_unix_process()
+            denied = PermissionError(errno.EPERM, "signal denied")
+            gone = ProcessLookupError(errno.ESRCH, "group gone")
+            responses = ([denied, denied, None, gone, gone] if first_signal else
+                         [None, denied, denied, None, gone])
+            expected = [call(owned.process.pid, bench.signal.SIGTERM)]
+            if not first_signal:
+                expected.append(call(owned.process.pid, bench.signal.SIGKILL))
+            expected.extend([call(owned.process.pid, 0)] * 3)
+            if first_signal:
+                expected.append(call(owned.process.pid, bench.signal.SIGKILL))
+            with self.subTest(first_signal=first_signal), \
+                    patch.object(bench.sys, "platform", "darwin"), \
+                    patch.object(bench.os, "killpg", side_effect=responses) as killpg, \
+                    patch.object(bench.time, "sleep"):
+                owned.stop()
+                self.assertTrue(owned.stopped)
+                self.assertEqual(killpg.call_args_list, expected)
+                self.assertEqual(owned.process.poll.call_count, 3)
+
+    @unittest.skipIf(os.name == "nt", "Unix process-group signaling")
+    def test_darwin_persistent_group_permission_error_remains_fatal(self):
+        owned = self.fake_unix_process()
+        denied = PermissionError(errno.EPERM, "persistent signal denial")
+        with patch.object(bench.sys, "platform", "darwin"), \
+                patch.object(bench.os, "killpg", side_effect=[None, denied, denied]), \
+                patch.object(bench.time, "monotonic", side_effect=[0, 0, 4]), \
+                patch.object(bench.time, "sleep"):
+            with self.assertRaises(PermissionError) as failure:
+                owned.stop()
+            self.assertIs(failure.exception, denied)
+            self.assertFalse(owned.stopped)
+
+    @unittest.skipIf(os.name == "nt", "Unix process-group signaling")
+    def test_non_darwin_group_permission_error_is_not_retried(self):
+        owned = self.fake_unix_process()
+        denied = PermissionError(errno.EPERM, "signal denied")
+        with patch.object(bench.sys, "platform", "linux"), \
+                patch.object(bench.os, "killpg", side_effect=[None, denied]) as killpg, \
+                patch.object(bench.time, "sleep") as sleep:
+            with self.assertRaises(PermissionError):
+                owned.stop()
+            self.assertEqual(killpg.call_count, 2)
+            sleep.assert_not_called()
+            self.assertFalse(owned.stopped)
+
     @unittest.skipUnless(os.name == "nt", "Windows suspended process containment")
     def test_windows_assignment_resume_failures_never_execute_child(self):
         original_popen = bench.subprocess.Popen
@@ -438,12 +497,25 @@ class ProcessTests(unittest.TestCase):
         else:
             deadline = time.monotonic() + 3
             while True:
-                status = Path(f"/proc/{pid}/stat")
-                try:
-                    state = status.read_text().rsplit(")", 1)[1].split()[0]
-                except FileNotFoundError:
-                    return
-                if state == "Z":
+                if sys.platform == "darwin":
+                    result = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "stat="],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    self.assertEqual(result.stderr, "")
+                    if result.returncode == 1 and not result.stdout.strip():
+                        return
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    states = result.stdout.split()
+                    self.assertEqual(len(states), 1, result.stdout)
+                    state = states[0]
+                else:
+                    status = Path(f"/proc/{pid}/stat")
+                    try:
+                        state = status.read_text().rsplit(")", 1)[1].split()[0]
+                    except FileNotFoundError:
+                        return
+                if state.startswith("Z"):
                     return
                 self.assertLess(time.monotonic(), deadline, "owned descendant survived")
                 time.sleep(.01)

@@ -281,6 +281,28 @@ class OwnedProcess:
                     stream.close()
             raise
 
+    def _signal_group(self, signum):
+        try:
+            os.killpg(self.process.pid, signum)
+        except ProcessLookupError:
+            return
+        except PermissionError as error:
+            if sys.platform != "darwin":
+                raise
+            # Darwin skips zombies while signaling groups. Reap our child and
+            # require confirmed group disappearance, not just a permission error.
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                self.process.poll()
+                try:
+                    os.killpg(self.process.pid, 0)
+                except ProcessLookupError:
+                    return
+                except PermissionError:
+                    pass
+                time.sleep(.01)
+            raise error
+
     def stop(self):
         if self.stopped:
             return
@@ -301,29 +323,20 @@ class OwnedProcess:
             self.stopped = True
             return
         if os.name != "nt":
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            self._signal_group(signal.SIGTERM)
         elif process.poll() is None:
             process.terminate()
         try:
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             if os.name != "nt":
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                self._signal_group(signal.SIGKILL)
             else:
                 process.kill()
             process.wait(timeout=3)
         # A leader can exit before a child; finish its owned Unix group too.
         if os.name != "nt":
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            self._signal_group(signal.SIGKILL)
         self.stopped = True
 
 

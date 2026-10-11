@@ -152,6 +152,31 @@ Large files can be memory-mapped, but files needing decoding or UTF-8 repair
 require heap buffers. Use `--max-filesize` to limit admitted file sizes.
 See [index-build benchmarks](BENCHMARKS.md#index-build-strategies).
 
+#### Temporary storage and free space
+
+Ordinary `index` and `serve` processes share an exclusive `serve.lock` in the
+index directory. Stop a server before running `index` against the same directory;
+use the server's `reload` RPC to rebuild without stopping it.
+Core API callers sharing an output directory with the CLI must hold the same lock.
+After acquiring the lock, both commands remove abandoned numeric
+`spill-<pid>[-<sequence>].tmp` artifacts and the known reload, filename, delta,
+merge, and flush staging directories. Published index files, unrelated entries,
+and uncommitted recovery backups are preserved. Linked or unremovable artifacts
+produce warnings; Windows files still mapped by readers are not force-unlinked.
+Managed shared storage uses its own lifecycle and is not cleaned by this path.
+
+Before extracting content, ordinary builds check available space on the index
+filesystem. The estimate is three times candidate-file bytes for external
+sorting, or twice for in-memory sorting, plus 1 KiB per candidate path and
+64 MiB of headroom. An unavailable file size is charged as 64 MiB. Staged
+rewrites also check their known posting and lookup sizes before writing.
+These are estimates, not space reservations or worst-case bounds: content,
+path lengths, concurrent writers, and filesystem quotas can still cause later
+write failures. An initial preflight rejection leaves the existing index intact.
+Free space or choose `--index-path` on another volume if a check fails. A failed
+initial server build reports the error in `status` and leaves queries scanning;
+free space and reload or restart it to retry.
+
 ### Start the server
 
 ```bash

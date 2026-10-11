@@ -116,6 +116,74 @@ fn wait_for_port(index_dir: &Path) -> u16 {
 }
 
 #[test]
+fn warm_start_cleans_abandoned_build_output_before_serving() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path();
+    let index_dir = root.join(".tgrep");
+    fs::write(root.join("source.rs"), "fn startup_cleanup_marker() {}\n").unwrap();
+    tgrep_core::builder::build_index(root, Some(&index_dir), true, false, &[]).unwrap();
+    let artifacts = [
+        ".reload-build",
+        ".filename-index-staging",
+        ".stale-delta",
+        ".stale-merge",
+        ".flush-staging",
+        "spill-123-0.tmp",
+    ];
+    for name in artifacts {
+        let path = index_dir.join(name);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("segment.bin"), b"abandoned build").unwrap();
+    }
+    let pending = index_dir.join(".retired").join("generation-123-1");
+    fs::create_dir_all(&pending).unwrap();
+    fs::write(
+        pending.join("index.bin"),
+        b"recover interrupted publication",
+    )
+    .unwrap();
+    fs::write(index_dir.join("unrelated.tmp"), b"keep").unwrap();
+    let log = fs::File::create(index_dir.join("test-startup.log")).unwrap();
+    let child = Command::new(tgrep_bin())
+        .args(["serve", "--no-watch", "--index-path"])
+        .arg(&index_dir)
+        .arg(root)
+        .stderr(log)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _server = ServerGuard { child };
+    let port = wait_for_port(&index_dir);
+
+    for name in artifacts {
+        assert!(!index_dir.join(name).exists(), "{name}");
+    }
+    assert_eq!(
+        fs::read(pending.join("index.bin")).unwrap(),
+        b"recover interrupted publication"
+    );
+    assert_eq!(fs::read(index_dir.join("unrelated.tmp")).unwrap(), b"keep");
+    assert_eq!(search_matches(port, "startup_cleanup_marker"), 1);
+
+    let active_spill = index_dir.join("spill-123-1.tmp");
+    fs::write(&active_spill, b"active server output").unwrap();
+    let output = assert_cmd::Command::new(tgrep_bin())
+        .timeout(Duration::from_secs(30))
+        .args(["index", "--index-path"])
+        .arg(&index_dir)
+        .arg(root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("another tgrep server or index build")
+    );
+    assert_eq!(fs::read(active_spill).unwrap(), b"active server output");
+}
+
+#[test]
 fn warm_start_watcher_does_not_index_gitignored_files() {
     let fixture = setup_fixture();
     let root = fixture.path();

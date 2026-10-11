@@ -1656,11 +1656,10 @@ fn poll_build_paths_repair_post_extraction_changes_without_native_watches() {
         match build {
             Build::Bootstrap => {
                 fixture.state.indexing.store(true, Ordering::SeqCst);
-                assert!(bootstrap_index_build(
-                    &fixture.state,
-                    &fixture.root,
-                    &fixture.state.index_dir
-                ));
+                assert!(
+                    bootstrap_index_build(&fixture.state, &fixture.root, &fixture.state.index_dir)
+                        .unwrap()
+                );
             }
             Build::Reload => {
                 let response = handle_reload(None, &fixture.state);

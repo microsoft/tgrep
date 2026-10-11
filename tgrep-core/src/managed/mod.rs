@@ -95,7 +95,7 @@ pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// namespaces are reserved, so an unrelated directory that merely shares the
 /// store name stays usable. The absolute path is checked lexically after
 /// `.`/`..` normalization, without following links.
-pub(crate) fn reject_unguarded(path: &std::path::Path) -> crate::Result<()> {
+pub fn reject_unguarded(path: &std::path::Path) -> crate::Result<()> {
     if reserved_store_path(path)? || path.join("paths.tgm").try_exists()? {
         return Err(
             Error::incompatible("managed storage requires a protected managed reader").into(),

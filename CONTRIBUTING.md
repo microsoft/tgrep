@@ -4,7 +4,7 @@ Thanks for your interest in contributing! Here's how to get started.
 
 ## Development Setup
 
-1. Install [Rust](https://rustup.rs/) (1.85+ required for edition 2024)
+1. Install [Rust](https://rustup.rs/) (1.88+ is the workspace minimum)
 2. Clone and build:
    ```bash
    git clone https://github.com/microsoft/tgrep.git
@@ -84,6 +84,14 @@ from `tgrep-core` to `vendor/ignore`, is required in each graph. This is a stabl
 Cargo compile check using the host C++ compiler, not a sanitizer fuzz campaign;
 the separate nightly weekly/manual Fuzz workflow remains unchanged.
 
+A separate native Windows job checks all workspace targets with
+`managed-test-hooks` on Rust 1.88.0, runs the native WAL-lock and managed lifecycle
+regressions, then builds and smoke-tests the actual locked x64 release executable
+with the OneBranch control-flow guard, static CRT,
+`/DYNAMICBASE` and `/CETCOMPAT` flags. This bounded upstream-compiler check
+guards the workspace minimum; it does not replace qualification with the
+Microsoft `ms-stable` compiler, private feed or OneBranch signing pipeline.
+
 An installed-release smoke runs on Linux for each PR/push and on **all three
 OSes weekly/manually**. It runs the documented
 `cargo install --path tgrep-cli --locked --root <private-temporary-root>`, then
@@ -129,7 +137,9 @@ These checks qualify checkout-based distribution, not crates.io packaging or
 the separate cross-build/signing pipelines.
 
 Managed catalogs pin `rusqlite` to upstream Git revision
-`2a71e35d94b2a02f7dd4a0c4cfd59c339370e747`, which bundles SQLite 3.53.3.
+`a1a23ea2a6a8a27bc07c8b10cbd363760287e1cc`, which supports Rust 1.88 and
+bundles SQLite 3.53.4. This development-line revision retains the Windows
+WAL-lock correction while advancing the previous bundled SQLite 3.53.3.
 SQLite 3.53.2 can retain native WAL read locks after readers close when a
 canonical Windows DOS-device path is mistaken for a UNC path. The upstream
 correction preserves canonical path and identity checks; a separate native

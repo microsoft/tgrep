@@ -1964,9 +1964,10 @@ impl ViewSlot {
                 return Err(Error::stale_version(current.version));
             }
         }
+        #[allow(deprecated, reason = "Rust 1.88 compatibility")]
         let before = self
             .epoch
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| Error::corrupt("view input epoch exhausted"))?;

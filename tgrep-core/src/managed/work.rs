@@ -731,8 +731,9 @@ impl WorkPermit {
 
     pub(crate) fn charge_write(&self, amount: u64) -> Result<()> {
         self.check()?;
+        #[allow(deprecated, reason = "Rust 1.88 compatibility")]
         self.bytes_written
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(amount)
                     .filter(|total| *total <= self.staging_limit())
             })
@@ -752,9 +753,10 @@ impl WorkPermit {
 
     pub(crate) fn memory(self: &Arc<Self>, bytes: u64) -> Result<MemoryCharge> {
         self.check()?;
+        #[allow(deprecated, reason = "Rust 1.88 compatibility")]
         let before = self
             .private_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|total| *total <= self.private_limit())
             })
@@ -890,10 +892,11 @@ impl MemoryCharge {
             .bytes
             .checked_add(bytes)
             .ok_or_else(|| Error::pressure("private-memory-account-overflow"))?;
+        #[allow(deprecated, reason = "Rust 1.88 compatibility")]
         let before = self
             .permit
             .private_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|total| *total <= self.permit.private_limit())
             })

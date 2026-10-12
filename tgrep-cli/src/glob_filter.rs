@@ -4,6 +4,19 @@ use std::path::Path;
 use anyhow::Result;
 use tgrep_core::walker::{Override, OverrideBuilder};
 
+/// How the glob overrides treat one file. As in ripgrep, a glob decision takes
+/// precedence over every other filter, including `-t`/`-T`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlobDecision {
+    /// A positive glob matched the file.
+    Include,
+    /// A negated glob matched the file or one of its directories, or positive
+    /// globs exist and none matched the file.
+    Exclude,
+    /// No glob applies, so later filters decide.
+    Unmatched,
+}
+
 pub struct GlobFilter {
     overrides: Override,
     globs: Vec<(String, bool)>,
@@ -50,10 +63,22 @@ impl GlobFilter {
         self.overrides.is_empty()
     }
 
+    /// Whether any positive (non-`!`) glob was given. Such a glob makes the
+    /// globs decide every file, so `-t`/`-T` no longer apply.
+    pub fn has_includes(&self) -> bool {
+        self.overrides.num_whitelists() > 0
+    }
+
     /// Check if a path passes this glob filter.
+    #[cfg(test)]
     pub fn matches(&self, path: &str) -> bool {
+        self.decide(path) != GlobDecision::Exclude
+    }
+
+    /// Classify a file path against the globs.
+    pub fn decide(&self, path: &str) -> GlobDecision {
         if self.is_empty() {
-            return true;
+            return GlobDecision::Unmatched;
         }
         // Normalize backslashes only when needed (index paths use forward slashes)
         let normalized;
@@ -66,10 +91,17 @@ impl GlobFilter {
         // A directory exclusion prunes its whole subtree in a filesystem walk.
         for (end, _) in path.match_indices('/') {
             if self.overrides.matched(&path[..end], true).is_ignore() {
-                return false;
+                return GlobDecision::Exclude;
             }
         }
-        !self.overrides.matched(path, false).is_ignore()
+        let matched = self.overrides.matched(path, false);
+        if matched.is_whitelist() {
+            GlobDecision::Include
+        } else if matched.is_ignore() {
+            GlobDecision::Exclude
+        } else {
+            GlobDecision::Unmatched
+        }
     }
 }
 
@@ -187,5 +219,25 @@ mod tests {
         assert!(f.matches("bar.cs"));
         assert!(f.matches("src/foo/bar.cs"));
         assert!(!f.matches("src/foo/bar.rs"));
+    }
+
+    #[test]
+    fn decide_classifies_files() {
+        let empty = GlobFilter::default();
+        assert_eq!(empty.decide("a.rs"), GlobDecision::Unmatched);
+        assert!(!empty.has_includes());
+
+        let include = GlobFilter::new(&["*.txt".to_string()], &[], false).unwrap();
+        assert!(include.has_includes());
+        assert_eq!(include.decide("data/a.txt"), GlobDecision::Include);
+        // With a positive glob, an unmatched file is excluded outright.
+        assert_eq!(include.decide("data/a.rs"), GlobDecision::Exclude);
+
+        let exclude =
+            GlobFilter::new(&["!*.txt".to_string(), "!vendor".to_string()], &[], false).unwrap();
+        assert!(!exclude.has_includes());
+        assert_eq!(exclude.decide("data/a.txt"), GlobDecision::Exclude);
+        assert_eq!(exclude.decide("vendor/a.rs"), GlobDecision::Exclude);
+        assert_eq!(exclude.decide("data/a.rs"), GlobDecision::Unmatched);
     }
 }

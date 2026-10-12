@@ -29,6 +29,70 @@ pub fn builtin_types() -> &'static TypeMap {
     &BUILTIN_TYPES
 }
 
+/// One type-related flag, in command-line order.
+///
+/// Like ripgrep, `--type-add` and `--type-clear` edit the definitions in the
+/// order given, `-t`/`-T` are resolved against the final definitions, and the
+/// last selection matching a file decides whether it is searched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeOp {
+    /// `--type-add SPEC`
+    Add(String),
+    /// `--type-clear NAME`
+    Clear(String),
+    /// `-t NAME`
+    Select(String),
+    /// `-T NAME`
+    Negate(String),
+}
+
+impl TypeOp {
+    /// Ops for flags whose relative order is unknown: every clear, then every
+    /// add, then every `-t`, then every `-T`.
+    pub fn from_unordered(
+        type_add: &[String],
+        type_clear: &[String],
+        select: &[String],
+        negate: &[String],
+    ) -> Vec<TypeOp> {
+        type_clear
+            .iter()
+            .cloned()
+            .map(TypeOp::Clear)
+            .chain(type_add.iter().cloned().map(TypeOp::Add))
+            .chain(select.iter().cloned().map(TypeOp::Select))
+            .chain(negate.iter().cloned().map(TypeOp::Negate))
+            .collect()
+    }
+
+    /// Whether [`TypeOp::from_unordered`] reproduces these ops exactly: no
+    /// clear follows an add and no `-t` follows a `-T`.
+    pub fn is_unordered_equivalent(ops: &[TypeOp]) -> bool {
+        let mut seen_add = false;
+        let mut seen_negate = false;
+        for op in ops {
+            match op {
+                TypeOp::Add(_) => seen_add = true,
+                TypeOp::Clear(_) if seen_add => return false,
+                TypeOp::Negate(_) => seen_negate = true,
+                TypeOp::Select(_) if seen_negate => return false,
+                TypeOp::Clear(_) | TypeOp::Select(_) => {}
+            }
+        }
+        true
+    }
+}
+
+/// Apply `ops` to the built-in definitions and compile the selections.
+pub fn build_type_filter(ops: &[TypeOp]) -> Result<TypeFilter> {
+    if ops.is_empty() {
+        return Ok(TypeFilter::default());
+    }
+    let mut defs = TypeDefs::builtin();
+    defs.apply(ops)?;
+    defs.build_selections(ops)
+}
+
 /// The type definitions in effect for one invocation: the built-ins plus any
 /// `--type-add`, minus any `--type-clear`.
 #[derive(Clone, Debug)]
@@ -120,47 +184,66 @@ impl TypeDefs {
         }
     }
 
-    /// Compile `-t`/`-T` selections into a matcher.
-    pub fn build_filter(&self, select: &[String], negate: &[String]) -> Result<TypeFilter> {
-        Ok(TypeFilter {
-            select: self.compile(select)?,
-            negate: self.compile(negate)?,
-        })
+    /// Apply the `--type-add`/`--type-clear` ops in order, ignoring selections.
+    pub fn apply(&mut self, ops: &[TypeOp]) -> Result<()> {
+        for op in ops {
+            match op {
+                TypeOp::Add(spec) => self.add(spec)?,
+                TypeOp::Clear(name) => self.clear(name),
+                TypeOp::Select(_) | TypeOp::Negate(_) => {}
+            }
+        }
+        Ok(())
     }
 
-    fn compile(&self, names: &[String]) -> Result<Option<GlobSet>> {
-        if names.is_empty() {
-            return Ok(None);
-        }
-        let mut builder = GlobSetBuilder::new();
-        for name in names {
+    /// Compile `-t`/`-T` selections into a matcher, with every `-T` taking
+    /// precedence over every `-t`.
+    pub fn build_filter(&self, select: &[String], negate: &[String]) -> Result<TypeFilter> {
+        self.build_selections(&TypeOp::from_unordered(&[], &[], select, negate))
+    }
+
+    /// Compile the `-t`/`-T` ops in `ops` into a matcher, ignoring definition
+    /// ops. Fails on the first selection naming an undefined type.
+    pub fn build_selections(&self, ops: &[TypeOp]) -> Result<TypeFilter> {
+        let mut filter = TypeFilter::default();
+        for op in ops {
+            let (negated, name) = match op {
+                TypeOp::Select(name) => (false, name),
+                TypeOp::Negate(name) => (true, name),
+                TypeOp::Add(_) | TypeOp::Clear(_) => continue,
+            };
             let Some(globs) = self.map.get(name.as_str()) else {
                 bail!("unrecognized file type: {name}");
             };
+            let mut builder = GlobSetBuilder::new();
             for glob in globs {
                 // ripgrep matches type globs against the file name alone, so a
                 // `*` must not be allowed to cross a path separator.
                 builder.add(GlobBuilder::new(glob).literal_separator(true).build()?);
             }
+            filter.selections.push((negated, builder.build()?));
+            filter.has_selected |= !negated;
         }
-        Ok(Some(builder.build()?))
+        Ok(filter)
     }
 }
 
 /// Compiled `-t`/`-T` filter.
 ///
-/// `-T` takes precedence over `-t`, and when only `-T` is given every file that
-/// is not excluded is included.
+/// The last selection matching a file decides: `-t` includes it and `-T`
+/// excludes it. A file no selection matches is excluded when any `-t` was
+/// given, so `-T` alone includes everything it does not exclude.
 #[derive(Debug, Default)]
 pub struct TypeFilter {
-    select: Option<GlobSet>,
-    negate: Option<GlobSet>,
+    /// Compiled selections in command-line order; `true` marks a `-T`.
+    selections: Vec<(bool, GlobSet)>,
+    has_selected: bool,
 }
 
 impl TypeFilter {
     /// True when no `-t`/`-T` was given, so the filter passes everything.
     pub fn is_empty(&self) -> bool {
-        self.select.is_none() && self.negate.is_none()
+        self.selections.is_empty()
     }
 
     /// Whether `path` survives the filter.
@@ -169,15 +252,12 @@ impl TypeFilter {
             return true;
         }
         let name = base_name(path);
-        if let Some(negate) = &self.negate
-            && negate.is_match(name)
-        {
-            return false;
+        for (negated, set) in self.selections.iter().rev() {
+            if set.is_match(name) {
+                return !negated;
+            }
         }
-        match &self.select {
-            Some(select) => select.is_match(name),
-            None => true,
-        }
+        !self.has_selected
     }
 }
 
@@ -666,6 +746,110 @@ mod tests {
         d.clear("rust");
         assert!(!d.contains("rust"));
         assert!(d.build_filter(&["rust".to_string()], &[]).is_err());
+    }
+
+    fn op_filter(ops: &[TypeOp]) -> Result<TypeFilter> {
+        build_type_filter(ops)
+    }
+
+    #[test]
+    fn later_selection_wins() {
+        let select = TypeOp::Select("rust".to_string());
+        let negate = TypeOp::Negate("rust".to_string());
+        let f = op_filter(&[negate.clone(), select.clone()]).unwrap();
+        assert!(f.matches("data/a.rs"));
+        assert!(!f.matches("data/a.txt"));
+        let f = op_filter(&[select, negate]).unwrap();
+        assert!(!f.matches("data/a.rs"));
+        assert!(!f.matches("data/a.txt"));
+    }
+
+    #[test]
+    fn negate_then_select_of_overlapping_types_keeps_shared_globs() {
+        // `*.h` is in both c and cpp; the later `-t cpp` re-includes it.
+        let f = op_filter(&[
+            TypeOp::Negate("c".to_string()),
+            TypeOp::Select("cpp".to_string()),
+        ])
+        .unwrap();
+        assert!(f.matches("a.h"));
+        assert!(f.matches("a.cpp"));
+        assert!(!f.matches("a.c"));
+    }
+
+    #[test]
+    fn definitions_apply_in_argument_order() {
+        // Clearing after adding removes the type entirely.
+        let err = op_filter(&[
+            TypeOp::Add("rust:*.txt".to_string()),
+            TypeOp::Clear("rust".to_string()),
+            TypeOp::Select("rust".to_string()),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "unrecognized file type: rust");
+
+        // Clearing before adding redefines it from scratch.
+        let f = op_filter(&[
+            TypeOp::Clear("rust".to_string()),
+            TypeOp::Add("rust:*.txt".to_string()),
+            TypeOp::Select("rust".to_string()),
+        ])
+        .unwrap();
+        assert!(f.matches("a.txt"));
+        assert!(!f.matches("a.rs"));
+    }
+
+    #[test]
+    fn selections_resolve_against_final_definitions() {
+        // A selection given before the --type-add that defines it still works.
+        let f = op_filter(&[
+            TypeOp::Select("foo".to_string()),
+            TypeOp::Add("foo:*.foo".to_string()),
+        ])
+        .unwrap();
+        assert!(f.matches("a.foo"));
+        assert!(!f.matches("a.rs"));
+    }
+
+    #[test]
+    fn unordered_equivalence() {
+        let add = TypeOp::Add("foo:*.foo".to_string());
+        let clear = TypeOp::Clear("foo".to_string());
+        let select = TypeOp::Select("foo".to_string());
+        let negate = TypeOp::Negate("rust".to_string());
+        assert!(TypeOp::is_unordered_equivalent(&[]));
+        assert!(TypeOp::is_unordered_equivalent(&[
+            clear.clone(),
+            add.clone(),
+            select.clone(),
+            negate.clone(),
+        ]));
+        // Interleaving selections with definitions does not change the result.
+        assert!(TypeOp::is_unordered_equivalent(&[
+            select.clone(),
+            add.clone(),
+            negate.clone(),
+        ]));
+        assert!(!TypeOp::is_unordered_equivalent(&[
+            add.clone(),
+            clear.clone()
+        ]));
+        assert!(!TypeOp::is_unordered_equivalent(&[negate, select]));
+        assert_eq!(
+            TypeOp::from_unordered(
+                &["foo:*.foo".to_string()],
+                &["foo".to_string()],
+                &["foo".to_string()],
+                &["rust".to_string()],
+            ),
+            vec![
+                clear,
+                add,
+                TypeOp::Select("foo".to_string()),
+                TypeOp::Negate("rust".to_string()),
+            ]
+        );
     }
 
     #[test]

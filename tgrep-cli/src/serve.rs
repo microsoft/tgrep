@@ -1612,16 +1612,20 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
     let glob_filter =
         crate::glob_filter::GlobFilter::new(&glob_filter_strs, &iglob_strs, glob_case_insensitive)
             .map_err(|e| format!("{e}"))?;
-    // The client sends the raw `-t`/`-T`/`--type-add`/`--type-clear` values and
-    // the server rebuilds the filter with the same shared helper, so both sides
-    // are guaranteed to derive an identical definition table.
-    let type_filter = crate::search::build_type_filter(
-        &str_array("type_add"),
-        &str_array("type_clear"),
-        &str_array("types"),
-        &str_array("types_not"),
-    )
-    .map_err(|e| format!("{e}"))?;
+    // The client sends the type flags as per-kind arrays, plus `type_ops` when
+    // their relative order matters, and the server rebuilds the filter with
+    // the same shared code, so both sides derive an identical definition table.
+    let type_ops = match params.get("type_ops") {
+        Some(ops) => crate::search::type_ops_from_json(ops)?,
+        None => tgrep_core::filetypes::TypeOp::from_unordered(
+            &str_array("type_add"),
+            &str_array("type_clear"),
+            &str_array("types"),
+            &str_array("types_not"),
+        ),
+    };
+    let type_filter =
+        tgrep_core::filetypes::build_type_filter(&type_ops).map_err(|e| format!("{e}"))?;
     let invert_match = params
         .get("invert_match")
         .and_then(|v| v.as_bool())
@@ -1874,16 +1878,21 @@ fn handle_search(
                 if !visibility.is_visible(&rel_path, &scope.prefix, scope.hidden) {
                     return None;
                 }
-                if !type_filter.matches(scoped) {
-                    type_filtered_count += 1;
-                    return None;
-                }
-                if !glob_filter.is_empty() && !glob_filter.matches(scoped) {
-                    glob_filtered_count += 1;
-                    if first_glob_rejected.is_none() {
-                        first_glob_rejected = Some(rel_path);
+                match glob_filter.decide(scoped) {
+                    crate::glob_filter::GlobDecision::Include => {}
+                    crate::glob_filter::GlobDecision::Exclude => {
+                        glob_filtered_count += 1;
+                        if first_glob_rejected.is_none() {
+                            first_glob_rejected = Some(rel_path);
+                        }
+                        return None;
                     }
-                    return None;
+                    crate::glob_filter::GlobDecision::Unmatched => {
+                        if !type_filter.matches(scoped) {
+                            type_filtered_count += 1;
+                            return None;
+                        }
+                    }
                 }
                 // Match local-index stats: count after path filters, before
                 // size checks or reads can discard candidates.
@@ -2072,6 +2081,8 @@ fn handle_search(
         "num_matches": matches.len(),
         "elapsed_ms": elapsed_ms,
         "hidden_complete": true,
+        // Type flags apply in command-line order and globs override them.
+        "ordered_filters": true,
     });
     if opts.stats || opts.count_matches {
         result["file_stats"] = serde_json::json!(file_stats);

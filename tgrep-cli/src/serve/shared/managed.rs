@@ -1251,7 +1251,7 @@ impl State {
         let published = &query.published().record;
         let pin = published.pin()?;
         let metadata = json!({"root":slot.root(),"view":slot.id(),"generation":pin.key,"version":published.version,
-            "incarnation":pin.incarnation,"commit":pin.commit,"ready":true,"hidden_complete":true,"backend":"shared-v2"});
+            "incarnation":pin.incarnation,"commit":pin.commit,"ready":true,"hidden_complete":true,"ordered_filters":true,"backend":"shared-v2"});
         let source = ManagedQuery { query, slot };
         let result = super::server::search_snapshot(
             &source,

@@ -51,16 +51,32 @@ struct Cli {
     paths: Vec<String>,
 
     // ── Matching ──────────────────────────────────────
-    /// Case-insensitive matching.
-    #[arg(short = 'i', long = "ignore-case", global = true)]
+    /// Case-insensitive matching. The last of -i, -s and -S wins.
+    #[arg(
+        short = 'i',
+        long = "ignore-case",
+        global = true,
+        overrides_with_all = ["case_sensitive", "smart_case"]
+    )]
     ignore_case: bool,
 
-    /// Force case-sensitive matching (overrides --smart-case).
-    #[arg(short = 's', long = "case-sensitive", global = true)]
+    /// Force case-sensitive matching. The last of -i, -s and -S wins.
+    #[arg(
+        short = 's',
+        long = "case-sensitive",
+        global = true,
+        overrides_with_all = ["ignore_case", "smart_case"]
+    )]
     case_sensitive: bool,
 
     /// Smart case: case-insensitive when patterns have literals but no uppercase literals.
-    #[arg(short = 'S', long = "smart-case", global = true)]
+    /// The last of -i, -s and -S wins.
+    #[arg(
+        short = 'S',
+        long = "smart-case",
+        global = true,
+        overrides_with_all = ["ignore_case", "case_sensitive"]
+    )]
     smart_case: bool,
 
     /// Treat pattern as a literal string.
@@ -82,12 +98,17 @@ struct Cli {
     invert_match: bool,
 
     /// Additional patterns (can be specified multiple times).
-    #[arg(short = 'e', long = "regexp", global = true)]
+    #[arg(short = 'e', long = "regexp", global = true, action = clap::ArgAction::Append)]
     regexp: Vec<String>,
 
     /// Read patterns verbatim, one per line. Empty lines match every input line.
-    #[arg(short = 'f', long = "file", global = true)]
-    pattern_file: Option<String>,
+    /// Repeatable; combines with -e in command-line order.
+    #[arg(short = 'f', long = "file", global = true, action = clap::ArgAction::Append)]
+    pattern_file: Vec<String>,
+
+    /// `-e` and `-f` in command-line order, across command scopes.
+    #[arg(skip)]
+    pattern_sources: Vec<search::PatternSource>,
 
     /// Enable multiline matching (patterns may span line boundaries).
     #[arg(short = 'U', long = "multiline", global = true)]
@@ -143,10 +164,12 @@ struct Cli {
     glob_case_insensitive: bool,
 
     /// Filter files by type (e.g., rust, py, js). Repeatable. Use --type-list to see all.
+    /// A glob that matches a file overrides -t and -T.
     #[arg(short = 't', long = "type", global = true, action = clap::ArgAction::Append)]
     file_type: Vec<String>,
 
-    /// Exclude files matching a type. Repeatable; takes precedence over --type.
+    /// Exclude files matching a type. Repeatable; when -t and -T both match a
+    /// file, the one given last wins.
     #[arg(short = 'T', long = "type-not", global = true, action = clap::ArgAction::Append)]
     type_not: Vec<String>,
 
@@ -154,9 +177,14 @@ struct Cli {
     #[arg(long = "type-add", global = true, value_name = "SPEC", action = clap::ArgAction::Append)]
     type_add: Vec<String>,
 
-    /// Remove all globs for a type before applying --type-add.
+    /// Remove all globs for a type. --type-add and --type-clear apply in
+    /// command-line order, so clear a type before redefining it.
     #[arg(long = "type-clear", global = true, value_name = "NAME", action = clap::ArgAction::Append)]
     type_clear: Vec<String>,
+
+    /// `-t`, `-T`, `--type-add` and `--type-clear` in command-line order.
+    #[arg(skip)]
+    type_ops: Vec<tgrep_core::filetypes::TypeOp>,
 
     /// Print all supported file types.
     #[arg(long = "type-list", global = true)]
@@ -758,14 +786,59 @@ enum Command {
     },
 }
 
+/// Flags whose relative order changes the result, by clap id.
+const ORDERED_ARGS: [&str; 9] = [
+    "regexp",
+    "pattern_file",
+    "file_type",
+    "type_not",
+    "type_add",
+    "type_clear",
+    "ignore_case",
+    "case_sensitive",
+    "smart_case",
+];
+
+/// Push `(scope, index, id, value)` for every command-line occurrence of an
+/// [`ORDERED_ARGS`] flag in one command's matches. Boolean flags carry an
+/// empty value.
+fn collect_ordered_args(
+    matches: &clap::ArgMatches,
+    scope: usize,
+    found: &mut Vec<(usize, usize, &'static str, String)>,
+) {
+    for id in ORDERED_ARGS {
+        // Defaults are recorded with indices too.
+        if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+            continue;
+        }
+        let Some(indices) = matches.indices_of(id) else {
+            continue;
+        };
+        match matches.try_get_many::<String>(id) {
+            Ok(Some(values)) => found.extend(
+                indices
+                    .zip(values)
+                    .map(|(index, value)| (scope, index, id, value.clone())),
+            ),
+            _ => found.extend(
+                indices
+                    .last()
+                    .map(|index| (scope, index, id, String::new())),
+            ),
+        }
+    }
+}
+
 impl Cli {
     fn try_parse_args_from<I, T>(args: I) -> std::result::Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<std::ffi::OsString> + Clone,
     {
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
         let mut command = Self::command();
-        let matches = command.try_get_matches_from_mut(args)?;
+        let matches = command.try_get_matches_from_mut(args.iter().cloned())?;
         // Clap conflicts are unconditional; this one depends on the mode's
         // value and must not treat the inherited budget as an explicit flag.
         if let Some(("serve", serve)) = matches.subcommand()
@@ -795,7 +868,97 @@ impl Cli {
             }
             scope = subcommand;
         }
+        cli.resolve_ordered_args(&matches, &args);
         Ok(cli)
+    }
+
+    /// Rebuild the flags whose relative order matters from their command-line
+    /// positions. Clap stores each flag's values separately, and keeps only the
+    /// deepest scope's values of a global flag, so neither `-T rust -t rust` nor
+    /// `-e foo search -e bar` survives in the parsed fields.
+    fn resolve_ordered_args(&mut self, matches: &clap::ArgMatches, args: &[std::ffi::OsString]) {
+        let mut found = Vec::new();
+        let probe = matches!(matches.subcommand(), Some(("search", _)))
+            .then(|| Self::probe_search_scopes(args))
+            .flatten();
+        match &probe {
+            Some(probe) => {
+                // Clap restarts its indices in each subcommand, whose arguments
+                // all follow the parent's.
+                collect_ordered_args(probe, 0, &mut found);
+                if let Some(("search", search)) = probe.subcommand() {
+                    collect_ordered_args(search, 1, &mut found);
+                }
+            }
+            None => collect_ordered_args(matches, 0, &mut found),
+        }
+        found.sort_by_key(|&(scope, index, ..)| (scope, index));
+
+        use search::PatternSource;
+        use tgrep_core::filetypes::TypeOp;
+        self.pattern_sources.clear();
+        self.type_ops.clear();
+        self.regexp.clear();
+        self.pattern_file.clear();
+        self.file_type.clear();
+        self.type_not.clear();
+        self.type_add.clear();
+        self.type_clear.clear();
+        let mut case_flag = None;
+        for (_, _, id, value) in found {
+            match id {
+                "regexp" => {
+                    self.regexp.push(value.clone());
+                    self.pattern_sources.push(PatternSource::Regexp(value));
+                }
+                "pattern_file" => {
+                    self.pattern_file.push(value.clone());
+                    self.pattern_sources.push(PatternSource::File(value));
+                }
+                "file_type" => {
+                    self.file_type.push(value.clone());
+                    self.type_ops.push(TypeOp::Select(value));
+                }
+                "type_not" => {
+                    self.type_not.push(value.clone());
+                    self.type_ops.push(TypeOp::Negate(value));
+                }
+                "type_add" => {
+                    self.type_add.push(value.clone());
+                    self.type_ops.push(TypeOp::Add(value));
+                }
+                "type_clear" => {
+                    self.type_clear.push(value.clone());
+                    self.type_ops.push(TypeOp::Clear(value));
+                }
+                _ => case_flag = Some(id),
+            }
+        }
+        // As in ripgrep, the last of `-i`, `-s` and `-S` decides.
+        if let Some(flag) = case_flag {
+            self.ignore_case = flag == "ignore_case";
+            self.case_sensitive = flag == "case_sensitive";
+            self.smart_case = flag == "smart_case";
+        }
+    }
+
+    /// Re-parse a `search` invocation with the order-sensitive flags local to
+    /// each command, so the root and `search` matches each hold only their own
+    /// occurrences. Returns `None` if that parse fails.
+    fn probe_search_scopes(args: &[std::ffi::OsString]) -> Option<clap::ArgMatches> {
+        let mut command = Self::command();
+        let local: Vec<clap::Arg> = command
+            .get_arguments()
+            .filter(|arg| ORDERED_ARGS.contains(&arg.get_id().as_str()))
+            .map(|arg| arg.clone().global(false))
+            .collect();
+        for id in ORDERED_ARGS {
+            command = command.mut_arg(id, |arg| arg.global(false));
+        }
+        command
+            .mut_subcommand("search", |search| search.args(local))
+            .try_get_matches_from(args.iter().cloned())
+            .ok()
     }
 
     /// Resolve `--max-filesize` once, so a malformed value is reported instead
@@ -875,7 +1038,7 @@ impl Cli {
         positional: Option<&String>,
         rest: &[String],
     ) -> (String, Vec<String>) {
-        if self.regexp.is_empty() && self.pattern_file.is_none() {
+        if self.pattern_sources.is_empty() {
             return (positional.cloned().unwrap_or_default(), rest.to_vec());
         }
         let mut paths = Vec::with_capacity(rest.len() + 1);
@@ -921,8 +1084,7 @@ impl Cli {
 
         search::SearchOptions {
             pattern,
-            extra_patterns: self.regexp.clone(),
-            pattern_file: self.pattern_file.clone(),
+            pattern_sources: self.pattern_sources.clone(),
             case_insensitive: self.ignore_case,
             case_sensitive: self.case_sensitive,
             smart_case: self.smart_case,
@@ -940,10 +1102,7 @@ impl Cli {
             glob: self.glob.clone(),
             iglob: self.iglob.clone(),
             glob_case_insensitive: self.glob_case_insensitive,
-            types: self.file_type.clone(),
-            types_not: self.type_not.clone(),
-            type_add: self.type_add.clone(),
-            type_clear: self.type_clear.clone(),
+            type_ops: self.type_ops.clone(),
             invert_match: self.invert_match,
             only_matching: self.only_matching,
             after_context: self.after_context,
@@ -1117,17 +1276,16 @@ fn run_cli() {
     let no_ignore = cli.no_ignore || cli.unrestricted >= 1;
 
     // Handle --type-list. It reflects --type-add/--type-clear so users can
-    // verify a custom definition without running a search.
+    // verify a custom definition without running a search. Like ripgrep, it
+    // applies them in argument order and rejects an unknown -t/-T first.
     if cli.type_list {
         let mut defs = tgrep_core::filetypes::TypeDefs::builtin();
-        for name in &cli.type_clear {
-            defs.clear(name);
-        }
-        for spec in &cli.type_add {
-            if let Err(e) = defs.add(spec) {
-                eprintln!("tgrep: {e}");
-                process::exit(2);
-            }
+        if let Err(e) = defs
+            .apply(&cli.type_ops)
+            .and_then(|()| defs.build_selections(&cli.type_ops))
+        {
+            eprintln!("tgrep: {e}");
+            process::exit(2);
         }
         defs.print_list();
         process::exit(0);
@@ -1311,8 +1469,7 @@ fn run_cli() {
                 let opts = cli.build_search_opts(String::new(), &resolved);
                 let paths = list_files_paths(&cli);
                 list_files(&paths, cli.index_path.as_deref(), &opts)
-            } else if cli.pattern.is_some() || !cli.regexp.is_empty() || cli.pattern_file.is_some()
-            {
+            } else if cli.pattern.is_some() || !cli.pattern_sources.is_empty() {
                 let (pattern, paths) =
                     cli.split_pattern_and_paths(cli.pattern.as_ref(), &cli.paths);
                 run_search(&cli, pattern, &paths, &resolved)
@@ -1541,6 +1698,114 @@ mod tests {
             let cli = parse(&args).unwrap();
             assert_eq!(cli.word_regexp, word, "{args:?}");
             assert_eq!(cli.line_regexp, !word, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn pattern_sources_keep_argument_order_across_scopes() {
+        use search::PatternSource::{File, Regexp};
+        let regexp = |p: &str| Regexp(p.to_string());
+        let file = |p: &str| File(p.to_string());
+        for (args, expected) in [
+            (vec!["-e", "foo", "data"], vec![regexp("foo")]),
+            (
+                vec!["-e", "foo", "search", "-e", "bar", "data"],
+                vec![regexp("foo"), regexp("bar")],
+            ),
+            (
+                vec!["-f", "a", "search", "-f", "b", "data"],
+                vec![file("a"), file("b")],
+            ),
+            (
+                vec!["-f", "a", "-f", "b", "data"],
+                vec![file("a"), file("b")],
+            ),
+            (
+                vec![
+                    "-e", "foo", "-f", "a", "search", "-e", "bar", "-f", "b", "data",
+                ],
+                vec![regexp("foo"), file("a"), regexp("bar"), file("b")],
+            ),
+            (
+                vec!["search", "-f", "a", "-e", "foo", "-f", "b", "data"],
+                vec![file("a"), regexp("foo"), file("b")],
+            ),
+            (vec!["foo", "data"], vec![]),
+        ] {
+            let cli = parse(&args).unwrap();
+            assert_eq!(cli.pattern_sources, expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn type_ops_keep_argument_order_across_scopes() {
+        use tgrep_core::filetypes::TypeOp::{Add, Clear, Negate, Select};
+        let s = String::from;
+        for (args, expected) in [
+            (
+                vec!["-T", "rust", "-t", "rust", "foo"],
+                vec![Negate(s("rust")), Select(s("rust"))],
+            ),
+            (
+                vec!["-t", "rust", "-T", "rust", "foo"],
+                vec![Select(s("rust")), Negate(s("rust"))],
+            ),
+            (
+                vec!["-T", "rust", "search", "-t", "rust", "foo"],
+                vec![Negate(s("rust")), Select(s("rust"))],
+            ),
+            (
+                vec![
+                    "--type-add",
+                    "rust:*.txt",
+                    "search",
+                    "--type-clear",
+                    "rust",
+                    "-t",
+                    "rust",
+                    "foo",
+                ],
+                vec![Add(s("rust:*.txt")), Clear(s("rust")), Select(s("rust"))],
+            ),
+            (
+                vec![
+                    "--type-clear",
+                    "rust",
+                    "--type-add",
+                    "rust:*.txt",
+                    "-t",
+                    "rust",
+                    "foo",
+                ],
+                vec![Clear(s("rust")), Add(s("rust:*.txt")), Select(s("rust"))],
+            ),
+        ] {
+            let cli = parse(&args).unwrap();
+            assert_eq!(cli.type_ops, expected, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn last_case_flag_wins_across_scopes() {
+        // (ignore_case, case_sensitive, smart_case)
+        for (args, expected) in [
+            (vec!["foo"], (false, false, false)),
+            (vec!["-i", "-s", "foo"], (false, true, false)),
+            (vec!["-i", "-S", "foo"], (false, false, true)),
+            (vec!["-s", "-S", "foo"], (false, false, true)),
+            (vec!["-s", "-i", "foo"], (true, false, false)),
+            (vec!["-i", "-s", "-i", "foo"], (true, false, false)),
+            (vec!["-i", "search", "-s", "foo"], (false, true, false)),
+            (vec!["-s", "search", "-i", "foo"], (true, false, false)),
+            (vec!["-S", "search", "foo"], (false, false, true)),
+            (vec!["search", "-i", "-S", "foo"], (false, false, true)),
+        ] {
+            let cli = parse(&args).unwrap();
+            assert_eq!(
+                (cli.ignore_case, cli.case_sensitive, cli.smart_case),
+                expected,
+                "{args:?}"
+            );
         }
     }
 

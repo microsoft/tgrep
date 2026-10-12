@@ -19,12 +19,20 @@ use crate::matching::SearchMatcher;
 use crate::output::{ColorMode, ContextLine, Match, OutputConfig, OutputFormat, OutputWriter};
 use crate::serve::ServerInfo;
 
+/// One `-e/--regexp` or `-f/--file` flag, in command-line order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PatternSource {
+    Regexp(String),
+    File(String),
+}
+
 #[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
 pub struct SearchOptions {
     pub pattern: String,
-    pub extra_patterns: Vec<String>,
-    pub pattern_file: Option<String>,
+    /// `-e`/`-f` flags in command-line order. When non-empty, they replace
+    /// `pattern`.
+    pub pattern_sources: Vec<PatternSource>,
     pub case_insensitive: bool,
     pub case_sensitive: bool,
     pub smart_case: bool,
@@ -42,10 +50,8 @@ pub struct SearchOptions {
     pub glob: Vec<String>,
     pub iglob: Vec<String>,
     pub glob_case_insensitive: bool,
-    pub types: Vec<String>,
-    pub types_not: Vec<String>,
-    pub type_add: Vec<String>,
-    pub type_clear: Vec<String>,
+    /// `-t`/`-T`/`--type-add`/`--type-clear` in command-line order.
+    pub type_ops: Vec<filetypes::TypeOp>,
     pub invert_match: bool,
     pub only_matching: bool,
     pub after_context: Option<usize>,
@@ -370,16 +376,10 @@ impl SearchOptions {
         }
     }
 
-    /// Compile `--type-add`/`--type-clear` into the effective definitions, then
-    /// build the `-t`/`-T` matcher. Shared with the server via the same fields
-    /// so both sides derive an identical filter.
+    /// Compile the type flags into the `-t`/`-T` matcher. The server rebuilds
+    /// it from the same ops, so both sides derive an identical filter.
     pub fn type_filter(&self) -> Result<filetypes::TypeFilter> {
-        build_type_filter(
-            &self.type_add,
-            &self.type_clear,
-            &self.types,
-            &self.types_not,
-        )
+        filetypes::build_type_filter(&self.type_ops)
     }
 
     /// Effective after-context lines.
@@ -430,10 +430,9 @@ impl SearchOptions {
     /// Returns whether any patterns were supplied.
     pub fn resolve_patterns(&mut self) -> Result<bool> {
         let patterns = self.all_patterns()?;
-        self.pattern_file = None;
         self.pattern.clear();
-        self.extra_patterns = patterns;
-        if self.extra_patterns.is_empty() {
+        self.pattern_sources = patterns.into_iter().map(PatternSource::Regexp).collect();
+        if self.pattern_sources.is_empty() {
             // Inversion still needs to search: an empty pattern set rejects every
             // line, unlike an empty pattern, which accepts every line.
             self.pattern = crate::matching::NEVER_MATCH_PATTERN.to_string();
@@ -443,22 +442,22 @@ impl SearchOptions {
         Ok(true)
     }
 
-    /// Collect all patterns (primary + -e extras + -f file patterns).
+    /// Collect every pattern: the `-e`/`-f` flags in command-line order, or the
+    /// positional pattern when neither was given. `-e`/`-f` move the positional
+    /// argument into the path list, so it never contributes a pattern alongside
+    /// them.
     fn all_patterns(&self) -> Result<Vec<String>> {
-        let has_extra = !self.extra_patterns.is_empty() || self.pattern_file.is_some();
-        // `-e`/`-f` move the positional argument into the path list, leaving the
-        // base pattern empty. Keeping it would contribute an empty alternative
-        // that matches every line.
-        let mut patterns = if has_extra && self.pattern.is_empty() {
-            Vec::new()
-        } else {
-            vec![self.pattern.clone()]
-        };
-        patterns.extend(self.extra_patterns.iter().cloned());
-        if let Some(ref path) = self.pattern_file {
-            let content = std::fs::read_to_string(path)?;
-            for line in content.lines() {
-                patterns.push(line.to_string());
+        if self.pattern_sources.is_empty() {
+            return Ok(vec![self.pattern.clone()]);
+        }
+        let mut patterns = Vec::new();
+        for source in &self.pattern_sources {
+            match source {
+                PatternSource::Regexp(pattern) => patterns.push(pattern.clone()),
+                PatternSource::File(path) => {
+                    let content = std::fs::read_to_string(path)?;
+                    patterns.extend(content.lines().map(str::to_string));
+                }
             }
         }
         Ok(patterns)
@@ -858,6 +857,7 @@ pub fn run(
                 let request = server_search_request(&scope, opts, ci)?;
                 let result = client.view_request("search", &view, request["params"].clone())?;
                 require_server_coverage(&result)?;
+                require_ordered_filters(&result, opts)?;
                 Ok((view.root, scope, result))
             })();
             match response {
@@ -1018,6 +1018,16 @@ fn server_search_request(
         .split_first()
         .map(|(p, rest)| (p.clone(), rest.to_vec()))
         .unwrap_or_else(|| (opts.pattern.clone(), Vec::new()));
+    let (mut types, mut types_not, mut type_add, mut type_clear) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for op in &opts.type_ops {
+        match op {
+            filetypes::TypeOp::Select(name) => types.push(name),
+            filetypes::TypeOp::Negate(name) => types_not.push(name),
+            filetypes::TypeOp::Add(spec) => type_add.push(spec),
+            filetypes::TypeOp::Clear(name) => type_clear.push(name),
+        }
+    }
 
     // Context lines are pure presentation; requesting them while counting would
     // stream rows the count path has to filter back out.
@@ -1045,10 +1055,10 @@ fn server_search_request(
             "glob": opts.glob,  // sent as JSON array
             "iglob": opts.iglob,
             "glob_case_insensitive": opts.glob_case_insensitive,
-            "types": opts.types,
-            "types_not": opts.types_not,
-            "type_add": opts.type_add,
-            "type_clear": opts.type_clear,
+            "types": types,
+            "types_not": types_not,
+            "type_add": type_add,
+            "type_clear": type_clear,
             "invert_match": opts.invert_match,
             "only_matching": opts.effective_only_matching(),
             "after_context": if wants_context { opts.after_ctx() } else { 0 },
@@ -1086,7 +1096,29 @@ fn server_search_request(
     if opts.count_matches {
         request["params"]["count_matches"] = serde_json::json!(true);
     }
+    // The per-kind arrays above lose the order between kinds. Send the ordered
+    // form only when that order changes the result.
+    if !filetypes::TypeOp::is_unordered_equivalent(&opts.type_ops) {
+        request["params"]["type_ops"] = type_ops_to_json(&opts.type_ops);
+    }
     Ok(request)
+}
+
+/// Fail when the result comes from a server that predates ordered filtering
+/// but this search depends on it: such a server applies every `-T` after every
+/// `-t` and lets `-t` veto a file that a positive glob included.
+fn require_ordered_filters(result: &serde_json::Value, opts: &SearchOptions) -> Result<()> {
+    let needs_order = !filetypes::TypeOp::is_unordered_equivalent(&opts.type_ops)
+        || (opts.type_ops.iter().any(|op| {
+            matches!(
+                op,
+                filetypes::TypeOp::Select(_) | filetypes::TypeOp::Negate(_)
+            )
+        }) && opts.glob_filter()?.has_includes());
+    if needs_order && result.get("ordered_filters").and_then(|v| v.as_bool()) != Some(true) {
+        anyhow::bail!("server does not support ordered type and glob filters");
+    }
+    Ok(())
 }
 
 fn render_server_result(
@@ -1100,6 +1132,7 @@ fn render_server_result(
     // Older servers ignore unknown request fields. Validate before writing any
     // rows, so an old/partial server can never silently answer --hidden.
     require_server_coverage(result)?;
+    require_ordered_filters(result, opts)?;
 
     let empty_vec = Vec::new();
     let matches = result
@@ -2219,36 +2252,63 @@ fn explicit_file_display_path(path: &Path) -> String {
     strip_verbatim_prefix(&display_path.to_string_lossy()).replace('\\', "/")
 }
 
-fn passes_filters(
+/// Whether a path survives the glob and type filters. As in ripgrep, a glob
+/// that decides a file overrides `-t`/`-T`, which only apply to files no glob
+/// decides.
+pub(crate) fn passes_filters(
     rel_path: &str,
     glob_filter: &crate::glob_filter::GlobFilter,
     type_filter: &filetypes::TypeFilter,
 ) -> bool {
-    type_filter.matches(rel_path) && glob_filter.matches(rel_path)
+    match glob_filter.decide(rel_path) {
+        crate::glob_filter::GlobDecision::Include => true,
+        crate::glob_filter::GlobDecision::Exclude => false,
+        crate::glob_filter::GlobDecision::Unmatched => type_filter.matches(rel_path),
+    }
 }
 
-/// Apply `--type-clear` then `--type-add` to the built-in definitions and
-/// compile the `-t`/`-T` selections. Lives here rather than on `SearchOptions`
-/// so the server can reuse it verbatim from its own request fields.
-pub fn build_type_filter(
-    type_add: &[String],
-    type_clear: &[String],
-    types: &[String],
-    types_not: &[String],
-) -> Result<filetypes::TypeFilter> {
-    if type_add.is_empty() && type_clear.is_empty() && types.is_empty() && types_not.is_empty() {
-        return Ok(filetypes::TypeFilter::default());
-    }
-    let mut defs = filetypes::TypeDefs::builtin();
-    // Clears run first so `--type-clear foo --type-add foo:*.x` redefines a
-    // type from scratch, which is the documented ripgrep idiom.
-    for name in type_clear {
-        defs.clear(name);
-    }
-    for spec in type_add {
-        defs.add(spec)?;
-    }
-    defs.build_filter(types, types_not)
+/// Encode type ops for the `type_ops` request field, e.g.
+/// `[["clear","rust"],["add","rust:*.txt"],["select","rust"]]`.
+pub(crate) fn type_ops_to_json(ops: &[filetypes::TypeOp]) -> serde_json::Value {
+    ops.iter()
+        .map(|op| {
+            let (kind, value) = match op {
+                filetypes::TypeOp::Add(spec) => ("add", spec),
+                filetypes::TypeOp::Clear(name) => ("clear", name),
+                filetypes::TypeOp::Select(name) => ("select", name),
+                filetypes::TypeOp::Negate(name) => ("negate", name),
+            };
+            serde_json::json!([kind, value])
+        })
+        .collect()
+}
+
+/// Decode the `type_ops` request field, rejecting anything malformed.
+pub(crate) fn type_ops_from_json(
+    value: &serde_json::Value,
+) -> std::result::Result<Vec<filetypes::TypeOp>, String> {
+    let malformed = || "type_ops must be an array of [kind, value] string pairs".to_string();
+    value
+        .as_array()
+        .ok_or_else(malformed)?
+        .iter()
+        .map(|op| {
+            let [kind, value] = op.as_array().map(Vec::as_slice).ok_or_else(malformed)? else {
+                return Err(malformed());
+            };
+            let (Some(kind), Some(value)) = (kind.as_str(), value.as_str()) else {
+                return Err(malformed());
+            };
+            let value = value.to_string();
+            Ok(match kind {
+                "add" => filetypes::TypeOp::Add(value),
+                "clear" => filetypes::TypeOp::Clear(value),
+                "select" => filetypes::TypeOp::Select(value),
+                "negate" => filetypes::TypeOp::Negate(value),
+                _ => return Err(format!("unknown type_ops kind: {kind}")),
+            })
+        })
+        .collect()
 }
 
 /// Original per-file RPC totals for stats and counts, independent of rendered rows.
@@ -2402,7 +2462,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("patterns.txt");
         let opts = SearchOptions {
-            pattern_file: Some(path.to_str().unwrap().to_string()),
+            pattern_sources: vec![PatternSource::File(path.to_str().unwrap().to_string())],
             ..Default::default()
         };
         for (contents, expected) in [
@@ -2425,8 +2485,10 @@ mod tests {
         let path = dir.path().join("patterns.txt");
         std::fs::write(&path, "\n UPPER \n").unwrap();
         let mut opts = SearchOptions {
-            extra_patterns: vec!["lower".into()],
-            pattern_file: Some(path.to_str().unwrap().to_string()),
+            pattern_sources: vec![
+                PatternSource::Regexp("lower".into()),
+                PatternSource::File(path.to_str().unwrap().to_string()),
+            ],
             smart_case: true,
             ..Default::default()
         };
@@ -2438,6 +2500,41 @@ mod tests {
         let mut empty = SearchOptions::default();
         assert!(empty.resolve_patterns().unwrap());
         assert_eq!(empty.all_patterns().unwrap(), [""]);
+    }
+
+    #[test]
+    fn pattern_sources_keep_command_line_order_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, "one\ntwo\n").unwrap();
+        std::fs::write(&second, "four\n").unwrap();
+        let mut opts = SearchOptions {
+            pattern: "ignored".into(),
+            pattern_sources: vec![
+                PatternSource::File(first.to_str().unwrap().to_string()),
+                PatternSource::Regexp("three".into()),
+                PatternSource::File(second.to_str().unwrap().to_string()),
+                PatternSource::Regexp("five".into()),
+            ],
+            ..Default::default()
+        };
+        assert!(opts.resolve_patterns().unwrap());
+        assert_eq!(
+            opts.all_patterns().unwrap(),
+            ["one", "two", "three", "four", "five"]
+        );
+
+        let empty_file = dir.path().join("empty.txt");
+        std::fs::write(&empty_file, "").unwrap();
+        let mut none = SearchOptions {
+            pattern_sources: vec![
+                PatternSource::File(empty_file.to_str().unwrap().to_string()),
+                PatternSource::File(empty_file.to_str().unwrap().to_string()),
+            ],
+            ..Default::default()
+        };
+        assert!(!none.resolve_patterns().unwrap());
     }
 
     #[test]

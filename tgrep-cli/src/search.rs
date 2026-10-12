@@ -319,6 +319,28 @@ impl SearchOptions {
         self.only_matching && !self.json
     }
 
+    /// Whether matching lines get printed as text, rather than reduced to
+    /// counts, file names, an exit code or JSON events.
+    fn prints_text_lines(&self) -> bool {
+        !(self.json
+            || self.count
+            || self.count_matches
+            || self.files_only
+            || self.files_without_match
+            || self.quiet)
+    }
+
+    /// Whether `-U --replace` may rewrite whole blocks of lines, as ripgrep's
+    /// multiline printer does when the pattern can match a line terminator.
+    fn replace_blocks(&self) -> bool {
+        self.multiline && self.replace.is_some() && !self.invert_match && self.prints_text_lines()
+    }
+
+    /// `--json --replace`: report each submatch's replacement beside it.
+    fn report_replacements(&self) -> bool {
+        self.json && self.replace.is_some()
+    }
+
     fn effective_passthru(&self) -> bool {
         // ripgrep treats `-m 0` as suppressing all search output, including
         // passthru context.
@@ -353,6 +375,9 @@ impl SearchOptions {
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
             all_spans: self.wants_match_detail(),
+            dotall: self.dotall(),
+            replace_blocks: self.replace_blocks(),
+            report_replacements: self.report_replacements(),
         }
     }
 
@@ -858,6 +883,7 @@ pub fn run(
                 let result = client.view_request("search", &view, request["params"].clone())?;
                 require_server_coverage(&result)?;
                 require_ordered_filters(&result, opts)?;
+                require_replace_support(&result, opts)?;
                 Ok((view.root, scope, result))
             })();
             match response {
@@ -1101,7 +1127,28 @@ fn server_search_request(
     if !filetypes::TypeOp::is_unordered_equivalent(&opts.type_ops) {
         request["params"]["type_ops"] = type_ops_to_json(&opts.type_ops);
     }
+    if opts.replace_blocks() {
+        request["params"]["multiline_replace"] = serde_json::json!(true);
+    }
+    if opts.report_replacements() {
+        request["params"]["report_replacements"] = serde_json::json!(true);
+    }
     Ok(request)
+}
+
+/// Fail when the result comes from a server that predates the `--replace`
+/// rendering this search asked for. Such a server ignores the request and
+/// rewrites `-U` matches line by line, or leaves `--json` submatches without
+/// their `replacement`.
+fn require_replace_support(result: &serde_json::Value, opts: &SearchOptions) -> Result<()> {
+    let acked = |key: &str| result.get(key).and_then(|v| v.as_bool()) == Some(true);
+    if opts.replace_blocks() && !acked("multiline_replace") {
+        anyhow::bail!("server does not support multiline replacement blocks");
+    }
+    if opts.report_replacements() && !acked("report_replacements") {
+        anyhow::bail!("server does not report JSON replacements");
+    }
+    Ok(())
 }
 
 /// Fail when the result comes from a server that predates ordered filtering
@@ -1133,6 +1180,7 @@ fn render_server_result(
     // rows, so an old/partial server can never silently answer --hidden.
     require_server_coverage(result)?;
     require_ordered_filters(result, opts)?;
+    require_replace_support(result, opts)?;
 
     let empty_vec = Vec::new();
     let matches = result
@@ -1343,7 +1391,17 @@ fn render_server_result(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                writer.write_context_separator(file, line)?;
+                // `-U --replace` rows carry the source lines of their block,
+                // which is what decides context gaps.
+                let block = m.get("block").and_then(|b| b.as_array()).and_then(|b| {
+                    Some((b.first()?.as_u64()? as usize, b.get(1)?.as_u64()? as usize))
+                });
+                let replacements = m.get("replacements").and_then(|r| r.as_array()).map(|arr| {
+                    arr.iter()
+                        .map(|t| t.as_str().unwrap_or("").to_string())
+                        .collect()
+                });
+                writer.write_context_separator(file, block.map_or(line, |b| b.0))?;
                 writer.write_match(&Match {
                     file: file.to_string(),
                     line_number: line,
@@ -1360,6 +1418,9 @@ fn render_server_result(
                     spans,
                     absolute_offset: offset,
                     terminator_len,
+                    block,
+                    hidden: m.get("hidden").and_then(|h| h.as_bool()).unwrap_or(false),
+                    replacements,
                 })?;
             }
         }
@@ -2191,8 +2252,12 @@ fn search_decoded_file(
                 column_shifts,
                 offset_shift,
                 terminator_len,
+                block,
+                hidden,
+                replacements,
             } => {
-                writer.write_context_separator(rel_path, line_number)?;
+                // A rewritten block is a gap only if its source lines are.
+                writer.write_context_separator(rel_path, block.map_or(line_number, |b| b.0))?;
                 let (columns, absolute_offset) = to_source_positions(
                     &columns,
                     &column_shifts,
@@ -2209,6 +2274,9 @@ fn search_decoded_file(
                     spans,
                     absolute_offset,
                     terminator_len,
+                    block,
+                    hidden,
+                    replacements,
                 })?;
             }
             crate::matching::Emit::Context {
@@ -3039,6 +3107,115 @@ mod tests {
             assert!(require_server_coverage(&response).is_err());
         }
         assert!(require_server_coverage(&serde_json::json!({"hidden_complete": true})).is_ok());
+    }
+
+    #[test]
+    fn replace_rendering_is_requested_only_where_it_changes_output() {
+        let replace = SearchOptions {
+            pattern: "a\\nb".into(),
+            replace: Some("X".into()),
+            ..Default::default()
+        };
+        let with = |f: fn(&mut SearchOptions)| {
+            let mut opts = replace.clone();
+            f(&mut opts);
+            opts
+        };
+        let params = |opts: &SearchOptions| {
+            server_search_request(&IndexScope::Whole, opts, false).unwrap()["params"].clone()
+        };
+        // Older shared servers reject unknown fields, so leave them out of
+        // every request whose rendering they would not change.
+        for opts in [
+            SearchOptions::default(),
+            replace.clone(),
+            with(|o| o.invert_match = true),
+            with(|o| {
+                o.multiline = true;
+                o.invert_match = true;
+            }),
+            with(|o| {
+                o.multiline = true;
+                o.count = true;
+            }),
+            with(|o| {
+                o.multiline = true;
+                o.files_only = true;
+            }),
+            with(|o| {
+                o.multiline = true;
+                o.quiet = true;
+            }),
+        ] {
+            let params = params(&opts);
+            assert!(params.get("multiline_replace").is_none());
+            assert!(params.get("report_replacements").is_none());
+            assert!(require_replace_support(&serde_json::json!({}), &opts).is_ok());
+        }
+
+        for opts in [
+            with(|o| o.multiline = true),
+            with(|o| {
+                o.multiline = true;
+                o.only_matching = true;
+            }),
+            with(|o| {
+                o.multiline = true;
+                o.vimgrep = true;
+            }),
+        ] {
+            let params = params(&opts);
+            assert_eq!(params["multiline_replace"], true);
+            assert!(params.get("report_replacements").is_none());
+            assert!(opts.match_options().replace_blocks);
+        }
+
+        for opts in [
+            with(|o| o.json = true),
+            with(|o| {
+                o.json = true;
+                o.multiline = true;
+            }),
+        ] {
+            let params = params(&opts);
+            assert!(params.get("multiline_replace").is_none());
+            assert_eq!(params["report_replacements"], true);
+            assert!(opts.match_options().report_replacements);
+        }
+    }
+
+    #[test]
+    fn replace_rendering_requires_a_server_that_acknowledges_it() {
+        let blocks = SearchOptions {
+            multiline: true,
+            replace: Some("X".into()),
+            ..Default::default()
+        };
+        let json = SearchOptions {
+            json: true,
+            replace: Some("X".into()),
+            ..Default::default()
+        };
+        // A server predating the feature ignores the request and renders the
+        // old way, so its reply must be refused rather than printed.
+        for result in [
+            serde_json::json!({}),
+            serde_json::json!({"multiline_replace": false, "report_replacements": false}),
+        ] {
+            assert!(require_replace_support(&result, &blocks).is_err());
+            assert!(require_replace_support(&result, &json).is_err());
+        }
+        assert!(
+            require_replace_support(&serde_json::json!({"multiline_replace": true}), &json)
+                .is_err()
+        );
+        assert!(
+            require_replace_support(&serde_json::json!({"report_replacements": true}), &blocks)
+                .is_err()
+        );
+        let acked = serde_json::json!({"multiline_replace": true, "report_replacements": true});
+        assert!(require_replace_support(&acked, &blocks).is_ok());
+        assert!(require_replace_support(&acked, &json).is_ok());
     }
 
     #[test]

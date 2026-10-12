@@ -246,6 +246,28 @@ fn multiline_count_matches_uses_managed_per_file_totals() {
     fixture.temp.close().unwrap();
 }
 
+#[test]
+fn ordered_filters_and_replacements_use_managed_views() {
+    let mut fixture = Fixture::new();
+    prepare_compat(&mut fixture);
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    assert_compat_queries(&fixture.a.join("compat"), "(via shared daemon v2)");
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
 fn completed(daemon: &Daemon, operation: &Value) -> Value {
     let record = terminal(daemon, operation);
     assert_eq!(

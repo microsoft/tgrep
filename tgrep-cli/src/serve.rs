@@ -810,6 +810,15 @@ struct SearchOpts {
     stats: bool,
     /// Return original per-file totals even when diagnostics are not requested.
     count_matches: bool,
+    /// `--multiline-dotall`, which decides whether `-U --replace` rewrites
+    /// whole blocks of lines.
+    dotall: bool,
+    /// Render `-U --replace` as ripgrep's multiline printer does. Only sent by
+    /// clients that print text lines and understand block rows.
+    multiline_replace: bool,
+    /// `--json --replace`: report each span's replacement instead of rewriting
+    /// the line.
+    report_replacements: bool,
 }
 
 impl SearchOpts {
@@ -831,6 +840,9 @@ impl SearchOpts {
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
             all_spans: self.detail || self.stats || self.count_matches,
+            dotall: self.dotall,
+            replace_blocks: self.multiline_replace,
+            report_replacements: self.report_replacements,
         }
     }
 }
@@ -1801,6 +1813,17 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
                 .get("count_matches")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            dotall: multiline_dotall,
+            // Older clients neither send these nor understand the rows they
+            // produce, so absence keeps today's line-by-line rendering.
+            multiline_replace: params
+                .get("multiline_replace")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            report_replacements: params
+                .get("report_replacements")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
     })
 }
@@ -2083,6 +2106,9 @@ fn handle_search(
         "hidden_complete": true,
         // Type flags apply in command-line order and globs override them.
         "ordered_filters": true,
+        // `multiline_replace` and `report_replacements` requests are honoured.
+        "multiline_replace": true,
+        "report_replacements": true,
     });
     if opts.stats || opts.count_matches {
         result["file_stats"] = serde_json::json!(file_stats);
@@ -2329,6 +2355,15 @@ fn collect_match_rows_bounded(
         offset: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         term: Option<usize>,
+        /// Source lines of a `-U --replace` block row.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        block: Option<[usize; 2]>,
+        /// A block whose rewrite left nothing to print.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        hidden: bool,
+        /// `--json --replace`: each span's replacement.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replacements: Option<&'a [String]>,
     }
 
     found.for_each(match_opts, matcher, |emit| -> anyhow::Result<()> {
@@ -2343,6 +2378,9 @@ fn collect_match_rows_bounded(
                 column_shifts,
                 offset_shift,
                 terminator_len,
+                block,
+                hidden,
+                replacements,
             } => {
                 let (columns, offset) = crate::search::to_source_positions(
                     &columns,
@@ -2363,6 +2401,9 @@ fn collect_match_rows_bounded(
                         columns: detail.then_some(&columns),
                         offset: positions.then_some(offset),
                         term: positions.then_some(terminator_len),
+                        block: block.map(|(first, last)| [first, last]),
+                        hidden,
+                        replacements: replacements.as_deref(),
                     },
                     &mut budget,
                 )?;
@@ -2384,6 +2425,9 @@ fn collect_match_rows_bounded(
                         columns: None,
                         offset: positions.then(|| fixups.to_source_offset(absolute_offset)),
                         term: positions.then_some(terminator_len),
+                        block: None,
+                        hidden: false,
+                        replacements: None,
                     },
                     &mut budget,
                 )?;

@@ -1135,6 +1135,8 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             | "detail"
             | "positions"
             | "count_matches"
+            | "multiline_replace"
+            | "report_replacements"
             | "stats" => value.is_boolean(),
             _ => false,
         };
@@ -1209,7 +1211,8 @@ impl State {
     fn search(&self, entry: &Entry, query: &Value, files: bool, id: &Value) -> Result<Value> {
         let metadata = json!({
             "root":entry.view.root(), "view":entry.id, "generation":entry.view.generation().key(),
-            "ready":true, "hidden_complete":true, "ordered_filters":true, "backend":"shared-v1",
+            "ready":true, "hidden_complete":true, "ordered_filters":true,
+            "multiline_replace":true, "report_replacements":true, "backend":"shared-v1",
             "protocol":PROTOCOL, "instance":self.registration.instance,
             "repository":self.registration.repository
         });

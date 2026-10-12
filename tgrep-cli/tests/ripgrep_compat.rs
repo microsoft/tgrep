@@ -628,6 +628,495 @@ fn reported_multiline_preserves_adjacent_matches_in_every_output() {
 }
 
 #[test]
+fn reported_patterns_accumulate_across_search_and_pattern_files() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("input.txt"), "foo\nbar\nbaz\n").unwrap();
+    let pattern_file = |name: &str, patterns: &str| {
+        let path = dir.path().join(name);
+        fs::write(&path, patterns).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let p1 = pattern_file("p1.txt", "foo\n");
+    let p2 = pattern_file("p2.txt", "bar\n");
+    let empty = pattern_file("empty.txt", "");
+    let (p1, p2, empty) = (p1.as_str(), p2.as_str(), empty.as_str());
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        // Flags before `search`, flags after it, and the lines they select.
+        for (global, local, expected) in [
+            (vec!["-e", "foo"], vec!["-e", "bar"], "foo\nbar\n"),
+            (vec!["-f", p1], vec!["-f", p2], "foo\nbar\n"),
+            (vec!["-e", "foo"], vec!["-f", p2], "foo\nbar\n"),
+            (vec![], vec!["-f", p1, "-f", p2], "foo\nbar\n"),
+            (vec!["-f", p1, "-f", p2], vec![], "foo\nbar\n"),
+            (vec!["-f", empty, "-f", p2], vec![], "bar\n"),
+            (vec!["-e", "baz", "-f", p1], vec![], "foo\nbaz\n"),
+            (vec!["-f", p1, "-e", "baz"], vec![], "foo\nbaz\n"),
+        ] {
+            let mut cmd = tgrep();
+            cmd.args(backend)
+                .args(["--stats", "--color", "never", "--no-filename"])
+                .args(&global);
+            if !local.is_empty() {
+                cmd.arg("search").args(&local);
+            }
+            cmd.arg("--")
+                .arg(&root)
+                .assert()
+                .success()
+                .stdout(expected)
+                .stderr(predicate::str::contains(marker));
+        }
+    });
+}
+
+#[test]
+fn reported_case_flags_use_the_last_occurrence() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "foo\nFOO\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        // Flags before `search`, flags after it, the pattern and its lines.
+        for (global, local, pattern, expected) in [
+            (vec!["-i", "-s"], vec![], "foo", "foo\n"),
+            (vec!["-i", "-S"], vec![], "FOO", "FOO\n"),
+            (vec!["-i", "-S"], vec![], "foo", "foo\nFOO\n"),
+            (vec!["-s", "-S"], vec![], "foo", "foo\nFOO\n"),
+            (vec!["-s", "-i"], vec![], "foo", "foo\nFOO\n"),
+            (vec!["-S", "-i"], vec![], "FOO", "foo\nFOO\n"),
+            (
+                vec!["--ignore-case", "--case-sensitive"],
+                vec![],
+                "foo",
+                "foo\n",
+            ),
+            (
+                vec!["--smart-case", "--ignore-case"],
+                vec![],
+                "FOO",
+                "foo\nFOO\n",
+            ),
+            (vec!["-i"], vec!["-s"], "foo", "foo\n"),
+            (vec!["-s"], vec!["-i"], "foo", "foo\nFOO\n"),
+            (vec!["-i"], vec!["-S"], "FOO", "FOO\n"),
+            (vec!["-S"], vec!["-i"], "FOO", "foo\nFOO\n"),
+        ] {
+            let mut cmd = tgrep();
+            cmd.args(backend)
+                .args(["--stats", "--color", "never", "--no-filename"])
+                .args(&global);
+            if !local.is_empty() {
+                cmd.arg("search").args(&local);
+            }
+            cmd.args(["--", pattern])
+                .arg(&root)
+                .assert()
+                .success()
+                .stdout(expected)
+                .stderr(predicate::str::contains(marker));
+        }
+    });
+}
+
+/// A Rust file and a text file with the same contents, plus the `-l` line
+/// each one prints.
+fn type_fixture() -> (TempDir, std::path::PathBuf, String, String) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.rs"), "needle\n").unwrap();
+    fs::write(root.join("a.txt"), "needle\n").unwrap();
+    let rs = format!("{}\n", root.join("a.rs").display());
+    let txt = format!("{}\n", root.join("a.txt").display());
+    (dir, root, rs, txt)
+}
+
+/// Check that a content search and `--files` both select `expected`.
+fn assert_selected_files(
+    backend: &[&str],
+    marker: &str,
+    root: &std::path::Path,
+    flags: &[&str],
+    expected: &str,
+) {
+    tgrep()
+        .args(backend)
+        .args(["--stats", "--color", "never", "--sort", "path", "-l"])
+        .args(flags)
+        .args(["--", "needle"])
+        .arg(root)
+        .assert()
+        .code(if expected.is_empty() { 1 } else { 0 })
+        .stdout(expected.to_string())
+        .stderr(predicate::str::contains(marker));
+    // An empty `--files` listing exits 0, unlike ripgrep, so only the listing
+    // is compared.
+    tgrep()
+        .args(backend)
+        .args(["--sort", "path", "--files"])
+        .args(flags)
+        .arg(root)
+        .assert()
+        .stdout(expected.to_string());
+}
+
+#[test]
+fn reported_positive_globs_override_type_filters() {
+    let (dir, root, rs, txt) = type_fixture();
+    let both = format!("{rs}{txt}");
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, expected) in [
+            (vec!["-t", "rust", "-g", "*.txt"], txt.as_str()),
+            (vec!["-t", "rust", "-g", "!*.txt"], rs.as_str()),
+            (
+                vec!["-t", "rust", "-g", "*.txt", "-g", "*.rs"],
+                both.as_str(),
+            ),
+            (vec!["-t", "rust", "--iglob", "*.TXT"], txt.as_str()),
+            (vec!["-T", "rust", "-g", "*.rs"], rs.as_str()),
+        ] {
+            assert_selected_files(backend, marker, &root, &flags, expected);
+        }
+    });
+}
+
+#[test]
+fn reported_type_selections_follow_argument_order() {
+    let (dir, root, rs, _) = type_fixture();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, expected) in [
+            (vec!["-T", "rust", "-t", "rust"], rs.as_str()),
+            (vec!["-t", "rust", "-T", "rust"], ""),
+            (vec!["--type-not", "rust", "--type", "rust"], rs.as_str()),
+            (vec!["-t", "rust", "-T", "rust", "-t", "rust"], rs.as_str()),
+            (vec!["-T", "rust", "-t", "rust", "-T", "rust"], ""),
+        ] {
+            assert_selected_files(backend, marker, &root, &flags, expected);
+        }
+        // `search` appends its flags after the ones before it.
+        for (global, local, expected) in [
+            (["-T", "rust"], ["-t", "rust"], rs.as_str()),
+            (["-t", "rust"], ["-T", "rust"], ""),
+        ] {
+            tgrep()
+                .args(backend)
+                .args(["--stats", "--color", "never", "-l"])
+                .args(global)
+                .arg("search")
+                .args(local)
+                .args(["--", "needle"])
+                .arg(&root)
+                .assert()
+                .code(if expected.is_empty() { 1 } else { 0 })
+                .stdout(expected.to_string())
+                .stderr(predicate::str::contains(marker));
+        }
+    });
+}
+
+#[test]
+fn reported_type_definitions_follow_argument_order() {
+    let (dir, root, _, txt) = type_fixture();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        tgrep()
+            .args(backend)
+            .args(["--type-add", "rust:*.txt", "--type-clear", "rust"])
+            .args(["-t", "rust", "--", "needle"])
+            .arg(&root)
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(predicate::str::contains("unrecognized file type: rust"));
+        // Flags before `search` and flags after it.
+        for (global, local) in [
+            (
+                vec!["--type-clear", "rust", "--type-add", "rust:*.txt"],
+                vec![],
+            ),
+            (
+                vec!["--type-clear", "rust"],
+                vec!["--type-add", "rust:*.txt"],
+            ),
+        ] {
+            let mut cmd = tgrep();
+            cmd.args(backend)
+                .args(["--stats", "--color", "never", "-l"])
+                .args(&global);
+            if !local.is_empty() {
+                cmd.arg("search").args(&local);
+            }
+            cmd.args(["-t", "rust", "--", "needle"])
+                .arg(&root)
+                .assert()
+                .success()
+                .stdout(txt.clone())
+                .stderr(predicate::str::contains(marker));
+        }
+    });
+    for (flags, rust) in [
+        (
+            vec!["--type-clear", "rust", "--type-add", "rust:*.txt"],
+            Some("rust: *.txt"),
+        ),
+        (
+            vec!["--type-add", "rust:*.txt", "--type-clear", "rust"],
+            None,
+        ),
+        (vec!["--type-add", "rust:*.txt"], Some("rust: *.rs, *.txt")),
+    ] {
+        let output = tgrep()
+            .args(&flags)
+            .arg("--type-list")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let listing = String::from_utf8(output).unwrap();
+        assert_eq!(
+            listing.lines().find(|line| line.starts_with("rust:")),
+            rust,
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
+fn reported_multiline_replace_rewrites_cross_line_matches() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "hello\nworld\n").unwrap();
+    fs::write(root.join("c.txt"), "x\nhello\nworld\ny\nz\nhello\nworld\n").unwrap();
+    let a = root.join("a.txt").display().to_string();
+    let c = root.join("c.txt").display().to_string();
+    let (pair, lines, o_w) = (r"hello\nworld", r"hello\nworld\n", r"(o\nw)");
+    // ripgrep numbers the rewritten lines from the start of the block and
+    // repeats its starting column on each of them.
+    let blocks = "1:3:heA\n2:3:BA\n3:3:Bo\n4:3:worA\n5:3:Bd\n\
+                  2:3:heA\n3:3:BA\n4:3:Bo\n5:3:worA\n6:3:Bd\n\
+                  6:3:heA\n7:3:BA\n8:3:Bo\n9:3:worA\n10:3:Bd\n";
+    let only = "1:3:A\n2:3:B\n2:6:A\n3:6:B\n4:14:A\n5:14:B\n\
+                2:3:A\n3:3:B\n3:6:A\n4:6:B\n5:14:A\n6:14:B\n\
+                6:3:A\n7:3:B\n7:6:A\n8:6:B\n9:14:A\n10:14:B\n";
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, pattern, expected) in [
+            (
+                vec!["-I", "-n", "-r", "X"],
+                pair,
+                "1:X\n2:X\n6:X\n".to_string(),
+            ),
+            (
+                vec!["-I", "-n", "-o", "-r", "${2}/${1}"],
+                r"(hello)\n(world)",
+                "1:world/hello\n2:world/hello\n6:world/hello\n".to_string(),
+            ),
+            (
+                vec!["-I", "-n", "-C1", "-r", "X"],
+                pair,
+                "1:X\n--\n1-x\n2:X\n4-y\n5-z\n6:X\n".to_string(),
+            ),
+            // Every printed line of the first file is empty, so no separator
+            // precedes the second one.
+            (
+                vec!["-I", "-n", "-A1", "-r", ""],
+                lines,
+                "4-y\n--\n".to_string(),
+            ),
+            (
+                vec!["-n", "--heading", "-A1", "-r", ""],
+                lines,
+                format!("{a}\n\n{c}\n4-y\n--\n"),
+            ),
+            (
+                vec!["--vimgrep", "-r", "X"],
+                pair,
+                format!("{a}:1:1:X\n{c}:2:1:X\n{c}:6:1:X\n"),
+            ),
+            (
+                vec!["-I", "-n", "--passthru", "-r", "X"],
+                pair,
+                "1:X\n1-x\n2:X\n4-y\n5-z\n6:X\n".to_string(),
+            ),
+            (
+                vec!["-I", "-n", "-m1", "-r", "X"],
+                pair,
+                "1:X\n2:X\n".to_string(),
+            ),
+            (
+                vec!["-I", "-n", "-b", "-r", "X"],
+                pair,
+                "1:0:X\n2:2:X\n6:18:X\n".to_string(),
+            ),
+            (vec!["-I", "-r", ""], lines, String::new()),
+            (
+                vec!["-I", "-n", "--column", "-r", "<$1>"],
+                o_w,
+                "1:5:hell<o\n2:5:w>orld\n2:5:hell<o\n3:5:w>orld\n6:5:hell<o\n7:5:w>orld\n"
+                    .to_string(),
+            ),
+            (
+                vec!["-I", "-n", "--column", "-o", "-r", "<$1>"],
+                o_w,
+                "1:5:<o\n2:5:w>\n2:5:<o\n3:5:w>\n6:5:<o\n7:5:w>\n".to_string(),
+            ),
+            (
+                vec!["--vimgrep", "-r", "<$1>"],
+                o_w,
+                format!("{a}:1:5:hell<o\n{c}:2:5:hell<o\n{c}:6:5:hell<o\n"),
+            ),
+            // `\s` can match a line terminator, so matches on adjacent lines
+            // form one block even though none of them crosses a line.
+            (
+                vec!["-I", "-n", "--column", "-r", "A\nB"],
+                r"l\s?",
+                blocks.to_string(),
+            ),
+            (
+                vec!["-I", "-n", "--column", "-o", "-r", "A\nB"],
+                r"l\s?",
+                only.to_string(),
+            ),
+        ] {
+            // `--passthru` must print every file, so it never asks the server.
+            let marker = if flags.contains(&"--passthru") && marker == "(via server)" {
+                "Search completed"
+            } else {
+                marker
+            };
+            tgrep()
+                .args(backend)
+                .args(["--stats", "--color", "never", "--sort", "path", "-U"])
+                .args(&flags)
+                .args(["--", pattern])
+                .arg(&root)
+                .assert()
+                .success()
+                .stdout(expected)
+                .stderr(predicate::str::contains(marker));
+        }
+    });
+}
+
+#[test]
+fn reported_json_replace_keeps_source_text_beside_replacements() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "hello\n").unwrap();
+    fs::write(root.join("b.txt"), "say hello, hello\nbye\n").unwrap();
+    let hit = |text: &str, replacement: &str, start: usize, end: usize| {
+        serde_json::json!({
+            "match": {"text": text}, "replacement": {"text": replacement},
+            "start": start, "end": end,
+        })
+    };
+    let event = |kind: &str, line: u64, offset: u64, text: &str, hits: Vec<serde_json::Value>| {
+        serde_json::json!({"type": kind, "data": {
+            "lines": {"text": text}, "line_number": line, "absolute_offset": offset,
+            "submatches": hits,
+        }})
+    };
+    let cases = [
+        (
+            vec!["-g", "a.txt", "-r", "R"],
+            "(hello)",
+            vec![event(
+                "match",
+                1,
+                0,
+                "hello\n",
+                vec![hit("hello", "R", 0, 5)],
+            )],
+        ),
+        (
+            vec!["-g", "a.txt", "-r", "[$1]"],
+            "(l+)",
+            vec![event(
+                "match",
+                1,
+                0,
+                "hello\n",
+                vec![hit("ll", "[ll]", 2, 4)],
+            )],
+        ),
+        (
+            vec!["-g", "a.txt", "-r", "XYZ"],
+            "l|o",
+            vec![event(
+                "match",
+                1,
+                0,
+                "hello\n",
+                vec![
+                    hit("l", "XYZ", 2, 3),
+                    hit("l", "XYZ", 3, 4),
+                    hit("o", "XYZ", 4, 5),
+                ],
+            )],
+        ),
+        (
+            vec!["-g", "a.txt", "-r", ""],
+            "hello",
+            vec![event(
+                "match",
+                1,
+                0,
+                "hello\n",
+                vec![hit("hello", "", 0, 5)],
+            )],
+        ),
+        (
+            vec!["-g", "b.txt", "-C1", "-r", "<$0>"],
+            "hello",
+            vec![
+                event(
+                    "match",
+                    1,
+                    0,
+                    "say hello, hello\n",
+                    vec![
+                        hit("hello", "<hello>", 4, 9),
+                        hit("hello", "<hello>", 11, 16),
+                    ],
+                ),
+                event("context", 2, 17, "bye\n", vec![]),
+            ],
+        ),
+    ];
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, pattern, expected) in &cases {
+            let output = tgrep()
+                .args(backend)
+                .args(["--stats", "--json"])
+                .args(flags)
+                .arg("--")
+                .arg(pattern)
+                .arg(&root)
+                .assert()
+                .success()
+                .stderr(predicate::str::contains(marker))
+                .get_output()
+                .stdout
+                .clone();
+            let events: Vec<serde_json::Value> = String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["type"] == "match" || event["type"] == "context")
+                .map(|mut event| {
+                    event["data"].as_object_mut().unwrap().remove("path");
+                    event
+                })
+                .collect();
+            assert_eq!(&events, expected, "{marker}: {flags:?}");
+        }
+    });
+}
+
+#[test]
 fn indexed_json_preserves_utf8_match_and_context_offsets() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");
@@ -1849,6 +2338,149 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                     assert!(stderr.contains("Search completed"), "{stderr}");
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn ordered_filters_and_replacements_reject_servers_without_support() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.rs"), "needle\n").unwrap();
+    fs::write(root.join("a.txt"), "needle\n").unwrap();
+    fs::write(root.join("m.txt"), "hello\nworld\n").unwrap();
+    let index_dir = dir.path().join("idx");
+    tgrep()
+        .args([
+            "index",
+            root.to_str().unwrap(),
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let rs = format!("{}\n", root.join("a.rs").display());
+    let txt = format!("{}\n", root.join("a.txt").display());
+    // Flags, pattern, the request field the result depends on (if any), why
+    // the client rejects a reply that does not acknowledge it, and the output
+    // (`None` for JSON).
+    for (flags, pattern, field, reason, expected) in [
+        (
+            vec!["-l", "-T", "rust", "-t", "rust"],
+            "needle",
+            Some("type_ops"),
+            "ordered type and glob filters",
+            Some(rs.as_str()),
+        ),
+        (
+            vec!["-l", "-t", "rust", "-g", "*.txt"],
+            "needle",
+            None,
+            "ordered type and glob filters",
+            Some(txt.as_str()),
+        ),
+        (
+            vec!["--no-filename", "-U", "-r", "X"],
+            r"hello\nworld",
+            Some("multiline_replace"),
+            "multiline replacement blocks",
+            Some("X\n"),
+        ),
+        (
+            vec!["--json", "-g", "m.txt", "-r", "R"],
+            "(hello)",
+            Some("report_replacements"),
+            "JSON replacements",
+            None,
+        ),
+    ] {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        fs::write(
+            index_dir.join("serve.json"),
+            serde_json::json!({"pid":std::process::id(),"port":listener.local_addr().unwrap().port()})
+                .to_string(),
+        )
+        .unwrap();
+        let output = std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "client did not contact server");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                // New fields are sent only when the result depends on them.
+                for name in ["type_ops", "multiline_replace", "report_replacements"] {
+                    assert_eq!(
+                        request["params"].get(name).is_some(),
+                        field == Some(name),
+                        "{name}: {request}"
+                    );
+                }
+                // A server that predates them ignores the fields and answers
+                // the old way, without acknowledging them.
+                let rows: Vec<_> = ["a.rs", "a.txt", "m.txt"]
+                    .into_iter()
+                    .map(|file| {
+                        serde_json::json!({
+                            "file":file,"line":1,"content":"STALE hello needle",
+                            "spans":[[6,11]],"type":"match",
+                        })
+                    })
+                    .collect();
+                let result = serde_json::json!({
+                    "hidden_complete":true,"matches":rows,"elapsed_ms":1,
+                });
+                writeln!(
+                    stream,
+                    "{}",
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"result":result})
+                )
+                .unwrap();
+            });
+            let output = tgrep()
+                .timeout(Duration::from_secs(30))
+                .args(["--index-path", index_dir.to_str().unwrap()])
+                .args(["--stats", "--color", "never", "--sort", "path"])
+                .args(&flags)
+                .args(["--", pattern])
+                .arg(&root)
+                .output()
+                .unwrap();
+            server.join().unwrap();
+            output
+        });
+        assert!(output.status.success(), "{flags:?}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(reason), "{flags:?}: {stderr}");
+        assert!(
+            stderr.contains("falling back to local index"),
+            "{flags:?}: {stderr}"
+        );
+        assert!(stderr.contains("Search completed"), "{flags:?}: {stderr}");
+        assert!(!stderr.contains("(via server)"), "{flags:?}: {stderr}");
+        assert!(!stdout.contains("STALE"), "{flags:?}: {stdout}");
+        match expected {
+            Some(expected) => assert_eq!(stdout, expected, "{flags:?}"),
+            None => assert!(stdout.contains(r#""replacement":{"text":"R"}"#), "{stdout}"),
         }
     }
 }

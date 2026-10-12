@@ -549,6 +549,87 @@ fn assert_multiline_counts(root: &Path, marker: &str) -> u64 {
 }
 
 #[test]
+fn ordered_filters_and_replacements_use_shared_views() {
+    let mut f = Fixture::new();
+    prepare_compat(&mut f);
+    let d = f.start(&["--no-watch"]);
+    let lease = d.attach(&f.a, &f.revision);
+    let before = d.lookup(&f.a)["queries"].as_u64().unwrap();
+    let queries = assert_compat_queries(&f.a.join("compat"), "(via shared daemon v1)");
+    assert_eq!(d.lookup(&f.a)["queries"], before + queries);
+    d.rpc(
+        "detach",
+        json!({"root":f.a,"view":lease["view"],"lease":lease["lease"]}),
+    );
+}
+
+fn prepare_compat(f: &mut Fixture) {
+    let root = f.a.join("compat");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.rs"), "needle\n").unwrap();
+    fs::write(root.join("a.txt"), "needle\n").unwrap();
+    fs::write(root.join("m.txt"), "x\nhello\nworld\ny\n").unwrap();
+    git(&f.a, &["add", "compat"]);
+    git(&f.a, &["commit", "-qm", "ripgrep compatibility"]);
+    f.revision = git(&f.a, &["rev-parse", "HEAD"]);
+}
+
+/// Run searches whose results depend on ordered type and glob filters or on
+/// `--replace` rendering, which a shared view must acknowledge before its
+/// rows are used.
+fn assert_compat_queries(root: &Path, marker: &str) -> u64 {
+    let prefix = root.to_string_lossy().replace('\\', "/");
+    let mut queries = 0;
+    for (flags, pattern, expected) in [
+        (
+            vec!["-l", "-T", "rust", "-t", "rust"],
+            "needle",
+            Some(format!("{prefix}/a.rs\n")),
+        ),
+        (
+            vec!["-l", "-t", "rust", "-g", "*.txt"],
+            "needle",
+            Some(format!("{prefix}/a.txt\n")),
+        ),
+        (
+            vec!["--no-filename", "-n", "-U", "-C1", "-r", "<$1>"],
+            r"(o\nw)",
+            Some("1-x\n2:hell<o\n3:w>orld\n4-y\n".to_string()),
+        ),
+        (vec!["--json", "-g", "m.txt", "-r", "R"], "(hello)", None),
+    ] {
+        let mut args = vec!["--stats", "--color", "never", "--path-separator", "/"];
+        args.extend_from_slice(&flags);
+        args.extend(["--", pattern, root.to_str().unwrap()]);
+        let output = cli(root, &args);
+        queries += 1;
+        assert!(output.status.success(), "{marker} {args:?}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match expected {
+            Some(expected) => assert_eq!(stdout, expected, "{marker} {args:?}"),
+            None => {
+                let hit = stdout
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .find(|event| event["type"] == "match")
+                    .unwrap();
+                assert_eq!(
+                    hit["data"]["submatches"],
+                    json!([{"match":{"text":"hello"},"replacement":{"text":"R"},"start":0,"end":5}]),
+                    "{marker}"
+                );
+            }
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(marker), "{args:?}: {stderr}");
+        assert!(!stderr.contains("Brute-force"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("falling back"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("unavailable"), "{args:?}: {stderr}");
+    }
+    queries
+}
+
+#[test]
 fn exact_base_sharing_leases_and_revision_pins() {
     let f = Fixture::new();
     let d = f.start(&["--no-watch"]);

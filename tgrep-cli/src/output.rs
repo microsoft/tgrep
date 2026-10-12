@@ -6,6 +6,9 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 use std::time::Instant;
 
+/// A match span paired with its position in the original span list.
+type IndexedSpan = (usize, (usize, usize));
+
 /// A single match result.
 pub struct Match {
     pub file: String,
@@ -21,6 +24,16 @@ pub struct Match {
     /// Bytes of line terminator stripped from `content`. `-M/--max-columns`
     /// measures the line including its terminator, as ripgrep does.
     pub terminator_len: usize,
+    /// 1-based first and last source lines of the `-U --replace` block this
+    /// row was rewritten from. Context gaps are measured from these, since
+    /// the rewrite can print more or fewer lines than it replaced.
+    pub block: Option<(usize, usize)>,
+    /// A block whose rewrite printed nothing. It still opens the file's
+    /// heading and moves the context position past the block.
+    pub hidden: bool,
+    /// `--json --replace`: each span's expanded replacement, parallel to
+    /// `spans`.
+    pub replacements: Option<Vec<String>>,
 }
 
 impl Match {
@@ -235,6 +248,10 @@ pub struct OutputWriter {
     use_heading: bool,
     /// Track the last line we printed for context-gap detection.
     last_printed_line: Option<(String, usize)>,
+    /// Whether any line has been written yet. ripgrep only separates one
+    /// file's context output from the next once something was written, so a
+    /// file whose `--replace` rewrites printed nothing earns no `--`.
+    printed_any: bool,
     started: Instant,
     /// Start of the file currently open in JSON mode. ripgrep's per-file `end`
     /// stats report time spent on that file, so this is reset per file and
@@ -285,6 +302,7 @@ impl OutputWriter {
             use_color,
             use_heading,
             last_printed_line: None,
+            printed_any: false,
             started: Instant::now(),
             file_started: Instant::now(),
             file_stats: Stats::default(),
@@ -432,9 +450,10 @@ impl OutputWriter {
         };
         if let Some((ref last_file, last_line)) = self.last_printed_line {
             let gap_within_file = last_file == file && line_num > last_line + 1;
-            let new_file = last_file != file && !self.use_heading;
+            let new_file = last_file != file && !self.use_heading && self.printed_any;
             if gap_within_file || new_file {
                 writeln!(self.stdout, "{sep}")?;
+                self.printed_any = true;
             }
         }
         Ok(())
@@ -560,12 +579,30 @@ impl OutputWriter {
         let prefix =
             self.field_prefix(&ctx.file, ctx.line_number, None, ctx.absolute_offset, false);
         writeln!(self.stdout, "{prefix}{content}")?;
+        self.printed_any = true;
         self.last_printed_line = Some((ctx.file.clone(), ctx.line_number));
         self.maybe_flush()
     }
 
     pub fn write_match(&mut self, m: &Match) -> io::Result<()> {
-        let (content, spans) = self.trim_adjust(&m.content, &m.spans);
+        // The context position moves past the whole source block, however
+        // many lines its rewrite printed.
+        let last_line = m.block.map_or(m.line_number, |(_, last)| last);
+        if m.hidden {
+            // ripgrep prints a file's heading before rendering its first
+            // match, even when the rewrite then leaves nothing to print.
+            if matches!(
+                self.config.format,
+                OutputFormat::Heading | OutputFormat::Flat
+            ) && !self.config.no_filename
+            {
+                self.ensure_heading(&m.file)?;
+            }
+            self.last_printed_line = Some((m.file.clone(), last_line));
+            return self.maybe_flush();
+        }
+        let (content, kept) = self.trim_adjust_indexed(&m.content, &m.spans);
+        let spans: Vec<(usize, usize)> = kept.iter().map(|&(_, span)| span).collect();
         let content = content.to_string();
         match self.config.format {
             OutputFormat::Heading | OutputFormat::Flat => {
@@ -605,14 +642,22 @@ impl OutputWriter {
                 // emits `text`, so its offsets stay usable for slicing it —
                 // they can differ from `absolute_offset`, which is a real file
                 // offset, on a line containing invalid UTF-8.
-                let submatches: Vec<serde_json::Value> = spans
+                let submatches: Vec<serde_json::Value> = kept
                     .iter()
-                    .map(|&(s, e)| {
-                        serde_json::json!({
+                    .map(|&(i, (s, e))| {
+                        let mut submatch = serde_json::json!({
                             "match": { "text": &content[s..e] },
                             "start": s,
                             "end": e,
-                        })
+                        });
+                        // ripgrep reports what `--replace` would put in place
+                        // of each match, next to the match itself.
+                        if let Some(texts) = &m.replacements {
+                            submatch["replacement"] = serde_json::json!({
+                                "text": texts.get(i).map_or("", String::as_str),
+                            });
+                        }
+                        submatch
                     })
                     .collect();
                 // ripgrep counts distinct matching *lines* here, not emitted
@@ -642,7 +687,8 @@ impl OutputWriter {
             }
             OutputFormat::FilesOnly | OutputFormat::Count => {}
         }
-        self.last_printed_line = Some((m.file.clone(), m.line_number));
+        self.printed_any = true;
+        self.last_printed_line = Some((m.file.clone(), last_line));
         self.maybe_flush()
     }
 
@@ -748,6 +794,7 @@ impl OutputWriter {
             } else {
                 writeln!(self.stdout, "{shown}")?;
             }
+            self.printed_any = true;
             self.current_file = Some(file.to_string());
             self.last_printed_line = None;
         }
@@ -760,17 +807,29 @@ impl OutputWriter {
         s: &'a str,
         spans: &[(usize, usize)],
     ) -> (&'a str, Vec<(usize, usize)>) {
+        let (content, kept) = self.trim_adjust_indexed(s, spans);
+        (content, kept.into_iter().map(|(_, span)| span).collect())
+    }
+
+    /// [`trim_adjust`](Self::trim_adjust), pairing each surviving span with
+    /// its index in `spans`, since trimming can drop spans.
+    fn trim_adjust_indexed<'a>(
+        &self,
+        s: &'a str,
+        spans: &[(usize, usize)],
+    ) -> (&'a str, Vec<IndexedSpan>) {
         if !self.config.trim {
-            return (s, spans.to_vec());
+            return (s, spans.iter().copied().enumerate().collect());
         }
         let trimmed = s.trim();
         let delta = s.len() - s.trim_start().len();
         let adjusted = spans
             .iter()
-            .filter_map(|&(a, b)| {
+            .enumerate()
+            .filter_map(|(i, &(a, b))| {
                 let a = a.saturating_sub(delta).min(trimmed.len());
                 let b = b.saturating_sub(delta).min(trimmed.len());
-                (b > a).then_some((a, b))
+                (b > a).then_some((i, (a, b)))
             })
             .collect();
         (trimmed, adjusted)

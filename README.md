@@ -389,15 +389,15 @@ These tables describe search flags. Use `tgrep index --help` and
 
 | Flag | Description |
 |------|-------------|
-| `-i, --ignore-case` | Case-insensitive matching |
-| `-s, --case-sensitive` | Force case-sensitive matching (overrides `-S`) |
-| `-S, --smart-case` | Case-insensitive when the patterns contain literals and none are uppercase |
+| `-i, --ignore-case` | Case-insensitive matching (the last of `-i`, `-s` and `-S` wins) |
+| `-s, --case-sensitive` | Force case-sensitive matching (the last of `-i`, `-s` and `-S` wins) |
+| `-S, --smart-case` | Case-insensitive when the patterns contain literals and none are uppercase (the last of `-i`, `-s` and `-S` wins) |
 | `-F, --fixed-strings` | Treat pattern as a literal string |
 | `-w, --word-regexp` | Require non-word characters or text boundaries on both sides of the match; overrides earlier `-x` |
 | `-v, --invert-match` | Show lines that do NOT match |
 | `-o, --only-matching` | Print only the matched parts |
 | `-e, --regexp <PAT>` | Additional pattern (repeatable for OR) |
-| `-f, --file <FILE>` | Read patterns verbatim, one per line; blank lines are empty patterns |
+| `-f, --file <FILE>` | Read patterns verbatim, one per line; blank lines are empty patterns (repeatable) |
 | `-U, --multiline` | Enable multiline matching (`.` still excludes `\n`) |
 | `--multiline-dotall` | Make `.` match `\n`; implies `-U` |
 | `-n, --line-number` | Show line numbers (default: on when stdout is a terminal) |
@@ -407,13 +407,13 @@ These tables describe search flags. Use `tgrep index --help` and
 | `--files-without-match` | Print files that do NOT match |
 | `-q, --quiet` | Suppress output; exit code only |
 | `-m, --max-count <N>` | Limit matching lines per file (see [Match limits](#match-limits)) |
-| `-g, --glob <GLOB>` | Filter files by glob pattern, case-sensitive (repeatable) |
+| `-g, --glob <GLOB>` | Filter files by glob pattern, case-sensitive (repeatable); overrides `-t`/`-T` |
 | `--iglob <GLOB>` | Case-insensitive glob filter (repeatable) |
 | `--glob-case-insensitive` | Treat all `-g` globs as case-insensitive |
 | `-t, --type <TYPE>` | Filter by file type (`rust`, `py`, `js`, …; repeatable) |
-| `-T, --type-not <TYPE>` | Exclude a file type (repeatable) |
+| `-T, --type-not <TYPE>` | Exclude a file type (repeatable); the last `-t`/`-T` matching a file wins |
 | `--type-add <SPEC>` | Add/extend a type, e.g. `--type-add 'web:*.html'` |
-| `--type-clear <TYPE>` | Remove a type's definitions |
+| `--type-clear <TYPE>` | Remove a type's definitions given before it |
 | `--type-list` | Print all supported file types (reflects `--type-add`/`--type-clear`) |
 | `--files` | List admitted paths without content checks; includes binary files |
 | `-A, --after-context <N>` | Lines of context after match |
@@ -466,6 +466,14 @@ Each `-e` or `-f` pattern has its own inline-flag scope: `(?i)` in one does
 not make the others case-insensitive. Smart case considers all supplied patterns
 together, counting literal characters rather than escapes such as `\S` or
 Unicode property names. With `-F`, every pattern character is literal.
+
+Patterns from every `-e` and `-f` accumulate in command-line order, including
+those given after the `search` subcommand. Case flags do not accumulate: as in
+ripgrep, the last of `-i`, `-s` and `-S` decides.
+
+With `--json`, `-r` leaves `lines` and each submatch's `match` text and offsets
+pointing at the source, and adds the expanded text as the submatch's
+`replacement`, as ripgrep does.
 
 Pattern files preserve leading and trailing whitespace and accept LF or CRLF
 line endings. A blank line supplies an empty pattern that matches every input
@@ -561,6 +569,25 @@ parsing. Put all flags before `--`:
 tgrep -F -- serve .
 ```
 
+### File types and globs
+
+`-t`/`-T` selections and `--type-add`/`--type-clear` definitions apply in
+command-line order, as in ripgrep, including flags given after `search`:
+
+- When several `-t`/`-T` selections match a file, the last one decides:
+  `-T rust -t rust` searches Rust files, while `-t rust -T rust` searches none.
+- `--type-clear` removes a type with every definition given before it. A later
+  `--type-add` defines the type afresh, while selecting a cleared type that was
+  not redefined is an error. `--type-list` reflects the same order.
+- Globs take precedence over types. A file that matches a `-g`/`--iglob` glob
+  is included or excluded by that glob alone, and when any positive glob is
+  given, a file matching none of them is excluded. `-t`/`-T` decide only the
+  files that globs leave open, so `-t rust -g '*.txt'` searches `.txt` files.
+
+Servers and shared daemons from releases that predate ordered filters cannot
+answer searches whose result depends on this order; those searches fall back
+with a diagnostic.
+
 ### Output defaults
 
 tgrep matches ripgrep's context-dependent defaults rather than fixed ones:
@@ -600,8 +627,21 @@ while the matcher still collects every hit.
 Older servers without count metadata support cannot answer these requests:
 unsupported requests fall back with a diagnostic, and incomplete totals are
 rejected before any counts are printed.
-Unlike ripgrep, tgrep reports columns relative to each printed line rather
-than repeating the starting column on continuation lines.
+Without `-r`, tgrep reports columns relative to each printed line, whereas
+ripgrep repeats the starting column on continuation lines.
+
+With `-r`, each block of lines joined by matches is rewritten as a whole, as in
+ripgrep: the rewritten text replaces the block, so a match that spans lines can
+become a single line, and `-o` prints the expanded replacement of each match.
+Line numbers and columns of the rewritten lines follow ripgrep, which numbers
+them consecutively from the block's first line and repeats its starting column.
+Servers and shared daemons that predate this rendering are bypassed with a
+diagnostic.
+
+`--json` reports a multiline match as one `match` event per covered line,
+while ripgrep emits a single event whose `lines.text` holds the whole block.
+With `-r`, the first of these fragments carries the whole replacement and the
+others an empty one.
 
 ### Binary files
 

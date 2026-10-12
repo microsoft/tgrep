@@ -812,7 +812,7 @@ fn collect_ordered_args(
         if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
             continue;
         }
-        let Some(indices) = matches.indices_of(id) else {
+        let Some(mut indices) = matches.indices_of(id) else {
             continue;
         };
         match matches.try_get_many::<String>(id) {
@@ -823,7 +823,7 @@ fn collect_ordered_args(
             ),
             _ => found.extend(
                 indices
-                    .last()
+                    .next_back()
                     .map(|index| (scope, index, id, String::new())),
             ),
         }

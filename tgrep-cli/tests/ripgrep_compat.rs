@@ -2363,35 +2363,35 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
     let rs = format!("{}\n", root.join("a.rs").display());
     let txt = format!("{}\n", root.join("a.txt").display());
     let stale = "STALE hello needle\n".repeat(3);
-    // Flags, pattern, the request field the result depends on (if any), why
-    // the client rejects a reply that does not acknowledge it (`None` when an
+    // Flags, pattern, the request fields the result depends on, why the
+    // client rejects a reply that does not acknowledge them (`None` when an
     // older server's reply is just as good), and the output (`None` for JSON).
-    for (flags, pattern, field, reason, expected) in [
+    for (flags, pattern, fields, reason, expected) in [
         (
             vec!["-l", "-T", "rust", "-t", "rust"],
             "needle",
-            Some("type_ops"),
+            &["type_ops", "ordered_filters"][..],
             Some("ordered type and glob filters"),
             Some(rs.as_str()),
         ),
         (
             vec!["-l", "-t", "rust", "-g", "*.txt"],
             "needle",
-            None,
+            &["ordered_filters"][..],
             Some("ordered type and glob filters"),
             Some(txt.as_str()),
         ),
         (
             vec!["--no-filename", "-U", "-r", "X"],
             r"hello\nworld",
-            Some("multiline_replace"),
+            &["multiline_replace"][..],
             Some("multiline replacement blocks"),
             Some("X\n"),
         ),
         (
             vec!["--json", "-g", "m.txt", "-r", "R"],
             "(hello)",
-            Some("report_replacements"),
+            &["report_replacements"][..],
             Some("JSON replacements"),
             None,
         ),
@@ -2400,12 +2400,24 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
         (
             vec!["--no-filename", "-U", "-r", "X"],
             "needle",
-            None,
+            &[][..],
             None,
             Some(stale.as_str()),
         ),
-        (vec!["--json", "-v", "-r", "R"], "needle", None, None, None),
-        (vec!["--json", "-q", "-r", "R"], "needle", None, None, None),
+        (
+            vec!["--json", "-v", "-r", "R"],
+            "needle",
+            &[][..],
+            None,
+            None,
+        ),
+        (
+            vec!["--json", "-q", "-r", "R"],
+            "needle",
+            &[][..],
+            None,
+            None,
+        ),
     ] {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -2439,10 +2451,15 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
                 BufReader::new(&stream).read_line(&mut line).unwrap();
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                 // New fields are sent only when the result depends on them.
-                for name in ["type_ops", "multiline_replace", "report_replacements"] {
+                for name in [
+                    "type_ops",
+                    "ordered_filters",
+                    "multiline_replace",
+                    "report_replacements",
+                ] {
                     assert_eq!(
                         request["params"].get(name).is_some(),
-                        field == Some(name),
+                        fields.contains(&name),
                         "{name}: {request}"
                     );
                 }

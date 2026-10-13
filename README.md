@@ -586,7 +586,8 @@ command-line order, as in ripgrep, including flags given after `search`:
 
 Servers and shared daemons from releases that predate ordered filters cannot
 answer searches whose result depends on this order; those searches fall back
-with a diagnostic.
+with a diagnostic. Clients from those releases keep their old filtering when
+they search a newer server.
 
 ### Output defaults
 

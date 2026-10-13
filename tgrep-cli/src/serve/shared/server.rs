@@ -1135,6 +1135,7 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             | "detail"
             | "positions"
             | "count_matches"
+            | "ordered_filters"
             | "multiline_replace"
             | "report_replacements"
             | "stats" => value.is_boolean(),
@@ -1307,6 +1308,7 @@ pub(super) fn search_snapshot(
                         relative,
                         &request.glob_filter,
                         &request.type_filter,
+                        request.ordered_filters,
                     )
                 })
             })

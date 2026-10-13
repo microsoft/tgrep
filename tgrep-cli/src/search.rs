@@ -354,6 +354,22 @@ impl SearchOptions {
         self.json && self.replace.is_some() && !self.invert_match && !self.quiet
     }
 
+    /// Whether the result depends on ripgrep's filter order: type flags in
+    /// command-line order, and a positive glob overriding `-t`/`-T`. Otherwise
+    /// a server's legacy order, which applies every `-T` after every `-t` and
+    /// requires a file to pass both the globs and the types, gives the same
+    /// result.
+    fn needs_ordered_filters(&self) -> Result<bool> {
+        let selects = self.type_ops.iter().any(|op| {
+            matches!(
+                op,
+                filetypes::TypeOp::Select(_) | filetypes::TypeOp::Negate(_)
+            )
+        });
+        Ok(!filetypes::TypeOp::is_unordered_equivalent(&self.type_ops)
+            || (selects && self.glob_filter()?.has_includes()))
+    }
+
     fn effective_passthru(&self) -> bool {
         // ripgrep treats `-m 0` as suppressing all search output, including
         // passthru context.
@@ -531,7 +547,7 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
     if root.is_file() {
         let rel_path = explicit_file_display_path(&root);
 
-        if passes_filters(&rel_path, &glob_filter, &type_filter) {
+        if passes_filters(&rel_path, &glob_filter, &type_filter, true) {
             let mut writer = OutputWriter::new(opts.make_output_config());
             writer.write_file(&rel_path)?;
             writer.flush()?;
@@ -777,7 +793,7 @@ fn write_indexed_file_paths(
         })
         .filter_map(|path| scope.relativize(&path, search_root))
         .filter(|path| within_max_depth(path, opts))
-        .filter(|path| passes_filters(path, glob_filter, type_filter))
+        .filter(|path| passes_filters(path, glob_filter, type_filter, true))
         .collect();
 
     if let Some(sort) = opts.sort {
@@ -895,7 +911,7 @@ pub fn run(
                 let request = server_search_request(&scope, opts, ci)?;
                 let result = client.view_request("search", &view, request["params"].clone())?;
                 require_server_coverage(&result)?;
-                require_ordered_filters(&result, opts)?;
+                require_ordered_filters(&result, &request)?;
                 require_replace_support(&result, &request)?;
                 Ok((view.root, scope, request, result))
             })();
@@ -1148,6 +1164,12 @@ fn server_search_request(
     if !filetypes::TypeOp::is_unordered_equivalent(&opts.type_ops) {
         request["params"]["type_ops"] = type_ops_to_json(&opts.type_ops);
     }
+    // A server keeps its legacy filter order for clients that do not ask for
+    // ripgrep's, and a server that predates it ignores the request. Ask only
+    // when the result depends on it, so that reply is refused only then.
+    if opts.needs_ordered_filters()? {
+        request["params"]["ordered_filters"] = serde_json::json!(true);
+    }
     // A server that predates a `--replace` rendering cannot honour it, and
     // its reply is then refused. Ask only when the output depends on it.
     if opts.needs_replace_blocks(ci) {
@@ -1165,34 +1187,29 @@ fn server_search_request(
 /// their `replacement`. Reading the request rather than the options keeps
 /// this check in step with what `server_search_request` decided to ask for.
 fn require_replace_support(result: &serde_json::Value, request: &serde_json::Value) -> Result<()> {
-    let set = |value: &serde_json::Value, key: &str| {
-        value.get(key).and_then(|v| v.as_bool()) == Some(true)
-    };
     let params = &request["params"];
-    if set(params, "multiline_replace") && !set(result, "multiline_replace") {
+    if flag_set(params, "multiline_replace") && !flag_set(result, "multiline_replace") {
         anyhow::bail!("server does not support multiline replacement blocks");
     }
-    if set(params, "report_replacements") && !set(result, "report_replacements") {
+    if flag_set(params, "report_replacements") && !flag_set(result, "report_replacements") {
         anyhow::bail!("server does not report JSON replacements");
     }
     Ok(())
 }
 
-/// Fail when the result comes from a server that predates ordered filtering
-/// but this search depends on it: such a server applies every `-T` after every
-/// `-t` and lets `-t` veto a file that a positive glob included.
-fn require_ordered_filters(result: &serde_json::Value, opts: &SearchOptions) -> Result<()> {
-    let needs_order = !filetypes::TypeOp::is_unordered_equivalent(&opts.type_ops)
-        || (opts.type_ops.iter().any(|op| {
-            matches!(
-                op,
-                filetypes::TypeOp::Select(_) | filetypes::TypeOp::Negate(_)
-            )
-        }) && opts.glob_filter()?.has_includes());
-    if needs_order && result.get("ordered_filters").and_then(|v| v.as_bool()) != Some(true) {
+/// Fail when the result comes from a server that predates the ordered
+/// filtering `request` asked for. Such a server ignores the request, applies
+/// every `-T` after every `-t` and lets `-t` veto a file that a positive glob
+/// included.
+fn require_ordered_filters(result: &serde_json::Value, request: &serde_json::Value) -> Result<()> {
+    if flag_set(&request["params"], "ordered_filters") && !flag_set(result, "ordered_filters") {
         anyhow::bail!("server does not support ordered type and glob filters");
     }
     Ok(())
+}
+
+fn flag_set(value: &serde_json::Value, key: &str) -> bool {
+    value.get(key).and_then(|v| v.as_bool()) == Some(true)
 }
 
 fn render_server_result(
@@ -1207,7 +1224,7 @@ fn render_server_result(
     // Older servers ignore unknown request fields. Validate before writing any
     // rows, so an old/partial server can never silently answer --hidden.
     require_server_coverage(result)?;
-    require_ordered_filters(result, opts)?;
+    require_ordered_filters(result, request)?;
     require_replace_support(result, request)?;
 
     let empty_vec = Vec::new();
@@ -1609,7 +1626,7 @@ fn search_local_index(
                 .then_some(())?;
             let rel = scope.relativize(indexed, root)?;
             within_max_depth(&rel, opts).then_some(())?;
-            passes_filters(&rel, &glob_filter, &type_filter).then_some(())?;
+            passes_filters(&rel, &glob_filter, &type_filter, true).then_some(())?;
             Some((fid, rel))
         })
         .collect();
@@ -1776,7 +1793,7 @@ fn brute_force_search(
 
     if root.is_file() {
         let rel_path = explicit_file_display_path(root);
-        if passes_filters(&rel_path, &glob_filter, &type_filter)
+        if passes_filters(&rel_path, &glob_filter, &type_filter, true)
             && let Some(read) = read_text_lossy(root, opts.encoding, read_size_limit(opts, true))?
         {
             had_matches = search_file(&read, &matcher, &rel_path, opts, writer, true)?;
@@ -1818,7 +1835,7 @@ fn brute_force_search(
             .to_string_lossy()
             .replace('\\', "/");
 
-        if !passes_filters(&rel_path, &glob_filter, &type_filter) {
+        if !passes_filters(&rel_path, &glob_filter, &type_filter, true) {
             continue;
         }
 
@@ -2350,16 +2367,20 @@ fn explicit_file_display_path(path: &Path) -> String {
 
 /// Whether a path survives the glob and type filters. As in ripgrep, a glob
 /// that decides a file overrides `-t`/`-T`, which only apply to files no glob
-/// decides.
+/// decides. Without `glob_precedence`, as a server answers a client that
+/// predates it, a file a positive glob includes must also pass `-t`/`-T`.
 pub(crate) fn passes_filters(
     rel_path: &str,
     glob_filter: &crate::glob_filter::GlobFilter,
     type_filter: &filetypes::TypeFilter,
+    glob_precedence: bool,
 ) -> bool {
     match glob_filter.decide(rel_path) {
-        crate::glob_filter::GlobDecision::Include => true,
         crate::glob_filter::GlobDecision::Exclude => false,
-        crate::glob_filter::GlobDecision::Unmatched => type_filter.matches(rel_path),
+        crate::glob_filter::GlobDecision::Include if glob_precedence => true,
+        crate::glob_filter::GlobDecision::Include | crate::glob_filter::GlobDecision::Unmatched => {
+            type_filter.matches(rel_path)
+        }
     }
 }
 
@@ -3300,6 +3321,144 @@ mod tests {
         let acked = serde_json::json!({"multiline_replace": true, "report_replacements": true});
         assert!(require_replace_support(&acked, &blocks).is_ok());
         assert!(require_replace_support(&acked, &json).is_ok());
+    }
+
+    fn filter_options(type_ops: &[(&str, &str)], glob: &[&str], iglob: &[&str]) -> SearchOptions {
+        SearchOptions {
+            pattern: "needle".into(),
+            type_ops: type_ops
+                .iter()
+                .map(|&(kind, value)| match kind {
+                    "add" => filetypes::TypeOp::Add(value.into()),
+                    "clear" => filetypes::TypeOp::Clear(value.into()),
+                    "select" => filetypes::TypeOp::Select(value.into()),
+                    "negate" => filetypes::TypeOp::Negate(value.into()),
+                    _ => unreachable!("{kind}"),
+                })
+                .collect(),
+            glob: glob.iter().map(|g| g.to_string()).collect(),
+            iglob: iglob.iter().map(|g| g.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ordered_filters_are_requested_only_where_they_change_output() {
+        let params = |opts: &SearchOptions| {
+            server_search_request(&IndexScope::Whole, opts, false).unwrap()["params"].clone()
+        };
+        // A server answers a request without the field in the legacy order,
+        // which these cannot tell apart from ripgrep's: a glob that only
+        // excludes, or one with no type selection for it to override.
+        for opts in [
+            filter_options(&[], &[], &[]),
+            filter_options(&[("select", "rust")], &[], &[]),
+            filter_options(&[("negate", "rust"), ("negate", "c")], &[], &[]),
+            filter_options(&[("select", "rust"), ("negate", "rust")], &[], &[]),
+            filter_options(&[("add", "foo:*.foo"), ("select", "foo")], &[], &[]),
+            filter_options(&[], &["*.txt"], &[]),
+            filter_options(&[("select", "rust")], &["!*.txt"], &[]),
+            filter_options(&[("add", "foo:*.txt")], &["*.txt"], &[]),
+        ] {
+            let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+            let params = &request["params"];
+            assert!(params.get("ordered_filters").is_none(), "{params}");
+            assert!(params.get("type_ops").is_none(), "{params}");
+            assert!(require_ordered_filters(&serde_json::json!({}), &request).is_ok());
+        }
+
+        // A positive glob overrides a selection, which a legacy server would
+        // let veto the files that glob includes.
+        for opts in [
+            filter_options(&[("select", "rust")], &["*.txt"], &[]),
+            filter_options(&[("negate", "txt")], &["*.txt"], &[]),
+            filter_options(&[("select", "rust")], &[], &["*.TXT"]),
+            filter_options(&[("select", "rust")], &["!*.md", "*.txt"], &[]),
+        ] {
+            let params = params(&opts);
+            assert_eq!(params["ordered_filters"], true, "{params}");
+            assert!(params.get("type_ops").is_none(), "{params}");
+        }
+
+        // Type flags whose order matters also need a server that honours it.
+        for opts in [
+            filter_options(&[("negate", "rust"), ("select", "rust")], &[], &[]),
+            filter_options(&[("add", "rust:*.txt"), ("clear", "rust")], &[], &[]),
+        ] {
+            let params = params(&opts);
+            assert_eq!(params["ordered_filters"], true, "{params}");
+            assert!(params["type_ops"].is_array(), "{params}");
+        }
+    }
+
+    #[test]
+    fn ordered_filters_require_a_server_that_acknowledges_them() {
+        let ordered = server_search_request(
+            &IndexScope::Whole,
+            &filter_options(&[("select", "rust")], &["*.txt"], &[]),
+            false,
+        )
+        .unwrap();
+        // A server predating ordered filters ignores the request and lets
+        // `-t rust` veto `a.txt`, so its reply must be refused.
+        for result in [
+            serde_json::json!({}),
+            serde_json::json!({"ordered_filters": false}),
+            serde_json::json!({"ordered_filters": null}),
+        ] {
+            assert!(require_ordered_filters(&result, &ordered).is_err());
+        }
+        assert!(
+            require_ordered_filters(&serde_json::json!({"ordered_filters": true}), &ordered)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn glob_precedence_lets_a_positive_glob_override_types() {
+        let glob_filter = crate::glob_filter::GlobFilter::new(
+            &["*.txt".to_string(), "!skip.txt".to_string()],
+            &[],
+            false,
+        )
+        .unwrap();
+        let type_filter =
+            filetypes::build_type_filter(&[filetypes::TypeOp::Select("rust".into())]).unwrap();
+        // ripgrep's order: the glob decides every file it matches.
+        assert!(passes_filters("a.txt", &glob_filter, &type_filter, true));
+        assert!(!passes_filters(
+            "skip.txt",
+            &glob_filter,
+            &type_filter,
+            true
+        ));
+        assert!(!passes_filters("a.rs", &glob_filter, &type_filter, true));
+        // The legacy order a server keeps for older clients: a file must pass
+        // both, so `-t rust` vetoes `a.txt`. An exclusion still wins.
+        assert!(!passes_filters("a.txt", &glob_filter, &type_filter, false));
+        assert!(!passes_filters(
+            "skip.txt",
+            &glob_filter,
+            &type_filter,
+            false
+        ));
+        assert!(!passes_filters("a.rs", &glob_filter, &type_filter, false));
+
+        let no_globs = crate::glob_filter::GlobFilter::new(&[], &[], false).unwrap();
+        for glob_precedence in [true, false] {
+            assert!(passes_filters(
+                "a.rs",
+                &no_globs,
+                &type_filter,
+                glob_precedence
+            ));
+            assert!(!passes_filters(
+                "a.txt",
+                &no_globs,
+                &type_filter,
+                glob_precedence
+            ));
+        }
     }
 
     #[test]

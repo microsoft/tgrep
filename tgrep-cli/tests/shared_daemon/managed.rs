@@ -257,6 +257,20 @@ fn ordered_filters_and_replacements_use_managed_views() {
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
     assert_compat_queries(&fixture.a.join("compat"), "(via shared daemon v2)");
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    assert_filter_order_follows_request(|query| {
+        retry_busy(
+            &daemon,
+            "search",
+            json!({
+                "root":view["root"],"view":view["view"],"expected_version":view["version"],
+                "query":query
+            }),
+        )
+    });
     daemon.rpc(
         "views.detach",
         json!({"owner":claim.owner,"lease":"managed-client"}),

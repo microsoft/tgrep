@@ -557,6 +557,12 @@ fn ordered_filters_and_replacements_use_shared_views() {
     let before = d.lookup(&f.a)["queries"].as_u64().unwrap();
     let queries = assert_compat_queries(&f.a.join("compat"), "(via shared daemon v1)");
     assert_eq!(d.lookup(&f.a)["queries"], before + queries);
+    assert_filter_order_follows_request(|query| {
+        d.rpc(
+            "search",
+            json!({"root":f.a,"view":lease["view"],"query":query}),
+        )
+    });
     d.rpc(
         "detach",
         json!({"root":f.a,"view":lease["view"],"lease":lease["lease"]}),
@@ -627,6 +633,42 @@ fn assert_compat_queries(root: &Path, marker: &str) -> u64 {
         assert!(!stderr.contains("unavailable"), "{args:?}: {stderr}");
     }
     queries
+}
+
+/// A client that predates ordered filters sends type flags and globs without
+/// asking for ripgrep's precedence, and expects a file to pass both. One that
+/// asks gets a positive glob overriding the type flags.
+fn assert_filter_order_follows_request(search: impl Fn(Value) -> Value) {
+    for (filters, legacy, ordered) in [
+        (
+            json!({"types":["rust"],"glob":["*.txt"]}),
+            &[][..],
+            &["compat/a.txt"][..],
+        ),
+        (
+            json!({"types_not":["rust"],"glob":["*.rs","*.txt"]}),
+            &["compat/a.txt"][..],
+            &["compat/a.rs", "compat/a.txt"][..],
+        ),
+    ] {
+        let mut query = filters;
+        query["pattern"] = json!("needle");
+        for (request, expected) in [(None, legacy), (Some(false), legacy), (Some(true), ordered)] {
+            if let Some(request) = request {
+                query["ordered_filters"] = json!(request);
+            }
+            let result = search(query.clone());
+            assert_eq!(result["ordered_filters"], true, "{result}");
+            let mut files: Vec<&str> = result["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["file"].as_str().unwrap())
+                .collect();
+            files.sort_unstable();
+            assert_eq!(files, expected, "{query}");
+        }
+    }
 }
 
 #[test]

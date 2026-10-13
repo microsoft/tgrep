@@ -559,6 +559,53 @@ fn reported_word_and_line_flags_use_the_last_occurrence() {
 }
 
 #[test]
+fn word_boundary_patterns_print_each_matching_line_once() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("words.txt"), "aaa\nbbb\n").unwrap();
+    fs::write(root.join("punct.txt"), "!!\nbbb\n").unwrap();
+    fs::write(root.join("tail.txt"), "x\nbbb").unwrap();
+
+    tgrep()
+        .args(["--no-index", "--color", "never", r"\b"])
+        .arg(root.join("words.txt"))
+        .assert()
+        .success()
+        .stdout("aaa\nbbb\n");
+
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (pattern, glob, expected) in [
+            // An empty match at offset 0.
+            (r"\b", "words.txt", "1:aaa\n2:bbb\n"),
+            // An empty match at the start of a later line.
+            (r"\<", "punct.txt", "2:bbb\n"),
+            // The `\<` before `bbb` is hidden behind the `\n` that `\s` matched.
+            (r"\s|\<", "tail.txt", "1:x\n2:bbb\n"),
+        ] {
+            tgrep()
+                .args(backend)
+                .args([
+                    "--stats",
+                    "--color",
+                    "never",
+                    "--no-filename",
+                    "-n",
+                    "-g",
+                    glob,
+                    "--",
+                    pattern,
+                ])
+                .arg(&root)
+                .assert()
+                .success()
+                .stdout(expected)
+                .stderr(predicate::str::contains(marker));
+        }
+    });
+}
+
+#[test]
 fn reported_multiline_preserves_adjacent_matches_in_every_output() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");

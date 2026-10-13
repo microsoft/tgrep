@@ -1590,9 +1590,15 @@ fn pattern_is_anchor_free(pattern: &str) -> bool {
 /// match *spans* is a candidate, not just the line it starts on: `find_iter`
 /// yields leftmost non-overlapping matches, so a match beginning on an earlier
 /// line can be the one that covers this line's match, and a pattern that can
-/// cross `\n` (via `\s`, a negated class, or `-s`) can span several. Under those
-/// rules every line that really matches is covered, and the per-line matcher
-/// still has the final say, so extra candidates cost time and never accuracy.
+/// cross `\n` (via `\s`, a negated class, or `-s`) can span several.
+///
+/// A match covers the lines from its start offset through its end offset. A
+/// zero-length match, like those of `\b` and `\<`, covers only the line it sits
+/// on. A match ending just past a `\n` also covers the next line: `find_iter`
+/// never yields an empty match where the previous match ended, so it may have
+/// hidden one at that line's start (`\<` in `\s|\<`). Under those rules every
+/// line that really matches is covered, and the per-line matcher still has the
+/// final say, so extra candidates cost time and never accuracy.
 fn candidate_lines<'a>(
     content: &'a str,
     index: &'a LineIndex<'a>,
@@ -1611,20 +1617,18 @@ fn candidate_lines<'a>(
         return None;
     }
     // A pattern that matches the empty string matches at every offset, so the
-    // prescan would yield every line and the real loop is cheaper.
+    // prescan would yield every line and the real loop is cheaper. Patterns
+    // like `\b` still match empty at some offsets; the spans below allow that.
     if re.is_match("") {
         return None;
     }
 
+    // Each match starts at or after the previous one's end, so lines arrive in
+    // non-decreasing order and dropping repeats leaves them strictly ascending.
     let mut last: Option<usize> = None;
     Some(
         re.find_iter(content)
-            .flat_map(move |m| {
-                let first = index.line_of(m.start());
-                // Matches are non-empty here, so `end - 1` is inside the match.
-                let last_line = index.line_of(m.end() - 1);
-                first..=last_line
-            })
+            .flat_map(move |m| index.line_of(m.start())..=index.line_of(m.end()))
             .filter(move |&li| {
                 let fresh = last != Some(li);
                 if fresh {
@@ -1883,6 +1887,14 @@ mod tests {
             "(?i)ABC",
             r"\d+",
             "xyz",
+            r"\b",
+            r"\<",
+            r"\>",
+            r"\b{start}",
+            r"\b{end}",
+            r"\s|\<",
+            r"\W|\<",
+            r"\b|zzz",
         ];
         let haystacks = [
             "",
@@ -1899,6 +1911,9 @@ mod tests {
             "12\n34a\n\n56\n",
             "no matches at all\nnothing here\n",
             "a\n\n\na\n",
+            "x\nbbb",
+            "!!\nbbb\n",
+            " aaa\nbbb\n",
         ];
 
         for pat in patterns {
@@ -1994,6 +2009,32 @@ mod tests {
             .collect();
         assert!(proposed.contains(&0));
         assert!(proposed.contains(&1));
+    }
+
+    #[test]
+    fn prescan_covers_zero_length_matches() {
+        // `\b` and `\<` match empty at a word's edge but never match `""` on
+        // their own, so they take the prescan. An empty match at offset 0 has
+        // no byte before its end, and one at a later line's start has that byte
+        // on the previous line. `find_iter` also skips the empty `\<` match
+        // right after the `\n` that `\s` matched in `\s|\<`, so only where that
+        // `\n` match ends puts line 1 forward.
+        let opts = MatchOptions::default();
+        for (pattern, hay, want) in [
+            (r"\b", "aaa\nbbb\n", &[0, 1][..]),
+            (r"\<", "!!\nbbb\n", &[1][..]),
+            (r"\s|\<", "x\nbbb", &[0, 1][..]),
+        ] {
+            let index = LineIndex::new(hay);
+            let matcher = SearchMatcher::standard(regex::Regex::new(pattern).unwrap(), false);
+            assert!(
+                candidate_lines(hay, &index, &matcher, &opts).is_some(),
+                "{pattern:?} should take the prescan"
+            );
+            let hits = collect_hits(hay, &index, &matcher, &opts).unwrap();
+            let got: Vec<usize> = hits.iter().map(|h| h.idx).collect();
+            assert_eq!(got, want, "{pattern:?} on {hay:?}");
+        }
     }
 
     //

@@ -358,16 +358,23 @@ impl SearchOptions {
     /// command-line order, and a positive glob overriding `-t`/`-T`. Otherwise
     /// a server's legacy order, which applies every `-T` after every `-t` and
     /// requires a file to pass both the globs and the types, gives the same
-    /// result.
+    /// result. Without a `-t`/`-T`, the type filter admits every file however
+    /// the definitions are ordered.
     fn needs_ordered_filters(&self) -> Result<bool> {
-        let selects = self.type_ops.iter().any(|op| {
+        Ok(self.selects_types()
+            && (!filetypes::TypeOp::is_unordered_equivalent(&self.type_ops)
+                || self.glob_filter()?.has_includes()))
+    }
+
+    /// Whether any `-t`/`-T` was given, the only flags that consume
+    /// `--type-add`/`--type-clear` definitions.
+    fn selects_types(&self) -> bool {
+        self.type_ops.iter().any(|op| {
             matches!(
                 op,
                 filetypes::TypeOp::Select(_) | filetypes::TypeOp::Negate(_)
             )
-        });
-        Ok(!filetypes::TypeOp::is_unordered_equivalent(&self.type_ops)
-            || (selects && self.glob_filter()?.has_includes()))
+        })
     }
 
     fn effective_passthru(&self) -> bool {
@@ -890,6 +897,10 @@ pub fn run(
         .unwrap_or_else(|| builder::default_index_dir(&root));
 
     let ci = opts.effective_case_insensitive()?;
+    // ripgrep rejects an invalid `--type-add` before searching, even one that
+    // no `-t`/`-T` uses. A server is not sent definitions that no selection
+    // consumes, so it cannot be left to reject them.
+    opts.type_filter()?;
 
     let selected = crate::serve::shared::Client::selected(&root, opts.shared, index_path);
     if !matches!(selected, Ok(false)) {
@@ -1081,9 +1092,13 @@ fn server_search_request(
         .split_first()
         .map(|(p, rest)| (p.clone(), rest.to_vec()))
         .unwrap_or_else(|| (opts.pattern.clone(), Vec::new()));
+    // Definitions that no `-t`/`-T` consumes cannot change the result, and a
+    // server rebuilding them in its legacy order could reject a valid
+    // sequence, so they are left out. `run` has already validated them.
+    let selects = opts.selects_types();
     let (mut types, mut types_not, mut type_add, mut type_clear) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for op in &opts.type_ops {
+    for op in opts.type_ops.iter().filter(|_| selects) {
         match op {
             filetypes::TypeOp::Select(name) => types.push(name),
             filetypes::TypeOp::Negate(name) => types_not.push(name),
@@ -1161,7 +1176,7 @@ fn server_search_request(
     }
     // The per-kind arrays above lose the order between kinds. Send the ordered
     // form only when that order changes the result.
-    if !filetypes::TypeOp::is_unordered_equivalent(&opts.type_ops) {
+    if selects && !filetypes::TypeOp::is_unordered_equivalent(&opts.type_ops) {
         request["params"]["type_ops"] = type_ops_to_json(&opts.type_ops);
     }
     // A server keeps its legacy filter order for clients that do not ask for
@@ -3367,6 +3382,44 @@ mod tests {
             assert!(require_ordered_filters(&serde_json::json!({}), &request).is_ok());
         }
 
+        // Definitions that no `-t`/`-T` consumes cannot change the result in
+        // any order, so a server is not sent them at all.
+        for opts in [
+            filter_options(&[("add", "rust:*.txt"), ("clear", "rust")], &[], &[]),
+            filter_options(
+                &[("add", "foo:include:rust"), ("clear", "rust")],
+                &["*.txt"],
+                &[],
+            ),
+            filter_options(&[("add", "foo:*.txt")], &["*.txt"], &[]),
+        ] {
+            let params = params(&opts);
+            assert!(params.get("ordered_filters").is_none(), "{params}");
+            assert!(params.get("type_ops").is_none(), "{params}");
+            for name in ["types", "types_not", "type_add", "type_clear"] {
+                assert_eq!(params[name], serde_json::json!([]), "{name}: {params}");
+            }
+        }
+        // A `-t` or a `-T` keeps the definitions it may consume.
+        for (kind, name) in [("select", "types"), ("negate", "types_not")] {
+            let params = params(&filter_options(
+                &[("clear", "rust"), ("add", "foo:*.foo"), (kind, "foo")],
+                &[],
+                &[],
+            ));
+            assert_eq!(params[name], serde_json::json!(["foo"]), "{params}");
+            assert_eq!(
+                params["type_add"],
+                serde_json::json!(["foo:*.foo"]),
+                "{params}"
+            );
+            assert_eq!(
+                params["type_clear"],
+                serde_json::json!(["rust"]),
+                "{params}"
+            );
+        }
+
         // A positive glob overrides a selection, which a legacy server would
         // let veto the files that glob includes.
         for opts in [
@@ -3383,11 +3436,24 @@ mod tests {
         // Type flags whose order matters also need a server that honours it.
         for opts in [
             filter_options(&[("negate", "rust"), ("select", "rust")], &[], &[]),
-            filter_options(&[("add", "rust:*.txt"), ("clear", "rust")], &[], &[]),
+            filter_options(
+                &[
+                    ("add", "foo:*.txt"),
+                    ("clear", "foo"),
+                    ("add", "foo:*.rs"),
+                    ("select", "foo"),
+                ],
+                &[],
+                &[],
+            ),
         ] {
             let params = params(&opts);
             assert_eq!(params["ordered_filters"], true, "{params}");
-            assert!(params["type_ops"].is_array(), "{params}");
+            assert_eq!(
+                params["type_ops"],
+                type_ops_to_json(&opts.type_ops),
+                "{params}"
+            );
         }
     }
 

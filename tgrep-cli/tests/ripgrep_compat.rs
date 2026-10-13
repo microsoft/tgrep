@@ -883,6 +883,49 @@ fn reported_type_definitions_follow_argument_order() {
     }
 }
 
+/// ripgrep rejects an invalid `--type-add` before searching, even one that no
+/// `-t`/`-T` uses, and definitions that nothing selects leave every file in.
+/// A server is not sent unselected definitions, so the client has to reject
+/// them itself rather than report a server failure and fall back.
+#[test]
+fn unselected_type_definitions_are_validated_but_do_not_filter() {
+    let (dir, root, rs, txt) = type_fixture();
+    let both = format!("{rs}{txt}");
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for flags in [
+            vec!["--type-add", "foo:*.x", "--type-clear", "foo"],
+            vec!["--type-add", "foo:include:rust", "--type-clear", "rust"],
+            // Only a selected type's globs are compiled.
+            vec!["--type-add", "foo:["],
+        ] {
+            assert_selected_files(backend, marker, &root, &flags, &both);
+        }
+        for (flags, error) in [
+            (
+                vec!["--type-add", "bogus"],
+                "invalid --type-add value `bogus`: expected `name:glob`",
+            ),
+            (
+                vec!["--type-clear", "rust", "--type-add", "foo:include:rust"],
+                "invalid --type-add value `foo:include:rust`: unrecognized file type `rust`",
+            ),
+        ] {
+            for listing in [&["-l", "--", "needle"][..], &["--files"][..]] {
+                tgrep()
+                    .args(backend)
+                    .args(["--color", "never"])
+                    .args(&flags)
+                    .args(listing)
+                    .arg(&root)
+                    .assert()
+                    .code(2)
+                    .stdout("")
+                    .stderr(format!("tgrep: {error}\n"));
+            }
+        }
+    });
+}
+
 #[test]
 fn reported_multiline_replace_rewrites_cross_line_matches() {
     let dir = TempDir::new().unwrap();
@@ -2441,6 +2484,21 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
             Some("JSON replacements"),
             None,
         ),
+        // Definitions that no `-t`/`-T` consumes are not sent at all, so an
+        // older server cannot rebuild them in its own order and reject them.
+        (
+            vec![
+                "--no-filename",
+                "--type-add",
+                "foo:include:rust",
+                "--type-clear",
+                "rust",
+            ],
+            "needle",
+            &[][..],
+            None,
+            Some(stale.as_str()),
+        ),
         // A pattern that cannot match a line terminator prints line by line
         // either way, and JSON without submatches has nothing to report.
         (
@@ -2508,6 +2566,15 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
                         fields.contains(&name),
                         "{name}: {request}"
                     );
+                }
+                if !flags.iter().any(|flag| matches!(*flag, "-t" | "-T")) {
+                    for name in ["types", "types_not", "type_add", "type_clear"] {
+                        assert_eq!(
+                            request["params"][name],
+                            serde_json::json!([]),
+                            "{name}: {request}"
+                        );
+                    }
                 }
                 // A server that predates them ignores the fields and answers
                 // the old way, without acknowledging them. Inverted lines

@@ -349,7 +349,7 @@ impl SearchOptions {
         self.replace_blocks()
             && self
                 .matcher(ci)
-                .map_or(true, |matcher| matcher.can_match_newline(self.dotall()))
+                .map_or(true, |matcher| matcher.can_match_newline())
     }
 
     /// `--json --replace`: report each submatch's replacement beside it.
@@ -421,7 +421,6 @@ impl SearchOptions {
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
             all_spans: self.wants_match_detail(),
-            dotall: self.dotall(),
             replace_blocks: self.replace_blocks(),
             report_replacements: self.report_replacements(),
         }
@@ -2905,7 +2904,7 @@ mod tests {
 
     #[test]
     fn quiet_file_selection_distinguishes_nonmatching_and_skipped_files() {
-        let matcher = SearchMatcher::Standard(regex::Regex::new("needle").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new("needle").unwrap(), false);
         for (content, explicit, binary, matched, without_match) in [
             ("needle\n", false, false, true, false),
             ("other\n", false, false, false, true),

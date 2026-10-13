@@ -810,9 +810,6 @@ struct SearchOpts {
     stats: bool,
     /// Return original per-file totals even when diagnostics are not requested.
     count_matches: bool,
-    /// `--multiline-dotall`, which decides whether `-U --replace` rewrites
-    /// whole blocks of lines.
-    dotall: bool,
     /// Render `-U --replace` as ripgrep's multiline printer does. Only sent by
     /// clients that print text lines and understand block rows.
     multiline_replace: bool,
@@ -840,7 +837,6 @@ impl SearchOpts {
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
             all_spans: self.detail || self.stats || self.count_matches,
-            dotall: self.dotall,
             replace_blocks: self.multiline_replace,
             report_replacements: self.report_replacements,
         }
@@ -1821,7 +1817,6 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
                 .get("count_matches")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
-            dotall: multiline_dotall,
             // Older clients neither send these nor understand the rows they
             // produce, so absence keeps today's line-by-line rendering.
             multiline_replace: params

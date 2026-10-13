@@ -442,7 +442,16 @@ fn line_replacements(
 /// The compiled pattern. `regex` handles almost everything and is linear-time;
 /// `fancy_regex` is the fallback for backreferences and lookaround.
 pub enum SearchMatcher {
-    Standard(regex::Regex),
+    Standard {
+        re: regex::Regex,
+        /// `--multiline-dotall`, which `re` was compiled with but does not
+        /// expose, and which decides whether `.` can match a line terminator.
+        dotall: bool,
+        /// [`can_match_newline`](Self::can_match_newline), worked out the
+        /// first time it is asked. It depends only on the pattern, so every
+        /// later file, on any thread, reuses it instead of parsing again.
+        newline: std::sync::OnceLock<bool>,
+    },
     /// A backtracking match, optionally gated by a linear-time prefilter.
     ///
     /// `fancy_regex` already delegates to `regex` when a pattern needs nothing
@@ -463,8 +472,17 @@ pub enum SearchMatcher {
 }
 
 impl SearchMatcher {
+    /// The linear-time matcher for `re`, which was compiled with `dotall`.
+    pub fn standard(re: regex::Regex, dotall: bool) -> Self {
+        Self::Standard {
+            re,
+            dotall,
+            newline: std::sync::OnceLock::new(),
+        }
+    }
+
     pub fn is_standard(&self) -> bool {
-        matches!(self, Self::Standard(_))
+        matches!(self, Self::Standard { .. })
     }
 
     /// Whether the prefilter has already ruled this haystack out.
@@ -477,7 +495,7 @@ impl SearchMatcher {
 
     pub fn is_match(&self, hay: &str) -> Result<bool> {
         match self {
-            Self::Standard(re) => Ok(re.is_match(hay)),
+            Self::Standard { re, .. } => Ok(re.is_match(hay)),
             Self::Fancy { re, prefilter } => {
                 if Self::ruled_out(prefilter, hay) {
                     return Ok(false);
@@ -492,7 +510,7 @@ impl SearchMatcher {
     pub fn find_spans(&self, hay: &str) -> Result<Vec<(usize, usize)>> {
         let mut spans: Vec<(usize, usize)> = Vec::new();
         match self {
-            Self::Standard(re) => {
+            Self::Standard { re, .. } => {
                 for m in re.find_iter(hay) {
                     spans.push((m.start(), m.end()));
                 }
@@ -516,7 +534,7 @@ impl SearchMatcher {
     /// that only need to know whether the line matched and where it starts.
     pub fn find_first_span(&self, hay: &str) -> Result<Option<(usize, usize)>> {
         match self {
-            Self::Standard(re) => Ok(re.find(hay).map(|m| (m.start(), m.end()))),
+            Self::Standard { re, .. } => Ok(re.find(hay).map(|m| (m.start(), m.end()))),
             Self::Fancy { re, prefilter } => {
                 if Self::ruled_out(prefilter, hay) {
                     return Ok(None);
@@ -568,7 +586,7 @@ impl SearchMatcher {
     ) -> Result<Vec<Expansion>> {
         let mut out = Vec::new();
         match self {
-            Self::Standard(re) => {
+            Self::Standard { re, .. } => {
                 for caps in re.captures_iter(hay).take(limit) {
                     let m = caps.get(0).expect("group 0 always participates");
                     let mut dst = String::new();
@@ -599,18 +617,25 @@ impl SearchMatcher {
     /// results printed as blocks. Like ripgrep, line anchors count as able to
     /// match `\n`. The backtracking engine is never analysed, which ripgrep's
     /// PCRE2 matcher does not do either, so it always counts.
-    pub fn can_match_newline(&self, dotall: bool) -> bool {
-        let Self::Standard(re) = self else {
+    pub fn can_match_newline(&self) -> bool {
+        let Self::Standard {
+            re,
+            dotall,
+            newline,
+        } = self
+        else {
             return true;
         };
-        regex_syntax::ParserBuilder::new()
-            .nest_limit(250)
-            .utf8(false)
-            .multi_line(true)
-            .dot_matches_new_line(dotall)
-            .build()
-            .parse(re.as_str())
-            .map_or(true, |hir| hir_can_match_newline(&hir))
+        *newline.get_or_init(|| {
+            regex_syntax::ParserBuilder::new()
+                .nest_limit(250)
+                .utf8(false)
+                .multi_line(true)
+                .dot_matches_new_line(*dotall)
+                .build()
+                .parse(re.as_str())
+                .map_or(true, |hir| hir_can_match_newline(&hir))
+        })
     }
 }
 
@@ -705,7 +730,7 @@ pub fn build_search_matcher(patterns: &[String], cfg: &MatcherConfig) -> Result<
 
     let combined = combine_patterns(patterns, cfg, false);
     match build_regex(&combined, cfg) {
-        Ok(re) => Ok(SearchMatcher::Standard(re)),
+        Ok(re) => Ok(SearchMatcher::standard(re, cfg.dotall)),
         // Exceeding `--regex-size-limit`/`--dfa-size-limit` is a resource error,
         // not an unsupported construct. Retrying on the backtracking engine
         // would silently ignore the limit the user asked for.
@@ -956,9 +981,6 @@ pub struct MatchOptions {
     /// search only needs to know the line matched at all. Scanning the rest of
     /// each matching line is pure overhead in that case, so this turns it off.
     pub all_spans: bool,
-    /// `--multiline-dotall`, which decides whether `.` lets a match cross a
-    /// line and so whether `-U --replace` has to rewrite whole blocks.
-    pub dotall: bool,
     /// Render `-U --replace` the way ripgrep's multiline printer does: rewrite
     /// every match inside the block of lines it covers, then print the result
     /// line by line. Only text output prints those blocks; JSON keeps its
@@ -1066,9 +1088,7 @@ impl<'a> FileMatches<'a> {
                     hits
                 }
                 Some(rep)
-                    if opts.replace_blocks
-                        && !spans.is_empty()
-                        && matcher.can_match_newline(opts.dotall) =>
+                    if opts.replace_blocks && !spans.is_empty() && matcher.can_match_newline() =>
                 {
                     let reps = matcher.expansions_upto(content, rep, spans.len())?;
                     blocks = ReplaceBlock::build(&index, content, reps);
@@ -1584,7 +1604,7 @@ fn candidate_lines<'a>(
     if opts.stop_on_nonmatch {
         return None;
     }
-    let SearchMatcher::Standard(re) = matcher else {
+    let SearchMatcher::Standard { re, .. } = matcher else {
         return None;
     };
     if !pattern_is_anchor_free(re.as_str()) {
@@ -1775,7 +1795,7 @@ mod tests {
 
     #[test]
     fn stats_keep_original_multiline_matches_and_physical_lines() {
-        let matcher = SearchMatcher::Standard(regex::Regex::new(r"hello\nworld").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new(r"hello\nworld").unwrap(), false);
         for vimgrep in [false, true] {
             let found = FileMatches::find(
                 "hello\nworld\n",
@@ -1796,7 +1816,7 @@ mod tests {
 
     #[test]
     fn multiline_empty_matches_do_not_create_a_phantom_trailing_line() {
-        let matcher = SearchMatcher::Standard(regex::Regex::new("").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new("").unwrap(), false);
         for (content, matches, lines) in [("", 0, 0), ("\n", 1, 1), ("aa\n", 3, 1), ("aa", 3, 1)] {
             for max_count in [None, Some(1)] {
                 let found = FileMatches::find(
@@ -1883,7 +1903,7 @@ mod tests {
 
         for pat in patterns {
             let re = regex::Regex::new(pat).expect("test pattern compiles");
-            let matcher = SearchMatcher::Standard(re);
+            let matcher = SearchMatcher::standard(re, false);
             for hay in haystacks {
                 let index = LineIndex::new(hay);
                 let opts = MatchOptions::default();
@@ -1929,7 +1949,7 @@ mod tests {
     #[test]
     fn prescan_respects_max_count_and_stop_on_nonmatch() {
         let hay = "hit\nhit\nmiss\nhit\n";
-        let matcher = SearchMatcher::Standard(regex::Regex::new("hit").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new("hit").unwrap(), false);
         let index = LineIndex::new(hay);
 
         let opts = MatchOptions {
@@ -1956,7 +1976,7 @@ mod tests {
         // propose every line at the cost of an extra pass.
         let hay = "a\nb\n";
         let index = LineIndex::new(hay);
-        let matcher = SearchMatcher::Standard(regex::Regex::new("x*").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new("x*").unwrap(), false);
         let opts = MatchOptions::default();
         assert!(candidate_lines(hay, &index, &matcher, &opts).is_none());
     }
@@ -1967,7 +1987,7 @@ mod tests {
         // both have to be offered.
         let hay = "a \n b\nzzz\n";
         let index = LineIndex::new(hay);
-        let matcher = SearchMatcher::Standard(regex::Regex::new(r"\s+").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new(r"\s+").unwrap(), false);
         let opts = MatchOptions::default();
         let proposed: Vec<usize> = candidate_lines(hay, &index, &matcher, &opts)
             .expect("anchor-free and non-empty")
@@ -2435,9 +2455,22 @@ mod tests {
                 },
             )
             .unwrap();
+            // Worked out once, on first use, from the `dotall` the pattern was
+            // compiled with.
+            let SearchMatcher::Standard { newline, .. } = &matcher else {
+                panic!("{pattern:?} should use the linear-time engine");
+            };
+            assert_eq!(newline.get(), None, "{pattern:?} dotall={dotall}");
+            for _ in 0..2 {
+                assert_eq!(
+                    matcher.can_match_newline(),
+                    expected,
+                    "{pattern:?} dotall={dotall}"
+                );
+            }
             assert_eq!(
-                matcher.can_match_newline(dotall),
-                expected,
+                newline.get(),
+                Some(&expected),
                 "{pattern:?} dotall={dotall}"
             );
         }
@@ -2451,7 +2484,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(fancy.can_match_newline(false));
+        assert!(fancy.can_match_newline());
     }
 
     #[test]
@@ -2540,7 +2573,7 @@ mod tests {
 
     #[test]
     fn json_replace_reports_source_text_beside_each_replacement() {
-        let matcher = SearchMatcher::Standard(regex::Regex::new("(l+)|(o)").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new("(l+)|(o)").unwrap(), false);
         for multiline in [false, true] {
             let opts = MatchOptions {
                 multiline,

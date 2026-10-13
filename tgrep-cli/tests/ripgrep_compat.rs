@@ -1043,6 +1043,32 @@ fn reported_multiline_replace_rewrites_cross_line_matches() {
     });
 }
 
+/// ripgrep reports no match in an empty file, not even a zero-width one, so
+/// `-U --replace` has no block to rewrite and context has nothing to surround.
+#[test]
+fn multiline_replace_never_matches_an_empty_file() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("empty.txt"), "").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for pattern in ["^", r"\A", "(?s).*"] {
+            for context in [&[][..], &["-C1"], &["-A1"], &["-B1"]] {
+                tgrep()
+                    .args(backend)
+                    .args(["--stats", "--color", "never", "-U", "-r", "X"])
+                    .args(context)
+                    .args(["--", pattern])
+                    .arg(&root)
+                    .assert()
+                    .code(1)
+                    .stdout("")
+                    .stderr(predicate::str::contains(marker));
+            }
+        }
+    });
+}
+
 /// Searching one file at a time, as it does under `--sort`, ripgrep writes a
 /// file's separator (its path, with `--heading`) before it renders the file's
 /// first block, and a context break before any block that does not follow on

@@ -332,8 +332,13 @@ impl SearchOptions {
 
     /// Whether `-U --replace` may rewrite whole blocks of lines, as ripgrep's
     /// multiline printer does when the pattern can match a line terminator.
+    /// `-m0` prints no lines, so it has no block to rewrite.
     fn replace_blocks(&self) -> bool {
-        self.multiline && self.replace.is_some() && !self.invert_match && self.prints_text_lines()
+        self.multiline
+            && self.replace.is_some()
+            && !self.invert_match
+            && self.prints_text_lines()
+            && self.max_count != Some(0)
     }
 
     /// Whether the output of a `-U --replace` search depends on blocks.
@@ -348,10 +353,15 @@ impl SearchOptions {
     }
 
     /// `--json --replace`: report each submatch's replacement beside it.
-    /// Inverted searches print no submatches, not even on context lines, and
-    /// `-q` prints only the summary, so neither has a replacement to report.
+    /// Inverted searches print no submatches, not even on context lines, `-q`
+    /// prints only the summary and `-m0` prints no lines, so none of them has
+    /// a replacement to report.
     fn report_replacements(&self) -> bool {
-        self.json && self.replace.is_some() && !self.invert_match && !self.quiet
+        self.json
+            && self.replace.is_some()
+            && !self.invert_match
+            && !self.quiet
+            && self.max_count != Some(0)
     }
 
     /// Whether the result depends on ripgrep's filter order: type flags in
@@ -3247,6 +3257,15 @@ mod tests {
                 o.json = true;
                 o.quiet = true;
             }),
+            // `-m0` prints no lines at all.
+            with(|o| {
+                o.multiline = true;
+                o.max_count = Some(0);
+            }),
+            with(|o| {
+                o.json = true;
+                o.max_count = Some(0);
+            }),
         ] {
             let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
             let params = &request["params"];
@@ -3257,6 +3276,10 @@ mod tests {
 
         for opts in [
             with(|o| o.multiline = true),
+            with(|o| {
+                o.multiline = true;
+                o.max_count = Some(1);
+            }),
             with(|o| {
                 o.multiline = true;
                 o.only_matching = true;
@@ -3299,6 +3322,10 @@ mod tests {
         // predating it would not, whatever the pattern can match.
         for opts in [
             with(|o| o.json = true),
+            with(|o| {
+                o.json = true;
+                o.max_count = Some(1);
+            }),
             with(|o| {
                 o.json = true;
                 o.multiline = true;

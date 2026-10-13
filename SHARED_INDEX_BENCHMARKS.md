@@ -8,6 +8,10 @@ migration/collection or runtime integration. The separate
 [managed lifecycle protocol](#managed-lifecycle-measurements) qualifies the
 new lifecycle without relabeling these baseline results.
 
+V1 is deprecated as of tgrep 1.2.1 but remains supported; new integrations should
+use [managed v2](README.md#managed-shared-lifecycle-opt-in). The historical v1
+measurements and their pinned controls remain unchanged.
+
 ## Managed lifecycle measurements
 
 [`managed_performance.rs`](tgrep-cli/tests/shared_daemon/managed_performance.rs)

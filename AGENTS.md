@@ -64,8 +64,53 @@ Check that a server is up:
 tgrep status .
 ```
 
+### Shared daemons: managed v2 recommended
+
+For new linked-worktree integrations, start **one opt-in managed v2 repository
+daemon** with `tgrep serve --shared <root> --shared-storage <existing trusted
+external directory> --shared-policy <policy-file>`. Supply a complete
+[managed policy](SHARED_WORKTREE_INDEXES.md#managed-policy) and follow the
+[managed startup example](README.md#managed-shared-lifecycle-opt-in).
+It runs in the foreground; keep it supervised. Managed v2 remains an explicit
+opt-in: omitting `--shared-policy` still starts deprecated v1.
+
+Follow the [managed lifecycle contract](SHARED_WORKTREE_INDEXES.md#managed-client-contract).
+Use `shared manage` to negotiate capabilities and effective policy, persist
+operation/lease tokens, register an instance-bound owner guard, and attach a
+versioned view. `shared owner-hold --claim <issued-claim.json>` retains ownership
+until stdin closes; supervise that process too. Do not replace its guard with a
+PID check or inactivity timeout. Unknown ownership proof protects the lease.
+Normal queries discover a ready managed attachment without new search flags.
+Managed RPC also requires a per-daemon private credential; the CLI loads it
+automatically from an owner-only file. Public namespace/instance IDs are not
+credentials. Do not copy the private file into logs or bypass authentication.
+
+Managed advancement is version-checked and may be adaptive under explicit
+policy. Recover the authoritative current exact commit/version after a lost
+response or restart, rather than replaying the original starting commit as the
+current pin. New instances require new ownership and lease tokens. Detach all
+leases and wait for reader/root-handle drain before deleting the worktree.
+`shared discover` and `shared maintenance` inspect external namespaces even
+after Git is gone; collection requires explicit authorization and current
+versions. Never delete a cache directory as a substitute for managed collection.
+Legacy/unmanaged v1 storage remains retain-all.
+
+Moving an existing v1 integration to managed v2 requires this client lifecycle,
+not just a startup flag. Detach all v1 leases and drain in-flight operations
+before stopping v1, then establish new managed ownership and tokens.
+Use `shared manage` / `views.attach`, not v1 `shared attach`, for managed leases.
+Enabling v2 does not migrate or authorize collection of legacy storage.
+
+### Legacy v1 (deprecated, still supported)
+
+Shared daemon v1 is **deprecated as of tgrep 1.2.1**, not removed.
+No-policy startup emits one deprecation warning on stderr; stdout and protocol
+JSON remain unchanged. Existing clients and the fixed-pin/retain-all contract remain
+supported. Use managed v2 above for new integrations; the following is legacy
+compatibility guidance, not a change of default.
+
 For linked-worktree sessions, an agent runtime can instead start **one opt-in
-repository daemon** with `tgrep serve --shared <root> --shared-storage <existing
+legacy v1 daemon** with `tgrep serve --shared <root> --shared-storage <existing
 trusted external directory>`. It runs in the foreground; keep it supervised.
 Choose and retain a unique caller-owned token before calling `tgrep shared attach
 <worktree> --revision <starting-commit> --lease <token>` per session. Retry the
@@ -102,27 +147,7 @@ compatibility and retain-all storage. The runtime owns process lifetime and
 offline cleanup for this default v1 mode; its leases do not expire and its
 published cache is not collected.
 
-**Managed v2 is a separate opt-in.** A supervisor may supply `--shared-policy`
-to select the [managed lifecycle contract](SHARED_WORKTREE_INDEXES.md#managed-client-contract).
-Use `shared manage` to negotiate capabilities and effective policy, persist
-operation/lease tokens, register an instance-bound owner guard, and attach a
-versioned view. `shared owner-hold --claim <issued-claim.json>` retains ownership
-until stdin closes; supervise that process too. Do not replace its guard with a
-PID check or inactivity timeout. Unknown ownership proof protects the lease.
-Normal queries discover a ready managed attachment without new search flags.
-Managed RPC also requires a per-daemon private credential; the CLI loads it
-automatically from an owner-only file. Public namespace/instance IDs are not
-credentials. Do not copy the private file into logs or bypass authentication.
-
-Managed advancement is version-checked and may be adaptive under explicit
-policy. Recover the authoritative current exact commit/version after a lost
-response or restart, rather than replaying the original starting commit as the
-current pin. New instances require new ownership and lease tokens. Detach all
-leases and wait for reader/root-handle drain before deleting the worktree.
-`shared discover` and `shared maintenance` inspect external namespaces even
-after Git is gone; collection requires explicit authorization and current
-versions. Never delete a cache directory as a substitute for managed collection.
-Legacy/unmanaged v1 storage remains retain-all.
+### Without a supervised server
 
 If your agent framework cannot keep a background process alive, skip `serve`
 and run `tgrep index .` instead. Searches then use the on-disk index. That

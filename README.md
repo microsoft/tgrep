@@ -779,9 +779,18 @@ An agent runtime can explicitly attach linked Git worktrees to one repository
 daemon. They share an immutable committed-tree index and keep private overlays.
 Ordinary `serve`/`index` and unattached queries retain their existing behavior.
 Do **not** point ordinary servers at a shared `--index-path`.
-The commands in this section use the default **v1 retain-all, fixed-pin**
-contract. [Managed v2](#managed-shared-lifecycle-opt-in) adds explicit/adaptive
-advancement, owner lifetimes and collection without changing those defaults.
+**New shared-daemon integrations should use
+[managed v2](#managed-shared-lifecycle-opt-in)** with an explicit
+`--shared-policy <FILE>` and the managed client lifecycle.
+
+#### Legacy v1 (deprecated, still supported)
+
+Shared daemon v1 is **deprecated as of tgrep 1.2.1**, not removed.
+Omitting `--shared-policy` still selects v1 and emits one deprecation warning
+on stderr per daemon startup; stdout and protocol JSON are unchanged.
+Existing v1 clients retain the **retain-all, fixed-pin** contract below.
+This is staged retirement, not a silent switch to v2 or an implicit storage
+migration. No removal date or release is set.
 
 ```bash
 mkdir /trusted/external/tgrep-cache
@@ -898,7 +907,8 @@ for generic runtime integration.
 
 ### Managed shared lifecycle (opt-in)
 
-For active base advancement and reference-aware reclamation, start a v2 daemon
+**Recommended for new shared-daemon integrations.** Managed v2 adds owner
+lifetimes, optional base advancement and reference-aware reclamation. Start it
 with a complete [managed policy](SHARED_WORKTREE_INDEXES.md#managed-policy):
 
 ```bash
@@ -914,7 +924,8 @@ generations/checkpoints live in an isolated namespace with a transactional
 catalog and OS-backed reader protection. Old binaries and unguarded core readers
 cannot open its data, even when files are renamed to legacy names. Compatibility
 mode supports v1 clients but **never collects legacy generations**. Storage mode
-is immutable; omitting `--shared-policy` still selects the existing v1 daemon.
+is immutable; omitting `--shared-policy` still selects the deprecated, supported
+v1 daemon, not managed v2.
 Ordinary indexing, non-Git directories and unborn repositories are unchanged.
 
 A managed daemon authenticates every RPC with a rotating per-daemon credential
@@ -930,6 +941,14 @@ After attachment, normal search and `--files` discover that view. Do not use
 the v1 `shared attach` command to create a managed lease.
 The [v2 client contract](SHARED_WORKTREE_INDEXES.md#managed-client-contract)
 specifies complete request shapes, recovery and token acknowledgement.
+
+To migrate an existing integration, implement that client contract rather than
+only adding a startup flag. Detach all v1 leases and drain in-flight operations
+and root handles before stopping the v1 daemon. Start v2 with the explicit
+policy above, establish fresh ownership and tokens, and attach the intended
+exact revision through the managed lifecycle. Enabling v2 does not convert
+existing v1 stores or authorize their collection; legacy storage remains
+retain-all.
 
 `views.advance` prepares and reconciles a complete replacement while unrelated
 ready views continue serving. The current exact commit, physical generation,

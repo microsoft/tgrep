@@ -1,12 +1,18 @@
 # Shared worktree index design
 
 **Status:** shared readers, committed-tree generations, private reconciliation
-and the opt-in repository daemon are implemented. The default shared **v1**
-contract remains retain-all and fixed-pin. Explicit **managed v2** additionally
-provides atomic advancement, owner guards, reference-aware collection, allocations
-and storage-only maintenance. See the [managed contract](#managed-client-contract)
-below; the earlier sections describe the architecture and legacy v1 behavior.
-Ordinary single-root CLI/server behavior remains the default.
+and the opt-in repository daemon are implemented. **Managed v2 is recommended
+for new shared-daemon integrations** and provides atomic advancement, owner
+guards, reference-aware collection, allocations and storage-only maintenance.
+It requires an explicit `--shared-policy` file; see the
+[managed contract](#managed-client-contract) below.
+Shared **v1 is deprecated as of tgrep 1.2.1 but remains supported**:
+no-policy startup still selects its retain-all, fixed-pin contract and warns
+once on stderr. This patch does not remove v1, change its protocol/storage, or
+implicitly migrate or collect legacy data. No removal date or release is set.
+The earlier sections describe the architecture and legacy v1 behavior.
+Ordinary single-root CLI/server behavior remains the default and does not emit
+this deprecation warning.
 
 ## Goal and ownership
 
@@ -490,6 +496,12 @@ attached to the daemon described below.
 
 ## Daemon wire contract v1
 
+**Deprecated as of tgrep 1.2.1, still supported for existing clients.**
+New integrations should use the [managed v2 client contract](#managed-client-contract)
+with an explicit [policy](#managed-policy). The no-policy invocation below
+continues to select v1; its one-time startup warning goes only to stderr, never
+stdout or the RPC stream.
+
 Run `tgrep serve --shared ROOT --shared-storage EXISTING_EXTERNAL_DIRECTORY`.
 The runtime supervises this foreground process. `shared attach ROOT --revision
 REV --lease TOKEN`, `shared refresh ROOT --lease TOKEN [--changed REL ... | --full]`, and
@@ -726,7 +738,7 @@ The implemented increments are additive; shared serving requires explicit opt-in
 | [`Generation coverage`](tgrep-core/tests/generations.rs) | Temporary repositories/worktrees, thread/process races, content transformations, immutable old readers, errors and interrupted publication |
 | [`Worktree synchronization`](tgrep-core/src/worktrees.rs) | Pinned private views, actual-content verification, atomic readiness/membership, bounded invalidations, full repair and bound checkpoints |
 | [`Synchronization coverage`](tgrep-core/src/worktrees/tests.rs) | Real divergent worktrees, scan/candidate parity, CRLF/smudge/decoding, sparse/assume-unchanged, filtering, epochs, errors and extraction counts |
-| Shared CLI/daemon routing and native watchers | Versioned leases, discovery, bounded workers/watchers/hints, full repair, delta checkpoints, strict scan fallback |
+| Legacy v1 CLI/daemon routing and native watchers (deprecated, supported) | Versioned leases, discovery, bounded workers/watchers/hints, full repair, delta checkpoints, strict scan fallback |
 | [Managed lifecycle](tgrep-core/src/managed/mod.rs) | Isolated guarded storage, transactional catalog, owner lifetimes, versioned migration, allocation admission, bounded collection and offline maintenance |
 | [Managed CLI/RPC](tgrep-cli/src/serve/shared/managed.rs) | Negotiation, asynchronous operation receipts, owner holder, recovery, adaptive scheduling, live diagnostics and atomic idle shutdown |
 
@@ -760,7 +772,7 @@ trusted. The policy selects one immutable namespace storage kind:
 | --- | --- |
 | `managed` | Guarded generation/checkpoint format; published objects can be collected under bounded policy |
 | `compatibility-retain-all` | Adapter over legacy generation storage; v1 participants remain fixed-pin and legacy objects are never collected |
-| No policy file | Original v1 daemon, layout, flags, leases and retain-all behavior |
+| No policy file | Deprecated but supported v1 daemon, with unchanged layout, flags, leases and retain-all behavior |
 
 The managed namespace is `CACHE_PARENT/tgrep-managed-v2/<repository-id>`.
 Repository identity derives from the canonical native Git common-directory

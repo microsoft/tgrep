@@ -46,6 +46,35 @@ fn start(fixture: &Fixture, policy: &Value, watch: &[&str]) -> Daemon {
     fixture.start(&args)
 }
 
+#[test]
+fn startup_deprecation_is_absent_for_managed_v2() {
+    for storage in ["managed", "compatibility-retain-all"] {
+        let fixture = Fixture::new();
+        let mut policy = policy();
+        policy["storage"] = json!(storage);
+        let mut daemon = start(&fixture, &policy, &["--no-watch"]);
+        assert_eq!(daemon.marker["protocol"], 2);
+        let output = cli(&fixture.a, &["shared", "manage", ".", "hello"]);
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hello: Value = serde_json::from_str(&success(output)).unwrap();
+        assert_eq!(hello["ok"], true);
+        assert_eq!(hello["result"]["storage"], storage);
+        assert_eq!(daemon.rpc("hello", json!({}))["storage"], storage);
+
+        stop(&mut daemon);
+        assert!(daemon.child.wait().unwrap().success());
+        let stderr = fs::read_to_string(&daemon.log).unwrap();
+        assert!(!stderr.contains(V1_DEPRECATION), "{stderr}");
+        assert!(fs::read(&daemon.stdout_log).unwrap().is_empty());
+        drop(daemon);
+        fixture.temp.close().unwrap();
+    }
+}
+
 fn owner(daemon: &Daemon) -> (OwnerClaim, OwnerGuard) {
     let prepared = daemon.rpc(
         "owners.prepare",

@@ -865,8 +865,19 @@ fn reported_type_definitions_follow_argument_order() {
             None,
         ),
         (vec!["--type-add", "rust:*.txt"], Some("rust: *.rs, *.txt")),
+        // `--type-list` preempts any subcommand, and reads the type flags on
+        // both sides of it in command-line order.
+        (
+            vec!["--type-clear", "rust", "index", "--type-add", "rust:*.txt"],
+            Some("rust: *.txt"),
+        ),
+        (
+            vec!["--type-add", "rust:*.txt", "status", "--type-clear", "rust"],
+            None,
+        ),
     ] {
         let output = tgrep()
+            .current_dir(dir.path())
             .args(&flags)
             .arg("--type-list")
             .assert()

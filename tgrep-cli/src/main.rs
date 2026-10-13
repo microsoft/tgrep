@@ -875,22 +875,27 @@ impl Cli {
     /// Rebuild the flags whose relative order matters from their command-line
     /// positions. Clap stores each flag's values separately, and keeps only the
     /// deepest scope's values of a global flag, so neither `-T rust -t rust` nor
-    /// `-e foo search -e bar` survives in the parsed fields.
+    /// `-e foo search -e bar` survives in the parsed fields. Any subcommand,
+    /// nested or not, splits them the same way, and `--type-list` honors them
+    /// under every one.
     fn resolve_ordered_args(&mut self, matches: &clap::ArgMatches, args: &[std::ffi::OsString]) {
         let mut found = Vec::new();
-        let probe = matches!(matches.subcommand(), Some(("search", _)))
-            .then(|| Self::probe_search_scopes(args))
-            .flatten();
-        match &probe {
-            Some(probe) => {
-                // Clap restarts its indices in each subcommand, whose arguments
-                // all follow the parent's.
-                collect_ordered_args(probe, 0, &mut found);
-                if let Some(("search", search)) = probe.subcommand() {
-                    collect_ordered_args(search, 1, &mut found);
-                }
+        collect_ordered_args(matches, 0, &mut found);
+        // The root holds every scope's flags, but only the deepest scope's
+        // values of each.
+        if !found.is_empty()
+            && matches.subcommand().is_some()
+            && let Some(probe) = Self::probe_scopes(args)
+        {
+            found.clear();
+            // Clap restarts its indices in each subcommand, whose arguments
+            // all follow its parent's.
+            let chain = std::iter::successors(Some(&probe), |scope| {
+                scope.subcommand().map(|(_, subcommand)| subcommand)
+            });
+            for (depth, scope) in chain.enumerate() {
+                collect_ordered_args(scope, depth, &mut found);
             }
-            None => collect_ordered_args(matches, 0, &mut found),
         }
         found.sort_by_key(|&(scope, index, ..)| (scope, index));
 
@@ -942,10 +947,21 @@ impl Cli {
         }
     }
 
-    /// Re-parse a `search` invocation with the order-sensitive flags local to
-    /// each command, so the root and `search` matches each hold only their own
-    /// occurrences. Returns `None` if that parse fails.
-    fn probe_search_scopes(args: &[std::ffi::OsString]) -> Option<clap::ArgMatches> {
+    /// Re-parse with the order-sensitive flags local to every command, nested
+    /// ones included, so the matches at each level of the subcommand chain hold
+    /// only that command's own occurrences. Returns `None` if that parse fails.
+    fn probe_scopes(args: &[std::ffi::OsString]) -> Option<clap::ArgMatches> {
+        fn localize(command: clap::Command, local: &[clap::Arg]) -> clap::Command {
+            let names: Vec<String> = command
+                .get_subcommands()
+                .map(|subcommand| subcommand.get_name().to_owned())
+                .collect();
+            names.into_iter().fold(command, |command, name| {
+                command.mut_subcommand(name, |subcommand| {
+                    localize(subcommand.args(local.iter().cloned()), local)
+                })
+            })
+        }
         let mut command = Self::command();
         let local: Vec<clap::Arg> = command
             .get_arguments()
@@ -955,8 +971,7 @@ impl Cli {
         for id in ORDERED_ARGS {
             command = command.mut_arg(id, |arg| arg.global(false));
         }
-        command
-            .mut_subcommand("search", |search| search.args(local))
+        localize(command, &local)
             .try_get_matches_from(args.iter().cloned())
             .ok()
     }
@@ -1730,6 +1745,16 @@ mod tests {
                 vec!["search", "-f", "a", "-e", "foo", "-f", "b", "data"],
                 vec![file("a"), regexp("foo"), file("b")],
             ),
+            (
+                vec!["-e", "foo", "status", "-e", "bar"],
+                vec![regexp("foo"), regexp("bar")],
+            ),
+            (
+                vec![
+                    "-f", "a", "shared", "-e", "foo", "detach", "--lease", "t", "-f", "b", ".",
+                ],
+                vec![file("a"), regexp("foo"), file("b")],
+            ),
             (vec!["foo", "data"], vec![]),
         ] {
             let cli = parse(&args).unwrap();
@@ -1779,6 +1804,57 @@ mod tests {
                 ],
                 vec![Clear(s("rust")), Add(s("rust:*.txt")), Select(s("rust"))],
             ),
+            // `--type-list` reads these under any subcommand.
+            (
+                vec![
+                    "--type-clear",
+                    "rust",
+                    "index",
+                    "--type-add",
+                    "rust:*.txt",
+                    "--type-list",
+                ],
+                vec![Clear(s("rust")), Add(s("rust:*.txt"))],
+            ),
+            (
+                vec!["-t", "rust", "serve", "-T", "rust"],
+                vec![Select(s("rust")), Negate(s("rust"))],
+            ),
+            (
+                vec![
+                    "--type-add",
+                    "rust:*.txt",
+                    "count-files",
+                    "--type-clear",
+                    "rust",
+                    "-t",
+                    "rust",
+                ],
+                vec![Add(s("rust:*.txt")), Clear(s("rust")), Select(s("rust"))],
+            ),
+            (
+                vec![
+                    "-T",
+                    "rust",
+                    "shared",
+                    "--type-clear",
+                    "rust",
+                    "attach",
+                    "--revision",
+                    "x",
+                    "--type-add",
+                    "rust:*.txt",
+                    "-t",
+                    "rust",
+                    ".",
+                ],
+                vec![
+                    Negate(s("rust")),
+                    Clear(s("rust")),
+                    Add(s("rust:*.txt")),
+                    Select(s("rust")),
+                ],
+            ),
         ] {
             let cli = parse(&args).unwrap();
             assert_eq!(cli.type_ops, expected, "{args:?}");
@@ -1799,6 +1875,16 @@ mod tests {
             (vec!["-s", "search", "-i", "foo"], (true, false, false)),
             (vec!["-S", "search", "foo"], (false, false, true)),
             (vec!["search", "-i", "-S", "foo"], (false, false, true)),
+            (vec!["-i", "status", "-s"], (false, true, false)),
+            (vec!["-S", "index", "-i"], (true, false, false)),
+            (
+                vec!["-s", "shared", "-i", "detach", "--lease", "t", "-S", "."],
+                (false, false, true),
+            ),
+            (
+                vec!["-S", "shared", "-i", "detach", "--lease", "t", "."],
+                (true, false, false),
+            ),
         ] {
             let cli = parse(&args).unwrap();
             assert_eq!(

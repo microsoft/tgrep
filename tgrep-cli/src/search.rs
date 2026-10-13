@@ -336,9 +336,22 @@ impl SearchOptions {
         self.multiline && self.replace.is_some() && !self.invert_match && self.prints_text_lines()
     }
 
+    /// Whether the output of a `-U --replace` search depends on blocks.
+    /// `FileMatches::find` only builds them when the pattern can match a line
+    /// terminator; any other pattern prints line by line, just as a server
+    /// that predates blocks does. A pattern that does not compile counts.
+    fn needs_replace_blocks(&self, ci: bool) -> bool {
+        self.replace_blocks()
+            && self
+                .matcher(ci)
+                .map_or(true, |matcher| matcher.can_match_newline(self.dotall()))
+    }
+
     /// `--json --replace`: report each submatch's replacement beside it.
+    /// Inverted searches print no submatches, not even on context lines, and
+    /// `-q` prints only the summary, so neither has a replacement to report.
     fn report_replacements(&self) -> bool {
-        self.json && self.replace.is_some()
+        self.json && self.replace.is_some() && !self.invert_match && !self.quiet
     }
 
     fn effective_passthru(&self) -> bool {
@@ -883,12 +896,20 @@ pub fn run(
                 let result = client.view_request("search", &view, request["params"].clone())?;
                 require_server_coverage(&result)?;
                 require_ordered_filters(&result, opts)?;
-                require_replace_support(&result, opts)?;
-                Ok((view.root, scope, result))
+                require_replace_support(&result, &request)?;
+                Ok((view.root, scope, request, result))
             })();
             match response {
-                Ok((index_root, scope, result)) => {
-                    return render_server_result(&result, &root, &index_root, &scope, opts, writer);
+                Ok((index_root, scope, request, result)) => {
+                    return render_server_result(
+                        &result,
+                        &request,
+                        &root,
+                        &index_root,
+                        &scope,
+                        opts,
+                        writer,
+                    );
                 }
                 Err(error) => warn_shared_fallback(&error, opts),
             }
@@ -1027,7 +1048,7 @@ fn search_via_server(
     let result = response
         .get("result")
         .ok_or_else(|| anyhow::anyhow!("no result in response"))?;
-    render_server_result(result, root, index_root, scope, opts, writer)
+    render_server_result(result, &request, root, index_root, scope, opts, writer)
 }
 
 fn server_search_request(
@@ -1127,7 +1148,9 @@ fn server_search_request(
     if !filetypes::TypeOp::is_unordered_equivalent(&opts.type_ops) {
         request["params"]["type_ops"] = type_ops_to_json(&opts.type_ops);
     }
-    if opts.replace_blocks() {
+    // A server that predates a `--replace` rendering cannot honour it, and
+    // its reply is then refused. Ask only when the output depends on it.
+    if opts.needs_replace_blocks(ci) {
         request["params"]["multiline_replace"] = serde_json::json!(true);
     }
     if opts.report_replacements() {
@@ -1137,15 +1160,19 @@ fn server_search_request(
 }
 
 /// Fail when the result comes from a server that predates the `--replace`
-/// rendering this search asked for. Such a server ignores the request and
+/// rendering `request` asked for. Such a server ignores the request and
 /// rewrites `-U` matches line by line, or leaves `--json` submatches without
-/// their `replacement`.
-fn require_replace_support(result: &serde_json::Value, opts: &SearchOptions) -> Result<()> {
-    let acked = |key: &str| result.get(key).and_then(|v| v.as_bool()) == Some(true);
-    if opts.replace_blocks() && !acked("multiline_replace") {
+/// their `replacement`. Reading the request rather than the options keeps
+/// this check in step with what `server_search_request` decided to ask for.
+fn require_replace_support(result: &serde_json::Value, request: &serde_json::Value) -> Result<()> {
+    let set = |value: &serde_json::Value, key: &str| {
+        value.get(key).and_then(|v| v.as_bool()) == Some(true)
+    };
+    let params = &request["params"];
+    if set(params, "multiline_replace") && !set(result, "multiline_replace") {
         anyhow::bail!("server does not support multiline replacement blocks");
     }
-    if opts.report_replacements() && !acked("report_replacements") {
+    if set(params, "report_replacements") && !set(result, "report_replacements") {
         anyhow::bail!("server does not report JSON replacements");
     }
     Ok(())
@@ -1170,6 +1197,7 @@ fn require_ordered_filters(result: &serde_json::Value, opts: &SearchOptions) -> 
 
 fn render_server_result(
     result: &serde_json::Value,
+    request: &serde_json::Value,
     root: &Path,
     index_root: &Path,
     scope: &IndexScope,
@@ -1180,7 +1208,7 @@ fn render_server_result(
     // rows, so an old/partial server can never silently answer --hidden.
     require_server_coverage(result)?;
     require_ordered_filters(result, opts)?;
-    require_replace_support(result, opts)?;
+    require_replace_support(result, request)?;
 
     let empty_vec = Vec::new();
     let matches = result
@@ -3124,8 +3152,8 @@ mod tests {
         let params = |opts: &SearchOptions| {
             server_search_request(&IndexScope::Whole, opts, false).unwrap()["params"].clone()
         };
-        // Older shared servers reject unknown fields, so leave them out of
-        // every request whose rendering they would not change.
+        // Older servers refuse or ignore unknown fields, so leave them out of
+        // every request whose output they would not change.
         for opts in [
             SearchOptions::default(),
             replace.clone(),
@@ -3146,11 +3174,35 @@ mod tests {
                 o.multiline = true;
                 o.quiet = true;
             }),
+            // A pattern that cannot match a line terminator prints line by
+            // line, with or without blocks.
+            with(|o| {
+                o.multiline = true;
+                o.pattern = "needle".into();
+            }),
+            with(|o| {
+                o.multiline = true;
+                o.pattern = "a.b".into();
+            }),
+            with(|o| {
+                o.multiline = true;
+                o.fixed_string = true;
+            }),
+            // Inverted searches print no submatches, and `-q` prints none.
+            with(|o| {
+                o.json = true;
+                o.invert_match = true;
+            }),
+            with(|o| {
+                o.json = true;
+                o.quiet = true;
+            }),
         ] {
-            let params = params(&opts);
-            assert!(params.get("multiline_replace").is_none());
-            assert!(params.get("report_replacements").is_none());
-            assert!(require_replace_support(&serde_json::json!({}), &opts).is_ok());
+            let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+            let params = &request["params"];
+            assert!(params.get("multiline_replace").is_none(), "{params}");
+            assert!(params.get("report_replacements").is_none(), "{params}");
+            assert!(require_replace_support(&serde_json::json!({}), &request).is_ok());
         }
 
         for opts in [
@@ -3163,18 +3215,47 @@ mod tests {
                 o.multiline = true;
                 o.vimgrep = true;
             }),
+            with(|o| {
+                o.multiline = true;
+                o.pattern = r"a\sb".into();
+            }),
+            with(|o| {
+                o.multiline = true;
+                o.multiline_dotall = true;
+                o.pattern = "a.b".into();
+            }),
+            // Line anchors count, as they do in ripgrep, and the backtracking
+            // engine is never analysed.
+            with(|o| {
+                o.multiline = true;
+                o.pattern = "^a".into();
+            }),
+            with(|o| {
+                o.multiline = true;
+                o.pattern = "a(?=b)".into();
+            }),
+            with(|o| {
+                o.multiline = true;
+                o.pattern = "(".into();
+            }),
         ] {
             let params = params(&opts);
-            assert_eq!(params["multiline_replace"], true);
+            assert_eq!(params["multiline_replace"], true, "{params}");
             assert!(params.get("report_replacements").is_none());
             assert!(opts.match_options().replace_blocks);
         }
 
+        // JSON keeps the source line and adds `replacement`, which a server
+        // predating it would not, whatever the pattern can match.
         for opts in [
             with(|o| o.json = true),
             with(|o| {
                 o.json = true;
                 o.multiline = true;
+            }),
+            with(|o| {
+                o.json = true;
+                o.pattern = "needle".into();
             }),
         ] {
             let params = params(&opts);
@@ -3186,16 +3267,19 @@ mod tests {
 
     #[test]
     fn replace_rendering_requires_a_server_that_acknowledges_it() {
-        let blocks = SearchOptions {
+        let request =
+            |opts: SearchOptions| server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+        let blocks = request(SearchOptions {
+            pattern: "a\\nb".into(),
             multiline: true,
             replace: Some("X".into()),
             ..Default::default()
-        };
-        let json = SearchOptions {
+        });
+        let json = request(SearchOptions {
             json: true,
             replace: Some("X".into()),
             ..Default::default()
-        };
+        });
         // A server predating the feature ignores the request and renders the
         // old way, so its reply must be refused rather than printed.
         for result in [

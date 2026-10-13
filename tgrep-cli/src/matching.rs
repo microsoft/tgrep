@@ -599,7 +599,7 @@ impl SearchMatcher {
     /// results printed as blocks. Like ripgrep, line anchors count as able to
     /// match `\n`. The backtracking engine is never analysed, which ripgrep's
     /// PCRE2 matcher does not do either, so it always counts.
-    fn can_match_newline(&self, dotall: bool) -> bool {
+    pub fn can_match_newline(&self, dotall: bool) -> bool {
         let Self::Standard(re) = self else {
             return true;
         };

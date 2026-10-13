@@ -2362,38 +2362,50 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
         .success();
     let rs = format!("{}\n", root.join("a.rs").display());
     let txt = format!("{}\n", root.join("a.txt").display());
+    let stale = "STALE hello needle\n".repeat(3);
     // Flags, pattern, the request field the result depends on (if any), why
-    // the client rejects a reply that does not acknowledge it, and the output
-    // (`None` for JSON).
+    // the client rejects a reply that does not acknowledge it (`None` when an
+    // older server's reply is just as good), and the output (`None` for JSON).
     for (flags, pattern, field, reason, expected) in [
         (
             vec!["-l", "-T", "rust", "-t", "rust"],
             "needle",
             Some("type_ops"),
-            "ordered type and glob filters",
+            Some("ordered type and glob filters"),
             Some(rs.as_str()),
         ),
         (
             vec!["-l", "-t", "rust", "-g", "*.txt"],
             "needle",
             None,
-            "ordered type and glob filters",
+            Some("ordered type and glob filters"),
             Some(txt.as_str()),
         ),
         (
             vec!["--no-filename", "-U", "-r", "X"],
             r"hello\nworld",
             Some("multiline_replace"),
-            "multiline replacement blocks",
+            Some("multiline replacement blocks"),
             Some("X\n"),
         ),
         (
             vec!["--json", "-g", "m.txt", "-r", "R"],
             "(hello)",
             Some("report_replacements"),
-            "JSON replacements",
+            Some("JSON replacements"),
             None,
         ),
+        // A pattern that cannot match a line terminator prints line by line
+        // either way, and JSON without submatches has nothing to report.
+        (
+            vec!["--no-filename", "-U", "-r", "X"],
+            "needle",
+            None,
+            None,
+            Some(stale.as_str()),
+        ),
+        (vec!["--json", "-v", "-r", "R"], "needle", None, None, None),
+        (vec!["--json", "-q", "-r", "R"], "needle", None, None, None),
     ] {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -2435,13 +2447,19 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
                     );
                 }
                 // A server that predates them ignores the fields and answers
-                // the old way, without acknowledging them.
+                // the old way, without acknowledging them. Inverted lines
+                // carry no spans.
+                let spans = if request["params"]["invert_match"] == true {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([[6, 11]])
+                };
                 let rows: Vec<_> = ["a.rs", "a.txt", "m.txt"]
                     .into_iter()
                     .map(|file| {
                         serde_json::json!({
                             "file":file,"line":1,"content":"STALE hello needle",
-                            "spans":[[6,11]],"type":"match",
+                            "spans":spans,"type":"match",
                         })
                     })
                     .collect();
@@ -2470,6 +2488,20 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
         assert!(output.status.success(), "{flags:?}: {output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let Some(reason) = reason else {
+            assert!(!stderr.contains("falling back"), "{flags:?}: {stderr}");
+            assert!(stderr.contains("(via server)"), "{flags:?}: {stderr}");
+            match expected {
+                Some(expected) => assert_eq!(stdout, expected, "{flags:?}"),
+                None => {
+                    assert!(stdout.contains(r#""type":"summary""#), "{stdout}");
+                    assert!(!stdout.contains("replacement"), "{stdout}");
+                    // `-q` prints only the summary.
+                    assert_eq!(stdout.contains("STALE"), !flags.contains(&"-q"), "{stdout}");
+                }
+            }
+            continue;
+        };
         assert!(stderr.contains(reason), "{flags:?}: {stderr}");
         assert!(
             stderr.contains("falling back to local index"),

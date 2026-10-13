@@ -479,12 +479,26 @@ impl SearchOptions {
             max_columns: self.max_columns,
             max_columns_preview: self.max_columns_preview,
             context_separator: self.context_separator.clone(),
+            eager_file_separator: self.ripgrep_would_search_sequentially(),
             field_match_separator: self.field_match_separator.clone(),
             field_context_separator: self.field_context_separator.clone(),
             path_separator: self.path_separator.clone(),
             path_display: self.path_display.clone(),
             line_buffered: self.line_buffered,
         }
+    }
+
+    /// Whether ripgrep would search one file at a time, which changes how it
+    /// separates files (see [`OutputConfig::eager_file_separator`]).
+    ///
+    /// ripgrep sorts on a single thread, and otherwise uses `-j` threads or,
+    /// for `-j0` or no `-j`, one per available CPU.
+    fn ripgrep_would_search_sequentially(&self) -> bool {
+        self.sort.is_some()
+            || match self.threads {
+                Some(0) | None => std::thread::available_parallelism().map_or(1, |n| n.get()) == 1,
+                Some(n) => n == 1,
+            }
     }
 
     /// Snapshot pattern files once, before case analysis, planning or server dispatch.
@@ -3336,6 +3350,30 @@ mod tests {
         let acked = serde_json::json!({"multiline_replace": true, "report_replacements": true});
         assert!(require_replace_support(&acked, &blocks).is_ok());
         assert!(require_replace_support(&acked, &json).is_ok());
+    }
+
+    #[test]
+    fn file_separators_follow_ripgreps_thread_count() {
+        let eager = |sort: Option<SortMode>, threads: Option<usize>| {
+            SearchOptions {
+                sort,
+                threads,
+                ..Default::default()
+            }
+            .make_output_config()
+            .eager_file_separator
+        };
+        let by_path = Some(SortMode {
+            key: SortKey::Path,
+            reverse: true,
+        });
+        assert!(eager(by_path, None));
+        assert!(eager(by_path, Some(4)));
+        assert!(eager(None, Some(1)));
+        assert!(!eager(None, Some(2)));
+        let one_cpu = std::thread::available_parallelism().map_or(1, |n| n.get()) == 1;
+        assert_eq!(eager(None, None), one_cpu);
+        assert_eq!(eager(None, Some(0)), one_cpu);
     }
 
     fn filter_options(type_ops: &[(&str, &str)], glob: &[&str], iglob: &[&str]) -> SearchOptions {

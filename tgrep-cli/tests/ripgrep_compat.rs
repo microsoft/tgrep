@@ -1043,11 +1043,12 @@ fn reported_multiline_replace_rewrites_cross_line_matches() {
     });
 }
 
-/// ripgrep writes a file's separator (its path, with `--heading`) before it
-/// renders the file's first block, and a context break before any block that
-/// does not follow on from the last one, without knowing whether the rewrite
-/// will leave a row to print. A hidden block after printed output therefore
-/// keeps its `--`, even when nothing follows it.
+/// Searching one file at a time, as it does under `--sort`, ripgrep writes a
+/// file's separator (its path, with `--heading`) before it renders the file's
+/// first block, and a context break before any block that does not follow on
+/// from the last one, without knowing whether the rewrite will leave a row to
+/// print. A hidden block after printed output therefore keeps its `--`, even
+/// when nothing follows it.
 #[test]
 fn multiline_replace_hidden_blocks_keep_their_separators() {
     let dir = TempDir::new().unwrap();
@@ -1085,6 +1086,104 @@ fn multiline_replace_hidden_blocks_keep_their_separators() {
                 .success()
                 .stdout(expected)
                 .stderr(predicate::str::contains(marker));
+        }
+    });
+}
+
+/// Searching in parallel, ripgrep buffers each file's output and writes the
+/// separator between files only before a buffer that holds some, so a file
+/// whose rewrites all print nothing adds no `--`. With `--heading`, the path
+/// it printed still earns a blank line. A gap within a file is still marked,
+/// even right before a hidden block, so it can follow the file's own `--`.
+#[test]
+fn multiline_replace_hidden_files_add_no_parallel_separator() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    for (name, text) in [
+        ("a.txt", "xx\nzz\n"),
+        ("b.txt", "yy\n"),
+        ("c.txt", "m\nyy\nm\nxx\nm\nm\nm\nyy\n"),
+        ("d.txt", "yy\n"),
+        ("e.txt", "xx\n"),
+        ("f.txt", "yy\nm\nxx\n"),
+        ("g.txt", "yy\nm\nm\nyy\n"),
+    ] {
+        fs::write(root.join(name), text).unwrap();
+    }
+    let path = |stem: &str| root.join(format!("{stem}.txt")).display().to_string();
+    let [a, b, c, d, e, f, g] = ["a", "b", "c", "d", "e", "f", "g"].map(path);
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, joiner, mut files) in [
+            (
+                vec!["-n", "-C1"],
+                "--\n",
+                vec![
+                    (&a, format!("{a}:1:xx\n{a}-2-zz\n")),
+                    (
+                        &c,
+                        format!("{c}-1-m\n{c}-3-m\n{c}:4:xx\n{c}-5-m\n--\n{c}-7-m\n"),
+                    ),
+                    (&e, format!("{e}:1:xx\n")),
+                    (&f, format!("{f}-2-m\n{f}:3:xx\n")),
+                    (&g, format!("{g}-2-m\n{g}-3-m\n")),
+                ],
+            ),
+            (
+                vec!["-n", "-A1"],
+                "--\n",
+                vec![
+                    (&a, format!("{a}:1:xx\n{a}-2-zz\n")),
+                    (&c, format!("{c}-3-m\n{c}:4:xx\n{c}-5-m\n--\n")),
+                    (&e, format!("{e}:1:xx\n")),
+                    (&f, format!("{f}-2-m\n{f}:3:xx\n")),
+                    (&g, format!("{g}-2-m\n--\n")),
+                ],
+            ),
+            (
+                vec!["-n", "-B1"],
+                "--\n",
+                vec![
+                    (&a, format!("{a}:1:xx\n")),
+                    (&c, format!("{c}-1-m\n{c}-3-m\n{c}:4:xx\n--\n{c}-7-m\n")),
+                    (&e, format!("{e}:1:xx\n")),
+                    (&f, format!("{f}-2-m\n{f}:3:xx\n")),
+                    (&g, format!("--\n{g}-3-m\n")),
+                ],
+            ),
+            (
+                vec!["-n", "--heading", "-C1"],
+                "\n",
+                vec![
+                    (&a, format!("{a}\n1:xx\n2-zz\n")),
+                    (&b, format!("{b}\n")),
+                    (&c, format!("{c}\n1-m\n3-m\n4:xx\n5-m\n--\n7-m\n")),
+                    (&d, format!("{d}\n")),
+                    (&e, format!("{e}\n1:xx\n")),
+                    (&f, format!("{f}\n2-m\n3:xx\n")),
+                    (&g, format!("{g}\n2-m\n3-m\n")),
+                ],
+            ),
+        ] {
+            // `-j2` keeps ripgrep's parallel behaviour on a single-CPU host.
+            let output = tgrep()
+                .args(backend)
+                .args(["--stats", "--color", "never", "-j2"])
+                .args(["-U", "-r", "$1"])
+                .args(&flags)
+                .args(["--", r"(x+)\n|y+\n"])
+                .arg(&root)
+                .assert()
+                .success()
+                .stderr(predicate::str::contains(marker))
+                .get_output()
+                .stdout
+                .clone();
+            let output = String::from_utf8(output).unwrap();
+            // The file order is unspecified, so take it from the output.
+            files.sort_by_key(|(path, _)| output.find(path.as_str()));
+            let rows: Vec<&str> = files.iter().map(|(_, rows)| rows.as_str()).collect();
+            assert_eq!(output, rows.join(joiner), "{marker} {flags:?}");
         }
     });
 }

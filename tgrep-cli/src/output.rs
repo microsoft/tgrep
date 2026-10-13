@@ -124,6 +124,14 @@ pub struct OutputConfig {
     pub max_columns_preview: bool,
     /// `--context-separator` / `--no-context-separator`. `None` suppresses it.
     pub context_separator: Option<String>,
+    /// Whether the `--` between files is written as soon as a file reports a
+    /// line, even if `--replace` then hides every row the file reports.
+    ///
+    /// ripgrep decides this by how it searches. One file at a time (with
+    /// `--sort`, `-j1` or a single CPU), its printer writes the separator when
+    /// a file reports its first line. In parallel, it buffers each file's
+    /// output and writes the separator only before a buffer that holds some.
+    pub eager_file_separator: bool,
     /// `--field-match-separator`, between the fields of a matching line.
     pub field_match_separator: String,
     /// `--field-context-separator`, between the fields of a context line.
@@ -168,6 +176,7 @@ impl Default for OutputConfig {
             max_columns: None,
             max_columns_preview: false,
             context_separator: Some("--".to_string()),
+            eager_file_separator: false,
             field_match_separator: ":".to_string(),
             field_context_separator: "-".to_string(),
             path_separator: None,
@@ -252,6 +261,9 @@ pub struct OutputWriter {
     /// file's context output from the next once something was written, so a
     /// file whose `--replace` rewrites printed nothing earns no `--`.
     printed_any: bool,
+    /// A file boundary whose `--` waits until the next file prints something.
+    /// See [`OutputConfig::eager_file_separator`].
+    pending_file_separator: bool,
     started: Instant,
     /// Start of the file currently open in JSON mode. ripgrep's per-file `end`
     /// stats report time spent on that file, so this is reset per file and
@@ -303,6 +315,7 @@ impl OutputWriter {
             use_heading,
             last_printed_line: None,
             printed_any: false,
+            pending_file_separator: false,
             started: Instant::now(),
             file_started: Instant::now(),
             file_stats: Stats::default(),
@@ -441,6 +454,10 @@ impl OutputWriter {
     /// output was missing one `--` per file boundary - 808 of them across a
     /// Substrate-sized tree. In heading mode there is no separator, because the
     /// blank line before the next heading already does that job.
+    ///
+    /// Unless [`OutputConfig::eager_file_separator`] is set, a file boundary's
+    /// `--` waits until the new file prints something, so a file whose rows are
+    /// all hidden by `--replace` adds none.
     pub fn write_context_separator(&mut self, file: &str, line_num: usize) -> io::Result<()> {
         if self.is_json() || !self.config.context {
             return Ok(());
@@ -448,13 +465,28 @@ impl OutputWriter {
         let Some(sep) = self.config.context_separator.clone() else {
             return Ok(());
         };
-        if let Some((ref last_file, last_line)) = self.last_printed_line {
-            let gap_within_file = last_file == file && line_num > last_line + 1;
-            let new_file = last_file != file && !self.use_heading && self.printed_any;
-            if gap_within_file || new_file {
-                writeln!(self.stdout, "{sep}")?;
-                self.printed_any = true;
-            }
+        let Some((last_file, last_line)) = &self.last_printed_line else {
+            return Ok(());
+        };
+        let gap_within_file = last_file == file && line_num > last_line + 1;
+        let new_file = last_file != file && !self.use_heading && self.printed_any;
+        if new_file && !self.config.eager_file_separator {
+            self.pending_file_separator = true;
+        } else if gap_within_file || new_file {
+            self.write_pending_file_separator()?;
+            writeln!(self.stdout, "{sep}")?;
+            self.printed_any = true;
+        }
+        Ok(())
+    }
+
+    /// Write a file boundary's deferred `--`, now that the file after it
+    /// prints something.
+    fn write_pending_file_separator(&mut self) -> io::Result<()> {
+        if std::mem::take(&mut self.pending_file_separator)
+            && let Some(sep) = &self.config.context_separator
+        {
+            writeln!(self.stdout, "{sep}")?;
         }
         Ok(())
     }
@@ -571,6 +603,7 @@ impl OutputWriter {
             return Ok(());
         }
 
+        self.write_pending_file_separator()?;
         if !self.config.no_filename {
             self.ensure_heading(&ctx.file)?;
         }
@@ -601,6 +634,7 @@ impl OutputWriter {
             self.last_printed_line = Some((m.file.clone(), last_line));
             return self.maybe_flush();
         }
+        self.write_pending_file_separator()?;
         let (content, kept) = self.trim_adjust_indexed(&m.content, &m.spans);
         let spans: Vec<(usize, usize)> = kept.iter().map(|&(_, span)| span).collect();
         let content = content.to_string();

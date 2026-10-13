@@ -636,6 +636,10 @@ ripgrep: the rewritten text replaces the block, so a match that spans lines can
 become a single line, and `-o` prints the expanded replacement of each match.
 Line numbers and columns of the rewritten lines follow ripgrep, which numbers
 them consecutively from the block's first line and repeats its starting column.
+A block whose rewrite is empty prints nothing. With context, a file that then
+prints no lines at all still adds a `--` under `--sort` or `-j1`, or on a single
+CPU, as ripgrep's one-file-at-a-time search does; otherwise it adds none, as in
+ripgrep's parallel search.
 Servers and shared daemons that predate this rendering are bypassed with a
 diagnostic.
 

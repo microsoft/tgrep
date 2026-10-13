@@ -1000,6 +1000,52 @@ fn reported_multiline_replace_rewrites_cross_line_matches() {
     });
 }
 
+/// ripgrep writes a file's separator (its path, with `--heading`) before it
+/// renders the file's first block, and a context break before any block that
+/// does not follow on from the last one, without knowing whether the rewrite
+/// will leave a row to print. A hidden block after printed output therefore
+/// keeps its `--`, even when nothing follows it.
+#[test]
+fn multiline_replace_hidden_blocks_keep_their_separators() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "xx\nzz\n").unwrap();
+    fs::write(root.join("b.txt"), "yy\n").unwrap();
+    fs::write(root.join("c.txt"), "m\nyy\nm\nxx\nm\nm\nm\nyy\n").unwrap();
+    fs::write(root.join("d.txt"), "yy\n").unwrap();
+    let path = |name: &str| root.join(name).display().to_string();
+    let (a, b, c, d) = (path("a.txt"), path("b.txt"), path("c.txt"), path("d.txt"));
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (flags, expected) in [
+            (
+                vec!["-I", "-n", "-C1"],
+                "1:xx\n2-zz\n--\n--\n1-m\n3-m\n4:xx\n5-m\n--\n7-m\n--\n".to_string(),
+            ),
+            (
+                vec!["-I", "-n", "-A1"],
+                "1:xx\n2-zz\n--\n--\n3-m\n4:xx\n5-m\n--\n--\n".to_string(),
+            ),
+            (
+                vec!["-n", "--heading", "-C1"],
+                format!("{a}\n1:xx\n2-zz\n\n{b}\n\n{c}\n1-m\n3-m\n4:xx\n5-m\n--\n7-m\n\n{d}\n"),
+            ),
+        ] {
+            tgrep()
+                .args(backend)
+                .args(["--stats", "--color", "never", "--sort", "path"])
+                .args(["-U", "-r", "$1"])
+                .args(&flags)
+                .args(["--", r"(x+)\n|y+\n"])
+                .arg(&root)
+                .assert()
+                .success()
+                .stdout(expected)
+                .stderr(predicate::str::contains(marker));
+        }
+    });
+}
+
 #[test]
 fn reported_json_replace_keeps_source_text_beside_replacements() {
     let dir = TempDir::new().unwrap();

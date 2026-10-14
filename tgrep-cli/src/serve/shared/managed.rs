@@ -1084,26 +1084,20 @@ impl State {
                     return Err(Error::invalid("test timer exceeds one day").into());
                 }
                 let slot = self.views.slot(&input.view)?;
-                let monitor = self
+                if !self
                     .monitors
                     .lock()
                     .map_err(|_| Error::corrupt("monitor registry poisoned"))?
-                    .get(&input.view)
-                    .cloned()
-                    .ok_or_else(|| Error::invalid("view has no monitor"))?;
+                    .contains_key(&input.view)
                 {
-                    let mut monitor = monitor
-                        .lock()
-                        .map_err(|_| Error::corrupt("monitor poisoned"))?;
-                    let now = Instant::now();
-                    monitor.last_reconcile = now
-                        .checked_sub(Duration::from_millis(input.elapsed_ms))
-                        .ok_or_else(|| Error::invalid("test timer is out of range"))?;
-                    monitor.last_schedule = now
-                        .checked_sub(Duration::from_secs(30))
-                        .ok_or_else(|| Error::invalid("test retry timer is out of range"))?;
+                    return Err(Error::invalid("view has no monitor").into());
                 }
-                self.schedule_view(&slot)?;
+                self.schedule_view_with_elapsed(&slot, |_| {
+                    (
+                        Duration::from_secs(30),
+                        Duration::from_millis(input.elapsed_ms),
+                    )
+                })?;
                 Ok(json!({"input_epoch":slot.input_epoch()}))
             }
             #[cfg(feature = "managed-test-hooks")]
@@ -1468,6 +1462,19 @@ impl State {
     }
 
     fn schedule_view(&self, slot: &Arc<ViewSlot>) -> Result<()> {
+        self.schedule_view_with_elapsed(slot, |monitor| {
+            (
+                monitor.last_schedule.elapsed(),
+                monitor.last_reconcile.elapsed(),
+            )
+        })
+    }
+
+    fn schedule_view_with_elapsed(
+        &self,
+        slot: &Arc<ViewSlot>,
+        elapsed: impl FnOnce(&Monitor) -> (Duration, Duration),
+    ) -> Result<()> {
         let status = self.views.status(slot.id())?;
         if status.leases == 0 {
             return Ok(());
@@ -1526,10 +1533,9 @@ impl State {
             return Ok(());
         }
         let retry = Duration::from_millis(200_u64.saturating_mul(1_u64 << monitor.failures.min(7)));
-        let elapsed = monitor.last_schedule.elapsed();
-        let periodic = self.watches.polling(&monitor)
-            && monitor.last_reconcile.elapsed() >= self.watches.interval;
-        if (!status.ready || periodic) && elapsed >= retry {
+        let (schedule_elapsed, reconcile_elapsed) = elapsed(&monitor);
+        let periodic = self.watches.polling(&monitor) && reconcile_elapsed >= self.watches.interval;
+        if (!status.ready || periodic) && schedule_elapsed >= retry {
             monitor.last_schedule = Instant::now();
             drop(monitor);
             if periodic {
@@ -1545,7 +1551,7 @@ impl State {
             )?;
             self.enqueue(&operation)?;
         } else if status.ready
-            && elapsed >= retry
+            && schedule_elapsed >= retry
             && matches!(
                 self.namespace.policy()?.policy.advancement,
                 managed::policy::Advancement::Adaptive { .. }

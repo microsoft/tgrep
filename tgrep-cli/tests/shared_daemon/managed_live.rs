@@ -876,7 +876,7 @@ fn native_failure_enables_polling_only_for_the_affected_view() {
         "testing.watch-event",
         json!({"view":fallback["view"],"kind":"failure"}),
     );
-    let before = wait_for(
+    let mut before = wait_for(
         &daemon,
         "views.status",
         json!({"id":fallback["view"]}),
@@ -918,23 +918,31 @@ fn native_failure_enables_polling_only_for_the_affected_view() {
     }
 
     fs::write(fixture.b.join("missed.txt"), "shared_term fallback_poll\n").unwrap();
-    let timer = daemon.rpc(
+    let not_due = daemon.rpc(
         "testing.reconcile-timer",
-        json!({"view":fallback["view"],"elapsed_ms":121_000}),
+        json!({"view":fallback["view"],"elapsed_ms":119_999}),
     );
-    assert!(timer["input_epoch"].as_u64().unwrap() > before["input_epoch"].as_u64().unwrap());
-    let repaired = wait_for(
-        &daemon,
-        "views.status",
-        json!({"id":fallback["view"]}),
-        |status| {
-            status["ready"] == true
-                && status["authoritative"]["input_epoch"].as_u64().unwrap()
-                    >= timer["input_epoch"].as_u64().unwrap()
-        },
-    );
-    assert_eq!(repaired["last_reconcile"]["full"], true);
-    assert_eq!(repaired["last_reconcile"]["content_reads_avoided"], 0);
+    assert_eq!(not_due["input_epoch"], before["input_epoch"]);
+    for elapsed_ms in [120_000, 121_000, 86_400_000] {
+        let timer = daemon.rpc(
+            "testing.reconcile-timer",
+            json!({"view":fallback["view"],"elapsed_ms":elapsed_ms}),
+        );
+        assert!(timer["input_epoch"].as_u64().unwrap() > before["input_epoch"].as_u64().unwrap());
+        before = wait_for(
+            &daemon,
+            "views.status",
+            json!({"id":fallback["view"]}),
+            |status| {
+                status["ready"] == true
+                    && status["work"].is_null()
+                    && status["authoritative"]["input_epoch"].as_u64().unwrap()
+                        >= timer["input_epoch"].as_u64().unwrap()
+            },
+        );
+        assert_eq!(before["last_reconcile"]["full"], true);
+        assert_eq!(before["last_reconcile"]["content_reads_avoided"], 0);
+    }
     assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
     for lease in ["managed-client", "sibling-client"] {
         daemon.rpc("views.detach", json!({"owner":claim.owner,"lease":lease}));

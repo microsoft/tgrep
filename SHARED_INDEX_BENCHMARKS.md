@@ -48,6 +48,11 @@ error. That correction and its deterministic regressions are not part of the
 measured executable; these timings remain attributed to `58fdda8`, not later
 PR heads.
 
+The later ancestor-observation naming, documentation and regression follow-up
+does not change reconciliation behavior or these measurements. The final ID
+comparison detects observed substitutions; it does not establish uninterrupted
+ancestor lifetime or an atomic filesystem snapshot.
+
 Standalone ran first; the file cache was **not flushed**. Implementation
 builds/tests were paused during measurement, but this was not an exclusive
 host. Native watching was disabled to isolate initial attachment. These

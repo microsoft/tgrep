@@ -22,7 +22,7 @@ use crate::hybrid::HybridIndex;
 use crate::live::LiveIndex;
 use crate::meta::{ContentId, FileVersion, file_version};
 use crate::query::QueryPlan;
-use crate::rooted::{OpenedFile, ParentEvidence, RootedBatch, RootedDir};
+use crate::rooted::{OpenedFile, ParentObservation, RootedBatch, RootedDir};
 use crate::trigram::TrigramMaskMap;
 use crate::visibility::PathVisibility;
 use crate::walker::{self, MetaWalkOptions};
@@ -578,7 +578,7 @@ impl WorktreeView {
                                 let _memory = permit
                                     .admit_read(parent.verification_memory_bytes(&self.files))
                                     .map_err(crate::Error::from)?;
-                                parent.verify(&self.files)?;
+                                parent.check_current_ids(&self.files)?;
                             }
                             Ok(())
                         })
@@ -594,7 +594,7 @@ impl WorktreeView {
                     }
                 } else {
                     for parent in &prepared.parents {
-                        parent.verify(&self.files)?;
+                        parent.check_current_ids(&self.files)?;
                     }
                 }
                 Ok(())
@@ -1642,7 +1642,7 @@ impl WorktreeSnapshot<'_> {
 
 struct Prepared {
     memory: Option<crate::managed::work::MemoryCharge>,
-    parents: Vec<ParentEvidence>,
+    parents: Vec<ParentObservation>,
     evidence: BTreeMap<String, Evidence>,
     visibility: PathVisibility,
     upserts: BTreeMap<String, TrigramMaskMap>,
@@ -1750,11 +1750,11 @@ impl<'root, 'inputs> VerificationBatch<'root, 'inputs> {
         mut self,
         workers: usize,
     ) -> Result<(
-        Vec<ParentEvidence>,
+        Vec<ParentObservation>,
         Option<crate::managed::work::MemoryCharge>,
     )> {
         let mut groups: Vec<_> = self.parents.into_values().collect();
-        let verify = |groups: &mut [ParentBatch<'_>]| -> Result<Vec<ParentEvidence>> {
+        let verify = |groups: &mut [ParentBatch<'_>]| -> Result<Vec<ParentObservation>> {
             let mut parents = Vec::with_capacity(groups.len());
             for group in groups {
                 if let Some(permit) = self.permit {
@@ -1788,9 +1788,9 @@ impl<'root, 'inputs> VerificationBatch<'root, 'inputs> {
         if let Some(error) = failure {
             return Err(error);
         }
-        let mut bytes = parents.capacity() as u64 * std::mem::size_of::<ParentEvidence>() as u64;
-        for evidence in &parents {
-            bytes += evidence.memory_bytes();
+        let mut bytes = parents.capacity() as u64 * std::mem::size_of::<ParentObservation>() as u64;
+        for observation in &parents {
+            bytes += observation.memory_bytes();
         }
         if let Some(memory) = &mut self.memory {
             memory.resize(bytes).map_err(crate::Error::from)?;

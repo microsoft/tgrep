@@ -1455,6 +1455,52 @@ fn root_replacement_before_publication_keeps_the_view_not_ready() {
     ));
 }
 
+#[test]
+fn observed_parent_replacement_after_batch_drain_blocks_publication() {
+    for managed in [false, true] {
+        let fixture = Fixture::new();
+        write(&fixture.root, "dir/nested/file.txt", b"original marker");
+        commit(&fixture.root);
+        let exercise = |view: &WorktreeView, permit: Option<&Arc<crate::managed::WorkPermit>>| {
+            let result = view.refresh_controlled_inner(
+                || {},
+                || {
+                    fs::rename(fixture.root.join("dir"), fixture._temp.path().join("saved"))
+                        .unwrap();
+                    write(&fixture.root, "dir/nested/file.txt", b"replacement marker");
+                    view.files.verify_root().unwrap();
+                },
+                permit,
+            );
+            assert!(matches!(result, Err(WorktreeError::Io(_))), "{result:?}");
+            let status = view.status().unwrap();
+            assert!(!status.ready);
+            assert!(status.full_required);
+            assert!(status.published_epoch.is_none());
+            assert!(matches!(
+                view.with_snapshot(|_| ()),
+                Err(WorktreeError::NotReady)
+            ));
+            let released = fixture._temp.path().join("after-check");
+            fs::rename(fixture.root.join("dir"), &released).unwrap();
+            fs::rename(&released, fixture.root.join("dir")).unwrap();
+            let repaired = view.refresh_controlled_inner(|| {}, || {}, permit).unwrap();
+            assert!(repaired.full);
+            assert_eq!(repaired.files_read, 1);
+            assert_eq!(repaired.content_reads_avoided, 0);
+            assert!(candidates(view, "original").is_empty());
+            assert_eq!(matches(view, "replacement"), ["dir/nested/file.txt"]);
+        };
+        if managed {
+            let (_namespace, permit, view) = fixture.controlled();
+            exercise(&view, Some(&permit));
+        } else {
+            let view = fixture.view(&fixture.root, &fixture.generation());
+            exercise(&view, None);
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn fifo_swap_after_discovery_is_bounded_and_keeps_the_view_not_ready() {

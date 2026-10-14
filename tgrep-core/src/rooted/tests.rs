@@ -110,11 +110,40 @@ fn sibling_batches_release_pins_and_recheck_ancestor_identity() {
     }
     #[cfg(windows)]
     assert!(fs::rename(&parent, temp.path().join("saved")).is_err());
-    let evidence = batch.finish().unwrap();
-    evidence.verify(&root).unwrap();
+    let observation = batch.finish().unwrap();
+    observation.check_current_ids(&root).unwrap();
     fs::rename(&parent, temp.path().join("saved")).unwrap();
     fs::create_dir(&parent).unwrap();
-    assert!(evidence.verify(&root).is_err());
+    assert!(observation.check_current_ids(&root).is_err());
+}
+
+#[test]
+fn ancestor_observations_are_point_in_time_not_lifetime_pins() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("parent");
+    let saved = temp.path().join("saved");
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("file"), "original").unwrap();
+    let root = RootedDir::open(temp.path()).unwrap();
+    let batch = root.batch(Path::new("parent")).unwrap();
+    assert_eq!(
+        contents(batch.open_file(Path::new("parent/file")).unwrap()),
+        "original"
+    );
+    let observation = batch.finish().unwrap();
+    fs::rename(&parent, &saved).unwrap();
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("file"), "replacement").unwrap();
+    assert!(observation.check_current_ids(&root).is_err());
+    fs::remove_file(parent.join("file")).unwrap();
+    fs::remove_dir(&parent).unwrap();
+    fs::rename(&saved, &parent).unwrap();
+    // Restoring the original object restores ID equality, not path continuity.
+    observation.check_current_ids(&root).unwrap();
+    assert_eq!(
+        contents(root.open_file(Path::new("parent/file")).unwrap()),
+        "original"
+    );
 }
 
 #[test]
@@ -132,11 +161,11 @@ fn completed_batch_never_accepts_a_reparse_replacement() {
         contents(batch.open_file(Path::new("parent/file")).unwrap()),
         "original"
     );
-    let evidence = batch.finish().unwrap();
+    let observation = batch.finish().unwrap();
     fs::rename(&parent, temp.path().join("saved")).unwrap();
     link_directory(&other, &parent);
     assert!(root.batch(Path::new("parent")).is_err());
-    assert!(evidence.verify(&root).is_err());
+    assert!(observation.check_current_ids(&root).is_err());
 }
 
 #[cfg(unix)]

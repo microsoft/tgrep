@@ -115,8 +115,8 @@ impl RootedDir {
         self.open_file_with(relative, |_| {})
     }
 
-    /// Pin one ancestor chain for a bounded group of sibling reads. The caller
-    /// must finish the batch and revalidate its returned evidence at publication.
+    /// Pin one ancestor chain for a bounded group of sibling reads. Finishing
+    /// releases the pins; the returned IDs are observations, not lifetime proof.
     pub(crate) fn batch(&self, parent: &Path) -> io::Result<RootedBatch<'_>> {
         let names = if parent.as_os_str().is_empty() {
             Vec::new()
@@ -158,7 +158,7 @@ impl RootedDir {
         let resolved = final_path_of(guards.last().unwrap_or(&self.directory))?;
         Ok(RootedBatch {
             root: self,
-            evidence: ParentEvidence {
+            observation: ParentObservation {
                 path: parent.into(),
                 identities,
             },
@@ -243,14 +243,17 @@ impl RootedDir {
     }
 }
 
-/// Stores identities, not open handles: completed batches must not keep
-/// checkout directories pinned while later batches or checkpoints run.
-pub(crate) struct ParentEvidence {
+/// Native IDs observed during a rooted batch, not an ancestor lifetime pin.
+///
+/// IDs may be reused after handles close. A later comparison can reject an
+/// observed substitution, but cannot prove continuity through publication.
+/// Read containment relies on live rooted handles, not these retained IDs.
+pub(crate) struct ParentObservation {
     path: PathBuf,
     identities: Vec<crate::managed::FileIdentity>,
 }
 
-impl ParentEvidence {
+impl ParentObservation {
     pub(crate) fn verification_memory_bytes(&self, root: &RootedDir) -> u64 {
         root.batch_memory_bytes(&self.path)
     }
@@ -259,9 +262,9 @@ impl ParentEvidence {
         RootedDir::batch_handles(&self.path)
     }
 
-    pub(crate) fn verify(&self, root: &RootedDir) -> io::Result<()> {
+    pub(crate) fn check_current_ids(&self, root: &RootedDir) -> io::Result<()> {
         let current = root.batch(&self.path)?;
-        if current.evidence.identities != self.identities {
+        if current.observation.identities != self.identities {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "batch ancestor identity changed",
@@ -279,7 +282,7 @@ impl ParentEvidence {
 
 pub(crate) struct RootedBatch<'a> {
     root: &'a RootedDir,
-    evidence: ParentEvidence,
+    observation: ParentObservation,
     guards: Vec<File>,
     #[cfg(windows)]
     path: PathBuf,
@@ -301,7 +304,7 @@ impl RootedBatch<'_> {
     }
 
     pub(crate) fn open_observed(&self, relative: &Path) -> io::Result<OpenedFile> {
-        if relative.parent() != Some(self.evidence.path.as_path()) {
+        if relative.parent() != Some(self.observation.path.as_path()) {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 "file is not a batch sibling",
@@ -347,16 +350,16 @@ impl RootedBatch<'_> {
         }
     }
 
-    pub(crate) fn finish(self) -> io::Result<ParentEvidence> {
+    pub(crate) fn finish(self) -> io::Result<ParentObservation> {
         #[cfg(windows)]
-        debug_assert_eq!(self.guards.len(), self.evidence.identities.len());
+        debug_assert_eq!(self.guards.len(), self.observation.identities.len());
         #[cfg(unix)]
         debug_assert_eq!(
             self.guards.len(),
-            usize::from(!self.evidence.identities.is_empty())
+            usize::from(!self.observation.identities.is_empty())
         );
-        self.evidence.verify(self.root)?;
-        Ok(self.evidence)
+        self.observation.check_current_ids(self.root)?;
+        Ok(self.observation)
     }
 }
 

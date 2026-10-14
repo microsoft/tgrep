@@ -1018,10 +1018,18 @@ parent rather than accumulating pins for unrelated directories.
 
 Siblings share one scoped, handle-rooted ancestor chain per bounded batch,
 including siblings assigned to different workers. Child containment, reparse
-rejection, file identity and before/after read checks remain mandatory. Ancestor
-identities are checked with bounded parallelism when the batch ends and again
-before assembly publishes; completed batches retain identities, not directory
-handles. Compute credits, parent pins and input bytes are admitted in that order.
+rejection, file identity and before/after read checks remain mandatory. Observed
+ancestor IDs are compared with bounded parallelism when the batch ends and again
+before assembly publishes; completed batches retain observations, not directory
+handles. These comparisons detect observed substitutions, not uninterrupted
+ancestor lifetime: filesystems can reuse IDs after handles close, and paths can
+change after the comparison. Read containment uses the live root, batch and child
+handles; root and input-epoch checks independently gate publication. As before
+batching, reconciliation is not an atomic filesystem snapshot. This is not a new
+relaxation of initial verified reads or a consequence of disabling native safety
+rescans.
+
+Compute credits, parent pins and input bytes are admitted in that order.
 Native metadata obtained by a verified open is reused, not reacquired redundantly
 before reading. Workers drain on cancellation/error before their reservation or
 checkout handles can be released.

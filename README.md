@@ -957,6 +957,10 @@ Namespace operation-worker limits do not need to be raised. Exact checkout bytes
 identity checks, cancellation and final readiness gates are preserved; clean Git
 status never replaces first-attachment verification. Receipts and status expose
 [phase timings and resource counters](SHARED_WORKTREE_INDEXES.md#bounded-managed-reconciliation).
+Ancestor-ID comparisons detect observed substitutions, but are not lifetime
+pins: IDs may be reused after batch handles close. Reconciliation retains its
+per-read containment and publication-epoch checks, not an atomic filesystem
+snapshot or uninterrupted ancestor-lifetime guarantee.
 A [same-binary Windows/ReFS measurement](SHARED_INDEX_BENCHMARKS.md#large-checkout-reconciliation-rc2)
 completed a fresh warm-base attachment in 186.144 seconds versus 542.469 seconds
 for a standalone full build (2.914x), while still reading every required file.

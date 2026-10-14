@@ -672,8 +672,9 @@ enum Command {
         #[arg(long, requires = "shared")]
         shared_storage: Option<PathBuf>,
 
-        /// Opt into the v2 lifecycle with an explicit validated policy JSON file.
-        #[arg(long, requires_all = ["shared", "shared_storage"], conflicts_with_all = ["shared_max_views", "shared_max_leases", "max_memory_mb", "max_cpu_percent"])]
+        /// Use managed v2 (recommended) with a complete validated policy JSON file.
+        /// Without this policy, --shared selects deprecated v1.
+        #[arg(long, value_name = "FILE", requires_all = ["shared", "shared_storage"], conflicts_with_all = ["shared_max_views", "shared_max_leases", "max_memory_mb", "max_cpu_percent"])]
         shared_policy: Option<PathBuf>,
 
         /// Maximum shared views; native watches and hint slots are divided by this.

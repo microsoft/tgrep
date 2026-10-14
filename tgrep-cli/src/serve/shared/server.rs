@@ -362,6 +362,9 @@ pub fn run(root: &Path, options: Options<'_>) -> Result<()> {
     // Listener and every bounded worker queue are usable before discovery.
     publish(&marker, &state.registration)?;
     eprintln!(
+        "warning: shared repository daemon v1 is deprecated as of tgrep 1.2.1 but is still supported; use managed v2 with --shared-policy <FILE> for new integrations."
+    );
+    eprintln!(
         "Shared repository daemon v{PROTOCOL} listening on 127.0.0.1:{}",
         state.registration.port
     );

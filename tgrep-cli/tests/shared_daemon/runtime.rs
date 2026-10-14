@@ -110,6 +110,79 @@ pub(super) fn output(command: &mut Command) -> Output {
         .unwrap_or_else(|error| panic!("{command:?}: {error}"))
 }
 
+#[test]
+fn startup_deprecation_is_absent_for_ordinary_serve() {
+    let fixture = Fixture::new();
+    let index = fixture.temp.path().join("ordinary-index");
+    success(cli(
+        &fixture.a,
+        &["index", ".", "--index-path", index.to_str().unwrap()],
+    ));
+    let mut server = Process::start(
+        Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+            .current_dir(&fixture.a)
+            .args([
+                "serve",
+                ".",
+                "--no-watch",
+                "--index-path",
+                index.to_str().unwrap(),
+            ]),
+    );
+    let started = Instant::now();
+    loop {
+        assert!(
+            started.elapsed() < DEADLINE,
+            "ordinary server did not start"
+        );
+        assert!(
+            server.child.try_wait().unwrap().is_none(),
+            "ordinary server exited before becoming ready"
+        );
+        if let Ok(bytes) = fs::read(index.join("serve.json"))
+            && let Ok(marker) = serde_json::from_slice::<Value>(&bytes)
+            && let Some(port) = marker["port"].as_u64()
+            && TcpStream::connect(("127.0.0.1", port as u16)).is_ok()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    let output = cli(
+        &fixture.a,
+        &[
+            "--index-path",
+            index.to_str().unwrap(),
+            "--json",
+            "--stats",
+            "-F",
+            "--",
+            "shared_term",
+            ".",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("(via server)"), "{stderr}");
+    assert!(!stderr.contains(V1_DEPRECATION), "{stderr}");
+    let rows: Vec<Value> = success(output)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.iter().filter(|row| row["type"] == "match").count(), 3);
+    assert_eq!(
+        rows.iter().filter(|row| row["type"] == "summary").count(),
+        1
+    );
+
+    server.cancel();
+    let output = server.finish(DEADLINE).unwrap();
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains(V1_DEPRECATION), "{stderr}");
+    drop(server);
+    fixture.temp.close().unwrap();
+}
+
 #[derive(Serialize, Deserialize)]
 struct Session {
     root: PathBuf,

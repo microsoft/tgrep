@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const PROFILE: &str = r#"{"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864}"#;
+const V1_DEPRECATION: &str = "warning: shared repository daemon v1 is deprecated";
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[path = "shared_daemon/managed.rs"]
@@ -150,6 +151,7 @@ struct Daemon {
     marker: Value,
     authorization: Value,
     log: PathBuf,
+    stdout_log: PathBuf,
 }
 
 impl Daemon {
@@ -162,6 +164,7 @@ impl Daemon {
             "daemon-{}.log",
             LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
+        let stdout_log = log.with_extension("stdout");
         let marker_path = tgrep_core::generations::Repository::discover(root)
             .unwrap()
             .common_dir()
@@ -187,7 +190,7 @@ impl Daemon {
                     storage.to_str().unwrap(),
                 ])
                 .args(options)
-                .stdout(Stdio::null())
+                .stdout(fs::File::create(&stdout_log).unwrap())
                 .stderr(fs::File::create(&log).unwrap()),
         );
         let mut daemon = Self {
@@ -195,6 +198,7 @@ impl Daemon {
             marker: Value::Null,
             authorization: Value::Null,
             log: log.clone(),
+            stdout_log,
         };
         let started = Instant::now();
         loop {
@@ -370,6 +374,92 @@ impl Drop for Daemon {
             }
         }
     }
+}
+
+#[test]
+fn startup_deprecation_warns_once_per_v1_start_and_preserves_clients() {
+    let fixture = Fixture::new();
+    let json_cli = |args: &[&str]| {
+        let output = cli(&fixture.a, args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(V1_DEPRECATION),
+            "startup warning leaked into a client command: {stderr}"
+        );
+        serde_json::from_str::<Value>(&success(output)).unwrap()
+    };
+    let help = success(cli(&fixture.a, &["serve", "--help"]));
+    assert!(help.contains("--shared-policy <FILE>"), "{help}");
+    assert!(help.contains("managed v2 (recommended)"), "{help}");
+    assert!(help.contains("--shared selects deprecated v1"), "{help}");
+
+    for _ in 0..2 {
+        let mut daemon = fixture.start(&["--no-watch"]);
+        assert_eq!(daemon.marker["protocol"], 1);
+        let attached = json_cli(&[
+            "shared",
+            "attach",
+            ".",
+            "--revision",
+            &fixture.revision,
+            "--lease",
+            "deprecation-client",
+        ]);
+        assert_eq!(attached["protocol"], 1);
+        assert_eq!(attached["lease"], "deprecation-client");
+        daemon.ready(&fixture.a);
+        assert_eq!(
+            daemon.search(&fixture.a, "shared_term")["backend"],
+            "shared-v1"
+        );
+        assert_eq!(json_cli(&["status", "."])["ready"], true);
+
+        let output = cli(
+            &fixture.a,
+            &["--json", "--stats", "-F", "--", "shared_term", "."],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("(via shared daemon v1)"), "{stderr}");
+        assert!(!stderr.contains(V1_DEPRECATION), "{stderr}");
+        let rows: Vec<Value> = success(output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.iter().filter(|row| row["type"] == "match").count(), 3);
+        assert_eq!(
+            rows.iter().filter(|row| row["type"] == "summary").count(),
+            1
+        );
+
+        fs::write(fixture.a.join("late.txt"), "late_term\n").unwrap();
+        let refreshed = json_cli(&[
+            "shared",
+            "refresh",
+            ".",
+            "--lease",
+            "deprecation-client",
+            "--changed",
+            "late.txt",
+        ]);
+        assert!(refreshed["processed_epoch"].is_u64(), "{refreshed}");
+        let result = daemon.search(&fixture.a, "late_term");
+        assert_eq!(result["backend"], "shared-v1");
+        assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+        let detached = json_cli(&["shared", "detach", ".", "--lease", "deprecation-client"]);
+        assert_eq!(detached["remaining_leases"], 0);
+
+        daemon.stop();
+        let stderr = fs::read_to_string(&daemon.log).unwrap();
+        assert_eq!(stderr.matches(V1_DEPRECATION).count(), 1, "{stderr}");
+        assert!(stderr.contains("as of tgrep 1.2.1"), "{stderr}");
+        assert!(stderr.contains("still supported"), "{stderr}");
+        assert!(
+            stderr.contains("managed v2 with --shared-policy <FILE>"),
+            "{stderr}"
+        );
+        assert!(fs::read(&daemon.stdout_log).unwrap().is_empty());
+    }
+    fixture.temp.close().unwrap();
 }
 
 #[test]

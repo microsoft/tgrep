@@ -36,10 +36,10 @@ cargo build --release
 
 After the version bump is merged and CI passes, open **Actions > Release >
 Run workflow**, select **main**, and enter the tag matching the workspace
-version in `Cargo.toml`, for example `v1.2.0`. The equivalent CLI command is:
+version in `Cargo.toml`, for example `v1.2.1`. The equivalent CLI command is:
 
 ```bash
-gh workflow run release.yml --repo microsoft/tgrep --ref main -f tag=v1.2.0
+gh workflow run release.yml --repo microsoft/tgrep --ref main -f tag=v1.2.1
 ```
 
 The workflow validates the version, creates a missing tag at the exact commit
@@ -162,7 +162,9 @@ of the normally installed release binary, without test hooks. It covers
 `owner-hold`, exact-generation reuse with no blob reads, independent private
 overlays, indexed RPC/CLI parity with forced scans, migration, exact receipt
 replay and explicit detach/owner release. Ordinary and default-v1 installed
-coverage remains enabled.
+coverage remains enabled. V1 is deprecated as of 1.2.1 but still supported:
+its startup warning belongs on stderr, not stdout or protocol JSON, and legacy
+compatibility coverage remains required.
 
 The managed lifecycle suite uses actual CLI/RPC clients, temporary Git
 repositories, native filesystem/owner locks and the production owned-child

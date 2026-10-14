@@ -459,6 +459,65 @@ fn managed_cancellation_and_policy_changes_drain_paused_directory_batches() {
 }
 
 #[test]
+fn managed_verified_read_classifies_growth_at_blob_limit_as_unstable() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"committed\n");
+    commit(&fixture.root);
+    let (_namespace, permit, view) = fixture.controlled();
+    let path = fixture.root.join("file.txt");
+    let blob_bytes = permit.read_limits().blob_bytes;
+    let writer = File::options().write(true).open(&path).unwrap();
+    writer.set_len(blob_bytes).unwrap();
+    let reader = view.files.batch(Path::new("")).unwrap();
+    let relative = Path::new("file.txt");
+    let opened = reader.open_observed(relative).unwrap();
+    assert_eq!(opened.metadata.len(), blob_bytes);
+    writer.set_len(blob_bytes + 1).unwrap();
+
+    let read = read_file(
+        || reader.open_observed(relative),
+        relative,
+        opened,
+        None,
+        Some(&permit),
+    );
+    assert!(matches!(read, Err(WorktreeError::UnstableFile(_))));
+}
+
+#[test]
+fn managed_verified_read_preserves_blob_limit_for_stable_oversized_file() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"committed\n");
+    commit(&fixture.root);
+    let (_namespace, permit, view) = fixture.controlled();
+    let path = fixture.root.join("file.txt");
+    let blob_bytes = permit.read_limits().blob_bytes;
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(blob_bytes + 1)
+        .unwrap();
+    let reader = view.files.batch(Path::new("")).unwrap();
+    let relative = Path::new("file.txt");
+    let opened = reader.open_observed(relative).unwrap();
+    assert_eq!(opened.metadata.len(), blob_bytes + 1);
+
+    let read = read_file(
+        || reader.open_observed(relative),
+        relative,
+        opened,
+        None,
+        Some(&permit),
+    );
+    assert!(
+        matches!(read, Err(WorktreeError::Index(crate::Error::Managed(error)))
+        if error.category == crate::managed::ErrorCategory::ResourcePressure
+            && error.reason_code == "checkout-blob-read-limit")
+    );
+}
+
+#[test]
 fn managed_verified_read_rejects_restored_mtime_mutation_and_replacement() {
     for replace in [false, true] {
         let fixture = Fixture::new();

@@ -2039,16 +2039,16 @@ fn read_file<'a>(
         if count == 0 {
             break;
         }
+        // A growing file is unstable, not a request to wait for additional
+        // capacity while retaining an already admitted read buffer.
+        if bytes.len() as u64 + count as u64 > expected {
+            return Err(WorktreeError::UnstableFile(path.into()));
+        }
         if work_limit.is_some_and(|limit| bytes.len() as u64 + count as u64 > limit) {
             return Err(crate::Error::from(crate::managed::Error::pressure(
                 "checkout-blob-read-limit",
             ))
             .into());
-        }
-        // A growing file is unstable, not a request to wait for additional
-        // capacity while retaining an already admitted read buffer.
-        if bytes.len() as u64 + count as u64 > expected {
-            return Err(WorktreeError::UnstableFile(path.into()));
         }
         bytes.extend_from_slice(&chunk[..count]);
     }

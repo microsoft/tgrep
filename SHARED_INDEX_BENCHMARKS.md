@@ -41,6 +41,13 @@ remains a separate diagnostic, not the baseline in this comparison.
 | Host | Windows/ReFS, 16 logical CPUs |
 | Exact-source qualification | [CI run 38500502076](https://github.com/microsoft/tgrep/actions/runs/38500502076), all nine jobs passed |
 
+A subsequent guard-order correction classifies a file growing one byte beyond
+its opened length at the managed blob limit as unstable, rather than as a
+blob-limit violation. A stable initially oversized file retains its blob-limit
+error. That correction and its deterministic regressions are not part of the
+measured executable; these timings remain attributed to `58fdda8`, not later
+PR heads.
+
 Standalone ran first; the file cache was **not flushed**. Implementation
 builds/tests were paused during measurement, but this was not an exclusive
 host. Native watching was disabled to isolate initial attachment. These

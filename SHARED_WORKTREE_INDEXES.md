@@ -876,7 +876,9 @@ timestamps are unchanged. The native deny-write/delete handle stays open through
 the catalog update; identity, ownership and length must still match, and no
 producer seal is replaced. This accepts metadata-only ChangeTime drift without
 an EA allowlist or a timestamp-based content shortcut. Verification uses bounded,
-charged buffers and the generation's existing work reservation and deadline.
+charged buffers. With a work reservation it uses that reservation's admitted
+deadline and cancellation/version checks, not a new timeout from mutable policy.
+Unreserved observations receive a bounded deadline from current policy.
 Open producers and withdrawn or partially reclaimed members do not qualify.
 
 ## Managed policy

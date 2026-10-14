@@ -1984,6 +1984,32 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn publication_authentication_keeps_the_admitted_deadline_after_policy_reduction() {
+        let (_temp, namespace, permit) = fixture();
+        let admitted_deadline = permit.deadline();
+        let mut policy = namespace.policy().unwrap();
+        policy.policy.work.operation_timeout_ms = 1;
+        namespace
+            .update_policy(policy.version, policy.policy)
+            .unwrap();
+        assert_eq!(
+            super::super::verification::member_authentication_deadline(&namespace, Some(&permit))
+                .unwrap(),
+            admitted_deadline
+        );
+        let before = Instant::now();
+        let unreserved_deadline =
+            super::super::verification::member_authentication_deadline(&namespace, None).unwrap();
+        assert!(unreserved_deadline >= before + Duration::from_millis(1));
+        assert!(unreserved_deadline <= Instant::now() + Duration::from_millis(1));
+        assert_eq!(
+            permit.check_now().unwrap_err().category,
+            ErrorCategory::StaleVersion
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn closed_publication_authentication_obeys_the_existing_work_budget() {
         let (_temp, namespace, permit) = fixture();
         let (object, pin) = namespace

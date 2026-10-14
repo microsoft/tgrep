@@ -148,6 +148,21 @@ fn proof_page(
 }
 
 #[cfg(windows)]
+pub(super) fn member_authentication_deadline(
+    namespace: &Namespace,
+    permit: Option<&Arc<WorkPermit>>,
+) -> Result<Instant> {
+    if let Some(permit) = permit {
+        return Ok(permit.deadline());
+    }
+    Instant::now()
+        .checked_add(Duration::from_millis(
+            namespace.policy()?.policy.work.operation_timeout_ms,
+        ))
+        .ok_or_else(|| Error::invalid("member authentication deadline overflow"))
+}
+
+#[cfg(windows)]
 pub(super) fn authenticate_complete_member(
     namespace: &Namespace,
     directory: &Directory,
@@ -173,21 +188,17 @@ pub(super) fn authenticate_complete_member(
     {
         return Err(modified("member is not an intact closed producer output"));
     }
-    let deadline = Instant::now()
-        .checked_add(Duration::from_millis(
-            namespace.policy()?.policy.work.operation_timeout_ms,
-        ))
-        .ok_or_else(|| Error::invalid("member authentication deadline overflow"))?;
+    let deadline = member_authentication_deadline(namespace, permit)?;
     let check_work = || -> Result<()> {
+        if let Some(permit) = permit {
+            return permit.check();
+        }
         if Instant::now() >= deadline {
             return Err(Error::new(
                 ErrorCategory::Deadline,
                 "member-authentication-deadline",
                 "complete member authentication exceeded its work deadline",
             ));
-        }
-        if let Some(permit) = permit {
-            permit.check()?;
         }
         Ok(())
     };

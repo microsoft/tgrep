@@ -870,6 +870,15 @@ content. Basic timestamps, including Windows ChangeTime, are neither a seal nor
 an unchanged-content fast path. Bookkeeping-only metadata drift can be accepted
 only when producer content and ownership-sensitive metadata still match.
 
+On Windows, re-recording a closed producer before generation publication
+authenticates every original block and the complete manifest, even if basic
+timestamps are unchanged. The native deny-write/delete handle stays open through
+the catalog update; identity, ownership and length must still match, and no
+producer seal is replaced. This accepts metadata-only ChangeTime drift without
+an EA allowlist or a timestamp-based content shortcut. Verification uses bounded,
+charged buffers and the generation's existing work reservation and deadline.
+Open producers and withdrawn or partially reclaimed members do not qualify.
+
 ## Managed policy
 
 The policy file is a complete JSON object; fields have no silent unlimited

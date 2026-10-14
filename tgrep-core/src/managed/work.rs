@@ -1982,6 +1982,44 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn closed_publication_authentication_obeys_the_existing_work_budget() {
+        let (_temp, namespace, permit) = fixture();
+        let (object, pin) = namespace
+            .create_object(ObjectKind::BuildStage, None, &permit)
+            .unwrap();
+        let mut writer =
+            ChargedWriter::new(Arc::clone(&pin), "payload", Arc::clone(&permit)).unwrap();
+        writer.write_all(&[b'a'; 8192]).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        let sealed = member(&namespace, &object.id);
+        let occupied = permit
+            .memory(permit.private_limit() - super::super::verification::MEMORY_BYTES + 1)
+            .unwrap();
+        let error = namespace
+            .record_file_with_permit(&object.id, "payload", Some(&permit))
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::ResourcePressure);
+        assert_eq!(member(&namespace, &object.id), sealed);
+        drop(occupied);
+        assert_eq!(
+            namespace
+                .record_file_with_permit(&object.id, "payload", Some(&permit))
+                .unwrap()
+                .seal,
+            sealed.seal
+        );
+        assert_eq!(permit.private_bytes.load(Ordering::Acquire), 0);
+        permit.cancel();
+        let error = namespace
+            .record_file_with_permit(&object.id, "payload", Some(&permit))
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::Cancelled);
+        assert_eq!(member(&namespace, &object.id).seal, sealed.seal);
+    }
+
     #[test]
     fn intended_proof_retries_exact_rows_after_postcommit_response_loss() {
         let (_temp, namespace, permit) = fixture();

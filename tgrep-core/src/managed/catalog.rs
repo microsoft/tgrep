@@ -156,7 +156,7 @@ pub struct ObjectRecord {
     pub error: Option<serde_json::Value>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileRecord {
     pub name: String,
@@ -965,18 +965,74 @@ impl Namespace {
     }
 
     pub(crate) fn record_file(&self, id: &Id, name: &str) -> Result<FileRecord> {
-        self.record_file_state(id, name, false)
+        self.record_file_with_permit(id, name, None)
     }
 
-    pub(crate) fn record_file_state(
+    pub(crate) fn record_file_with_permit(
         &self,
         id: &Id,
         name: &str,
-        producer_open: bool,
+        permit: Option<&Arc<super::WorkPermit>>,
     ) -> Result<FileRecord> {
         let directory = self.objects.child(id.as_str())?;
+        #[cfg(windows)]
+        {
+            if let Some(permit) = permit
+                && !std::ptr::eq(self, permit.namespace.as_ref())
+            {
+                return Err(Error::invalid(
+                    "member reservation belongs to another namespace",
+                ));
+            }
+            let previous: Option<FileRecord> = self.read(|connection| {
+                let record: Option<String> = connection
+                    .query_row(
+                        "SELECT record FROM members WHERE object_id=?1 AND name=?2",
+                        params![id.as_str(), name],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                record
+                    .map(|record| serde_json::from_str(&record).map_err(Error::from))
+                    .transpose()
+            })?;
+            if let Some(previous) = previous
+                && !previous.producer_open
+            {
+                let _memory = match permit {
+                    Some(permit) => permit
+                        .memory(super::verification::MEMORY_BYTES)?
+                        .retain(0)?,
+                    None => self.verification_scratch(super::verification::MEMORY_BYTES)?,
+                };
+                // ChangeTime can move for metadata-only work. Unchanged times
+                // are not authority either: authenticate the original seal.
+                let native = super::verification::authenticate_complete_member(
+                    self, &directory, id, &previous, permit,
+                )?;
+                let record = self.record_open_file_state_with_authentication(
+                    id,
+                    name,
+                    &native.file,
+                    false,
+                    Some(&previous),
+                )?;
+                super::verification::check_native_member(
+                    &native,
+                    &directory,
+                    name,
+                    &previous.identity,
+                    &previous.ownership,
+                    previous.logical_bytes,
+                )
+                .map_err(|error| error.committed(CommitState::Committed))?;
+                return Ok(record);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = permit;
         let file = directory.open_file(name, false)?;
-        self.record_open_file_state(id, name, &file, producer_open)
+        self.record_open_file_state(id, name, &file, false)
     }
 
     pub(crate) fn record_open_file_state(
@@ -985,6 +1041,17 @@ impl Namespace {
         name: &str,
         file: &File,
         producer_open: bool,
+    ) -> Result<FileRecord> {
+        self.record_open_file_state_with_authentication(id, name, file, producer_open, None)
+    }
+
+    fn record_open_file_state_with_authentication(
+        &self,
+        id: &Id,
+        name: &str,
+        file: &File,
+        producer_open: bool,
+        authenticated: Option<&FileRecord>,
     ) -> Result<FileRecord> {
         let identity = FileIdentity::of(file)?;
         if self
@@ -1022,9 +1089,14 @@ impl Namespace {
             ).optional()?;
             if let Some(previous) = previous {
                 let previous: FileRecord = serde_json::from_str(&previous)?;
-                if previous.identity != record.identity || previous.ownership != record.ownership || previous.removed || previous.pending_length.is_some()
+                let needs_authentication = authenticated.is_none()
+                    && (cfg!(windows) || previous.change != record.change);
+                if authenticated.is_some_and(|expected| expected != &previous)
+                    || previous.identity != record.identity || previous.ownership != record.ownership || previous.removed || previous.pending_length.is_some()
+                    || previous.pending_manifest.is_some()
                     || previous.credited_logical_bytes != 0
-                    || (!previous.producer_open && (previous.change != record.change
+                    || previous.credited_allocated_bytes != 0
+                    || (!previous.producer_open && (needs_authentication
                         || previous.logical_bytes != record.logical_bytes || producer_open))
                 {
                     return Err(Error::new(ErrorCategory::StaleIdentity, "producer-member-modified",
@@ -1032,6 +1104,10 @@ impl Namespace {
                 }
                 record.seal = previous.seal;
             } else {
+                if authenticated.is_some() {
+                    return Err(Error::new(ErrorCategory::StaleIdentity, "producer-member-modified",
+                        "authenticated producer inventory disappeared before recording"));
+                }
                 let creating: bool = transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM member_creations WHERE object_id=?1 AND name=?2)",
                     params![id.as_str(), name], |row| row.get(0),

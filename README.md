@@ -931,6 +931,17 @@ the v1 `shared attach` command to create a managed lease.
 The [v2 client contract](SHARED_WORKTREE_INDEXES.md#managed-client-contract)
 specifies complete request shapes, recovery and token acknowledgement.
 
+Managed reconciliation verifies files in bounded parallel batches, with shared
+daemon-wide concurrency/input admission and scoped sibling-directory handles.
+Namespace operation-worker limits do not need to be raised. Exact checkout bytes,
+identity checks, cancellation and final readiness gates are preserved; clean Git
+status never replaces first-attachment verification. Receipts and status expose
+[phase timings and resource counters](SHARED_WORKTREE_INDEXES.md#bounded-managed-reconciliation).
+This initial-pipeline optimization does **not** eliminate recurring full repair:
+without trustworthy change coverage, the existing 120-second fallback remains.
+`reconciliation_policy` in status reports that limitation and the configured
+interval; neither timestamps nor an unavailable ReFS journal prove coverage.
+
 `views.advance` prepares and reconciles a complete replacement while unrelated
 ready views continue serving. The current exact commit, physical generation,
 view version and checkpoint commit together before acknowledgement. Queries

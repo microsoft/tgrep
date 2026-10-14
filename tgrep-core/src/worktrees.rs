@@ -6,13 +6,15 @@
 //! require periodic [`WorktreeView::reconcile_full`] calls. No native watcher,
 //! CLI routing, content cache, base migration, or generation GC is provided.
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Instant;
 
 use crate::generations::{Generation, GenerationError, Repository};
 use crate::gitignore::CaseInsensitiveIgnore;
@@ -20,7 +22,7 @@ use crate::hybrid::HybridIndex;
 use crate::live::LiveIndex;
 use crate::meta::{ContentId, FileVersion, file_version};
 use crate::query::QueryPlan;
-use crate::rooted::RootedDir;
+use crate::rooted::{OpenedFile, ParentEvidence, RootedBatch, RootedDir};
 use crate::trigram::TrigramMaskMap;
 use crate::visibility::PathVisibility;
 use crate::walker::{self, MetaWalkOptions};
@@ -119,6 +121,7 @@ pub struct WorktreeStatus {
 
 /// Work performed by one successful refresh (including no-op verification).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReconcileStats {
     pub epoch: u64,
     pub full: bool,
@@ -140,6 +143,77 @@ pub struct ReconcileStats {
     /// Ordered-set probes for hinted paths/ancestors, bounded by path depth
     /// rather than the number of pending hints. Full passes make no probes.
     pub hint_lookups: u64,
+    pub batches: u64,
+    pub batch_retries: u64,
+    pub parent_batches: u64,
+    pub control_checks: u64,
+    pub namespace_catalog_calls: u64,
+    pub peak_workers: u64,
+    pub peak_parent_handles: u64,
+    pub peak_read_bytes: u64,
+    pub peak_private_bytes: u64,
+    pub timings: ReconcileTimings,
+}
+
+/// Microseconds. Phase durations are wall time; worker_content_us and read_wait_us
+/// are aggregate worker time. Catalog/control checks overlap the enclosing phases.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReconcileTimings {
+    pub queue_us: u64,
+    pub discovery_us: u64,
+    pub planning_us: u64,
+    pub content_verification_us: u64,
+    pub worker_content_us: u64,
+    pub worker_parent_us: u64,
+    pub worker_open_us: u64,
+    pub worker_read_verify_us: u64,
+    pub worker_decode_hash_us: u64,
+    pub worker_compare_extract_us: u64,
+    pub parent_verify_us: u64,
+    pub assembly_us: u64,
+    pub checkpoint_us: u64,
+    pub publication_prepare_us: u64,
+    pub catalog_control_us: u64,
+    pub namespace_catalog_us: u64,
+    pub base_materialization_us: u64,
+    pub worker_wait_us: u64,
+    pub parent_wait_us: u64,
+    pub read_wait_us: u64,
+    pub admitted_us: u64,
+}
+
+impl ReconcileStats {
+    fn add_verification(&mut self, other: &Self) {
+        self.files_read += other.files_read;
+        self.bytes_read += other.bytes_read;
+        self.files_decoded += other.files_decoded;
+        self.files_extracted += other.files_extracted;
+        self.base_reused += other.base_reused;
+        self.base_files_copied += other.base_files_copied;
+        self.overlay_reused += other.overlay_reused;
+        self.content_reads_avoided += other.content_reads_avoided;
+        self.hint_lookups += other.hint_lookups;
+        self.parent_batches += other.parent_batches;
+    }
+}
+
+impl ReconcileTimings {
+    fn add_worker(&mut self, other: &Self) {
+        self.worker_content_us += other.worker_content_us;
+        self.worker_parent_us += other.worker_parent_us;
+        self.worker_open_us += other.worker_open_us;
+        self.worker_read_verify_us += other.worker_read_verify_us;
+        self.worker_decode_hash_us += other.worker_decode_hash_us;
+        self.worker_compare_extract_us += other.worker_compare_extract_us;
+    }
+}
+
+fn timed<T>(micros: &mut u64, work: impl FnOnce() -> T) -> T {
+    let start = Instant::now();
+    let result = work();
+    *micros += crate::managed::work::micros(start.elapsed());
+    result
 }
 
 struct Control {
@@ -479,9 +553,57 @@ impl WorktreeView {
             control.full = true;
             (epoch, full, control.hints.clone())
         };
-        let prepared = self.prepare(full, &hints, after_discovery, permit)?;
+        let mut prepared = self.prepare(full, &hints, after_discovery, permit)?;
         before_publish();
+        let assembly = Instant::now();
+        timed(
+            &mut prepared.stats.timings.parent_verify_us,
+            || -> Result<()> {
+                if let Some(permit) = permit {
+                    let admission = permit
+                        .parallelism(
+                            rayon::current_num_threads()
+                                .min(prepared.parents.len())
+                                .max(1),
+                        )
+                        .map_err(crate::Error::from)?;
+                    let checks: Vec<_> = prepared
+                        .parents
+                        .par_chunks(prepared.parents.len().div_ceil(admission.workers).max(1))
+                        .map(|parents| -> Result<()> {
+                            for parent in parents {
+                                let _pins = permit
+                                    .admit_parents(parent.verification_handles())
+                                    .map_err(crate::Error::from)?;
+                                let _memory = permit
+                                    .admit_read(parent.verification_memory_bytes(&self.files))
+                                    .map_err(crate::Error::from)?;
+                                parent.verify(&self.files)?;
+                            }
+                            Ok(())
+                        })
+                        .collect();
+                    let mut failure = None;
+                    for check in checks {
+                        if let Err(error) = check {
+                            record_failure(&mut failure, error);
+                        }
+                    }
+                    if let Some(error) = failure {
+                        return Err(error);
+                    }
+                } else {
+                    for parent in &prepared.parents {
+                        parent.verify(&self.files)?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
         self.files.verify_root()?;
+        if let Some(permit) = permit {
+            permit.check_now().map_err(crate::Error::from)?;
+        }
         let mut control = self
             .control
             .lock()
@@ -502,6 +624,7 @@ impl WorktreeView {
             upserts,
             mut stats,
             mut memory,
+            parents: _,
         } = prepared;
         let mut replacement = match (permit, &mut memory) {
             (Some(permit), Some(memory)) => Some(
@@ -580,6 +703,11 @@ impl WorktreeView {
         state.restored_content.clear();
         state.memory = retained;
         state.cost = measure_overlay_cost(&state, permit).map_err(crate::Error::from)?;
+        if let Some(permit) = permit {
+            permit.check_now().map_err(crate::Error::from)?;
+            permit.observe_reconciliation(&mut stats);
+        }
+        stats.timings.assembly_us += crate::managed::work::micros(assembly.elapsed());
         stats.epoch = epoch;
         control.published_epoch = Some(epoch);
         control.full = false;
@@ -601,6 +729,7 @@ impl WorktreeView {
         after_discovery: impl FnOnce(),
         permit: Option<&Arc<crate::managed::WorkPermit>>,
     ) -> Result<Prepared> {
+        let discovery = Instant::now();
         self.files.verify_root()?;
         let process = permit.map(crate::managed::process::Control::work);
         let repository = match &process {
@@ -651,151 +780,187 @@ impl WorktreeView {
         after_discovery();
         let mut prepared = Prepared {
             memory,
+            parents: Vec::new(),
             evidence: BTreeMap::new(),
             visibility: walk.visibility,
             upserts: BTreeMap::new(),
             stats: ReconcileStats {
                 full,
                 files_discovered: walk.listed_files.len(),
+                timings: ReconcileTimings {
+                    discovery_us: crate::managed::work::micros(discovery.elapsed()),
+                    ..ReconcileTimings::default()
+                },
                 ..ReconcileStats::default()
             },
         };
+        let planning = Instant::now();
         let state = self
             .state
             .read()
             .map_err(|_| WorktreeError::Synchronization)?;
-        let mut base_contents = None;
+        let base_contents = BaseContents::default();
         let mut copies: HashMap<u32, Vec<String>> = HashMap::new();
-        for path in walk.listed_files {
-            if let Some(permit) = permit {
-                permit.check().map_err(crate::Error::from)?;
+        let mut paths = walk.listed_files;
+        if let Some(memory) = &mut prepared.memory {
+            memory
+                .grow(paths.len() as u64 * 128)
+                .map_err(crate::Error::from)?;
+        }
+        paths.sort_unstable_by(|left, right| {
+            parent_path(left)
+                .cmp(parent_path(right))
+                .then_with(|| left.cmp(right))
+        });
+        let sizes: HashMap<_, _> = walk
+            .files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.size))
+            .collect();
+        let charges: Vec<_> = paths
+            .iter()
+            .map(|path| crate::builder::BatchCharge {
+                heap: sizes.get(path.as_str()).map_or(
+                    crate::builder::INDEX_BUILD_BATCH_BYTES,
+                    |size| {
+                        size.saturating_add(1)
+                            .saturating_mul(6)
+                            .saturating_add(64 * 1024)
+                    },
+                ),
+                mapped: 0,
+            })
+            .collect();
+        let mut ranges = Vec::new();
+        for range in crate::builder::batch_ranges(&charges, crate::builder::INDEX_BUILD_BATCH_BYTES)
+        {
+            let mut start = range.start;
+            let mut handles = 0;
+            let mut previous = None;
+            for index in range.clone() {
+                let parent = parent_path(&paths[index]);
+                if previous == Some(parent) {
+                    continue;
+                }
+                let required = RootedDir::batch_handles(Path::new(parent));
+                if index > start
+                    && (permit.is_none()
+                        || handles + required > crate::managed::work::RECONCILE_PARENT_HANDLES)
+                {
+                    ranges.push(start..index);
+                    start = index;
+                    handles = 0;
+                }
+                handles += required;
+                previous = Some(parent);
             }
-            relative_path(Path::new(&path))?;
-            let file = self.files.open_file(Path::new(&path))?;
-            let metadata = file.metadata()?;
-            let version = file_version(&metadata);
-            let previous = state.evidence.get(&path);
-            // Case aliases must not lose notifications on case-insensitive
-            // filesystems. Extra verification on case-sensitive trees is safe.
-            let hinted = !full && is_hinted(&path, hints, &mut prepared.stats.hint_lookups);
-            let evidence = if !full
-                && !hinted
-                && version.is_trusted()
-                && previous.is_some_and(|entry| entry.version == version)
-            {
-                prepared.stats.content_reads_avoided += 1;
-                previous.expect("verified previous entry").clone()
-            } else {
-                let (bytes, version, _content_memory) = read_file(
-                    &self.files,
-                    Path::new(&path),
-                    file,
-                    self.options.walk.max_file_size,
-                    permit,
-                )?;
-                prepared.stats.files_read += 1;
-                prepared.stats.bytes_read += bytes.len() as u64;
-                let listed = self
-                    .options
-                    .walk
-                    .max_file_size
-                    .is_none_or(|limit| bytes.len() as u64 <= limit);
-                let content = if listed && !walker::is_binary_extension(Path::new(&path)) {
-                    let text = crate::encoding::decode_for_index_controlled(&bytes, permit)
-                        .map_err(crate::Error::from)?;
-                    prepared.stats.files_decoded += 1;
-                    if crate::trigram::is_binary(&text) {
-                        None
-                    } else {
-                        let id = ContentId::from_indexed_bytes_controlled(&text, permit)
-                            .map_err(crate::Error::from)?;
-                        if self.base_content(&path) != Some(id)
-                            && !(previous
-                                .and_then(|entry| entry.content)
-                                .or_else(|| state.restored_content.get(&path).copied())
-                                == Some(id)
-                                && state.index.live.has_path(&path))
-                        {
-                            if base_contents.is_none() {
-                                if let Some(memory) = &mut prepared.memory {
-                                    memory
-                                        .grow(
-                                            (self.generation.base().reader().all_paths().len()
-                                                as u64)
-                                                .checked_mul(128)
-                                                .ok_or_else(|| {
-                                                    crate::Error::from(
-                                                        crate::managed::Error::pressure(
-                                                            "base-copy-memory-overflow",
-                                                        ),
-                                                    )
-                                                })?,
-                                        )
-                                        .map_err(crate::Error::from)?;
-                                }
-                                let mut contents = HashMap::new();
-                                for (file_id, path) in self
-                                    .generation
-                                    .base()
-                                    .reader()
-                                    .all_paths()
-                                    .iter()
-                                    .enumerate()
-                                {
-                                    if let Some(permit) = permit {
-                                        permit.check().map_err(crate::Error::from)?;
-                                    }
-                                    if let Some(id) = self.base_content(path) {
-                                        contents.insert(id, file_id as u32);
-                                    }
-                                }
-                                base_contents = Some(contents);
+            ranges.push(start..range.end);
+        }
+        prepared.stats.timings.planning_us = crate::managed::work::micros(planning.elapsed());
+        let verification = Instant::now();
+        for range in ranges {
+            let files = &paths[range];
+            let mut wanted = rayon::current_num_threads().min(files.len());
+            let chunks = loop {
+                let admission = permit
+                    .map(|permit| permit.parallelism(wanted))
+                    .transpose()
+                    .map_err(crate::Error::from)?;
+                let batch = VerificationBatch::new(&self.files, files, &base_contents, permit)?;
+                let failure = Mutex::new(None);
+                let verify = |paths: &[String]| {
+                    let start = Instant::now();
+                    let mut timings = ReconcileTimings::default();
+                    let verified =
+                        self.verify_files(paths, &state, full, hints, &batch, &mut timings);
+                    timings.worker_content_us = crate::managed::work::micros(start.elapsed());
+                    let chunk = match verified {
+                        Ok(result) => Some(result),
+                        Err(error) => {
+                            let retryable = is_private_pressure(&error);
+                            let mut failure = failure.lock().expect("verification failure lock");
+                            record_failure(&mut failure, error);
+                            if !retryable && let Some(permit) = permit {
+                                permit.cancel();
                             }
-                            let contents = base_contents.as_ref().expect("base content map");
-                            if let Some(&file_id) = contents.get(&id) {
-                                copies.entry(file_id).or_default().push(path.clone());
-                                prepared.stats.base_files_copied += 1;
-                                prepared
-                                    .upserts
-                                    .insert(path.clone(), TrigramMaskMap::default());
-                            } else {
-                                let masks = match (permit, &mut prepared.memory) {
-                                    (Some(permit), Some(memory)) => {
-                                        crate::trigram::extract_merged_masks_controlled(
-                                            &text, permit, memory,
-                                        )
-                                        .map_err(crate::Error::from)?
-                                    }
-                                    _ => LiveIndex::compute_trigram_masks(&text),
-                                };
-                                prepared.stats.files_extracted += 1;
-                                prepared.upserts.insert(path.clone(), masks);
-                            }
+                            None
                         }
-                        Some(id)
-                    }
-                } else {
-                    None
+                    };
+                    (chunk, timings)
                 };
-                Evidence {
-                    version,
-                    listed,
-                    content,
+                let chunks: Vec<_> = match &admission {
+                    Some(admission) => files
+                        .par_chunks(files.len().div_ceil(admission.workers))
+                        .map(verify)
+                        .collect(),
+                    None => vec![verify(files)],
+                };
+                for (_, timings) in &chunks {
+                    prepared.stats.timings.add_worker(timings);
                 }
+                if let Some(error) = failure
+                    .into_inner()
+                    .map_err(|_| WorktreeError::Synchronization)?
+                {
+                    // Join and drop all outputs and shared parent pins before
+                    // retrying; cancellation and non-memory failures stay fatal.
+                    drop(chunks);
+                    drop(batch);
+                    if is_private_pressure(&error)
+                        && admission.as_ref().is_some_and(|guard| guard.workers > 1)
+                        && let Some(permit) = permit
+                    {
+                        permit
+                            .namespace
+                            .fault(
+                                crate::managed::faults::Point::ReconcileRetryDrained,
+                                Some(permit.operation_id()),
+                            )
+                            .map_err(crate::Error::from)?;
+                        permit.check_now().map_err(crate::Error::from)?;
+                        prepared.stats.batch_retries += 1;
+                        wanted = 1;
+                        continue;
+                    }
+                    if let Some(permit) = permit {
+                        permit.cancel();
+                    }
+                    return Err(error);
+                }
+                let (parents, memory) =
+                    timed(&mut prepared.stats.timings.parent_verify_us, || {
+                        batch.finish(admission.as_ref().map_or(1, |guard| guard.workers))
+                    })?;
+                prepared.stats.parent_batches += parents.len() as u64;
+                prepared.parents.extend(parents);
+                if let (Some(target), Some(memory)) = (&mut prepared.memory, memory) {
+                    target.absorb(memory).map_err(crate::Error::from)?;
+                }
+                break chunks;
             };
-            if let Some(id) = evidence.content {
-                if self.base_content(&path) == Some(id) {
-                    prepared.stats.base_reused += 1;
-                } else if !prepared.upserts.contains_key(&path) {
-                    prepared.stats.overlay_reused += 1;
+            prepared.stats.batches += 1;
+            for chunk in chunks.into_iter().filter_map(|(chunk, _)| chunk) {
+                prepared.stats.add_verification(&chunk.stats);
+                if let (Some(memory), Some(charge)) = (&mut prepared.memory, chunk.memory) {
+                    memory.absorb(charge).map_err(crate::Error::from)?;
                 }
-            }
-            if prepared.evidence.insert(path, evidence).is_some() {
-                return Err(WorktreeError::InvalidInput(
-                    "duplicate checkout path".into(),
-                ));
+                for (path, entry) in chunk.evidence {
+                    if prepared.evidence.insert(path, entry).is_some() {
+                        return Err(WorktreeError::InvalidInput(
+                            "duplicate checkout path".into(),
+                        ));
+                    }
+                }
+                for (path, file_id) in chunk.copies {
+                    copies.entry(file_id).or_default().push(path.clone());
+                    prepared.upserts.insert(path, TrigramMaskMap::default());
+                }
+                prepared.upserts.extend(chunk.upserts);
             }
         }
+        prepared.stats.timings.content_verification_us =
+            crate::managed::work::micros(verification.elapsed());
+        let assembly = Instant::now();
         // One streaming pass for all verified renames/copies, not one full
         // posting scan per file. No read/extraction of another checkout.
         if !copies.is_empty() {
@@ -828,7 +993,149 @@ impl WorktreeView {
                 }
             }
         }
+        prepared.stats.timings.assembly_us += crate::managed::work::micros(assembly.elapsed());
         Ok(prepared)
+    }
+
+    fn verify_files(
+        &self,
+        paths: &[String],
+        state: &State,
+        full: bool,
+        hints: &BTreeSet<String>,
+        batch: &VerificationBatch<'_, '_>,
+        timings: &mut ReconcileTimings,
+    ) -> Result<VerifiedChunk> {
+        let permit = batch.permit;
+        let mut chunk = VerifiedChunk {
+            memory: permit
+                .map(|permit| permit.memory(0))
+                .transpose()
+                .map_err(crate::Error::from)?,
+            ..VerifiedChunk::default()
+        };
+        let mut start_path = 0;
+        while start_path < paths.len() {
+            let parent = parent_path(&paths[start_path]);
+            let end_path = start_path
+                + paths[start_path..]
+                    .iter()
+                    .take_while(|path| parent_path(path) == parent)
+                    .count();
+            if let Some(permit) = permit {
+                permit.check().map_err(crate::Error::from)?;
+            }
+            let reader = timed(&mut timings.worker_parent_us, || batch.reader(parent))?;
+            for path in &paths[start_path..end_path] {
+                if let Some(permit) = permit {
+                    permit.check().map_err(crate::Error::from)?;
+                }
+                let relative = Path::new(path);
+                relative_path(relative)?;
+                let file = timed(&mut timings.worker_open_us, || {
+                    reader.open_observed(relative)
+                })?;
+                let version = file_version(&file.metadata);
+                let previous = state.evidence.get(path);
+                let hinted = !full && is_hinted(path, hints, &mut chunk.stats.hint_lookups);
+                let mut updated = false;
+                let evidence = if !full
+                    && !hinted
+                    && version.is_trusted()
+                    && previous.is_some_and(|entry| entry.version == version)
+                {
+                    chunk.stats.content_reads_avoided += 1;
+                    previous.expect("verified previous entry").clone()
+                } else {
+                    let read = timed(&mut timings.worker_read_verify_us, || {
+                        read_file(
+                            || reader.open_observed(relative),
+                            relative,
+                            file,
+                            self.options.walk.max_file_size,
+                            permit,
+                        )
+                    })?;
+                    chunk.stats.files_read += 1;
+                    chunk.stats.bytes_read += read.bytes.len() as u64;
+                    let listed = self
+                        .options
+                        .walk
+                        .max_file_size
+                        .is_none_or(|limit| read.bytes.len() as u64 <= limit);
+                    let content = if listed && !walker::is_binary_extension(relative) {
+                        chunk.stats.files_decoded += 1;
+                        let (text, id) =
+                            timed(&mut timings.worker_decode_hash_us, || -> Result<_> {
+                                let text = crate::encoding::decode_for_index_controlled(
+                                    &read.bytes,
+                                    permit,
+                                )
+                                .map_err(crate::Error::from)?;
+                                let id = if crate::trigram::is_binary(&text) {
+                                    None
+                                } else {
+                                    Some(
+                                        ContentId::from_indexed_bytes_controlled(&text, permit)
+                                            .map_err(crate::Error::from)?,
+                                    )
+                                };
+                                Ok((text, id))
+                            })?;
+                        if let Some(id) = id {
+                            timed(&mut timings.worker_compare_extract_us, || -> Result<()> {
+                                if self.base_content(path) != Some(id)
+                                    && !(previous
+                                        .and_then(|entry| entry.content)
+                                        .or_else(|| state.restored_content.get(path).copied())
+                                        == Some(id)
+                                        && state.index.live.has_path(path))
+                                {
+                                    if let Some(file_id) =
+                                        batch.base_contents.find(self, id, permit)?
+                                    {
+                                        chunk.copies.push((path.clone(), file_id));
+                                        chunk.stats.base_files_copied += 1;
+                                    } else {
+                                        let masks = match (permit, &mut chunk.memory) {
+                                            (Some(permit), Some(memory)) => {
+                                                crate::trigram::extract_merged_masks_controlled(
+                                                    &text, permit, memory,
+                                                )
+                                                .map_err(crate::Error::from)?
+                                            }
+                                            _ => LiveIndex::compute_trigram_masks(&text),
+                                        };
+                                        chunk.upserts.push((path.clone(), masks));
+                                        chunk.stats.files_extracted += 1;
+                                    }
+                                    updated = true;
+                                }
+                                Ok(())
+                            })?;
+                        }
+                        id
+                    } else {
+                        None
+                    };
+                    Evidence {
+                        version: read.version,
+                        listed,
+                        content,
+                    }
+                };
+                if let Some(id) = evidence.content {
+                    if self.base_content(path) == Some(id) {
+                        chunk.stats.base_reused += 1;
+                    } else if !updated {
+                        chunk.stats.overlay_reused += 1;
+                    }
+                }
+                chunk.evidence.push((path.clone(), evidence));
+            }
+            start_path = end_path;
+        }
+        Ok(chunk)
     }
 
     /// Hold the readiness, overlay, visibility and membership guards together.
@@ -1335,10 +1642,225 @@ impl WorktreeSnapshot<'_> {
 
 struct Prepared {
     memory: Option<crate::managed::work::MemoryCharge>,
+    parents: Vec<ParentEvidence>,
     evidence: BTreeMap<String, Evidence>,
     visibility: PathVisibility,
     upserts: BTreeMap<String, TrigramMaskMap>,
     stats: ReconcileStats,
+}
+
+#[derive(Default)]
+struct VerifiedChunk {
+    memory: Option<crate::managed::work::MemoryCharge>,
+    evidence: Vec<(String, Evidence)>,
+    upserts: Vec<(String, TrigramMaskMap)>,
+    copies: Vec<(String, u32)>,
+    stats: ReconcileStats,
+}
+
+struct ParentBatch<'a> {
+    reader: OnceLock<RootedBatch<'a>>,
+    initialize: Mutex<()>,
+}
+
+struct VerificationBatch<'root, 'inputs> {
+    root: &'root RootedDir,
+    parents: HashMap<&'inputs str, ParentBatch<'root>>,
+    base_contents: &'inputs BaseContents,
+    permit: Option<&'inputs Arc<crate::managed::WorkPermit>>,
+    memory: Option<crate::managed::work::MemoryCharge>,
+    _pins: Option<crate::managed::work::ParentAdmission<'inputs>>,
+}
+
+impl<'root, 'inputs> VerificationBatch<'root, 'inputs> {
+    fn new(
+        root: &'root RootedDir,
+        paths: &'inputs [String],
+        base_contents: &'inputs BaseContents,
+        permit: Option<&'inputs Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Self> {
+        let mut memory = permit
+            .map(|permit| permit.memory(0))
+            .transpose()
+            .map_err(crate::Error::from)?;
+        let mut parents = HashMap::new();
+        let mut handles = 0;
+        for path in paths {
+            let parent = parent_path(path);
+            if let std::collections::hash_map::Entry::Vacant(entry) = parents.entry(parent) {
+                handles += RootedDir::batch_handles(Path::new(parent));
+                if let Some(memory) = &mut memory {
+                    memory
+                        .grow(
+                            root.batch_memory_bytes(Path::new(parent))
+                                + std::mem::size_of::<ParentBatch<'_>>() as u64 * 2,
+                        )
+                        .map_err(crate::Error::from)?;
+                }
+                entry.insert(ParentBatch {
+                    reader: OnceLock::new(),
+                    initialize: Mutex::new(()),
+                });
+            }
+        }
+        let pins = permit
+            .map(|permit| permit.admit_parents(handles))
+            .transpose()
+            .map_err(crate::Error::from)?;
+        Ok(Self {
+            root,
+            parents,
+            base_contents,
+            permit,
+            memory,
+            _pins: pins,
+        })
+    }
+
+    fn reader(&self, parent: &str) -> Result<&RootedBatch<'root>> {
+        let entry = self.parents.get(parent).expect("planned parent batch");
+        if entry.reader.get().is_none() {
+            let _initialize = entry
+                .initialize
+                .lock()
+                .map_err(|_| WorktreeError::Synchronization)?;
+            if entry.reader.get().is_none() {
+                if let Some(permit) = self.permit {
+                    permit.check().map_err(crate::Error::from)?;
+                }
+                let reader = self.root.batch(Path::new(parent))?;
+                if entry.reader.set(reader).is_err() {
+                    return Err(WorktreeError::Synchronization);
+                }
+                if let Some(permit) = self.permit {
+                    permit
+                        .namespace
+                        .fault(
+                            crate::managed::faults::Point::ReconcileBatchOpened,
+                            Some(permit.operation_id()),
+                        )
+                        .map_err(crate::Error::from)?;
+                }
+            }
+        }
+        Ok(entry.reader.get().expect("initialized parent batch"))
+    }
+
+    fn finish(
+        mut self,
+        workers: usize,
+    ) -> Result<(
+        Vec<ParentEvidence>,
+        Option<crate::managed::work::MemoryCharge>,
+    )> {
+        let mut groups: Vec<_> = self.parents.into_values().collect();
+        let verify = |groups: &mut [ParentBatch<'_>]| -> Result<Vec<ParentEvidence>> {
+            let mut parents = Vec::with_capacity(groups.len());
+            for group in groups {
+                if let Some(permit) = self.permit {
+                    permit.check().map_err(crate::Error::from)?;
+                }
+                parents.push(
+                    group
+                        .reader
+                        .take()
+                        .ok_or(WorktreeError::Synchronization)?
+                        .finish()?,
+                );
+            }
+            Ok(parents)
+        };
+        let mut parents = Vec::with_capacity(groups.len());
+        let checks: Vec<_> = if workers > 1 {
+            let chunk_size = groups.len().div_ceil(workers).max(1);
+            groups.par_chunks_mut(chunk_size).map(verify).collect()
+        } else {
+            vec![verify(&mut groups)]
+        };
+        drop(groups);
+        let mut failure = None;
+        for check in checks {
+            match check {
+                Ok(verified) => parents.extend(verified),
+                Err(error) => record_failure(&mut failure, error),
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let mut bytes = parents.capacity() as u64 * std::mem::size_of::<ParentEvidence>() as u64;
+        for evidence in &parents {
+            bytes += evidence.memory_bytes();
+        }
+        if let Some(memory) = &mut self.memory {
+            memory.resize(bytes).map_err(crate::Error::from)?;
+        }
+        Ok((parents, self.memory))
+    }
+}
+
+#[derive(Default)]
+struct BaseContents {
+    entries: OnceLock<BaseContentMap>,
+    initialize: Mutex<()>,
+}
+
+struct BaseContentMap {
+    entries: HashMap<ContentId, u32>,
+    _memory: Option<crate::managed::work::MemoryCharge>,
+}
+
+impl BaseContents {
+    fn find(
+        &self,
+        view: &WorktreeView,
+        id: ContentId,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Option<u32>> {
+        if self.entries.get().is_none() {
+            let _initialize = self
+                .initialize
+                .lock()
+                .map_err(|_| WorktreeError::Synchronization)?;
+            if self.entries.get().is_none() {
+                let paths = view.generation.base().reader().all_paths();
+                let memory = permit
+                    .map(|permit| permit.memory(paths.len() as u64 * 128))
+                    .transpose()
+                    .map_err(crate::Error::from)?;
+                let mut entries = HashMap::new();
+                for (file_id, path) in paths.iter().enumerate() {
+                    if let Some(permit) = permit {
+                        permit.check().map_err(crate::Error::from)?;
+                    }
+                    if let Some(content) = view.base_content(path) {
+                        entries.insert(content, file_id as u32);
+                    }
+                }
+                if self
+                    .entries
+                    .set(BaseContentMap {
+                        entries,
+                        _memory: memory,
+                    })
+                    .is_err()
+                {
+                    return Err(WorktreeError::Synchronization);
+                }
+            }
+        }
+        Ok(self
+            .entries
+            .get()
+            .expect("initialized base contents")
+            .entries
+            .get(&id)
+            .copied())
+    }
+}
+
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
 pub(crate) fn relative_path(path: &Path) -> Result<String> {
@@ -1438,37 +1960,76 @@ fn is_hinted(path: &str, hints: &BTreeSet<String>, lookups: &mut u64) -> bool {
     }
 }
 
-fn read_file(
-    root: &RootedDir,
+struct VerifiedRead<'a> {
+    bytes: Vec<u8>,
+    version: FileVersion,
+    _admission: Option<crate::managed::work::ReadAdmission<'a>>,
+}
+
+fn is_private_pressure(error: &WorktreeError) -> bool {
+    matches!(error, WorktreeError::Index(crate::Error::Managed(error))
+        if error.category == crate::managed::ErrorCategory::ResourcePressure
+            && error.reason_code == "reserved-private-memory-exhausted")
+}
+
+fn record_failure(failure: &mut Option<WorktreeError>, error: WorktreeError) {
+    let substantive = !is_private_pressure(&error) && !is_peer_cancellation(&error);
+    if failure.as_ref().is_none_or(|previous| {
+        substantive && (is_private_pressure(previous) || is_peer_cancellation(previous))
+    }) {
+        *failure = Some(error);
+    }
+}
+
+fn is_peer_cancellation(error: &WorktreeError) -> bool {
+    matches!(error, WorktreeError::Index(crate::Error::Managed(error))
+        if error.category == crate::managed::ErrorCategory::Cancelled)
+}
+
+fn read_file<'a>(
+    reopen: impl FnOnce() -> std::io::Result<OpenedFile>,
     path: &Path,
-    mut file: File,
+    opened: OpenedFile,
     limit: Option<u64>,
-    permit: Option<&Arc<crate::managed::WorkPermit>>,
-) -> Result<(
-    Vec<u8>,
-    FileVersion,
-    Option<crate::managed::work::MemoryCharge>,
-)> {
-    let opened = file.metadata()?;
+    permit: Option<&'a Arc<crate::managed::WorkPermit>>,
+) -> Result<VerifiedRead<'a>> {
+    let OpenedFile {
+        mut file,
+        metadata: opened,
+    } = opened;
     let version = file_version(&opened);
-    let mut bytes = Vec::new();
-    let mut memory = permit
-        .map(|permit| permit.memory(64 * 1024))
+    let change = permit
+        .map(|_| crate::managed::storage::file_change(&file))
         .transpose()
         .map_err(crate::Error::from)?;
-    let work_limit = permit
-        .map(|permit| {
-            permit
-                .namespace
-                .policy()
-                .map(|policy| policy.policy.work.blob_bytes)
-        })
-        .transpose()
-        .map_err(crate::Error::from)?;
+    let work_limit = permit.map(|permit| permit.read_limits().blob_bytes);
     let read_limit = limit
         .map_or(u64::MAX, |limit| limit.saturating_add(1))
         .min(work_limit.map_or(u64::MAX, |limit| limit.saturating_add(1)));
-    let mut input = (&mut file).take(read_limit);
+    let expected = opened.len().min(read_limit);
+    let charged = expected
+        .checked_mul(6)
+        .and_then(|bytes| bytes.checked_add(64 * 1024))
+        .ok_or_else(|| {
+            crate::Error::from(crate::managed::Error::pressure(
+                "checkout-read-memory-overflow",
+            ))
+        })?;
+    let admission = permit
+        .map(|permit| permit.admit_read(charged))
+        .transpose()
+        .map_err(crate::Error::from)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(usize::try_from(expected).map_err(|_| {
+            crate::Error::from(crate::managed::Error::pressure(
+                "checkout-read-address-space",
+            ))
+        })?)
+        .map_err(|_| {
+            crate::Error::from(crate::managed::Error::pressure("checkout-read-allocation"))
+        })?;
+    let mut input = (&mut file).take(read_limit.min(opened.len().saturating_add(1)));
     let mut chunk = [0_u8; 64 * 1024];
     loop {
         if let Some(permit) = permit {
@@ -1484,21 +2045,37 @@ fn read_file(
             ))
             .into());
         }
-        if let Some(memory) = &mut memory {
-            memory.grow(count as u64 * 6).map_err(crate::Error::from)?;
+        // A growing file is unstable, not a request to wait for additional
+        // capacity while retaining an already admitted read buffer.
+        if bytes.len() as u64 + count as u64 > expected {
+            return Err(WorktreeError::UnstableFile(path.into()));
         }
         bytes.extend_from_slice(&chunk[..count]);
     }
-    let current = root.open_file(path)?;
-    if version != file_version(&file.metadata()?)
-        || version != file_version(&current.metadata()?)
-        || same_file::Handle::from_file(file)? != same_file::Handle::from_file(current)?
+    let current = reopen()?;
+    let native_changed = match change {
+        Some(change) => {
+            change != crate::managed::storage::file_change(&file).map_err(crate::Error::from)?
+                || change
+                    != crate::managed::storage::file_change(&current.file)
+                        .map_err(crate::Error::from)?
+        }
+        None => false,
+    };
+    if native_changed
+        || version != file_version(&file.metadata()?)
+        || version != file_version(&current.metadata)
+        || same_file::Handle::from_file(file)? != same_file::Handle::from_file(current.file)?
         || (limit.is_none_or(|limit| bytes.len() as u64 <= limit)
             && bytes.len() as u64 != opened.len())
     {
         return Err(WorktreeError::UnstableFile(path.into()));
     }
-    Ok((bytes, version, memory))
+    Ok(VerifiedRead {
+        bytes,
+        version,
+        _admission: admission,
+    })
 }
 
 #[cfg(test)]

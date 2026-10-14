@@ -964,8 +964,16 @@ Use JSON `null`, not a string, for an absent coordinator or storage ceiling.
 The update's `expected_version` selects the current allocation; the server
 publishes the new allocation with that version plus one. Byte values are
 positive and work slots are `1..64`. Policy and allocation both constrain
-admission. Reducing an allocation does not revoke live readers or pretend
-already-admitted work vanished; later work can receive resource pressure.
+admission. Updates do not revoke live readers or pretend already-admitted work
+vanished. Producers capture read limits and both versions at admission; a
+version change stops them at the next bounded control check (normally within
+10 ms) or the forced publication check. Namespace mutations invalidate the
+in-process control cache. An independent one-second fallback refresh checks
+persisted versions/cancellation and native owner-guard proof even when that
+cache has not been invalidated. Deadlines and explicit cancellation are checked
+on every call; no owner lifetime is inferred from a PID or inactivity.
+Retry failed work under current versions;
+do not replay an old allocation version as if it were still current.
 
 Reservations cover workers, private capacity, staging, predecessor/successor
 publication overlap and retained private state. `charged_overlap_logical_bytes`
@@ -976,6 +984,99 @@ observed/unavailable results; sparse/compressed allocation is not inferred from
 logical length. Namespace memory is process-local admitted/retained capacity
 and mappings, **not an RSS cap**. A coordinator must budget multiple namespaces
 and its other processes independently.
+
+### Bounded managed reconciliation
+
+`work.workers` and allocation `work_slots` bound namespace operations, not the
+number of files one operation can verify. Within an attachment, discovery and
+content verification share a namespace-wide concurrency gate, capped at available
+logical CPUs (at most 64). Discovery also retains the normal walker's 12-thread
+cap. Verification uses the existing shared Rayon pool, never a pool per worktree.
+Increasing namespace operation workers is not required to parallelize an isolated
+attachment.
+
+The normal builder's file-count/byte batch planner is reused, **not** its file
+opening or mmap path. Batches are further split by distinct-parent handle cost,
+and a namespace-wide 256-credit handle gate bounds simultaneous parent pins.
+Credits cover retained and verification chains plus root-check scratch. A single
+unusually deep Windows parent takes the whole gate alone; its actual memory is
+still charged. Unix retains only the last ancestor descriptor while keeping the
+complete identity chain. Unmanaged/v1 reconciliation scopes each batch to one
+parent rather than accumulating pins for unrelated directories.
+
+Siblings share one scoped, handle-rooted ancestor chain per bounded batch,
+including siblings assigned to different workers. Child containment, reparse
+rejection, file identity and before/after read checks remain mandatory. Ancestor
+identities are checked with bounded parallelism when the batch ends and again
+before assembly publishes; completed batches retain identities, not directory
+handles. Compute credits, parent pins and input bytes are admitted in that order.
+Native metadata obtained by a verified open is reused, not reacquired redundantly
+before reading. Workers drain on cancellation/error before their reservation or
+checkout handles can be released.
+
+Input admission is shared across the namespace: 64 MiB of conservative read
+charges (six times bounded input bytes plus 64 KiB scratch per active file).
+As in the normal builder, a single larger input takes the entire input gate and
+runs alone. Its actual buffers must still fit the operation's private reservation
+and blob limit. Final directory-verification scratch uses the same byte gate;
+scoped parent-reader memory is separately charged to the private reservation.
+Reads also wait for that reservation's active input buffers, not
+for retained postings/evidence that cannot drain during the pass. File growth
+invalidates the read instead of waiting for more bytes while holding a partial
+buffer. Postings, decoded buffers, discovery and retained evidence all remain
+subject to existing private-memory admission. These estimates are not an RSS cap.
+If parallel extraction exhausts private headroom, the bounded batch is joined,
+its temporary outputs are dropped, and it retries once with one worker under the
+same limits. Serial pressure or any non-memory failure still fails the operation.
+
+Workers verify and decode/hash every required file, compare exact indexed content
+identities, and extract only differences. A single assembler preserves base,
+overlay and rename/copy reuse and publishes only after epoch, identity, policy and
+allocation checks. A clean Git status is not content evidence: first attachments
+and restores still read the checkout, including CRLF/filter differences and
+hidden/untracked membership.
+
+Successful operation receipts expose `result.reconcile`, also available as
+`last_reconcile` in view status. `hello` advertises `reconciliation-phase-metrics`.
+Its `timings` fields are integer microseconds:
+
+| Field | Scope |
+|-------|-------|
+| `queue_us` | Accepted operation lifetime up to the admission snapshot, including pre-reservation setup |
+| `base_materialization_us` | On attach, generation open/build and view construction |
+| `discovery_us` | Root/Git identity, ignore snapshot and membership walk, wall time |
+| `planning_us` | Prior-state lock, sibling ordering, size/charge maps and batch planning, wall time |
+| `content_verification_us` | Bounded read/verify/decode/hash/compare/extract and batch aggregation, wall time |
+| `worker_content_us` | Sum of worker intervals; includes input admission waits |
+| `worker_parent_us` | Aggregate shared parent initialization/access, including initialization waits |
+| `worker_open_us` | Aggregate secure child opens and their initial metadata observations |
+| `worker_read_verify_us` | Aggregate bounded reads, input waits, secure reopens and before/after checks |
+| `worker_decode_hash_us` | Aggregate decoding, binary checks and indexed-content hashing |
+| `worker_compare_extract_us` | Aggregate base/overlay comparison, copy lookup and difference extraction |
+| `parent_verify_us` | Batch-end and final ancestor validation wall time, within content/assembly phases |
+| `assembly_us` | Copy-posting pass, final ancestor checks and private overlay assembly, wall time |
+| `checkpoint_us` | Checkpoint writing, verification and publication, wall time |
+| `publication_prepare_us` | Final view/receipt preparation up to receipt construction; excludes its commit/fsync |
+| `catalog_control_us` | Admission and operation-scoped periodic/final control checks, including waits |
+| `namespace_catalog_us` | Aggregate namespace catalog accesses during admission, including other operations/polling |
+| `worker_wait_us` | Concurrency admission wall time |
+| `parent_wait_us`, `read_wait_us` | Aggregate parent-handle and input-admission wait time |
+| `admitted_us` | Elapsed since reservation entry, sampled at receipt preparation |
+
+These are **not additive**: worker and catalog measurements overlap wall phases.
+The worker subphases are diagnostics within `worker_content_us`, not additional
+wall time.
+Namespace catalog time cannot be attributed to one attachment when other work
+overlaps. Final view-commit fsync, receipt delivery, registration and producer
+teardown remain outside the receipt sample; use end-to-end readiness wall time
+for acceptance. `namespace_catalog_calls`, `control_checks`, `batches`,
+`batch_retries`, `parent_batches`, `peak_workers` (admitted concurrency credits),
+`peak_parent_handles` (conservative parent-handle capacity, not a sampled FD
+count), `peak_read_bytes` (input capacity plus transient directory verification),
+and `peak_private_bytes` complement the existing
+read/extraction/reuse counters. Those file counters describe completed batch
+evidence; when `batch_retries` is nonzero, timing fields also include discarded
+parallel attempts.
 
 ## Managed client contract
 
@@ -1185,6 +1286,22 @@ and zero new reconciliation work. This does not postpone periodic verification.
 Explicit refresh always verifies; periodic repair, watcher uncertainty and
 rescan events invalidate for full verification before queuing reconciliation.
 A newer invalidation therefore cannot be skipped by the coalescing check.
+
+**Recurring-repair limitation:** the bounded initial pipeline does not eliminate
+periodic full verification. This implementation has no integrated, lossless
+checkout change journal. File timestamps, Windows `ChangeTime`, a clean Git
+status, or a drained watcher queue do not prove absence of unreported writes
+(including active/mapped writers). An unavailable/inactive journal, including on
+ReFS, must not be treated as an empty journal. First attachment/restore, explicit
+full refresh, watcher error/overflow, Git/ignore changes and periodic fallback
+therefore continue to require full verification. The default 120-second interval
+after completion is retained, not silently lengthened or disabled.
+Online `namespace.status`, `views.status` and ordinary `status` expose
+`reconciliation_policy` with `periodic_full_verification`, `interval_ms`,
+`incremental_coverage: "unavailable"`, `change_journal: "not-integrated"`,
+`full_verification_reason: "no-trusted-change-coverage"` and repair triggers.
+`--no-watch` explicitly disables automatic repair; it does not supply coverage
+evidence or skip first-attachment verification.
 
 `views.adaptive` takes `view`, `owner`, `expected_version`, `allocation_version`
 in an operation envelope. Adaptive policy evaluates the worktree's captured

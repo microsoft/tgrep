@@ -102,6 +102,393 @@ impl Fixture {
     fn view(&self, root: &Path, generation: &Arc<Generation>) -> WorktreeView {
         WorktreeView::new(root, generation.clone(), WorktreeOptions::default()).unwrap()
     }
+
+    fn controlled(
+        &self,
+    ) -> (
+        Arc<crate::managed::Namespace>,
+        Arc<crate::managed::WorkPermit>,
+        WorktreeView,
+    ) {
+        let namespace = crate::managed::Namespace::initialize(
+            &Repository::discover(&self.root).unwrap(),
+            &self.storage,
+            crate::managed::policy::fixture_policy(),
+        )
+        .unwrap();
+        namespace.activate().unwrap();
+        let operation = namespace
+            .accept_system_operation(
+                crate::managed::Token::parse("reconciliation").unwrap(),
+                "build",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let permit = namespace
+            .reserve(
+                &operation.id,
+                None,
+                crate::managed::WorkRequest {
+                    allocation_version: 1,
+                    private_bytes: 32 * 1024 * 1024,
+                    staging_bytes: 32 * 1024 * 1024,
+                    slots: 1,
+                },
+            )
+            .unwrap();
+        let view = WorktreeView::new_controlled(
+            &self.root,
+            self.generation(),
+            WorktreeOptions::default(),
+            &permit,
+        )
+        .unwrap();
+        (namespace, permit, view)
+    }
+}
+
+#[test]
+fn managed_batches_reuse_exact_contents_copies_and_overlay_postings() {
+    let fixture = Fixture::new();
+    for index in 0..80 {
+        write(
+            &fixture.root,
+            &format!("siblings/file-{index:03}.txt"),
+            b"committed common content\n",
+        );
+    }
+    commit(&fixture.root);
+    write(
+        &fixture.root,
+        "siblings/copied.txt",
+        b"committed common content\n",
+    );
+    write(
+        &fixture.root,
+        "siblings/file-000.txt",
+        b"private changed content\n",
+    );
+    write(&fixture.root, "hidden/.extra", b"private hidden content\n");
+    let (_namespace, permit, view) = fixture.controlled();
+    let first = view.refresh_controlled(&permit).unwrap();
+    assert_eq!(first.files_read, 82);
+    assert_eq!(first.base_reused, 79);
+    assert_eq!(first.base_files_copied, 1);
+    assert_eq!(first.files_extracted, 2);
+    assert!(first.batches > 0);
+    assert_eq!(first.parent_batches, 2);
+    assert!(first.peak_read_bytes <= crate::builder::INDEX_BUILD_BATCH_BYTES);
+    assert!(first.peak_private_bytes <= permit.private_limit());
+    assert!(first.timings.discovery_us > 0);
+    assert!(first.timings.content_verification_us > 0);
+    assert!(first.timings.worker_content_us > 0);
+    assert!(first.timings.assembly_us > 0);
+    assert!(first.control_checks > 0);
+    assert_scan_parity(&view, &["common", "private", "hidden", "changed"]);
+    view.invalidate_all().unwrap();
+    let second = view.refresh_controlled(&permit).unwrap();
+    assert_eq!(second.files_read, 82);
+    assert_eq!(second.overlay_reused, 3);
+    assert_eq!(second.files_extracted, 0);
+    assert_eq!(second.base_files_copied, 0);
+    assert_scan_parity(&view, &["common", "private", "hidden", "changed"]);
+}
+
+#[test]
+fn managed_changed_files_fit_the_same_private_budget_at_any_worker_width() {
+    use crate::managed::faults::{Action, Point, Specification, Stage};
+    let fixture = Fixture::new();
+    for index in 0..4 {
+        write(
+            &fixture.root,
+            &format!("siblings/{index}.txt"),
+            b"committed\n",
+        );
+    }
+    commit(&fixture.root);
+    let mut seed = 1_u32;
+    let bytes: Vec<_> = (0..1024 * 1024)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b'a' + ((seed >> 24) % 26) as u8
+        })
+        .collect();
+    for index in 0..4 {
+        write(&fixture.root, &format!("siblings/{index}.txt"), &bytes);
+    }
+    let (namespace, permit, view) = fixture.controlled();
+    let fault = namespace
+        .install_test_fault(Specification {
+            point: Point::ReconcileRetryDrained,
+            operation: Some(permit.operation_id().clone()),
+            skip_hits: 0,
+            action: Action::Pause { timeout_ms: 30_000 },
+        })
+        .unwrap();
+    let stats = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| view.refresh_controlled(&permit));
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        let mut retried = false;
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "reconciliation did not finish");
+            if namespace.test_fault_status().unwrap().unwrap().stage == Stage::Waiting {
+                // Retained discovery/base-map evidence is small. Every input
+                // and partial posting charge must already have been dropped.
+                let capacity = permit.memory(permit.private_limit() - 1024 * 1024).unwrap();
+                drop(capacity);
+                let parent = fixture.root.join("siblings");
+                let moved = fixture.root.join("released");
+                fs::rename(&parent, &moved).unwrap();
+                fs::rename(&moved, &parent).unwrap();
+                namespace.release_test_fault(&fault.ticket).unwrap();
+                retried = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let stats = worker.join().unwrap().unwrap();
+        assert_eq!(stats.batch_retries, u64::from(retried));
+        stats
+    });
+    assert_eq!(stats.files_extracted, 4);
+    assert!(stats.peak_private_bytes <= permit.private_limit());
+    assert!(view.status().unwrap().ready);
+}
+
+#[test]
+fn substantive_verification_errors_override_secondary_pressure_and_cancellation() {
+    use crate::managed::{Error, ErrorCategory};
+    for category in [
+        ErrorCategory::Io,
+        ErrorCategory::StaleVersion,
+        ErrorCategory::Deadline,
+    ] {
+        for secondary in [
+            Error::pressure("reserved-private-memory-exhausted"),
+            Error::new(
+                ErrorCategory::Cancelled,
+                "operation-cancelled",
+                "peer cancellation",
+            ),
+        ] {
+            let mut failure = Some(WorktreeError::Index(secondary.into()));
+            record_failure(
+                &mut failure,
+                WorktreeError::Index(
+                    Error::new(
+                        category,
+                        "substantive-verification-failure",
+                        "verification failed",
+                    )
+                    .into(),
+                ),
+            );
+            assert!(
+                matches!(failure, Some(WorktreeError::Index(crate::Error::Managed(error)))
+                if error.category == category)
+            );
+        }
+    }
+    assert!(!is_private_pressure(&WorktreeError::Index(
+        Error::new(
+            ErrorCategory::Io,
+            "reserved-private-memory-exhausted",
+            "I/O failure"
+        )
+        .into()
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_and_unmanaged_parent_pins_fit_a_low_descriptor_limit() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "worktrees::tests::low_descriptor_limit_child",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("TGREP_TEST_LOW_FD_CHILD", "1")
+        .env("RAYON_NUM_THREADS", "4")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess entry point; lowers only this child process's descriptor limit"]
+fn low_descriptor_limit_child() {
+    assert_eq!(std::env::var("TGREP_TEST_LOW_FD_CHILD").as_deref(), Ok("1"));
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: valid output storage; this opt-in child runs no other tests.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    limit.rlim_cur = limit.rlim_cur.min(256);
+    // SAFETY: only lowering this dedicated subprocess's soft limit.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    let fixture = Fixture::new();
+    for index in 0..512 {
+        write(
+            &fixture.root,
+            &format!("parents/{index:04}/nested/file.txt"),
+            b"stable content\n",
+        );
+    }
+    commit(&fixture.root);
+    let generation = fixture.generation();
+    let unmanaged = fixture.view(&fixture.root, &generation);
+    let stats = unmanaged.refresh().unwrap();
+    assert_eq!(stats.files_read, 512);
+    assert_eq!(stats.base_reused, 512);
+    assert_eq!(stats.batches, 512);
+    drop(unmanaged);
+    let (_namespace, permit, managed) = fixture.controlled();
+    let stats = managed.refresh_controlled(&permit).unwrap();
+    assert_eq!(stats.files_read, 512);
+    assert_eq!(stats.base_reused, 512);
+    assert!(stats.batches < 512);
+    assert!(stats.peak_parent_handles <= crate::managed::work::RECONCILE_PARENT_HANDLES);
+    assert!(managed.status().unwrap().ready);
+}
+
+#[test]
+fn managed_worker_failure_drains_buffers_and_parent_handles_before_returning() {
+    use crate::managed::faults::{Action, Point, Specification};
+    let fixture = Fixture::new();
+    for index in 0..40 {
+        write(
+            &fixture.root,
+            &format!("siblings-{}/file-{index:03}.txt", index % 2),
+            b"stable content\n",
+        );
+    }
+    commit(&fixture.root);
+    let (namespace, permit, view) = fixture.controlled();
+    namespace
+        .install_test_fault(Specification {
+            point: Point::ReconcileBatchOpened,
+            operation: Some(permit.operation_id().clone()),
+            skip_hits: 1,
+            action: Action::Error {
+                category: crate::managed::ErrorCategory::Io,
+            },
+        })
+        .unwrap();
+    assert!(view.refresh_controlled(&permit).is_err());
+    assert!(!view.status().unwrap().ready);
+    assert!(view.status().unwrap().full_required);
+    for index in 0..2 {
+        fs::rename(
+            fixture.root.join(format!("siblings-{index}")),
+            fixture.root.join(format!("released-{index}")),
+        )
+        .unwrap();
+    }
+    drop((view, permit));
+    assert_eq!(namespace.work_usage().unwrap().reservations, 0);
+}
+
+#[test]
+fn managed_cancellation_and_policy_changes_drain_paused_directory_batches() {
+    use crate::managed::faults::{Action, Point, Specification, Stage};
+    for policy_change in [false, true] {
+        let fixture = Fixture::new();
+        for index in 0..40 {
+            write(
+                &fixture.root,
+                &format!("siblings/file-{index:03}.txt"),
+                b"stable content\n",
+            );
+        }
+        commit(&fixture.root);
+        let (namespace, permit, view) = fixture.controlled();
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::ReconcileBatchOpened,
+                operation: Some(permit.operation_id().clone()),
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 30_000 },
+            })
+            .unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| view.refresh_controlled(&permit));
+            let deadline = Instant::now() + std::time::Duration::from_secs(20);
+            while namespace.test_fault_status().unwrap().unwrap().stage != Stage::Waiting {
+                assert!(Instant::now() < deadline, "worker did not open the batch");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if policy_change {
+                let mut policy = namespace.policy().unwrap();
+                policy.policy.work.blob_bytes /= 2;
+                namespace
+                    .update_policy(policy.version, policy.policy)
+                    .unwrap();
+            } else {
+                permit.cancel();
+            }
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            let error = worker.join().unwrap().unwrap_err();
+            let expected = if policy_change {
+                crate::managed::ErrorCategory::StaleVersion
+            } else {
+                crate::managed::ErrorCategory::Cancelled
+            };
+            assert!(
+                matches!(error, WorktreeError::Index(crate::Error::Managed(error))
+                if error.category == expected)
+            );
+        });
+        assert!(!view.status().unwrap().ready);
+        assert!(view.status().unwrap().full_required);
+        fs::rename(fixture.root.join("siblings"), fixture.root.join("released")).unwrap();
+        drop((view, permit));
+        assert_eq!(namespace.work_usage().unwrap().reservations, 0);
+    }
+}
+
+#[test]
+fn managed_verified_read_rejects_restored_mtime_mutation_and_replacement() {
+    for replace in [false, true] {
+        let fixture = Fixture::new();
+        write(&fixture.root, "file.txt", b"before");
+        commit(&fixture.root);
+        let (_namespace, permit, view) = fixture.controlled();
+        let path = fixture.root.join("file.txt");
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let reader = view.files.batch(Path::new("")).unwrap();
+        let relative = Path::new("file.txt");
+        let file = reader.open_observed(relative).unwrap();
+        let read = read_file(
+            || {
+                if replace {
+                    fs::rename(&path, fixture.root.join("previous"))?;
+                }
+                fs::write(&path, b"after!")?;
+                File::options()
+                    .write(true)
+                    .open(&path)?
+                    .set_modified(modified)?;
+                reader.open_observed(relative)
+            },
+            relative,
+            file,
+            None,
+            Some(&permit),
+        );
+        assert!(matches!(read, Err(WorktreeError::UnstableFile(_))));
+    }
 }
 
 fn candidates(view: &WorktreeView, pattern: &str) -> Vec<String> {

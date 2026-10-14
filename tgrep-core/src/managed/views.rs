@@ -1046,10 +1046,13 @@ impl ViewManager {
             request.allocation_version,
         )?;
         let _work = slot.begin_work(operation)?;
+        let materialization = std::time::Instant::now();
         let (record, view, stats) = self.materialize_view(record, root, &permit)?;
+        let materialization_us = super::work::micros(materialization.elapsed());
         slot.install_preparing(Arc::clone(&view))?;
-        let (checkpoint, reconcile, input) =
+        let (checkpoint, mut reconcile, input) =
             self.prepare_checkpoint(&slot, &view, &record, &permit)?;
+        reconcile.timings.base_materialization_us = materialization_us;
         self.publish(
             &slot,
             operation,
@@ -1480,6 +1483,7 @@ impl ViewManager {
         permit.check_now()?;
         self.namespace.transaction(|transaction| {
             super::work::ensure_admission(transaction)?;
+            permit.check_versions(transaction)?;
             let allocation = super::work::allocation_row(transaction)?;
             if allocation.version != permit.record.request.allocation_version {
                 return Err(Error::stale_version(allocation.version));
@@ -1543,7 +1547,7 @@ impl ViewManager {
         for _ in 0..attempts {
             permit.check()?;
             let input = slot.epoch.load(Ordering::Acquire);
-            let stats = match view.refresh_controlled(permit) {
+            let mut stats = match view.refresh_controlled(permit) {
                 Ok(stats) => stats,
                 Err(crate::worktrees::WorktreeError::ChangedDuringReconcile) => continue,
                 Err(error) => return Err(error.into()),
@@ -1551,6 +1555,7 @@ impl ViewManager {
             if slot.epoch.load(Ordering::Acquire) != input {
                 continue;
             }
+            let checkpoint_start = std::time::Instant::now();
             let checkpoint = self.namespace.save_checkpoint(
                 view,
                 &record.id,
@@ -1559,6 +1564,8 @@ impl ViewManager {
                 record.pin()?,
                 permit,
             )?;
+            stats.timings.checkpoint_us = super::work::micros(checkpoint_start.elapsed());
+            permit.observe_reconciliation(&mut stats);
             if slot.epoch.load(Ordering::Acquire) == input
                 && view.status()?.published_epoch == Some(stats.epoch)
             {
@@ -1576,12 +1583,13 @@ impl ViewManager {
         mut record: ViewRecord,
         view: Arc<WorktreeView>,
         checkpoint: super::ProtectedCheckpoint,
-        stats: ReconcileStats,
+        mut stats: ReconcileStats,
         input: u64,
         mut result: Value,
         permit: &Arc<WorkPermit>,
         migration: bool,
     ) -> Result<()> {
+        let publication = std::time::Instant::now();
         if migration {
             self.namespace
                 .fault(super::faults::Point::MigrationPrepared, Some(&operation.id))?;
@@ -1601,7 +1609,8 @@ impl ViewManager {
         if view.status()?.published_epoch != Some(stats.epoch) {
             return Err(Error::busy("checkpoint-epoch-changed"));
         }
-        permit.check()?;
+        permit.check_now()?;
+        permit.observe_reconciliation(&mut stats);
         let expected_publication = if migration {
             state
                 .current
@@ -1621,6 +1630,7 @@ impl ViewManager {
         record.instance = self.namespace.instance().clone();
         let commitment = self.namespace.transaction(|transaction| {
             super::work::ensure_admission(transaction)?;
+            permit.check_versions(transaction)?;
             let previous = view_row(transaction, &record.id)?;
             let expected = if migration { record.version - 1 } else { record.version };
             if previous.version != expected {
@@ -1649,6 +1659,8 @@ impl ViewManager {
             replace_view_references(transaction, &record)?;
             transaction.execute("DELETE FROM refs WHERE source_kind='migration' AND source_id=?1", [operation.id.as_str()])?;
             result["current"] = serde_json::to_value(&record)?;
+            stats.timings.publication_prepare_us = super::work::micros(publication.elapsed());
+            permit.observe_reconciliation(&mut stats);
             result["reconcile"] = serde_json::to_value(&stats)?;
             current_operation.committed_state = CommitState::Committed;
             current_operation.state = OperationState::Completed;

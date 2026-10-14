@@ -224,6 +224,246 @@ fn attach_input(fixture: &Fixture, claim: &OwnerClaim) -> Value {
 }
 
 #[test]
+fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_worker() {
+    for automatic in [false, true] {
+        let fixture = Fixture::new();
+        let mut configured = policy();
+        configured["work"]["workers"] = json!(1);
+        let mut daemon = start(
+            &fixture,
+            &configured,
+            if automatic {
+                &["--watch-mode", "poll", "--poll-interval", "120"]
+            } else {
+                &["--no-watch"]
+            },
+        );
+        let hello = daemon.rpc("hello", json!({}));
+        assert!(
+            hello["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("reconciliation-phase-metrics"))
+        );
+        let (claim, guard) = owner(&daemon);
+        let receipt = completed(
+            &daemon,
+            &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+        );
+        let stats = &receipt["result"]["reconcile"];
+        assert_eq!(stats["full"], true);
+        assert_eq!(stats["files_read"], 3);
+        assert_eq!(stats["base_reused"], 3);
+        assert_eq!(stats["files_extracted"], 0);
+        assert_eq!(stats["batch_retries"], 0);
+        let timing = &stats["timings"];
+        for field in [
+            "queue_us",
+            "base_materialization_us",
+            "discovery_us",
+            "planning_us",
+            "content_verification_us",
+            "worker_content_us",
+            "worker_parent_us",
+            "worker_open_us",
+            "worker_read_verify_us",
+            "worker_decode_hash_us",
+            "worker_compare_extract_us",
+            "parent_verify_us",
+            "assembly_us",
+            "checkpoint_us",
+            "publication_prepare_us",
+            "catalog_control_us",
+            "namespace_catalog_us",
+            "worker_wait_us",
+            "parent_wait_us",
+            "read_wait_us",
+            "admitted_us",
+        ] {
+            assert!(timing[field].is_u64(), "{field}: {timing}");
+        }
+        for field in ["discovery_us", "content_verification_us", "checkpoint_us"] {
+            assert!(timing[field].as_u64().unwrap() > 0, "{field}: {timing}");
+        }
+        let worker_parts: u64 = [
+            "worker_parent_us",
+            "worker_open_us",
+            "worker_read_verify_us",
+            "worker_decode_hash_us",
+            "worker_compare_extract_us",
+        ]
+        .into_iter()
+        .map(|field| timing[field].as_u64().unwrap())
+        .sum();
+        assert!(
+            worker_parts <= timing["worker_content_us"].as_u64().unwrap(),
+            "{timing}"
+        );
+        let wall_phases: u64 = [
+            "base_materialization_us",
+            "discovery_us",
+            "planning_us",
+            "content_verification_us",
+            "assembly_us",
+            "checkpoint_us",
+            "publication_prepare_us",
+        ]
+        .into_iter()
+        .map(|field| timing[field].as_u64().unwrap())
+        .sum();
+        assert!(
+            wall_phases <= timing["admitted_us"].as_u64().unwrap(),
+            "{timing}"
+        );
+        assert!(stats["control_checks"].as_u64().unwrap() > 0);
+        assert!(
+            stats["peak_private_bytes"].as_u64().unwrap()
+                <= configured["work"]["private_work_bytes"].as_u64().unwrap()
+        );
+        assert!(stats["peak_read_bytes"].as_u64().unwrap() <= 64 * 1024 * 1024);
+        assert!(stats["peak_parent_handles"].as_u64().unwrap() <= 256);
+        let view = &receipt["result"]["current"];
+        let status = daemon.rpc("views.status", json!({"id":view["id"]}));
+        assert_eq!(status["last_reconcile"], *stats);
+        let namespace = daemon.rpc("namespace.status", json!({}));
+        let ordinary: Value =
+            serde_json::from_str(&success(cli(&fixture.a, &["status", "."]))).unwrap();
+        for report in [&status, &namespace, &ordinary] {
+            let repair = &report["reconciliation_policy"];
+            assert_eq!(repair["periodic_full_verification"], automatic);
+            assert_eq!(repair["interval_ms"], 120_000);
+            assert_eq!(repair["incremental_coverage"], "unavailable");
+            assert_eq!(repair["change_journal"], "not-integrated");
+            assert_eq!(
+                repair["full_verification_reason"],
+                "no-trusted-change-coverage"
+            );
+            assert!(
+                repair["full_repair_triggers"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("watcher-error-or-overflow"))
+            );
+        }
+        assert_eq!(namespace["allocation"]["work_slots"], 1);
+        daemon.rpc(
+            "views.detach",
+            json!({"owner":claim.owner,"lease":"managed-client"}),
+        );
+        daemon.rpc("owners.release", json!({"claim":claim}));
+        drop(guard);
+        stop(&mut daemon);
+        drop(daemon);
+        fixture.temp.close().unwrap();
+    }
+}
+
+#[test]
+fn periodic_fallback_repairs_unreported_restored_mtime_and_membership_changes() {
+    let fixture = Fixture::new();
+    let mut daemon = start(
+        &fixture,
+        &policy(),
+        &["--watch-mode", "poll", "--poll-interval", "1"],
+    );
+    let (claim, guard) = owner(&daemon);
+    let receipt = completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let view = &receipt["result"]["current"];
+    let before = daemon.rpc("views.status", json!({"id":view["id"]}));
+    let path = fixture.a.join("notes.txt");
+    let metadata = fs::metadata(&path).unwrap();
+    git(
+        &fixture.a,
+        &["update-index", "--assume-unchanged", "notes.txt"],
+    );
+    fs::write(&path, "shared_term fresh\n").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(metadata.modified().unwrap())
+        .unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), metadata.len());
+    assert_eq!(
+        fs::metadata(&path).unwrap().modified().unwrap(),
+        metadata.modified().unwrap(),
+    );
+    assert!(git(&fixture.a, &["status", "--porcelain", "--", "notes.txt"]).is_empty());
+    fs::remove_file(fixture.a.join(".hidden")).unwrap();
+    fs::write(fixture.a.join(".missed-hidden"), "shared_term hidden\n").unwrap();
+    fs::write(fixture.a.join("missed.txt"), "shared_term untracked\n").unwrap();
+    fs::write(fixture.a.join(".gitignore"), "ignored.txt\n").unwrap();
+    fs::write(fixture.a.join("ignored.txt"), "shared_term ignored\n").unwrap();
+    let lookup = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    let started = Instant::now();
+    loop {
+        let status = daemon.rpc("views.status", json!({"id":view["id"]}));
+        if status["ready"] == true
+            && status["input_epoch"].as_u64().unwrap() > before["input_epoch"].as_u64().unwrap()
+        {
+            let matches = retry_busy(
+                &daemon,
+                "search",
+                json!({
+                    "root":lookup["root"],"view":view["id"],"expected_version":view["version"],
+                    "query":{"pattern":"fresh"}
+                }),
+            );
+            let listing = retry_busy(
+                &daemon,
+                "files",
+                json!({
+                    "root":lookup["root"],"view":view["id"],"expected_version":view["version"],
+                    "query":{"hidden":true}
+                }),
+            );
+            let files = listing["files"].as_array().unwrap();
+            if !matches["matches"].as_array().unwrap().is_empty()
+                && files.contains(&json!(".missed-hidden"))
+                && files.contains(&json!("missed.txt"))
+                && !files.contains(&json!(".hidden"))
+                && !files.contains(&json!("ignored.txt"))
+            {
+                assert_eq!(matches["backend"], "shared-v2");
+                assert_eq!(listing["backend"], "shared-v2");
+                assert_eq!(status["last_reconcile"]["full"], true);
+                assert_eq!(status["last_reconcile"]["content_reads_avoided"], 0);
+                assert_eq!(
+                    status["reconciliation_policy"]["periodic_full_verification"],
+                    true
+                );
+                assert_eq!(status["reconciliation_policy"]["interval_ms"], 1000);
+                assert_eq!(
+                    status["reconciliation_policy"]["full_verification_reason"],
+                    "no-trusted-change-coverage"
+                );
+                break;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "periodic repair did not complete: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
 fn multiline_count_matches_uses_managed_per_file_totals() {
     let mut fixture = Fixture::new();
     prepare_multiline_counts(&mut fixture);

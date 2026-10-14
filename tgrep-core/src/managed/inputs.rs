@@ -116,7 +116,7 @@ impl InputControl {
     pub(crate) fn new(permit: &Arc<WorkPermit>) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
             permit: Arc::clone(permit),
-            max_file_bytes: permit.namespace.policy()?.policy.work.blob_bytes,
+            max_file_bytes: permit.read_limits().blob_bytes,
             state: Mutex::new(State {
                 snapshots: HashMap::new(),
                 memory: permit.memory(64 * 1024)?,

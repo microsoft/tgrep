@@ -109,7 +109,7 @@ fn hello(namespace: &Namespace) -> Result<Value> {
             "instance-owner-guards","catalog-pages","reference-aware-collection",
             "versioned-allocations","bound-checkpoints","offline-maintenance","stop-if-idle",
             "bounded-storage-inventory","namespace-discovery","maintenance-diagnostics",
-            "private-rpc-authentication"
+            "private-rpc-authentication","bounded-reconciliation","reconciliation-phase-metrics"
         ],
         "profile":IndexingProfile::default(),
         "policy":namespace.policy()?,"allocation":namespace.allocation()?,
@@ -323,6 +323,22 @@ struct WatchSettings {
     mode: crate::serve::WatchMode,
     interval: Duration,
     watches_per_view: usize,
+}
+
+impl WatchSettings {
+    fn reconciliation_status(&self) -> Value {
+        json!({
+            "periodic_full_verification": !self.no_watch,
+            "interval_ms": self.interval.as_millis(),
+            "incremental_coverage": "unavailable",
+            "change_journal": "not-integrated",
+            "full_verification_reason": "no-trusted-change-coverage",
+            "full_repair_triggers": [
+                "first-attachment-or-restore", "explicit-full-refresh",
+                "watcher-error-or-overflow", "git-or-ignore-change", "periodic-fallback"
+            ]
+        })
+    }
 }
 
 struct Observer {
@@ -1051,10 +1067,14 @@ impl State {
                 self.views
                     .recover(&decode::<ObjectId>(request.params.clone())?.id)?,
             )?),
-            "views.status" => Ok(serde_json::to_value(
-                self.views
-                    .status(&decode::<ObjectId>(request.params.clone())?.id)?,
-            )?),
+            "views.status" => {
+                let mut status = serde_json::to_value(
+                    self.views
+                        .status(&decode::<ObjectId>(request.params.clone())?.id)?,
+                )?;
+                status["reconciliation_policy"] = self.watches.reconciliation_status();
+                Ok(status)
+            }
             "views.detach" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -1177,6 +1197,7 @@ impl State {
                         .map_err(|error| error.committed(managed::CommitState::Committed))?;
                 }
                 if matches!(method, "namespace.status" | "maintenance.status") {
+                    result["reconciliation_policy"] = self.watches.reconciliation_status();
                     result["process_memory"] = process_memory();
                     result["scheduler"] = self
                         .scheduler_snapshot
@@ -1239,6 +1260,7 @@ impl State {
                 "ready":status.ready,"epoch":status.input_epoch,"backend":"shared-v2","status":status,
                 "watch_mode":if self.watches.no_watch { "disabled" } else if monitor.as_ref().is_some_and(|monitor| monitor.watcher.is_some()) { "native" } else { "poll" },
                 "watch_fallback":monitor.as_ref().and_then(|monitor| monitor.fallback.as_ref()),
+                "reconciliation_policy":self.watches.reconciliation_status(),
                 "policy":self.namespace.policy()?,"usage":self.namespace.work_usage()?,
                 "adaptive":self.views.last_adaptive(slot.id())?,
                 "adaptive_error":self.views.last_adaptive_error(slot.id())?,

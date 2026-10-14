@@ -7,8 +7,10 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+const CONTROL_REFRESH: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -261,7 +263,8 @@ impl Namespace {
         owner: Option<&Id>,
         allocation_version: u64,
     ) -> Result<Arc<WorkPermit>> {
-        let policy = self.policy()?.policy;
+        let versioned = self.policy()?;
+        let policy = &versioned.policy;
         let allocation = self.allocation()?;
         self.reserve_inner(
             operation,
@@ -274,7 +277,7 @@ impl Namespace {
                 private_bytes: (policy.work.private_work_bytes / u64::from(policy.work.workers))
                     .min(allocation.private_work_bytes),
             },
-            Some(policy.work.minimum_private_bytes()?),
+            Some(versioned),
         )
     }
 
@@ -283,10 +286,20 @@ impl Namespace {
         operation: &Id,
         owner: Option<&Id>,
         request: WorkRequest,
-        private_minimum: Option<u64>,
+        view_policy: Option<super::VersionedPolicy>,
     ) -> Result<Arc<WorkPermit>> {
+        let admitted = Instant::now();
+        let catalog_baseline = self.catalog_metrics.snapshot();
         let activity = ActivityGuard::acquire(&self.directory)?;
-        let policy = self.policy()?.policy;
+        let private_minimum = view_policy
+            .as_ref()
+            .map(|versioned| versioned.policy.work.minimum_private_bytes())
+            .transpose()?;
+        let versioned = match view_policy {
+            Some(versioned) => versioned,
+            None => self.policy()?,
+        };
+        let policy = &versioned.policy;
         let operation_record = self.operation(operation)?;
         if operation_record.instance != *self.instance() {
             return Err(Error::new(
@@ -353,6 +366,14 @@ impl Namespace {
         let mut memory = self.memory.lock()?;
         self.transaction(|transaction| {
             ensure_admission(transaction)?;
+            let current: u64 = transaction.query_row(
+                "SELECT policy_version FROM state WHERE singleton=1",
+                [],
+                |row| unsigned(row, 0),
+            )?;
+            if current != versioned.version {
+                return Err(Error::stale_version(current));
+            }
             let allocation = allocation_row(transaction)?;
             if allocation.version != record.request.allocation_version {
                 return Err(Error::stale_version(allocation.version));
@@ -442,7 +463,28 @@ impl Namespace {
             inventory_failed: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             deadline,
-            last_check: Mutex::new(None),
+            admitted,
+            catalog_baseline,
+            queue_us: elapsed.saturating_mul(1000),
+            control_us: AtomicU64::new(micros(admitted.elapsed())),
+            control_checks: AtomicU64::new(0),
+            next_check_us: AtomicU64::new(0),
+            next_refresh_us: AtomicU64::new(0),
+            control_revision: AtomicU64::new(0),
+            control: Mutex::new(()),
+            read_limits: ReadLimits {
+                policy_version: versioned.version,
+                blob_bytes: policy.work.blob_bytes,
+                sort_buffer_bytes: policy.work.sort_buffer_bytes,
+            },
+            worker_wait_us: AtomicU64::new(0),
+            parent_wait_us: AtomicU64::new(0),
+            parent_handles: AtomicU64::new(0),
+            peak_parent_handles: AtomicU64::new(0),
+            read_wait_us: AtomicU64::new(0),
+            peak_read_bytes: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            peak_workers: AtomicU64::new(0),
             _activity: activity,
         }))
     }
@@ -647,11 +689,292 @@ pub struct WorkPermit {
     inventory_failed: AtomicBool,
     finished: AtomicBool,
     deadline: Instant,
-    last_check: Mutex<Option<Instant>>,
+    admitted: Instant,
+    catalog_baseline: (u64, u64),
+    queue_us: u64,
+    control_us: AtomicU64,
+    control_checks: AtomicU64,
+    next_check_us: AtomicU64,
+    next_refresh_us: AtomicU64,
+    control_revision: AtomicU64,
+    control: Mutex<()>,
+    read_limits: ReadLimits,
+    worker_wait_us: AtomicU64,
+    parent_wait_us: AtomicU64,
+    parent_handles: AtomicU64,
+    peak_parent_handles: AtomicU64,
+    read_wait_us: AtomicU64,
+    peak_read_bytes: AtomicU64,
+    read_bytes: AtomicU64,
+    peak_workers: AtomicU64,
     _activity: ActivityGuard,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ReadLimits {
+    pub(crate) policy_version: u64,
+    pub(crate) blob_bytes: u64,
+    pub(crate) sort_buffer_bytes: u64,
+}
+
+pub(crate) fn micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Default)]
+pub(crate) struct CatalogMetrics {
+    calls: AtomicU64,
+    micros: AtomicU64,
+}
+
+impl CatalogMetrics {
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.calls.load(Ordering::Relaxed),
+            self.micros.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn start(&self) -> CatalogTimer<'_> {
+        CatalogTimer {
+            metrics: self,
+            start: Instant::now(),
+        }
+    }
+}
+
+pub(crate) struct CatalogTimer<'a> {
+    metrics: &'a CatalogMetrics,
+    start: Instant,
+}
+
+impl Drop for CatalogTimer<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .micros
+            .fetch_add(micros(self.start.elapsed()), Ordering::Relaxed);
+        self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Namespace job slots remain operation reservations. Discovery and verification
+/// additionally share CPU, parent-handle and byte gates, never separate pools.
+pub(crate) struct ReconciliationResources {
+    workers: usize,
+    state: Mutex<ReconciliationUsage>,
+    ready: Condvar,
+}
+
+pub(crate) const RECONCILE_PARENT_HANDLES: u64 = 256;
+
+#[derive(Default)]
+struct ReconciliationUsage {
+    workers: usize,
+    parent_handles: u64,
+    read_bytes: u64,
+}
+
+impl Default for ReconciliationResources {
+    fn default() -> Self {
+        Self {
+            workers: std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(64),
+            state: Mutex::new(ReconciliationUsage::default()),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+pub(crate) struct Parallelism<'a> {
+    resources: &'a ReconciliationResources,
+    pub(crate) workers: usize,
+}
+
+impl Drop for Parallelism<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .resources
+            .state
+            .lock()
+            .expect("reconciliation resource lock");
+        state.workers -= self.workers;
+        self.resources.ready.notify_all();
+    }
+}
+
+pub(crate) struct ParentAdmission<'a> {
+    permit: &'a WorkPermit,
+    handles: u64,
+    charged: u64,
+}
+
+impl Drop for ParentAdmission<'_> {
+    fn drop(&mut self) {
+        let resources = &self.permit.namespace.reconciliation;
+        let mut state = resources
+            .state
+            .lock()
+            .expect("reconciliation resource lock");
+        state.parent_handles -= self.charged;
+        self.permit
+            .parent_handles
+            .fetch_sub(self.handles, Ordering::Relaxed);
+        resources.ready.notify_all();
+    }
+}
+
+pub(crate) struct ReadAdmission<'a> {
+    permit: &'a WorkPermit,
+    charged: u64,
+    bytes: u64,
+    memory: MemoryCharge,
+}
+
+impl Drop for ReadAdmission<'_> {
+    fn drop(&mut self) {
+        let resources = &self.permit.namespace.reconciliation;
+        let mut state = resources
+            .state
+            .lock()
+            .expect("reconciliation resource lock");
+        self.memory.resize(0).expect("releasing a memory charge");
+        state.read_bytes -= self.charged;
+        self.permit
+            .read_bytes
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+        resources.ready.notify_all();
+    }
+}
+
 impl WorkPermit {
+    pub(crate) fn read_limits(&self) -> ReadLimits {
+        self.read_limits
+    }
+
+    pub(crate) fn parallelism(&self, wanted: usize) -> Result<Parallelism<'_>> {
+        let start = Instant::now();
+        let resources = &self.namespace.reconciliation;
+        loop {
+            self.check()?;
+            let mut state = resources
+                .state
+                .lock()
+                .map_err(|_| Error::corrupt("reconciliation resource lock poisoned"))?;
+            let workers = wanted
+                .max(1)
+                .min(resources.workers.saturating_sub(state.workers));
+            if workers != 0 {
+                state.workers += workers;
+                self.peak_workers
+                    .fetch_max(workers as u64, Ordering::Relaxed);
+                self.worker_wait_us
+                    .fetch_add(micros(start.elapsed()), Ordering::Relaxed);
+                return Ok(Parallelism { resources, workers });
+            }
+            drop(
+                resources
+                    .ready
+                    .wait_timeout(state, Duration::from_millis(10))
+                    .map_err(|_| Error::corrupt("reconciliation resource lock poisoned"))?,
+            );
+        }
+    }
+
+    pub(crate) fn admit_parents(&self, handles: u64) -> Result<ParentAdmission<'_>> {
+        let start = Instant::now();
+        let resources = &self.namespace.reconciliation;
+        // An unusually deep Windows parent runs alone, like oversized reads.
+        // Unix retains just its last ancestor descriptor, regardless of depth.
+        let charged = handles.min(RECONCILE_PARENT_HANDLES);
+        loop {
+            self.check()?;
+            let mut state = resources
+                .state
+                .lock()
+                .map_err(|_| Error::corrupt("reconciliation resource lock poisoned"))?;
+            if state.parent_handles <= RECONCILE_PARENT_HANDLES - charged {
+                state.parent_handles += charged;
+                let used = self.parent_handles.fetch_add(handles, Ordering::Relaxed) + handles;
+                self.peak_parent_handles.fetch_max(used, Ordering::Relaxed);
+                self.parent_wait_us
+                    .fetch_add(micros(start.elapsed()), Ordering::Relaxed);
+                return Ok(ParentAdmission {
+                    permit: self,
+                    handles,
+                    charged,
+                });
+            }
+            drop(
+                resources
+                    .ready
+                    .wait_timeout(state, Duration::from_millis(10))
+                    .map_err(|_| Error::corrupt("reconciliation resource lock poisoned"))?,
+            );
+        }
+    }
+
+    pub(crate) fn admit_read(self: &Arc<Self>, bytes: u64) -> Result<ReadAdmission<'_>> {
+        let start = Instant::now();
+        let resources = &self.namespace.reconciliation;
+        // As in the normal builder, one oversized input runs alone. Its actual
+        // buffers still have to fit the operation's private memory reservation.
+        let charged = bytes.min(crate::builder::INDEX_BUILD_BATCH_BYTES);
+        loop {
+            self.check()?;
+            let mut state = resources
+                .state
+                .lock()
+                .map_err(|_| Error::corrupt("reconciliation resource lock poisoned"))?;
+            if state.read_bytes <= crate::builder::INDEX_BUILD_BATCH_BYTES - charged {
+                // Already admitted reads can release private capacity. Never
+                // wait for retained evidence/postings, which cannot drain here.
+                match self.try_memory(bytes) {
+                    Ok(memory) => {
+                        state.read_bytes += charged;
+                        let used = self.read_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                        self.peak_read_bytes.fetch_max(used, Ordering::Relaxed);
+                        self.read_wait_us
+                            .fetch_add(micros(start.elapsed()), Ordering::Relaxed);
+                        return Ok(ReadAdmission {
+                            permit: self,
+                            charged,
+                            bytes,
+                            memory,
+                        });
+                    }
+                    Err(error)
+                        if error.reason_code == "reserved-private-memory-exhausted"
+                            && self.read_bytes.load(Ordering::Relaxed) != 0 => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            drop(
+                resources
+                    .ready
+                    .wait_timeout(state, Duration::from_millis(10))
+                    .map_err(|_| Error::corrupt("reconciliation resource lock poisoned"))?,
+            );
+        }
+    }
+
+    pub(crate) fn observe_reconciliation(&self, stats: &mut crate::worktrees::ReconcileStats) {
+        let catalog = self.namespace.catalog_metrics.snapshot();
+        stats.namespace_catalog_calls = catalog.0.saturating_sub(self.catalog_baseline.0);
+        stats.timings.namespace_catalog_us = catalog.1.saturating_sub(self.catalog_baseline.1);
+        stats.timings.queue_us = self.queue_us;
+        stats.timings.catalog_control_us = self.control_us.load(Ordering::Relaxed);
+        stats.timings.worker_wait_us = self.worker_wait_us.load(Ordering::Relaxed);
+        stats.timings.parent_wait_us = self.parent_wait_us.load(Ordering::Relaxed);
+        stats.timings.read_wait_us = self.read_wait_us.load(Ordering::Relaxed);
+        stats.timings.admitted_us = micros(self.admitted.elapsed());
+        stats.control_checks = self.control_checks.load(Ordering::Relaxed);
+        stats.peak_read_bytes = self.peak_read_bytes.load(Ordering::Relaxed);
+        stats.peak_workers = self.peak_workers.load(Ordering::Relaxed);
+        stats.peak_parent_handles = self.peak_parent_handles.load(Ordering::Relaxed);
+        stats.peak_private_bytes = self.peak_private_bytes();
+    }
+
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -694,6 +1017,55 @@ impl WorkPermit {
     }
 
     fn check_control(&self, refresh: bool) -> Result<()> {
+        self.check_local()?;
+        if !refresh && self.control_is_fresh() {
+            return Ok(());
+        }
+        let start = Instant::now();
+        let _control = self
+            .control
+            .lock()
+            .map_err(|_| Error::corrupt("work control lock poisoned"))?;
+        if !refresh && self.control_is_fresh() {
+            return self.check_local();
+        }
+        let result = (|| {
+            if let Some(owner) = &self.record.owner {
+                self.namespace.validate_active_owner(owner)?;
+            }
+            self.namespace.read(|connection| {
+                self.check_versions(connection)?;
+                Ok(self.namespace.work_revision.load(Ordering::Acquire))
+            })
+        })();
+        self.control_us
+            .fetch_add(micros(start.elapsed()), Ordering::Relaxed);
+        self.control_checks.fetch_add(1, Ordering::Relaxed);
+        if let Ok(revision) = &result {
+            let elapsed = micros(self.admitted.elapsed());
+            self.control_revision.store(*revision, Ordering::Release);
+            self.next_check_us
+                .store(elapsed.saturating_add(10_000), Ordering::Release);
+            self.next_refresh_us.store(
+                elapsed.saturating_add(micros(CONTROL_REFRESH)),
+                Ordering::Release,
+            );
+        }
+        result?;
+        self.check_local()
+    }
+
+    fn control_is_fresh(&self) -> bool {
+        let elapsed = micros(self.admitted.elapsed());
+        if elapsed >= self.next_refresh_us.load(Ordering::Acquire) {
+            return false;
+        }
+        let revision = self.namespace.work_revision.load(Ordering::Acquire);
+        (revision != u64::MAX && revision == self.control_revision.load(Ordering::Acquire))
+            || elapsed < self.next_check_us.load(Ordering::Acquire)
+    }
+
+    fn check_local(&self) -> Result<()> {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(Error::new(
                 ErrorCategory::Cancelled,
@@ -711,20 +1083,37 @@ impl WorkPermit {
                 "operation time budget exhausted",
             ));
         }
-        let mut last = self
-            .last_check
-            .lock()
-            .map_err(|_| Error::corrupt("work control lock poisoned"))?;
-        if refresh || last.is_none_or(|time| time.elapsed() >= Duration::from_millis(10)) {
-            if self.namespace.operation(&self.record.operation)?.cancelled {
-                self.cancelled.store(true, Ordering::Release);
-                return Err(Error::new(
-                    ErrorCategory::Cancelled,
-                    "operation-cancelled",
-                    "work was cancelled",
-                ));
-            }
-            *last = Some(Instant::now());
+        Ok(())
+    }
+
+    pub(crate) fn check_versions(&self, connection: &rusqlite::Connection) -> Result<()> {
+        self.check_local()?;
+        let (policy, allocation, cancelled): (u64, u64, bool) = connection.query_row(
+            "SELECT s.policy_version,a.version,json_extract(o.record,'$.cancelled')
+             FROM state s,records a,operations o
+             WHERE s.singleton=1 AND a.kind='allocation' AND a.id='namespace' AND o.id=?1",
+            [self.record.operation.as_str()],
+            |row| Ok((unsigned(row, 0)?, unsigned(row, 1)?, row.get(2)?)),
+        )?;
+        if cancelled {
+            self.cancel();
+            return Err(Error::new(
+                ErrorCategory::Cancelled,
+                "operation-cancelled",
+                "work was cancelled",
+            ));
+        }
+        if policy != self.read_limits.policy_version
+            || allocation != self.record.request.allocation_version
+        {
+            self.cancel();
+            return Err(Error::stale_version(
+                if policy != self.read_limits.policy_version {
+                    policy
+                } else {
+                    allocation
+                },
+            ));
         }
         Ok(())
     }
@@ -753,6 +1142,10 @@ impl WorkPermit {
 
     pub(crate) fn memory(self: &Arc<Self>, bytes: u64) -> Result<MemoryCharge> {
         self.check()?;
+        self.try_memory(bytes)
+    }
+
+    fn try_memory(self: &Arc<Self>, bytes: u64) -> Result<MemoryCharge> {
         #[allow(deprecated, reason = "Rust 1.88 compatibility")]
         let before = self
             .private_bytes
@@ -864,6 +1257,20 @@ pub(crate) struct MemoryCharge {
 }
 
 impl MemoryCharge {
+    pub(crate) fn absorb(&mut self, mut other: Self) -> Result<()> {
+        if !Arc::ptr_eq(&self.permit, &other.permit) {
+            return Err(Error::invalid(
+                "cannot transfer another reservation's memory",
+            ));
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .ok_or_else(|| Error::pressure("private-memory-account-overflow"))?;
+        other.bytes = 0;
+        Ok(())
+    }
+
     pub(crate) fn resize(&mut self, bytes: u64) -> Result<()> {
         if bytes > self.bytes {
             self.grow(bytes - self.bytes)?;
@@ -1079,6 +1486,402 @@ mod tests {
             )
             .unwrap();
         (temp, namespace, permit)
+    }
+
+    fn another_permit(namespace: &Arc<Namespace>) -> Arc<WorkPermit> {
+        let operation = namespace
+            .accept_system_operation(
+                Token::parse("other-producer").unwrap(),
+                "build",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        namespace
+            .reserve(
+                &operation.id,
+                None,
+                WorkRequest {
+                    allocation_version: 1,
+                    staging_bytes: 1024 * 1024,
+                    private_bytes: 1024 * 1024,
+                    slots: 1,
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn read_limits_are_admitted_once_and_version_changes_stop_work() {
+        for allocation_changed in [false, true] {
+            let (_temp, namespace, permit) = fixture();
+            permit.check_now().unwrap();
+            let limits = permit.read_limits();
+            let checks = permit.control_checks.load(Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(11));
+            for _ in 0..1000 {
+                assert_eq!(permit.read_limits().blob_bytes, limits.blob_bytes);
+                permit.check().unwrap();
+            }
+            assert_eq!(permit.control_checks.load(Ordering::Relaxed), checks);
+            if allocation_changed {
+                let mut allocation = namespace.allocation().unwrap();
+                allocation.private_work_bytes /= 2;
+                namespace
+                    .update_allocation(allocation.version, allocation)
+                    .unwrap();
+            } else {
+                let mut policy = namespace.policy().unwrap();
+                policy.policy.work.blob_bytes /= 2;
+                namespace
+                    .update_policy(policy.version, policy.policy)
+                    .unwrap();
+            }
+            assert_eq!(permit.read_limits().blob_bytes, limits.blob_bytes);
+            std::thread::sleep(Duration::from_millis(11));
+            assert_eq!(
+                permit.check().unwrap_err().category,
+                ErrorCategory::StaleVersion
+            );
+            assert_eq!(
+                permit.check().unwrap_err().category,
+                ErrorCategory::Cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn control_refresh_observes_independent_commits_and_owner_guard_closure() {
+        let (_temp, namespace, permit) = fixture();
+        permit.check_now().unwrap();
+        let revision = namespace.work_revision.load(Ordering::Acquire);
+        let mut connection = super::super::catalog::connect(&namespace.directory, false).unwrap();
+        let (transaction, _) =
+            super::super::catalog_io::begin(&mut connection, &namespace.directory, None).unwrap();
+        transaction.execute(
+            "UPDATE operations SET record=json_set(record,'$.cancelled',json('true')) WHERE id=?1",
+            [permit.operation_id().as_str()],
+        ).unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(namespace.work_revision.load(Ordering::Acquire), revision);
+        std::thread::sleep(CONTROL_REFRESH + Duration::from_millis(10));
+        assert_eq!(
+            permit.check().unwrap_err().category,
+            ErrorCategory::Cancelled
+        );
+        drop(permit);
+
+        let prepared = namespace
+            .prepare_owner_with_token(&Token::parse("guard-refresh").unwrap())
+            .unwrap();
+        let guard = super::super::OwnerGuard::claim(prepared.claim.clone()).unwrap();
+        namespace.register_owner(&prepared.claim).unwrap();
+        let operation = namespace
+            .accept_system_operation(
+                Token::parse("owned-producer").unwrap(),
+                "build",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let permit = namespace
+            .reserve(
+                &operation.id,
+                Some(&prepared.claim.owner),
+                WorkRequest {
+                    allocation_version: 1,
+                    slots: 1,
+                    staging_bytes: 1024,
+                    private_bytes: 1024,
+                },
+            )
+            .unwrap();
+        permit.check_now().unwrap();
+        let revision = namespace.work_revision.load(Ordering::Acquire);
+        drop(guard);
+        assert_eq!(namespace.work_revision.load(Ordering::Acquire), revision);
+        std::thread::sleep(CONTROL_REFRESH + Duration::from_millis(10));
+        assert_eq!(permit.check().unwrap_err().reason_code, "owner-ended");
+    }
+
+    #[test]
+    fn view_admission_rejects_a_superseded_policy_snapshot() {
+        let (_temp, namespace, permit) = fixture();
+        let operation = permit.operation_id().clone();
+        drop(permit);
+        let snapshot = namespace.policy().unwrap();
+        let request = WorkRequest {
+            allocation_version: 1,
+            slots: 1,
+            staging_bytes: snapshot.policy.work.staging_bytes
+                / u64::from(snapshot.policy.work.workers),
+            private_bytes: snapshot.policy.work.private_work_bytes
+                / u64::from(snapshot.policy.work.workers),
+        };
+        let mut changed = snapshot.policy.clone();
+        changed.work.blob_bytes /= 2;
+        namespace.update_policy(snapshot.version, changed).unwrap();
+        assert!(matches!(
+            namespace.reserve_inner(&operation, None, request, Some(snapshot)),
+            Err(error) if error.category == ErrorCategory::StaleVersion
+        ));
+        assert_eq!(namespace.work_usage().unwrap().reservations, 0);
+    }
+
+    #[test]
+    fn workers_and_read_bytes_are_shared_and_waiters_cancel_without_leaks() {
+        let (_temp, namespace, first) = fixture();
+        let second = another_permit(&namespace);
+        let workers = first.parallelism(usize::MAX).unwrap();
+        assert_eq!(workers.workers, namespace.reconciliation.workers);
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let second = &second;
+            let worker = scope.spawn(move || {
+                sent.send(()).unwrap();
+                second.parallelism(1)
+            });
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            second.cancel();
+            assert!(
+                matches!(worker.join().unwrap(), Err(error) if error.category == ErrorCategory::Cancelled)
+            );
+        });
+        drop(workers);
+        assert_eq!(namespace.reconciliation.state.lock().unwrap().workers, 0);
+        // Force the same wait with bytes, without asking a tiny fixture
+        // reservation to allocate the namespace's entire 64 MiB input gate.
+        let resources = &namespace.reconciliation;
+        resources.state.lock().unwrap().read_bytes = crate::builder::INDEX_BUILD_BATCH_BYTES;
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let first = &first;
+            let worker = scope.spawn(move || {
+                sent.send(()).unwrap();
+                first.admit_read(1024)
+            });
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            first.cancel();
+            assert!(
+                matches!(worker.join().unwrap(), Err(error) if error.category == ErrorCategory::Cancelled)
+            );
+        });
+        resources.state.lock().unwrap().read_bytes = 0;
+        assert_eq!(first.private_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(first.read_bytes.load(Ordering::Relaxed), 0);
+        drop((first, second));
+        assert_eq!(namespace.work_usage().unwrap().reservations, 0);
+    }
+
+    #[test]
+    fn parent_handles_are_shared_and_cancelled_waiters_do_not_leak() {
+        let (_temp, namespace, first) = fixture();
+        let second = another_permit(&namespace);
+        let first_pins = first.admit_parents(RECONCILE_PARENT_HANDLES / 2).unwrap();
+        let second_pins = second.admit_parents(RECONCILE_PARENT_HANDLES / 2).unwrap();
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let first = &first;
+            let worker = scope.spawn(move || {
+                let pins = first.admit_parents(1).unwrap();
+                sent.send(()).unwrap();
+                drop(pins);
+            });
+            assert!(received.recv_timeout(Duration::from_millis(20)).is_err());
+            drop(first_pins);
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+        });
+        drop(second_pins);
+        assert_eq!(
+            namespace
+                .reconciliation
+                .state
+                .lock()
+                .unwrap()
+                .parent_handles,
+            0
+        );
+
+        let large = first.admit_parents(RECONCILE_PARENT_HANDLES + 8).unwrap();
+        assert_eq!(
+            namespace
+                .reconciliation
+                .state
+                .lock()
+                .unwrap()
+                .parent_handles,
+            RECONCILE_PARENT_HANDLES
+        );
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let second = &second;
+            let worker = scope.spawn(move || {
+                sent.send(()).unwrap();
+                second.admit_parents(1)
+            });
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            second.cancel();
+            assert!(matches!(worker.join().unwrap(), Err(error)
+                if error.category == ErrorCategory::Cancelled));
+        });
+        drop(large);
+        assert_eq!(
+            namespace
+                .reconciliation
+                .state
+                .lock()
+                .unwrap()
+                .parent_handles,
+            0
+        );
+        assert_eq!(first.parent_handles.load(Ordering::Relaxed), 0);
+        assert_eq!(second.parent_handles.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            first.peak_parent_handles.load(Ordering::Relaxed),
+            RECONCILE_PARENT_HANDLES + 8
+        );
+    }
+
+    #[test]
+    fn read_admission_waits_for_private_buffers_but_not_retained_memory() {
+        let (_temp, namespace, permit) = fixture();
+        let first = permit.admit_read(permit.private_limit()).unwrap();
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let permit = &permit;
+            let worker = scope.spawn(move || {
+                let second = permit.admit_read(128).unwrap();
+                sent.send(()).unwrap();
+                drop(second);
+            });
+            assert!(received.recv_timeout(Duration::from_millis(20)).is_err());
+            drop(first);
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+        });
+        assert_eq!(namespace.reconciliation.state.lock().unwrap().read_bytes, 0);
+        assert_eq!(permit.private_bytes.load(Ordering::Relaxed), 0);
+        let _retained = permit.memory(permit.private_limit()).unwrap();
+        assert!(matches!(permit.admit_read(1), Err(error)
+            if error.reason_code == "reserved-private-memory-exhausted"));
+    }
+
+    #[test]
+    fn oversized_read_claims_the_whole_shared_gate_and_releases_actual_charge() {
+        let (_temp, namespace, small) = fixture();
+        drop(small);
+        let operation = namespace
+            .accept_system_operation(
+                Token::parse("large-producer").unwrap(),
+                "build",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let bytes = crate::builder::INDEX_BUILD_BATCH_BYTES + 1024;
+        // Raise only this test's admitted fixture capacity, not production limits.
+        let mut policy = namespace.policy().unwrap();
+        policy.policy.work.private_work_bytes = bytes * 2;
+        namespace
+            .update_policy(policy.version, policy.policy)
+            .unwrap();
+        let mut allocation = namespace.allocation().unwrap();
+        allocation.private_work_bytes = bytes * 2;
+        let allocation = namespace
+            .update_allocation(allocation.version, allocation)
+            .unwrap();
+        let permit = namespace
+            .reserve(
+                &operation.id,
+                None,
+                WorkRequest {
+                    allocation_version: allocation.version,
+                    staging_bytes: 1024,
+                    private_bytes: bytes,
+                    slots: 1,
+                },
+            )
+            .unwrap();
+        let read = permit.admit_read(bytes).unwrap();
+        assert_eq!(
+            namespace.reconciliation.state.lock().unwrap().read_bytes,
+            crate::builder::INDEX_BUILD_BATCH_BYTES
+        );
+        assert_eq!(permit.private_bytes.load(Ordering::Relaxed), bytes);
+        drop(read);
+        assert_eq!(namespace.reconciliation.state.lock().unwrap().read_bytes, 0);
+        assert_eq!(permit.private_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn simultaneous_operations_share_input_capacity_and_release_waiters() {
+        let (_temp, namespace, small) = fixture();
+        drop(small);
+        let limit = crate::builder::INDEX_BUILD_BATCH_BYTES;
+        let mut policy = namespace.policy().unwrap();
+        policy.policy.work.private_work_bytes = limit * 2;
+        namespace
+            .update_policy(policy.version, policy.policy)
+            .unwrap();
+        let mut allocation = namespace.allocation().unwrap();
+        allocation.private_work_bytes = limit * 2;
+        let allocation = namespace
+            .update_allocation(allocation.version, allocation)
+            .unwrap();
+        let permits: Vec<_> = ["read-first", "read-second"]
+            .into_iter()
+            .map(|token| {
+                let operation = namespace
+                    .accept_system_operation(
+                        Token::parse(token).unwrap(),
+                        "build",
+                        serde_json::json!({}),
+                    )
+                    .unwrap();
+                namespace
+                    .reserve(
+                        &operation.id,
+                        None,
+                        WorkRequest {
+                            allocation_version: allocation.version,
+                            staging_bytes: 1024,
+                            private_bytes: limit,
+                            slots: 1,
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let first = permits[0].admit_read(limit / 2).unwrap();
+        let second = permits[1].admit_read(limit / 2).unwrap();
+        assert_eq!(
+            namespace.reconciliation.state.lock().unwrap().read_bytes,
+            limit
+        );
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let permit = &permits[1];
+            let worker = scope.spawn(move || {
+                let admission = permit.admit_read(limit / 2).unwrap();
+                sent.send(()).unwrap();
+                drop(admission);
+            });
+            assert!(received.recv_timeout(Duration::from_millis(20)).is_err());
+            drop(first);
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+        });
+        assert_eq!(
+            namespace.reconciliation.state.lock().unwrap().read_bytes,
+            limit / 2
+        );
+        drop(second);
+        assert_eq!(namespace.reconciliation.state.lock().unwrap().read_bytes, 0);
+        assert!(
+            permits
+                .iter()
+                .all(|permit| permit.private_bytes.load(Ordering::Relaxed) == 0)
+        );
+        drop(permits);
+        assert_eq!(namespace.work_usage().unwrap().reservations, 0);
     }
 
     fn recover(namespace: &Namespace) -> Vec<crate::managed::MaintenanceIssue> {

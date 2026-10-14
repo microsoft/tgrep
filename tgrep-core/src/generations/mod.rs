@@ -959,9 +959,9 @@ impl GenerationManager {
         };
         let sort_bytes = match output.control() {
             Some(permit) => {
-                usize::try_from(permit.namespace.policy()?.policy.work.sort_buffer_bytes).map_err(
-                    |_| crate::managed::Error::invalid("sort buffer exceeds addressable memory"),
-                )?
+                usize::try_from(permit.read_limits().sort_buffer_bytes).map_err(|_| {
+                    crate::managed::Error::invalid("sort buffer exceeds addressable memory")
+                })?
             }
             None => builder::DEFAULT_INDEX_BUFFER_BYTES,
         };
@@ -1060,7 +1060,7 @@ impl GenerationManager {
             let _blob_memory = output
                 .control()
                 .map(|permit| {
-                    let limit = permit.namespace.policy()?.policy.work.blob_bytes;
+                    let limit = permit.read_limits().blob_bytes;
                     if size > limit {
                         return Err(crate::managed::Error::pressure("blob-work-limit"));
                     }

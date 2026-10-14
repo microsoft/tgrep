@@ -27,6 +27,8 @@ pub enum Point {
     AttachBeforeLease,
     AttachBeforeResume,
     ReconcileBeforeComplete,
+    ReconcileBatchOpened,
+    ReconcileRetryDrained,
     ViewBeforeCommit,
     ViewAfterCommit,
     ViewAfterSwap,

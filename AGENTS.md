@@ -124,6 +124,14 @@ after Git is gone; collection requires explicit authorization and current
 versions. Never delete a cache directory as a substitute for managed collection.
 Legacy/unmanaged v1 storage remains retain-all.
 
+Managed attachments use bounded parallel verified-read batches without raising
+namespace operation-worker limits. Inspect `last_reconcile.timings` and its
+read/reuse/resource counters to distinguish queueing, discovery, verification,
+catalog/control and checkpoint work. This does not eliminate periodic repair:
+`reconciliation_policy` reports the full-verification fallback when trustworthy
+change coverage is unavailable. A clean Git status is never proof of indexed
+checkout bytes, even for another worktree at the same commit.
+
 If your agent framework cannot keep a background process alive, skip `serve`
 and run `tgrep index .` instead. Searches then use the on-disk index. That
 index is not updated by searches or edits, so re-run `tgrep index .` after any

@@ -89,6 +89,75 @@ fn regular_opens_and_literal_path_validation() {
 }
 
 #[test]
+fn sibling_batches_release_pins_and_recheck_ancestor_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("outer").join("inner");
+    fs::create_dir_all(&parent).unwrap();
+    fs::write(parent.join("one"), "one").unwrap();
+    fs::write(parent.join("two"), "two").unwrap();
+    let root = RootedDir::open(temp.path()).unwrap();
+    let batch = root.batch(Path::new("outer/inner")).unwrap();
+    assert_eq!(
+        contents(batch.open_file(Path::new("outer/inner/one")).unwrap()),
+        "one"
+    );
+    assert_eq!(
+        contents(batch.open_file(Path::new("outer/inner/two")).unwrap()),
+        "two"
+    );
+    for path in ["outer/one", "outer/inner/../one", "../one", "one"] {
+        assert!(batch.open_file(Path::new(path)).is_err(), "{path}");
+    }
+    #[cfg(windows)]
+    assert!(fs::rename(&parent, temp.path().join("saved")).is_err());
+    let evidence = batch.finish().unwrap();
+    evidence.verify(&root).unwrap();
+    fs::rename(&parent, temp.path().join("saved")).unwrap();
+    fs::create_dir(&parent).unwrap();
+    assert!(evidence.verify(&root).is_err());
+}
+
+#[test]
+fn completed_batch_never_accepts_a_reparse_replacement() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("parent");
+    let other = temp.path().join("other");
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&other).unwrap();
+    fs::write(parent.join("file"), "original").unwrap();
+    fs::write(other.join("file"), "redirected").unwrap();
+    let root = RootedDir::open(temp.path()).unwrap();
+    let batch = root.batch(Path::new("parent")).unwrap();
+    assert_eq!(
+        contents(batch.open_file(Path::new("parent/file")).unwrap()),
+        "original"
+    );
+    let evidence = batch.finish().unwrap();
+    fs::rename(&parent, temp.path().join("saved")).unwrap();
+    link_directory(&other, &parent);
+    assert!(root.batch(Path::new("parent")).is_err());
+    assert!(evidence.verify(&root).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_child_fifo_open_is_nonblocking_and_never_follows_symlinks() {
+    if !bounded_child(
+        "rooted::tests::batch_child_fifo_open_is_nonblocking_and_never_follows_symlinks",
+    ) {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = RootedDir::open(temp.path()).unwrap();
+    let batch = root.batch(Path::new("")).unwrap();
+    make_fifo(&temp.path().join("fifo"));
+    assert!(batch.open_file(Path::new("fifo")).is_err());
+    fs::write(temp.path().join("target"), "outside").unwrap();
+    std::os::unix::fs::symlink("target", temp.path().join("link")).unwrap();
+    assert!(batch.open_file(Path::new("link")).is_err());
+}
+
+#[test]
 fn directory_swap_before_open_rejects_outside_and_inside_links() {
     for inside in [false, true] {
         let temp = tempfile::tempdir().unwrap();

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -244,6 +245,9 @@ pub struct Namespace {
     pub(crate) operation_readers: Arc<Mutex<HashMap<Id, u32>>>,
     pub(super) live_views: Mutex<HashMap<Id, Vec<Weak<super::ViewSlot>>>>,
     pub(crate) memory: Arc<super::memory::MemoryAccount>,
+    pub(crate) reconciliation: super::work::ReconciliationResources,
+    pub(crate) catalog_metrics: super::work::CatalogMetrics,
+    pub(crate) work_revision: AtomicU64,
     pub(crate) clock: Arc<dyn super::clock::Clock>,
     #[cfg(any(test, feature = "managed-test-hooks"))]
     pub(super) faults: super::faults::Faults,
@@ -451,6 +455,9 @@ impl Namespace {
         directory.create_json("namespace.json", &header)?;
         Ok(Arc::new(Self {
             memory: super::memory::MemoryAccount::for_namespace(&header.namespace)?,
+            reconciliation: super::work::ReconciliationResources::default(),
+            catalog_metrics: super::work::CatalogMetrics::default(),
+            work_revision: AtomicU64::new(1),
             directory,
             objects,
             guards,
@@ -531,6 +538,9 @@ impl Namespace {
         super::accounting::counters(&connection)?;
         let result = Arc::new(Self {
             memory: super::memory::MemoryAccount::for_namespace(&header.namespace)?,
+            reconciliation: super::work::ReconciliationResources::default(),
+            catalog_metrics: super::work::CatalogMetrics::default(),
+            work_revision: AtomicU64::new(1),
             objects: directory.child("objects")?,
             guards: directory.child("guards")?,
             owners: directory.child("owners")?,
@@ -569,6 +579,7 @@ impl Namespace {
     }
 
     pub(crate) fn read<T>(&self, action: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let _timing = self.catalog_metrics.start();
         self.verify_identity()?;
         let connection = self
             .database
@@ -591,6 +602,7 @@ impl Namespace {
         change: Option<VersionedPolicy>,
         action: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
+        let _timing = self.catalog_metrics.start();
         self.verify_identity()?;
         let mut connection = self
             .database
@@ -609,6 +621,14 @@ impl Namespace {
         budget.cache_used_before_commit_bytes = super::catalog_io::cache_used(&transaction);
         self.observe_catalog_write(&budget)?;
         self.fault(super::faults::Point::CatalogBeforeCommit, None)?;
+        // Invalidate under the database lock, even if commit has an unknown
+        // outcome. Readers sample this revision while holding the same lock.
+        #[allow(deprecated, reason = "Rust 1.88 compatibility")]
+        let _ = self
+            .work_revision
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |revision| {
+                Some(revision.saturating_add(1))
+            });
         transaction
             .commit()
             .map_err(|error| Error::from(error).committed(CommitState::Unknown))?;

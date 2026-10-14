@@ -721,6 +721,9 @@ fn walk_metadata_inner(
     let root = root.to_path_buf();
     let exclude_paths = opts.exclude_paths.clone();
 
+    let parallelism = permit
+        .map(|permit| permit.parallelism(walker_thread_count()))
+        .transpose()?;
     let walker = WalkBuilder::new(&root)
         .file_read_control(read_control.clone())
         .hidden(false)
@@ -774,11 +777,11 @@ fn walk_metadata_inner(
             }
             true
         })
-        .threads(if permit.is_some() {
-            1
-        } else {
-            walker_thread_count()
-        })
+        .threads(
+            parallelism
+                .as_ref()
+                .map_or_else(walker_thread_count, |guard| guard.workers),
+        )
         .build_parallel();
 
     walker.run(|| {
@@ -904,10 +907,10 @@ fn walk_metadata_inner(
                 size: stamp.size,
                 version: version.is_trusted().then_some(version),
             });
-
             ignore::WalkState::Continue
         })
     });
+    drop(parallelism);
 
     if let Some(error) = failure.lock().expect("walk failure lock").take() {
         return Err(error);

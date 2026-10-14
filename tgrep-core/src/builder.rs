@@ -40,7 +40,7 @@ const INDEX_BUILD_BATCH_SIZE: usize = 1024;
 /// pool. Raising this budget would trade memory on *every* tree for that;
 /// charging mapped bytes honestly costs nothing on trees like the kernel, where
 /// only 110 of 94,747 files are mapped at all.
-const INDEX_BUILD_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const INDEX_BUILD_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_OWNED_FILE_BYTES: u64 = INDEX_BUILD_BATCH_BYTES;
 
 const BUILD_DISK_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
@@ -484,12 +484,12 @@ const MAPPED_BATCH_BYTES: u64 = 256 * 1024 * 1024;
 
 /// What one file costs a batch, split by where the bytes live.
 #[derive(Clone, Copy, Default)]
-struct BatchCharge {
+pub(crate) struct BatchCharge {
     /// Charge against the heap budget: the read buffer for a small file, or the
     /// saturating stand-in for a mapped file's extracted trigram map.
-    heap: u64,
+    pub(crate) heap: u64,
     /// Charge against the mapped budget; zero for a file that is read.
-    mapped: u64,
+    pub(crate) mapped: u64,
 }
 
 fn batch_charge(size: u64) -> BatchCharge {
@@ -523,7 +523,7 @@ const UNKNOWN_SIZE_CHARGE: BatchCharge = BatchCharge {
 /// A file whose charge alone exceeds a budget forms a batch of its own rather
 /// than being split, so the bound is "one budget, plus at most one oversized
 /// file".
-fn batch_ranges(charges: &[BatchCharge], budget: u64) -> Vec<std::ops::Range<usize>> {
+pub(crate) fn batch_ranges(charges: &[BatchCharge], budget: u64) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
     let mut heap = 0u64;

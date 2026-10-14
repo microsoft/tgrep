@@ -1,7 +1,7 @@
 //! Handle-rooted regular-file opens shared by reconciliation and serving.
 
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, Metadata};
 use std::io::{self, Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 
@@ -63,6 +63,29 @@ impl RootedDir {
         self.directory.try_clone()
     }
 
+    pub(crate) fn batch_memory_bytes(&self, parent: &Path) -> u64 {
+        // Native paths, ancestor handles/identities and path-query scratch.
+        let path_bytes = (self.path.as_os_str().as_encoded_bytes().len()
+            + parent.as_os_str().as_encoded_bytes().len()) as u64;
+        path_bytes
+            .saturating_mul(12)
+            .saturating_add(parent.components().count() as u64 * 192)
+            .saturating_add(4096)
+    }
+
+    pub(crate) fn batch_handles(parent: &Path) -> u64 {
+        #[cfg(windows)]
+        {
+            // Retained chain plus the independent batch-end verification chain.
+            parent.components().count() as u64 * 2 + 4
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = parent;
+            4
+        }
+    }
+
     fn open_directory(path: &Path) -> io::Result<File> {
         #[cfg(unix)]
         {
@@ -90,6 +113,63 @@ impl RootedDir {
     /// Unix opens are nonblocking so a raced-in FIFO cannot stall the caller.
     pub fn open_file(&self, relative: &Path) -> io::Result<File> {
         self.open_file_with(relative, |_| {})
+    }
+
+    /// Pin one ancestor chain for a bounded group of sibling reads. The caller
+    /// must finish the batch and revalidate its returned evidence at publication.
+    pub(crate) fn batch(&self, parent: &Path) -> io::Result<RootedBatch<'_>> {
+        let names = if parent.as_os_str().is_empty() {
+            Vec::new()
+        } else {
+            components(parent)?
+        };
+        self.verify_root()?;
+        let mut guards = Vec::with_capacity(names.len());
+        let mut identities = Vec::with_capacity(names.len());
+        #[cfg(windows)]
+        let anchor = final_path_of(&self.directory)?;
+        #[cfg(windows)]
+        let mut path = self.path.clone();
+        for name in names {
+            let parent_file = guards.last().unwrap_or(&self.directory);
+            #[cfg(unix)]
+            let file = open_child(parent_file, &name, true)?;
+            #[cfg(windows)]
+            let file = {
+                path.push(name);
+                let file = open_windows(&path, true)?;
+                check_parent(&file, parent_file, &anchor)?;
+                file
+            };
+            #[cfg(not(any(unix, windows)))]
+            let file: File = {
+                let _ = (parent_file, name);
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "handle-rooted reads unsupported",
+                ));
+            };
+            identities.push(crate::managed::FileIdentity::of(&file).map_err(Error::other)?);
+            #[cfg(unix)]
+            guards.clear();
+            guards.push(file);
+        }
+        #[cfg(windows)]
+        let resolved = final_path_of(guards.last().unwrap_or(&self.directory))?;
+        Ok(RootedBatch {
+            root: self,
+            evidence: ParentEvidence {
+                path: parent.into(),
+                identities,
+            },
+            guards,
+            #[cfg(windows)]
+            path,
+            #[cfg(windows)]
+            anchor,
+            #[cfg(windows)]
+            resolved,
+        })
     }
 
     fn open_file_with(
@@ -163,6 +243,155 @@ impl RootedDir {
     }
 }
 
+/// Stores identities, not open handles: completed batches must not keep
+/// checkout directories pinned while later batches or checkpoints run.
+pub(crate) struct ParentEvidence {
+    path: PathBuf,
+    identities: Vec<crate::managed::FileIdentity>,
+}
+
+impl ParentEvidence {
+    pub(crate) fn verification_memory_bytes(&self, root: &RootedDir) -> u64 {
+        root.batch_memory_bytes(&self.path)
+    }
+
+    pub(crate) fn verification_handles(&self) -> u64 {
+        RootedDir::batch_handles(&self.path)
+    }
+
+    pub(crate) fn verify(&self, root: &RootedDir) -> io::Result<()> {
+        let current = root.batch(&self.path)?;
+        if current.evidence.identities != self.identities {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "batch ancestor identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn memory_bytes(&self) -> u64 {
+        self.path.as_os_str().as_encoded_bytes().len() as u64 * 2
+            + self.identities.len() as u64 * 64
+            + 128
+    }
+}
+
+pub(crate) struct RootedBatch<'a> {
+    root: &'a RootedDir,
+    evidence: ParentEvidence,
+    guards: Vec<File>,
+    #[cfg(windows)]
+    path: PathBuf,
+    #[cfg(windows)]
+    anchor: PathBuf,
+    #[cfg(windows)]
+    resolved: PathBuf,
+}
+
+pub(crate) struct OpenedFile {
+    pub(crate) file: File,
+    pub(crate) metadata: Metadata,
+}
+
+impl RootedBatch<'_> {
+    #[cfg(test)]
+    pub(crate) fn open_file(&self, relative: &Path) -> io::Result<File> {
+        self.open_observed(relative).map(|opened| opened.file)
+    }
+
+    pub(crate) fn open_observed(&self, relative: &Path) -> io::Result<OpenedFile> {
+        if relative.parent() != Some(self.evidence.path.as_path()) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "file is not a batch sibling",
+            ));
+        }
+        let name = relative
+            .file_name()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing batch file name"))?;
+        components(Path::new(name))?;
+        #[cfg(unix)]
+        {
+            let file = open_child(
+                self.guards.last().unwrap_or(&self.root.directory),
+                name,
+                false,
+            )?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+            }
+            Ok(OpenedFile { metadata, file })
+        }
+        #[cfg(windows)]
+        {
+            let observed = open_windows_observed(&self.path.join(name), false)?;
+            let opened = final_path_of(&observed.file)?;
+            if !opened.starts_with(&self.anchor) || opened.parent() != Some(self.resolved.as_path())
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "file escaped batch parent",
+                ));
+            }
+            Ok(observed)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = name;
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "handle-rooted reads unsupported",
+            ))
+        }
+    }
+
+    pub(crate) fn finish(self) -> io::Result<ParentEvidence> {
+        #[cfg(windows)]
+        debug_assert_eq!(self.guards.len(), self.evidence.identities.len());
+        #[cfg(unix)]
+        debug_assert_eq!(
+            self.guards.len(),
+            usize::from(!self.evidence.identities.is_empty())
+        );
+        self.evidence.verify(self.root)?;
+        Ok(self.evidence)
+    }
+}
+
+#[cfg(unix)]
+fn open_child(parent: &File, name: &std::ffi::OsStr, directory: bool) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "NUL in path component"))?;
+    let flags = libc::O_RDONLY
+        | libc::O_NOFOLLOW
+        | libc::O_CLOEXEC
+        | libc::O_NONBLOCK
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    // SAFETY: a live pinned parent, one literal NUL-terminated child name.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: the successful openat returned a fresh owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(windows)]
+fn check_parent(file: &File, parent: &File, anchor: &Path) -> io::Result<()> {
+    let opened = final_path_of(file)?;
+    if !opened.starts_with(anchor) || opened.parent() != Some(final_path_of(parent)?.as_path()) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "file escaped pinned root",
+        ));
+    }
+    Ok(())
+}
+
 fn regular(file: File) -> io::Result<File> {
     if !file.metadata()?.is_file() {
         return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
@@ -204,6 +433,11 @@ fn is_reparse(metadata: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn open_windows(path: &Path, directory: bool) -> io::Result<File> {
+    open_windows_observed(path, directory).map(|opened| opened.file)
+}
+
+#[cfg(windows)]
+fn open_windows_observed(path: &Path, directory: bool) -> io::Result<OpenedFile> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
@@ -234,7 +468,10 @@ fn open_windows(path: &Path, directory: bool) -> io::Result<File> {
     if directory && !metadata.is_dir() {
         return Err(Error::new(ErrorKind::NotADirectory, "not a directory"));
     }
-    Ok(file)
+    if !directory && !metadata.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    Ok(OpenedFile { file, metadata })
 }
 
 /// Query the resolved path of the actual open Windows handle.

@@ -50,8 +50,10 @@ machine, filesystem or checkout.
 ### Verification and effective limits
 
 The generation receipt confirmed `reused_generation=true`, `published=false`
-and `blobs_read=0`. Reconciliation nevertheless performed **293,288 full file
-reads totaling 6,894,175,823 input bytes**, with zero content reads avoided.
+and `blobs_read=0`. Full reconciliation read **293,288 files**, consuming
+**6,894,175,823 input bytes** under the unchanged file-size/probe limits, with
+zero content reads avoided. The read counter does not prove that every physical
+file was consumed to EOF.
 It reused 287,319 base files and extracted one file. These are logical input
 bytes, not physical device I/O.
 
@@ -68,7 +70,8 @@ The effective policy and allocation capacities were checked, not increased:
 | Namespace operation workers / allocation work slots | 1 / 1 |
 | Private-work / staging limits | 8 GiB / 8 GiB |
 | Metadata / sort-buffer limit | 4 GiB / 16 MiB |
-| Blob limit | 67,108,865 bytes |
+| Searchable file-size cap | 64 MiB (67,108,864 bytes) |
+| Managed read/probe limit (`work.blob_bytes`) | 64 MiB + 1 byte (67,108,865 bytes) |
 | Operation timeout | 10,800,000 ms |
 | Storage allocation / retention target | 32 GiB / 16 GiB |
 
@@ -136,9 +139,11 @@ catalog accesses.
 | Private charge | 2,747,155,386 bytes |
 
 These peaks are **admitted accounting**, not sampled CPU utilization, RSS or
-operating-system descriptor counts. The 402,718,726-byte input peak is a
-serialized oversized input charged for six 67,108,865-byte buffers plus
-65,536 bytes of scratch; it does not enlarge the 64 MiB concurrent-input gate.
+operating-system descriptor counts. The 402,718,726-byte input peak uses a
+conservative six-times read/decode charge plus 65,536 bytes of scratch for one
+serialized oversized input. This charge uses the 64 MiB + 1 byte read/probe
+limit, not a higher searchable file-size cap or a count of allocated buffers.
+It does not enlarge the 64 MiB concurrent-input gate.
 Private charges remained within the unchanged 8 GiB private-work limit.
 
 **Recurring full-reconciliation elimination is not implemented.** The normal

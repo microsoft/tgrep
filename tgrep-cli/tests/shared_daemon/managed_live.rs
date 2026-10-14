@@ -743,6 +743,276 @@ fn independent_repository_allocations_and_offline_collection_preserve_a_live_sib
 }
 
 #[test]
+fn healthy_native_views_do_not_reconcile_on_elapsed_poll_intervals() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    let before = wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["ready"] == true && status["work"].is_null() && status["watch_mode"] == "native"
+        },
+    );
+    for elapsed_ms in [121_000, 86_400_000] {
+        let timer = daemon.rpc(
+            "testing.reconcile-timer",
+            json!({"view":view["view"],"elapsed_ms":elapsed_ms}),
+        );
+        assert_eq!(timer["input_epoch"], before["input_epoch"]);
+        let after = daemon.rpc("views.status", json!({"id":view["view"]}));
+        assert_eq!(after["ready"], true);
+        assert_eq!(after["input_epoch"], before["input_epoch"]);
+        assert_eq!(after["last_reconcile"], before["last_reconcile"]);
+        let ordinary: Value =
+            serde_json::from_str(&success(cli(&fixture.a, &["status", "."]))).unwrap();
+        assert_eq!(
+            ordinary["reconciliation_policy"],
+            after["reconciliation_policy"]
+        );
+        let namespace = daemon.rpc("namespace.status", json!({}));
+        let maintenance = daemon.rpc("maintenance.status", json!({}));
+        for report in [&after, &namespace, &maintenance] {
+            let repair = &report["reconciliation_policy"];
+            assert_eq!(repair["configured_watch_mode"], "auto");
+            assert_eq!(repair["periodic_full_verification"], false);
+            assert_eq!(repair["native_periodic_full_verification"], false);
+            assert!(repair["interval_ms"].is_null());
+            assert_eq!(repair["poll_interval_ms"], 120_000);
+            assert!(repair["full_verification_reason"].is_null());
+            assert_eq!(
+                repair["native_missed_changes"],
+                "may-remain-stale-indefinitely"
+            );
+            assert!(
+                !repair["full_repair_triggers"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("poll-interval"))
+            );
+        }
+        assert_eq!(namespace["reconciliation_policy"]["native_views"], 1);
+        assert_eq!(namespace["reconciliation_policy"]["polling_views"], 0);
+    }
+
+    fs::write(fixture.a.join("notes.txt"), "shared_term native_edit\n").unwrap();
+    wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["ready"] == true
+                && status["input_epoch"].as_u64().unwrap() > before["input_epoch"].as_u64().unwrap()
+        },
+    );
+    let matches = retry_busy(
+        &daemon,
+        "search",
+        json!({"root":view["root"],"view":view["view"],"expected_version":view["version"],
+            "query":{"pattern":"native_edit"}}),
+    );
+    assert!(!matches["matches"].as_array().unwrap().is_empty());
+    let refreshed = completed(&daemon, &daemon.rpc("views.refresh", json!({
+        "token":token(&claim,2),"request":{"view":view["view"],"expected_version":view["version"],
+            "owner":claim.owner,"allocation_version":1}
+    })));
+    assert_eq!(refreshed["result"]["reconcile"]["full"], true);
+    assert_eq!(refreshed["result"]["reconcile"]["files_read"], 3);
+    assert_eq!(refreshed["result"]["reconcile"]["content_reads_avoided"], 0);
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
+fn native_failure_enables_polling_only_for_the_affected_view() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let mut sibling = attach_input(&fixture, &claim);
+    sibling["token"] = token(&claim, 2);
+    sibling["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
+    sibling["request"]["lease"] = json!("sibling-client");
+    completed(&daemon, &daemon.rpc("views.attach", sibling));
+    let native = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    let fallback = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.b).unwrap()}),
+    );
+    for view in [&native, &fallback] {
+        wait_for(
+            &daemon,
+            "views.status",
+            json!({"id":view["view"]}),
+            |status| {
+                status["ready"] == true
+                    && status["work"].is_null()
+                    && status["watch_mode"] == "native"
+            },
+        );
+    }
+    let failure = daemon.rpc(
+        "testing.watch-event",
+        json!({"view":fallback["view"],"kind":"failure"}),
+    );
+    let before = wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":fallback["view"]}),
+        |status| {
+            status["ready"] == true
+                && status["work"].is_null()
+                && status["watch_mode"] == "poll"
+                && status["authoritative"]["input_epoch"].as_u64().unwrap()
+                    >= failure["input_epoch"].as_u64().unwrap()
+        },
+    );
+    assert!(
+        before["watch_fallback"]
+            .as_str()
+            .unwrap()
+            .contains("injected native watcher uncertainty")
+    );
+    let ordinary: Value =
+        serde_json::from_str(&success(cli(&fixture.b, &["status", "."]))).unwrap();
+    assert_eq!(
+        ordinary["reconciliation_policy"],
+        before["reconciliation_policy"]
+    );
+    let native_status = daemon.rpc("views.status", json!({"id":native["view"]}));
+    assert_eq!(native_status["watch_mode"], "native");
+    assert_eq!(
+        native_status["reconciliation_policy"]["periodic_full_verification"],
+        false
+    );
+    for method in ["namespace.status", "maintenance.status"] {
+        let status = daemon.rpc(method, json!({}));
+        let repair = &status["reconciliation_policy"];
+        assert_eq!(repair["configured_watch_mode"], "auto");
+        assert_eq!(repair["native_periodic_full_verification"], false);
+        assert_eq!(repair["periodic_full_verification"], true);
+        assert_eq!(repair["native_views"], 1);
+        assert_eq!(repair["polling_views"], 1);
+        assert_eq!(repair["interval_ms"], 120_000);
+    }
+
+    fs::write(fixture.b.join("missed.txt"), "shared_term fallback_poll\n").unwrap();
+    let timer = daemon.rpc(
+        "testing.reconcile-timer",
+        json!({"view":fallback["view"],"elapsed_ms":121_000}),
+    );
+    assert!(timer["input_epoch"].as_u64().unwrap() > before["input_epoch"].as_u64().unwrap());
+    let repaired = wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":fallback["view"]}),
+        |status| {
+            status["ready"] == true
+                && status["authoritative"]["input_epoch"].as_u64().unwrap()
+                    >= timer["input_epoch"].as_u64().unwrap()
+        },
+    );
+    assert_eq!(repaired["last_reconcile"]["full"], true);
+    assert_eq!(repaired["last_reconcile"]["content_reads_avoided"], 0);
+    assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
+    for lease in ["managed-client", "sibling-client"] {
+        daemon.rpc("views.detach", json!({"owner":claim.owner,"lease":lease}));
+    }
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
+fn no_watch_has_no_timer_repair_but_initial_and_explicit_refresh_verify() {
+    let fixture = Fixture::new();
+    fs::write(fixture.a.join("notes.txt"), "shared_term before\n").unwrap();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    let attached = completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    assert_eq!(attached["result"]["reconcile"]["full"], true);
+    assert_eq!(attached["result"]["reconcile"]["files_read"], 3);
+    assert_eq!(attached["result"]["reconcile"]["files_extracted"], 1);
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    let before = wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| status["ready"] == true && status["work"].is_null(),
+    );
+    let path = fixture.a.join("notes.txt");
+    let metadata = fs::metadata(&path).unwrap();
+    fs::write(&path, "shared_term missed\n").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(metadata.modified().unwrap())
+        .unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), metadata.len());
+    assert_eq!(
+        fs::metadata(&path).unwrap().modified().unwrap(),
+        metadata.modified().unwrap()
+    );
+    let timer = daemon.rpc(
+        "testing.reconcile-timer",
+        json!({"view":view["view"],"elapsed_ms":121_000}),
+    );
+    assert_eq!(timer["input_epoch"], before["input_epoch"]);
+    let after = daemon.rpc("views.status", json!({"id":view["view"]}));
+    assert_eq!(after["ready"], true);
+    assert_eq!(after["watch_mode"], "disabled");
+    assert_eq!(after["last_reconcile"], before["last_reconcile"]);
+    assert_eq!(
+        after["reconciliation_policy"]["periodic_full_verification"],
+        false
+    );
+    assert!(after["reconciliation_policy"]["interval_ms"].is_null());
+    let refreshed = completed(&daemon, &daemon.rpc("views.refresh", json!({
+        "token":token(&claim,2),"request":{"view":view["view"],"expected_version":view["version"],
+            "owner":claim.owner,"allocation_version":1}
+    })));
+    assert_eq!(refreshed["result"]["reconcile"]["full"], true);
+    assert_eq!(refreshed["result"]["reconcile"]["files_read"], 3);
+    assert_eq!(refreshed["result"]["reconcile"]["content_reads_avoided"], 0);
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
 fn native_watching_smudge_crlf_sparse_and_rescan_repair_preserve_indexed_scan_parity() {
     let mut fixture = Fixture::new();
     fs::write(

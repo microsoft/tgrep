@@ -153,11 +153,21 @@ limit, not a higher searchable file-size cap or a count of allocated buffers.
 It does not enlarge the 64 MiB concurrent-input gate.
 Private charges remained within the unchanged 8 GiB private-work limit.
 
-**Recurring full-reconciliation elimination is not implemented.** The normal
-120-second full-repair fallback remains when trusted change coverage is absent;
-clean Git status never substitutes for verified checkout bytes. The benchmark's
-disabled watcher isolates initial attachment and does not demonstrate an idle
-maintenance improvement or authorize changing the default repair interval.
+**Post-measurement recurring-mode change:** measured source `58fdda8` retained
+the normal 120-second native safety pass. A subsequent user-directed change
+removes that timer for healthy native managed views, accepting that silently
+missed notifications may leave results stale indefinitely rather than claiming
+trusted change coverage. Explicit polling and actual native-watcher-unavailable
+fallback still perform full verification after `--poll-interval` (default 120
+seconds); initial/restore verification, explicit refresh and reported
+watcher-error/rescan recovery remain intact. Legacy v1 and ordinary-server
+policies are unchanged.
+
+That later behavior is **not part of the measured executable**. The benchmark's
+disabled watcher isolates initial attachment and does not measure idle
+maintenance savings. Timings remain attributed to immutable `58fdda8`, not
+subsequent PR heads; clean Git status never substitutes for initial verified
+checkout reads.
 
 ## Managed lifecycle measurements
 

@@ -274,6 +274,26 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
                 .unwrap()
                 .contains(&json!("reconciliation-phase-metrics"))
         );
+        assert!(
+            hello["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("event-driven-native-reconciliation"))
+        );
+        for method in ["namespace.status", "maintenance.status"] {
+            let report = daemon.rpc(method, json!({}));
+            let repair = &report["reconciliation_policy"];
+            assert_eq!(
+                repair["configured_watch_mode"],
+                if automatic { "poll" } else { "disabled" }
+            );
+            assert_eq!(repair["periodic_full_verification"], false);
+            assert!(repair["interval_ms"].is_null());
+            assert_eq!(repair["poll_interval_ms"], 120_000);
+            assert_eq!(repair["native_views"], 0);
+            assert_eq!(repair["polling_views"], 0);
+            assert_eq!(repair["disabled_views"], 0);
+        }
         let (claim, guard) = owner(&daemon);
         let receipt = completed(
             &daemon,
@@ -355,25 +375,53 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
         let status = daemon.rpc("views.status", json!({"id":view["id"]}));
         assert_eq!(status["last_reconcile"], *stats);
         let namespace = daemon.rpc("namespace.status", json!({}));
+        let maintenance = daemon.rpc("maintenance.status", json!({}));
         let ordinary: Value =
             serde_json::from_str(&success(cli(&fixture.a, &["status", "."]))).unwrap();
-        for report in [&status, &namespace, &ordinary] {
+        for report in [&status, &namespace, &maintenance, &ordinary] {
             let repair = &report["reconciliation_policy"];
             assert_eq!(repair["periodic_full_verification"], automatic);
-            assert_eq!(repair["interval_ms"], 120_000);
+            assert_eq!(repair["native_periodic_full_verification"], false);
+            assert_eq!(
+                repair["interval_ms"],
+                if automatic {
+                    json!(120_000)
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(repair["poll_interval_ms"], 120_000);
+            assert_eq!(
+                repair["configured_watch_mode"],
+                if automatic { "poll" } else { "disabled" }
+            );
             assert_eq!(repair["incremental_coverage"], "unavailable");
             assert_eq!(repair["change_journal"], "not-integrated");
             assert_eq!(
-                repair["full_verification_reason"],
-                "no-trusted-change-coverage"
+                repair["native_missed_changes"],
+                "may-remain-stale-indefinitely"
             );
-            assert!(
+            assert_eq!(
+                repair["full_verification_reason"],
+                if automatic {
+                    json!("polling-update-mechanism")
+                } else {
+                    Value::Null
+                }
+            );
+            assert_eq!(
                 repair["full_repair_triggers"]
                     .as_array()
                     .unwrap()
-                    .contains(&json!("watcher-error-or-overflow"))
+                    .contains(&json!("poll-interval")),
+                automatic
             );
         }
+        let repair = &namespace["reconciliation_policy"];
+        assert_eq!(repair["scope"], "monitored-views");
+        assert_eq!(repair["native_views"], 0);
+        assert_eq!(repair["polling_views"], usize::from(automatic));
+        assert_eq!(repair["disabled_views"], usize::from(!automatic));
         assert_eq!(namespace["allocation"]["work_slots"], 1);
         daemon.rpc(
             "views.detach",
@@ -388,108 +436,127 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
 }
 
 #[test]
-fn periodic_fallback_repairs_unreported_restored_mtime_and_membership_changes() {
-    let fixture = Fixture::new();
-    let mut daemon = start(
-        &fixture,
-        &policy(),
-        &["--watch-mode", "poll", "--poll-interval", "1"],
-    );
-    let (claim, guard) = owner(&daemon);
-    let receipt = completed(
-        &daemon,
-        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
-    );
-    let view = &receipt["result"]["current"];
-    let before = daemon.rpc("views.status", json!({"id":view["id"]}));
-    let path = fixture.a.join("notes.txt");
-    let metadata = fs::metadata(&path).unwrap();
-    git(
-        &fixture.a,
-        &["update-index", "--assume-unchanged", "notes.txt"],
-    );
-    fs::write(&path, "shared_term fresh\n").unwrap();
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .unwrap()
-        .set_modified(metadata.modified().unwrap())
-        .unwrap();
-    assert_eq!(fs::metadata(&path).unwrap().len(), metadata.len());
-    assert_eq!(
-        fs::metadata(&path).unwrap().modified().unwrap(),
-        metadata.modified().unwrap(),
-    );
-    assert!(git(&fixture.a, &["status", "--porcelain", "--", "notes.txt"]).is_empty());
-    fs::remove_file(fixture.a.join(".hidden")).unwrap();
-    fs::write(fixture.a.join(".missed-hidden"), "shared_term hidden\n").unwrap();
-    fs::write(fixture.a.join("missed.txt"), "shared_term untracked\n").unwrap();
-    fs::write(fixture.a.join(".gitignore"), "ignored.txt\n").unwrap();
-    fs::write(fixture.a.join("ignored.txt"), "shared_term ignored\n").unwrap();
-    let lookup = daemon.rpc(
-        "lookup",
-        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
-    );
-    let started = Instant::now();
-    loop {
-        let status = daemon.rpc("views.status", json!({"id":view["id"]}));
-        if status["ready"] == true
-            && status["input_epoch"].as_u64().unwrap() > before["input_epoch"].as_u64().unwrap()
-        {
-            let matches = retry_busy(
-                &daemon,
-                "search",
-                json!({
-                    "root":lookup["root"],"view":view["id"],"expected_version":view["version"],
-                    "query":{"pattern":"fresh"}
-                }),
-            );
-            let listing = retry_busy(
-                &daemon,
-                "files",
-                json!({
-                    "root":lookup["root"],"view":view["id"],"expected_version":view["version"],
-                    "query":{"hidden":true}
-                }),
-            );
-            let files = listing["files"].as_array().unwrap();
-            if !matches["matches"].as_array().unwrap().is_empty()
-                && files.contains(&json!(".missed-hidden"))
-                && files.contains(&json!("missed.txt"))
-                && !files.contains(&json!(".hidden"))
-                && !files.contains(&json!("ignored.txt"))
-            {
-                assert_eq!(matches["backend"], "shared-v2");
-                assert_eq!(listing["backend"], "shared-v2");
-                assert_eq!(status["last_reconcile"]["full"], true);
-                assert_eq!(status["last_reconcile"]["content_reads_avoided"], 0);
-                assert_eq!(
-                    status["reconciliation_policy"]["periodic_full_verification"],
-                    true
-                );
-                assert_eq!(status["reconciliation_policy"]["interval_ms"], 1000);
-                assert_eq!(
-                    status["reconciliation_policy"]["full_verification_reason"],
-                    "no-trusted-change-coverage"
-                );
-                break;
-            }
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "periodic repair did not complete: {status}"
+fn polling_modes_repair_unreported_restored_mtime_and_membership_changes() {
+    for fallback in [false, true] {
+        let fixture = Fixture::new();
+        let mut daemon = start(
+            &fixture,
+            &policy(),
+            if fallback {
+                &[
+                    "--watch-mode",
+                    "auto",
+                    "--watch-budget",
+                    "1",
+                    "--poll-interval",
+                    "1",
+                ]
+            } else {
+                &["--watch-mode", "poll", "--poll-interval", "1"]
+            },
         );
-        thread::sleep(Duration::from_millis(20));
+        let (claim, guard) = owner(&daemon);
+        let receipt = completed(
+            &daemon,
+            &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+        );
+        let view = &receipt["result"]["current"];
+        let before = daemon.rpc("views.status", json!({"id":view["id"]}));
+        assert_eq!(before["watch_mode"], "poll");
+        assert_eq!(before["watch_fallback"].is_string(), fallback);
+        let path = fixture.a.join("notes.txt");
+        let metadata = fs::metadata(&path).unwrap();
+        git(
+            &fixture.a,
+            &["update-index", "--assume-unchanged", "notes.txt"],
+        );
+        fs::write(&path, "shared_term fresh\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(metadata.modified().unwrap())
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), metadata.len());
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            metadata.modified().unwrap(),
+        );
+        assert!(git(&fixture.a, &["status", "--porcelain", "--", "notes.txt"]).is_empty());
+        fs::remove_file(fixture.a.join(".hidden")).unwrap();
+        fs::write(fixture.a.join(".missed-hidden"), "shared_term hidden\n").unwrap();
+        fs::write(fixture.a.join("missed.txt"), "shared_term untracked\n").unwrap();
+        fs::write(fixture.a.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(fixture.a.join("ignored.txt"), "shared_term ignored\n").unwrap();
+        let lookup = daemon.rpc(
+            "lookup",
+            json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+        );
+        let started = Instant::now();
+        loop {
+            let status = daemon.rpc("views.status", json!({"id":view["id"]}));
+            if status["ready"] == true
+                && status["input_epoch"].as_u64().unwrap() > before["input_epoch"].as_u64().unwrap()
+            {
+                let matches = retry_busy(
+                    &daemon,
+                    "search",
+                    json!({
+                        "root":lookup["root"],"view":view["id"],"expected_version":view["version"],
+                        "query":{"pattern":"fresh"}
+                    }),
+                );
+                let listing = retry_busy(
+                    &daemon,
+                    "files",
+                    json!({
+                        "root":lookup["root"],"view":view["id"],"expected_version":view["version"],
+                        "query":{"hidden":true}
+                    }),
+                );
+                let files = listing["files"].as_array().unwrap();
+                if !matches["matches"].as_array().unwrap().is_empty()
+                    && files.contains(&json!(".missed-hidden"))
+                    && files.contains(&json!("missed.txt"))
+                    && !files.contains(&json!(".hidden"))
+                    && !files.contains(&json!("ignored.txt"))
+                {
+                    assert_eq!(matches["backend"], "shared-v2");
+                    assert_eq!(listing["backend"], "shared-v2");
+                    assert_eq!(status["last_reconcile"]["full"], true);
+                    assert_eq!(status["last_reconcile"]["content_reads_avoided"], 0);
+                    assert_eq!(
+                        status["reconciliation_policy"]["periodic_full_verification"],
+                        true
+                    );
+                    assert_eq!(status["reconciliation_policy"]["interval_ms"], 1000);
+                    assert_eq!(
+                        status["reconciliation_policy"]["full_verification_reason"],
+                        "polling-update-mechanism"
+                    );
+                    assert_eq!(
+                        status["reconciliation_policy"]["configured_watch_mode"],
+                        if fallback { "auto" } else { "poll" }
+                    );
+                    break;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "periodic repair did not complete: {status}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        daemon.rpc(
+            "views.detach",
+            json!({"owner":claim.owner,"lease":"managed-client"}),
+        );
+        daemon.rpc("owners.release", json!({"claim":claim}));
+        drop(guard);
+        stop(&mut daemon);
+        drop(daemon);
+        fixture.temp.close().unwrap();
     }
-    daemon.rpc(
-        "views.detach",
-        json!({"owner":claim.owner,"lease":"managed-client"}),
-    );
-    daemon.rpc("owners.release", json!({"claim":claim}));
-    drop(guard);
-    stop(&mut daemon);
-    drop(daemon);
-    fixture.temp.close().unwrap();
 }
 
 #[test]

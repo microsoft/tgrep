@@ -654,7 +654,7 @@ refresh and checkpoint publication finish, including failed checkpoint retries.
 Candidate files are opened through the view's retained snapshot reader. Every
 query ends with a root-verified epoch check, including empty and filename-only
 responses; replacing the directory cannot pair old candidates with a new root.
-Both auto and poll modes perform full
+In the legacy v1 daemon, both auto and poll modes perform full
 verification every `--poll-interval` seconds after completion (default 120), also
 repairing missed bytes, ignores and external Git/global configuration changes.
 Native notifications allow earlier incremental repair. `--no-watch` disables
@@ -1299,26 +1299,52 @@ Under the view's work/publication gates, tgrep checks the exact current pin,
 checkpoint and input epoch before completing such a job without changing the
 ready view or invalidating its readers. Its original token/request is retained;
 the terminal receipt reports `coalesced: true`, the existing reconciled epoch
-and zero new reconciliation work. This does not postpone periodic verification.
-Explicit refresh always verifies; periodic repair, watcher uncertainty and
+and zero new reconciliation work. This does not postpone polling verification.
+Explicit refresh always verifies; polling repair, watcher uncertainty and
 rescan events invalidate for full verification before queuing reconciliation.
 A newer invalidation therefore cannot be skipped by the coalescing check.
 
-**Recurring-repair limitation:** the bounded initial pipeline does not eliminate
-periodic full verification. This implementation has no integrated, lossless
-checkout change journal. File timestamps, Windows `ChangeTime`, a clean Git
-status, or a drained watcher queue do not prove absence of unreported writes
-(including active/mapped writers). An unavailable/inactive journal, including on
-ReFS, must not be treated as an empty journal. First attachment/restore, explicit
-full refresh, watcher error/overflow, Git/ignore changes and periodic fallback
-therefore continue to require full verification. The default 120-second interval
-after completion is retained, not silently lengthened or disabled.
-Online `namespace.status`, `views.status` and ordinary `status` expose
-`reconciliation_policy` with `periodic_full_verification`, `interval_ms`,
-`incremental_coverage: "unavailable"`, `change_journal: "not-integrated"`,
-`full_verification_reason: "no-trusted-change-coverage"` and repair triggers.
-`--no-watch` explicitly disables automatic repair; it does not supply coverage
-evidence or skip first-attachment verification.
+**Managed update policy:** healthy native-watcher views have no timer-driven
+full-reconciliation safety pass. Elapsing the former 120-second interval does
+not invalidate or reread an otherwise quiet ready view. Silently missed changes
+can therefore remain stale indefinitely, even while ready. This is an explicitly
+accepted staleness tradeoff, not proven coverage. There is no integrated lossless
+checkout change journal; timestamps, Windows `ChangeTime`, clean Git status and
+a drained watcher queue still do not prove absence of unreported writes
+(including active/mapped writers). An unavailable/inactive journal is not an
+empty journal and does not justify skipping initial content verification.
+
+First attachment/restore, explicit full refresh, reported watcher error/overflow
+or rescan, and observed Git/ignore changes retain full verification and the
+existing publication gates. Normal native file events still invalidate their
+paths. Explicit `--watch-mode poll` and actual native-watcher unavailability,
+failure or budget exhaustion use periodic full reconciliation as their update
+mechanism, not a redundant native safety pass. They wait `--poll-interval`
+seconds after completion (default 120). `--no-watch` disables both automatic
+update mechanisms but not initial verification or explicit refresh. Legacy v1
+and ordinary-server policies are unchanged.
+
+`hello` advertises `event-driven-native-reconciliation`. Online `views.status`
+and ordinary `status` expose the effective `watch_mode`, `watch_fallback` and
+`reconciliation_policy`. It reports `native_periodic_full_verification: false`,
+`native_missed_changes: "may-remain-stale-indefinitely"`,
+`incremental_coverage: "unavailable"` and `change_journal: "not-integrated"`.
+`periodic_full_verification` is true only for an effectively polling view;
+`interval_ms` is then its active interval and `full_verification_reason` is
+`"polling-update-mechanism"`. Both fields are null otherwise. The configured
+`poll_interval_ms` remains visible even when no periodic work is enabled;
+`configured_watch_mode` is `auto`, `poll` or `disabled`.
+
+Online `namespace.status` and `maintenance.status` distinguish configuration
+from effective per-view behavior: the same policy has
+`scope: "monitored-views"` plus `native_views`, `polling_views` and `disabled_views`
+counts. Its `periodic_full_verification` means at least one monitored view is
+polling, not that all views have a safety timer. A namespace configured as
+`auto` can contain both healthy native views and fallback-polling views. With
+no polling monitors its active interval/reason are null, even if polling is
+configured for future views. Repair triggers include `poll-interval` only when
+polling is active. Use explicit refresh or `--no-index` when watcher-dependent
+freshness is insufficient.
 
 `views.adaptive` takes `view`, `owner`, `expected_version`, `allocation_version`
 in an operation envelope. Adaptive policy evaluates the worktree's captured

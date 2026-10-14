@@ -694,6 +694,7 @@ enum Command {
         watch_mode: serve::WatchMode,
 
         /// Seconds to wait after a polling reconciliation completes (1-86400).
+        /// Managed v2 uses this only for polling views, not healthy native watchers.
         #[arg(
             long,
             default_value_t = 120,
@@ -1894,6 +1895,23 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn managed_poll_interval_help_distinguishes_native_watchers() {
+        let help = parse(&["serve", "--help"]).err().expect("serve help");
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = help.to_string();
+        assert!(
+            help.contains("Seconds to wait after a polling reconciliation completes"),
+            "{help}"
+        );
+        assert!(
+            help.contains(
+                "Managed v2 uses this only for polling views, not healthy native watchers"
+            ),
+            "{help}"
+        );
     }
 
     #[test]

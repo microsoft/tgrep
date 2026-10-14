@@ -109,7 +109,8 @@ fn hello(namespace: &Namespace) -> Result<Value> {
             "instance-owner-guards","catalog-pages","reference-aware-collection",
             "versioned-allocations","bound-checkpoints","offline-maintenance","stop-if-idle",
             "bounded-storage-inventory","namespace-discovery","maintenance-diagnostics",
-            "private-rpc-authentication","bounded-reconciliation","reconciliation-phase-metrics"
+            "private-rpc-authentication","bounded-reconciliation","reconciliation-phase-metrics",
+            "event-driven-native-reconciliation"
         ],
         "profile":IndexingProfile::default(),
         "policy":namespace.policy()?,"allocation":namespace.allocation()?,
@@ -326,17 +327,37 @@ struct WatchSettings {
 }
 
 impl WatchSettings {
-    fn reconciliation_status(&self) -> Value {
+    fn polling(&self, monitor: &Monitor) -> bool {
+        !self.no_watch
+            && (matches!(self.mode, crate::serve::WatchMode::Poll)
+                || monitor.watcher.is_none()
+                || monitor.fallback.is_some())
+    }
+
+    fn reconciliation_status(&self, polling: bool) -> Value {
+        let mut triggers = vec![
+            "first-attachment-or-restore",
+            "explicit-full-refresh",
+            "candidate-read-error",
+        ];
+        if !self.no_watch {
+            triggers.extend(["watcher-error-or-overflow", "git-or-ignore-change"]);
+        }
+        if polling {
+            triggers.push("poll-interval");
+        }
         json!({
-            "periodic_full_verification": !self.no_watch,
-            "interval_ms": self.interval.as_millis(),
+            "configured_watch_mode": if self.no_watch { "disabled" }
+                else if matches!(self.mode, crate::serve::WatchMode::Poll) { "poll" } else { "auto" },
+            "native_periodic_full_verification": false,
+            "periodic_full_verification": polling,
+            "interval_ms": polling.then_some(self.interval.as_millis()),
+            "poll_interval_ms": self.interval.as_millis(),
             "incremental_coverage": "unavailable",
             "change_journal": "not-integrated",
-            "full_verification_reason": "no-trusted-change-coverage",
-            "full_repair_triggers": [
-                "first-attachment-or-restore", "explicit-full-refresh",
-                "watcher-error-or-overflow", "git-or-ignore-change", "periodic-fallback"
-            ]
+            "native_missed_changes": "may-remain-stale-indefinitely",
+            "full_verification_reason": polling.then_some("polling-update-mechanism"),
+            "full_repair_triggers": triggers
         })
     }
 }
@@ -721,6 +742,59 @@ fn sync_monitor(
 }
 
 impl State {
+    fn watch_status(&self, view: &Id) -> Result<Value> {
+        let monitor = self
+            .monitors
+            .lock()
+            .map_err(|_| Error::corrupt("monitor registry poisoned"))?
+            .get(view)
+            .cloned();
+        let monitor = monitor
+            .as_ref()
+            .map(|monitor| {
+                monitor
+                    .lock()
+                    .map_err(|_| Error::corrupt("monitor poisoned"))
+            })
+            .transpose()?;
+        let polling = monitor
+            .as_ref()
+            .is_some_and(|monitor| self.watches.polling(monitor));
+        Ok(json!({
+            "watch_mode": if self.watches.no_watch { "disabled" }
+                else if polling { "poll" }
+                else if monitor.is_some() { "native" } else { "unavailable" },
+            "watch_fallback": monitor.as_ref().and_then(|monitor| monitor.fallback.as_ref()),
+            "reconciliation_policy": self.watches.reconciliation_status(polling)
+        }))
+    }
+
+    fn namespace_reconciliation_status(&self) -> Result<Value> {
+        let monitors = self
+            .monitors
+            .lock()
+            .map_err(|_| Error::corrupt("monitor registry poisoned"))?;
+        let (mut native, mut polling, mut disabled) = (0_usize, 0_usize, 0_usize);
+        for monitor in monitors.values() {
+            let monitor = monitor
+                .lock()
+                .map_err(|_| Error::corrupt("monitor poisoned"))?;
+            if self.watches.no_watch {
+                disabled += 1;
+            } else if self.watches.polling(&monitor) {
+                polling += 1;
+            } else {
+                native += 1;
+            }
+        }
+        let mut status = self.watches.reconciliation_status(polling != 0);
+        status["scope"] = json!("monitored-views");
+        status["native_views"] = json!(native);
+        status["polling_views"] = json!(polling);
+        status["disabled_views"] = json!(disabled);
+        Ok(status)
+    }
+
     fn legacy_registration(&self) -> super::protocol::Registration {
         super::protocol::Registration {
             protocol: 1,
@@ -998,6 +1072,41 @@ impl State {
     fn lifecycle_inner(&self, request: &Request) -> Result<Value> {
         match request.method.as_str() {
             #[cfg(feature = "managed-test-hooks")]
+            "testing.reconcile-timer" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Input {
+                    view: Id,
+                    elapsed_ms: u64,
+                }
+                let input: Input = decode(request.params.clone())?;
+                if input.elapsed_ms > 86_400_000 {
+                    return Err(Error::invalid("test timer exceeds one day").into());
+                }
+                let slot = self.views.slot(&input.view)?;
+                let monitor = self
+                    .monitors
+                    .lock()
+                    .map_err(|_| Error::corrupt("monitor registry poisoned"))?
+                    .get(&input.view)
+                    .cloned()
+                    .ok_or_else(|| Error::invalid("view has no monitor"))?;
+                {
+                    let mut monitor = monitor
+                        .lock()
+                        .map_err(|_| Error::corrupt("monitor poisoned"))?;
+                    let now = Instant::now();
+                    monitor.last_reconcile = now
+                        .checked_sub(Duration::from_millis(input.elapsed_ms))
+                        .ok_or_else(|| Error::invalid("test timer is out of range"))?;
+                    monitor.last_schedule = now
+                        .checked_sub(Duration::from_secs(30))
+                        .ok_or_else(|| Error::invalid("test retry timer is out of range"))?;
+                }
+                self.schedule_view(&slot)?;
+                Ok(json!({"input_epoch":slot.input_epoch()}))
+            }
+            #[cfg(feature = "managed-test-hooks")]
             "testing.watch-event" => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "kebab-case")]
@@ -1068,11 +1177,12 @@ impl State {
                     .recover(&decode::<ObjectId>(request.params.clone())?.id)?,
             )?),
             "views.status" => {
-                let mut status = serde_json::to_value(
-                    self.views
-                        .status(&decode::<ObjectId>(request.params.clone())?.id)?,
-                )?;
-                status["reconciliation_policy"] = self.watches.reconciliation_status();
+                let id = decode::<ObjectId>(request.params.clone())?.id;
+                let mut status = serde_json::to_value(self.views.status(&id)?)?;
+                let watch = self.watch_status(&id)?;
+                for field in ["watch_mode", "watch_fallback", "reconciliation_policy"] {
+                    status[field] = watch[field].clone();
+                }
                 Ok(status)
             }
             "views.detach" => {
@@ -1197,7 +1307,7 @@ impl State {
                         .map_err(|error| error.committed(managed::CommitState::Committed))?;
                 }
                 if matches!(method, "namespace.status" | "maintenance.status") {
-                    result["reconciliation_policy"] = self.watches.reconciliation_status();
+                    result["reconciliation_policy"] = self.namespace_reconciliation_status()?;
                     result["process_memory"] = process_memory();
                     result["scheduler"] = self
                         .scheduler_snapshot
@@ -1241,26 +1351,13 @@ impl State {
                 return Err(Error::stale_version(status.authoritative.version).into());
             }
             let pin = status.authoritative.pin()?;
-            let monitor = self
-                .monitors
-                .lock()
-                .map_err(|_| Error::corrupt("monitor registry poisoned"))?
-                .get(slot.id())
-                .cloned();
-            let monitor = monitor
-                .as_ref()
-                .map(|monitor| {
-                    monitor
-                        .lock()
-                        .map_err(|_| Error::corrupt("monitor poisoned"))
-                })
-                .transpose()?;
+            let watch = self.watch_status(slot.id())?;
             return Ok(json!({
                 "root":slot.root(),"view":slot.id(),"generation":pin.key,"version":status.authoritative.version,
                 "ready":status.ready,"epoch":status.input_epoch,"backend":"shared-v2","status":status,
-                "watch_mode":if self.watches.no_watch { "disabled" } else if monitor.as_ref().is_some_and(|monitor| monitor.watcher.is_some()) { "native" } else { "poll" },
-                "watch_fallback":monitor.as_ref().and_then(|monitor| monitor.fallback.as_ref()),
-                "reconciliation_policy":self.watches.reconciliation_status(),
+                "watch_mode":watch["watch_mode"],
+                "watch_fallback":watch["watch_fallback"],
+                "reconciliation_policy":watch["reconciliation_policy"],
                 "policy":self.namespace.policy()?,"usage":self.namespace.work_usage()?,
                 "adaptive":self.views.last_adaptive(slot.id())?,
                 "adaptive_error":self.views.last_adaptive_error(slot.id())?,
@@ -1430,8 +1527,8 @@ impl State {
         }
         let retry = Duration::from_millis(200_u64.saturating_mul(1_u64 << monitor.failures.min(7)));
         let elapsed = monitor.last_schedule.elapsed();
-        let periodic =
-            !self.watches.no_watch && monitor.last_reconcile.elapsed() >= self.watches.interval;
+        let periodic = self.watches.polling(&monitor)
+            && monitor.last_reconcile.elapsed() >= self.watches.interval;
         if (!status.ready || periodic) && elapsed >= retry {
             monitor.last_schedule = Instant::now();
             drop(monitor);

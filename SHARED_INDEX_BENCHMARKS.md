@@ -3,14 +3,149 @@
 [`scripts/benchmark_shared.py`](scripts/benchmark_shared.py) compares **one ordinary
 server and index per worktree** against **one repository daemon with private
 views**. This is separate from the [large-repository search benchmarks](BENCHMARKS.md).
-The historical measurements below cover legacy v1 sharing, not managed
-migration/collection or runtime integration. The separate
+The historical [v1 baseline](#measured-baseline-6-october-2026) covers legacy
+sharing, not managed migration/collection or runtime integration. The separate
 [managed lifecycle protocol](#managed-lifecycle-measurements) qualifies the
 new lifecycle without relabeling these baseline results.
 
 V1 is deprecated as of tgrep 1.2.1 but remains supported; new integrations should
 use [managed v2](README.md#managed-shared-lifecycle-opt-in). The historical v1
 measurements and their pinned controls remain unchanged.
+
+## Large-checkout reconciliation: RC2
+
+**A fresh managed attachment to an already published base took 186.144 seconds
+versus 542.469 seconds for a same-version standalone full build: a 2.914x
+speedup, or 65.69% less wall time, without skipping content verification.**
+This is one ordered pair on Windows/ReFS, not a latency distribution, a
+cold-generation build comparison or a query-speed measurement.
+
+| Operation | Wall seconds |
+| --- | ---: |
+| Standalone full build | 542.469240 |
+| Fresh warm-base attachment, including ready confirmation | 186.144162 |
+| Terminal receipt, within that attachment interval | 185.945503 |
+
+Both operations used the same immutable `tgrep 1.2.1` release executable, without
+test hooks. The compatible persisted base was originally published by RC1
+(`1.2.0`); it was not rebuilt for RC2. The measured worktree had never been
+attached and did not restore an old checkpoint. RC1's failed performance result
+remains a separate diagnostic, not the baseline in this comparison.
+
+| Provenance | Value |
+| --- | --- |
+| Measured source | [`58fdda83495ad9480ebafd3dad44d181039b5023`](https://github.com/microsoft/tgrep/commit/58fdda83495ad9480ebafd3dad44d181039b5023) |
+| Executable SHA-256 | `EED824A543C1160569AC7FC8AD3F57925301817ACF79EA181FA3E540920EDE49` |
+| Harness SHA-256 | `D271BBCE315C6F53D47FB98F7E8628CA940E0B51F55C28EDC8EECA2FA4C18F5B` |
+| Compiler | `rustc 1.98.0 (88d9e12ae 2026-08-18)` |
+| Host | Windows/ReFS, 16 logical CPUs |
+| Exact-source qualification | [CI run 38500502076](https://github.com/microsoft/tgrep/actions/runs/38500502076), all nine jobs passed |
+
+Standalone ran first; the file cache was **not flushed**. Implementation
+builds/tests were paused during measurement, but this was not an exclusive
+host. Native watching was disabled to isolate initial attachment. These
+conditions do not establish a cold-file-cache speedup or performance on another
+machine, filesystem or checkout.
+
+### Verification and effective limits
+
+The generation receipt confirmed `reused_generation=true`, `published=false`
+and `blobs_read=0`. Reconciliation nevertheless performed **293,288 full file
+reads totaling 6,894,175,823 input bytes**, with zero content reads avoided.
+It reused 287,319 base files and extracted one file. These are logical input
+bytes, not physical device I/O.
+
+All 293,287 listed paths agreed. Content probes agreed across the standalone
+local index, managed view and `--no-index`: the public pattern
+`Newtonsoft.Json` matched 9,576 files in each mode, while the absent sentinel
+matched none. Owned helpers shut down cleanly and the original checkout was
+preserved.
+
+The effective policy and allocation capacities were checked, not increased:
+
+| Limit | Effective value |
+| --- | ---: |
+| Namespace operation workers / allocation work slots | 1 / 1 |
+| Private-work / staging limits | 8 GiB / 8 GiB |
+| Metadata / sort-buffer limit | 4 GiB / 16 MiB |
+| Blob limit | 67,108,865 bytes |
+| Operation timeout | 10,800,000 ms |
+| Storage allocation / retention target | 32 GiB / 16 GiB |
+
+Allocation version 3 was a valid versioned update of those existing capacities,
+not a limit increase. Intra-attachment verification used up to 16 shared compute
+credits while the namespace still admitted only one operation.
+
+### Native phase and resource measurements
+
+Times below are **seconds**, converted from receipt microseconds. Main phase
+intervals are distinct; queueing and admitted lifetime are separate summaries.
+See the [metric definitions](SHARED_WORKTREE_INDEXES.md#bounded-managed-reconciliation).
+
+| Main wall phase | Seconds |
+| --- | ---: |
+| Base materialization | 13.157244 |
+| Discovery | 7.329610 |
+| Planning | 0.545797 |
+| Content verification | 142.381160 |
+| Assembly | 21.194228 |
+| Checkpoint publication | 0.379539 |
+| Publication preparation | 0.018758 |
+
+Queueing took 0.343000 seconds and the admitted lifetime was 185.115304 seconds.
+The main phases total 185.006336 seconds, leaving 0.108968 seconds of admitted
+orchestration outside those phase samples. End-to-end readiness exceeds queue
+plus admitted time by another 0.685858 seconds. That remainder mixes client
+startup/polling with native work outside receipt sampling. Final commit/fsync,
+receipt delivery, registration and producer teardown have no individual timers;
+the remainder is **not a pure fsync measurement**.
+End-to-end readiness, rather than a sum of sampled phases, is the acceptance
+measurement.
+
+The following diagnostics **overlap** the main phases and each other. Worker
+totals and some admission waits aggregate parallel intervals; parent verification records
+wall intervals within content verification and assembly. Namespace catalog
+time includes other namespace accesses, including polling. None should be
+added to the main phase table.
+
+| Overlapping diagnostic | Seconds |
+| --- | ---: |
+| Operation catalog/control | 10.854187 |
+| Namespace catalog aggregate | 55.462965 |
+| Batch-end/final parent verification | 46.616789 |
+| Worker content aggregate | 753.957036 |
+| Worker parent initialization/access aggregate | 251.480929 |
+| Worker secure-open aggregate | 214.592417 |
+| Worker read/verify aggregate | 251.655375 |
+| Worker decode/hash aggregate | 14.633635 |
+| Worker compare/extract aggregate | 1.451950 |
+| Compute-admission wait | 1.766779 |
+| Parent-admission wait aggregate | 59.682619 |
+| Input-admission wait aggregate | 8.871141 |
+
+The largest worker subphase totals remain secure parent/open/read work, not
+postings extraction. The run completed 6,741 batches and 42,605 parent batches
+with zero serial retries. It recorded 1,565 control checks and 20,041 namespace
+catalog accesses.
+
+| Accounting peak | Observed charge |
+| --- | ---: |
+| Compute credits | 16 |
+| Parent-handle credits | 256 |
+| Input charge | 402,718,726 bytes |
+| Private charge | 2,747,155,386 bytes |
+
+These peaks are **admitted accounting**, not sampled CPU utilization, RSS or
+operating-system descriptor counts. The 402,718,726-byte input peak is a
+serialized oversized input charged for six 67,108,865-byte buffers plus
+65,536 bytes of scratch; it does not enlarge the 64 MiB concurrent-input gate.
+Private charges remained within the unchanged 8 GiB private-work limit.
+
+**Recurring full-reconciliation elimination is not implemented.** The normal
+120-second full-repair fallback remains when trusted change coverage is absent;
+clean Git status never substitutes for verified checkout bytes. The benchmark's
+disabled watcher isolates initial attachment and does not demonstrate an idle
+maintenance improvement or authorize changing the default repair interval.
 
 ## Managed lifecycle measurements
 

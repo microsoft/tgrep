@@ -956,6 +956,10 @@ Namespace operation-worker limits do not need to be raised. Exact checkout bytes
 identity checks, cancellation and final readiness gates are preserved; clean Git
 status never replaces first-attachment verification. Receipts and status expose
 [phase timings and resource counters](SHARED_WORKTREE_INDEXES.md#bounded-managed-reconciliation).
+A [same-binary Windows/ReFS measurement](SHARED_INDEX_BENCHMARKS.md#large-checkout-reconciliation-rc2)
+completed a fresh warm-base attachment in 186.144 seconds versus 542.469 seconds
+for a standalone full build (2.914x), while still reading every required file.
+That result is one ordered pair without a file-cache flush, not a universal speedup.
 This initial-pipeline optimization does **not** eliminate recurring full repair:
 without trustworthy change coverage, the existing 120-second fallback remains.
 `reconciliation_policy` in status reports that limitation and the configured

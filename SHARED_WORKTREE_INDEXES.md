@@ -1090,6 +1090,11 @@ read/extraction/reuse counters. Those file counters describe completed batch
 evidence; when `batch_retries` is nonzero, timing fields also include discarded
 parallel attempts.
 
+The [RC2 large-checkout measurement](SHARED_INDEX_BENCHMARKS.md#large-checkout-reconciliation-rc2)
+records a same-binary standalone/attachment comparison, the native phase and
+resource counters, and the unattributed orchestration/readiness remainders.
+It qualifies initial warm-base attachment, not elimination of recurring full repair.
+
 ## Managed client contract
 
 Use `tgrep shared manage ROOT METHOD --params JSON`. It discovers and validates

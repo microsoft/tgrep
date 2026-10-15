@@ -36,10 +36,10 @@ cargo build --release
 
 After the version bump is merged and CI passes, open **Actions > Release >
 Run workflow**, select **main**, and enter the tag matching the workspace
-version in `Cargo.toml`, for example `v1.2.1`. The equivalent CLI command is:
+version in `Cargo.toml`, for example `v1.2.2`. The equivalent CLI command is:
 
 ```bash
-gh workflow run release.yml --repo microsoft/tgrep --ref main -f tag=v1.2.1
+gh workflow run release.yml --repo microsoft/tgrep --ref main -f tag=v1.2.2
 ```
 
 The workflow validates the version, creates a missing tag at the exact commit

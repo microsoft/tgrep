@@ -2386,6 +2386,71 @@ fn retained_checkpoints_release_independent_edges_and_stale_preview_cannot_autho
 #[test]
 #[cfg(windows)]
 fn native_sharing_and_mapping_failures_stay_pending_without_false_reclaimed_bytes() {
+    assert_native_sharing_collection(|fixture| collect(fixture, None));
+}
+
+#[test]
+#[cfg(all(windows, feature = "managed-test-hooks"))]
+fn native_sharing_recovery_resumes_a_deadline_limited_collection_pass() {
+    use std::time::{Duration, Instant};
+    use tgrep_core::managed::faults::{Action, Point, Specification, Stage};
+
+    assert_native_sharing_collection(|fixture| {
+        let namespace = Arc::clone(&fixture.namespace);
+        let duration = namespace
+            .policy()
+            .unwrap()
+            .policy
+            .collection
+            .max_duration_ms;
+        let hook = namespace
+            .install_test_fault(Specification {
+                point: Point::MemberVerificationPage,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 30_000 },
+            })
+            .unwrap();
+        let resumed = std::thread::scope(|scope| {
+            let release = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while namespace.test_fault_status().unwrap().unwrap().stage != Stage::Waiting {
+                    if Instant::now() >= deadline {
+                        namespace.release_test_fault(&hook.ticket).unwrap();
+                        panic!("collection verification barrier was not reached");
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                std::thread::sleep(Duration::from_millis(duration));
+                namespace.release_test_fault(&hook.ticket).unwrap();
+            });
+            let resumed = collect(fixture, None);
+            release.join().unwrap();
+            resumed
+        });
+        assert_eq!(resumed.errors, 0, "{resumed:?}");
+        assert_eq!(resumed.skipped, 0, "{resumed:?}");
+        assert_eq!(resumed.removed, 0, "{resumed:?}");
+        assert_eq!(resumed.logical_bytes_reclaimed, 0, "{resumed:?}");
+        assert_eq!(resumed.elapsed_budget_exceeded, Some(true), "{resumed:?}");
+        assert!(resumed.verification_context_retained, "{resumed:?}");
+        assert!(resumed.next.is_some(), "{resumed:?}");
+        assert!(
+            namespace
+                .work_usage()
+                .unwrap()
+                .memory
+                .retained_private_estimate_bytes
+                > 0
+        );
+        resumed
+    });
+}
+
+#[cfg(windows)]
+fn assert_native_sharing_collection(
+    resume: impl FnOnce(&mut Fixture) -> tgrep_core::managed::CollectionProgress,
+) {
     use std::os::windows::fs::OpenOptionsExt;
     use tgrep_core::managed::ObjectState;
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
@@ -2440,6 +2505,10 @@ fn native_sharing_and_mapping_failures_stay_pending_without_false_reclaimed_byte
         blocked.logical_bytes_reclaimed + blocked.recovered_logical_bytes,
         0
     );
+    assert_eq!(
+        blocked.allocated_bytes_reclaimed + blocked.recovered_allocated_bytes,
+        0
+    );
     let error = blocked
         .details
         .iter()
@@ -2453,17 +2522,60 @@ fn native_sharing_and_mapping_failures_stay_pending_without_false_reclaimed_byte
     );
     drop(mapping);
     drop(files);
-    let resumed = collect(&mut fixture, None);
-    assert_eq!(resumed.errors, 0, "{resumed:?}");
+    let mut resumed = resume(&mut fixture);
+    let bounds = fixture.namespace.policy().unwrap().policy.collection;
+    let mut reclaimed = 0;
+    for pass in 0..16 {
+        assert_eq!(resumed.errors, 0, "{resumed:?}");
+        assert_eq!(resumed.skipped, 0, "{resumed:?}");
+        assert!(!resumed.cancelled, "{resumed:?}");
+        reclaimed += resumed.logical_bytes_reclaimed + resumed.recovered_logical_bytes;
+        let remaining = fixture.namespace.object(&id).unwrap();
+        assert_eq!(
+            reclaimed + remaining.logical_bytes,
+            record.logical_bytes,
+            "{resumed:?}"
+        );
+        if remaining.state == ObjectState::Removed {
+            break;
+        }
+        assert_eq!(remaining.state, ObjectState::PendingDeletion, "{resumed:?}");
+        // Resume only a reported bounded continuation, not an unexplained
+        // pending object or a repeated native sharing error.
+        assert!(
+            resumed.elapsed_budget_exceeded == Some(true)
+                || resumed.pages == bounds.max_pages
+                || resumed.verification_bytes >= bounds.max_delete_bytes
+                || resumed.logical_bytes_reclaimed == bounds.max_delete_bytes
+                || resumed.examined == bounds.max_examined
+                || resumed.removed == bounds.max_removed,
+            "{resumed:?}"
+        );
+        let cursor = resumed.next.clone().expect("bounded pass needs a cursor");
+        assert!(
+            cursor.current.as_ref() == Some(&id)
+                || (resumed.examined == 0 && cursor.current.is_none()),
+            "{resumed:?}"
+        );
+        assert!(
+            pass < 15,
+            "collection continuations did not finish: {resumed:?}"
+        );
+        resumed = collect(&mut fixture, Some(cursor));
+    }
     assert_eq!(
         fixture.namespace.object(&id).unwrap().state,
-        ObjectState::Removed
+        ObjectState::Removed,
+        "blocked={blocked:#?}; resumed={resumed:#?}; object={:#?}; memory={:#?}; bounds={:#?}",
+        fixture.namespace.object(&id).unwrap(),
+        fixture.namespace.work_usage().unwrap().memory,
+        fixture.namespace.policy().unwrap().policy.collection,
     );
-    assert_eq!(
-        resumed.logical_bytes_reclaimed + resumed.recovered_logical_bytes,
-        record.logical_bytes
-    );
+    assert_eq!(reclaimed, record.logical_bytes);
     assert!(!directory.exists());
+    let memory = fixture.namespace.work_usage().unwrap().memory;
+    assert_eq!(memory.retained_private_estimate_bytes, 0, "{memory:?}");
+    assert_eq!(memory.mapped_bytes, 0, "{memory:?}");
 }
 
 #[test]

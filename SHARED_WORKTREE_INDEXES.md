@@ -1325,6 +1325,13 @@ inputs, not every concurrent filesystem write. Native/poll watching and full
 repair use the same reconciliation path. Git metadata events use the most
 specific matching metadata root, including a linked worktree's private Git
 directory nested under the common directory; lock-file traffic is ignored.
+Readiness is a snapshot, not a notification-drain barrier: a later event can
+advance the input epoch and make the next query return `busy` /
+`view-input-pending`. Epoch advancement alone also need not acknowledge a
+particular write. To qualify a change, verify its expected content through a
+managed response (`backend: shared-v2`, `ready: true`), including empty results.
+Bound retries of known retryable invalidations; never count a CLI fallback scan
+as indexed success.
 `--no-index` remains the way to search
 current disk bytes without relying on watcher delivery.
 
@@ -1567,6 +1574,11 @@ include protected/unknown/retry reasons. Passes bound examined objects, successf
 removals, deletion bytes, pages and elapsed work, including partial-file
 continuations. In-flight OS calls may overrun a deadline; progress reports
 elapsed time and budget exhaustion rather than claiming hard real-time preemption.
+A pass with no errors can therefore leave an object `PendingDeletion` after
+consuming a bound, even after a conflicting native handle has closed. Preserve
+its actual and recovered credits and continue from the returned cursor with a
+fresh operation token and current policy/allocation versions. Require the final
+`Removed` state and complete accounting before claiming the object was reclaimed.
 
 ```bash
 tgrep shared discover /trusted/cache

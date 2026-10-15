@@ -59,6 +59,111 @@ fn matches(daemon: &Daemon, view: &Value, pattern: &str) -> Vec<Value> {
 }
 
 #[test]
+#[cfg(feature = "managed-test-hooks")]
+fn parity_rejects_invalidation_after_an_earlier_ready_snapshot() {
+    for files in [true, false] {
+        let fixture = Fixture::new();
+        let pattern = "native_ready_snapshot_only";
+        fs::create_dir(fixture.b.join("ignored")).unwrap();
+        fs::write(
+            fixture.b.join("ignored").join("marker.txt"),
+            format!("shared_term {pattern}\n"),
+        )
+        .unwrap();
+        let mut configured = policy();
+        configured["work"]["max_views"] = json!(32);
+        configured["work"]["workers"] = json!(1);
+        let mut daemon = start(&fixture, &configured, &[]);
+        let (claim, guard) = owner(&daemon);
+        let mut input = attach_input(&fixture, &claim);
+        input["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
+        completed(&daemon, &daemon.rpc("views.attach", input));
+        let view = daemon.rpc(
+            "lookup",
+            json!({"root":fs::canonicalize(&fixture.b).unwrap()}),
+        );
+        let ready = native_ready(&daemon, &view, None);
+        assert_eq!(matches(&daemon, &view, pattern).len(), 1);
+        assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
+
+        let (_, common) = tgrep_core::git_index::read_repository_dirs(&fixture.b).unwrap();
+        let hook = faults::pause(&daemon, "view-before-commit");
+        let args = if files {
+            vec!["--files", "--glob", "!**/.git/**", "."]
+        } else {
+            vec!["--stats", "--json", "-F", "--", pattern, "."]
+        };
+        let mut invocations = 0;
+        let indexed = managed_cli(&daemon, &view, || {
+            invocations += 1;
+            if invocations == 1 {
+                // Deliver a real ignore event after the caller's ready snapshot.
+                fs::write(common.join("info").join("exclude"), "ignored/\n").unwrap();
+                faults::reached(&daemon, &hook);
+                let pending = daemon.rpc("views.status", json!({"id":view["view"]}));
+                assert_eq!(pending["ready"], false, "{pending}");
+                assert_eq!(pending["watch_mode"], "native", "{pending}");
+                assert!(pending["watch_fallback"].is_null(), "{pending}");
+                assert!(epoch(&pending) > epoch(&ready), "{pending}");
+                eprintln!(
+                    "late invalidation control: {}",
+                    json!({"files":files,"ready_epoch":epoch(&ready),
+                        "pending_epoch":epoch(&pending),"pending_ready":pending["ready"]})
+                );
+            }
+            let output = runtime::output(
+                Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+                    .current_dir(&fixture.b)
+                    .env("HOME", fixture.temp.path())
+                    .env("USERPROFILE", fixture.temp.path())
+                    .env("XDG_CONFIG_HOME", fixture.temp.path())
+                    .args(&args),
+            );
+            if invocations == 1 {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("view-input-pending"), "{output:?}");
+                assert!(stderr.contains("scanning filesystem"), "{output:?}");
+                assert!(!stderr.contains("(via shared daemon v2)"), "{output:?}");
+                daemon.rpc("testing.release", json!({"id":hook["ticket"]}));
+            }
+            output
+        });
+        if files {
+            assert!(indexed.stderr.is_empty(), "{indexed:?}");
+            let paths = success(indexed);
+            assert!(!paths.contains("marker.txt"), "{paths}");
+        } else {
+            assert!(
+                String::from_utf8_lossy(&indexed.stderr).contains("(via shared daemon v2)"),
+                "{indexed:?}"
+            );
+            assert_eq!(indexed.status.code(), Some(1), "{indexed:?}");
+            let rows: Vec<Value> = std::str::from_utf8(&indexed.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert!(rows.iter().all(|row| row["type"] != "match"), "{rows:?}");
+            let summary = rows.iter().find(|row| row["type"] == "summary").unwrap();
+            assert_eq!(summary["data"]["stats"]["matches"], 0, "{summary}");
+        }
+        assert!(invocations >= 2, "fallback output was not discarded");
+        assert!(matches(&daemon, &view, pattern).is_empty());
+        assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
+        native_ready(&daemon, &view, Some(epoch(&ready)));
+        daemon.rpc(
+            "views.detach",
+            json!({"owner":claim.owner,"lease":"managed-client"}),
+        );
+        daemon.rpc("owners.release", json!({"claim":claim}));
+        drop(guard);
+        stop(&mut daemon);
+        drop(daemon);
+        fixture.temp.close().unwrap();
+    }
+}
+
+#[test]
 fn native_subscriptions_cover_nested_worktree_changes_with_default_budgets() {
     let mut fixture = Fixture::new();
     let recursive = cfg!(any(windows, target_os = "macos"));

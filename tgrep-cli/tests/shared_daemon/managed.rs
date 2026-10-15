@@ -731,6 +731,38 @@ fn retry_busy_response(daemon: &Daemon, method: &str, params: Value) -> Value {
     }
 }
 
+fn managed_cli(daemon: &Daemon, view: &Value, mut invoke: impl FnMut() -> Output) -> Output {
+    let started = Instant::now();
+    let mut last_fallback = None;
+    loop {
+        let before = daemon.rpc("views.status", json!({"id":view["view"]}));
+        if before["ready"] == true {
+            let output = invoke();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.lines().any(|line| {
+                line == "warning: shared view unavailable (view-input-pending: view-input-pending) - scanning filesystem (not a legacy index)"
+            }) {
+                return output;
+            }
+            assert!(matches!(output.status.code(), Some(0 | 1)), "{output:?}");
+            // A notification can close the gate after the ready snapshot.
+            // Discard this scan; only a later managed result can prove parity.
+            let after = daemon.rpc("views.status", json!({"id":view["view"]}));
+            assert!(
+                after["input_epoch"].as_u64().unwrap()
+                    > before["authoritative"]["input_epoch"].as_u64().unwrap(),
+                "fallback without a newer input epoch: before={before}, after={after}, output={output:?}"
+            );
+            last_fallback = Some(output);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "managed CLI remains unavailable: {before}; last fallback={last_fallback:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn legacy_cli(root: &Path, args: &[&str]) -> Output {
     let binary = std::env::var_os("TGREP_V1_BINARY")
         .map(PathBuf::from)
@@ -819,7 +851,7 @@ fn assert_scan_parity(daemon: &Daemon, root: &Path, home: &Path) {
             args.push("--hidden");
         }
         args.extend(["--", "shared_term", "."]);
-        let indexed = invoke(&args);
+        let indexed = managed_cli(daemon, &view, || invoke(&args));
         args.insert(0, "--no-index");
         let scan = invoke(&args);
         assert!(
@@ -833,7 +865,7 @@ fn assert_scan_parity(daemon: &Daemon, root: &Path, home: &Path) {
             args.push("--hidden");
         }
         args.push(".");
-        let indexed = invoke(&args);
+        let indexed = managed_cli(daemon, &view, || invoke(&args));
         args.insert(0, "--no-index");
         let scan = invoke(&args);
         let paths = |output: Output| {

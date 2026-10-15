@@ -429,6 +429,284 @@ mod tests {
     }
 
     #[test]
+    fn busy_idle_probe_preserves_cached_proof_for_external_work() {
+        let (temp, namespace, _object, path) =
+            authenticated_fixture(&vec![b'a'; 128 * 1024 + 17]);
+        let (request, _) = cached_prefix(&namespace, "before-busy-probe");
+        let retained = namespace
+            .work_usage()
+            .unwrap()
+            .memory
+            .retained_private_estimate_bytes;
+        let busy = namespace
+            .stop_if_idle(crate::managed::ExternalWork {
+                queries: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!busy.stopping, "{busy:?}");
+        assert!(!busy.verification_active);
+        assert!(!namespace.stop_is_committed().unwrap());
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"],
+            4096,
+            "a refused idle probe must not discard bounded collection progress"
+        );
+        assert_eq!(
+            namespace
+                .work_usage()
+                .unwrap()
+                .memory
+                .retained_private_estimate_bytes,
+            retained
+        );
+        let progress = request_pass(&namespace, &request, "after-busy-probe");
+        assert_eq!(progress.errors, 0, "{progress:?}");
+        assert_eq!(progress.verification_bytes, 4096);
+        assert_eq!(progress.verification_restarts, 0);
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"],
+            8192
+        );
+        assert!(
+            namespace
+                .stop_if_idle(Default::default())
+                .unwrap()
+                .stopping
+        );
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["state"],
+            "empty"
+        );
+        drop(File::options().write(true).open(&path).unwrap());
+        drop(namespace);
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn busy_idle_probes_preserve_staging_reclamation_and_storage_admission() {
+        use crate::managed::OwnerGuard;
+
+        const MIB: u64 = 1024 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = crate::managed::policy::fixture_policy();
+        policy.retention = crate::managed::policy::Retention::Bounded {
+            target_bytes: 8 * MIB,
+        };
+        policy.work.workers = 1;
+        policy.work.staging_bytes = 8 * MIB;
+        policy.collection.checkpoint_grace_ms = 3_600_000;
+        policy.collection.generation_grace_ms = 86_400_000;
+        policy.collection.max_duration_ms = 200;
+        policy.collection.max_pages = 16;
+        policy.collection.max_delete_bytes = 16 * MIB;
+        policy.collection.chunk_bytes = 65_536;
+        let namespace =
+            Namespace::initialize_identity(&"a".repeat(64), temp.path(), policy).unwrap();
+        namespace.activate().unwrap();
+        let mut allocation = namespace.allocation().unwrap();
+        allocation.storage_bytes = Some(16 * MIB);
+        let allocation = namespace
+            .update_allocation(allocation.version, allocation)
+            .unwrap();
+        let prepared = namespace.prepare_owner().unwrap();
+        let owner = OwnerGuard::claim(prepared.claim).unwrap();
+        namespace.register_owner(owner.registration()).unwrap();
+        let request = WorkRequest {
+            allocation_version: allocation.version,
+            staging_bytes: 8 * MIB,
+            private_bytes: 8 * MIB,
+            slots: 1,
+        };
+        let mut generations = Vec::new();
+        let mut stages = Vec::new();
+        for (index, stage_bytes) in [3 * MIB, 2 * MIB].into_iter().enumerate() {
+            let operation = namespace
+                .accept_system_operation(
+                    Token::parse(format!("spill-build-{index}")).unwrap(),
+                    "build",
+                    serde_json::json!({}),
+                )
+                .unwrap();
+            let permit = namespace
+                .reserve(
+                    &operation.id,
+                    Some(&owner.registration().owner),
+                    request.clone(),
+                )
+                .unwrap();
+            for (kind, bytes) in [
+                (ObjectKind::Generation, 2 * MIB),
+                (ObjectKind::BuildStage, stage_bytes),
+            ] {
+                let (object, pin) = namespace.create_object(kind, None, &permit).unwrap();
+                let mut writer = crate::managed::work::ChargedWriter::new(
+                    Arc::clone(&pin),
+                    "payload.bin",
+                    Arc::clone(&permit),
+                )
+                .unwrap();
+                writer.write_all(&vec![b'a'; bytes as usize]).unwrap();
+                writer.sync_all().unwrap();
+                drop(writer);
+                if kind == ObjectKind::Generation {
+                    namespace.publish_object(&object.id, None, None).unwrap();
+                    generations.push(pin);
+                } else {
+                    stages.push(object.id);
+                }
+            }
+            drop(permit);
+            namespace
+                .record_operation_result(&operation.id, Ok(serde_json::json!({})), true)
+                .unwrap();
+        }
+        let before = namespace.work_usage().unwrap();
+        assert_eq!(before.reservations, 0);
+        let mut stage_bytes = 0;
+        for id in &stages {
+            let object = namespace.object(id).unwrap();
+            assert_eq!(object.state, ObjectState::Preparing);
+            assert!(namespace.eligibility(id).unwrap().eligible);
+            stage_bytes += object.logical_bytes;
+        }
+        let attachment = namespace
+            .accept_system_operation(
+                Token::parse("warm-admission").unwrap(),
+                "attach",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let error = namespace
+            .reserve(&attachment.id, None, request.clone())
+            .err()
+            .expect("retained build stages must prevent the next staging reservation");
+        assert_eq!(error.category, ErrorCategory::ResourcePressure);
+        assert_eq!(error.reason_code, "namespace-storage-allocation");
+        let mut collection = CollectionRequest {
+            policy_version: namespace.policy().unwrap().version,
+            allocation_version: allocation.version,
+            bounds: CollectionBounds {
+                max_duration_ms: 200,
+                max_examined: 1,
+                max_removed: 1,
+                max_delete_bytes: 256 * 1024,
+                max_pages: 4,
+            },
+            cursor: None,
+        };
+        let mut reclaimed = 0;
+        let mut removed = 0;
+        let mut busy_probes = 0;
+        for sequence in 0..128 {
+            let progress = request_pass(
+                &namespace,
+                &collection,
+                &format!("spill-collection-{sequence}"),
+            );
+            assert_eq!(progress.errors, 0, "{progress:?}");
+            assert!(progress.pages <= collection.bounds.max_pages);
+            assert!(progress.examined <= collection.bounds.max_examined);
+            assert!(progress.removed <= collection.bounds.max_removed);
+            assert!(progress.verification_bytes <= collection.bounds.max_delete_bytes);
+            assert!(progress.logical_bytes_reclaimed <= collection.bounds.max_delete_bytes);
+            reclaimed += progress.logical_bytes_reclaimed + progress.recovered_logical_bytes;
+            removed += progress.removed + progress.recovered_objects;
+            if progress.verification_context_retained {
+                if busy_probes == 0 {
+                    assert_eq!(
+                        namespace.object(&stages[0]).unwrap().state,
+                        ObjectState::PendingDeletion
+                    );
+                    assert_eq!(
+                        namespace.object(&stages[1]).unwrap().state,
+                        ObjectState::Preparing
+                    );
+                }
+                let prefix =
+                    namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"].clone();
+                let busy = namespace.stop_if_idle(Default::default()).unwrap();
+                assert!(!busy.stopping, "{busy:?}");
+                assert_eq!(busy.owners, 1);
+                assert!(busy.namespace_readers_or_work);
+                assert_eq!(
+                    namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"],
+                    prefix,
+                    "busy owner/reader probes must preserve the selected stage's prefix"
+                );
+                busy_probes += 1;
+            }
+            collection.cursor = progress.next;
+            if removed == 2 {
+                break;
+            }
+        }
+        assert!(busy_probes > 1);
+        assert_eq!(removed, 2, "both completed build stages must finish collection");
+        assert_eq!(reclaimed, stage_bytes);
+        assert_eq!(
+            namespace.work_usage().unwrap().object_logical_bytes,
+            before.object_logical_bytes - stage_bytes
+        );
+        for id in stages {
+            assert_eq!(namespace.object(&id).unwrap().state, ObjectState::Removed);
+            assert!(!namespace.path().join("objects").join(id.as_str()).exists());
+        }
+        let permit = namespace
+            .reserve(&attachment.id, None, request.clone())
+            .expect("reclamation must reopen admission without increasing the allocation");
+        assert_eq!(namespace.allocation().unwrap().storage_bytes, Some(16 * MIB));
+        drop(permit);
+        namespace
+            .record_operation_result(&attachment.id, Ok(serde_json::json!({})), false)
+            .unwrap();
+        for pin in &generations {
+            assert_eq!(namespace.object(&pin.id).unwrap().state, ObjectState::Published);
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut pin.directory.open_file("payload.bin", false).unwrap(),
+                &mut bytes,
+            )
+            .unwrap();
+            assert_eq!(bytes, vec![b'a'; (2 * MIB) as usize]);
+        }
+        drop(generations);
+        namespace.release_owner(owner.registration()).unwrap();
+        drop(owner);
+        assert_eq!(namespace.work_usage().unwrap().reservations, 0);
+        assert!(namespace.stop_if_idle(Default::default()).unwrap().stopping);
+        let path = namespace.path().to_path_buf();
+        let instance = namespace.instance().clone();
+        drop(namespace);
+        let restarted = Namespace::open(&path).unwrap();
+        restarted.activate().unwrap();
+        assert_ne!(*restarted.instance(), instance);
+        assert_eq!(restarted.allocation().unwrap().version, allocation.version);
+        assert_eq!(
+            restarted.work_usage().unwrap().object_logical_bytes,
+            before.object_logical_bytes - stage_bytes
+        );
+        let attachment = restarted
+            .accept_system_operation(
+                Token::parse("restarted-warm-admission").unwrap(),
+                "attach",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let permit = restarted
+            .reserve(&attachment.id, None, request)
+            .expect("reclaimed headroom must survive a native namespace restart");
+        drop(permit);
+        restarted
+            .record_operation_result(&attachment.id, Ok(serde_json::json!({})), false)
+            .unwrap();
+        assert_eq!(restarted.work_usage().unwrap().reservations, 0);
+        assert!(restarted.stop_if_idle(Default::default()).unwrap().stopping);
+        drop(restarted);
+        temp.close().unwrap();
+    }
+
+    #[test]
     fn cancellation_at_a_verified_page_discards_all_cached_proof_without_delete_credit() {
         for point in [
             Point::MemberVerificationPage,

@@ -1653,8 +1653,10 @@ authorization. Recover the retained token and exact current state.
 `stop-if-idle` first closes admission, then accounts for leases, owners,
 reservations, operations and receipt readers, independent namespace/root/object
 guards, requests, queries, queued jobs and background batches. Idle verifier
-caches are discarded while active verification remains protected by its work
-lifetime. A retained cache alone does not make a daemon permanently busy.
+caches are discarded only when those other shutdown blockers are clear; a busy
+probe preserves bounded member-verification progress until its normal expiry.
+Active verification remains protected by its work lifetime. A retained cache
+alone does not make a daemon permanently busy.
 A busy decision reopens admission; a committed stop leaves it closed before exit.
 An uncommitted lock-admission Busy error leaves the accepted token pending;
 retry that same token rather than abandoning it and consuming another queue

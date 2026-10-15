@@ -1065,8 +1065,14 @@ extraction releases temporary growth headroom, and publication releases each
 input table after consuming it. Live overlay admission accounts for hash-table
 capacities, including bucket/control storage and per-allocation padding, rather
 than accumulating a fixed allowance for every posting insertion. Table growth
-reserves both old and replacement storage before allocation; retained views and
-checkpoint capture remain charged. This allows full CRLF/smudge overlays to use
+reserves both old and replacement storage before allocation. Retained tables,
+including each posting set and its allocation bookkeeping, keep a backing-capacity
+watermark across deletions: tombstones can reduce insertion capacity without
+freeing buckets. Charges are lowered only for dropped or rebuilt storage, not
+merely because entries were removed. File replacement removes old entries from
+the unpublished overlay before admitting table growth; failures leave the
+published view unchanged. Retained views and checkpoint capture remain charged.
+This allows full CRLF/smudge overlays to use
 the existing budget without normalizing bytes, weakening masks or raising limits.
 
 Workers verify and decode/hash every required file, compare exact indexed content

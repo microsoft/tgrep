@@ -658,12 +658,12 @@ impl WorktreeView {
             if evidence.get(path).and_then(|entry| entry.content).is_none()
                 && !live.is_deleted(path)
             {
-                if let Some(memory) = &mut memory {
-                    memory
-                        .grow(path.len() as u64 * 4 + 256)
+                if let (Some(permit), Some(memory)) = (permit, &mut memory) {
+                    live.delete_file_controlled(path, permit, memory)
                         .map_err(crate::Error::from)?;
+                } else {
+                    live.delete_file(path);
                 }
-                live.delete_file(path);
             }
         }
         for (path, upsert) in upserts {

@@ -1137,6 +1137,7 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             | "vimgrep"
             | "detail"
             | "positions"
+            | "count"
             | "count_matches"
             | "ordered_filters"
             | "multiline_replace"
@@ -1444,6 +1445,20 @@ fn read_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_projection_query_fields_require_booleans() {
+        for field in ["count", "count_matches"] {
+            for value in [json!(true), json!(false)] {
+                let query = json!({"pattern":"return",field:value});
+                validate_query(&query, false).unwrap();
+                assert!(validate_query(&query, true).is_err());
+            }
+            for value in [Value::Null, json!(1), json!("true"), json!([])] {
+                assert!(validate_query(&json!({"pattern":"return",field:value}), false).is_err());
+            }
+        }
+    }
 
     #[test]
     fn response_budgets_count_escaped_rows_paths_and_serialized_envelopes() {

@@ -1138,7 +1138,8 @@ fn server_search_request(
     // match — and most searches never read them. Asking for them only when
     // something will consume them keeps a 21k-hit query from building, sending
     // and parsing 21k arrays that are then dropped.
-    // Counts consume per-file totals; the server still collects every span.
+    // An older server may ignore `count`, so retain the detail it needs for
+    // stats. New servers project counts without rendering those fields.
     let detail = !opts.count_matches && opts.wants_match_detail();
     let positions = opts.wants_position_detail();
 
@@ -1196,6 +1197,8 @@ fn server_search_request(
     // non-counting requests unchanged.
     if opts.count_matches {
         request["params"]["count_matches"] = serde_json::json!(true);
+    } else if opts.count {
+        request["params"]["count"] = serde_json::json!(true);
     }
     // The per-kind arrays above lose the order between kinds. Send the ordered
     // form only when that order changes the result.
@@ -1250,6 +1253,28 @@ fn flag_set(value: &serde_json::Value, key: &str) -> bool {
     value.get(key).and_then(|v| v.as_bool()) == Some(true)
 }
 
+fn projected_line_count(row: &serde_json::Value) -> Result<(&str, usize)> {
+    anyhow::ensure!(
+        matches!(
+            row.get("type").and_then(|t| t.as_str()),
+            Some("count" | "binary")
+        ),
+        "server mixed projected counts with match rows"
+    );
+    let file = row
+        .get("file")
+        .and_then(|f| f.as_str())
+        .context("server count is missing its file")?;
+    let count = row
+        .get("lines")
+        .and_then(|l| l.as_u64())
+        .context("server count is missing its line total")?;
+    Ok((
+        file,
+        usize::try_from(count).context("server line count exceeds platform limits")?,
+    ))
+}
+
 fn render_server_result(
     result: &serde_json::Value,
     request: &serde_json::Value,
@@ -1270,6 +1295,22 @@ fn render_server_result(
         .get("matches")
         .and_then(|m| m.as_array())
         .unwrap_or(&empty_vec);
+    let projected_counts = opts.count
+        && !opts.count_matches
+        && matches
+            .iter()
+            .any(|m| m.get("type").and_then(|t| t.as_str()) == Some("count"));
+    if projected_counts {
+        // Validate before scope/binary filtering can hide malformed rows.
+        let mut seen = std::collections::HashSet::new();
+        for row in matches {
+            let (file, _) = projected_line_count(row)?;
+            anyhow::ensure!(
+                seen.insert(file),
+                "server returned duplicate line counts for {file}"
+            );
+        }
+    }
 
     // The server scopes candidates before searching but still reports paths
     // relative to the index root. Translate those paths for output and apply
@@ -1399,9 +1440,9 @@ fn render_server_result(
             writer.write_count(file, count)?;
         }
     } else if opts.count {
-        // `-c` counts matching *lines*, so collapse rows that share a line
-        // (`-o` emits one per match) and ignore context rows. This is what the
-        // local path reports via `FileMatches::matched_lines`.
+        // New servers project `FileMatches::matched_lines` into one count row.
+        // Older servers send full rows: collapse repeated lines and ignore
+        // context, preserving their existing count semantics.
         let mut order: Vec<String> = Vec::new();
         let mut lines: std::collections::HashMap<String, std::collections::HashSet<usize>> =
             std::collections::HashMap::new();
@@ -1412,7 +1453,7 @@ fn render_server_result(
         let mut exact: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for m in matches {
             let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or("match");
-            if mtype != "match" && mtype != "binary" {
+            if mtype != "match" && mtype != "binary" && mtype != "count" {
                 continue;
             }
             let Some(file) = m.get("file").and_then(|f| f.as_str()) else {
@@ -1421,8 +1462,12 @@ fn render_server_result(
             if !lines.contains_key(file) && !exact.contains_key(file) {
                 order.push(file.to_string());
             }
-            if mtype == "binary" {
-                let n = m.get("lines").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
+            if mtype == "count" || mtype == "binary" {
+                let n = if projected_counts {
+                    projected_line_count(m)?.1
+                } else {
+                    m.get("lines").and_then(|l| l.as_u64()).unwrap_or(0) as usize
+                };
                 exact.insert(file.to_string(), n);
             } else {
                 let line = m.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
@@ -3150,14 +3195,40 @@ mod tests {
                 let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
                 assert!(request["params"].get("count_matches").is_none());
                 assert_eq!(request["params"]["detail"], opts.wants_match_detail());
+                assert_eq!(flag_set(&request["params"], "count"), opts.count);
                 opts.count_matches = true;
                 let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
                 assert_eq!(request["params"]["count_matches"], true);
+                assert!(request["params"].get("count").is_none());
                 assert_eq!(request["params"]["stats"], stats);
                 assert_eq!(request["params"]["detail"], false);
                 assert_eq!(request["params"]["positions"], opts.wants_position_detail());
                 assert!(opts.match_options().all_spans);
             }
+        }
+    }
+
+    #[test]
+    fn count_requests_line_totals_without_changing_legacy_details() {
+        for stats in [false, true] {
+            let opts = SearchOptions {
+                count: true,
+                stats,
+                column: true,
+                byte_offset: true,
+                only_matching: true,
+                context: Some(3),
+                replace: Some("replacement".into()),
+                ..Default::default()
+            };
+            let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+            assert_eq!(request["params"]["count"], true);
+            assert!(request["params"].get("count_matches").is_none());
+            assert_eq!(request["params"]["stats"], stats);
+            assert_eq!(request["params"]["detail"], true);
+            assert_eq!(request["params"]["positions"], true);
+            assert_eq!(request["params"]["before_context"], 0);
+            assert_eq!(request["params"]["after_context"], 0);
         }
     }
 

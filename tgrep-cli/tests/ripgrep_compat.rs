@@ -2393,13 +2393,18 @@ fn server_count_matches_returns_totals_without_stats() {
         format!("{}\nb\n", "a".repeat(repeats)),
     )
     .unwrap();
+    fs::write(
+        root.join("line-heavy.txt"),
+        "return return return\nmiss\n".repeat(4096),
+    )
+    .unwrap();
     let index_dir = dir.path().join("idx");
     let _server = start_passthru_server(&root, &index_dir);
     let info: serde_json::Value =
         serde_json::from_slice(&fs::read(index_dir.join("serve.json")).unwrap()).unwrap();
     let port = info["port"].as_u64().unwrap() as u16;
     for stats in [false, true] {
-        for count_matches in [false, true] {
+        for count_field in [None, Some("count"), Some("count_matches")] {
             let mut request = serde_json::json!({
                 "jsonrpc": "2.0", "method": "search", "id": 1,
                 "params": {
@@ -2407,8 +2412,8 @@ fn server_count_matches_returns_totals_without_stats() {
                     "stats": stats, "detail": false,
                 },
             });
-            if count_matches {
-                request["params"]["count_matches"] = serde_json::json!(true);
+            if let Some(field) = count_field {
+                request["params"][field] = serde_json::json!(true);
             }
             let response: serde_json::Value =
                 serde_json::from_str(&send_rpc_request(port, &request.to_string()).unwrap())
@@ -2416,9 +2421,12 @@ fn server_count_matches_returns_totals_without_stats() {
             assert!(response.get("error").is_none(), "{response}");
             let result = &response["result"];
             assert_eq!(result["hidden_complete"], true);
-            assert_eq!(result["num_matches"], 6);
+            assert_eq!(
+                result["num_matches"],
+                if count_field.is_some() { 2 } else { 6 }
+            );
             assert_eq!(result.get("index_stats").is_some(), stats);
-            if stats || count_matches {
+            if stats || count_field == Some("count_matches") {
                 let mut totals = result["file_stats"].as_array().unwrap().clone();
                 totals.sort_by_key(|s| s["file"].as_str().unwrap().to_string());
                 assert_eq!(
@@ -2435,36 +2443,58 @@ fn server_count_matches_returns_totals_without_stats() {
     }
     for engine in ["default", "pcre2"] {
         for stats in [false, true] {
-            for (pattern, multiline, matches, lines) in
-                [("a", false, repeats, 1), (r"a|\nb", true, repeats + 1, 2)]
-            {
+            for (path, pattern, multiline, matches, lines, field) in [
+                ("count-heavy.txt", "a", false, repeats, 1, "count_matches"),
+                (
+                    "count-heavy.txt",
+                    r"a|\nb",
+                    true,
+                    repeats + 1,
+                    2,
+                    "count_matches",
+                ),
+                ("line-heavy.txt", "return", false, 3 * 4096, 4096, "count"),
+                (
+                    "line-heavy.txt",
+                    "return",
+                    false,
+                    3 * 4096,
+                    4096,
+                    "count_matches",
+                ),
+            ] {
                 let request = serde_json::json!({
                     "jsonrpc": "2.0", "method": "search", "id": 1,
                     "params": {
                         "pattern": pattern, "multiline": multiline, "engine": engine,
-                        "glob": ["count-heavy.txt"], "count_matches": true,
+                        "glob": [path], field: true,
                         "stats": stats, "detail": false,
                     },
                 });
                 let raw = send_rpc_request(port, &request.to_string()).unwrap();
-                assert!(raw.len() < 40 * 1024, "count response: {} bytes", raw.len());
+                assert!(raw.len() < 4 * 1024, "count response: {} bytes", raw.len());
                 let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
                 assert!(response.get("error").is_none(), "{response}");
                 let result = &response["result"];
                 assert_eq!(result["hidden_complete"], true);
                 assert_eq!(result.get("index_stats").is_some(), stats);
-                assert_eq!(
-                    result["file_stats"],
-                    serde_json::json!([{
-                        "file":"count-heavy.txt","matches":matches,"matched_lines":lines,
-                    }])
-                );
-                let rows = result["matches"].as_array().unwrap();
-                assert_eq!(rows.len(), lines);
-                for row in rows {
-                    assert!(row.get("spans").is_none());
-                    assert!(row.get("columns").is_none());
+                if stats || field == "count_matches" {
+                    assert_eq!(
+                        result["file_stats"],
+                        serde_json::json!([{
+                            "file":path,"matches":matches,"matched_lines":lines,
+                        }])
+                    );
+                } else {
+                    assert!(result.get("file_stats").is_none());
                 }
+                let rows = result["matches"].as_array().unwrap();
+                let expected = if field == "count" {
+                    serde_json::json!({"type":"count","file":path,"lines":lines})
+                } else {
+                    serde_json::json!({"type":"match","file":path})
+                };
+                assert_eq!(rows, &[expected]);
             }
         }
     }
@@ -2503,7 +2533,7 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
         ])
         .assert()
         .success();
-    for (flag, metadata) in [
+    let mut cases: Vec<_> = [
         ("-c", None),
         ("--count-matches", None),
         ("--count-matches", Some(serde_json::json!(null))),
@@ -2529,7 +2559,27 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                 {"file":"b.txt","matches":2,"matched_lines":4},
             ])),
         ),
+    ]
+    .into_iter()
+    .map(|(flag, metadata)| (flag, metadata, None))
+    .collect();
+    for invalid in [
+        serde_json::json!({"type":"count","file":"b.txt"}),
+        serde_json::json!({"type":"count","file":"b.txt","lines":-1}),
+        serde_json::json!({"type":"count","lines":4}),
+        serde_json::json!({"type":"count","file":"a.txt","lines":4}),
+        serde_json::json!({"type":"match","file":"b.txt","line":1}),
     ] {
+        cases.push((
+            "-c",
+            None,
+            Some(vec![
+                serde_json::json!({"type":"count","file":"a.txt","lines":999}),
+                invalid,
+            ]),
+        ));
+    }
+    for (flag, metadata, projected) in cases {
         for stats in [false, true] {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -2559,16 +2609,17 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                     BufReader::new(&stream).read_line(&mut line).unwrap();
                     let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                     assert_eq!(request["params"].get("count_matches").is_some(), flag != "-c");
+                    assert_eq!(request["params"].get("count").is_some(), flag == "-c");
                     assert_eq!(request["params"]["stats"], stats);
-                    if flag == "--count-matches" {
-                        assert_eq!(request["params"]["detail"], false);
-                    }
-                    let rows: Vec<_> = [("a.txt", 2), ("b.txt", 4)]
-                        .into_iter()
-                        .flat_map(|(file, lines)| (1..=lines).map(move |line| {
-                            serde_json::json!({"file":file,"line":line,"spans":[[0,5]],"type":"match"})
-                        }))
-                        .collect();
+                    assert_eq!(request["params"]["detail"], flag == "-c" && stats);
+                    let rows = projected.clone().unwrap_or_else(|| {
+                        [("a.txt", 2), ("b.txt", 4)]
+                            .into_iter()
+                            .flat_map(|(file, lines)| (1..=lines).map(move |line| {
+                                serde_json::json!({"file":file,"line":line,"spans":[[0,5]],"type":"match"})
+                            }))
+                            .collect()
+                    });
                     let mut result = serde_json::json!({
                         "hidden_complete":true,"matches":rows,"elapsed_ms":1,
                     });
@@ -2583,6 +2634,9 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                     .args(["-U", flag, "--no-filename", "--sort", "path"]);
                 if stats {
                     cmd.arg("--stats");
+                }
+                if projected.is_some() {
+                    cmd.args(["--max-depth", "1"]);
                 }
                 let output = cmd
                     .args(["--", r"hello\nworld"])
@@ -2599,10 +2653,20 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                 "{flag} {metadata:?} stats={stats}"
             );
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if flag == "-c" {
+            if flag == "-c" && projected.is_none() {
                 assert!(!stderr.contains("falling back"), "{stderr}");
+                if stats {
+                    assert_eq!(stats_totals(&output.stderr), [(6, 6)]);
+                }
             } else {
-                assert!(stderr.contains("match totals"), "{stderr}");
+                assert!(
+                    stderr.contains(if projected.is_some() {
+                        "count"
+                    } else {
+                        "match totals"
+                    }),
+                    "{stderr}"
+                );
                 assert!(stderr.contains("falling back to local index"), "{stderr}");
                 assert!(!stderr.contains("(via server)"), "{stderr}");
                 if stats {

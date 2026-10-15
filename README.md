@@ -623,12 +623,15 @@ and JSON submatches.
 `--count-matches` counts each original regex match once, after applying `-m`,
 even when the match spans several lines. This does not depend on `--stats`;
 `-c` retains its matching-line count and `-v` counts selected non-matching lines.
-Server counts use per-file totals, not the line fragments sent for display.
-`--count-matches` requests omit unused span and column arrays from replies
-while the matcher still collects every hit.
-Older servers without count metadata support cannot answer these requests:
-unsupported requests fall back with a diagnostic, and incomplete totals are
-rejected before any counts are printed.
+Server `-c` and `--count-matches` requests return one count or path row per
+matching file, rather than transmitting every matching line, span and column.
+`--stats` still reports the original match and matched-line totals; it does not
+restore unused line detail. Counts therefore do not consume reply space
+proportional to matching content, but remain subject to the same response limit.
+Ordinary older servers that ignore `-c` projection retain line-row counting.
+Shared servers that reject the new option, and servers without metadata needed
+for `--count-matches`, fall back with a diagnostic. Malformed projected counts
+or incomplete match totals are rejected before any counts are printed.
 Without `-r`, tgrep reports columns relative to each printed line, whereas
 ripgrep repeats the starting column on continuation lines.
 

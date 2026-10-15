@@ -593,7 +593,13 @@ The `profile` is required on attach:
 
 `query` uses the existing search RPC fields built by `server_search_request`:
 pattern/extra_patterns, matcher flags, types/type_add/type_clear, globs,
-context/output-detail fields, hidden, scope and max_depth. Only default automatic
+context/output-detail fields, `count`/`count_matches`, hidden, scope and max_depth.
+`count: true` returns one `{"type":"count","file":"...","lines":N}` row per
+matching text file. `count_matches: true` returns one path row plus the original
+per-file totals. Binary markers retain their counts and client-side visibility
+filtering; `stats` still returns the original match totals without restoring
+content rows. Legacy non-counting requests keep their existing response shape.
+Only default automatic
 decoding and the 64 MiB profile are compatible. `scope` is empty or an existing
 relative directory, never a regular file; it cannot escape the root or cross a nested repository. Content reads
 use no-follow root-contained handles, never another worktree's content cache.

@@ -1321,21 +1321,35 @@ pub(super) fn search_snapshot(
         budget.charge(&index_stats)?;
         let mut rows = Vec::new();
         let mut stats = Vec::new();
-        for relative in &paths {
-            let bytes = read_candidate(source, relative)?;
-            if bytes.len() > 64 * 1024 * 1024 {
-                continue;
+        for siblings in tgrep_core::rooted::sibling_batches(&paths) {
+            let batch = (siblings.len() > 1)
+                .then(|| {
+                    candidate_snapshot(source, &siblings[0], |snapshot| {
+                        snapshot.candidate_batch(&siblings[0])
+                    })
+                })
+                .transpose()?;
+            for relative in siblings {
+                let bytes = read_candidate(source, batch.as_ref(), relative)?;
+                if bytes.len() > 64 * 1024 * 1024 {
+                    continue;
+                }
+                let decoded = crate::serve::DecodedFile::new(bytes, request.encoding);
+                let found = crate::serve::search_file_matches_bounded(
+                    relative,
+                    &decoded,
+                    &request.matcher,
+                    &request.opts,
+                    Some(&mut budget),
+                )?;
+                rows.extend(found.rows);
+                stats.extend(found.stats);
             }
-            let decoded = crate::serve::DecodedFile::new(bytes, request.encoding);
-            let found = crate::serve::search_file_matches_bounded(
-                relative,
-                &decoded,
-                &request.matcher,
-                &request.opts,
-                Some(&mut budget),
-            )?;
-            rows.extend(found.rows);
-            stats.extend(found.stats);
+            if let Some(batch) = batch
+                && let Err(error) = batch.finish()
+            {
+                return candidate_failed(source, &siblings[0], error.into());
+            }
         }
         (
             json!({
@@ -1359,26 +1373,51 @@ pub(super) fn search_snapshot(
 /// Only an open, stat or read failure of the candidate itself closes the view
 /// for full repair. Snapshot validation, deadline and cancellation failures say
 /// nothing about the file, so they propagate unchanged and leave the view ready.
-fn read_candidate(source: &impl QuerySource, relative: &str) -> Result<Vec<u8>> {
-    let failed = |error: anyhow::Error| -> Result<Vec<u8>> {
-        let error = error.context(format!("reading shared candidate {relative}"));
-        source.invalidate(&error)?;
-        Err(error)
-    };
+fn candidate_failed<T>(
+    source: &impl QuerySource,
+    relative: &str,
+    error: anyhow::Error,
+) -> Result<T> {
+    let error = error.context(format!("reading shared candidate {relative}"));
+    source.invalidate(&error)?;
+    Err(error)
+}
+
+fn candidate_snapshot<T>(
+    source: &impl QuerySource,
+    relative: &str,
+    open: impl FnOnce(WorktreeSnapshot<'_>) -> std::io::Result<T>,
+) -> Result<T> {
     let mut opened = None;
-    let snapshot = source.snapshot(|snapshot| opened = Some(snapshot.open_candidate(relative)));
-    let file = match opened {
+    let snapshot = source.snapshot(|snapshot| opened = Some(open(snapshot)));
+    match opened {
         // A failed open also fails the snapshot; keep the snapshot's typed error.
-        Some(Err(error)) => return failed(snapshot.err().unwrap_or_else(|| error.into())),
+        Some(Err(error)) => candidate_failed(
+            source,
+            relative,
+            snapshot.err().unwrap_or_else(|| error.into()),
+        ),
         Some(Ok(file)) => {
             snapshot?;
-            file
+            Ok(file)
         }
         None => {
             snapshot?;
             bail!("shared snapshot did not open candidate {relative}");
         }
-    };
+    }
+}
+
+fn read_candidate(
+    source: &impl QuerySource,
+    batch: Option<&tgrep_core::worktrees::CandidateBatch>,
+    relative: &str,
+) -> Result<Vec<u8>> {
+    let failed = |error| candidate_failed(source, relative, error);
+    let file = candidate_snapshot(source, relative, |snapshot| match batch {
+        Some(batch) => snapshot.open_candidate_in(batch, relative),
+        None => snapshot.open_candidate(relative),
+    })?;
     match file.metadata() {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => {

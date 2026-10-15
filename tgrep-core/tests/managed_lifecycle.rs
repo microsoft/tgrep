@@ -744,8 +744,12 @@ fn atomic_migration_preserves_dirty_overlay_old_queries_and_exact_replay() {
         .unwrap();
     paths.sort();
     assert_eq!(paths, ["private.txt", "source.txt"]);
+    let batch = query
+        .with_snapshot(|snapshot| snapshot.candidate_batch("source.txt"))
+        .unwrap()
+        .unwrap();
     let mut candidate = query
-        .with_snapshot(|snapshot| snapshot.open_candidate("source.txt"))
+        .with_snapshot(|snapshot| snapshot.open_candidate_in(&batch, "source.txt"))
         .unwrap()
         .unwrap();
     let mut bytes = String::new();
@@ -789,6 +793,17 @@ fn atomic_migration_preserves_dirty_overlay_old_queries_and_exact_replay() {
             .root_handles_released
     );
     drop(candidate);
+    assert!(
+        !manager
+            .detach(
+                &fixture.owner.registration().owner,
+                &Token::parse("primary-lease").unwrap(),
+                &first.id
+            )
+            .unwrap()
+            .root_handles_released
+    );
+    batch.finish().unwrap();
     assert!(
         manager
             .detach(
@@ -2038,6 +2053,15 @@ fn escaped_candidate_keeps_the_base_and_root_protected() {
         })
         .unwrap();
     let clone = candidate.try_clone().unwrap();
+    let batch = view
+        .with_snapshot(|snapshot| snapshot.candidate_batch("source.txt"))
+        .unwrap()
+        .unwrap();
+    let batched = view
+        .with_snapshot(|snapshot| snapshot.open_candidate_in(&batch, "source.txt"))
+        .unwrap()
+        .unwrap();
+    drop(batched);
     let guard = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2056,6 +2080,10 @@ fn escaped_candidate_keeps_the_base_and_root_protected() {
     #[cfg(windows)]
     assert!(fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).is_err());
     drop(clone);
+    assert!(fs2::FileExt::try_lock_exclusive(&guard).is_err());
+    #[cfg(windows)]
+    assert!(fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).is_err());
+    batch.finish().unwrap();
     fs2::FileExt::try_lock_exclusive(&guard).unwrap();
     #[cfg(windows)]
     fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).unwrap();

@@ -463,6 +463,110 @@ fn startup_deprecation_warns_once_per_v1_start_and_preserves_clients() {
 }
 
 #[test]
+fn sibling_query_batches_preserve_local_and_shared_routes() {
+    let mut fixture = Fixture::new();
+    prepare_query_batches(&mut fixture);
+    success(cli(&fixture.a, &["index", "."]));
+    assert_query_batch_parity(&fixture.a, "Search completed in");
+    let daemon = fixture.start(&["--no-watch"]);
+    let lease = daemon.attach(&fixture.a, &fixture.revision);
+    assert_query_batch_parity(&fixture.a, "(via shared daemon v1)");
+    daemon.rpc(
+        "detach",
+        json!({"root":fixture.a,"view":lease["view"],"lease":lease["lease"]}),
+    );
+}
+
+fn prepare_query_batches(fixture: &mut Fixture) {
+    for parent in ["batches/first/inner", "batches/second/inner"] {
+        fs::create_dir_all(fixture.a.join(parent)).unwrap();
+        for index in 0..67 {
+            let mut content = format!("public public class Example{index}\n");
+            if index % 3 == 0 {
+                content.push_str("// TODO: HACK and FIXME\r\n");
+            }
+            content.push_str("// todo_suffix hackish xxxsuffix\npublic end\n");
+            fs::write(
+                fixture.a.join(parent).join(format!("file-{index:03}.cs")),
+                content,
+            )
+            .unwrap();
+        }
+    }
+    fs::write(fixture.a.join("batches/.hidden.cs"), "public TODO\n").unwrap();
+    fs::write(fixture.a.join("batches/empty.cs"), "").unwrap();
+    fs::write(fixture.a.join("batches/binary.cs"), b"public\0TODO\n").unwrap();
+    fs::write(fixture.a.join("batches/.gitignore"), "ignored.cs\n").unwrap();
+    fs::write(
+        fixture.a.join("batches/ignored.cs"),
+        "public TODO ignored\n",
+    )
+    .unwrap();
+    git(&fixture.a, &["add", "."]);
+    git(&fixture.a, &["commit", "-qm", "sibling query batches"]);
+    fixture.revision = git(&fixture.a, &["rev-parse", "HEAD"]);
+}
+
+fn assert_query_batch_parity(root: &Path, backend: &str) {
+    let todo = r"\b(TODO|HACK|FIXME|XXX)\b";
+    for (pattern, flags) in [
+        ("public", vec!["-l"]),
+        (todo, vec!["-n", "-i"]),
+        (todo, vec!["-l", "-i"]),
+        ("absent_trigram_token", vec!["-l"]),
+        ("^$", vec!["-n"]),
+        ("public", vec!["-c"]),
+        ("public", vec!["--count-matches"]),
+        (todo, vec!["-i", "-n", "-v", "-m", "2"]),
+        ("public", vec!["-n", "-o", "-m", "1"]),
+        ("public", vec!["-n", "-m", "0"]),
+        ("public", vec!["-q"]),
+        (todo, vec!["-i", "-n", "--hidden"]),
+        (todo, vec!["-i", "-n", "-C", "1"]),
+        (r"xxxsuffix\npublic", vec!["-n", "-U"]),
+        ("public", vec!["-l", "-g", "!**/second/**"]),
+        ("public", vec!["-l", "--max-depth", "2"]),
+        ("public", vec!["-l", "--sortr", "path"]),
+        ("public", vec!["-n", "--column", "-b", "-r", "export"]),
+        ("public", vec!["-l", "-t", "cs"]),
+    ] {
+        let mut args = vec![
+            "--stats",
+            "--sort",
+            "path",
+            "--color",
+            "never",
+            "--path-separator",
+            "/",
+            "-g",
+            "!.git",
+        ];
+        args.extend(flags);
+        args.extend(["-e", pattern, "--", "."]);
+        let indexed = cli(root, &args);
+        let mut scan_args = vec!["--no-index"];
+        scan_args.extend(args.clone());
+        let scanned = cli(root, &scan_args);
+        assert_eq!(
+            indexed.status.code(),
+            scanned.status.code(),
+            "{backend}: {args:?}"
+        );
+        assert!(matches!(indexed.status.code(), Some(0 | 1)), "{indexed:?}");
+        assert_eq!(indexed.stdout, scanned.stdout, "{backend}: {args:?}");
+        let stderr = String::from_utf8_lossy(&indexed.stderr);
+        assert!(stderr.contains(backend), "{args:?}: {stderr}");
+        assert!(stderr.contains("Query plan:"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("Brute-force"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("warning:"), "{args:?}: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&scanned.stderr).contains("Brute-force"),
+            "{scanned:?}"
+        );
+    }
+}
+
+#[test]
 fn multiline_count_matches_uses_shared_per_file_totals() {
     let mut f = Fixture::new();
     prepare_multiline_counts(&mut f);

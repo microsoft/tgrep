@@ -1164,6 +1164,15 @@ The shared helper is `tgrep_core::rooted::RootedDir`
 retains one per server and reuses it across build, watcher and verification reads.
 `WorktreeSnapshot::open_file` uses the view's existing reader, not a new root
 registration per candidate. Neither API freezes file contents.
+Local-index and shared content queries reuse one pinned ancestor chain for at
+most 64 consecutive sibling candidates, without reordering or limiting results.
+They still read and match one file at a time and verify the ancestors when the
+batch ends. Shared queries retain per-candidate snapshot validation, read-time
+deadline checks, generation/root protection and the final epoch check.
+`RootedDir::read_batch` exposes this scoped reader; managed callers obtain a
+`WorktreeSnapshot::candidate_batch`, use `open_candidate_in` through subsequent
+snapshots, and call `finish` before publishing buffered results. A batch cannot
+be used with another root or generation. Reply and file-size limits are unchanged.
 Metadata discovery rejects unrepresentable native names before conversion:
 non-Unicode paths and literal Unix backslashes cannot alias other indexed paths.
 Ordinary full scans retain native paths and remain available as the fallback.

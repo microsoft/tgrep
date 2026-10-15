@@ -654,6 +654,14 @@ refresh and checkpoint publication finish, including failed checkpoint retries.
 Candidate files are opened through the view's retained snapshot reader. Every
 query ends with a root-verified epoch check, including empty and filename-only
 responses; replacing the directory cannot pair old candidates with a new root.
+Local-index and shared searches amortize ancestor opens across bounded groups
+of up to 64 consecutive siblings. Each group retains one parent chain, not an
+unbounded directory cache or a batch of file contents. Shared candidate batches
+retain the generation and root protection, validate each candidate through its
+snapshot, and verify ancestor identities before returning results. Open/read or
+final ancestor-verification failures close the view for repair; deadline and
+snapshot-validation failures do not masquerade as filesystem failures. This
+does not change admission, matching, response limits or fallback semantics.
 In the legacy v1 daemon, both auto and poll modes perform full
 verification every `--poll-interval` seconds after completion (default 120), also
 repairing missed bytes, ignores and external Git/global configuration changes.

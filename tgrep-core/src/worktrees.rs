@@ -1501,6 +1501,20 @@ pub struct CandidateFile {
     _protection: Option<Arc<crate::managed::roots::RootProtection>>,
 }
 
+/// A bounded sibling-read group retaining the same root and generation pins
+/// as escaped candidates. Open through a snapshot and finish before publishing.
+pub struct CandidateBatch {
+    batch: RootedBatch<Arc<RootedDir>>,
+    generation: Arc<Generation>,
+    _protection: Option<Arc<crate::managed::roots::RootProtection>>,
+}
+
+impl CandidateBatch {
+    pub fn finish(self) -> std::io::Result<()> {
+        self.batch.finish().map(|_| ())
+    }
+}
+
 impl CandidateFile {
     pub fn metadata(&self) -> std::io::Result<fs::Metadata> {
         self.file.metadata()
@@ -1568,8 +1582,47 @@ impl WorktreeSnapshot<'_> {
         })
     }
 
+    /// Pin the ancestors of one candidate for a bounded sibling group.
+    pub fn candidate_batch(&self, relative: &str) -> std::io::Result<CandidateBatch> {
+        crate::rooted::validate_index_path(relative)?;
+        let parent = Path::new(relative)
+            .parent()
+            .expect("validated relative path");
+        let batch = self.record_open(relative, self.rooted.owned_batch(parent))?;
+        Ok(CandidateBatch {
+            batch,
+            generation: Arc::clone(self.generation),
+            _protection: self.protection.clone(),
+        })
+    }
+
+    pub fn open_candidate_in(
+        &self,
+        batch: &CandidateBatch,
+        relative: &str,
+    ) -> std::io::Result<CandidateFile> {
+        if !std::ptr::eq(batch.batch.root(), self.rooted.as_ref())
+            || !Arc::ptr_eq(&batch.generation, self.generation)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "candidate batch belongs to a different snapshot",
+            ));
+        }
+        let opened = self.record_open(relative, batch.batch.open_observed(Path::new(relative)))?;
+        Ok(CandidateFile {
+            file: opened.file,
+            _root: Arc::clone(self.rooted),
+            _generation: Arc::clone(self.generation),
+            _protection: self.protection.clone(),
+        })
+    }
+
     fn open_inner(&self, relative: &str) -> std::io::Result<File> {
-        let result = self.rooted.open_file(Path::new(relative));
+        self.record_open(relative, self.rooted.open_file(Path::new(relative)))
+    }
+
+    fn record_open<T>(&self, relative: &str, result: std::io::Result<T>) -> std::io::Result<T> {
         if let Err(error) = &result {
             let mut first_error = self
                 .open_error
@@ -1660,7 +1713,7 @@ impl PreparedUpsert {
 }
 
 struct ParentBatch<'a> {
-    reader: OnceLock<RootedBatch<'a>>,
+    reader: OnceLock<RootedBatch<&'a RootedDir>>,
     initialize: Mutex<()>,
 }
 
@@ -1718,7 +1771,7 @@ impl<'root, 'inputs> VerificationBatch<'root, 'inputs> {
         })
     }
 
-    fn reader(&self, parent: &str) -> Result<&RootedBatch<'root>> {
+    fn reader(&self, parent: &str) -> Result<&RootedBatch<&'root RootedDir>> {
         let entry = self.parents.get(parent).expect("planned parent batch");
         if entry.reader.get().is_none() {
             let _initialize = entry

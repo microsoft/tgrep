@@ -1312,6 +1312,52 @@ fn actual_bytes_not_discovery_size_decide_size_and_binary_classification() {
 }
 
 #[test]
+fn snapshot_sibling_batches_reject_foreign_roots_and_record_open_failures() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "dir/one.txt", b"first needle");
+    write(&fixture.root, "dir/two.txt", b"second needle");
+    commit(&fixture.root);
+    let generation = fixture.generation();
+    let view = fixture.view(&fixture.root, &generation);
+    view.refresh().unwrap();
+    let linked = fixture.linked("other");
+    let other = fixture.view(&linked, &generation);
+    other.refresh().unwrap();
+    let batch = view
+        .with_snapshot(|snapshot| snapshot.candidate_batch("dir/one.txt"))
+        .unwrap()
+        .unwrap();
+    let mut bytes = String::new();
+    view.with_snapshot(|snapshot| snapshot.open_candidate_in(&batch, "dir/one.txt"))
+        .unwrap()
+        .unwrap()
+        .read_to_string(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, "first needle");
+    assert!(
+        other
+            .with_snapshot(|snapshot| snapshot.open_candidate_in(&batch, "dir/one.txt"))
+            .unwrap()
+            .is_err()
+    );
+    assert!(other.status().unwrap().ready);
+    fs::remove_file(fixture.root.join("dir/one.txt")).unwrap();
+    let before = view.status().unwrap();
+    let error = view
+        .with_snapshot(|snapshot| {
+            assert!(snapshot.open_candidate_in(&batch, "dir/one.txt").is_err());
+            assert!(snapshot.open_candidate_in(&batch, "dir/two.txt").is_ok());
+        })
+        .unwrap_err();
+    assert!(matches!(error, WorktreeError::Io(_)));
+    let after = view.status().unwrap();
+    assert!(!after.ready);
+    assert!(after.full_required);
+    assert!(after.epoch > before.epoch);
+    batch.finish().unwrap();
+}
+
+#[test]
 fn snapshot_candidate_opens_reject_directory_link_swaps() {
     let fixture = Fixture::new();
     write(&fixture.root, "dir/file.txt", b"inside needle");

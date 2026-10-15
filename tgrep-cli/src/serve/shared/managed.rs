@@ -2771,7 +2771,7 @@ mod candidate_read_tests {
         );
     }
 
-    /// Snapshot call 0 lists candidates and call 1 opens the only candidate.
+    /// Call 0 lists candidates, 1 pins their parent, and 2/3 open candidates.
     #[derive(Clone, Copy, Debug)]
     enum Inject {
         Nothing,
@@ -2833,6 +2833,7 @@ mod candidate_read_tests {
         std::fs::create_dir(&storage).unwrap();
         git(&root, &["init", "--quiet"]);
         std::fs::write(root.join("source.txt"), "shared_term\n").unwrap();
+        std::fs::write(root.join("sibling.txt"), "shared_term sibling\n").unwrap();
         git(&root, &["add", "."]);
         git(&root, &["commit", "--quiet", "-m", "initial"]);
         let repository = Repository::discover(&root).unwrap();
@@ -2910,12 +2911,18 @@ mod candidate_read_tests {
 
         let (result, snapshots, invalidations) = run(Inject::Nothing);
         let result = result.unwrap();
-        assert_eq!(result["matches"].as_array().unwrap().len(), 1, "{result}");
-        assert_eq!((snapshots, invalidations), (3, 0));
+        assert_eq!(result["matches"].as_array().unwrap().len(), 2, "{result}");
+        assert_eq!((snapshots, invalidations), (5, 0));
         let epoch = slot.input_epoch();
         for (inject, reason) in [
             (Inject::SnapshotBeforeRead(1), "query-input-changed"),
             (Inject::SnapshotAfterRead(1), "query-snapshot-changed"),
+            (Inject::SnapshotBeforeRead(2), "query-input-changed"),
+            (Inject::SnapshotAfterRead(2), "query-snapshot-changed"),
+            (Inject::SnapshotBeforeRead(3), "query-input-changed"),
+            (Inject::SnapshotAfterRead(3), "query-snapshot-changed"),
+            (Inject::SnapshotBeforeRead(4), "query-input-changed"),
+            (Inject::SnapshotAfterRead(4), "query-snapshot-changed"),
             (Inject::Check, "query-deadline"),
         ] {
             let (result, _, invalidations) = run(inject);
@@ -2933,7 +2940,7 @@ mod candidate_read_tests {
             assert!(manager.status(&record.id).unwrap().ready, "{inject:?}");
         }
         let (result, _, invalidations) = run(Inject::Nothing);
-        assert_eq!(result.unwrap()["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(result.unwrap()["matches"].as_array().unwrap().len(), 2);
         assert_eq!(invalidations, 0);
 
         std::fs::remove_file(root.join("source.txt")).unwrap();

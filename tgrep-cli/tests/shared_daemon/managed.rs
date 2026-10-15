@@ -563,6 +563,43 @@ fn polling_modes_repair_unreported_restored_mtime_and_membership_changes() {
 }
 
 #[test]
+fn sibling_query_batches_preserve_managed_routes() {
+    let mut fixture = Fixture::new();
+    prepare_query_batches(&mut fixture);
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let before = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    assert_query_batch_parity(&fixture.a, "(via shared daemon v2)");
+    let after = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    for field in ["view", "version", "generation"] {
+        assert_eq!(before[field], after[field], "{field}");
+    }
+    assert_eq!(
+        daemon.rpc("views.status", json!({"id":after["view"]}))["ready"],
+        true
+    );
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
 fn multiline_count_matches_uses_managed_per_file_totals() {
     let mut fixture = Fixture::new();
     prepare_multiline_counts(&mut fixture);

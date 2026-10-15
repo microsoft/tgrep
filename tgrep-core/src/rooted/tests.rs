@@ -89,6 +89,85 @@ fn regular_opens_and_literal_path_validation() {
 }
 
 #[test]
+fn query_sibling_batches_preserve_order_and_bound_pin_lifetimes() {
+    let mut paths: Vec<_> = (0..130).map(|i| format!("first/file-{i}")).collect();
+    paths.extend([
+        "second/file".into(),
+        "first/last".into(),
+        "root-file".into(),
+    ]);
+    let batches: Vec<_> = sibling_batches(&paths).collect();
+    assert_eq!(
+        batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+        [64, 64, 2, 1, 1, 1]
+    );
+    assert_eq!(
+        batches.into_iter().flatten().cloned().collect::<Vec<_>>(),
+        paths
+    );
+    assert_eq!(sibling_batches(&[]).count(), 0);
+}
+
+#[test]
+fn query_sibling_reader_retains_only_its_scoped_parent_pins() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("outer").join("inner");
+    fs::create_dir_all(&parent).unwrap();
+    fs::write(parent.join("one"), "one").unwrap();
+    fs::write(parent.join("two"), "two").unwrap();
+    let root = RootedDir::open(temp.path()).unwrap();
+    let batch = root.read_batch(Path::new("outer/inner")).unwrap();
+    assert_eq!(
+        contents(batch.open_file(Path::new("outer/inner/one")).unwrap()),
+        "one"
+    );
+    assert_eq!(
+        contents(batch.open_file(Path::new("outer/inner/two")).unwrap()),
+        "two"
+    );
+    for path in ["", "../one", "outer/one", "outer/inner/../one"] {
+        assert!(batch.open_file(Path::new(path)).is_err(), "{path}");
+    }
+    #[cfg(windows)]
+    assert!(fs::rename(&parent, temp.path().join("saved")).is_err());
+    batch.finish().unwrap();
+    fs::rename(&parent, temp.path().join("saved")).unwrap();
+}
+
+#[test]
+fn owned_query_batch_retains_root_until_verified_finish() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join("one"), "one").unwrap();
+    let root = Arc::new(RootedDir::open(temp.path()).unwrap());
+    let weak = Arc::downgrade(&root);
+    let batch = root.owned_batch(Path::new("")).unwrap();
+    drop(root);
+    assert!(weak.upgrade().is_some());
+    assert_eq!(contents(batch.open_file(Path::new("one")).unwrap()), "one");
+    batch.finish().unwrap();
+    assert!(weak.upgrade().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn query_batch_finish_rejects_a_replaced_parent_without_following_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("one"), "original").unwrap();
+    let root = RootedDir::open(temp.path()).unwrap();
+    let batch = root.read_batch(Path::new("parent")).unwrap();
+    fs::rename(&parent, temp.path().join("saved")).unwrap();
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("one"), "replacement").unwrap();
+    assert_eq!(
+        contents(batch.open_file(Path::new("parent/one")).unwrap()),
+        "original"
+    );
+    assert!(batch.finish().is_err());
+}
+
+#[test]
 fn sibling_batches_release_pins_and_recheck_ancestor_identity() {
     let temp = tempfile::tempdir().unwrap();
     let parent = temp.path().join("outer").join("inner");

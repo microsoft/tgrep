@@ -107,6 +107,20 @@ mod tests {
         (temp, namespace, object, path)
     }
 
+    #[cfg(windows)]
+    fn fixture_member(namespace: &Namespace, object: &Id) -> FileRecord {
+        namespace
+            .read(|connection| {
+                let record: String = connection.query_row(
+                    "SELECT record FROM members WHERE object_id=?1 AND name='payload.bin'",
+                    [object.as_str()],
+                    |row| row.get(0),
+                )?;
+                Ok(serde_json::from_str(&record)?)
+            })
+            .unwrap()
+    }
+
     fn request_pass(
         namespace: &Arc<Namespace>,
         request: &CollectionRequest,
@@ -505,6 +519,8 @@ mod tests {
                 }, [object.id.as_str()])?;
                 Ok(())
             }).unwrap();
+            #[cfg(windows)]
+            assert!(namespace.record_file(&object.id, "payload.bin").is_err());
             let result = pass(&namespace, "invalid-proof");
             assert_eq!(result.errors, 1, "{result:?}");
             assert_eq!(
@@ -573,7 +589,7 @@ mod tests {
             SetFileInformationByHandle,
         };
         let original = [b'a'; 8192];
-        let (_temp, namespace, _object, path) = authenticated_fixture(&original);
+        let (_temp, namespace, object, path) = authenticated_fixture(&original);
         let mut file = File::options().read(true).write(true).open(&path).unwrap();
         let mut before: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
         // SAFETY: the owned fixture handle and matching native output structure.
@@ -634,6 +650,11 @@ mod tests {
             ]
         );
         drop(file);
+        let error = namespace
+            .record_file(&object.id, "payload.bin")
+            .unwrap_err();
+        assert_eq!(error.reason_code, "member-modified");
+        assert_eq!(error.committed_state, CommitState::NotCommitted);
         let result = pass(&namespace, "restored-all-timestamps");
         assert_eq!(result.errors, 1, "{result:?}");
         assert_eq!(
@@ -731,6 +752,7 @@ mod tests {
         }
         let original = [b'a'; 8192];
         let (_temp, namespace, object, path) = authenticated_fixture(&original);
+        let sealed = fixture_member(&namespace, &object.id);
         let file = File::options().read(true).write(true).open(&path).unwrap();
         let before = super::super::storage::file_change(&file).unwrap();
         let ownership = super::super::Ownership::capture(&file).unwrap();
@@ -763,11 +785,218 @@ mod tests {
         assert_ne!(super::super::storage::file_change(&file).unwrap(), before);
         drop(file);
         assert_eq!(std::fs::read(&path).unwrap(), original);
+        let recorded = namespace.record_file(&object.id, "payload.bin").unwrap();
+        assert_eq!(recorded.identity, sealed.identity);
+        assert_eq!(recorded.ownership, sealed.ownership);
+        assert_eq!(recorded.seal, sealed.seal);
+        assert_eq!(recorded.logical_bytes, sealed.logical_bytes);
+        assert_eq!(recorded.change[0], sealed.change[0]);
+        assert_ne!(recorded.change[1], sealed.change[1]);
+        assert!(!recorded.producer_open);
         let result = pass(&namespace, "benign-ea");
         assert_eq!(result.errors, 0, "{result:?}");
         assert_eq!(result.logical_bytes_reclaimed, object.logical_bytes);
         assert_eq!(result.removed, 1);
         assert!(result.verification_bytes >= original.len() as u64);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_authenticates_empty_and_multi_page_members_without_reopening_producers() {
+        for length in [0, 35 * super::super::authentication::BLOCK_BYTES + 3] {
+            let original = vec![b'a'; length];
+            let (_temp, namespace, object, path) = authenticated_fixture(&original);
+            let sealed = fixture_member(&namespace, &object.id);
+            let recorded = namespace.record_file(&object.id, "payload.bin").unwrap();
+            assert_eq!(recorded.seal, sealed.seal);
+            assert_eq!(recorded.identity, sealed.identity);
+            assert_eq!(recorded.ownership, sealed.ownership);
+            assert_eq!(recorded.logical_bytes, length as u64);
+            assert!(!recorded.producer_open);
+            assert_eq!(
+                namespace
+                    .work_usage()
+                    .unwrap()
+                    .memory
+                    .retained_private_estimate_bytes,
+                0
+            );
+            let file = File::open(&path).unwrap();
+            for producer_open in [false, true] {
+                let error = namespace
+                    .record_open_file_state(&object.id, "payload.bin", &file, producer_open)
+                    .unwrap_err();
+                assert_eq!(error.reason_code, "producer-member-modified");
+            }
+            assert_eq!(fixture_member(&namespace, &object.id), recorded);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_preserves_replaced_or_ownership_changed_members() {
+        for replacement in [false, true] {
+            let original = [b'a'; 8192];
+            let (_temp, namespace, object, path) = authenticated_fixture(&original);
+            let sealed = fixture_member(&namespace, &object.id);
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            if replacement {
+                std::fs::rename(&path, path.with_extension("original")).unwrap();
+                std::fs::write(&path, original).unwrap();
+            } else {
+                let mut changed = permissions.clone();
+                changed.set_readonly(true);
+                std::fs::set_permissions(&path, changed).unwrap();
+            }
+            let result = namespace.record_file(&object.id, "payload.bin");
+            if !replacement {
+                std::fs::set_permissions(&path, permissions).unwrap();
+            }
+            let error = result.unwrap_err();
+            assert!(
+                matches!(
+                    error.category,
+                    ErrorCategory::StaleIdentity | ErrorCategory::Permission
+                ),
+                "{error}"
+            );
+            assert_eq!(error.committed_state, CommitState::NotCommitted);
+            assert_eq!(fixture_member(&namespace, &object.id), sealed);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_requires_complete_unwithdrawn_producer_inventory() {
+        let original = [b'a'; 8192];
+        let (_temp, namespace, object, path) = authenticated_fixture(&original);
+        let sealed = fixture_member(&namespace, &object.id);
+        let directory = namespace.objects.child(object.id.as_str()).unwrap();
+        let _memory = namespace
+            .verification_scratch(super::super::verification::MEMORY_BYTES)
+            .unwrap();
+        for case in 0..8 {
+            let mut member = sealed.clone();
+            match case {
+                0 => member.seal = None,
+                1 => member.seal.as_mut().unwrap().blocks -= 1,
+                2 => member.producer_open = true,
+                3 => member.removed = true,
+                4 => member.pending_length = Some(member.logical_bytes),
+                5 => member.pending_manifest = Some(member.seal.as_ref().unwrap().manifest),
+                6 => member.credited_logical_bytes = 1,
+                7 => member.credited_allocated_bytes = 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                super::super::verification::authenticate_complete_member(
+                    &namespace, &directory, &object.id, &member, None,
+                )
+                .is_err(),
+                "invalid producer inventory case {case} was accepted"
+            );
+        }
+        assert_eq!(fixture_member(&namespace, &object.id), sealed);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_holds_native_protection_through_inventory_commit() {
+        for (point, mutate_ownership) in [
+            (Point::MemberVerificationPage, false),
+            (Point::MemberVerified, false),
+            (Point::CatalogBeforeCommit, false),
+            (Point::CatalogBeforeCommit, true),
+        ] {
+            let original = [b'a'; 8192];
+            let (_temp, namespace, object, path) = authenticated_fixture(&original);
+            let sealed = fixture_member(&namespace, &object.id);
+            let permissions = std::fs::metadata(&path).unwrap().permissions();
+            let fault = namespace
+                .install_test_fault(Specification {
+                    point,
+                    operation: None,
+                    skip_hits: 0,
+                    action: Action::Pause { timeout_ms: 10_000 },
+                })
+                .unwrap();
+            let result = std::thread::scope(|scope| {
+                let worker = scope.spawn(|| namespace.record_file(&object.id, "payload.bin"));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut reached = false;
+                while Instant::now() < deadline {
+                    if namespace.test_fault_status().unwrap().unwrap().stage
+                        == crate::managed::faults::Stage::Waiting
+                    {
+                        reached = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let writer = File::options().write(true).open(&path);
+                let renamed = std::fs::rename(&path, path.with_extension("renamed"));
+                let ownership = if mutate_ownership {
+                    let mut changed = permissions.clone();
+                    changed.set_readonly(true);
+                    std::fs::set_permissions(&path, changed)
+                } else {
+                    Ok(())
+                };
+                namespace.release_test_fault(&fault.ticket).unwrap();
+                let result = worker.join().unwrap();
+                if mutate_ownership {
+                    std::fs::set_permissions(&path, permissions).unwrap();
+                }
+                assert!(reached, "the {point:?} boundary was not exercised");
+                assert!(writer.is_err(), "verification permitted an external writer");
+                assert!(
+                    renamed.is_err(),
+                    "verification permitted member replacement"
+                );
+                ownership.unwrap();
+                result
+            });
+            if mutate_ownership {
+                let error = result.unwrap_err();
+                assert_eq!(error.category, ErrorCategory::StaleIdentity);
+                assert_eq!(error.committed_state, CommitState::Committed);
+            } else {
+                assert_eq!(result.unwrap().seal, sealed.seal);
+            }
+            assert_eq!(fixture_member(&namespace, &object.id).seal, sealed.seal);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_does_not_bypass_retained_writable_mappings() {
+        let original = [b'a'; 8192];
+        let (_temp, namespace, object, path) = authenticated_fixture(&original);
+        let sealed = fixture_member(&namespace, &object.id);
+        let mapping = {
+            let file = File::options().read(true).write(true).open(&path).unwrap();
+            // SAFETY: only this owned disposable fixture is writable-mapped.
+            unsafe { memmap2::MmapOptions::new().map_mut(&file).unwrap() }
+        };
+        let error = namespace
+            .record_file(&object.id, "payload.bin")
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::Busy);
+        assert_eq!(error.reason_code, "windows-sharing-or-mapping");
+        assert_eq!(fixture_member(&namespace, &object.id), sealed);
+        drop(mapping);
+        assert_eq!(
+            namespace
+                .record_file(&object.id, "payload.bin")
+                .unwrap()
+                .seal,
+            sealed.seal
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]

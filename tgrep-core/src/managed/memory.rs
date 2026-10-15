@@ -3,8 +3,117 @@
 use super::{Error, Id, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, TryReserveError};
+use std::hash::{BuildHasher, Hash};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+
+pub(crate) fn hash_table_bytes<T>(allocation_capacity: usize) -> Result<u64> {
+    if allocation_capacity == 0 {
+        return Ok(0);
+    }
+    // Use a fresh allocation's capacity or its retained watermark, not the
+    // insertion capacity left after deletions. Include spare/control buckets.
+    allocation_capacity
+        .checked_mul(2)
+        .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<T>().checked_add(1)?))
+        .and_then(|bytes| bytes.checked_add(64))
+        .map(|bytes| bytes as u64)
+        .ok_or_else(|| Error::pressure("hash-table-memory-overflow"))
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HashTableAllocation {
+    capacity: usize,
+}
+
+impl HashTableAllocation {
+    pub(crate) fn observe(&mut self, capacity: usize) {
+        // Erasing entries can reduce insertion capacity without freeing any
+        // buckets. Only dropping/rebuilding the table resets this watermark.
+        self.capacity = self.capacity.max(capacity);
+    }
+
+    pub(crate) fn bytes<T>(&self) -> Result<u64> {
+        hash_table_bytes::<T>(self.capacity)
+    }
+
+    fn reserve<T>(
+        &mut self,
+        length: usize,
+        capacity: usize,
+        additional: usize,
+        memory: &mut super::work::MemoryCharge,
+        reserve: impl FnOnce() -> std::result::Result<usize, TryReserveError>,
+    ) -> Result<()> {
+        self.observe(capacity);
+        let required = length
+            .checked_add(additional)
+            .ok_or_else(|| Error::pressure("hash-table-capacity-overflow"))?;
+        if required <= capacity {
+            return Ok(());
+        }
+        let bound = required
+            .checked_next_power_of_two()
+            .and_then(|capacity| capacity.checked_mul(2))
+            .ok_or_else(|| Error::pressure("hash-table-capacity-overflow"))?;
+        // The old backing allocation stays charged, including tombstones.
+        let before = memory.bytes();
+        let allocated = self.bytes::<T>()?;
+        memory.grow(hash_table_bytes::<T>(bound)?)?;
+        let after = match reserve() {
+            Ok(after) => after,
+            Err(error) => {
+                memory.resize(before)?;
+                return Err(Error::new(
+                    super::ErrorCategory::ResourcePressure,
+                    "hash-table-allocation-failed",
+                    error.to_string(),
+                ));
+            }
+        };
+        self.observe(after);
+        let growth = self.bytes::<T>()? - allocated;
+        memory.resize(
+            before
+                .checked_add(growth)
+                .ok_or_else(|| Error::pressure("hash-table-memory-overflow"))?,
+        )
+    }
+
+    pub(crate) fn reserve_map<K: Eq + Hash, V, S: BuildHasher>(
+        &mut self,
+        map: &mut HashMap<K, V, S>,
+        additional: usize,
+        memory: &mut super::work::MemoryCharge,
+    ) -> Result<()> {
+        self.reserve::<(K, V)>(map.len(), map.capacity(), additional, memory, || {
+            map.try_reserve(additional)?;
+            Ok(map.capacity())
+        })
+    }
+
+    pub(crate) fn reserve_set<T: Eq + Hash, S: BuildHasher>(
+        &mut self,
+        set: &mut HashSet<T, S>,
+        additional: usize,
+        memory: &mut super::work::MemoryCharge,
+    ) -> Result<()> {
+        self.reserve::<T>(set.len(), set.capacity(), additional, memory, || {
+            set.try_reserve(additional)?;
+            Ok(set.capacity())
+        })
+    }
+}
+
+/// Reserve an insert-only table. Mutable retained tables need a persistent
+/// `HashTableAllocation` so deletions cannot discard their backing charge.
+pub(crate) fn reserve_map<K: Eq + Hash, V, S: BuildHasher>(
+    map: &mut HashMap<K, V, S>,
+    additional: usize,
+    memory: &mut super::work::MemoryCharge,
+) -> Result<()> {
+    HashTableAllocation::default().reserve_map(map, additional, memory)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

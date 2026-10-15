@@ -90,6 +90,182 @@ fn modified(detail: &str) -> Error {
     Error::new(ErrorCategory::StaleIdentity, "member-modified", detail)
 }
 
+pub(super) fn check_native_member(
+    native: &NativeFile,
+    directory: &Directory,
+    name: &str,
+    identity: &FileIdentity,
+    ownership: &Ownership,
+    length: u64,
+) -> Result<()> {
+    native.check()?;
+    if FileIdentity::of(&native.file)? != *identity
+        || native.file.metadata()?.len() != length
+        || Ownership::capture(&native.file)? != *ownership
+        || directory.observe_file(name)?.identity != *identity
+    {
+        return Err(modified(
+            "native identity, length, ownership or directory entry changed during verification",
+        ));
+    }
+    native.check()
+}
+
+fn proof_page(
+    namespace: &Namespace,
+    object: &Id,
+    name: &str,
+    next_block: u64,
+) -> Result<VecDeque<Block>> {
+    let mut pending = VecDeque::with_capacity(PAGE_BLOCKS);
+    namespace.read(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT block_index,length,substr(digest,1,33) FROM member_seals
+             WHERE object_id=?1 AND name=?2 AND block_index>=?3 ORDER BY block_index LIMIT ?4",
+        )?;
+        let mut rows = statement.query(params![
+            object.as_str(),
+            name,
+            super::catalog::sql_integer(next_block)?,
+            PAGE_BLOCKS as u32
+        ])?;
+        while let Some(row) = rows.next()? {
+            let digest: Vec<u8> = row.get(2)?;
+            pending.push_back(Block {
+                index: super::catalog::unsigned(row, 0)?,
+                length: row.get(1)?,
+                digest: digest.try_into().map_err(|_| {
+                    proof_error("digest length differs from the authentication format")
+                })?,
+            });
+        }
+        Ok(())
+    })?;
+    if pending.is_empty() {
+        return Err(proof_error("a required producer proof row is missing"));
+    }
+    Ok(pending)
+}
+
+#[cfg(windows)]
+pub(super) fn member_authentication_deadline(
+    namespace: &Namespace,
+    permit: Option<&Arc<WorkPermit>>,
+) -> Result<Instant> {
+    if let Some(permit) = permit {
+        return Ok(permit.deadline());
+    }
+    Instant::now()
+        .checked_add(Duration::from_millis(
+            namespace.policy()?.policy.work.operation_timeout_ms,
+        ))
+        .ok_or_else(|| Error::invalid("member authentication deadline overflow"))
+}
+
+#[cfg(windows)]
+pub(super) fn authenticate_complete_member(
+    namespace: &Namespace,
+    directory: &Directory,
+    object: &Id,
+    member: &FileRecord,
+    permit: Option<&Arc<WorkPermit>>,
+) -> Result<NativeFile> {
+    let seal = member.seal.as_ref().ok_or_else(|| {
+        Error::new(
+            ErrorCategory::RecoveryRequired,
+            "member-content-unsealed",
+            "complete producer-intended content proof is absent",
+        )
+    })?;
+    seal.validate()?;
+    if member.producer_open
+        || member.removed
+        || member.pending_length.is_some()
+        || member.pending_manifest.is_some()
+        || member.credited_logical_bytes != 0
+        || member.credited_allocated_bytes != 0
+        || member.logical_bytes != seal.length
+    {
+        return Err(modified("member is not an intact closed producer output"));
+    }
+    let deadline = member_authentication_deadline(namespace, permit)?;
+    let check_work = || -> Result<()> {
+        if let Some(permit) = permit {
+            return permit.check();
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::new(
+                ErrorCategory::Deadline,
+                "member-authentication-deadline",
+                "complete member authentication exceeded its work deadline",
+            ));
+        }
+        Ok(())
+    };
+    let check = |native: &NativeFile| {
+        check_native_member(
+            native,
+            directory,
+            &member.name,
+            &member.identity,
+            &member.ownership,
+            member.logical_bytes,
+        )
+    };
+    check_work()?;
+    let mut native = NativeFile::open(directory, &member.name)?;
+    check(&native)?;
+    let mut next_block = 0_u64;
+    let mut manifest = manifest_hasher();
+    let mut buffer = [0_u8; BLOCK_BYTES];
+    while next_block < seal.blocks {
+        check_work()?;
+        check(&native)?;
+        for block in proof_page(namespace, object, &member.name, next_block)? {
+            let start = next_block
+                .checked_mul(BLOCK_BYTES as u64)
+                .ok_or_else(|| proof_error("proof block offset overflow"))?;
+            let expected = seal.length.saturating_sub(start).min(BLOCK_BYTES as u64);
+            if block.index != next_block || u64::from(block.length) != expected || expected == 0 {
+                return Err(proof_error(
+                    "producer proof is missing, reordered or has a different block length",
+                ));
+            }
+            let bytes = &mut buffer[..block.length as usize];
+            native.file.read_exact(bytes)?;
+            if blake3::hash(bytes).as_bytes() != &block.digest {
+                return Err(modified(
+                    "current payload differs from producer-intended content",
+                ));
+            }
+            hash_block(&mut manifest, &block);
+            next_block += 1;
+        }
+        namespace.fault(
+            super::faults::Point::MemberVerificationPage,
+            permit.map(|permit| permit.operation_id()),
+        )?;
+        check(&native)?;
+    }
+    let extra: bool = namespace.read(|connection| Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM member_seals WHERE object_id=?1 AND name=?2 AND block_index>=?3)",
+        params![object.as_str(), member.name, super::catalog::sql_integer(seal.blocks)?],
+        |row| row.get(0),
+    )?))?;
+    if extra || manifest.finalize().as_bytes() != &seal.manifest {
+        return Err(proof_error(
+            "complete producer manifest differs from the immutable proof rows",
+        ));
+    }
+    namespace.fault(
+        super::faults::Point::MemberVerified,
+        permit.map(|permit| permit.operation_id()),
+    )?;
+    check_work()?;
+    check(&native)?;
+    Ok(native)
+}
+
 impl Verification {
     pub(super) fn new(
         namespace: &Namespace,
@@ -217,49 +393,21 @@ impl Verification {
     }
 
     pub(super) fn check(&self, directory: &Directory) -> Result<()> {
-        self.native.check()?;
-        if FileIdentity::of(&self.native.file)? != self.identity
-            || self.native.file.metadata()?.len() != self.current_length
-            || Ownership::capture(&self.native.file)? != self.ownership
-            || directory.observe_file(&self.name)?.identity != self.identity
-        {
-            return Err(modified(
-                "native identity, length, ownership or directory entry changed during verification",
-            ));
-        }
-        self.native.check()
+        check_native_member(
+            &self.native,
+            directory,
+            &self.name,
+            &self.identity,
+            &self.ownership,
+            self.current_length,
+        )
     }
 
     fn refill(&mut self, namespace: &Namespace) -> Result<()> {
         if !self.pending.is_empty() {
             return Ok(());
         }
-        namespace.read(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT block_index,length,substr(digest,1,33) FROM member_seals
-                 WHERE object_id=?1 AND name=?2 AND block_index>=?3 ORDER BY block_index LIMIT ?4",
-            )?;
-            let mut rows = statement.query(params![
-                self.object.as_str(),
-                self.name,
-                super::catalog::sql_integer(self.next_block)?,
-                PAGE_BLOCKS as u32
-            ])?;
-            while let Some(row) = rows.next()? {
-                let digest: Vec<u8> = row.get(2)?;
-                self.pending.push_back(Block {
-                    index: super::catalog::unsigned(row, 0)?,
-                    length: row.get(1)?,
-                    digest: digest.try_into().map_err(|_| {
-                        proof_error("digest length differs from the authentication format")
-                    })?,
-                });
-            }
-            Ok(())
-        })?;
-        if self.pending.is_empty() {
-            return Err(proof_error("a required producer proof row is missing"));
-        }
+        self.pending = proof_page(namespace, &self.object, &self.name, self.next_block)?;
         Ok(())
     }
 

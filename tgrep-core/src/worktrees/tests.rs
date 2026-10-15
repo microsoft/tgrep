@@ -195,6 +195,81 @@ fn managed_batches_reuse_exact_contents_copies_and_overlay_postings() {
 }
 
 #[test]
+fn managed_crlf_overlay_fits_its_existing_budget_through_checkpoint_and_refresh() {
+    let fixture = Fixture::new();
+    write(&fixture.root, ".gitattributes", b"*.txt text eol=crlf\n");
+    let mut seed = 121_u32;
+    let mut bytes = b"CRLF-MEMORY-REGRESSION\nfollowing_position_marker ".to_vec();
+    while bytes.len() < 8189 {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        bytes.push(32 + ((seed >> 24) % 95) as u8);
+    }
+    bytes.push(b'\n');
+    for index in 0..8 {
+        write(&fixture.root, &format!("files/{index}.txt"), &bytes);
+    }
+    commit(&fixture.root);
+    git(&fixture.root, &["config", "core.autocrlf", "true"]);
+    let crlf = String::from_utf8(bytes).unwrap().replace('\n', "\r\n");
+    assert_eq!(crlf.len(), 8192);
+    for index in 0..8 {
+        write(
+            &fixture.root,
+            &format!("files/{index}.txt"),
+            crlf.as_bytes(),
+        );
+    }
+    git(&fixture.root, &["add", "--all"]);
+    let status = git(&fixture.root, &["status", "--porcelain"]);
+    assert!(status.is_empty(), "{status}");
+    let (namespace, permit, view) = fixture.controlled();
+    let first = view.refresh_controlled(&permit).unwrap();
+    assert!(view.status().unwrap().ready);
+    assert_eq!(first.files_read, 9);
+    assert_eq!(first.files_extracted, 8);
+    assert_eq!(first.base_reused, 1);
+    assert_eq!(view.overlay_cost().unwrap().files, 8);
+    assert!(first.peak_private_bytes <= permit.private_limit());
+    assert_scan_parity(
+        &view,
+        &["CRLF-MEMORY-REGRESSION", "following_position_marker", r"\r"],
+    );
+    let checkpoint = view.capture_checkpoint(&permit).unwrap();
+    drop(checkpoint);
+    view.invalidate_all().unwrap();
+    let refreshed = view.refresh_controlled(&permit).unwrap();
+    assert_eq!(refreshed.files_read, 9);
+    assert_eq!(refreshed.files_extracted, 0);
+    assert_eq!(refreshed.overlay_reused, 8);
+    assert!(permit.peak_private_bytes() <= permit.private_limit());
+    assert_scan_parity(&view, &["following_position_marker", r"\r"]);
+    let changed = crlf.replace("following_position_marker", "following_revision_marker");
+    assert_eq!(changed.len(), crlf.len());
+    write(&fixture.root, "files/0.txt", changed.as_bytes());
+    view.invalidate_all().unwrap();
+    let changed_stats = view.refresh_controlled(&permit).unwrap();
+    assert_eq!(changed_stats.files_extracted, 1);
+    assert_eq!(changed_stats.overlay_reused, 7);
+    assert_scan_parity(
+        &view,
+        &[
+            "following_position_marker",
+            "following_revision_marker",
+            r"\r",
+        ],
+    );
+    drop(view.capture_checkpoint(&permit).unwrap());
+    assert!(permit.peak_private_bytes() <= permit.private_limit());
+    let retained = namespace
+        .work_usage()
+        .unwrap()
+        .memory
+        .retained_private_estimate_bytes;
+    let available = permit.memory(permit.private_limit() - retained).unwrap();
+    drop(available);
+}
+
+#[test]
 fn managed_changed_files_fit_the_same_private_budget_at_any_worker_width() {
     use crate::managed::faults::{Action, Point, Specification, Stage};
     let fixture = Fixture::new();

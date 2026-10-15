@@ -658,27 +658,22 @@ impl WorktreeView {
             if evidence.get(path).and_then(|entry| entry.content).is_none()
                 && !live.is_deleted(path)
             {
-                if let Some(memory) = &mut memory {
-                    memory
-                        .grow(path.len() as u64 * 4 + 256)
+                if let (Some(permit), Some(memory)) = (permit, &mut memory) {
+                    live.delete_file_controlled(path, permit, memory)
                         .map_err(crate::Error::from)?;
+                } else {
+                    live.delete_file(path);
                 }
-                live.delete_file(path);
             }
         }
-        for (path, masks) in upserts {
-            if let Some(memory) = &mut memory {
-                let bytes = (masks.len() as u64)
-                    .checked_mul(256)
-                    .and_then(|bytes| bytes.checked_add(path.len() as u64 * 4 + 256))
-                    .ok_or_else(|| {
-                        crate::Error::from(crate::managed::Error::pressure(
-                            "overlay-publication-memory-overflow",
-                        ))
-                    })?;
-                memory.grow(bytes).map_err(crate::Error::from)?;
+        for (path, upsert) in upserts {
+            if let (Some(permit), Some(memory)) = (permit, &mut memory) {
+                live.commit_upsert_controlled(&path, upsert.masks, permit, memory)
+                    .map_err(crate::Error::from)?;
+            } else {
+                live.commit_upsert(&path, upsert.masks);
             }
-            live.commit_upsert(&path, masks);
+            drop(upsert.memory);
         }
         let listed = evidence
             .iter()
@@ -941,9 +936,6 @@ impl WorktreeView {
             prepared.stats.batches += 1;
             for chunk in chunks.into_iter().filter_map(|(chunk, _)| chunk) {
                 prepared.stats.add_verification(&chunk.stats);
-                if let (Some(memory), Some(charge)) = (&mut prepared.memory, chunk.memory) {
-                    memory.absorb(charge).map_err(crate::Error::from)?;
-                }
                 for (path, entry) in chunk.evidence {
                     if prepared.evidence.insert(path, entry).is_some() {
                         return Err(WorktreeError::InvalidInput(
@@ -953,7 +945,7 @@ impl WorktreeView {
                 }
                 for (path, file_id) in chunk.copies {
                     copies.entry(file_id).or_default().push(path.clone());
-                    prepared.upserts.insert(path, TrigramMaskMap::default());
+                    prepared.upserts.insert(path, PreparedUpsert::new(permit)?);
                 }
                 prepared.upserts.extend(chunk.upserts);
             }
@@ -973,20 +965,18 @@ impl WorktreeView {
                 for posting in postings {
                     if let Some(paths) = copies.get(&posting.file_id) {
                         for path in paths {
-                            if let Some(memory) = &mut prepared.memory {
-                                memory.grow(128).map_err(crate::Error::from)?;
+                            let upsert = prepared.upserts.get_mut(path).expect("copy destination");
+                            if let Some(memory) = &mut upsert.memory {
+                                crate::managed::memory::reserve_map(&mut upsert.masks, 1, memory)
+                                    .map_err(crate::Error::from)?;
                             }
-                            prepared
-                                .upserts
-                                .get_mut(path)
-                                .expect("copy destination")
-                                .insert(
-                                    trigram,
-                                    crate::trigram::TrigramMasks {
-                                        loc_mask: posting.loc_mask,
-                                        next_mask: posting.next_mask,
-                                    },
-                                );
+                            upsert.masks.insert(
+                                trigram,
+                                crate::trigram::TrigramMasks {
+                                    loc_mask: posting.loc_mask,
+                                    next_mask: posting.next_mask,
+                                },
+                            );
                             prepared.stats.postings_copied += 1;
                         }
                     }
@@ -1007,13 +997,7 @@ impl WorktreeView {
         timings: &mut ReconcileTimings,
     ) -> Result<VerifiedChunk> {
         let permit = batch.permit;
-        let mut chunk = VerifiedChunk {
-            memory: permit
-                .map(|permit| permit.memory(0))
-                .transpose()
-                .map_err(crate::Error::from)?,
-            ..VerifiedChunk::default()
-        };
+        let mut chunk = VerifiedChunk::default();
         let mut start_path = 0;
         while start_path < paths.len() {
             let parent = parent_path(&paths[start_path]);
@@ -1097,7 +1081,8 @@ impl WorktreeView {
                                         chunk.copies.push((path.clone(), file_id));
                                         chunk.stats.base_files_copied += 1;
                                     } else {
-                                        let masks = match (permit, &mut chunk.memory) {
+                                        let mut upsert = PreparedUpsert::new(permit)?;
+                                        upsert.masks = match (permit, &mut upsert.memory) {
                                             (Some(permit), Some(memory)) => {
                                                 crate::trigram::extract_merged_masks_controlled(
                                                     &text, permit, memory,
@@ -1106,7 +1091,7 @@ impl WorktreeView {
                                             }
                                             _ => LiveIndex::compute_trigram_masks(&text),
                                         };
-                                        chunk.upserts.push((path.clone(), masks));
+                                        chunk.upserts.push((path.clone(), upsert));
                                         chunk.stats.files_extracted += 1;
                                     }
                                     updated = true;
@@ -1645,17 +1630,33 @@ struct Prepared {
     parents: Vec<ParentObservation>,
     evidence: BTreeMap<String, Evidence>,
     visibility: PathVisibility,
-    upserts: BTreeMap<String, TrigramMaskMap>,
+    upserts: BTreeMap<String, PreparedUpsert>,
     stats: ReconcileStats,
 }
 
 #[derive(Default)]
 struct VerifiedChunk {
-    memory: Option<crate::managed::work::MemoryCharge>,
     evidence: Vec<(String, Evidence)>,
-    upserts: Vec<(String, TrigramMaskMap)>,
+    upserts: Vec<(String, PreparedUpsert)>,
     copies: Vec<(String, u32)>,
     stats: ReconcileStats,
+}
+
+struct PreparedUpsert {
+    masks: TrigramMaskMap,
+    memory: Option<crate::managed::work::MemoryCharge>,
+}
+
+impl PreparedUpsert {
+    fn new(permit: Option<&Arc<crate::managed::WorkPermit>>) -> Result<Self> {
+        Ok(Self {
+            masks: TrigramMaskMap::default(),
+            memory: permit
+                .map(|permit| permit.memory(0))
+                .transpose()
+                .map_err(crate::Error::from)?,
+        })
+    }
 }
 
 struct ParentBatch<'a> {

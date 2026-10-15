@@ -870,6 +870,17 @@ content. Basic timestamps, including Windows ChangeTime, are neither a seal nor
 an unchanged-content fast path. Bookkeeping-only metadata drift can be accepted
 only when producer content and ownership-sensitive metadata still match.
 
+On Windows, re-recording a closed producer before generation publication
+authenticates every original block and the complete manifest, even if basic
+timestamps are unchanged. The native deny-write/delete handle stays open through
+the catalog update; identity, ownership and length must still match, and no
+producer seal is replaced. This accepts metadata-only ChangeTime drift without
+an EA allowlist or a timestamp-based content shortcut. Verification uses bounded,
+charged buffers. With a work reservation it uses that reservation's admitted
+deadline and cancellation/version checks, not a new timeout from mutable policy.
+Unreserved observations receive a bounded deadline from current policy.
+Open producers and withdrawn or partially reclaimed members do not qualify.
+
 ## Managed policy
 
 The policy file is a complete JSON object; fields have no silent unlimited
@@ -1048,6 +1059,21 @@ subject to existing private-memory admission. These estimates are not an RSS cap
 If parallel extraction exhausts private headroom, the bounded batch is joined,
 its temporary outputs are dropped, and it retries once with one worker under the
 same limits. Serial pressure or any non-memory failure still fails the operation.
+
+Changed-file mask tables retain their capacity charge only while they exist;
+extraction releases temporary growth headroom, and publication releases each
+input table after consuming it. Live overlay admission accounts for hash-table
+capacities, including bucket/control storage and per-allocation padding, rather
+than accumulating a fixed allowance for every posting insertion. Table growth
+reserves both old and replacement storage before allocation. Retained tables,
+including each posting set and its allocation bookkeeping, keep a backing-capacity
+watermark across deletions: tombstones can reduce insertion capacity without
+freeing buckets. Charges are lowered only for dropped or rebuilt storage, not
+merely because entries were removed. File replacement removes old entries from
+the unpublished overlay before admitting table growth; failures leave the
+published view unchanged. Retained views and checkpoint capture remain charged.
+This allows full CRLF/smudge overlays to use
+the existing budget without normalizing bytes, weakening masks or raising limits.
 
 Workers verify and decode/hash every required file, compare exact indexed content
 identities, and extract only differences. A single assembler preserves base,

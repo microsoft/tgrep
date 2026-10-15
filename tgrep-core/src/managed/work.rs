@@ -1257,6 +1257,10 @@ pub(crate) struct MemoryCharge {
 }
 
 impl MemoryCharge {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     pub(crate) fn absorb(&mut self, mut other: Self) -> Result<()> {
         if !Arc::ptr_eq(&self.permit, &other.permit) {
             return Err(Error::invalid(
@@ -1452,12 +1456,12 @@ impl Drop for ChargedWriter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::managed::faults::{Action, Point, Specification};
     use crate::managed::{ObjectKind, ObjectState, Token};
 
-    fn fixture() -> (tempfile::TempDir, Arc<Namespace>, Arc<WorkPermit>) {
+    pub(crate) fn fixture() -> (tempfile::TempDir, Arc<Namespace>, Arc<WorkPermit>) {
         let temp = tempfile::tempdir().unwrap();
         let namespace = Namespace::initialize_identity(
             &"a".repeat(64),
@@ -1742,6 +1746,108 @@ mod tests {
     }
 
     #[test]
+    fn hash_table_growth_charges_reallocation_and_releases_unused_headroom() {
+        use super::super::memory::{HashTableAllocation, hash_table_bytes, reserve_map};
+        let (_temp, _namespace, permit) = fixture();
+        let mut memory = permit.memory(0).unwrap();
+        let mut map = std::collections::HashMap::new();
+        for index in 0..4096_u32 {
+            reserve_map(&mut map, 1, &mut memory).unwrap();
+            map.insert(index, index);
+            assert_eq!(
+                memory.bytes(),
+                hash_table_bytes::<(u32, u32)>(map.capacity()).unwrap()
+            );
+        }
+        assert!(permit.peak_private_bytes() > memory.bytes());
+        let capacity = map.capacity();
+        let retained = memory.bytes();
+        let occupied = permit.memory(permit.private_limit() - retained).unwrap();
+        let error = reserve_map(&mut map, capacity + 1, &mut memory).unwrap_err();
+        assert_eq!(error.category, ErrorCategory::ResourcePressure);
+        assert_eq!(map.capacity(), capacity);
+        assert_eq!(map.len(), 4096);
+        assert_eq!(memory.bytes(), retained);
+        drop(occupied);
+        let mut ids = std::collections::HashSet::new();
+        let mut allocation = HashTableAllocation::default();
+        for id in 0..1024_u32 {
+            allocation.reserve_set(&mut ids, 1, &mut memory).unwrap();
+            ids.insert(id);
+            assert_eq!(
+                memory.bytes(),
+                retained + hash_table_bytes::<u32>(ids.capacity()).unwrap()
+            );
+        }
+        let capacity = ids.capacity();
+        permit.cancel();
+        assert_eq!(
+            allocation
+                .reserve_set(&mut ids, capacity + 1, &mut memory)
+                .unwrap_err()
+                .category,
+            ErrorCategory::Cancelled
+        );
+        assert_eq!(ids.capacity(), capacity);
+        drop((map, ids, memory));
+        assert_eq!(permit.private_bytes.load(Ordering::Acquire), 0);
+        assert!(hash_table_bytes::<u64>(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn hash_table_rehash_keeps_its_existing_backing_charge_after_deletions() {
+        use super::super::memory::HashTableAllocation;
+        use std::collections::HashMap;
+        use std::hash::{BuildHasherDefault, Hasher};
+
+        #[derive(Default)]
+        struct CollidingHasher;
+        impl Hasher for CollidingHasher {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, _: &[u8]) {}
+        }
+
+        let (_temp, _namespace, permit) = fixture();
+        let mut memory = permit.memory(0).unwrap();
+        let mut allocation = HashTableAllocation::default();
+        let mut map = HashMap::<u32, [u8; 64], BuildHasherDefault<CollidingHasher>>::default();
+        allocation.reserve_map(&mut map, 48, &mut memory).unwrap();
+        let capacity = map.capacity();
+        for key in 0..capacity as u32 {
+            map.insert(key, [0; 64]);
+        }
+        let allocated = memory.bytes();
+        let surviving_key = capacity as u32 - 1;
+        let address = map.get(&surviving_key).unwrap() as *const [u8; 64];
+        map.retain(|&key, _| key >= capacity as u32 - 4);
+        assert_eq!(map.get(&surviving_key).unwrap() as *const [u8; 64], address);
+        assert!(map.capacity() < capacity / 2);
+        assert!(
+            allocation.bytes::<(u32, [u8; 64])>().unwrap()
+                >= (capacity * std::mem::size_of::<(u32, [u8; 64])>()) as u64
+        );
+        let additional = map.capacity() - map.len() + 1;
+        allocation
+            .reserve_map(&mut map, additional, &mut memory)
+            .unwrap();
+        assert_eq!(map.capacity(), capacity);
+        assert_eq!(memory.bytes(), allocated);
+
+        let occupied = permit.memory(permit.private_limit() - allocated).unwrap();
+        let error = allocation
+            .reserve_map(&mut map, capacity, &mut memory)
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::ResourcePressure);
+        assert_eq!(map.len(), 4);
+        assert_eq!(map.capacity(), capacity);
+        assert_eq!(memory.bytes(), allocated);
+        drop((map, memory, occupied));
+        assert_eq!(permit.private_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn read_admission_waits_for_private_buffers_but_not_retained_memory() {
         let (_temp, namespace, permit) = fixture();
         let first = permit.admit_read(permit.private_limit()).unwrap();
@@ -1980,6 +2086,70 @@ mod tests {
             member(&namespace, &object.id).seal,
             Some(crate::managed::MemberSeal::bounded(&changed).unwrap())
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_authentication_keeps_the_admitted_deadline_after_policy_reduction() {
+        let (_temp, namespace, permit) = fixture();
+        let admitted_deadline = permit.deadline();
+        let mut policy = namespace.policy().unwrap();
+        policy.policy.work.operation_timeout_ms = 1;
+        namespace
+            .update_policy(policy.version, policy.policy)
+            .unwrap();
+        assert_eq!(
+            super::super::verification::member_authentication_deadline(&namespace, Some(&permit))
+                .unwrap(),
+            admitted_deadline
+        );
+        let before = Instant::now();
+        let unreserved_deadline =
+            super::super::verification::member_authentication_deadline(&namespace, None).unwrap();
+        assert!(unreserved_deadline >= before + Duration::from_millis(1));
+        assert!(unreserved_deadline <= Instant::now() + Duration::from_millis(1));
+        assert_eq!(
+            permit.check_now().unwrap_err().category,
+            ErrorCategory::StaleVersion
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn closed_publication_authentication_obeys_the_existing_work_budget() {
+        let (_temp, namespace, permit) = fixture();
+        let (object, pin) = namespace
+            .create_object(ObjectKind::BuildStage, None, &permit)
+            .unwrap();
+        let mut writer =
+            ChargedWriter::new(Arc::clone(&pin), "payload", Arc::clone(&permit)).unwrap();
+        writer.write_all(&[b'a'; 8192]).unwrap();
+        writer.sync_all().unwrap();
+        drop(writer);
+        let sealed = member(&namespace, &object.id);
+        let occupied = permit
+            .memory(permit.private_limit() - super::super::verification::MEMORY_BYTES + 1)
+            .unwrap();
+        let error = namespace
+            .record_file_with_permit(&object.id, "payload", Some(&permit))
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::ResourcePressure);
+        assert_eq!(member(&namespace, &object.id), sealed);
+        drop(occupied);
+        assert_eq!(
+            namespace
+                .record_file_with_permit(&object.id, "payload", Some(&permit))
+                .unwrap()
+                .seal,
+            sealed.seal
+        );
+        assert_eq!(permit.private_bytes.load(Ordering::Acquire), 0);
+        permit.cancel();
+        let error = namespace
+            .record_file_with_permit(&object.id, "payload", Some(&permit))
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::Cancelled);
+        assert_eq!(member(&namespace, &object.id).seal, sealed.seal);
     }
 
     #[test]

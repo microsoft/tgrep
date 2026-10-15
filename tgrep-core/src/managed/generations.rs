@@ -332,7 +332,7 @@ impl Namespace {
                 "generation.tgm",
             ] {
                 pin.directory.open_file(name, true)?.sync_all()?;
-                self.record_file(&record.id, name)?;
+                self.record_file_with_permit(&record.id, name, Some(permit))?;
             }
             pin.directory.sync()?;
             permit.check()?;

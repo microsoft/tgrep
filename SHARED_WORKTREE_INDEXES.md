@@ -1342,6 +1342,28 @@ a drained watcher queue still do not prove absence of unreported writes
 (including active/mapped writers). An unavailable/inactive journal is not an
 empty journal and does not justify skipping initial content verification.
 
+Managed native registration uses recursive roots on Windows
+(`ReadDirectoryChangesW`) and macOS (FSEvents), without enumerating worktree
+descendants first. It watches the canonical worktree and Git/common metadata
+roots, omitting subscriptions already covered by another recursive root.
+New and moved-in directory trees are covered by those same subscriptions;
+Git metadata events still use the most specific metadata root. Cache and
+irrelevant Git events are filtered after delivery, not by pruning OS coverage.
+The per-view share of `--watch-budget` is unchanged: the startup budget divided
+by the policy's `work.max_views` (8192 / 32 = 256 for the runtime defaults).
+It counts registered roots on these backends, not descendant directories.
+Typically a main worktree costs one subscription and a linked worktree costs
+two; external Git layouts may need three. Each view owns and releases its own
+subscriptions, including any shared metadata-root subscription.
+
+Linux/Android retain bounded, non-recursive per-directory registration; other
+backends are also conservatively per-directory. Their directory-count,
+entry-traversal and 100-ms planning bounds are unchanged, and large trees may
+still require polling. This process-local budget does not reserve or raise OS
+capacity; another process can exhaust it first. Registration failures retire
+the affected view's entire watcher and select polling, rather than advertising
+partial native coverage. Ordinary-server and legacy v1 registration are unchanged.
+
 First attachment/restore, explicit full refresh, reported watcher error/overflow
 or rescan, and observed Git/ignore changes retain full verification and the
 existing publication gates. Normal native file events still invalidate their
@@ -1362,6 +1384,10 @@ and ordinary `status` expose the effective `watch_mode`, `watch_fallback` and
 `"polling-update-mechanism"`. Both fields are null otherwise. The configured
 `poll_interval_ms` remains visible even when no periodic work is enabled;
 `configured_watch_mode` is `auto`, `poll` or `disabled`.
+`native_registration_mode` distinguishes `recursive-roots` from `per-directory`,
+and `native_watch_budget_per_view` reports the startup allocation. Per-view
+`watch_count` counts live subscriptions (zero after fallback or drain); namespace
+`reconciliation_policy.watch_count` sums those subscriptions across monitored views.
 
 Online `namespace.status` and `maintenance.status` distinguish configuration
 from effective per-view behavior: the same policy has

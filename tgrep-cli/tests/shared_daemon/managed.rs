@@ -3,6 +3,9 @@
 use super::*;
 use tgrep_core::managed::{CommitState, ErrorCategory, OwnerClaim, OwnerGuard};
 
+#[path = "managed_watch.rs"]
+mod watch;
+
 #[cfg(feature = "managed-test-hooks")]
 #[path = "managed_faults.rs"]
 mod faults;

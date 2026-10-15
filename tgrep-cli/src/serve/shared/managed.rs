@@ -327,6 +327,14 @@ struct WatchSettings {
 }
 
 impl WatchSettings {
+    fn registration_mode(&self) -> notify::RecursiveMode {
+        if cfg!(any(windows, target_os = "macos")) {
+            notify::RecursiveMode::Recursive
+        } else {
+            notify::RecursiveMode::NonRecursive
+        }
+    }
+
     fn polling(&self, monitor: &Monitor) -> bool {
         !self.no_watch
             && (matches!(self.mode, crate::serve::WatchMode::Poll)
@@ -356,6 +364,10 @@ impl WatchSettings {
             "incremental_coverage": "unavailable",
             "change_journal": "not-integrated",
             "native_missed_changes": "may-remain-stale-indefinitely",
+            "native_registration_mode": if matches!(self.registration_mode(), notify::RecursiveMode::Recursive) {
+                "recursive-roots"
+            } else { "per-directory" },
+            "native_watch_budget_per_view": self.watches_per_view,
             "full_verification_reason": polling.then_some("polling-update-mechanism"),
             "full_repair_triggers": triggers
         })
@@ -523,11 +535,12 @@ fn monitor_directories(
     root: &Path,
     storage: &Path,
     budget: usize,
+    mode: notify::RecursiveMode,
+    deadline: Instant,
 ) -> Result<(HashSet<PathBuf>, Vec<PathBuf>)> {
     let mut directories = HashSet::new();
     let mut stack = vec![(root.to_path_buf(), false)];
     let mut examined = 0_usize;
-    let deadline = Instant::now() + Duration::from_millis(100);
     let (git, common) = tgrep_core::git_index::read_repository_dirs_bounded(root)?;
     let mut metadata = vec![std::fs::canonicalize(git)?, std::fs::canonicalize(common)?];
     metadata.dedup();
@@ -542,6 +555,22 @@ fn monitor_directories(
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+    if matches!(mode, notify::RecursiveMode::Recursive) {
+        // ReadDirectoryChangesW and FSEvents cover descendants, including new
+        // directories. Count subscriptions, not the directories they cover.
+        directories.insert(root.to_path_buf());
+        let candidates = directories.clone();
+        directories.retain(|directory| {
+            !candidates
+                .iter()
+                .any(|parent| parent != directory && directory.starts_with(parent))
+        });
+        ensure!(
+            directories.len() <= budget,
+            "native watch count budget; polling"
+        );
+        return Ok((directories, metadata));
     }
     while let Some((directory, git_metadata)) = stack.pop() {
         ensure!(
@@ -593,6 +622,7 @@ fn process_memory() -> Value {
 fn watch_event(
     slot: &ViewSlot,
     metadata: &[PathBuf],
+    storage: &Path,
     watch_failure: &Mutex<Option<String>>,
     event: notify::Result<notify::Event>,
 ) -> managed::Result<()> {
@@ -604,6 +634,9 @@ fn watch_event(
                 || event.paths.is_empty()
                 || matches!(event.kind, EventKind::Any | EventKind::Other);
             for path in event.paths {
+                if path.starts_with(storage) {
+                    continue;
+                }
                 if let Some(relative) = metadata
                     .iter()
                     .filter_map(|directory| path.strip_prefix(directory).ok())
@@ -685,25 +718,32 @@ fn sync_monitor(
         monitor.watched.clear();
         return Ok(());
     }
-    let (desired, metadata) =
-        match monitor_directories(slot.root(), storage, settings.watches_per_view) {
-            Ok(desired) => desired,
-            Err(error) => {
-                monitor.fallback = Some(format!("{error:#}"));
-                monitor.watcher = None;
-                monitor.watched.clear();
-                slot.invalidate(&[], true)?;
-                return Ok(());
-            }
-        };
+    let mode = settings.registration_mode();
+    let (desired, metadata) = match monitor_directories(
+        slot.root(),
+        storage,
+        settings.watches_per_view,
+        mode,
+        Instant::now() + Duration::from_millis(100),
+    ) {
+        Ok(desired) => desired,
+        Err(error) => {
+            monitor.fallback = Some(format!("{error:#}"));
+            monitor.watcher = None;
+            monitor.watched.clear();
+            slot.invalidate(&[], true)?;
+            return Ok(());
+        }
+    };
     if monitor.watcher.is_none() {
         let weak = Arc::downgrade(slot);
         let watch_failure = Arc::clone(&monitor.watch_failure);
+        let storage = storage.to_path_buf();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Some(slot) = weak.upgrade() else {
                 return;
             };
-            let result = watch_event(&slot, &metadata, &watch_failure, event);
+            let result = watch_event(&slot, &metadata, &storage, &watch_failure, event);
             if let Err(error) = result {
                 eprintln!("managed watcher invalidation {}: {error}", slot.id());
             }
@@ -722,10 +762,15 @@ fn sync_monitor(
     let result = (|| -> notify::Result<()> {
         let watcher = monitor.watcher.as_mut().expect("installed watcher");
         for directory in &removed {
-            watcher.unwatch(directory)?;
+            // inotify can retire a deleted or moved directory before this sync.
+            if let Err(error) = watcher.unwatch(directory)
+                && !matches!(error.kind, notify::ErrorKind::WatchNotFound)
+            {
+                return Err(error);
+            }
         }
         for directory in &added {
-            watcher.watch(directory, notify::RecursiveMode::NonRecursive)?;
+            watcher.watch(directory, mode)?;
         }
         Ok(())
     })();
@@ -765,6 +810,7 @@ impl State {
                 else if polling { "poll" }
                 else if monitor.is_some() { "native" } else { "unavailable" },
             "watch_fallback": monitor.as_ref().and_then(|monitor| monitor.fallback.as_ref()),
+            "watch_count": monitor.as_ref().map_or(0, |monitor| monitor.watched.len()),
             "reconciliation_policy": self.watches.reconciliation_status(polling)
         }))
     }
@@ -775,10 +821,12 @@ impl State {
             .lock()
             .map_err(|_| Error::corrupt("monitor registry poisoned"))?;
         let (mut native, mut polling, mut disabled) = (0_usize, 0_usize, 0_usize);
+        let mut watch_count = 0_usize;
         for monitor in monitors.values() {
             let monitor = monitor
                 .lock()
                 .map_err(|_| Error::corrupt("monitor poisoned"))?;
+            watch_count += monitor.watched.len();
             if self.watches.no_watch {
                 disabled += 1;
             } else if self.watches.polling(&monitor) {
@@ -792,6 +840,7 @@ impl State {
         status["native_views"] = json!(native);
         status["polling_views"] = json!(polling);
         status["disabled_views"] = json!(disabled);
+        status["watch_count"] = json!(watch_count);
         Ok(status)
     }
 
@@ -1139,7 +1188,7 @@ impl State {
                         "injected native watcher uncertainty",
                     )),
                 };
-                watch_event(&slot, &[], &failure, event)?;
+                watch_event(&slot, &[], self.namespace.path(), &failure, event)?;
                 Ok(json!({"input_epoch":slot.input_epoch()}))
             }
             "views.attach" => {
@@ -1174,7 +1223,12 @@ impl State {
                 let id = decode::<ObjectId>(request.params.clone())?.id;
                 let mut status = serde_json::to_value(self.views.status(&id)?)?;
                 let watch = self.watch_status(&id)?;
-                for field in ["watch_mode", "watch_fallback", "reconciliation_policy"] {
+                for field in [
+                    "watch_mode",
+                    "watch_fallback",
+                    "watch_count",
+                    "reconciliation_policy",
+                ] {
                     status[field] = watch[field].clone();
                 }
                 Ok(status)
@@ -1351,6 +1405,7 @@ impl State {
                 "ready":status.ready,"epoch":status.input_epoch,"backend":"shared-v2","status":status,
                 "watch_mode":watch["watch_mode"],
                 "watch_fallback":watch["watch_fallback"],
+                "watch_count":watch["watch_count"],
                 "reconciliation_policy":watch["reconciliation_policy"],
                 "policy":self.namespace.policy()?,"usage":self.namespace.work_usage()?,
                 "adaptive":self.views.last_adaptive(slot.id())?,
@@ -2213,6 +2268,161 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
 }
 
 #[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use std::fs;
+
+    fn repository() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        let storage = temp.path().join("storage");
+        fs::create_dir_all(root.join(".git").join("refs")).unwrap();
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::create_dir(&storage).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let storage = fs::canonicalize(storage).unwrap();
+        (temp, root, storage)
+    }
+
+    #[test]
+    fn recursive_roots_do_not_spend_the_budget_on_descendants() {
+        let (temp, root, storage) = repository();
+        let budget = 8192 / 32;
+        for index in 0..budget + 64 {
+            fs::create_dir(root.join(format!("directory-{index}"))).unwrap();
+        }
+        let (directories, metadata) = monitor_directories(
+            &root,
+            &storage,
+            budget,
+            notify::RecursiveMode::Recursive,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("recursive roots must not exhaust the descendant count budget");
+        assert_eq!(directories, HashSet::from([root.clone()]));
+        assert_eq!(metadata, vec![root.join(".git")]);
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn recursive_roots_do_not_require_a_descendant_traversal_deadline() {
+        let (temp, root, storage) = repository();
+        let (directories, _) = monitor_directories(
+            &root,
+            &storage,
+            8192 / 32,
+            notify::RecursiveMode::Recursive,
+            Instant::now(),
+        )
+        .expect("recursive roots must not depend on the traversal deadline");
+        assert_eq!(directories, HashSet::from([root]));
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn per_directory_planning_retains_count_and_traversal_limits() {
+        let (temp, root, storage) = repository();
+        let budget = 8192 / 32;
+        for index in 0..budget + 64 {
+            fs::create_dir(root.join(format!("directory-{index}"))).unwrap();
+        }
+        let count = monitor_directories(
+            &root,
+            &storage,
+            budget,
+            notify::RecursiveMode::NonRecursive,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert_eq!(count.to_string(), "native watch count budget; polling");
+        let deadline = monitor_directories(
+            &root,
+            &storage,
+            budget,
+            notify::RecursiveMode::NonRecursive,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            deadline.to_string(),
+            "native watch registration budget; polling"
+        );
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn linked_metadata_is_covered_without_duplicate_recursive_subscriptions() {
+        let (temp, root, storage) = repository();
+        let linked = temp.path().join("linked");
+        let common = root.join(".git");
+        let private = common.join("worktrees").join("linked");
+        fs::create_dir(&linked).unwrap();
+        fs::create_dir_all(&private).unwrap();
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        fs::write(private.join("commondir"), format!("{}\n", common.display())).unwrap();
+        let linked = fs::canonicalize(linked).unwrap();
+        let (directories, metadata) = monitor_directories(
+            &linked,
+            &storage,
+            2,
+            notify::RecursiveMode::Recursive,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(directories, HashSet::from([linked.clone(), common.clone()]));
+        assert_eq!(metadata, vec![private, common]);
+        let error = monitor_directories(
+            &linked,
+            &storage,
+            1,
+            notify::RecursiveMode::Recursive,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "native watch count budget; polling");
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn recursive_roots_still_reject_non_directory_git_watch_inputs() {
+        let (temp, root, storage) = repository();
+        fs::remove_dir(root.join(".git").join("refs")).unwrap();
+        fs::write(root.join(".git").join("refs"), "not a directory").unwrap();
+        let error = monitor_directories(
+            &root,
+            &storage,
+            8192 / 32,
+            notify::RecursiveMode::Recursive,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "non-directory Git watch input; polling");
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn native_registration_mode_matches_the_backend_resource_model() {
+        let settings = WatchSettings {
+            no_watch: false,
+            mode: crate::serve::WatchMode::Auto,
+            interval: Duration::from_secs(120),
+            watches_per_view: 8192 / 32,
+        };
+        assert_eq!(
+            matches!(
+                settings.registration_mode(),
+                notify::RecursiveMode::Recursive
+            ),
+            cfg!(any(windows, target_os = "macos"))
+        );
+    }
+}
+
+#[cfg(test)]
 mod scheduling_tests {
     use super::*;
 
@@ -2347,6 +2557,7 @@ mod scheduling_tests {
                     watch_event(
                         &slot,
                         &roots,
+                        &storage,
                         &failure,
                         Ok(
                             notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
@@ -2373,6 +2584,7 @@ mod scheduling_tests {
                     watch_event(
                         &slot,
                         &roots,
+                        &storage,
                         &failure,
                         Ok(
                             notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
@@ -2391,6 +2603,7 @@ mod scheduling_tests {
             watch_event(
                 &slot,
                 &roots,
+                &storage,
                 &failure,
                 Ok(
                     notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
@@ -2402,6 +2615,7 @@ mod scheduling_tests {
             watch_event(
                 &slot,
                 &roots,
+                &storage,
                 &failure,
                 Ok(
                     notify::Event::new(EventKind::Access(notify::event::AccessKind::Any))
@@ -2410,8 +2624,55 @@ mod scheduling_tests {
             )
             .unwrap();
             assert_eq!(slot.input_epoch(), before);
+            for path in [
+                storage.join("checkpoint"),
+                slot.root().join(".tgrep").join("index"),
+            ] {
+                watch_event(
+                    &slot,
+                    &roots,
+                    &storage,
+                    &failure,
+                    Ok(
+                        notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                            .add_path(path),
+                    ),
+                )
+                .unwrap();
+                assert_eq!(slot.input_epoch(), before);
+            }
         }
-        assert!(failure.into_inner().unwrap().is_none());
+        assert!(failure.lock().unwrap().is_none());
+        let before = slot.input_epoch();
+        watch_event(
+            &slot,
+            &[common, private],
+            &storage,
+            &failure,
+            Ok(
+                notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(storage.join("checkpoint"))
+                    .set_flag(notify::event::Flag::Rescan),
+            ),
+        )
+        .unwrap();
+        assert_eq!(slot.input_epoch(), before + 1);
+        watch_event(
+            &slot,
+            &[],
+            &storage,
+            &failure,
+            Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
+        )
+        .unwrap();
+        assert_eq!(slot.input_epoch(), before + 2);
+        assert!(
+            failure
+                .into_inner()
+                .unwrap()
+                .unwrap()
+                .starts_with("native watcher failed:")
+        );
         drop((slot, manager, owner, namespace, repository));
         temp.close().unwrap();
     }

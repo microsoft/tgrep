@@ -973,6 +973,16 @@ clean Git status and an unavailable journal do not prove that nothing changed.
 Initial attachment/restore, explicit `views.refresh`, and reported watcher
 errors/rescans retain verified repair. Use `--no-index` for current disk bytes.
 
+On Windows/macOS, managed views use recursive worktree and Git metadata-root
+subscriptions, without pre-enumerating descendant directories. The unchanged
+per-view watch budget counts these roots, not their descendants; typically one
+subscription covers a main worktree and two cover a linked worktree. New nested
+directories are covered automatically. Linux/Android keep bounded per-directory
+registration and may still fall back on large trees. Status exposes `watch_count`,
+`native_registration_mode` and `native_watch_budget_per_view`; the latter two are
+in `reconciliation_policy`. OS resource limits remain independent of this budget.
+See [managed registration and update policy](SHARED_WORKTREE_INDEXES.md#advancing-and-reconciling-views).
+
 Explicit `--watch-mode poll` and actual native-watcher failure/budget fallback
 still perform full reconciliation after `--poll-interval` seconds (default 120)
 following completion. `--no-watch` disables watching and polling, not initial

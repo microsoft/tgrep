@@ -1060,6 +1060,15 @@ If parallel extraction exhausts private headroom, the bounded batch is joined,
 its temporary outputs are dropped, and it retries once with one worker under the
 same limits. Serial pressure or any non-memory failure still fails the operation.
 
+Changed-file mask tables retain their capacity charge only while they exist;
+extraction releases temporary growth headroom, and publication releases each
+input table after consuming it. Live overlay admission accounts for hash-table
+capacities, including bucket/control storage and per-allocation padding, rather
+than accumulating a fixed allowance for every posting insertion. Table growth
+reserves both old and replacement storage before allocation; retained views and
+checkpoint capture remain charged. This allows full CRLF/smudge overlays to use
+the existing budget without normalizing bytes, weakening masks or raising limits.
+
 Workers verify and decode/hash every required file, compare exact indexed content
 identities, and extract only differences. A single assembler preserves base,
 overlay and rename/copy reuse and publishes only after epoch, identity, policy and

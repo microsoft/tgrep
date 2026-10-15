@@ -172,21 +172,31 @@ pub(crate) fn extract_merged_masks_controlled(
     permit: &std::sync::Arc<crate::managed::WorkPermit>,
     memory: &mut crate::managed::work::MemoryCharge,
 ) -> crate::managed::Result<TrigramMaskMap> {
+    let before = memory.bytes();
     let mut charged = 0_u64;
-    extract_merged_masks_inner(content, |map, windows| {
-        permit.check()?;
-        let bytes = (map.len() as u64)
-            .checked_add(windows as u64 * 2)
-            .and_then(|keys| keys.checked_add(1))
-            .and_then(u64::checked_next_power_of_two)
-            .and_then(|capacity| capacity.checked_mul(64))
-            .ok_or_else(|| crate::managed::Error::pressure("trigram-table-memory-overflow"))?;
-        if bytes > charged {
-            memory.grow(bytes - charged)?;
-            charged = bytes;
-        }
-        Ok(())
-    })
+    let masks =
+        extract_merged_masks_inner(content, |map, windows| -> crate::managed::Result<()> {
+            permit.check()?;
+            let bytes = (map.len() as u64)
+                .checked_add(windows as u64 * 2)
+                .and_then(|keys| keys.checked_add(1))
+                .and_then(u64::checked_next_power_of_two)
+                .and_then(|capacity| capacity.checked_mul(64))
+                .ok_or_else(|| crate::managed::Error::pressure("trigram-table-memory-overflow"))?;
+            if bytes > charged {
+                memory.grow(bytes - charged)?;
+                charged = bytes;
+            }
+            Ok(())
+        })?;
+    let retained =
+        crate::managed::memory::hash_table_bytes::<(TrigramHash, TrigramMasks)>(masks.capacity())?;
+    memory.resize(
+        before
+            .checked_add(retained)
+            .ok_or_else(|| crate::managed::Error::pressure("trigram-table-memory-overflow"))?,
+    )?;
+    Ok(masks)
 }
 
 fn extract_merged_masks_inner<E>(

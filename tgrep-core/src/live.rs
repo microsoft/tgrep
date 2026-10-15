@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::managed::memory::{hash_table_bytes, reserve_map, reserve_set};
 use crate::ondisk::PostingEntry;
 use crate::trigram;
 
@@ -75,38 +76,28 @@ impl LiveIndex {
         permit: &std::sync::Arc<crate::managed::WorkPermit>,
     ) -> crate::managed::Result<u64> {
         let mut bytes = std::mem::size_of::<Self>() as u64;
-        let mut add = |count: usize, width: usize| -> crate::managed::Result<()> {
+        let mut add = |amount: u64| -> crate::managed::Result<()> {
             permit.check()?;
-            bytes = (count as u64)
-                .checked_mul(width as u64)
-                .and_then(|amount| bytes.checked_add(amount))
-                .ok_or_else(|| {
-                    crate::managed::Error::pressure("overlay-memory-account-overflow")
-                })?;
+            bytes = bytes.checked_add(amount).ok_or_else(|| {
+                crate::managed::Error::pressure("overlay-memory-account-overflow")
+            })?;
             Ok(())
         };
-        add(
+        add(hash_table_bytes::<(u32, HashSet<u32>)>(
             self.inverted.capacity(),
-            2 * (std::mem::size_of::<(u32, HashSet<u32>)>() + 16),
-        )?;
-        add(
+        )?)?;
+        add(hash_table_bytes::<((u32, u32), trigram::TrigramMasks)>(
             self.masks.capacity(),
-            2 * (std::mem::size_of::<((u32, u32), trigram::TrigramMasks)>() + 16),
-        )?;
-        add(
+        )?)?;
+        add(hash_table_bytes::<(u32, String)>(
             self.file_paths.capacity(),
-            2 * (std::mem::size_of::<(u32, String)>() + 16),
-        )?;
-        add(
+        )?)?;
+        add(hash_table_bytes::<(String, u32)>(
             self.path_to_id.capacity(),
-            2 * (std::mem::size_of::<(String, u32)>() + 16),
-        )?;
-        add(
-            self.deleted_paths.capacity(),
-            2 * (std::mem::size_of::<String>() + 16),
-        )?;
+        )?)?;
+        add(hash_table_bytes::<String>(self.deleted_paths.capacity())?)?;
         for ids in self.inverted.values() {
-            add(ids.capacity(), 2 * (std::mem::size_of::<u32>() + 16))?;
+            add(hash_table_bytes::<u32>(ids.capacity())?)?;
         }
         for path in self
             .file_paths
@@ -114,7 +105,7 @@ impl LiveIndex {
             .chain(self.path_to_id.keys())
             .chain(self.deleted_paths.iter())
         {
-            add(path.capacity(), 1)?;
+            add(path.capacity() as u64)?;
         }
         Ok(bytes)
     }
@@ -125,10 +116,17 @@ impl LiveIndex {
         memory: &mut crate::managed::work::MemoryCharge,
     ) -> crate::managed::Result<Self> {
         memory.grow(self.private_memory_estimate(permit)?)?;
-        let mut copy = Self::new();
+        let mut copy = Self {
+            inverted: HashMap::with_capacity(self.inverted.len()),
+            masks: HashMap::with_capacity(self.masks.len()),
+            file_paths: HashMap::with_capacity(self.file_paths.len()),
+            path_to_id: HashMap::with_capacity(self.path_to_id.len()),
+            deleted_paths: HashSet::with_capacity(self.deleted_paths.len()),
+            ..Self::new()
+        };
         for (trigram, ids) in &self.inverted {
             permit.check()?;
-            let mut copied_ids = HashSet::new();
+            let mut copied_ids = HashSet::with_capacity(ids.len());
             for (index, id) in ids.iter().enumerate() {
                 if index % 512 == 0 {
                     permit.check()?;
@@ -174,6 +172,44 @@ impl LiveIndex {
     /// Intended to run under the index write lock after the caller has
     /// already done the expensive extraction outside the lock.
     pub fn commit_upsert(&mut self, rel_path: &str, per_tri: trigram::TrigramMaskMap) {
+        self.commit_upsert_inner(rel_path, per_tri, None)
+            .expect("uncontrolled upsert cannot fail admission");
+    }
+
+    pub(crate) fn commit_upsert_controlled(
+        &mut self,
+        rel_path: &str,
+        per_tri: trigram::TrigramMaskMap,
+        permit: &std::sync::Arc<crate::managed::WorkPermit>,
+        memory: &mut crate::managed::work::MemoryCharge,
+    ) -> crate::managed::Result<()> {
+        self.commit_upsert_inner(rel_path, per_tri, Some((permit, memory)))
+    }
+
+    fn commit_upsert_inner(
+        &mut self,
+        rel_path: &str,
+        per_tri: trigram::TrigramMaskMap,
+        mut control: Option<(
+            &std::sync::Arc<crate::managed::WorkPermit>,
+            &mut crate::managed::work::MemoryCharge,
+        )>,
+    ) -> crate::managed::Result<()> {
+        if let Some((permit, memory)) = &mut control {
+            permit.check()?;
+            let mut new_trigrams = 0;
+            for (index, trigram) in per_tri.keys().enumerate() {
+                if index % 512 == 0 {
+                    permit.check()?;
+                }
+                new_trigrams += usize::from(!self.inverted.contains_key(trigram));
+            }
+            reserve_map(&mut self.inverted, new_trigrams, memory)?;
+            reserve_map(&mut self.masks, per_tri.len(), memory)?;
+            reserve_map(&mut self.file_paths, 1, memory)?;
+            reserve_map(&mut self.path_to_id, 1, memory)?;
+            memory.grow(rel_path.len() as u64 * 2)?;
+        }
         // Remove old entry if exists
         if let Some(&old_id) = self.path_to_id.get(rel_path) {
             self.remove_file_by_id(old_id);
@@ -182,8 +218,15 @@ impl LiveIndex {
         let raw_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let file_id = raw_id | OVERLAY_BIT;
 
-        for (tri, m) in per_tri {
-            self.inverted.entry(tri).or_default().insert(file_id);
+        for (index, (tri, m)) in per_tri.into_iter().enumerate() {
+            let ids = self.inverted.entry(tri).or_default();
+            if let Some((permit, memory)) = &mut control {
+                if index % 512 == 0 {
+                    permit.check()?;
+                }
+                reserve_set(ids, 1, memory)?;
+            }
+            ids.insert(file_id);
             self.masks.insert((tri, file_id), m);
         }
 
@@ -191,6 +234,7 @@ impl LiveIndex {
         self.path_to_id.insert(rel_path.to_string(), file_id);
         self.deleted_paths.remove(rel_path);
         self.dirty_count += 1;
+        Ok(())
     }
 
     /// Insert or update a file with pre-computed trigrams.

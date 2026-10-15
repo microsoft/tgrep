@@ -3,8 +3,86 @@
 use super::{Error, Id, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, TryReserveError};
+use std::hash::{BuildHasher, Hash};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+
+pub(crate) fn hash_table_bytes<T>(capacity: usize) -> Result<u64> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    // Capacity excludes spare buckets. Bound those and one control byte per
+    // bucket by 2x; allocation/group padding is per table, not per element.
+    capacity
+        .checked_mul(2)
+        .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<T>().checked_add(1)?))
+        .and_then(|bytes| bytes.checked_add(64))
+        .map(|bytes| bytes as u64)
+        .ok_or_else(|| Error::pressure("hash-table-memory-overflow"))
+}
+
+fn reserve_table<T>(
+    length: usize,
+    capacity: usize,
+    additional: usize,
+    memory: &mut super::work::MemoryCharge,
+    reserve: impl FnOnce() -> std::result::Result<usize, TryReserveError>,
+) -> Result<()> {
+    let required = length
+        .checked_add(additional)
+        .ok_or_else(|| Error::pressure("hash-table-capacity-overflow"))?;
+    if required <= capacity {
+        return Ok(());
+    }
+    let bound = required
+        .checked_next_power_of_two()
+        .and_then(|capacity| capacity.checked_mul(2))
+        .ok_or_else(|| Error::pressure("hash-table-capacity-overflow"))?;
+    // The old table remains charged while allocation and rehashing take place.
+    let before = memory.bytes();
+    memory.grow(hash_table_bytes::<T>(bound)?)?;
+    let after = match reserve() {
+        Ok(after) => after,
+        Err(error) => {
+            memory.resize(before)?;
+            return Err(Error::new(
+                super::ErrorCategory::ResourcePressure,
+                "hash-table-allocation-failed",
+                error.to_string(),
+            ));
+        }
+    };
+    let growth = hash_table_bytes::<T>(after)?
+        .checked_sub(hash_table_bytes::<T>(capacity)?)
+        .ok_or_else(|| Error::corrupt("hash table shrank during reservation"))?;
+    memory.resize(
+        before
+            .checked_add(growth)
+            .ok_or_else(|| Error::pressure("hash-table-memory-overflow"))?,
+    )
+}
+
+pub(crate) fn reserve_map<K: Eq + Hash, V, S: BuildHasher>(
+    map: &mut HashMap<K, V, S>,
+    additional: usize,
+    memory: &mut super::work::MemoryCharge,
+) -> Result<()> {
+    reserve_table::<(K, V)>(map.len(), map.capacity(), additional, memory, || {
+        map.try_reserve(additional)?;
+        Ok(map.capacity())
+    })
+}
+
+pub(crate) fn reserve_set<T: Eq + Hash, S: BuildHasher>(
+    set: &mut HashSet<T, S>,
+    additional: usize,
+    memory: &mut super::work::MemoryCharge,
+) -> Result<()> {
+    reserve_table::<T>(set.len(), set.capacity(), additional, memory, || {
+        set.try_reserve(additional)?;
+        Ok(set.capacity())
+    })
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

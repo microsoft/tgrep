@@ -1257,6 +1257,10 @@ pub(crate) struct MemoryCharge {
 }
 
 impl MemoryCharge {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     pub(crate) fn absorb(&mut self, mut other: Self) -> Result<()> {
         if !Arc::ptr_eq(&self.permit, &other.permit) {
             return Err(Error::invalid(
@@ -1739,6 +1743,53 @@ mod tests {
             first.peak_parent_handles.load(Ordering::Relaxed),
             RECONCILE_PARENT_HANDLES + 8
         );
+    }
+
+    #[test]
+    fn hash_table_growth_charges_reallocation_and_releases_unused_headroom() {
+        use super::super::memory::{hash_table_bytes, reserve_map, reserve_set};
+        let (_temp, _namespace, permit) = fixture();
+        let mut memory = permit.memory(0).unwrap();
+        let mut map = std::collections::HashMap::new();
+        for index in 0..4096_u32 {
+            reserve_map(&mut map, 1, &mut memory).unwrap();
+            map.insert(index, index);
+            assert_eq!(
+                memory.bytes(),
+                hash_table_bytes::<(u32, u32)>(map.capacity()).unwrap()
+            );
+        }
+        assert!(permit.peak_private_bytes() > memory.bytes());
+        let capacity = map.capacity();
+        let retained = memory.bytes();
+        let occupied = permit.memory(permit.private_limit() - retained).unwrap();
+        let error = reserve_map(&mut map, capacity + 1, &mut memory).unwrap_err();
+        assert_eq!(error.category, ErrorCategory::ResourcePressure);
+        assert_eq!(map.capacity(), capacity);
+        assert_eq!(map.len(), 4096);
+        assert_eq!(memory.bytes(), retained);
+        drop(occupied);
+        let mut ids = std::collections::HashSet::new();
+        for id in 0..1024_u32 {
+            reserve_set(&mut ids, 1, &mut memory).unwrap();
+            ids.insert(id);
+            assert_eq!(
+                memory.bytes(),
+                retained + hash_table_bytes::<u32>(ids.capacity()).unwrap()
+            );
+        }
+        let capacity = ids.capacity();
+        permit.cancel();
+        assert_eq!(
+            reserve_set(&mut ids, capacity + 1, &mut memory)
+                .unwrap_err()
+                .category,
+            ErrorCategory::Cancelled
+        );
+        assert_eq!(ids.capacity(), capacity);
+        drop((map, ids, memory));
+        assert_eq!(permit.private_bytes.load(Ordering::Acquire), 0);
+        assert!(hash_table_bytes::<u64>(usize::MAX).is_err());
     }
 
     #[test]

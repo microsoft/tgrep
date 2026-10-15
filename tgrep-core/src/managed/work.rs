@@ -1456,12 +1456,12 @@ impl Drop for ChargedWriter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::managed::faults::{Action, Point, Specification};
     use crate::managed::{ObjectKind, ObjectState, Token};
 
-    fn fixture() -> (tempfile::TempDir, Arc<Namespace>, Arc<WorkPermit>) {
+    pub(crate) fn fixture() -> (tempfile::TempDir, Arc<Namespace>, Arc<WorkPermit>) {
         let temp = tempfile::tempdir().unwrap();
         let namespace = Namespace::initialize_identity(
             &"a".repeat(64),
@@ -1747,7 +1747,7 @@ mod tests {
 
     #[test]
     fn hash_table_growth_charges_reallocation_and_releases_unused_headroom() {
-        use super::super::memory::{hash_table_bytes, reserve_map, reserve_set};
+        use super::super::memory::{HashTableAllocation, hash_table_bytes, reserve_map};
         let (_temp, _namespace, permit) = fixture();
         let mut memory = permit.memory(0).unwrap();
         let mut map = std::collections::HashMap::new();
@@ -1770,8 +1770,9 @@ mod tests {
         assert_eq!(memory.bytes(), retained);
         drop(occupied);
         let mut ids = std::collections::HashSet::new();
+        let mut allocation = HashTableAllocation::default();
         for id in 0..1024_u32 {
-            reserve_set(&mut ids, 1, &mut memory).unwrap();
+            allocation.reserve_set(&mut ids, 1, &mut memory).unwrap();
             ids.insert(id);
             assert_eq!(
                 memory.bytes(),
@@ -1781,7 +1782,8 @@ mod tests {
         let capacity = ids.capacity();
         permit.cancel();
         assert_eq!(
-            reserve_set(&mut ids, capacity + 1, &mut memory)
+            allocation
+                .reserve_set(&mut ids, capacity + 1, &mut memory)
                 .unwrap_err()
                 .category,
             ErrorCategory::Cancelled
@@ -1790,6 +1792,59 @@ mod tests {
         drop((map, ids, memory));
         assert_eq!(permit.private_bytes.load(Ordering::Acquire), 0);
         assert!(hash_table_bytes::<u64>(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn hash_table_rehash_keeps_its_existing_backing_charge_after_deletions() {
+        use super::super::memory::HashTableAllocation;
+        use std::collections::HashMap;
+        use std::hash::{BuildHasherDefault, Hasher};
+
+        #[derive(Default)]
+        struct CollidingHasher;
+        impl Hasher for CollidingHasher {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, _: &[u8]) {}
+        }
+
+        let (_temp, _namespace, permit) = fixture();
+        let mut memory = permit.memory(0).unwrap();
+        let mut allocation = HashTableAllocation::default();
+        let mut map = HashMap::<u32, [u8; 64], BuildHasherDefault<CollidingHasher>>::default();
+        allocation.reserve_map(&mut map, 48, &mut memory).unwrap();
+        let capacity = map.capacity();
+        for key in 0..capacity as u32 {
+            map.insert(key, [0; 64]);
+        }
+        let allocated = memory.bytes();
+        let surviving_key = capacity as u32 - 1;
+        let address = map.get(&surviving_key).unwrap() as *const [u8; 64];
+        map.retain(|&key, _| key >= capacity as u32 - 4);
+        assert_eq!(map.get(&surviving_key).unwrap() as *const [u8; 64], address);
+        assert!(map.capacity() < capacity / 2);
+        assert!(
+            allocation.bytes::<(u32, [u8; 64])>().unwrap()
+                >= (capacity * std::mem::size_of::<(u32, [u8; 64])>()) as u64
+        );
+        let additional = map.capacity() - map.len() + 1;
+        allocation
+            .reserve_map(&mut map, additional, &mut memory)
+            .unwrap();
+        assert_eq!(map.capacity(), capacity);
+        assert_eq!(memory.bytes(), allocated);
+
+        let occupied = permit.memory(permit.private_limit() - allocated).unwrap();
+        let error = allocation
+            .reserve_map(&mut map, capacity, &mut memory)
+            .unwrap_err();
+        assert_eq!(error.category, ErrorCategory::ResourcePressure);
+        assert_eq!(map.len(), 4);
+        assert_eq!(map.capacity(), capacity);
+        assert_eq!(memory.bytes(), allocated);
+        drop((map, memory, occupied));
+        assert_eq!(permit.private_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]

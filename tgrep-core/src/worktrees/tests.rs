@@ -243,6 +243,23 @@ fn managed_crlf_overlay_fits_its_existing_budget_through_checkpoint_and_refresh(
     assert_eq!(refreshed.overlay_reused, 8);
     assert!(permit.peak_private_bytes() <= permit.private_limit());
     assert_scan_parity(&view, &["following_position_marker", r"\r"]);
+    let changed = crlf.replace("following_position_marker", "following_revision_marker");
+    assert_eq!(changed.len(), crlf.len());
+    write(&fixture.root, "files/0.txt", changed.as_bytes());
+    view.invalidate_all().unwrap();
+    let changed_stats = view.refresh_controlled(&permit).unwrap();
+    assert_eq!(changed_stats.files_extracted, 1);
+    assert_eq!(changed_stats.overlay_reused, 7);
+    assert_scan_parity(
+        &view,
+        &[
+            "following_position_marker",
+            "following_revision_marker",
+            r"\r",
+        ],
+    );
+    drop(view.capture_checkpoint(&permit).unwrap());
+    assert!(permit.peak_private_bytes() <= permit.private_limit());
     let retained = namespace
         .work_usage()
         .unwrap()

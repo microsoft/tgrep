@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::managed::memory::{hash_table_bytes, reserve_map, reserve_set};
+use crate::managed::memory::HashTableAllocation;
 use crate::ondisk::PostingEntry;
 use crate::trigram;
 
@@ -38,10 +38,23 @@ pub struct LiveIndex {
     path_to_id: HashMap<String, u32>,
     /// Paths that have been deleted (remove from reader results).
     deleted_paths: HashSet<String>,
+    // Keep allocation metadata separate from the public inverted-index map.
+    posting_allocations: HashMap<u32, HashTableAllocation>,
+    allocations: LiveAllocations,
     /// Next file ID counter (before applying OVERLAY_BIT).
     next_id: AtomicU32,
     /// Number of mutations since last save.
     dirty_count: u32,
+}
+
+#[derive(Default)]
+struct LiveAllocations {
+    inverted: HashTableAllocation,
+    masks: HashTableAllocation,
+    file_paths: HashTableAllocation,
+    path_to_id: HashTableAllocation,
+    deleted_paths: HashTableAllocation,
+    posting_allocations: HashTableAllocation,
 }
 
 impl Default for LiveIndex {
@@ -52,6 +65,8 @@ impl Default for LiveIndex {
             file_paths: HashMap::new(),
             path_to_id: HashMap::new(),
             deleted_paths: HashSet::new(),
+            posting_allocations: HashMap::new(),
+            allocations: LiveAllocations::default(),
             next_id: AtomicU32::new(0),
             dirty_count: 0,
         }
@@ -71,6 +86,23 @@ impl LiveIndex {
         self.deleted_paths.iter().map(String::as_str)
     }
 
+    fn observe_table_allocations(&mut self) {
+        self.allocations.inverted.observe(self.inverted.capacity());
+        self.allocations.masks.observe(self.masks.capacity());
+        self.allocations
+            .file_paths
+            .observe(self.file_paths.capacity());
+        self.allocations
+            .path_to_id
+            .observe(self.path_to_id.capacity());
+        self.allocations
+            .deleted_paths
+            .observe(self.deleted_paths.capacity());
+        self.allocations
+            .posting_allocations
+            .observe(self.posting_allocations.capacity());
+    }
+
     pub(crate) fn private_memory_estimate(
         &self,
         permit: &std::sync::Arc<crate::managed::WorkPermit>,
@@ -83,21 +115,20 @@ impl LiveIndex {
             })?;
             Ok(())
         };
-        add(hash_table_bytes::<(u32, HashSet<u32>)>(
-            self.inverted.capacity(),
-        )?)?;
-        add(hash_table_bytes::<((u32, u32), trigram::TrigramMasks)>(
-            self.masks.capacity(),
-        )?)?;
-        add(hash_table_bytes::<(u32, String)>(
-            self.file_paths.capacity(),
-        )?)?;
-        add(hash_table_bytes::<(String, u32)>(
-            self.path_to_id.capacity(),
-        )?)?;
-        add(hash_table_bytes::<String>(self.deleted_paths.capacity())?)?;
-        for ids in self.inverted.values() {
-            add(hash_table_bytes::<u32>(ids.capacity())?)?;
+        add(self.allocations.inverted.bytes::<(u32, HashSet<u32>)>()?)?;
+        add(self
+            .allocations
+            .masks
+            .bytes::<((u32, u32), trigram::TrigramMasks)>()?)?;
+        add(self.allocations.file_paths.bytes::<(u32, String)>()?)?;
+        add(self.allocations.path_to_id.bytes::<(String, u32)>()?)?;
+        add(self.allocations.deleted_paths.bytes::<String>()?)?;
+        add(self
+            .allocations
+            .posting_allocations
+            .bytes::<(u32, HashTableAllocation)>()?)?;
+        for allocation in self.posting_allocations.values() {
+            add(allocation.bytes::<u32>()?)?;
         }
         for path in self
             .file_paths
@@ -122,6 +153,7 @@ impl LiveIndex {
             file_paths: HashMap::with_capacity(self.file_paths.len()),
             path_to_id: HashMap::with_capacity(self.path_to_id.len()),
             deleted_paths: HashSet::with_capacity(self.deleted_paths.len()),
+            posting_allocations: HashMap::with_capacity(self.inverted.len()),
             ..Self::new()
         };
         for (trigram, ids) in &self.inverted {
@@ -133,6 +165,9 @@ impl LiveIndex {
                 }
                 copied_ids.insert(*id);
             }
+            let mut allocation = HashTableAllocation::default();
+            allocation.observe(copied_ids.capacity());
+            copy.posting_allocations.insert(*trigram, allocation);
             copy.inverted.insert(*trigram, copied_ids);
         }
         for (key, masks) in &self.masks {
@@ -151,6 +186,7 @@ impl LiveIndex {
         copy.next_id
             .store(self.next_id.load(Ordering::Relaxed), Ordering::Relaxed);
         copy.dirty_count = self.dirty_count;
+        copy.observe_table_allocations();
         Ok(copy)
     }
 
@@ -195,8 +231,15 @@ impl LiveIndex {
             &mut crate::managed::work::MemoryCharge,
         )>,
     ) -> crate::managed::Result<()> {
-        if let Some((permit, memory)) = &mut control {
+        if let Some((permit, _)) = &control {
             permit.check()?;
+        }
+        // Controlled callers mutate an unpublished clone. Remove replacements
+        // before sizing growth; their backing allocations remain charged.
+        if let Some(&old_id) = self.path_to_id.get(rel_path) {
+            self.remove_file_by_id(old_id);
+        }
+        if let Some((permit, memory)) = &mut control {
             let mut new_trigrams = 0;
             for (index, trigram) in per_tri.keys().enumerate() {
                 if index % 512 == 0 {
@@ -204,15 +247,24 @@ impl LiveIndex {
                 }
                 new_trigrams += usize::from(!self.inverted.contains_key(trigram));
             }
-            reserve_map(&mut self.inverted, new_trigrams, memory)?;
-            reserve_map(&mut self.masks, per_tri.len(), memory)?;
-            reserve_map(&mut self.file_paths, 1, memory)?;
-            reserve_map(&mut self.path_to_id, 1, memory)?;
+            self.allocations
+                .inverted
+                .reserve_map(&mut self.inverted, new_trigrams, memory)?;
+            self.allocations
+                .masks
+                .reserve_map(&mut self.masks, per_tri.len(), memory)?;
+            self.allocations
+                .file_paths
+                .reserve_map(&mut self.file_paths, 1, memory)?;
+            self.allocations
+                .path_to_id
+                .reserve_map(&mut self.path_to_id, 1, memory)?;
+            self.allocations.posting_allocations.reserve_map(
+                &mut self.posting_allocations,
+                new_trigrams,
+                memory,
+            )?;
             memory.grow(rel_path.len() as u64 * 2)?;
-        }
-        // Remove old entry if exists
-        if let Some(&old_id) = self.path_to_id.get(rel_path) {
-            self.remove_file_by_id(old_id);
         }
 
         let raw_id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -220,19 +272,22 @@ impl LiveIndex {
 
         for (index, (tri, m)) in per_tri.into_iter().enumerate() {
             let ids = self.inverted.entry(tri).or_default();
+            let allocation = self.posting_allocations.entry(tri).or_default();
             if let Some((permit, memory)) = &mut control {
                 if index % 512 == 0 {
                     permit.check()?;
                 }
-                reserve_set(ids, 1, memory)?;
+                allocation.reserve_set(ids, 1, memory)?;
             }
             ids.insert(file_id);
+            allocation.observe(ids.capacity());
             self.masks.insert((tri, file_id), m);
         }
 
         self.file_paths.insert(file_id, rel_path.to_string());
         self.path_to_id.insert(rel_path.to_string(), file_id);
         self.deleted_paths.remove(rel_path);
+        self.observe_table_allocations();
         self.dirty_count += 1;
         Ok(())
     }
@@ -257,12 +312,18 @@ impl LiveIndex {
         let file_id = raw_id | OVERLAY_BIT;
 
         for &tri in &trigrams {
-            self.inverted.entry(tri).or_default().insert(file_id);
+            let ids = self.inverted.entry(tri).or_default();
+            ids.insert(file_id);
+            self.posting_allocations
+                .entry(tri)
+                .or_default()
+                .observe(ids.capacity());
         }
 
         self.file_paths.insert(file_id, rel_path.to_string());
         self.path_to_id.insert(rel_path.to_string(), file_id);
         self.deleted_paths.remove(rel_path);
+        self.observe_table_allocations();
         self.dirty_count += 1;
     }
 
@@ -272,7 +333,27 @@ impl LiveIndex {
             self.remove_file_by_id(file_id);
         }
         self.deleted_paths.insert(rel_path.to_string());
+        self.allocations
+            .deleted_paths
+            .observe(self.deleted_paths.capacity());
         self.dirty_count += 1;
+    }
+
+    pub(crate) fn delete_file_controlled(
+        &mut self,
+        rel_path: &str,
+        permit: &std::sync::Arc<crate::managed::WorkPermit>,
+        memory: &mut crate::managed::work::MemoryCharge,
+    ) -> crate::managed::Result<()> {
+        permit.check()?;
+        if !self.deleted_paths.contains(rel_path) {
+            self.allocations
+                .deleted_paths
+                .reserve_set(&mut self.deleted_paths, 1, memory)?;
+            memory.grow(rel_path.len() as u64)?;
+        }
+        self.delete_file(rel_path);
+        Ok(())
     }
 
     /// Look up a trigram in the live overlay (file IDs only).
@@ -406,6 +487,7 @@ impl LiveIndex {
         self.file_paths.shrink_to_fit();
         self.path_to_id.shrink_to_fit();
         self.deleted_paths.shrink_to_fit();
+        self.posting_allocations.shrink_to_fit();
     }
 
     /// Get all live file IDs.
@@ -534,13 +616,19 @@ impl LiveIndex {
         if self.path_to_id.is_empty() {
             self.inverted.clear();
             self.masks.clear();
+            self.posting_allocations.clear();
             return;
         }
         // Single retain over inverted: remove all matching ids from each
         // posting set in one pass; drop empty posting sets.
-        self.inverted.retain(|_, set| {
+        self.inverted.retain(|tri, set| {
             set.retain(|fid| !ids.contains(fid));
-            !set.is_empty()
+            if set.is_empty() {
+                self.posting_allocations.remove(tri);
+                false
+            } else {
+                true
+            }
         });
         // Single retain over masks: drop any (tri, fid) where fid was removed.
         self.masks.retain(|&(_, fid), _| !ids.contains(&fid));
@@ -599,6 +687,8 @@ impl LiveIndex {
         let file_paths = std::mem::take(&mut self.file_paths);
         let path_to_id = std::mem::take(&mut self.path_to_id);
         let deleted_paths = std::mem::take(&mut self.deleted_paths);
+        let posting_allocations = std::mem::take(&mut self.posting_allocations);
+        self.allocations = LiveAllocations::default();
 
         // Only pay the thread-creation cost when the overlay is large
         // enough that an inline drop would noticeably stall the caller.
@@ -612,6 +702,7 @@ impl LiveIndex {
             drop(file_paths);
             drop(path_to_id);
             drop(deleted_paths);
+            drop(posting_allocations);
         } else if std::thread::Builder::new()
             .name("tgrep-drop-overlay".into())
             .spawn(move || {
@@ -620,6 +711,7 @@ impl LiveIndex {
                 drop(file_paths);
                 drop(path_to_id);
                 drop(deleted_paths);
+                drop(posting_allocations);
             })
             .is_err()
         {
@@ -649,11 +741,10 @@ impl LiveIndex {
 
     fn remove_file_by_id(&mut self, file_id: u32) {
         // Remove from inverted index and masks
-        let mut trigrams_to_clean = Vec::new();
         self.inverted.retain(|&tri, set| {
             set.remove(&file_id);
             if set.is_empty() {
-                trigrams_to_clean.push(tri);
+                self.posting_allocations.remove(&tri);
                 false
             } else {
                 true
@@ -671,6 +762,152 @@ impl LiveIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed::work::tests::fixture as controlled;
+
+    #[test]
+    fn replacement_admission_reuses_the_removed_files_table_capacity() {
+        let (_temp, _namespace, permit) = controlled();
+        let masks: trigram::TrigramMaskMap = (0..3)
+            .map(|tri| (tri, trigram::TrigramMasks::default()))
+            .collect();
+        let mut published = LiveIndex::new();
+        published.commit_upsert("file.txt", masks.clone());
+        let original_id = published.file_id_for_path("file.txt").unwrap();
+        let original_bytes = published.private_memory_estimate(&permit).unwrap();
+        let retained = permit.memory(original_bytes).unwrap().retain(0).unwrap();
+        let mut memory = permit.memory(0).unwrap();
+        let mut replacement = published.clone_controlled(&permit, &mut memory).unwrap();
+        let occupied = permit
+            .memory(permit.private_limit() - original_bytes - memory.bytes() - 320)
+            .unwrap();
+
+        replacement
+            .commit_upsert_controlled("file.txt", masks, &permit, &mut memory)
+            .unwrap();
+        assert_eq!(replacement.num_files(), 1);
+        assert_eq!(replacement.masks.capacity(), 3);
+        assert_ne!(replacement.file_id_for_path("file.txt"), Some(original_id));
+        let larger = (0..4096)
+            .map(|tri| (tri, trigram::TrigramMasks::default()))
+            .collect();
+        let error = replacement
+            .commit_upsert_controlled("file.txt", larger, &permit, &mut memory)
+            .unwrap_err();
+        assert_eq!(
+            error.category,
+            crate::managed::ErrorCategory::ResourcePressure
+        );
+        assert_eq!(published.file_id_for_path("file.txt"), Some(original_id));
+        assert_eq!(published.masks.len(), 3);
+        drop((replacement, memory, published, retained, occupied));
+        assert!(permit.memory(permit.private_limit()).is_ok());
+    }
+
+    #[test]
+    fn deletion_retains_backing_storage_charges_until_rebuilt() {
+        use std::hash::BuildHasher;
+
+        for batch in [false, true] {
+            let (_temp, namespace, permit) = controlled();
+            let mut live = LiveIndex::new();
+            let tri = trigram::hash(b'a', b'b', b'c');
+            let masks = || {
+                [(tri, trigram::TrigramMasks::default())]
+                    .into_iter()
+                    .collect()
+            };
+            live.commit_upsert("file-0", masks());
+            let first_id = live.file_id_for_path("file-0").unwrap();
+            let ids = live.inverted.get_mut(&tri).unwrap();
+            ids.reserve(48);
+            let allocated_capacity = ids.capacity();
+            let bucket_mask = allocated_capacity.next_power_of_two() as u64 - 1;
+            let hasher = ids.hasher().clone();
+            let bucket = hasher.hash_one(first_id) & bucket_mask;
+            let mut paths = vec!["file-0".to_string()];
+            let mut raw_id = 1_u32;
+            while paths.len() < allocated_capacity {
+                if hasher.hash_one(raw_id | OVERLAY_BIT) & bucket_mask == bucket {
+                    let path = format!("file-{raw_id}");
+                    live.next_id.store(raw_id, Ordering::Relaxed);
+                    live.commit_upsert(&path, masks());
+                    paths.push(path);
+                }
+                raw_id += 1;
+            }
+            let keep_id = live.file_id_for_path(paths.last().unwrap()).unwrap();
+            let keep_address = live.inverted[&tri].get(&keep_id).unwrap() as *const u32;
+            let before = live.private_memory_estimate(&permit).unwrap();
+            let mut memory = permit.memory(before).unwrap();
+            let removed = &paths[..paths.len() - 4];
+            let freed_strings: u64 = removed
+                .iter()
+                .map(|path| {
+                    let (key, id) = live.path_to_id.get_key_value(path).unwrap();
+                    (key.capacity() + live.file_paths[id].capacity()) as u64
+                })
+                .sum();
+            if batch {
+                live.batch_remove_overlay_entries(removed);
+            } else {
+                for path in removed {
+                    live.remove_overlay_entry(path);
+                }
+            }
+            assert_eq!(live.num_files(), 4);
+            assert_eq!(
+                live.inverted[&tri].get(&keep_id).unwrap() as *const u32,
+                keep_address
+            );
+            assert!(live.inverted[&tri].capacity() < allocated_capacity / 2);
+            memory
+                .resize(live.private_memory_estimate(&permit).unwrap())
+                .unwrap();
+            let retained = memory.retain(0).unwrap();
+            // Copy entries were erased in place. Only the removed path strings
+            // were freed; all top-level tables and the posting set still exist.
+            assert_eq!(
+                namespace
+                    .work_usage()
+                    .unwrap()
+                    .memory
+                    .retained_private_estimate_bytes,
+                before - freed_strings,
+                "deletion released a charge for backing storage that is still allocated"
+            );
+
+            let mut copy_memory = permit.memory(0).unwrap();
+            let copy = live.clone_controlled(&permit, &mut copy_memory).unwrap();
+            let rebuilt_bytes = copy.private_memory_estimate(&permit).unwrap();
+            assert!(rebuilt_bytes < before - freed_strings);
+            copy_memory.resize(rebuilt_bytes).unwrap();
+            assert_eq!(copy.num_files(), 4);
+            assert_eq!(
+                live.inverted[&tri].get(&keep_id).unwrap() as *const u32,
+                keep_address
+            );
+            live.batch_remove_overlay_entries(&live.overlay_paths());
+            assert!(
+                live.private_memory_estimate(&permit).unwrap()
+                    > std::mem::size_of::<LiveIndex>() as u64
+            );
+            assert!(live.try_drop_all_persisted(&HashSet::new()));
+            assert_eq!(
+                live.private_memory_estimate(&permit).unwrap(),
+                std::mem::size_of::<LiveIndex>() as u64
+            );
+            drop((live, retained, copy, copy_memory));
+            assert_eq!(
+                namespace
+                    .work_usage()
+                    .unwrap()
+                    .memory
+                    .retained_private_estimate_bytes,
+                0
+            );
+            assert!(permit.memory(permit.private_limit()).is_ok());
+        }
+    }
 
     #[test]
     fn descendant_lookup_is_directory_boundary_aware() {

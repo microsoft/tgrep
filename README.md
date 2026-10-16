@@ -943,6 +943,9 @@ registers that claim, then calls `views.attach` through `shared manage`. Operati
 are asynchronous: inspect their receipts and wait for a reconciled ready view.
 After attachment, normal search and `--files` discover that view. Do not use
 the v1 `shared attach` command to create a managed lease.
+A typed owner-hold failure before its `holding:true` handshake is one
+`{"ok":false,"error":...}` stdout line; retry the same claim only as the
+client contract linked below specifies.
 The [v2 client contract](SHARED_WORKTREE_INDEXES.md#managed-client-contract)
 specifies complete request shapes, recovery and token acknowledgement.
 

@@ -279,7 +279,20 @@ pub(super) fn owner_hold(path: &Path) -> Result<()> {
         "managed owner claim exceeds its size limit"
     );
     let claim: OwnerClaim = serde_json::from_slice(&bytes)?;
-    let guard = OwnerGuard::claim(claim)?;
+    let guard = match OwnerGuard::claim(claim) {
+        Ok(guard) => guard,
+        Err(error) => {
+            // Pre-handshake typed failure: frame it as received, without inferring
+            // retryability. A lost frame leaves the caller with exit 2 and no
+            // handshake, which still fails closed.
+            if let Ok(failure) = serde_json::to_value(&error) {
+                let mut stdout = std::io::stdout().lock();
+                let _ = writeln!(stdout, "{}", json!({"ok":false,"error":failure}))
+                    .and_then(|()| stdout.flush());
+            }
+            return Err(error.into());
+        }
+    };
     println!("{}", json!({"holding":true,"claim":guard.registration()}));
     std::io::stdout().flush()?;
     let mut byte = [0_u8; 1];

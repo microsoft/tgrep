@@ -1213,6 +1213,22 @@ writers, as does the trusted-storage contract.
 2. Start and supervise `tgrep shared owner-hold --claim CLAIM_FILE`, keeping its
    stdin open. After its `holding:true` response, call `owners.register` with
    `{"claim":<issued-claim>}`. A Rust client can instead retain `OwnerGuard`.
+   If typed claim acquisition fails before that handshake, the helper writes
+   exactly one newline-terminated `{"ok":false,"error":...}` stdout line whose
+   managed failure fields (`category`, `reason_code`, `retryable`,
+   `committed_state`, `detail`) are reported as returned, then exits with
+   status 2 and its unchanged `tgrep: <reason_code>: <detail>` stderr diagnostic.
+   Examples are `busy`/`catalog-io` (another catalog writer outlasted the fixed
+   SQLite wait), `busy`/`owner-guard-already-held`, `busy`/`namespace-admission-*`
+   and non-retryable `stale-identity` claims whose namespace, instance or
+   lifetime ended. Claim acquisition writes nothing to the catalog.
+   Claim-file read, size and parse errors are not classified and write no stdout
+   line; neither does any failure after `holding:true`, such as a lost handshake.
+   Reuse the same claim file only after a frame with `retryable:true` and
+   `committed_state:"not-committed"`, after confirming that the failed helper
+   exited, within the client's existing attempt and time bounds. Treat no frame,
+   an unparsable line or any other classification as a failed owner handshake.
+   Clients that accept only `holding:true` fail closed on this frame.
 3. Persist a unique lease token and the complete operation token/request before
    calling `views.attach`. Poll `operations.inspect`, then verify `views.status`
    or `lookup` reports ready. A routing-ready daemon is not a search-ready view.

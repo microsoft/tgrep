@@ -893,6 +893,145 @@ fn owner_holder_enforces_claim_file_size_limit() {
     fixture.temp.close().unwrap();
 }
 
+fn owner_hold(path: &Path) -> runtime::Process {
+    runtime::Process::start(Command::new(assert_cmd::cargo::cargo_bin("tgrep")).args([
+        "shared",
+        "owner-hold",
+        "--claim",
+        path.to_str().unwrap(),
+    ]))
+}
+
+fn stdout_lines(bytes: &[u8]) -> Vec<Value> {
+    let text = std::str::from_utf8(bytes).unwrap();
+    assert!(text.is_empty() || text.ends_with('\n'), "{text:?}");
+    text.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The exact pre-handshake contract: one `{ok:false,error}` line, exit 2 and
+/// the unchanged human diagnostic, never a `holding` success.
+fn pre_handshake_failure(output: &Output, category: &str, reason: &str, retryable: bool) -> Value {
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let lines = stdout_lines(&output.stdout);
+    assert_eq!(lines.len(), 1, "{output:?}");
+    let frame = &lines[0];
+    let mut keys: Vec<_> = frame
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["error", "ok"], "{frame}");
+    assert_eq!(frame["ok"], false, "{frame}");
+    let error = &frame["error"];
+    assert_eq!(error["category"], category, "{frame}");
+    assert_eq!(error["reason_code"], reason, "{frame}");
+    assert_eq!(error["retryable"], retryable, "{frame}");
+    assert_eq!(error["committed_state"], "not-committed", "{frame}");
+    let detail = error["detail"].as_str().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        format!("tgrep: {reason}: {detail}"),
+        "{output:?}"
+    );
+    error.clone()
+}
+
+fn holding_handshake(process: &mut runtime::Process, prepared: &Value) {
+    let holding = wait_json(process, "holding");
+    assert_eq!(holding["claim"], prepared["claim"]);
+    // The success handshake is unchanged and is never preceded by a failure frame.
+    assert_eq!(stdout_lines(&process.stdout()), [holding]);
+}
+
+#[test]
+fn owner_holder_frames_catalog_contention_and_the_same_claim_then_holds() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let prepared = daemon.rpc("owners.prepare", json!({"token":"framed-contention"}));
+    let claim: OwnerClaim = serde_json::from_value(prepared["claim"].clone()).unwrap();
+    let path = fixture.temp.path().join("framed-contention.claim.json");
+    fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
+
+    // Hold the catalog writer until the failed helper has exited.
+    let mut connection = rusqlite::Connection::open(claim.storage.join("catalog.sqlite")).unwrap();
+    connection.busy_timeout(Duration::from_secs(10)).unwrap();
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+    transaction.rollback().unwrap();
+    drop(connection);
+    let error = pre_handshake_failure(&output, "busy", "catalog-io", true);
+    assert_eq!(error["detail"], "database is locked");
+
+    // The confirmed-exited helper left no claim state: the SAME claim now holds.
+    let mut holder = owner_hold(&path);
+    holding_handshake(&mut holder, &prepared);
+    daemon.rpc("owners.register", json!({"claim":claim}));
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    holder.close_input();
+    success(holder.finish(Duration::from_secs(30)).unwrap());
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn owner_holder_frames_typed_refusals_without_inferring_retry_safety() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let prepared = daemon.rpc("owners.prepare", json!({"token":"framed-refusals"}));
+    let claim: OwnerClaim = serde_json::from_value(prepared["claim"].clone()).unwrap();
+    let path = fixture.temp.path().join("framed-refusals.claim.json");
+    fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
+
+    // A live holder's OS lock is reported as typed busy; the holder is unaffected.
+    let mut holder = owner_hold(&path);
+    holding_handshake(&mut holder, &prepared);
+    let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+    pre_handshake_failure(&output, "busy", "owner-guard-already-held", true);
+    assert!(holder.running());
+    daemon.rpc("owners.register", json!({"claim":claim}));
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    holder.close_input();
+    success(holder.finish(Duration::from_secs(30)).unwrap());
+
+    // An ended lifetime is framed as non-retryable, never as a fresh claim.
+    let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+    pre_handshake_failure(&output, "stale-identity", "owner-lifetime-ended", false);
+
+    // Untyped claim-file failures have no managed classification and stay unframed.
+    for (name, bytes) in [
+        ("malformed", b"{".to_vec()),
+        (
+            "unknown-field",
+            serde_json::to_vec(&{
+                let mut value = prepared["claim"].clone();
+                value["unexpected"] = json!(true);
+                value
+            })
+            .unwrap(),
+        ),
+    ] {
+        let path = fixture.temp.path().join(format!("{name}.claim.json"));
+        fs::write(&path, bytes).unwrap();
+        let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{name}: {output:?}");
+        assert!(output.stdout.is_empty(), "{name}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).starts_with("tgrep: "),
+            "{name}: {output:?}"
+        );
+    }
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
 #[test]
 fn owner_holder_graceful_eof_releases_its_os_proof_without_guessing_process_identity() {
     let fixture = Fixture::new();

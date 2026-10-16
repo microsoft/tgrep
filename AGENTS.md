@@ -80,6 +80,9 @@ operation/lease tokens, register an instance-bound owner guard, and attach a
 versioned view. `shared owner-hold --claim <issued-claim.json>` retains ownership
 until stdin closes; supervise that process too. Do not replace its guard with a
 PID check or inactivity timeout. Unknown ownership proof protects the lease.
+Before `holding:true`, a typed claim failure is one `{"ok":false,"error":...}`
+stdout line plus exit 2. Retry the same claim only for retryable
+`not-committed` failures after the failed helper exits.
 Normal queries discover a ready managed attachment without new search flags.
 Managed RPC also requires a per-daemon private credential; the CLI loads it
 automatically from an owner-only file. Public namespace/instance IDs are not

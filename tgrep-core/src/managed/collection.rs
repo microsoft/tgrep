@@ -514,7 +514,14 @@ mod tests {
         };
         let mut generations = Vec::new();
         let mut stages = Vec::new();
-        for (index, stage_bytes) in [3 * MIB, 2 * MIB].into_iter().enumerate() {
+        // macOS re-verifies the remainder after each truncation. Keep the same
+        // bounds and admission pressure by moving bytes into pinned generations.
+        let (generation_bytes, stage_sizes) = if cfg!(target_os = "macos") {
+            (5 * MIB / 2, [3 * MIB / 4, MIB / 2])
+        } else {
+            (2 * MIB, [3 * MIB, 2 * MIB])
+        };
+        for (index, stage_bytes) in stage_sizes.into_iter().enumerate() {
             let operation = namespace
                 .accept_system_operation(
                     Token::parse(format!("spill-build-{index}")).unwrap(),
@@ -530,7 +537,7 @@ mod tests {
                 )
                 .unwrap();
             for (kind, bytes) in [
-                (ObjectKind::Generation, 2 * MIB),
+                (ObjectKind::Generation, generation_bytes),
                 (ObjectKind::BuildStage, stage_bytes),
             ] {
                 let (object, pin) = namespace.create_object(kind, None, &permit).unwrap();
@@ -671,7 +678,7 @@ mod tests {
                 &mut bytes,
             )
             .unwrap();
-            assert_eq!(bytes, vec![b'a'; (2 * MIB) as usize]);
+            assert_eq!(bytes, vec![b'a'; generation_bytes as usize]);
         }
         drop(generations);
         namespace.release_owner(owner.registration()).unwrap();

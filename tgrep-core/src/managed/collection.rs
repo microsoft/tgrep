@@ -430,8 +430,7 @@ mod tests {
 
     #[test]
     fn busy_idle_probe_preserves_cached_proof_for_external_work() {
-        let (temp, namespace, _object, path) =
-            authenticated_fixture(&vec![b'a'; 128 * 1024 + 17]);
+        let (temp, namespace, _object, path) = authenticated_fixture(&vec![b'a'; 128 * 1024 + 17]);
         let (request, _) = cached_prefix(&namespace, "before-busy-probe");
         let retained = namespace
             .work_usage()
@@ -468,12 +467,7 @@ mod tests {
             namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"],
             8192
         );
-        assert!(
-            namespace
-                .stop_if_idle(Default::default())
-                .unwrap()
-                .stopping
-        );
+        assert!(namespace.stop_if_idle(Default::default()).unwrap().stopping);
         assert_eq!(
             namespace.verification_diagnostics().unwrap()["state"],
             "empty"
@@ -642,7 +636,10 @@ mod tests {
             }
         }
         assert!(busy_probes > 1);
-        assert_eq!(removed, 2, "both completed build stages must finish collection");
+        assert_eq!(
+            removed, 2,
+            "both completed build stages must finish collection"
+        );
         assert_eq!(reclaimed, stage_bytes);
         assert_eq!(
             namespace.work_usage().unwrap().object_logical_bytes,
@@ -655,13 +652,19 @@ mod tests {
         let permit = namespace
             .reserve(&attachment.id, None, request.clone())
             .expect("reclamation must reopen admission without increasing the allocation");
-        assert_eq!(namespace.allocation().unwrap().storage_bytes, Some(16 * MIB));
+        assert_eq!(
+            namespace.allocation().unwrap().storage_bytes,
+            Some(16 * MIB)
+        );
         drop(permit);
         namespace
             .record_operation_result(&attachment.id, Ok(serde_json::json!({})), false)
             .unwrap();
         for pin in &generations {
-            assert_eq!(namespace.object(&pin.id).unwrap().state, ObjectState::Published);
+            assert_eq!(
+                namespace.object(&pin.id).unwrap().state,
+                ObjectState::Published
+            );
             let mut bytes = Vec::new();
             std::io::Read::read_to_end(
                 &mut pin.directory.open_file("payload.bin", false).unwrap(),

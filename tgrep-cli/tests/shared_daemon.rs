@@ -2940,12 +2940,63 @@ fn oversized_single_file_response_errors_and_cli_scans_without_truncation() {
             .contains("response exceeds 64 MiB"),
         "{response}"
     );
-    let output = cli(&f.a, &["-c", "--", "oversize_marker", "."]);
+    let args = [
+        "--color",
+        "never",
+        "--path-separator",
+        "/",
+        "--stats",
+        "--",
+        "oversize_marker",
+        ".",
+    ];
+    let output = cli(&f.a, &args);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("scanning filesystem"),
-        "{output:?}"
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(success(output).contains("oversized.txt:1"));
+    assert_eq!(output.status.code(), Some(0));
+    let scanned = cli(&f.a, &[&["--no-index"][..], &args].concat());
+    assert_eq!(scanned.status.code(), Some(0));
+    assert!(
+        output.stdout == scanned.stdout,
+        "fallback content differs from the full scan ({} vs {} bytes)",
+        output.stdout.len(),
+        scanned.stdout.len()
+    );
+    assert!(output.stdout.len() > 12 * 1024 * 1024);
+
+    let raw = d
+        .raw_response(&d.request(
+            "search",
+            json!({"root":f.a,"view":a["view"],"query":{
+                "pattern":"oversize_marker","count":true,"detail":false
+            }}),
+        ))
+        .unwrap();
+    assert!(raw.len() < 4 * 1024, "count response: {} bytes", raw.len());
+    let response: Value = serde_json::from_str(&raw).unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["backend"], "shared-v1");
+    assert_eq!(response["result"]["ready"], true);
+    assert_eq!(response["result"]["view"], a["view"]);
+    assert_eq!(
+        response["result"]["matches"],
+        json!([{"type":"count","file":"oversized.txt","lines":1}])
+    );
+    let counted = cli(&f.a, &[&["-c"][..], &args].concat());
+    assert_eq!(counted.status.code(), Some(0));
+    assert_eq!(counted.stdout, b"./oversized.txt:1\n");
+    let scanned_count = cli(&f.a, &[&["--no-index", "-c"][..], &args].concat());
+    assert_eq!(scanned_count.status.code(), Some(0));
+    assert_eq!(counted.stdout, scanned_count.stdout);
+    let stderr = String::from_utf8_lossy(&counted.stderr);
+    assert!(stderr.contains("(via shared daemon v1)"), "{stderr}");
+    assert!(
+        !stderr.contains("warning:") && !stderr.contains("Brute-force"),
+        "{stderr}"
+    );
     assert_eq!(d.search(&f.a, "shared_term")["backend"], "shared-v1");
 }
 

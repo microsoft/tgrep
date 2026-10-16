@@ -477,6 +477,138 @@ mod tests {
         temp.close().unwrap();
     }
 
+    /// Runs `test` alone in a child test process and returns whether the caller
+    /// is that child. Concurrent tests that fork would otherwise briefly retain
+    /// inherited descriptors and perturb Linux lease acquisition.
+    #[cfg(target_os = "linux")]
+    fn isolated_lease_fixture(test: &str) -> bool {
+        const VARIABLE: &str = "TGREP_NATIVE_LEASE_FIXTURE";
+        if std::env::var_os(VARIABLE).is_some() {
+            return true;
+        }
+        use crate::managed::process::{Control, PipedProcess};
+        let name = format!("managed::collection::tests::{test}");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(VARIABLE, "1");
+        let mut child = PipedProcess::spawn(&mut command, Control::bootstrap(), false).unwrap();
+        let output = child.read_output(64 * 1024).unwrap();
+        let (status, diagnostics) = child.finish().unwrap();
+        let output = String::from_utf8_lossy(&output);
+        assert!(status.success(), "{diagnostics}\n{output}");
+        assert!(
+            output.contains("test result: ok. 1 passed"),
+            "{name} did not run\n{output}"
+        );
+        false
+    }
+
+    /// Opens like an on-access scanner. A non-blocking open breaks a live lease
+    /// without waiting for the holder to release it.
+    #[cfg(target_os = "linux")]
+    fn foreign_read(path: &std::path::Path) -> std::io::Result<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        File::options()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_reader_breaks_the_cached_lease_and_collection_fails_closed() {
+        if !isolated_lease_fixture(
+            "foreign_reader_breaks_the_cached_lease_and_collection_fails_closed",
+        ) {
+            return;
+        }
+        let original = vec![b'a'; 8193];
+        let (temp, namespace, object, path) = authenticated_fixture(&original);
+        let (request, _) = cached_prefix(&namespace, "before-foreign-reader");
+        let refused = foreign_read(&path).unwrap_err();
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(libc::EWOULDBLOCK),
+            "the cached proof did not hold an exclusive lease"
+        );
+        let progress = request_pass(&namespace, &request, "after-foreign-reader");
+        assert_eq!(progress.errors, 1, "{progress:?}");
+        assert_eq!(progress.skipped, 1);
+        assert_eq!(progress.removed, 0);
+        assert_eq!(progress.verification_bytes, 0);
+        assert!(!progress.verification_context_retained);
+        assert_eq!(
+            progress.logical_bytes_reclaimed + progress.recovered_logical_bytes,
+            0
+        );
+        assert_eq!(
+            progress.details[0].reasons,
+            ["member-verification-invalidated"]
+        );
+        let error = progress.details[0].error.as_ref().unwrap();
+        assert_eq!(error["category"], "stale-identity");
+        assert_eq!(
+            error["detail"],
+            "the exclusive file lease was broken or revoked"
+        );
+        assert_eq!(
+            namespace.verification_diagnostics().unwrap()["state"],
+            "empty"
+        );
+        let mut retained = Vec::new();
+        std::io::Read::read_to_end(&mut foreign_read(&path).unwrap(), &mut retained).unwrap();
+        assert_eq!(retained, original);
+        let recovered = pass(&namespace, "after-foreign-reader-closed");
+        assert_eq!(recovered.errors, 0, "{recovered:?}");
+        assert_eq!(recovered.removed, 1);
+        assert_eq!(recovered.logical_bytes_reclaimed, object.logical_bytes);
+        assert!(!path.exists());
+        drop(namespace);
+        temp.close().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_reader_at_lease_acquisition_keeps_collection_busy_and_retryable() {
+        if !isolated_lease_fixture(
+            "foreign_reader_at_lease_acquisition_keeps_collection_busy_and_retryable",
+        ) {
+            return;
+        }
+        let (temp, namespace, object, path) = authenticated_fixture(&[b'a'; 4096]);
+        let reader = foreign_read(&path).unwrap();
+        let progress = pass(&namespace, "foreign-reader-open");
+        assert_eq!(progress.errors, 1, "{progress:?}");
+        assert_eq!(progress.skipped, 1);
+        assert_eq!(progress.removed, 0);
+        assert_eq!(progress.verification_bytes, 0);
+        assert_eq!(
+            progress.logical_bytes_reclaimed + progress.recovered_logical_bytes,
+            0
+        );
+        assert_eq!(
+            progress.details[0].reasons,
+            ["member-writer-or-mapping-active"]
+        );
+        let error = progress.details[0].error.as_ref().unwrap();
+        assert_eq!(error["category"], "busy");
+        assert_eq!(error["retryable"], true);
+        assert!(path.exists());
+        assert_eq!(
+            namespace.object(&object.id).unwrap().state,
+            ObjectState::PendingDeletion
+        );
+        drop(reader);
+        let recovered = pass(&namespace, "foreign-reader-closed");
+        assert_eq!(recovered.errors, 0, "{recovered:?}");
+        assert_eq!(recovered.removed, 1);
+        assert_eq!(recovered.logical_bytes_reclaimed, object.logical_bytes);
+        assert!(!path.exists());
+        drop(namespace);
+        temp.close().unwrap();
+    }
+
     #[test]
     fn busy_idle_probes_preserve_staging_reclamation_and_storage_admission() {
         use crate::managed::OwnerGuard;

@@ -385,6 +385,11 @@ impl ViewManager {
                 "unmanaged leases cannot attach to managed storage",
             ));
         }
+        if !request.profile.eligibility.is_default() {
+            return Err(Error::incompatible(
+                "unmanaged leases support only the default content eligibility",
+            ));
+        }
         let token = Token::parse(format!(
             "legacy-{}",
             blake3::hash(request.lease.as_str().as_bytes()).to_hex()

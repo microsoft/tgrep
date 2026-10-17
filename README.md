@@ -432,6 +432,7 @@ These tables describe search flags. Use `tgrep index --help` and
 | `--no-ignore` | Don't respect `.gitignore` or `p4ignore.ini` files |
 | `-a, --text` | Search binary files as if they were text |
 | `--binary` | Search binary files, reporting a note instead of their contents |
+| `--content-eligibility extensions/content` | `content` admits text behind the binary-extension heuristic; uses only a matching managed view (see below) |
 | `-u, --unrestricted` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden, `-uuu` = +binary |
 | `--max-filesize <SIZE>` | Skip files larger than `SIZE` (`K`/`M`/`G` suffixes); default 64M |
 | `--no-max-filesize` | Apply no size limit, as ripgrep does |
@@ -673,6 +674,17 @@ tgrep also skips known binary extensions during directory content searches
 and indexing, unlike ripgrep. For searches, `--binary` and `-a` lift this
 restriction and bypass the index; they do not change what `index` or `serve`
 indexes. `--files` lists binary paths too.
+
+`--content-eligibility content` is the explicit ripgrep-parity alternative for
+managed shared views. It drops only the extension heuristic: files are still
+classified by content, so NUL-containing files stay excluded as binary, and
+ignore, hidden, size and filename rules are unchanged. It is indexed only by a
+managed v2 view attached with the `content-only` eligibility profile (see
+[SHARED_WORKTREE_INDEXES.md](SHARED_WORKTREE_INDEXES.md#content-eligibility-profiles)).
+It bypasses ordinary servers and local indexes, which use the extension rule.
+Any profile mismatch, in either direction, produces the usual shared-fallback
+warning and a filesystem scan using the requested rule. The default,
+`extensions`, keeps the behaviour above. `index` and `serve` reject the flag.
 
 ### Flags that bypass the index
 

@@ -317,7 +317,8 @@ Clean Git status and equal blob IDs do not prove equivalence of worktree bytes.
 The synchronization layer verifies decoded identities from checkout reads, or
 overlays transformed/changed files. It also applies worktree-specific membership,
 including ignored/extension-filtered files, sparse checkout and filesystem case
-behavior. Non-UTF-8 tracked names, unsafe relative paths, and paths unrepresentable
+behavior. The profile's optional content eligibility selects whether the
+extension filter applies ([content eligibility profiles](#content-eligibility-profiles)). Non-UTF-8 tracked names, unsafe relative paths, and paths unrepresentable
 on the current platform are explicit unsupported errors, not lossy aliases.
 Native repository paths are retained losslessly. Content/coverage enum versions
 must advance if their semantics change, independently of the index format.
@@ -590,6 +591,52 @@ The `profile` is required on attach:
 ```json
 {"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864}
 ```
+
+#### Content eligibility profiles
+
+The profile may also carry `"eligibility":"content-only"`. The default,
+`extension-and-content`, is omitted from the wire form, so default profiles,
+generation keys, storage names and `hello.profile` are unchanged. Daemons that
+support the optional field advertise the `content-eligibility-profile`
+capability; older daemons reject the unknown field on attach.
+
+| Stage | `extension-and-content` (default) | `content-only` |
+|-------|-----------------------------------|----------------|
+| Committed base | Raw tracked blobs, content-classified; no extension rule | Same corpus, but a distinct generation key and storage name |
+| Overlay/verification | Binary-extension paths have no content and hide the base entry | All listed files are decoded and classified by content; clean text reuses the base, NUL content is excluded |
+| Incremental and full refresh | Same path rules | Same path rules; the profile is never re-chosen |
+| `--files` | Unaffected | Identical filename membership |
+
+Ignore, hidden, size, symlink and NUL/binary classification are the same in
+both profiles. The profile is part of the pin: a join, accept-current attach
+or migration with a different profile fails, so every client of one worktree
+root must request the same eligibility. Checkpoints restore only into the same
+profile. Unmanaged v1 leases accept only the default. To change a root's
+profile, release every lease; a fresh `views.attach` with an explicit
+`revision` and no `accept_current` then replaces the inactive view (retryable
+`previous-root-readers-active` while old readers drain). No close RPC is needed.
+
+Queries state their eligibility. The CLI sends `content_eligibility:
+"content-only"` in the search query when run with `--content-eligibility
+content`, and omits the field otherwise. Before using a discovered view, the
+client compares the requested eligibility with the view's generation profile.
+The server makes the same check for content queries (not `files`). A mismatch
+in either direction is refused with the shared-fallback warning, and the
+client scans the filesystem using the requested rule. A legacy view is never
+served under a wider-coverage request, and a content-only view is never
+served to a default request. Older clients see a non-default profile and fall
+back. Content-eligibility queries never use an ordinary server or local index.
+
+A runtime that wants ripgrep-compatible extension handling should check
+`content-eligibility-profile`, attach with:
+
+```json
+{"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864,"eligibility":"content-only"}
+```
+
+and query with `tgrep --content-eligibility content ...`. With `--stats`, a
+managed answer reports `(via shared daemon v2)`. A content-only base is
+built and stored separately from a default base for the same tree.
 
 `query` uses the existing search RPC fields built by `server_search_request`:
 pattern/extra_patterns, matcher flags, types/type_add/type_clear, globs,

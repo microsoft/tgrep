@@ -255,6 +255,8 @@ These fall back to a full scan even with a server running:
 
 - `--no-ignore` and variants, `-u`/`-uu`/`-uuu`
 - `-a`/`--text`, `--binary`, non-`auto` `-E`/`--encoding`
+- `--content-eligibility content`, unless a managed v2 view was attached with
+  the `content-only` profile
 - `--no-index` (explicit)
 - naming a single file instead of a directory
 

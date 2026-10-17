@@ -12,7 +12,9 @@ use anyhow::{Context, Result, bail, ensure};
 use notify::{Event, EventKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tgrep_core::generations::{BuildStats, GenerationManager, IndexingProfile, Repository};
+use tgrep_core::generations::{
+    BuildStats, ContentEligibility, GenerationManager, IndexingProfile, Repository,
+};
 use tgrep_core::worktrees::{
     ReconcileStats, WorktreeError, WorktreeOptions, WorktreeSnapshot, WorktreeView,
 };
@@ -1143,6 +1145,9 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             | "multiline_replace"
             | "report_replacements"
             | "stats" => value.is_boolean(),
+            "content_eligibility" => {
+                serde_json::from_value::<ContentEligibility>(value.clone()).is_ok()
+            }
             _ => false,
         };
         ensure!(valid, "unknown or malformed shared query option: {key}");
@@ -1235,6 +1240,8 @@ impl State {
 
 pub(super) trait QuerySource {
     fn root(&self) -> &Path;
+    /// Content eligibility of the exact generation profile being served.
+    fn eligibility(&self) -> Result<ContentEligibility>;
     fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T>;
     fn invalidate(&self, error: &anyhow::Error) -> Result<()>;
     fn check(&self) -> Result<()> {
@@ -1250,6 +1257,9 @@ struct LegacyQuery<'a> {
 impl QuerySource for LegacyQuery<'_> {
     fn root(&self) -> &Path {
         self.entry.view.root()
+    }
+    fn eligibility(&self) -> Result<ContentEligibility> {
+        Ok(self.entry.view.generation().key().profile().eligibility)
     }
     fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
         self.state.query_snapshot(self.entry, read)
@@ -1269,6 +1279,18 @@ pub(super) fn search_snapshot(
     metadata: Value,
 ) -> Result<Value> {
     validate_query(query, files)?;
+    if !files {
+        // Filename membership is identical across eligibilities; content is not.
+        let requested = query
+            .get("content_eligibility")
+            .map(|value| serde_json::from_value::<ContentEligibility>(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(
+            requested == source.eligibility()?,
+            "view content eligibility differs from the query; scan instead"
+        );
+    }
     let scope = crate::serve::SearchScope::parse(query).map_err(anyhow::Error::msg)?;
     let scoped_root = source.root().join(&scope.prefix);
     ensure!(scoped_root.is_dir(), "scope must be an existing directory");

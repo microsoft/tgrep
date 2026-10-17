@@ -1391,3 +1391,348 @@ fn v2_cli_real_backend_migration_replay_and_idle_shutdown() {
     drop(guard);
     stop(&mut daemon);
 }
+
+fn prepare_eligibility(f: &mut Fixture) {
+    let root = f.a.join("eligibility");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::write(
+        root.join("docs/report.doc"),
+        "{\\rtf1\\ansi tracked rtf needle}\n",
+    )
+    .unwrap();
+    fs::write(root.join("data/table.pdf"), "tracked pdf needle\n").unwrap();
+    fs::write(root.join("data/early.doc"), b"\0nul needle\n").unwrap();
+    fs::write(root.join("plain.txt"), "plain needle\n").unwrap();
+    git(&f.a, &["add", "eligibility"]);
+    git(&f.a, &["commit", "-qm", "content eligibility"]);
+    f.revision = git(&f.a, &["rev-parse", "HEAD"]);
+    fs::write(root.join("docs/untracked.dat"), "untracked dat needle\n").unwrap();
+}
+
+fn content_only_attach(fixture: &Fixture, claim: &OwnerClaim) -> Value {
+    let mut input = attach_input(fixture, claim);
+    input["request"]["profile"]["eligibility"] = json!("content-only");
+    input
+}
+
+fn sorted_rows(output: &Output) -> Vec<String> {
+    let mut rows: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// Runs `args` indexed and as an explicit scan with the same eligibility.
+fn eligibility_query(root: &Path, args: &[&str]) -> (Output, Output) {
+    let mut common = vec!["--color", "never", "--path-separator", "/", "--stats"];
+    common.extend_from_slice(args);
+    let indexed = cli(root, &common);
+    let mut scan = vec!["--no-index"];
+    scan.extend_from_slice(&common);
+    (indexed, cli(root, &scan))
+}
+
+#[test]
+fn content_only_profile_serves_extension_named_text_from_the_managed_view() {
+    let mut fixture = Fixture::new();
+    prepare_eligibility(&mut fixture);
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let hello = daemon.rpc("hello", json!({}));
+    assert!(
+        hello["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("content-eligibility-profile"))
+    );
+    assert_eq!(
+        hello["profile"],
+        serde_json::from_str::<Value>(PROFILE).unwrap()
+    );
+    let (claim, guard) = owner(&daemon);
+    let receipt = completed(
+        &daemon,
+        &daemon.rpc("views.attach", content_only_attach(&fixture, &claim)),
+    );
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    assert_eq!(
+        view["generation"]["profile"]["eligibility"], "content-only",
+        "{receipt}"
+    );
+
+    let content = ["--content-eligibility", "content"];
+    let expected = [
+        "eligibility/data/table.pdf:1",
+        "eligibility/docs/report.doc:1",
+        "eligibility/docs/untracked.dat:1",
+        "eligibility/plain.txt:1",
+    ];
+    let mut args = content.to_vec();
+    args.extend(["-c", "-e", "needle", "--", "eligibility"]);
+    let (indexed, scanned) = eligibility_query(&fixture.a, &args);
+    let stderr = String::from_utf8_lossy(&indexed.stderr);
+    assert!(stderr.contains("(via shared daemon v2)"), "{stderr}");
+    assert!(!stderr.contains("warning:"), "{stderr}");
+    assert_eq!(sorted_rows(&indexed), expected);
+    assert_eq!(sorted_rows(&scanned), expected);
+    assert_eq!(indexed.status.code(), Some(0));
+
+    // The legacy default never reads a view admitted under wider coverage.
+    let (indexed, scanned) =
+        eligibility_query(&fixture.a, &["-c", "-e", "needle", "--", "eligibility"]);
+    let stderr = String::from_utf8_lossy(&indexed.stderr);
+    assert!(
+        stderr.contains("warning: shared view unavailable")
+            && stderr.contains("content eligibility"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("(via shared daemon v2)"), "{stderr}");
+    assert_eq!(sorted_rows(&indexed), ["eligibility/plain.txt:1"]);
+    assert_eq!(sorted_rows(&indexed), sorted_rows(&scanned));
+
+    // Filename membership is the same under either eligibility.
+    for args in [
+        vec!["--files", "eligibility"],
+        vec!["--content-eligibility", "content", "--files", "eligibility"],
+    ] {
+        let (indexed, scanned) = eligibility_query(&fixture.a, &args);
+        let stderr = String::from_utf8_lossy(&indexed.stderr);
+        assert!(stderr.contains("(via shared daemon v2)"), "{stderr}");
+        assert_eq!(sorted_rows(&indexed).len(), 5);
+        assert_eq!(sorted_rows(&indexed), sorted_rows(&scanned));
+    }
+
+    // Incremental verification keeps the profile: text edits are indexed and
+    // NUL content is still excluded under an extension-heuristic filename.
+    fs::write(
+        fixture.a.join("eligibility/docs/report.doc"),
+        "{\\rtf1 revised marker}\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.a.join("eligibility/data/table.pdf"),
+        b"pdf\0needle\n",
+    )
+    .unwrap();
+    daemon.rpc(
+        "views.invalidate",
+        json!({"view":view["view"],"expected_version":view["version"],"owner":claim.owner,
+            "changed":["eligibility/docs/report.doc","eligibility/data/table.pdf"],"full":false}),
+    );
+    let refreshed = completed(
+        &daemon,
+        &daemon.rpc(
+            "views.refresh",
+            json!({"token":token(&claim,2),"request":{"view":view["view"],
+                "expected_version":view["version"],"owner":claim.owner,"allocation_version":1}}),
+        ),
+    );
+    assert_eq!(
+        refreshed["result"]["reconcile"]["full"], false,
+        "{refreshed}"
+    );
+    for (pattern, rows) in [
+        (
+            "needle",
+            vec![
+                "eligibility/docs/untracked.dat:1",
+                "eligibility/plain.txt:1",
+            ],
+        ),
+        ("revised marker", vec!["eligibility/docs/report.doc:1"]),
+    ] {
+        let mut args = content.to_vec();
+        args.extend(["-c", "-e", pattern, "--", "eligibility"]);
+        let (indexed, scanned) = eligibility_query(&fixture.a, &args);
+        let stderr = String::from_utf8_lossy(&indexed.stderr);
+        assert!(stderr.contains("(via shared daemon v2)"), "{stderr}");
+        assert_eq!(sorted_rows(&indexed), rows, "{pattern}");
+        assert_eq!(sorted_rows(&scanned), rows, "{pattern}");
+    }
+
+    // A same-root join cannot widen or narrow the attached profile.
+    let current = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    let mut join = attach_input(&fixture, &claim);
+    join["token"] = token(&claim, 3);
+    join["request"]["lease"] = json!("default-client");
+    join["request"]["revision"] = Value::Null;
+    join["request"]["accept_current"] =
+        json!({"view":current["view"],"version":current["version"]});
+    let failed = terminal(&daemon, &daemon.rpc("views.attach", join));
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert!(failed.to_string().contains("profile differs"), "{failed}");
+
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn content_only_query_scans_with_matching_rules_against_a_default_view() {
+    let mut fixture = Fixture::new();
+    prepare_eligibility(&mut fixture);
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let (indexed, scanned) = eligibility_query(
+        &fixture.a,
+        &[
+            "--content-eligibility",
+            "content",
+            "-c",
+            "-e",
+            "needle",
+            "--",
+            "eligibility",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&indexed.stderr);
+    assert!(
+        stderr.contains("warning: shared view unavailable")
+            && stderr.contains("content eligibility"),
+        "{stderr}"
+    );
+    assert_eq!(sorted_rows(&indexed).len(), 4);
+    assert_eq!(sorted_rows(&indexed), sorted_rows(&scanned));
+    let (indexed, _) = eligibility_query(&fixture.a, &["-c", "-e", "needle", "--", "eligibility"]);
+    let stderr = String::from_utf8_lossy(&indexed.stderr);
+    assert!(stderr.contains("(via shared daemon v2)"), "{stderr}");
+    assert_eq!(sorted_rows(&indexed), ["eligibility/plain.txt:1"]);
+
+    // The server enforces the same boundary for clients that skip the check.
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    let response = daemon
+        .try_rpc(
+            "search",
+            json!({"root":view["root"],"view":view["view"],"expected_version":view["version"],
+                "query":{"pattern":"needle","content_eligibility":"content-only"}}),
+        )
+        .unwrap();
+    assert!(
+        response["error"]
+            .to_string()
+            .contains("content eligibility"),
+        "{response}"
+    );
+
+    // While a default lease is live, a content-only join fails closed.
+    let mut join = content_only_attach(&fixture, &claim);
+    join["token"] = token(&claim, 2);
+    join["request"]["lease"] = json!("content-client");
+    join["request"]["revision"] = Value::Null;
+    join["request"]["accept_current"] = json!({"view":view["view"],"version":view["version"]});
+    let failed = terminal(&daemon, &daemon.rpc("views.attach", join));
+    assert_eq!(failed["state"], "failed", "{failed}");
+    assert!(failed.to_string().contains("profile differs"), "{failed}");
+
+    // Once every lease is released, a fresh attach with an explicit revision
+    // replaces the inactive root view with the content-only profile.
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    let mut upgrade = content_only_attach(&fixture, &claim);
+    upgrade["token"] = token(&claim, 3);
+    upgrade["request"]["lease"] = json!("content-client");
+    completed(&daemon, &daemon.rpc("views.attach", upgrade));
+    let upgraded = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    assert_ne!(upgraded["view"], view["view"]);
+    assert_eq!(
+        upgraded["generation"]["profile"]["eligibility"],
+        "content-only"
+    );
+    let (indexed, scanned) = eligibility_query(
+        &fixture.a,
+        &[
+            "--content-eligibility",
+            "content",
+            "-c",
+            "-e",
+            "needle",
+            "--",
+            "eligibility",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&indexed.stderr);
+    assert!(stderr.contains("(via shared daemon v2)"), "{stderr}");
+    assert_eq!(sorted_rows(&indexed).len(), 4);
+    assert_eq!(sorted_rows(&indexed), sorted_rows(&scanned));
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"content-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn unmanaged_leases_and_search_only_flags_refuse_content_only_profiles() {
+    let fixture = Fixture::new();
+    let mut configured = policy();
+    configured["storage"] = json!("compatibility-retain-all");
+    let mut daemon = start(&fixture, &configured, &["--no-watch"]);
+    let common = tgrep_core::generations::Repository::discover(&fixture.a)
+        .unwrap()
+        .common_dir()
+        .to_path_buf();
+    let legacy =
+        tgrep_core::managed::read_private_control_file(&common.join("tgrep-daemon-v1.json"))
+            .unwrap();
+    let mut profile = serde_json::from_str::<Value>(PROFILE).unwrap();
+    profile["eligibility"] = json!("content-only");
+    let response = daemon
+        .raw(&json!({
+            "jsonrpc":"2.0","protocol":1,"instance":legacy["instance"],
+            "repository":daemon.marker["repository"],"id":1,"method":"attach",
+            "params":{"root":fs::canonicalize(&fixture.a).unwrap(),"revision":fixture.revision,
+                "profile":profile,"lease":"legacy-client"}
+        }))
+        .unwrap();
+    assert!(
+        response["error"]
+            .to_string()
+            .contains("default content eligibility"),
+        "{response}"
+    );
+    stop(&mut daemon);
+    drop(daemon);
+    for args in [
+        vec!["--content-eligibility", "content", "index", "."],
+        vec!["--content-eligibility", "content", "serve", "."],
+    ] {
+        let output = cli(&fixture.a, &args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--content-eligibility"),
+            "{args:?}"
+        );
+    }
+    assert!(!fixture.a.join(".tgrep").exists());
+    fixture.temp.close().unwrap();
+}

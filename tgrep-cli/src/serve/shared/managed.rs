@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use tgrep_core::generations::{GenerationManager, IndexingProfile, Repository};
+use tgrep_core::generations::{ContentEligibility, GenerationManager, IndexingProfile, Repository};
 use tgrep_core::managed::{
     self, AdaptiveRequest, AttachRequest, CatalogCursor, CollectionBounds, CollectionProgress,
     CollectionRequest, Error, ErrorCategory, ExternalWork, Id, LegacyAttachRequest,
@@ -110,7 +110,8 @@ fn hello(namespace: &Namespace) -> Result<Value> {
             "versioned-allocations","bound-checkpoints","offline-maintenance","stop-if-idle",
             "bounded-storage-inventory","namespace-discovery","maintenance-diagnostics",
             "private-rpc-authentication","bounded-reconciliation","reconciliation-phase-metrics",
-            "event-driven-native-reconciliation","serving-native-periodic-verification"
+            "event-driven-native-reconciliation","serving-native-periodic-verification",
+            "content-eligibility-profile"
         ],
         "profile":IndexingProfile::default(),
         "policy":namespace.policy()?,"allocation":namespace.allocation()?,
@@ -526,6 +527,16 @@ struct ManagedQuery {
 impl QuerySource for ManagedQuery {
     fn root(&self) -> &Path {
         self.slot.root()
+    }
+    fn eligibility(&self) -> Result<ContentEligibility> {
+        Ok(self
+            .query
+            .published()
+            .record
+            .pin()?
+            .key
+            .profile()
+            .eligibility)
     }
     fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
         Ok(self.query.with_snapshot(read)?)
@@ -2884,6 +2895,9 @@ mod candidate_read_tests {
     impl QuerySource for Scripted {
         fn root(&self) -> &Path {
             self.inner.root()
+        }
+        fn eligibility(&self) -> Result<ContentEligibility> {
+            self.inner.eligibility()
         }
         fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
             let call = self.snapshots.get();

@@ -192,13 +192,19 @@ impl Client {
         Ok(client)
     }
 
+    /// Filename membership is identical across content eligibilities, so the
+    /// view may use either; content searches compare it with the query.
     pub fn lookup(&self) -> Result<View> {
         let result = self.request("lookup", json!({"root": self.root}))?;
         let view: View = serde_json::from_value(result)?;
+        let profile = IndexingProfile {
+            eligibility: Default::default(),
+            ..*view.generation.profile()
+        };
         ensure!(
             view.root == self.root
                 && view.generation.repository_identity() == self.registration.repository
-                && *view.generation.profile() == IndexingProfile::default(),
+                && profile == IndexingProfile::default(),
             "shared view identity/profile mismatch"
         );
         Ok(view)

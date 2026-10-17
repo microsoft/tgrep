@@ -80,9 +80,13 @@ impl Fixture {
     }
 
     fn generation(&self) -> Arc<Generation> {
+        self.generation_with(IndexingProfile::default())
+    }
+
+    fn generation_with(&self, profile: IndexingProfile) -> Arc<Generation> {
         GenerationManager::with_storage(Repository::discover(&self.root).unwrap(), &self.storage)
             .unwrap()
-            .ensure("HEAD", IndexingProfile::default(), None)
+            .ensure("HEAD", profile, None)
             .unwrap()
             .generation
     }
@@ -660,6 +664,8 @@ fn assert_scan_parity(view: &WorktreeView, patterns: &[&str]) {
         max_file_size: None,
         exclude_paths: view.options.walk.exclude_paths.clone(),
         exclude_dirs: view.options.walk.exclude_dirs.clone(),
+        search_binary: view.generation.key().profile().eligibility
+            == crate::generations::ContentEligibility::ContentOnly,
         ..walker::WalkOptions::default()
     };
     let walk = walker::walk_dir(view.root(), &options);
@@ -2658,4 +2664,113 @@ fn managed_serving_verification_budget_failure_after_a_difference_fails_closed()
         drop((view, permit));
         assert_eq!(namespace.work_usage().unwrap().reservations, 0);
     }
+}
+
+#[test]
+fn content_only_profile_admits_extension_named_text_through_base_overlay_and_hints() {
+    use crate::generations::ContentEligibility;
+    let fixture = Fixture::new();
+    write(
+        &fixture.root,
+        "docs/report.doc",
+        b"{\\rtf1\\ansi tracked rtf needle}\n",
+    );
+    write(&fixture.root, "data/table.pdf", b"tracked pdf needle\n");
+    write(&fixture.root, "data/early.doc", b"\0nul needle\n");
+    write(&fixture.root, "plain.txt", b"plain needle\n");
+    commit(&fixture.root);
+    write(
+        &fixture.root,
+        "docs/untracked.dat",
+        b"untracked dat needle\n",
+    );
+    write(
+        &fixture.root,
+        "docs/untracked.exe",
+        b"untracked\0exe needle\n",
+    );
+
+    let default_pin = fixture.generation();
+    let content_profile = IndexingProfile {
+        eligibility: ContentEligibility::ContentOnly,
+        ..IndexingProfile::default()
+    };
+    let content_pin = fixture.generation_with(content_profile);
+    assert_eq!(*content_pin.key().profile(), content_profile);
+    assert_ne!(
+        content_pin.key().storage_name(),
+        default_pin.key().storage_name()
+    );
+
+    let legacy = fixture.view(&fixture.root, &default_pin);
+    legacy.refresh().unwrap();
+    assert_eq!(matches(&legacy, "needle"), ["plain.txt"]);
+    assert_scan_parity(&legacy, &["needle", "rtf1", ".*"]);
+
+    let view = fixture.view(&fixture.root, &content_pin);
+    let first = view.refresh().unwrap();
+    assert_eq!(
+        matches(&view, "needle"),
+        [
+            "data/table.pdf",
+            "docs/report.doc",
+            "docs/untracked.dat",
+            "plain.txt"
+        ]
+    );
+    // Clean tracked text is served by the base, not copied into the overlay.
+    assert_eq!(first.files_extracted, 1, "{first:?}");
+    assert_eq!(view.overlay_cost().unwrap().files, 1, "only untracked text");
+    assert_eq!(legacy.overlay_cost().unwrap().files, 0);
+    let files = |view: &WorktreeView| {
+        view.with_snapshot(|snapshot| snapshot.files("", true))
+            .unwrap()
+    };
+    assert_eq!(files(&view), files(&legacy));
+    assert_scan_parity(&view, &["needle", "rtf1", "nul", ".*"]);
+
+    write(
+        &fixture.root,
+        "docs/report.doc",
+        b"{\\rtf1 revised marker}\n",
+    );
+    write(&fixture.root, "data/table.pdf", b"pdf\0needle\n");
+    view.invalidate_path(Path::new("docs/report.doc")).unwrap();
+    view.invalidate_path(Path::new("data/table.pdf")).unwrap();
+    let hinted = view.refresh().unwrap();
+    assert!(!hinted.full);
+    assert_eq!(matches(&view, "revised marker"), ["docs/report.doc"]);
+    assert_eq!(
+        matches(&view, "needle"),
+        ["docs/untracked.dat", "plain.txt"]
+    );
+    assert_scan_parity(&view, &["needle", "revised", "rtf1", ".*"]);
+
+    // Unreported edits are repaired by full verification like any other path.
+    write(&fixture.root, "data/early.doc", b"now plain needle\n");
+    view.invalidate_all().unwrap();
+    view.refresh().unwrap();
+    assert_eq!(
+        matches(&view, "needle"),
+        ["data/early.doc", "docs/untracked.dat", "plain.txt"]
+    );
+    assert_scan_parity(&view, &["needle", ".*"]);
+    legacy.invalidate_all().unwrap();
+    legacy.refresh().unwrap();
+    assert_eq!(matches(&legacy, "needle"), ["plain.txt"]);
+
+    // A checkpoint is bound to the exact profile it was verified under.
+    let directory = fixture._temp.path().join("content checkpoint");
+    fs::create_dir(&directory).unwrap();
+    let options = WorktreeOptions {
+        checkpoint_directory: Some(directory),
+        ..WorktreeOptions::default()
+    };
+    let saved = WorktreeView::new(&fixture.root, content_pin.clone(), options.clone()).unwrap();
+    saved.refresh().unwrap();
+    saved.save_checkpoint().unwrap();
+    assert!(WorktreeView::restore(&fixture.root, default_pin, options.clone()).is_err());
+    let restored = WorktreeView::restore(&fixture.root, content_pin, options).unwrap();
+    restored.refresh().unwrap();
+    assert_eq!(matches(&restored, "revised marker"), ["docs/report.doc"]);
 }

@@ -1240,7 +1240,13 @@ impl WorktreeView {
                         .walk
                         .max_file_size
                         .is_none_or(|limit| read.bytes.len() as u64 <= limit);
-                    let content = if listed && !walker::is_binary_extension(relative) {
+                    let eligible = !self
+                        .generation
+                        .key()
+                        .profile()
+                        .eligibility
+                        .excludes_by_extension(relative);
+                    let content = if listed && eligible {
                         chunk.stats.files_decoded += 1;
                         let (text, id) =
                             timed(&mut timings.worker_decode_hash_us, || -> Result<_> {

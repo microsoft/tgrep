@@ -72,6 +72,10 @@ pub struct SearchOptions {
     /// `--binary`: walk into files an extension check would reject, and report
     /// a "binary file matches" note for them instead of printing their lines.
     pub binary: bool,
+    /// `--content-eligibility`: whether the filename-extension heuristic may
+    /// exclude content. Selects only matching shared views; scans walk the
+    /// same eligible set.
+    pub content_eligibility: tgrep_core::generations::ContentEligibility,
     /// How to rebuild printed paths from the search-root-relative ones. Set per
     /// path argument, since each argument is echoed back exactly as typed.
     pub path_display: crate::output::PathDisplay,
@@ -253,6 +257,11 @@ impl SearchOptions {
         self.multiline_dotall
     }
 
+    /// Whether content eligibility ignores the filename-extension heuristic.
+    pub fn content_only(&self) -> bool {
+        self.content_eligibility == tgrep_core::generations::ContentEligibility::ContentOnly
+    }
+
     /// Walk options shared by every non-indexed traversal.
     ///
     /// Unlike index building, searching has no size cap by default: ripgrep
@@ -261,7 +270,7 @@ impl SearchOptions {
         walker::WalkOptions {
             include_hidden: self.hidden,
             no_ignore: self.no_ignore,
-            search_binary: self.text || self.binary,
+            search_binary: self.text || self.binary || self.content_only(),
             follow_links: self.follow,
             max_file_size: self.max_filesize,
             max_depth: self.max_depth,
@@ -940,6 +949,10 @@ pub fn run(
                     "options require a filesystem scan"
                 );
                 let (client, view) = crate::serve::shared::Client::registered(&root)?;
+                anyhow::ensure!(
+                    view.generation.profile().eligibility == opts.content_eligibility,
+                    "view content eligibility differs from the query"
+                );
                 let scope = IndexScope::resolve(&view.root, &root)
                     .ok_or_else(|| anyhow::anyhow!("search root outside shared worktree"))?;
                 let request = server_search_request(&scope, opts, ci)?;
@@ -983,6 +996,8 @@ pub fn run(
         || opts.encoding.may_differ_from_index()
         || opts.text
         || opts.binary
+        // Ordinary and local indexes apply the extension heuristic.
+        || opts.content_only()
         || opts.no_ignore
         || opts.no_ignore_dot
         || opts.no_ignore_exclude
@@ -1218,6 +1233,11 @@ fn server_search_request(
     }
     if opts.report_replacements() {
         request["params"]["report_replacements"] = serde_json::json!(true);
+    }
+    // Only managed views with a matching profile accept a non-default value;
+    // daemons that predate it reject the unknown field, so the client scans.
+    if !opts.content_eligibility.is_default() {
+        request["params"]["content_eligibility"] = serde_json::json!(opts.content_eligibility);
     }
     Ok(request)
 }

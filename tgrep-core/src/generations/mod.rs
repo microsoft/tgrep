@@ -228,6 +228,32 @@ pub enum Coverage {
     TrackedRegularFilesV1,
 }
 
+/// Which listed worktree files a view may expose for content search.
+///
+/// Membership, size limits and filename coverage are identical in both modes;
+/// only the filename-extension heuristic differs. NUL-classified content is
+/// excluded either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContentEligibility {
+    /// Legacy default: skip `walker::BINARY_EXTENSIONS` paths, then classify content.
+    #[default]
+    ExtensionAndContent,
+    /// Classify content only, as ripgrep does, regardless of filename extension.
+    ContentOnly,
+}
+
+impl ContentEligibility {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether the extension heuristic alone excludes `relative`'s content.
+    pub fn excludes_by_extension(self, relative: &Path) -> bool {
+        self == Self::ExtensionAndContent && crate::walker::is_binary_extension(relative)
+    }
+}
+
 /// Exact, serializable compatibility profile. Budgets are not part of identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -236,6 +262,10 @@ pub struct IndexingProfile {
     pub coverage: Coverage,
     /// Limit on raw blob size; `None` removes the cap (one blob is held in memory).
     pub max_blob_bytes: Option<u64>,
+    /// Omitted when default so legacy keys, storage names and peers are unchanged;
+    /// peers that predate the field reject a non-default value as unknown.
+    #[serde(default, skip_serializing_if = "ContentEligibility::is_default")]
+    pub eligibility: ContentEligibility,
 }
 
 impl Default for IndexingProfile {
@@ -244,6 +274,7 @@ impl Default for IndexingProfile {
             content: ContentSemantics::RawGitBlobAutoV1,
             coverage: Coverage::TrackedRegularFilesV1,
             max_blob_bytes: Some(64 * 1024 * 1024),
+            eligibility: ContentEligibility::ExtensionAndContent,
         }
     }
 }
@@ -1395,6 +1426,55 @@ mod tests {
         fs2::FileExt::try_lock_exclusive(&contender).unwrap();
         drop(contender);
         manager.lock().unwrap();
+    }
+
+    #[test]
+    fn default_content_eligibility_keeps_the_legacy_profile_wire_shape() {
+        let legacy = serde_json::json!({
+            "content": "raw-git-blob-auto-v1",
+            "coverage": "tracked-regular-files-v1",
+            "max_blob_bytes": 67108864,
+        });
+        assert_eq!(
+            serde_json::to_value(IndexingProfile::default()).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            serde_json::from_value::<IndexingProfile>(legacy.clone()).unwrap(),
+            IndexingProfile::default()
+        );
+        let content_only = IndexingProfile {
+            eligibility: ContentEligibility::ContentOnly,
+            ..IndexingProfile::default()
+        };
+        let mut wide = legacy;
+        wide["eligibility"] = "content-only".into();
+        assert_eq!(serde_json::to_value(content_only).unwrap(), wide);
+        assert_eq!(
+            serde_json::from_value::<IndexingProfile>(wide.clone()).unwrap(),
+            content_only
+        );
+        wide["eligibility"] = "extensions".into();
+        assert!(serde_json::from_value::<IndexingProfile>(wide).is_err());
+
+        let key = |profile| GenerationKey {
+            repository: "test".into(),
+            tree: "0".repeat(40),
+            profile,
+            index_format: INDEX_FORMAT_VERSION,
+            schema: SCHEMA_VERSION,
+        };
+        let default_key = key(IndexingProfile::default());
+        assert!(
+            !serde_json::to_string(&default_key)
+                .unwrap()
+                .contains("eligibility")
+        );
+        assert_ne!(
+            default_key.storage_name(),
+            key(content_only).storage_name(),
+            "eligibility is part of generation identity"
+        );
     }
 
     fn empty_generation(directory: &Path) -> Generation {

@@ -29,6 +29,7 @@ pub enum Point {
     ReconcileBeforeComplete,
     ReconcileBatchOpened,
     ReconcileRetryDrained,
+    PreparationCheckpointReady,
     ViewBeforeCommit,
     ViewAfterCommit,
     ViewAfterSwap,
@@ -93,6 +94,9 @@ mod enabled {
             category: ErrorCategory,
             token: OperationToken,
         },
+        Invalidate {
+            remaining: u32,
+        },
         CatalogBusyToken {
             token: OperationToken,
         },
@@ -154,6 +158,17 @@ mod enabled {
             }
             if matches!(specification.action, Action::OsError { code } if code <= 0) {
                 return Err(Error::invalid("test hook OS error code must be positive"));
+            }
+            if matches!(specification.action, Action::Invalidate { remaining } if !(1..=3).contains(&remaining))
+            {
+                return Err(Error::invalid("test invalidation count must be 1..=3"));
+            }
+            if matches!(specification.action, Action::Invalidate { .. })
+                && specification.point != Point::PreparationCheckpointReady
+            {
+                return Err(Error::invalid(
+                    "test invalidation is only supported at preparation-checkpoint-ready",
+                ));
             }
             if matches!(specification.action, Action::Pause { timeout_ms } | Action::PauseToken { timeout_ms, .. } if timeout_ms == 0 || timeout_ms > 30_000)
             {
@@ -255,6 +270,14 @@ mod enabled {
                 return Ok(());
             }
             status.reached_operation = operation.cloned();
+            if let Action::Invalidate { remaining } = &mut status.specification.action {
+                let last_hit = *remaining == 1;
+                *remaining -= 1;
+                if last_hit {
+                    status.stage = Stage::Fired;
+                }
+                return Err(Error::busy("test-preparation-invalidation"));
+            }
             match status.specification.action {
                 Action::Error { category } | Action::ErrorToken { category, .. } => {
                     status.stage = Stage::Fired;
@@ -271,6 +294,7 @@ mod enabled {
                         Some(format!("injected catalog contention at {point:?}")),
                     )))
                 }
+                Action::Invalidate { .. } => unreachable!("invalidation action handled above"),
                 Action::OsError { code } => {
                     status.stage = Stage::Fired;
                     Err(Error::io(std::io::Error::from_raw_os_error(code)))

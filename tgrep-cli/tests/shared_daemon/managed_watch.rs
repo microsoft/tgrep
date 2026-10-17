@@ -78,6 +78,84 @@ pub(super) fn attach_watched_root<E: super::attach_retry::AttachEndpoint>(
     })
 }
 
+#[test]
+#[cfg(feature = "managed-test-hooks")]
+fn watcher_attach_recovers_real_preparation_invalidation_with_one_lease() {
+    let fixture = Fixture::new();
+    let mut configured = policy();
+    configured["work"]["max_views"] = json!(32);
+    configured["work"]["workers"] = json!(1);
+    let mut daemon = start(&fixture, &configured, &[]);
+    let (claim, guard) = owner(&daemon);
+    let mut input = attach_input(&fixture, &claim);
+    input["request"]["root"] = json!(fs::canonicalize(&fixture.a).unwrap());
+    let hook = daemon.rpc(
+        "testing.install",
+        json!({
+            "point":"preparation-checkpoint-ready",
+            "operation":null,
+            "skip_hits":0,
+            "action":{"mode":"invalidate","remaining":3}
+        }),
+    );
+    let started = Instant::now();
+    let attached = attach_watched_root(
+        &daemon,
+        &claim,
+        input.clone(),
+        started + Duration::from_secs(30),
+    );
+    assert!(started.elapsed() < Duration::from_secs(30));
+
+    let failed = daemon.rpc("operations.lookup", input["token"].clone());
+    assert_eq!(failed["kind"], "attach");
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["cancelled"], false);
+    assert_eq!(failed["committed_state"], "not-committed");
+    assert_eq!(failed["error"]["category"], "busy");
+    assert_eq!(
+        failed["error"]["reason_code"],
+        "view-preparation-invalidated"
+    );
+    assert_eq!(failed["error"]["retryable"], true);
+    assert_eq!(failed["error"]["committed_state"], "not-committed");
+    assert_eq!(
+        failed["progress"]["view"],
+        attached["result"]["current"]["id"]
+    );
+    assert_eq!(failed["request"], input["request"]);
+
+    let status = daemon.rpc("testing.status", json!({}));
+    assert_eq!(status["ticket"], hook["ticket"]);
+    assert_eq!(status["stage"], "fired");
+    assert_eq!(status["hits"], 3);
+    assert_eq!(status["reached_operation"], failed["id"]);
+    assert_eq!(attached["token"], token(&claim, 2));
+    assert_ne!(attached["id"], failed["id"]);
+    assert_eq!(attached["state"], "completed");
+    assert_eq!(attached["result"]["lease"]["operation"], failed["id"]);
+
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    assert_eq!(view["view"], failed["progress"]["view"]);
+    let ready = native_ready(&daemon, &view, None);
+    assert_eq!(ready["leases"], 1);
+    assert!(!matches(&daemon, &view, "shared_term").is_empty());
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
 fn matches(daemon: &Daemon, view: &Value, pattern: &str) -> Vec<Value> {
     let result = retry_busy(
         daemon,

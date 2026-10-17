@@ -1687,6 +1687,17 @@ impl ViewManager {
             )?;
             stats.timings.checkpoint_us = super::work::micros(checkpoint_start.elapsed());
             permit.observe_reconciliation(&mut stats);
+            #[cfg(feature = "managed-test-hooks")]
+            if let Err(error) = self.namespace.fault(
+                super::faults::Point::PreparationCheckpointReady,
+                Some(permit.operation_id()),
+            ) {
+                if error.reason_code == "test-preparation-invalidation" {
+                    slot.invalidate(&[], true)?;
+                    continue;
+                }
+                return Err(error);
+            }
             if slot.epoch.load(Ordering::Acquire) == input
                 && view.status()?.published_epoch == Some(stats.epoch)
             {

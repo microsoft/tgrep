@@ -1208,6 +1208,9 @@ fn server_search_request(
     request["params"]["hidden"] = serde_json::json!(opts.hidden);
     request["params"]["scope"] = serde_json::json!(scope.prefix());
     request["params"]["max_depth"] = serde_json::json!(opts.max_depth);
+    if opts.json {
+        request["params"]["search_stats"] = serde_json::json!(true);
+    }
     // Older shared servers reject unknown fields, even when false. Leave
     // non-counting requests unchanged.
     if opts.count_matches {
@@ -1354,6 +1357,25 @@ fn render_server_result(
     } else {
         std::collections::HashSet::new()
     };
+    let search_stats = if opts.json {
+        Some(
+            server_search_stats(result, matches)?
+                .into_iter()
+                .filter_map(|stats| {
+                    if stats.binary_offset.is_some()
+                        && !opts.binary
+                        && !matches!(scope, IndexScope::File(_))
+                    {
+                        return None;
+                    }
+                    let rel = scope.relativize(&stats.file, root)?;
+                    within_max_depth(&rel, opts).then_some((rel, stats.bytes_searched))
+                })
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+    } else {
+        None
+    };
     let file_stats = if opts.stats || opts.count_matches {
         result
             .get("file_stats")
@@ -1441,6 +1463,21 @@ fn render_server_result(
 
     let had_matches = !matches.is_empty();
 
+    if let Some(stats) = &search_stats {
+        for row in matches {
+            let file = row["file"]
+                .as_str()
+                .context("server row is missing its file")?;
+            anyhow::ensure!(
+                stats.contains_key(file),
+                "server JSON search statistics disagree with visible rows for {file}"
+            );
+        }
+        for &bytes in stats.values() {
+            writer.note_bytes_searched(bytes);
+        }
+    }
+
     if opts.quiet {
         // No output, but still report stats for the first matching file.
     } else if opts.files_only {
@@ -1507,6 +1544,9 @@ fn render_server_result(
     } else {
         for m in matches {
             let file = m.get("file").and_then(|f| f.as_str()).unwrap_or("");
+            if let Some(stats) = &search_stats {
+                writer.set_file_bytes_searched(stats[file]);
+            }
             let line = m.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
             let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
             let mtype = m.get("type").and_then(|t| t.as_str()).unwrap_or("match");
@@ -2569,6 +2609,50 @@ pub(crate) struct FileMatchStats {
     pub matched_lines: u64,
 }
 
+/// Work performed on a candidate, even when it produced no output rows.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileSearchStats {
+    pub file: String,
+    pub bytes_searched: u64,
+    pub binary_offset: Option<u64>,
+}
+
+fn server_search_stats(
+    result: &serde_json::Value,
+    rows: &[serde_json::Value],
+) -> Result<Vec<FileSearchStats>> {
+    let stats: Vec<FileSearchStats> = serde_json::from_value(
+        result
+            .get("search_stats")
+            .context("server omitted JSON search statistics; upgrade the server")?
+            .clone(),
+    )
+    .context("invalid server JSON search statistics")?;
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes = 0_u64;
+    for s in &stats {
+        anyhow::ensure!(
+            seen.insert(s.file.as_str()),
+            "server returned duplicate search statistics for {}",
+            s.file
+        );
+        bytes = bytes
+            .checked_add(s.bytes_searched)
+            .context("server JSON searched byte total overflows")?;
+    }
+    for row in rows {
+        let file = row
+            .get("file")
+            .and_then(|value| value.as_str())
+            .context("server row is missing its file")?;
+        anyhow::ensure!(
+            seen.contains(file),
+            "server omitted JSON search statistics for {file}"
+        );
+    }
+    Ok(stats)
+}
+
 fn original_match_counts<'a>(
     rows: &'a [serde_json::Value],
     stats: Option<&[FileMatchStats]>,
@@ -3302,6 +3386,57 @@ mod tests {
         ] {
             let stats: Vec<FileMatchStats> = serde_json::from_value(metadata).unwrap();
             assert!(original_match_counts(&rows, Some(&stats), false).is_err());
+        }
+    }
+
+    #[test]
+    fn json_search_stats_require_complete_receipts_not_output_totals() {
+        let rows = [row("match", "a.rs", 1, 1)];
+        for metadata in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!([{"file":"a.rs"}]),
+            serde_json::json!([{"file":"a.rs","bytes_searched":-1}]),
+            serde_json::json!([
+                {"file":"a.rs","bytes_searched":8},
+                {"file":"a.rs","bytes_searched":8}
+            ]),
+            serde_json::json!([
+                {"file":"a.rs","bytes_searched":u64::MAX},
+                {"file":"b.rs","bytes_searched":1}
+            ]),
+        ] {
+            assert!(
+                server_search_stats(&serde_json::json!({"search_stats":metadata}), &rows).is_err()
+            );
+        }
+        assert!(server_search_stats(&serde_json::json!({}), &[]).is_err());
+        assert!(
+            server_search_stats(&serde_json::json!({"search_stats":[]}), &[])
+                .unwrap()
+                .is_empty()
+        );
+        let stats = server_search_stats(
+            &serde_json::json!({"search_stats":[
+                {"file":"a.rs","bytes_searched":8,"binary_offset":null},
+                {"file":"no-output.rs","bytes_searched":30,"binary_offset":null}
+            ]}),
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats.iter().map(|s| s.bytes_searched).sum::<u64>(), 38);
+        for json in [false, true] {
+            for stats in [false, true] {
+                let opts = SearchOptions {
+                    json,
+                    stats,
+                    ..Default::default()
+                };
+                let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+                assert_eq!(request["params"].get("search_stats").is_some(), json);
+                assert_eq!(request["params"]["stats"], stats);
+            }
         }
     }
 

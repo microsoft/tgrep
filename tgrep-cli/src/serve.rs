@@ -808,6 +808,8 @@ struct SearchOpts {
     positions: bool,
     /// Return original per-file totals and index diagnostics.
     stats: bool,
+    /// Return searched-file work, including candidates with no matching rows.
+    search_stats: bool,
     /// Project matching-line counts instead of rendering matching lines.
     count: bool,
     /// Return original per-file totals even when diagnostics are not requested.
@@ -1815,6 +1817,10 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
                 .get("stats")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            search_stats: params
+                .get("search_stats")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             count: params
                 .get("count")
                 .and_then(|v| v.as_bool())
@@ -2086,9 +2092,11 @@ fn handle_search(
     };
     let mut matches = Vec::new();
     let mut file_stats = Vec::new();
+    let mut search_stats = Vec::new();
     for file in per_file {
         matches.extend(file.rows);
         file_stats.extend(file.stats);
+        search_stats.extend(file.search_stats);
     }
 
     let search_ms = t_search.elapsed().as_secs_f64() * 1000.0;
@@ -2125,6 +2133,9 @@ fn handle_search(
     });
     if opts.stats || opts.count_matches {
         result["file_stats"] = serde_json::json!(file_stats);
+    }
+    if opts.search_stats {
+        result["search_stats"] = serde_json::json!(search_stats);
     }
     if let Some(total_files) = total_files {
         result["index_stats"] = serde_json::json!({
@@ -2185,6 +2196,7 @@ fn invalidate_cached_paths_locked<'a>(
 struct FileSearchResult {
     rows: Vec<serde_json::Value>,
     stats: Option<crate::search::FileMatchStats>,
+    search_stats: Option<crate::search::FileSearchStats>,
 }
 
 /// Counts encoded bytes without allocating a serialized copy.
@@ -2269,11 +2281,26 @@ fn search_file_matches_bounded(
     };
 
     let found = FileMatches::find(content, matcher, &match_opts)?;
+    let search_stats = opts.search_stats.then(|| crate::search::FileSearchStats {
+        file: rel_path.to_string(),
+        bytes_searched: binary_offset.unwrap_or_else(|| fixups.to_source_offset(content.len()))
+            as u64,
+        binary_offset: binary_offset.map(|offset| offset as u64),
+    });
+    if let Some(stats) = &search_stats
+        && let Some(budget) = &mut budget
+    {
+        budget.charge(stats)?;
+    }
     if found.is_empty() {
-        return Ok(FileSearchResult::default());
+        return Ok(FileSearchResult {
+            search_stats,
+            ..FileSearchResult::default()
+        });
     }
     let mut result = FileSearchResult {
         rows: Vec::new(),
+        search_stats,
         stats: (opts.stats || opts.count_matches).then(|| {
             let (matches, matched_lines) = found.match_totals();
             crate::search::FileMatchStats {

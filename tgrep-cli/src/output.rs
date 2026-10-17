@@ -360,9 +360,14 @@ impl OutputWriter {
 
     /// Record that a file of `bytes` length is about to be searched.
     pub fn note_bytes_searched(&mut self, bytes: u64) {
-        self.pending_bytes_searched = bytes;
+        self.set_file_bytes_searched(bytes);
         self.all_bytes_searched += bytes;
         self.all_searches += 1;
+    }
+
+    /// Remote work is counted before rendering, including files without rows.
+    pub fn set_file_bytes_searched(&mut self, bytes: u64) {
+        self.pending_bytes_searched = bytes;
     }
 
     /// Report that a matching file was suppressed because it looks binary.

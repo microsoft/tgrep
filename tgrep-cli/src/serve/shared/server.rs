@@ -1144,6 +1144,7 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             | "ordered_filters"
             | "multiline_replace"
             | "report_replacements"
+            | "search_stats"
             | "stats" => value.is_boolean(),
             "content_eligibility" => {
                 serde_json::from_value::<ContentEligibility>(value.clone()).is_ok()
@@ -1344,6 +1345,7 @@ pub(super) fn search_snapshot(
         budget.charge(&index_stats)?;
         let mut rows = Vec::new();
         let mut stats = Vec::new();
+        let mut search_stats = Vec::new();
         for siblings in tgrep_core::rooted::sibling_batches(&paths) {
             let batch = (siblings.len() > 1)
                 .then(|| {
@@ -1367,6 +1369,7 @@ pub(super) fn search_snapshot(
                 )?;
                 rows.extend(found.rows);
                 stats.extend(found.stats);
+                search_stats.extend(found.search_stats);
             }
             if let Some(batch) = batch
                 && let Err(error) = batch.finish()
@@ -1374,14 +1377,15 @@ pub(super) fn search_snapshot(
                 return candidate_failed(source, &siblings[0], error.into());
             }
         }
-        (
-            json!({
-                "matches":rows, "file_stats":stats, "epoch":epoch,
-                "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
-                "index_stats":index_stats
-            }),
-            epoch,
-        )
+        let mut result = json!({
+            "matches":rows, "file_stats":stats, "epoch":epoch,
+            "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
+            "index_stats":index_stats
+        });
+        if request.opts.search_stats {
+            result["search_stats"] = json!(search_stats);
+        }
+        (result, epoch)
     };
     ensure!(
         source.snapshot(|snapshot| snapshot.epoch() == epoch)?,
@@ -1470,7 +1474,7 @@ mod tests {
 
     #[test]
     fn count_projection_query_fields_require_booleans() {
-        for field in ["count", "count_matches"] {
+        for field in ["count", "count_matches", "search_stats"] {
             for value in [json!(true), json!(false)] {
                 let query = json!({"pattern":"return",field:value});
                 validate_query(&query, false).unwrap();
@@ -1485,7 +1489,7 @@ mod tests {
     #[test]
     fn response_budgets_count_escaped_rows_paths_and_serialized_envelopes() {
         let request = crate::serve::parse_search_params(&json!({
-            "pattern":"x", "detail":true, "positions":true, "stats":true,
+            "pattern":"x", "detail":true, "positions":true, "stats":true, "search_stats":true,
             "before_context":1, "after_context":1
         }))
         .unwrap();
@@ -1505,6 +1509,10 @@ mod tests {
             .map(|row| serde_json::to_vec(row).unwrap().len() + 1)
             .sum::<usize>()
             + serde_json::to_vec(expected.stats.as_ref().unwrap())
+                .unwrap()
+                .len()
+            + 1
+            + serde_json::to_vec(expected.search_stats.as_ref().unwrap())
                 .unwrap()
                 .len()
             + 1;
@@ -1579,7 +1587,7 @@ mod tests {
         assert!(budget.charge(&"").is_err());
         for value in [
             json!({"files":paths}),
-            json!({"matches":expected.rows,"file_stats":expected.stats}),
+            json!({"matches":expected.rows,"file_stats":expected.stats,"search_stats":expected.search_stats}),
         ] {
             let envelope = json!({"jsonrpc":"2.0","id":"\"\\\n","result":value});
             let expected = serde_json::to_vec(&envelope).unwrap();
@@ -1588,6 +1596,60 @@ mod tests {
                 expected
             );
             assert!(bounded_response(&envelope, expected.len() - 1).is_err());
+        }
+    }
+
+    #[test]
+    fn json_search_stats_charge_no_output_candidates_to_response_budget() {
+        for bytes in [b"absent\n".as_slice(), b"absent\0\n".as_slice()] {
+            let request = crate::serve::parse_search_params(&json!({
+                "pattern":"needle", "search_stats":true
+            }))
+            .unwrap();
+            let file = crate::serve::DecodedFile::new(bytes.to_vec(), request.encoding);
+            let result = crate::serve::search_file_matches(
+                "no-output.txt",
+                &file,
+                &request.matcher,
+                &request.opts,
+            )
+            .unwrap();
+            assert!(result.rows.is_empty());
+            assert!(result.stats.is_none());
+            let work = result.search_stats.unwrap();
+            assert_eq!(work.file, "no-output.txt");
+            let binary_offset = bytes.iter().position(|&b| b == 0).map(|n| n as u64);
+            assert_eq!(work.binary_offset, binary_offset);
+            assert_eq!(
+                work.bytes_searched,
+                binary_offset.unwrap_or(bytes.len() as u64)
+            );
+            let required = serde_json::to_vec(&work).unwrap().len() + 1;
+            let mut exact = crate::serve::JsonBudget {
+                remaining: required,
+            };
+            crate::serve::search_file_matches_bounded(
+                "no-output.txt",
+                &file,
+                &request.matcher,
+                &request.opts,
+                Some(&mut exact),
+            )
+            .unwrap();
+            assert_eq!(exact.remaining, 0);
+            let mut short = crate::serve::JsonBudget {
+                remaining: required - 1,
+            };
+            assert!(
+                crate::serve::search_file_matches_bounded(
+                    "no-output.txt",
+                    &file,
+                    &request.matcher,
+                    &request.opts,
+                    Some(&mut short),
+                )
+                .is_err()
+            );
         }
     }
 

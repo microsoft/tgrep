@@ -657,6 +657,135 @@ fn json_bytes_printed_excludes_end_messages_on_every_backend() {
 }
 
 #[test]
+fn json_backend_search_work_stats_include_candidates_without_output() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join("nested")).unwrap();
+    let probe = "// ActivityScope\n// ActivityScope second\n";
+    let other = "ActivityScope three\n";
+    // The literal is present, but its word boundary never matches.
+    let false_positive = "ActivityScopeExtra\n";
+    let miss = "no hit\n";
+    for (file, contents) in [
+        ("probe.cs", probe),
+        ("nested/other.cs", other),
+        ("candidate.cs", false_positive),
+        ("miss.cs", miss),
+    ] {
+        fs::write(root.join(file), contents).unwrap();
+    }
+    let assert_stats = |output: std::process::Output,
+                        searches: u64,
+                        bytes: u64,
+                        matching_files: u64,
+                        matches: u64| {
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let rows: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for row in rows.iter().filter(|row| row["type"] == "end") {
+            let path = row["data"]["path"]["text"].as_str().unwrap();
+            let expected = if path.ends_with("probe.cs") {
+                probe
+            } else {
+                other
+            };
+            assert_eq!(
+                row["data"]["stats"]["bytes_searched"],
+                expected.len(),
+                "{stdout}"
+            );
+            assert_eq!(row["data"]["stats"]["searches"], 1, "{stdout}");
+        }
+        let summaries: Vec<_> = rows.iter().filter(|row| row["type"] == "summary").collect();
+        assert_eq!(summaries.len(), 1, "{stdout}");
+        let stats = &summaries[0]["data"]["stats"];
+        assert_eq!(stats["searches"], searches, "{stdout}");
+        assert_eq!(stats["bytes_searched"], bytes, "{stdout}");
+        assert_eq!(stats["searches_with_match"], matching_files, "{stdout}");
+        assert_eq!(stats["matches"], matches, "{stdout}");
+        assert_eq!(stats["matched_lines"], matches, "{stdout}");
+    };
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for diagnostics in [false, true] {
+            for (paths, pattern, searches, bytes, matching_files, matches) in [
+                (
+                    vec![root.clone()],
+                    r"ActivityScope\b",
+                    if marker == "Brute-force search completed" {
+                        4
+                    } else {
+                        3
+                    },
+                    probe.len()
+                        + other.len()
+                        + false_positive.len()
+                        + if marker == "Brute-force search completed" {
+                            miss.len()
+                        } else {
+                            0
+                        },
+                    2,
+                    3,
+                ),
+                (
+                    vec![root.join("nested")],
+                    r"ActivityScope\b",
+                    1,
+                    other.len(),
+                    1,
+                    1,
+                ),
+                (
+                    vec![root.join("nested"), root.join("nested")],
+                    r"ActivityScope\b",
+                    2,
+                    2 * other.len(),
+                    2,
+                    2,
+                ),
+                (
+                    vec![root.clone()],
+                    "no-such-literal",
+                    if marker == "Brute-force search completed" {
+                        4
+                    } else {
+                        0
+                    },
+                    if marker == "Brute-force search completed" {
+                        probe.len() + other.len() + false_positive.len() + miss.len()
+                    } else {
+                        0
+                    },
+                    0,
+                    0,
+                ),
+            ] {
+                let mut command = tgrep();
+                command.args(backend).args(["--json", "--color", "never"]);
+                if diagnostics {
+                    command.arg("--stats");
+                }
+                let output = command
+                    .args(["-e", pattern, "--"])
+                    .args(paths)
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(if matches == 0 { 1 } else { 0 }));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("falling back"), "{stderr}");
+                if diagnostics {
+                    assert!(stderr.contains(marker), "{stderr}");
+                }
+                assert_stats(output, searches, bytes as u64, matching_files, matches);
+            }
+        }
+    });
+}
+
+#[test]
 fn reported_multiline_preserves_adjacent_matches_in_every_output() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");
@@ -2781,6 +2910,13 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
             Some("JSON replacements"),
             None,
         ),
+        (
+            vec!["--json"],
+            "needle",
+            &[][..],
+            Some("JSON search statistics"),
+            None,
+        ),
         // Definitions that no `-t`/`-T` consumes are not sent at all, so an
         // older server cannot rebuild them in its own order and reject them.
         (
@@ -2890,9 +3026,20 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
                         })
                     })
                     .collect();
-                let result = serde_json::json!({
+                let mut result = serde_json::json!({
                     "hidden_complete":true,"matches":rows,"elapsed_ms":1,
                 });
+                assert_eq!(
+                    request["params"].get("search_stats").is_some(),
+                    flags.contains(&"--json")
+                );
+                if flags.contains(&"--json") && reason != Some("JSON search statistics") {
+                    result["search_stats"] = serde_json::json!([
+                        {"file":"a.rs","bytes_searched":7,"binary_offset":null},
+                        {"file":"a.txt","bytes_searched":7,"binary_offset":null},
+                        {"file":"m.txt","bytes_searched":12,"binary_offset":null}
+                    ]);
+                }
                 writeln!(
                     stream,
                     "{}",
@@ -2939,6 +3086,13 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
         assert!(!stdout.contains("STALE"), "{flags:?}: {stdout}");
         match expected {
             Some(expected) => assert_eq!(stdout, expected, "{flags:?}"),
+            None if reason == "JSON search statistics" => {
+                let rows = stable_json_output(&output.stdout);
+                let summary = rows.iter().find(|row| row["type"] == "summary").unwrap();
+                assert_eq!(summary["data"]["stats"]["searches"], 2);
+                assert_eq!(summary["data"]["stats"]["bytes_searched"], 14);
+                assert_eq!(summary["data"]["stats"]["matches"], 2);
+            }
             None => assert!(stdout.contains(r#""replacement":{"text":"R"}"#), "{stdout}"),
         }
     }

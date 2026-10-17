@@ -646,6 +646,15 @@ matching text file. `count_matches: true` returns one path row plus the original
 per-file totals. Binary markers retain their counts and client-side visibility
 filtering; `stats` still returns the original match totals without restoring
 content rows. Legacy non-counting requests keep their existing response shape.
+JSON clients additionally send `search_stats: true`. The response's
+`search_stats` array contains `{"file":"...","bytes_searched":N,"binary_offset":null}`
+for every candidate searched, including those with no matching rows; a binary
+candidate carries its numeric detection offset. These receipts are collected
+at matching time, charged to the existing response budget, and filtered by the
+client's normal scope/binary visibility rules. They require no extra reads and
+do not claim full-scan work. Missing or malformed receipts are rejected before
+output; older shared servers reject the new query field, causing the usual
+diagnosed scan fallback. Queries without this field keep their prior shape.
 Only default automatic
 decoding and the 64 MiB profile are compatible. `scope` is empty or an existing
 relative directory, never a regular file; it cannot escape the root or cross a nested repository. Content reads

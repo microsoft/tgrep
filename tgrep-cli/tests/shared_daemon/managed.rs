@@ -1300,6 +1300,76 @@ fn compatibility_v1_cli_lease_blocks_v2_migration_until_explicit_release() {
 }
 
 #[test]
+fn json_backend_search_work_stats_include_managed_nonmatching_candidates() {
+    let fixture = Fixture::new();
+    let false_positive = "shared_term_extra\n";
+    fs::write(fixture.a.join("candidate.txt"), false_positive).unwrap();
+    fs::write(fixture.a.join("miss.txt"), "no hit\n").unwrap();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let main_bytes = fs::read(fixture.a.join("src/main.rs")).unwrap().len();
+    let notes_bytes = fs::read(fixture.a.join("notes.txt")).unwrap().len();
+    for diagnostics in [false, true] {
+        for (root, pattern, searches, bytes, matching_files, matches) in [
+            (
+                ".",
+                r"shared_term\b",
+                3,
+                main_bytes + notes_bytes + false_positive.len(),
+                2,
+                3,
+            ),
+            ("src", r"shared_term\b", 1, main_bytes, 1, 2),
+            (".", "no-such-literal", 0, 0, 0, 0),
+        ] {
+            let mut args = vec!["--json", "--color", "never"];
+            if diagnostics {
+                args.push("--stats");
+            }
+            args.extend(["--", pattern, root]);
+            let output = cli(&fixture.a, &args);
+            assert_eq!(output.status.code(), Some(if matches == 0 { 1 } else { 0 }));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("falling back"), "{stderr}");
+            if diagnostics {
+                assert!(stderr.contains("(via shared daemon v2)"), "{stderr}");
+            }
+            let rows: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            for row in rows.iter().filter(|row| row["type"] == "end") {
+                let path = row["data"]["path"]["text"].as_str().unwrap();
+                let bytes = if path.ends_with("main.rs") {
+                    main_bytes
+                } else {
+                    notes_bytes
+                };
+                assert_eq!(row["data"]["stats"]["bytes_searched"], bytes, "{rows:?}");
+            }
+            let summary = rows.iter().find(|row| row["type"] == "summary").unwrap();
+            let stats = &summary["data"]["stats"];
+            assert_eq!(stats["searches"], searches, "{rows:?}");
+            assert_eq!(stats["bytes_searched"], bytes, "{rows:?}");
+            assert_eq!(stats["searches_with_match"], matching_files, "{rows:?}");
+            assert_eq!(stats["matches"], matches, "{rows:?}");
+            assert_eq!(stats["matched_lines"], matches, "{rows:?}");
+        }
+    }
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
 fn v2_cli_real_backend_migration_replay_and_idle_shutdown() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);

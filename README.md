@@ -615,6 +615,39 @@ of lines covered by matches, so a multiline match is not cut short.
 tgrep reads a whole-file buffer even with `-m`; its `bytes_searched` statistic
 can therefore exceed ripgrep's.
 
+### JSON statistics
+
+`--json` emits ripgrep-shaped `begin`, `match`, `context`, `end`, and `summary`
+records. Result paths, contents, offsets, submatches and match/line counts do
+not depend on whether an index was used. Statistics describe the work of the
+selected backend, not an imaginary full scan:
+
+- `searches` counts eligible files actually searched, including candidates
+  that produced no rows. Indexed routes can search fewer files than a scan.
+- `bytes_searched` sums those files' existing buffer-byte counts (the binary
+  detection offset when applicable). It is not physical disk I/O: cached
+  content still counts, index construction is excluded, and whole-buffer
+  matching can count more bytes than ripgrep with an early match limit.
+- Each `end` has one search and that file's bytes. Summary work totals also
+  include searched files without an `end`; they are not inferred from output.
+- `searches_with_match`, `matches`, and `matched_lines` describe emitted
+  matching results. `bytes_printed` counts serialized `begin`/`match`/`context`
+  bytes, including newlines; `end` and `summary` exclude themselves. Summary
+  printed bytes are the sum of the per-file `end` values.
+
+Elapsed timings are diagnostic, not equality-comparable output. tgrep's
+per-file elapsed measures the client writer's file-output interval; summary
+`stats.elapsed` equals `elapsed_total`, the writer's invocation-wide wall time.
+Ripgrep instead aggregates per-search elapsed into summary `stats.elapsed`,
+which is distinct from its wall-clock `elapsed_total`. These timing conventions
+are unchanged; neither proves a search backend or the work done.
+
+JSON clients request per-file search-work statistics from ordinary and shared
+servers. A server too old to supply them is not used for JSON output: an
+ordinary connection falls back to the local index, and a shared connection
+that rejects the request falls back to scanning, with the usual diagnostics.
+Non-JSON requests retain their existing protocol behavior.
+
 ### Multiline matches
 
 `-U/--multiline` allows matches across line boundaries and prints every covered

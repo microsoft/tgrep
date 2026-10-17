@@ -90,21 +90,26 @@ fn owner(daemon: &Daemon) -> (OwnerClaim, OwnerGuard) {
         json!({"token":format!("bootstrap-{}",LEASE_SEQUENCE.fetch_add(1,Ordering::Relaxed))}),
     );
     let claim: OwnerClaim = serde_json::from_value(prepared["claim"].clone()).unwrap();
-    let guard = retry_owner_claim(
+    let guard = retry_catalog_busy(
         || OwnerGuard::claim(claim.clone()),
-        Instant::now() + Duration::from_secs(10),
+        Instant::now() + CATALOG_BUSY_DEADLINE,
     )
     .unwrap();
     daemon.rpc("owners.register", json!({"claim":claim}));
     (claim, guard)
 }
 
-fn retry_owner_claim(
-    mut claim: impl FnMut() -> tgrep_core::managed::Result<OwnerGuard>,
+/// Fixture bound for client-side catalog writers (owner claims and guarded
+/// generation opens) that legally return retryable, uncommitted
+/// `busy`/`catalog-io` when another writer outlasts the fixed SQLite wait.
+const CATALOG_BUSY_DEADLINE: Duration = Duration::from_secs(10);
+
+fn retry_catalog_busy<T>(
+    mut attempt: impl FnMut() -> tgrep_core::managed::Result<T>,
     deadline: Instant,
-) -> tgrep_core::managed::Result<OwnerGuard> {
+) -> tgrep_core::managed::Result<T> {
     loop {
-        match claim() {
+        match attempt() {
             Err(error)
                 if error.category == ErrorCategory::Busy
                     && error.reason_code == "catalog-io"
@@ -141,7 +146,7 @@ fn owner_fixture_retries_catalog_contention_without_replacing_the_claim() {
         });
         ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let mut attempts = 0;
-        let guard = retry_owner_claim(
+        let guard = retry_catalog_busy(
             || {
                 attempts += 1;
                 let result = OwnerGuard::claim(claim.clone());
@@ -230,8 +235,8 @@ fn owner_fixture_does_not_retry_unsafe_or_expired_claim_failures() {
                 Duration::from_secs(10)
             };
         let mut attempts = 0;
-        let result = retry_owner_claim(
-            || {
+        let result = retry_catalog_busy(
+            || -> tgrep_core::managed::Result<OwnerGuard> {
                 attempts += 1;
                 assert_eq!(attempts, 1, "unsafe claim retry: {reason}");
                 let mut error = tgrep_core::managed::Error::new(category, reason, "claim failed");

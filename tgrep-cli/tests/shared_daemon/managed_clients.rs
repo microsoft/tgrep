@@ -15,6 +15,136 @@ pub(super) fn manage(root: &Path, method: &str, params: Value) -> Value {
     response["result"].clone()
 }
 
+/// A client-side guarded generation open takes the catalog writer lock, so it
+/// may legally fail with retryable, uncommitted `busy`/`catalog-io`.
+fn open_guarded<T>(open: impl FnMut() -> tgrep_core::managed::Result<T>) -> T {
+    retry_catalog_busy(open, Instant::now() + CATALOG_BUSY_DEADLINE).unwrap()
+}
+
+fn assert_catalog_contention(error: &tgrep_core::managed::Error) {
+    assert_eq!(error.category, ErrorCategory::Busy, "{error:?}");
+    assert_eq!(error.reason_code, "catalog-io", "{error:?}");
+    assert!(error.retryable, "{error:?}");
+    assert_eq!(
+        error.committed_state,
+        CommitState::NotCommitted,
+        "{error:?}"
+    );
+}
+
+#[test]
+fn guarded_generation_open_retries_only_exact_catalog_writer_contention() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    let attached = completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let storage = PathBuf::from(daemon.marker["storage"].as_str().unwrap());
+    let incarnation = Id::parse(
+        attached["result"]["current"]["current"]["incarnation"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let open = || tgrep_core::managed::open_generation(&storage, &incarnation);
+    let generation = thread::scope(|scope| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let catalog = storage.join("catalog.sqlite");
+        let holder = scope.spawn(move || {
+            let mut connection = rusqlite::Connection::open(catalog).unwrap();
+            connection.busy_timeout(Duration::from_secs(10)).unwrap();
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            transaction.rollback().unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut attempts = 0;
+        let expired = retry_catalog_busy(
+            || {
+                attempts += 1;
+                open()
+            },
+            Instant::now(),
+        );
+        assert_catalog_contention(
+            expired
+                .as_ref()
+                .err()
+                .expect("writer lock must block the guarded open"),
+        );
+        assert_eq!(attempts, 1, "an expired bound must not be extended");
+        let mut attempts = 0;
+        let generation = open_guarded(|| {
+            attempts += 1;
+            let result = open();
+            if attempts == 1 {
+                assert_catalog_contention(
+                    result
+                        .as_ref()
+                        .err()
+                        .expect("writer lock must block the guarded open"),
+                );
+                release_tx.send(()).unwrap();
+            }
+            result
+        });
+        holder.join().unwrap();
+        assert!(attempts >= 2, "{attempts}");
+        generation
+    });
+    assert!(
+        generation
+            .base()
+            .reader()
+            .all_paths()
+            .contains(&"notes.txt".to_owned())
+    );
+    drop(generation);
+
+    let missing = Id::parse("f".repeat(32)).unwrap();
+    let mut outcomes = Vec::new();
+    let error = retry_catalog_busy(
+        || {
+            let result = tgrep_core::managed::open_generation(&storage, &missing);
+            outcomes.push(result.as_ref().err().map(|error| {
+                (
+                    error.category,
+                    error.reason_code.clone(),
+                    error.retryable,
+                    error.committed_state,
+                )
+            }));
+            result
+        },
+        Instant::now() + CATALOG_BUSY_DEADLINE,
+    )
+    .err()
+    .expect("an unpublished generation must not open");
+    assert_ne!(error.category, ErrorCategory::Busy, "{error:?}");
+    let (last, retried) = outcomes.split_last().unwrap();
+    assert_eq!(last.as_ref().unwrap().1, error.reason_code);
+    for retried in retried {
+        assert_eq!(
+            retried.as_ref().unwrap(),
+            &(
+                ErrorCategory::Busy,
+                "catalog-io".to_owned(),
+                true,
+                CommitState::NotCommitted
+            )
+        );
+    }
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
 fn wait_json(process: &mut runtime::Process, flag: &str) -> Value {
     let started = Instant::now();
     loop {
@@ -405,11 +535,9 @@ fn actual_legacy_core_readers_reject_staged_and_published_managed_storage() {
         stage["id"]
     );
     probe(&directory, 1);
-    let guarded = tgrep_core::managed::open_generation(
-        Path::new(daemon.marker["storage"].as_str().unwrap()),
-        &Id::parse(stage["id"].as_str().unwrap()).unwrap(),
-    )
-    .unwrap();
+    let storage = PathBuf::from(daemon.marker["storage"].as_str().unwrap());
+    let incarnation = Id::parse(stage["id"].as_str().unwrap()).unwrap();
+    let guarded = open_guarded(|| tgrep_core::managed::open_generation(&storage, &incarnation));
     assert!(
         guarded
             .base()
@@ -525,11 +653,10 @@ fn guarded_reader_process() {
     let journal =
         PathBuf::from(std::env::var_os("TGREP_MANAGED_READER").expect("owned reader journal"));
     let request: Value = serde_json::from_slice(&fs::read(journal).unwrap()).unwrap();
-    let generation = tgrep_core::managed::open_generation(
-        Path::new(request["namespace"].as_str().unwrap()),
-        &Id::parse(request["incarnation"].as_str().unwrap()).unwrap(),
-    )
-    .unwrap();
+    let namespace = PathBuf::from(request["namespace"].as_str().unwrap());
+    let incarnation = Id::parse(request["incarnation"].as_str().unwrap()).unwrap();
+    let generation =
+        open_guarded(|| tgrep_core::managed::open_generation(&namespace, &incarnation));
     if request["candidate"] == true {
         let view = tgrep_core::worktrees::WorktreeView::new(
             Path::new(request["root"].as_str().unwrap()),

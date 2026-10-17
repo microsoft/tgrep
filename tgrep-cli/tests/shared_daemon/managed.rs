@@ -6,6 +6,9 @@ use tgrep_core::managed::{CommitState, ErrorCategory, OwnerClaim, OwnerGuard};
 #[path = "managed_diagnostics.rs"]
 mod diagnostics;
 
+#[path = "managed_attach.rs"]
+mod attach_retry;
+
 #[path = "managed_watch.rs"]
 mod watch;
 

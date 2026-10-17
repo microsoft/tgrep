@@ -140,7 +140,7 @@ impl StopTiming {
     }
 }
 
-fn panic_text(action: impl FnOnce() + std::panic::UnwindSafe) -> String {
+pub(super) fn panic_text(action: impl FnOnce() + std::panic::UnwindSafe) -> String {
     let panic = std::panic::catch_unwind(action).expect_err("expected the original assertion");
     panic
         .downcast_ref::<String>()

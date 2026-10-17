@@ -146,6 +146,18 @@ impl Fixture {
     }
 }
 
+// Shared by Daemon::rpc and scripted endpoints so both decode responses identically.
+fn rpc_data(method: &str, response: &Value, marker: &Value) -> Value {
+    assert!(response.get("error").is_none(), "{method}: {response}");
+    assert_eq!(response["result"]["instance"], marker["instance"]);
+    assert_eq!(response["result"]["protocol"], marker["protocol"]);
+    if marker["protocol"] == 2 {
+        response["result"]["data"].clone()
+    } else {
+        response["result"].clone()
+    }
+}
+
 struct Daemon {
     child: Child,
     marker: Value,
@@ -277,14 +289,7 @@ impl Daemon {
         let response = self.try_rpc(method, params).unwrap_or_else(|error| {
             panic!("{method}: {error}; daemon log: {}", self.log.display())
         });
-        assert!(response.get("error").is_none(), "{method}: {response}");
-        assert_eq!(response["result"]["instance"], self.marker["instance"]);
-        assert_eq!(response["result"]["protocol"], self.marker["protocol"]);
-        if self.marker["protocol"] == 2 {
-            response["result"]["data"].clone()
-        } else {
-            response["result"].clone()
-        }
+        rpc_data(method, &response, &self.marker)
     }
 
     fn attach(&self, root: &Path, revision: &str) -> Value {

@@ -50,6 +50,34 @@ fn epoch(status: &Value) -> u64 {
     status["input_epoch"].as_u64().unwrap()
 }
 
+/// Initial attach may end in the documented retryable, not-committed preparation
+/// invalidation; only that exact result is resolved and resumed within `deadline`.
+pub(super) fn attach_watched_root<E: super::attach_retry::AttachEndpoint>(
+    endpoint: &E,
+    claim: &OwnerClaim,
+    input: Value,
+    deadline: Instant,
+) -> Value {
+    super::attach_retry::retry_attach(
+        endpoint,
+        claim,
+        None,
+        input,
+        super::attach_retry::Retry {
+            point: "native-watch-attach",
+            deadline,
+            allowance: super::attach_retry::RetryableAttach::PreparationInvalidated,
+        },
+        |_| {},
+    )
+    .unwrap_or_else(|failures| {
+        panic!(
+            "native-watch-attach: exhausted the shared attach bound after {} documented preparation invalidations: {failures:?}",
+            failures.len()
+        )
+    })
+}
+
 fn matches(daemon: &Daemon, view: &Value, pattern: &str) -> Vec<Value> {
     let result = retry_busy(
         daemon,
@@ -204,7 +232,7 @@ fn native_subscriptions_cover_nested_worktree_changes_with_default_budgets() {
         let mut input = attach_input(&fixture, &claim);
         input["request"]["root"] = json!(fs::canonicalize(root).unwrap());
         let started = Instant::now();
-        completed(&daemon, &daemon.rpc("views.attach", input));
+        attach_watched_root(&daemon, &claim, input, started + Duration::from_secs(30));
         let view = daemon.rpc("lookup", json!({"root":fs::canonicalize(root).unwrap()}));
         let status = native_ready(&daemon, &view, None);
         attach_ms.push(started.elapsed().as_millis());

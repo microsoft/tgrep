@@ -2578,3 +2578,84 @@ fn managed_serving_verification_stays_available_and_respects_budget_semantics() 
         assert_eq!(namespace.work_usage().unwrap().reservations, 0);
     }
 }
+
+#[test]
+fn managed_serving_verification_budget_failure_after_a_difference_fails_closed() {
+    use crate::managed::faults::{Action, Point, Specification, Stage};
+    for membership in [true, false] {
+        let fixture = Fixture::new();
+        for index in 0..40 {
+            write(
+                &fixture.root,
+                &format!("siblings/file-{index:03}.txt"),
+                b"stable needle\n",
+            );
+        }
+        commit(&fixture.root);
+        let (namespace, permit, view) = fixture.controlled();
+        view.refresh_controlled(&permit).unwrap();
+        let assert_closed = |context: &str| {
+            let status = view.status().unwrap();
+            assert!(
+                !status.ready && status.full_required,
+                "{context}: {status:?}"
+            );
+            assert!(
+                matches!(view.with_snapshot(|_| ()), Err(WorktreeError::NotReady)),
+                "{context}"
+            );
+        };
+        let error = if membership {
+            // Discovery observes an unreported addition before any read.
+            write(&fixture.root, "siblings/added.txt", b"added needle\n");
+            let fault = namespace
+                .install_test_fault(Specification {
+                    point: Point::ReconcileBatchOpened,
+                    operation: Some(permit.operation_id().clone()),
+                    skip_hits: 0,
+                    action: Action::Pause { timeout_ms: 30_000 },
+                })
+                .unwrap();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| view.verify_controlled(&permit));
+                let deadline = Instant::now() + std::time::Duration::from_secs(20);
+                while namespace.test_fault_status().unwrap().unwrap().stage != Stage::Waiting {
+                    assert!(
+                        Instant::now() < deadline,
+                        "verification did not open a batch"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert_closed("difference observed before cancellation");
+                permit.cancel();
+                namespace.release_test_fault(&fault.ticket).unwrap();
+                worker.join().unwrap().unwrap_err()
+            })
+        } else {
+            // Every file was read and one differs; cancel before publication.
+            same_stat_write(&fixture.root, "siblings/file-007.txt", b"zzzzzz needle\n");
+            view.verify_inner(
+                || assert!(view.status().unwrap().ready),
+                || {
+                    assert_closed("content difference observed by the full read");
+                    permit.cancel();
+                },
+                Some(&permit),
+            )
+            .unwrap_err()
+        };
+        assert!(
+            matches!(error, WorktreeError::Index(crate::Error::Managed(ref error))
+            if error.category == crate::managed::ErrorCategory::Cancelled),
+            "{error:?}"
+        );
+        assert!(is_budget_failure(&error));
+        assert_closed("budget failure after a difference never restores readiness");
+        assert_eq!(
+            view.verify_controlled(&permit).unwrap(),
+            Verification::Ineligible
+        );
+        drop((view, permit));
+        assert_eq!(namespace.work_usage().unwrap().reservations, 0);
+    }
+}

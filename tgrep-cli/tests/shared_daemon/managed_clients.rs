@@ -1001,8 +1001,18 @@ fn owner_holder_frames_typed_refusals_without_inferring_retry_safety() {
     success(holder.finish(Duration::from_secs(30)).unwrap());
 
     // An ended lifetime is framed as non-retryable, never as a fresh claim.
+    // Housekeeping may already have removed the released owner record, which
+    // reports the same stale identity as retired.
     let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
-    pre_handshake_failure(&output, "stale-identity", "owner-lifetime-ended", false);
+    let reason = stdout_lines(&output.stdout)
+        .first()
+        .and_then(|frame| frame["error"]["reason_code"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    assert!(
+        matches!(reason.as_str(), "owner-lifetime-ended" | "owner-retired"),
+        "{output:?}"
+    );
+    pre_handshake_failure(&output, "stale-identity", &reason, false);
 
     // Untyped claim-file failures have no managed classification and stay unframed.
     for (name, bytes) in [

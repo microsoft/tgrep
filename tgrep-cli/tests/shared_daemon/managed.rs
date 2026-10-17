@@ -1532,8 +1532,11 @@ fn content_only_profile_serves_extension_named_text_from_the_managed_view() {
                 "expected_version":view["version"],"owner":claim.owner,"allocation_version":1}}),
         ),
     );
+    // The invalidation also schedules automatic work that may consume the
+    // hints first, leaving this refresh a full pass; either path must keep
+    // the attached profile. Hint-only processing is covered in tgrep-core.
     assert_eq!(
-        refreshed["result"]["reconcile"]["full"], false,
+        refreshed["result"]["current"]["current"]["key"]["profile"]["eligibility"], "content-only",
         "{refreshed}"
     );
     for (pattern, rows) in [

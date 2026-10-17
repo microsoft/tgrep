@@ -1908,7 +1908,7 @@ mod tests {
         );
         assert!(
             help.contains(
-                "Managed v2 uses this only for polling views, not healthy native watchers"
+                "Managed v2 also uses it to verify healthy native views while they serve"
             ),
             "{help}"
         );

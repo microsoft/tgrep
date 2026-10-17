@@ -2638,17 +2638,34 @@ fn managed_serving_verification_budget_failure_after_a_difference_fails_closed()
                 worker.join().unwrap().unwrap_err()
             })
         } else {
-            // Every file was read and one differs; cancel before publication.
+            use crate::managed::faults::{Action, Point, Specification, Stage};
+
+            // The changed file is hashed, then cancellation interrupts the
+            // fallible base lookup before the rest of the batch can complete.
             same_stat_write(&fixture.root, "siblings/file-007.txt", b"zzzzzz needle\n");
-            view.verify_inner(
-                || assert!(view.status().unwrap().ready),
-                || {
-                    assert_closed("content difference observed by the full read");
-                    permit.cancel();
-                },
-                Some(&permit),
-            )
-            .unwrap_err()
+            let fault = namespace
+                .install_test_fault(Specification {
+                    point: Point::VerificationContentHashed,
+                    operation: Some(permit.operation_id().clone()),
+                    skip_hits: 0,
+                    action: Action::Pause { timeout_ms: 30_000 },
+                })
+                .unwrap();
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| view.verify_controlled(&permit));
+                let deadline = Instant::now() + std::time::Duration::from_secs(20);
+                while namespace.test_fault_status().unwrap().unwrap().stage != Stage::Waiting {
+                    assert!(
+                        Instant::now() < deadline,
+                        "verification did not hash the changed content"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert_closed("changed content closes readiness before base lookup");
+                permit.cancel();
+                namespace.release_test_fault(&fault.ticket).unwrap();
+                worker.join().unwrap().unwrap_err()
+            })
         };
         assert!(
             matches!(error, WorktreeError::Index(crate::Error::Managed(ref error))

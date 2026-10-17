@@ -20,6 +20,7 @@ pub enum Point {
     VerificationMemoryAdmission,
     MemberVerificationPage,
     MemberVerified,
+    VerificationContentHashed,
     GenerationBuilt,
     GenerationPublished,
     CheckpointPublished,

@@ -1783,57 +1783,29 @@ fn search_local_index(
     // which is what makes binary files visible in ripgrep.
     let explicit = matches!(scope, IndexScope::File(_));
 
-    for paths in tgrep_core::rooted::sibling_batches(&candidates) {
-        let parent = Path::new(&paths[0])
-            .parent()
-            .unwrap_or_else(|| Path::new(""));
-        let batch = match (paths.len() > 1)
-            .then(|| rooted.read_batch(parent))
-            .transpose()
-        {
-            Ok(batch) => batch,
+    // Keep indexed output streaming: a sibling batch only proves parent
+    // identity at finish, after its files may already have been printed.
+    for rel_path in &candidates {
+        let read = (|| -> std::io::Result<Option<FileRead>> {
+            let file = rooted.open_file(Path::new(rel_path))?;
+            read_open_text_lossy(file, opts.encoding, read_size_limit(opts, explicit))
+        })();
+        let read = match read {
+            Ok(Some(read)) => read,
+            Ok(None) => continue,
             Err(error) => {
                 if !opts.no_messages {
-                    for rel_path in paths {
-                        eprintln!("warning: cannot read indexed file {rel_path:?}: {error}");
-                    }
+                    eprintln!("warning: cannot read indexed file {rel_path:?}: {error}");
                 }
                 continue;
             }
         };
-        for rel_path in paths {
-            let read = (|| -> std::io::Result<Option<FileRead>> {
-                let file = match &batch {
-                    Some(batch) => batch.open_file(Path::new(rel_path))?,
-                    None => rooted.open_file(Path::new(rel_path))?,
-                };
-                read_open_text_lossy(file, opts.encoding, read_size_limit(opts, explicit))
-            })();
-            let read = match read {
-                Ok(Some(read)) => read,
-                Ok(None) => continue,
-                Err(error) => {
-                    if !opts.no_messages {
-                        eprintln!("warning: cannot read indexed file {rel_path:?}: {error}");
-                    }
-                    continue;
-                }
-            };
 
-            if search_file(&read, &matcher, rel_path, opts, writer, explicit)? {
-                had_matches = true;
-                if opts.quiet {
-                    break;
-                }
+        if search_file(&read, &matcher, rel_path, opts, writer, explicit)? {
+            had_matches = true;
+            if opts.quiet {
+                break;
             }
-        }
-        if let Some(batch) = batch {
-            batch
-                .finish()
-                .context("verifying indexed candidate ancestors")?;
-        }
-        if had_matches && opts.quiet {
-            break;
         }
     }
 

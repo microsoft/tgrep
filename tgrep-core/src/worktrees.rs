@@ -1267,13 +1267,24 @@ impl WorktreeView {
                             })?;
                         if let Some(id) = id {
                             timed(&mut timings.worker_compare_extract_us, || -> Result<()> {
-                                if self.base_content(path) != Some(id)
+                                let differs_from_published = self.base_content(path) != Some(id)
                                     && !(previous
                                         .and_then(|entry| entry.content)
                                         .or_else(|| state.restored_content.get(path).copied())
                                         == Some(id)
-                                        && state.index.live.has_path(path))
-                                {
+                                        && state.index.live.has_path(path));
+                                if differs_from_published {
+                                    if verify {
+                                        self.stale.store(true, Ordering::Release);
+                                        if let Some(permit) = permit {
+                                            let point =
+                                                crate::managed::faults::Point::VerificationContentHashed;
+                                            permit
+                                                .namespace
+                                                .fault(point, Some(permit.operation_id()))
+                                                .map_err(crate::Error::from)?;
+                                        }
+                                    }
                                     if let Some(file_id) =
                                         batch.base_contents.find(self, id, permit)?
                                     {

@@ -168,6 +168,28 @@ fn query_batch_finish_rejects_a_replaced_parent_without_following_it() {
 }
 
 #[test]
+fn streaming_file_open_does_not_reuse_a_replaced_parent_handle() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("one"), "original").unwrap();
+    let root = RootedDir::open(temp.path()).unwrap();
+
+    assert_eq!(
+        contents(root.open_file(Path::new("parent/one")).unwrap()),
+        "original"
+    );
+    fs::rename(&parent, temp.path().join("saved")).unwrap();
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("one"), "replacement").unwrap();
+
+    assert_eq!(
+        contents(root.open_file(Path::new("parent/one")).unwrap()),
+        "replacement"
+    );
+}
+
+#[test]
 fn sibling_batches_release_pins_and_recheck_ancestor_identity() {
     let temp = tempfile::tempdir().unwrap();
     let parent = temp.path().join("outer").join("inner");

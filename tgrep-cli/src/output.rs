@@ -360,9 +360,14 @@ impl OutputWriter {
 
     /// Record that a file of `bytes` length is about to be searched.
     pub fn note_bytes_searched(&mut self, bytes: u64) {
-        self.pending_bytes_searched = bytes;
+        self.set_file_bytes_searched(bytes);
         self.all_bytes_searched += bytes;
         self.all_searches += 1;
+    }
+
+    /// Remote work is counted before rendering, including files without rows.
+    pub fn set_file_bytes_searched(&mut self, bytes: u64) {
+        self.pending_bytes_searched = bytes;
     }
 
     /// Report that a matching file was suppressed because it looks binary.
@@ -433,7 +438,8 @@ impl OutputWriter {
             },
         });
         let line = format!("{msg}\n");
-        self.file_stats.bytes_printed += line.len() as u64;
+        // ripgrep totals bytes_printed before writing `end`, so neither `end`
+        // nor `summary` counts itself.
         self.stdout.write_all(line.as_bytes())?;
         self.total_stats.add(&self.file_stats);
         self.file_stats = Stats::default();

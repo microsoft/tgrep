@@ -191,6 +191,7 @@ fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
         view: first.id.clone(),
         expected_version: first.version,
         allocation_version: 1,
+        verify: false,
     };
     let queued = manager
         .accept_reconciliation(token.clone(), request.clone())
@@ -251,6 +252,7 @@ fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
                 view: first.id.clone(),
                 expected_version: first.version,
                 allocation_version: 1,
+                verify: false,
             },
         )
         .unwrap();
@@ -336,6 +338,7 @@ fn ready_reconciliation_preserves_forced_repairs_and_rejects_invalid_work() {
                     view: first.id.clone(),
                     expected_version: first.version,
                     allocation_version: 1,
+                    verify: false,
                 },
             )
             .unwrap();
@@ -369,6 +372,7 @@ fn ready_reconciliation_preserves_forced_repairs_and_rejects_invalid_work() {
                     view: first.id.clone(),
                     expected_version: version,
                     allocation_version: allocation,
+                    verify: false,
                 },
             )
             .unwrap();
@@ -420,6 +424,7 @@ fn coalesced_reconciliation_rechecks_cancellation_and_allocation_before_receipt(
                     view: first.id.clone(),
                     expected_version: first.version,
                     allocation_version: 1,
+                    verify: false,
                 },
             )
             .unwrap();
@@ -744,8 +749,12 @@ fn atomic_migration_preserves_dirty_overlay_old_queries_and_exact_replay() {
         .unwrap();
     paths.sort();
     assert_eq!(paths, ["private.txt", "source.txt"]);
+    let batch = query
+        .with_snapshot(|snapshot| snapshot.candidate_batch("source.txt"))
+        .unwrap()
+        .unwrap();
     let mut candidate = query
-        .with_snapshot(|snapshot| snapshot.open_candidate("source.txt"))
+        .with_snapshot(|snapshot| snapshot.open_candidate_in(&batch, "source.txt"))
         .unwrap()
         .unwrap();
     let mut bytes = String::new();
@@ -789,6 +798,17 @@ fn atomic_migration_preserves_dirty_overlay_old_queries_and_exact_replay() {
             .root_handles_released
     );
     drop(candidate);
+    assert!(
+        !manager
+            .detach(
+                &fixture.owner.registration().owner,
+                &Token::parse("primary-lease").unwrap(),
+                &first.id
+            )
+            .unwrap()
+            .root_handles_released
+    );
+    batch.finish().unwrap();
     assert!(
         manager
             .detach(
@@ -2038,6 +2058,15 @@ fn escaped_candidate_keeps_the_base_and_root_protected() {
         })
         .unwrap();
     let clone = candidate.try_clone().unwrap();
+    let batch = view
+        .with_snapshot(|snapshot| snapshot.candidate_batch("source.txt"))
+        .unwrap()
+        .unwrap();
+    let batched = view
+        .with_snapshot(|snapshot| snapshot.open_candidate_in(&batch, "source.txt"))
+        .unwrap()
+        .unwrap();
+    drop(batched);
     let guard = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2056,6 +2085,10 @@ fn escaped_candidate_keeps_the_base_and_root_protected() {
     #[cfg(windows)]
     assert!(fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).is_err());
     drop(clone);
+    assert!(fs2::FileExt::try_lock_exclusive(&guard).is_err());
+    #[cfg(windows)]
+    assert!(fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).is_err());
+    batch.finish().unwrap();
     fs2::FileExt::try_lock_exclusive(&guard).unwrap();
     #[cfg(windows)]
     fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).unwrap();
@@ -2386,6 +2419,71 @@ fn retained_checkpoints_release_independent_edges_and_stale_preview_cannot_autho
 #[test]
 #[cfg(windows)]
 fn native_sharing_and_mapping_failures_stay_pending_without_false_reclaimed_bytes() {
+    assert_native_sharing_collection(|fixture| collect(fixture, None));
+}
+
+#[test]
+#[cfg(all(windows, feature = "managed-test-hooks"))]
+fn native_sharing_recovery_resumes_a_deadline_limited_collection_pass() {
+    use std::time::{Duration, Instant};
+    use tgrep_core::managed::faults::{Action, Point, Specification, Stage};
+
+    assert_native_sharing_collection(|fixture| {
+        let namespace = Arc::clone(&fixture.namespace);
+        let duration = namespace
+            .policy()
+            .unwrap()
+            .policy
+            .collection
+            .max_duration_ms;
+        let hook = namespace
+            .install_test_fault(Specification {
+                point: Point::MemberVerificationPage,
+                operation: None,
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 30_000 },
+            })
+            .unwrap();
+        let resumed = std::thread::scope(|scope| {
+            let release = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while namespace.test_fault_status().unwrap().unwrap().stage != Stage::Waiting {
+                    if Instant::now() >= deadline {
+                        namespace.release_test_fault(&hook.ticket).unwrap();
+                        panic!("collection verification barrier was not reached");
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                std::thread::sleep(Duration::from_millis(duration));
+                namespace.release_test_fault(&hook.ticket).unwrap();
+            });
+            let resumed = collect(fixture, None);
+            release.join().unwrap();
+            resumed
+        });
+        assert_eq!(resumed.errors, 0, "{resumed:?}");
+        assert_eq!(resumed.skipped, 0, "{resumed:?}");
+        assert_eq!(resumed.removed, 0, "{resumed:?}");
+        assert_eq!(resumed.logical_bytes_reclaimed, 0, "{resumed:?}");
+        assert_eq!(resumed.elapsed_budget_exceeded, Some(true), "{resumed:?}");
+        assert!(resumed.verification_context_retained, "{resumed:?}");
+        assert!(resumed.next.is_some(), "{resumed:?}");
+        assert!(
+            namespace
+                .work_usage()
+                .unwrap()
+                .memory
+                .retained_private_estimate_bytes
+                > 0
+        );
+        resumed
+    });
+}
+
+#[cfg(windows)]
+fn assert_native_sharing_collection(
+    resume: impl FnOnce(&mut Fixture) -> tgrep_core::managed::CollectionProgress,
+) {
     use std::os::windows::fs::OpenOptionsExt;
     use tgrep_core::managed::ObjectState;
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
@@ -2440,6 +2538,10 @@ fn native_sharing_and_mapping_failures_stay_pending_without_false_reclaimed_byte
         blocked.logical_bytes_reclaimed + blocked.recovered_logical_bytes,
         0
     );
+    assert_eq!(
+        blocked.allocated_bytes_reclaimed + blocked.recovered_allocated_bytes,
+        0
+    );
     let error = blocked
         .details
         .iter()
@@ -2453,17 +2555,60 @@ fn native_sharing_and_mapping_failures_stay_pending_without_false_reclaimed_byte
     );
     drop(mapping);
     drop(files);
-    let resumed = collect(&mut fixture, None);
-    assert_eq!(resumed.errors, 0, "{resumed:?}");
+    let mut resumed = resume(&mut fixture);
+    let bounds = fixture.namespace.policy().unwrap().policy.collection;
+    let mut reclaimed = 0;
+    for pass in 0..16 {
+        assert_eq!(resumed.errors, 0, "{resumed:?}");
+        assert_eq!(resumed.skipped, 0, "{resumed:?}");
+        assert!(!resumed.cancelled, "{resumed:?}");
+        reclaimed += resumed.logical_bytes_reclaimed + resumed.recovered_logical_bytes;
+        let remaining = fixture.namespace.object(&id).unwrap();
+        assert_eq!(
+            reclaimed + remaining.logical_bytes,
+            record.logical_bytes,
+            "{resumed:?}"
+        );
+        if remaining.state == ObjectState::Removed {
+            break;
+        }
+        assert_eq!(remaining.state, ObjectState::PendingDeletion, "{resumed:?}");
+        // Resume only a reported bounded continuation, not an unexplained
+        // pending object or a repeated native sharing error.
+        assert!(
+            resumed.elapsed_budget_exceeded == Some(true)
+                || resumed.pages == bounds.max_pages
+                || resumed.verification_bytes >= bounds.max_delete_bytes
+                || resumed.logical_bytes_reclaimed == bounds.max_delete_bytes
+                || resumed.examined == bounds.max_examined
+                || resumed.removed == bounds.max_removed,
+            "{resumed:?}"
+        );
+        let cursor = resumed.next.clone().expect("bounded pass needs a cursor");
+        assert!(
+            cursor.current.as_ref() == Some(&id)
+                || (resumed.examined == 0 && cursor.current.is_none()),
+            "{resumed:?}"
+        );
+        assert!(
+            pass < 15,
+            "collection continuations did not finish: {resumed:?}"
+        );
+        resumed = collect(&mut fixture, Some(cursor));
+    }
     assert_eq!(
         fixture.namespace.object(&id).unwrap().state,
-        ObjectState::Removed
+        ObjectState::Removed,
+        "blocked={blocked:#?}; resumed={resumed:#?}; object={:#?}; memory={:#?}; bounds={:#?}",
+        fixture.namespace.object(&id).unwrap(),
+        fixture.namespace.work_usage().unwrap().memory,
+        fixture.namespace.policy().unwrap().policy.collection,
     );
-    assert_eq!(
-        resumed.logical_bytes_reclaimed + resumed.recovered_logical_bytes,
-        record.logical_bytes
-    );
+    assert_eq!(reclaimed, record.logical_bytes);
     assert!(!directory.exists());
+    let memory = fixture.namespace.work_usage().unwrap().memory;
+    assert_eq!(memory.retained_private_estimate_bytes, 0, "{memory:?}");
+    assert_eq!(memory.mapped_bytes, 0, "{memory:?}");
 }
 
 #[test]

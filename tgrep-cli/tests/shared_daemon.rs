@@ -146,6 +146,18 @@ impl Fixture {
     }
 }
 
+// Shared by Daemon::rpc and scripted endpoints so both decode responses identically.
+fn rpc_data(method: &str, response: &Value, marker: &Value) -> Value {
+    assert!(response.get("error").is_none(), "{method}: {response}");
+    assert_eq!(response["result"]["instance"], marker["instance"]);
+    assert_eq!(response["result"]["protocol"], marker["protocol"]);
+    if marker["protocol"] == 2 {
+        response["result"]["data"].clone()
+    } else {
+        response["result"].clone()
+    }
+}
+
 struct Daemon {
     child: Child,
     marker: Value,
@@ -277,14 +289,7 @@ impl Daemon {
         let response = self.try_rpc(method, params).unwrap_or_else(|error| {
             panic!("{method}: {error}; daemon log: {}", self.log.display())
         });
-        assert!(response.get("error").is_none(), "{method}: {response}");
-        assert_eq!(response["result"]["instance"], self.marker["instance"]);
-        assert_eq!(response["result"]["protocol"], self.marker["protocol"]);
-        if self.marker["protocol"] == 2 {
-            response["result"]["data"].clone()
-        } else {
-            response["result"].clone()
-        }
+        rpc_data(method, &response, &self.marker)
     }
 
     fn attach(&self, root: &Path, revision: &str) -> Value {
@@ -463,14 +468,121 @@ fn startup_deprecation_warns_once_per_v1_start_and_preserves_clients() {
 }
 
 #[test]
+fn sibling_query_batches_preserve_local_and_shared_routes() {
+    let mut fixture = Fixture::new();
+    prepare_query_batches(&mut fixture);
+    success(cli(&fixture.a, &["index", "."]));
+    assert_query_batch_parity(&fixture.a, "Search completed in");
+    let daemon = fixture.start(&["--no-watch"]);
+    let lease = daemon.attach(&fixture.a, &fixture.revision);
+    assert_query_batch_parity(&fixture.a, "(via shared daemon v1)");
+    daemon.rpc(
+        "detach",
+        json!({"root":fixture.a,"view":lease["view"],"lease":lease["lease"]}),
+    );
+}
+
+fn prepare_query_batches(fixture: &mut Fixture) {
+    for parent in ["batches/first/inner", "batches/second/inner"] {
+        fs::create_dir_all(fixture.a.join(parent)).unwrap();
+        for index in 0..67 {
+            let mut content = format!("public public class Example{index}\n");
+            if index % 3 == 0 {
+                content.push_str("// TODO: HACK and FIXME\r\n");
+            }
+            content.push_str("// todo_suffix hackish xxxsuffix\npublic end\n");
+            fs::write(
+                fixture.a.join(parent).join(format!("file-{index:03}.cs")),
+                content,
+            )
+            .unwrap();
+        }
+    }
+    fs::write(fixture.a.join("batches/.hidden.cs"), "public TODO\n").unwrap();
+    fs::write(fixture.a.join("batches/empty.cs"), "").unwrap();
+    fs::write(fixture.a.join("batches/binary.cs"), b"public\0TODO\n").unwrap();
+    fs::write(fixture.a.join("batches/.gitignore"), "ignored.cs\n").unwrap();
+    fs::write(
+        fixture.a.join("batches/ignored.cs"),
+        "public TODO ignored\n",
+    )
+    .unwrap();
+    git(&fixture.a, &["add", "."]);
+    git(&fixture.a, &["commit", "-qm", "sibling query batches"]);
+    fixture.revision = git(&fixture.a, &["rev-parse", "HEAD"]);
+}
+
+fn assert_query_batch_parity(root: &Path, backend: &str) {
+    let todo = r"\b(TODO|HACK|FIXME|XXX)\b";
+    for (pattern, flags) in [
+        ("public", vec!["-l"]),
+        (todo, vec!["-n", "-i"]),
+        (todo, vec!["-l", "-i"]),
+        ("absent_trigram_token", vec!["-l"]),
+        ("^$", vec!["-n"]),
+        ("public", vec!["-c"]),
+        ("public", vec!["--count-matches"]),
+        (todo, vec!["-i", "-n", "-v", "-m", "2"]),
+        ("public", vec!["-n", "-o", "-m", "1"]),
+        ("public", vec!["-n", "-m", "0"]),
+        ("public", vec!["-q"]),
+        (todo, vec!["-i", "-n", "--hidden"]),
+        (todo, vec!["-i", "-n", "-C", "1"]),
+        (r"xxxsuffix\npublic", vec!["-n", "-U"]),
+        ("public", vec!["-l", "-g", "!**/second/**"]),
+        ("public", vec!["-l", "--max-depth", "2"]),
+        ("public", vec!["-l", "--sortr", "path"]),
+        ("public", vec!["-n", "--column", "-b", "-r", "export"]),
+        ("public", vec!["-l", "-t", "cs"]),
+    ] {
+        let mut args = vec![
+            "--stats",
+            "--sort",
+            "path",
+            "--color",
+            "never",
+            "--path-separator",
+            "/",
+            "-g",
+            "!.git",
+        ];
+        args.extend(flags);
+        args.extend(["-e", pattern, "--", "."]);
+        let indexed = cli(root, &args);
+        let mut scan_args = vec!["--no-index"];
+        scan_args.extend(args.clone());
+        let scanned = cli(root, &scan_args);
+        assert_eq!(
+            indexed.status.code(),
+            scanned.status.code(),
+            "{backend}: {args:?}"
+        );
+        assert!(matches!(indexed.status.code(), Some(0 | 1)), "{indexed:?}");
+        assert_eq!(indexed.stdout, scanned.stdout, "{backend}: {args:?}");
+        let stderr = String::from_utf8_lossy(&indexed.stderr);
+        assert!(stderr.contains(backend), "{args:?}: {stderr}");
+        assert!(stderr.contains("Query plan:"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("Brute-force"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("warning:"), "{args:?}: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&scanned.stderr).contains("Brute-force"),
+            "{scanned:?}"
+        );
+    }
+}
+
+#[test]
 fn multiline_count_matches_uses_shared_per_file_totals() {
     let mut f = Fixture::new();
     prepare_multiline_counts(&mut f);
+    success(cli(&f.a, &["index", "."]));
+    assert_return_count_parity(&f.a, "Search completed in");
     let d = f.start(&["--no-watch"]);
     let lease = d.attach(&f.a, &f.revision);
     let before = d.lookup(&f.a)["queries"].as_u64().unwrap();
     let queries = assert_multiline_counts(&f.a.join("counts"), "(via shared daemon v1)");
     assert_eq!(d.lookup(&f.a)["queries"], before + queries);
+    assert_return_count_parity(&f.a, "(via shared daemon v1)");
     assert_compact_shared_count_responses(&d, &f.a);
     d.rpc(
         "detach",
@@ -482,6 +594,11 @@ fn prepare_multiline_counts(f: &mut Fixture) {
     fs::write(
         f.a.join("count-heavy.txt"),
         format!("{}\nb\n", "a".repeat(32 * 1024)),
+    )
+    .unwrap();
+    fs::write(
+        f.a.join("line-heavy.txt"),
+        "return return return\nmiss\n".repeat(4096),
     )
     .unwrap();
     let root = f.a.join("counts");
@@ -505,19 +622,35 @@ fn assert_compact_shared_count_responses(daemon: &Daemon, root: &Path) {
     }
     for engine in ["default", "pcre2"] {
         for stats in [false, true] {
-            for (pattern, multiline, matches, lines) in [
-                ("a", false, 32 * 1024, 1),
-                (r"a|\nb", true, 32 * 1024 + 1, 2),
+            for (path, pattern, multiline, matches, lines, count_field) in [
+                ("count-heavy.txt", "a", false, 32 * 1024, 1, "count_matches"),
+                (
+                    "count-heavy.txt",
+                    r"a|\nb",
+                    true,
+                    32 * 1024 + 1,
+                    2,
+                    "count_matches",
+                ),
+                ("line-heavy.txt", "return", false, 3 * 4096, 4096, "count"),
+                (
+                    "line-heavy.txt",
+                    "return",
+                    false,
+                    3 * 4096,
+                    4096,
+                    "count_matches",
+                ),
             ] {
                 params["query"] = json!({
                     "pattern":pattern,"multiline":multiline,"engine":engine,
-                    "glob":["count-heavy.txt"],"count_matches":true,
+                    "glob":[path],count_field:true,
                     "stats":stats,"detail":false,
                 });
                 let raw = daemon
                     .raw_response(&daemon.request("search", params.clone()))
                     .unwrap();
-                assert!(raw.len() < 40 * 1024, "count response: {} bytes", raw.len());
+                assert!(raw.len() < 4 * 1024, "count response: {} bytes", raw.len());
                 let response: Value = serde_json::from_str(&raw).unwrap();
                 assert!(response.get("error").is_none(), "{response}");
                 assert_eq!(response["result"]["instance"], daemon.marker["instance"]);
@@ -533,16 +666,21 @@ fn assert_compact_shared_count_responses(daemon: &Daemon, root: &Path) {
                 );
                 assert_eq!(result["ready"], true);
                 assert_eq!(result["view"], view["view"]);
-                assert_eq!(
-                    result["file_stats"],
-                    json!([{"file":"count-heavy.txt","matches":matches,"matched_lines":lines}])
-                );
-                let rows = result["matches"].as_array().unwrap();
-                assert_eq!(rows.len(), lines);
-                for row in rows {
-                    assert!(row.get("spans").is_none());
-                    assert!(row.get("columns").is_none());
+                if stats || count_field == "count_matches" {
+                    assert_eq!(
+                        result["file_stats"],
+                        json!([{"file":path,"matches":matches,"matched_lines":lines}])
+                    );
+                } else {
+                    assert_eq!(result["file_stats"], json!([]));
                 }
+                let rows = result["matches"].as_array().unwrap();
+                let expected = if count_field == "count" {
+                    json!({"type":"count","file":path,"lines":lines})
+                } else {
+                    json!({"type":"match","file":path})
+                };
+                assert_eq!(rows, &[expected]);
             }
         }
     }
@@ -565,6 +703,58 @@ fn assert_compact_shared_count_responses(daemon: &Daemon, root: &Path) {
     );
 }
 
+fn assert_return_count_parity(root: &Path, marker: &str) {
+    for flags in [
+        vec!["-c"],
+        vec!["--count-matches"],
+        vec!["-c", "-o", "-C", "2"],
+        vec!["-c", "--column", "-b", "--replace", "value"],
+        vec!["-c", "--json"],
+        vec!["-c", "-m", "1"],
+        vec!["-c", "-m", "0"],
+        vec!["-c", "-v"],
+        vec!["--count-matches", "-v"],
+        vec!["-c", "--count-matches"],
+        vec!["-c", "--no-filename"],
+        vec!["-c", "--null"],
+        vec!["-c", "-l"],
+        vec!["-c", "-q"],
+    ] {
+        for stats in [false, true] {
+            let mut args = vec![
+                "--color",
+                "never",
+                "--path-separator",
+                "/",
+                "-g",
+                "line-heavy.txt",
+            ];
+            args.extend_from_slice(&flags);
+            if stats {
+                args.push("--stats");
+            }
+            args.extend(["-e", "return", "--", "."]);
+            let indexed = cli(root, &args);
+            let mut scan = vec!["--no-index"];
+            scan.extend_from_slice(&args);
+            let scanned = cli(root, &scan);
+            assert_eq!(indexed.status.code(), scanned.status.code(), "{args:?}");
+            assert!(matches!(indexed.status.code(), Some(0 | 1)), "{indexed:?}");
+            assert_eq!(indexed.stdout, scanned.stdout, "{marker} {args:?}");
+            let stderr = String::from_utf8_lossy(&indexed.stderr);
+            assert!(
+                !stderr.contains("warning:") && !stderr.contains("Brute-force"),
+                "{stderr}"
+            );
+            if stats {
+                assert!(stderr.contains(marker), "{args:?}: {stderr}");
+            } else {
+                assert!(stderr.is_empty(), "{args:?}: {stderr}");
+            }
+        }
+    }
+}
+
 fn assert_multiline_counts(root: &Path, marker: &str) -> u64 {
     let mut queries = 0;
     for engine in ["default", "pcre2"] {
@@ -579,6 +769,12 @@ fn assert_multiline_counts(root: &Path, marker: &str) -> u64 {
             (r"hello\nworld", vec!["-m", "0"], "", (0, 0)),
             (r"hello\nworld", vec!["-o"], "a.txt:1\nb.txt:3\n", (4, 7)),
             (r"hello\nworld", vec!["-c"], "a.txt:2\nb.txt:5\n", (4, 7)),
+            (
+                r"hello\nworld",
+                vec!["-c", "--vimgrep"],
+                "a.txt:1\nb.txt:3\n",
+                (4, 7),
+            ),
             ("hello|world", vec![], "a.txt:2\nb.txt:6\n", (8, 7)),
             ("hello|world", vec!["-v"], "b.txt:1\n", (0, 1)),
         ] {
@@ -2749,12 +2945,63 @@ fn oversized_single_file_response_errors_and_cli_scans_without_truncation() {
             .contains("response exceeds 64 MiB"),
         "{response}"
     );
-    let output = cli(&f.a, &["-c", "--", "oversize_marker", "."]);
+    let args = [
+        "--color",
+        "never",
+        "--path-separator",
+        "/",
+        "--stats",
+        "--",
+        "oversize_marker",
+        ".",
+    ];
+    let output = cli(&f.a, &args);
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("scanning filesystem"),
-        "{output:?}"
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(success(output).contains("oversized.txt:1"));
+    assert_eq!(output.status.code(), Some(0));
+    let scanned = cli(&f.a, &[&["--no-index"][..], &args].concat());
+    assert_eq!(scanned.status.code(), Some(0));
+    assert!(
+        output.stdout == scanned.stdout,
+        "fallback content differs from the full scan ({} vs {} bytes)",
+        output.stdout.len(),
+        scanned.stdout.len()
+    );
+    assert!(output.stdout.len() > 12 * 1024 * 1024);
+
+    let raw = d
+        .raw_response(&d.request(
+            "search",
+            json!({"root":f.a,"view":a["view"],"query":{
+                "pattern":"oversize_marker","count":true,"detail":false
+            }}),
+        ))
+        .unwrap();
+    assert!(raw.len() < 4 * 1024, "count response: {} bytes", raw.len());
+    let response: Value = serde_json::from_str(&raw).unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["backend"], "shared-v1");
+    assert_eq!(response["result"]["ready"], true);
+    assert_eq!(response["result"]["view"], a["view"]);
+    assert_eq!(
+        response["result"]["matches"],
+        json!([{"type":"count","file":"oversized.txt","lines":1}])
+    );
+    let counted = cli(&f.a, &[&["-c"][..], &args].concat());
+    assert_eq!(counted.status.code(), Some(0));
+    assert_eq!(counted.stdout, b"./oversized.txt:1\n");
+    let scanned_count = cli(&f.a, &[&["--no-index", "-c"][..], &args].concat());
+    assert_eq!(scanned_count.status.code(), Some(0));
+    assert_eq!(counted.stdout, scanned_count.stdout);
+    let stderr = String::from_utf8_lossy(&counted.stderr);
+    assert!(stderr.contains("(via shared daemon v1)"), "{stderr}");
+    assert!(
+        !stderr.contains("warning:") && !stderr.contains("Brute-force"),
+        "{stderr}"
+    );
     assert_eq!(d.search(&f.a, "shared_term")["backend"], "shared-v1");
 }
 

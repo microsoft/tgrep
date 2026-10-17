@@ -36,10 +36,10 @@ cargo build --release
 
 After the version bump is merged and CI passes, open **Actions > Release >
 Run workflow**, select **main**, and enter the tag matching the workspace
-version in `Cargo.toml`, for example `v1.2.2`. The equivalent CLI command is:
+version in `Cargo.toml`, for example `v1.2.3`. The equivalent CLI command is:
 
 ```bash
-gh workflow run release.yml --repo microsoft/tgrep --ref main -f tag=v1.2.2
+gh workflow run release.yml --repo microsoft/tgrep --ref main -f tag=v1.2.3
 ```
 
 The workflow validates the version, creates a missing tag at the exact commit
@@ -173,6 +173,18 @@ publication, retirement, deletion and recovery barriers/failures. The hook RPCs
 are not compiled into normal binaries. Do not replace a barrier with a whole-test
 retry, count scan fallback as indexed success, or disable a platform's lifetime
 coverage.
+
+The `managed::watch` integration tests need no test hooks. They exercise the
+default native watch settings with three independently owned worktrees, one
+generation, nested directory creation/rename/removal, a later file-only event,
+Git/ignore metadata changes, indexed/scan parity, budget fallback and drained
+cleanup. Windows/macOS fixtures exceed the old per-view directory ceiling;
+Linux/Android fixtures stay within their genuine per-directory budget.
+Run these with the planning regressions using
+`cargo test --locked -p tgrep-cli --bin tgrep --test shared_daemon managed::watch`.
+Use a native filesystem for temporary fixtures (set `TEMP`/`TMP` on Windows or
+`TMPDIR` on Unix). The planner tests inject an expired traversal deadline rather
+than relying on a timing-sensitive large-tree failure.
 
 Arm asynchronous operation hooks with `pause-token` or `error-token` and the
 operation's persisted scope/sequence/token before submitting it. Admission binds

@@ -513,12 +513,78 @@ class ProcessTests(unittest.TestCase):
                     status = Path(f"/proc/{pid}/stat")
                     try:
                         state = status.read_text().rsplit(")", 1)[1].split()[0]
-                    except FileNotFoundError:
+                    except (FileNotFoundError, ProcessLookupError):
+                        # An open procfs file can outlive its task and fail with ESRCH.
                         return
                 if state.startswith("Z"):
                     return
                 self.assertLess(time.monotonic(), deadline, "owned descendant survived")
                 time.sleep(.01)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux procfs task lifetime")
+    def test_assert_dead_proc_exit_after_open(self):
+        owned = bench.OwnedProcess(
+            [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        status = Path(f"/proc/{owned.process.pid}/stat")
+        original_open = Path.open
+
+        @contextlib.contextmanager
+        def open_then_exit(path, *args, **kwargs):
+            self.assertEqual(path, status)
+            with original_open(path, *args, **kwargs) as stream:
+                owned.process.communicate(input=b"x", timeout=3)
+                self.assertEqual(owned.process.returncode, 0)
+                with self.assertRaises(ProcessLookupError) as gone:
+                    stream.read()
+                self.assertEqual(gone.exception.errno, errno.ESRCH)
+                yield stream
+
+        try:
+            with patch.object(Path, "open", autospec=True, side_effect=open_then_exit) as opened:
+                self.assert_dead(owned.process.pid)
+                opened.assert_called_once()
+        finally:
+            owned.stop()
+
+    def test_assert_dead_proc_observations(self):
+        cases = [
+            (FileNotFoundError(errno.ENOENT, "task gone"), None),
+            (ProcessLookupError(errno.ESRCH, "task exited after open"), None),
+            ("12345 (child) Z 1", None),
+            (PermissionError(errno.EACCES, "access denied"), PermissionError),
+            (PermissionError(errno.EPERM, "operation denied"), PermissionError),
+            (OSError(errno.EIO, "read failed"), OSError),
+            ("", IndexError),
+        ]
+        cases.extend((f"12345 (child) {state} 1", AssertionError) for state in ("R", "S", "D", "T"))
+        for observation, expected_error in cases:
+            with self.subTest(observation=observation), \
+                    patch(f"{__name__}.os") as system_os, \
+                    patch.object(sys, "platform", "linux"), \
+                    patch(f"{__name__}.Path") as path, \
+                    patch.object(time, "monotonic", side_effect=[0, 0, 2.99, 3]) as clock, \
+                    patch.object(time, "sleep") as sleep:
+                system_os.name = "posix"
+                read = path.return_value.read_text
+                if isinstance(observation, BaseException):
+                    read.side_effect = observation
+                else:
+                    read.return_value = observation
+                if expected_error is None:
+                    self.assert_dead(12345)
+                else:
+                    with self.assertRaises(expected_error) as failure:
+                        self.assert_dead(12345)
+                    if expected_error is AssertionError:
+                        self.assertIn("owned descendant survived", str(failure.exception))
+                    elif isinstance(observation, BaseException):
+                        self.assertIs(failure.exception, observation)
+                live = expected_error is AssertionError
+                self.assertEqual(path.call_args_list, [call("/proc/12345/stat")] * (3 if live else 1))
+                self.assertEqual(read.call_count, 3 if live else 1)
+                self.assertEqual(clock.call_count, 4 if live else 1)
+                self.assertEqual(sleep.call_args_list, [call(.01)] * (2 if live else 0))
 
     def test_malformed_detach_still_reaps_all_servers(self):
         for error in (json.JSONDecodeError("injected", "", 0), KeyError("detached")):

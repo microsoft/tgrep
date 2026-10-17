@@ -113,209 +113,31 @@ fn initial_attach(daemon: &Daemon, claim: &OwnerClaim, attach: Value, point: &st
     })
 }
 
-fn recover_initial_intent(
-    daemon: &Daemon,
-    attach: &Value,
-    pending: &mut Option<Value>,
-    point: &str,
-) {
-    let lookup = daemon
-        .try_rpc("lookup", json!({"root":attach["request"]["root"]}))
-        .unwrap();
-    if let Some(error) = lookup.get("error") {
-        assert_eq!(error["data"]["category"], "busy", "{point}: {lookup}");
-        assert_eq!(
-            error["data"]["reason_code"], "worktree-not-attached",
-            "{point}: {lookup}"
-        );
-        assert_eq!(error["data"]["retryable"], true, "{point}: {lookup}");
-        assert_eq!(
-            error["data"]["committed_state"], "not-committed",
-            "{point}: {lookup}"
-        );
-        assert!(
-            pending.is_none(),
-            "{point}: the known pending view disappeared"
-        );
-        // No catalog root is not a claim that all preparation state rolled back.
-        return;
-    }
-    assert_eq!(lookup["result"]["instance"], daemon.marker["instance"]);
-    assert_eq!(lookup["result"]["namespace"], daemon.marker["namespace"]);
-    let current = daemon.rpc(
-        "views.recover",
-        json!({"id":lookup["result"]["data"]["view"]}),
-    );
-    assert_eq!(current["version"], 1, "{point}: {current}");
-    assert_eq!(current["committed"], false, "{point}: {current}");
-    assert_eq!(current["active"], true, "{point}: {current}");
-    assert!(current["current"].is_null(), "{point}: {current}");
-    assert_eq!(
-        current["pending"]["commit"], attach["request"]["revision"],
-        "{point}: the pending exact target changed"
-    );
-    if let Some(previous) = pending {
-        for field in [
-            "id",
-            "version",
-            "root",
-            "root_identity",
-            "root_anchor",
-            "pending",
-            "checkpoint",
-            "checkpoint_binding",
-            "input_epoch",
-            "reconciled_epoch",
-            "instance",
-        ] {
-            assert_eq!(current[field], previous[field], "{point}: {field} changed");
-        }
-    } else {
-        *pending = Some(current);
-    }
-}
-
 fn retry_attach(
     daemon: &Daemon,
     claim: &OwnerClaim,
     view: Option<&Value>,
-    mut attach: Value,
+    attach: Value,
     point: &str,
     deadline: Instant,
-    mut before_attempt: impl FnMut(&Value),
+    before_attempt: impl FnMut(&Value),
 ) -> Result<Value, Vec<Value>> {
-    let mut failures: Vec<Value> = Vec::new();
-    let mut pending = None;
-    let first_sequence = attach["token"]["sequence"].as_u64().unwrap();
-    assert_eq!(attach["token"]["scope"], json!(claim.owner));
-    assert_eq!(attach["request"]["owner"], json!(claim.owner));
-    if view.is_none() {
-        let revision = attach["request"]["revision"].as_str().unwrap();
-        assert!(
-            matches!(revision.len(), 40 | 64)
-                && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "initial retry requires an already captured exact commit"
-        );
-        assert!(attach["request"]["accept_current"].is_null());
-    }
-    for attempt in 0..8 {
-        if Instant::now() >= deadline {
-            break;
-        }
-        let sequence = first_sequence.checked_add(attempt).unwrap();
-        if attempt != 0 {
-            attach["token"] = token(claim, sequence);
-        }
-        if attempt != 0 && view.is_none() {
-            recover_initial_intent(daemon, &attach, &mut pending, point);
-        }
-        before_attempt(&attach);
-        if Instant::now() >= deadline {
-            break;
-        }
-        let accepted = daemon.rpc("views.attach", attach.clone());
-        let record = terminal_before(daemon, &accepted, deadline);
-        assert_eq!(record["request"], attach["request"], "{point}: {record}");
-        assert_eq!(record["token"], attach["token"], "{point}: {record}");
-        if record["state"] == "completed" {
-            assert_eq!(record["committed_state"], "committed", "{point}: {record}");
-            let current = &record["result"]["current"];
-            let lease = &record["result"]["lease"];
-            assert_eq!(lease["token"], attach["request"]["lease"], "{point}");
-            assert_eq!(lease["owner"], attach["request"]["owner"], "{point}");
-            assert_eq!(lease["released"], false, "{point}");
-            for field in ["revision", "profile", "accept_current", "migratable"] {
-                assert_eq!(
-                    lease["original"][field], attach["request"][field],
-                    "{point}: {field}"
-                );
-            }
-            assert_eq!(lease["original"]["root"], current["root"], "{point}");
-            if let Some(view) = view {
-                assert_eq!(current["id"], view["id"], "{point}");
-                assert_eq!(current["version"], view["version"], "{point}");
-                assert_eq!(current["current"], view["current"], "{point}");
-            } else {
-                assert_eq!(current["version"], 1, "{point}");
-                assert_eq!(current["committed"], true, "{point}");
-                assert_eq!(
-                    current["current"]["commit"], attach["request"]["revision"],
-                    "{point}"
-                );
-                assert_eq!(
-                    lease["exact_original_commit"], attach["request"]["revision"],
-                    "{point}"
-                );
-                if let Some(pending) = &pending {
-                    for field in ["id", "version", "root", "root_identity", "instance"] {
-                        assert_eq!(current[field], pending[field], "{point}: {field}");
-                    }
-                    assert_eq!(
-                        current["current"]["key"], pending["pending"]["key"],
-                        "{point}"
-                    );
-                }
-            }
-            for failed in failures {
-                assert_eq!(
-                    daemon.rpc(
-                        "views.attach",
-                        json!({
-                            "token":failed["token"],"request":failed["request"]
-                        })
-                    ),
-                    failed,
-                    "{point}: a new attempt must not rewrite a failed receipt"
-                );
-            }
-            return Ok(record);
-        }
-        assert!(
-            retryable_attach_catalog_error(&record),
-            "{point}: attach failed without safe retry authorization: {record}"
-        );
-        assert_eq!(
-            daemon.rpc("views.attach", attach.clone()),
-            record,
-            "{point}: a failed token must replay its original receipt"
-        );
-        if let Some(view) = view {
-            let current = daemon.rpc("views.recover", json!({"id":view["id"]}));
-            assert_eq!(current["version"], view["version"], "{point}: {current}");
-            assert_eq!(current["current"], view["current"], "{point}: {current}");
-        } else {
-            recover_initial_intent(daemon, &attach, &mut pending, point);
-            if record["progress"]["view"].is_string() {
-                let pending = pending
-                    .as_ref()
-                    .expect("the recorded pending view must still exist");
-                assert_eq!(record["progress"]["view"], pending["id"], "{point}");
-                assert_eq!(
-                    record["progress"]["resolved_commit"], pending["pending"]["commit"],
-                    "{point}"
-                );
-            }
-        }
-        eprintln!("{point}: attach attempt {sequence} had uncommitted catalog contention");
-        failures.push(record);
-        if attempt < 7 {
-            thread::sleep(
-                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
-            );
-        }
-    }
-    Err(failures)
+    super::attach_retry::retry_attach(
+        daemon,
+        claim,
+        view,
+        attach,
+        super::attach_retry::Retry {
+            point,
+            deadline,
+            allowance: super::attach_retry::RetryableAttach::CatalogIo,
+        },
+        before_attempt,
+    )
 }
 
 fn retryable_attach_catalog_error(record: &Value) -> bool {
-    record["kind"] == "attach"
-        && record["state"] == "failed"
-        && record["cancelled"] == false
-        && record["committed_state"] == "not-committed"
-        && record["error"]["category"] == "busy"
-        && record["error"]["reason_code"] == "catalog-io"
-        && record["error"]["retryable"] == true
-        && record["error"]["committed_state"] == "not-committed"
+    super::attach_retry::RetryableAttach::CatalogIo.permits(record)
 }
 
 #[test]

@@ -266,7 +266,7 @@ Automatic refresh has two modes, configured on `tgrep serve`:
 | Flag | Default | Effect |
 |------|---------|--------|
 | `--watch-mode <auto\|poll>` | `auto` | Prefer native notifications with polling fallback, or use polling only |
-| `--poll-interval <SECONDS>` | `120` | Wait after each polling reconciliation completes; range 1-86400; does not schedule healthy native managed views |
+| `--poll-interval <SECONDS>` | `120` | Wait after each polling reconciliation, or since a healthy native managed view's last full verification; range 1-86400 |
 | `--watch-budget <N>` | `8192` | Conservative process-local native watch ceiling; range 1-4294967295 |
 | `--no-watch` | off | Disable all automatic refresh: native watching, polling, and periodic reconciliation |
 
@@ -432,6 +432,7 @@ These tables describe search flags. Use `tgrep index --help` and
 | `--no-ignore` | Don't respect `.gitignore` or `p4ignore.ini` files |
 | `-a, --text` | Search binary files as if they were text |
 | `--binary` | Search binary files, reporting a note instead of their contents |
+| `--content-eligibility extensions/content` | `content` admits text behind the binary-extension heuristic; uses only a matching managed view (see below) |
 | `-u, --unrestricted` | Unrestricted: `-u` = no-ignore, `-uu` = +hidden, `-uuu` = +binary |
 | `--max-filesize <SIZE>` | Skip files larger than `SIZE` (`K`/`M`/`G` suffixes); default 64M |
 | `--no-max-filesize` | Apply no size limit, as ripgrep does |
@@ -614,6 +615,39 @@ of lines covered by matches, so a multiline match is not cut short.
 tgrep reads a whole-file buffer even with `-m`; its `bytes_searched` statistic
 can therefore exceed ripgrep's.
 
+### JSON statistics
+
+`--json` emits ripgrep-shaped `begin`, `match`, `context`, `end`, and `summary`
+records. Result paths, contents, offsets, submatches and match/line counts do
+not depend on whether an index was used. Statistics describe the work of the
+selected backend, not an imaginary full scan:
+
+- `searches` counts eligible files actually searched, including candidates
+  that produced no rows. Indexed routes can search fewer files than a scan.
+- `bytes_searched` sums those files' existing buffer-byte counts (the binary
+  detection offset when applicable). It is not physical disk I/O: cached
+  content still counts, index construction is excluded, and whole-buffer
+  matching can count more bytes than ripgrep with an early match limit.
+- Each `end` has one search and that file's bytes. Summary work totals also
+  include searched files without an `end`; they are not inferred from output.
+- `searches_with_match`, `matches`, and `matched_lines` describe emitted
+  matching results. `bytes_printed` counts serialized `begin`/`match`/`context`
+  bytes, including newlines; `end` and `summary` exclude themselves. Summary
+  printed bytes are the sum of the per-file `end` values.
+
+Elapsed timings are diagnostic, not equality-comparable output. tgrep's
+per-file elapsed measures the client writer's file-output interval; summary
+`stats.elapsed` equals `elapsed_total`, the writer's invocation-wide wall time.
+Ripgrep instead aggregates per-search elapsed into summary `stats.elapsed`,
+which is distinct from its wall-clock `elapsed_total`. These timing conventions
+are unchanged; neither proves a search backend or the work done.
+
+JSON clients request per-file search-work statistics from ordinary and shared
+servers. A server too old to supply them is not used for JSON output: an
+ordinary connection falls back to the local index, and a shared connection
+that rejects the request falls back to scanning, with the usual diagnostics.
+Non-JSON requests retain their existing protocol behavior.
+
 ### Multiline matches
 
 `-U/--multiline` allows matches across line boundaries and prints every covered
@@ -623,12 +657,15 @@ and JSON submatches.
 `--count-matches` counts each original regex match once, after applying `-m`,
 even when the match spans several lines. This does not depend on `--stats`;
 `-c` retains its matching-line count and `-v` counts selected non-matching lines.
-Server counts use per-file totals, not the line fragments sent for display.
-`--count-matches` requests omit unused span and column arrays from replies
-while the matcher still collects every hit.
-Older servers without count metadata support cannot answer these requests:
-unsupported requests fall back with a diagnostic, and incomplete totals are
-rejected before any counts are printed.
+Server `-c` and `--count-matches` requests return one count or path row per
+matching file, rather than transmitting every matching line, span and column.
+`--stats` still reports the original match and matched-line totals; it does not
+restore unused line detail. Counts therefore do not consume reply space
+proportional to matching content, but remain subject to the same response limit.
+Ordinary older servers that ignore `-c` projection retain line-row counting.
+Shared servers that reject the new option, and servers without metadata needed
+for `--count-matches`, fall back with a diagnostic. Malformed projected counts
+or incomplete match totals are rejected before any counts are printed.
 Without `-r`, tgrep reports columns relative to each printed line, whereas
 ripgrep repeats the starting column on continuation lines.
 
@@ -670,6 +707,17 @@ tgrep also skips known binary extensions during directory content searches
 and indexing, unlike ripgrep. For searches, `--binary` and `-a` lift this
 restriction and bypass the index; they do not change what `index` or `serve`
 indexes. `--files` lists binary paths too.
+
+`--content-eligibility content` is the explicit ripgrep-parity alternative for
+managed shared views. It drops only the extension heuristic: files are still
+classified by content, so NUL-containing files stay excluded as binary, and
+ignore, hidden, size and filename rules are unchanged. It is indexed only by a
+managed v2 view attached with the `content-only` eligibility profile (see
+[SHARED_WORKTREE_INDEXES.md](SHARED_WORKTREE_INDEXES.md#content-eligibility-profiles)).
+It bypasses ordinary servers and local indexes, which use the extension rule.
+Any profile mismatch, in either direction, produces the usual shared-fallback
+warning and a filesystem scan using the requested rule. The default,
+`extensions`, keeps the behaviour above. `index` and `serve` reject the flag.
 
 ### Flags that bypass the index
 
@@ -940,6 +988,9 @@ registers that claim, then calls `views.attach` through `shared manage`. Operati
 are asynchronous: inspect their receipts and wait for a reconciled ready view.
 After attachment, normal search and `--files` discover that view. Do not use
 the v1 `shared attach` command to create a managed lease.
+A typed owner-hold failure before its `holding:true` handshake is one
+`{"ok":false,"error":...}` stdout line; retry the same claim only as the
+client contract linked below specifies.
 The [v2 client contract](SHARED_WORKTREE_INDEXES.md#managed-client-contract)
 specifies complete request shapes, recovery and token acknowledgement.
 
@@ -965,20 +1016,38 @@ A [same-binary Windows/ReFS measurement](SHARED_INDEX_BENCHMARKS.md#large-checko
 completed a fresh warm-base attachment in 186.144 seconds versus 542.469 seconds
 for a standalone full build (2.914x), while still reading every required file.
 That result is one ordered pair without a file-cache flush, not a universal speedup.
-Healthy native managed views do **not** run the former 120-second periodic
-safety rescan. Watcher notifications still invalidate and reconcile views, but
-silently missed changes can leave results stale indefinitely, even while ready.
-This deliberately accepts staleness, not proven change coverage; timestamps,
-clean Git status and an unavailable journal do not prove that nothing changed.
-Initial attachment/restore, explicit `views.refresh`, and reported watcher
-errors/rescans retain verified repair. Use `--no-index` for current disk bytes.
+Healthy native managed views also run a periodic full verification every
+`--poll-interval` seconds (default 120), measured from their last completed
+full pass, while they keep serving queries. It reads and hashes every admitted
+file under the existing operation and resource budgets. An unchanged result
+keeps the view ready and changes nothing. Readiness closes only when it finds a
+difference, after which it publishes a full repair; silently missed changes
+are therefore repaired within one interval plus the verification time.
+Watcher errors/rescans, explicit full invalidation and concurrent edits still
+close readiness first. A verification that exhausts its deadline or is
+cancelled leaves the view ready but unverified, reports `failed`/`cancelled`,
+and retries after the next interval. Timestamps, clean Git status and an
+unavailable journal never prove that nothing changed. Status reports
+`last_verification` with its outcome and age. Use `--no-index` for current disk bytes.
+
+On Windows/macOS, managed views use recursive worktree and Git metadata-root
+subscriptions, without pre-enumerating descendant directories. The unchanged
+per-view watch budget counts these roots, not their descendants; typically one
+subscription covers a main worktree and two cover a linked worktree. New nested
+directories are covered automatically. Linux/Android keep bounded per-directory
+registration and may still fall back on large trees. Status exposes `watch_count`,
+`native_registration_mode` and `native_watch_budget_per_view`; the latter two are
+in `reconciliation_policy`. OS resource limits remain independent of this budget.
+See [managed registration and update policy](SHARED_WORKTREE_INDEXES.md#advancing-and-reconciling-views).
 
 Explicit `--watch-mode poll` and actual native-watcher failure/budget fallback
 still perform full reconciliation after `--poll-interval` seconds (default 120)
 following completion. `--no-watch` disables watching and polling, not initial
 verification or explicit refresh. `reconciliation_policy` distinguishes these
-per-view modes and namespace monitor counts. This recurring-mode change is
-subsequent to the immutable benchmark source, not a measured idle-work saving.
+per-view modes and namespace monitor counts. Polling views close readiness for
+each pass; healthy native views keep serving through theirs. These
+recurring-mode changes postdate the immutable benchmark source and are not
+measured there.
 Legacy v1 and ordinary-server refresh policies are unchanged.
 
 `views.advance` prepares and reconciles a complete replacement while unrelated
@@ -1154,6 +1223,15 @@ The shared helper is `tgrep_core::rooted::RootedDir`
 retains one per server and reuses it across build, watcher and verification reads.
 `WorktreeSnapshot::open_file` uses the view's existing reader, not a new root
 registration per candidate. Neither API freezes file contents.
+Local-index and shared content queries reuse one pinned ancestor chain for at
+most 64 consecutive sibling candidates, without reordering or limiting results.
+They still read and match one file at a time and verify the ancestors when the
+batch ends. Shared queries retain per-candidate snapshot validation, read-time
+deadline checks, generation/root protection and the final epoch check.
+`RootedDir::read_batch` exposes this scoped reader; managed callers obtain a
+`WorktreeSnapshot::candidate_batch`, use `open_candidate_in` through subsequent
+snapshots, and call `finish` before publishing buffered results. A batch cannot
+be used with another root or generation. Reply and file-size limits are unchanged.
 Metadata discovery rejects unrepresentable native names before conversion:
 non-Unicode paths and literal Unix backslashes cannot alias other indexed paths.
 Ordinary full scans retain native paths and remain available as the fallback.
@@ -1170,9 +1248,9 @@ Later reads through that handle remain caller-owned: report read errors and call
 `invalidate_all()` after leaving the guard rather than publishing partial results.
 Do not reenter the view from its closure. A refresh acknowledges processed hints,
 **not an atomic filesystem snapshot**. For verification independent of
-notifications, use explicit or polling full repair: healthy native managed views
-no longer promise eventual periodic repair, and no-watch callers must explicitly
-refresh. Final reads can race subsequent edits.
+notifications, use explicit, polling or periodic full repair: healthy native
+managed views are verified within one `--poll-interval` plus verification time,
+and no-watch callers must explicitly refresh. Final reads can race subsequent edits.
 
 Full verification reads, auto-decodes and hashes checkout bytes; clean Git
 status, blob identity and index stat data are never byte-equivalence proofs.

@@ -326,6 +326,19 @@ struct Cli {
     #[arg(long = "binary", global = true)]
     binary: bool,
 
+    /// Which files may be searched for content. `extensions` (default) skips
+    /// filename extensions such as `.pdf` or `.doc` before reading them;
+    /// `content` decides by content alone, still skipping files with NUL
+    /// bytes. Indexed search uses only a managed shared view attached with
+    /// the matching profile; otherwise tgrep scans.
+    #[arg(
+        long = "content-eligibility",
+        global = true,
+        value_enum,
+        default_value_t = ContentEligibilityArg::Extensions
+    )]
+    content_eligibility: ContentEligibilityArg,
+
     // ── Matching ─────────────────────────────────────
     /// Only match when the whole line matches the pattern. Overrides -w.
     #[arg(
@@ -607,6 +620,24 @@ fn parse_size_limit(flag: &str, s: &str) -> Result<usize> {
         .map_err(|_| anyhow::anyhow!("{flag} value is too large for this platform: {s}"))
 }
 
+/// Content eligibility for searches (`--content-eligibility`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ContentEligibilityArg {
+    /// Skip known binary filename extensions, then decide by content.
+    Extensions,
+    /// Decide by content alone.
+    Content,
+}
+
+impl From<ContentEligibilityArg> for tgrep_core::generations::ContentEligibility {
+    fn from(value: ContentEligibilityArg) -> Self {
+        match value {
+            ContentEligibilityArg::Extensions => Self::ExtensionAndContent,
+            ContentEligibilityArg::Content => Self::ContentOnly,
+        }
+    }
+}
+
 /// Posting accumulation strategy for `tgrep index`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum IndexStrategyArg {
@@ -694,7 +725,7 @@ enum Command {
         watch_mode: serve::WatchMode,
 
         /// Seconds to wait after a polling reconciliation completes (1-86400).
-        /// Managed v2 uses this only for polling views, not healthy native watchers.
+        /// Managed v2 also uses it to verify healthy native views while they serve.
         #[arg(
             long,
             default_value_t = 120,
@@ -1147,6 +1178,7 @@ impl Cli {
                     || crate::output::atty_check()),
             text,
             binary,
+            content_eligibility: self.content_eligibility.into(),
             // Replaced per path argument in `run_search`.
             path_display: crate::output::PathDisplay::Bare,
             max_filesize: resolved.max_filesize,
@@ -1254,6 +1286,9 @@ impl Cli {
         }
         if self.no_ignore_vcs {
             out.push("--no-ignore-vcs");
+        }
+        if self.content_eligibility != ContentEligibilityArg::Extensions {
+            out.push("--content-eligibility");
         }
         out
     }
@@ -1908,7 +1943,7 @@ mod tests {
         );
         assert!(
             help.contains(
-                "Managed v2 uses this only for polling views, not healthy native watchers"
+                "Managed v2 also uses it to verify healthy native views while they serve"
             ),
             "{help}"
         );

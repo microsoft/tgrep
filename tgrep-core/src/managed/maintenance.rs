@@ -276,7 +276,6 @@ impl Namespace {
                 Ok(())
             })?;
             self.fault(super::faults::Point::IdleAdmissionClosed, operation)?;
-            let verification_active = !self.discard_idle_verification(false)?;
             let (leases, owners, reservations, operations) = self.read(|connection| {
                 Ok(connection.query_row(
                     "SELECT
@@ -312,17 +311,19 @@ impl Namespace {
                     u64::from(*count).saturating_sub(u64::from(operation == Some(id)))
                 })
                 .sum::<u64>();
-            let stopping = leases == 0
+            let idle = leases == 0
                 && owners == 0
                 && reservations == 0
                 && operations == 0
                 && operation_readers == 0
                 && !namespace_readers_or_work
-                && !verification_active
                 && external.queries == 0
                 && external.queued_jobs == 0
                 && external.requests == 0
                 && external.background_batches == 0;
+            // A refused stop must not restart bounded member authentication.
+            let verification_active = !self.discard_idle_verification(!idle)?;
+            let stopping = idle && !verification_active;
             let outcome = IdleOutcome {
                 stopping,
                 namespace: self.header().namespace.clone(),

@@ -12,7 +12,9 @@ use anyhow::{Context, Result, bail, ensure};
 use notify::{Event, EventKind};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tgrep_core::generations::{BuildStats, GenerationManager, IndexingProfile, Repository};
+use tgrep_core::generations::{
+    BuildStats, ContentEligibility, GenerationManager, IndexingProfile, Repository,
+};
 use tgrep_core::worktrees::{
     ReconcileStats, WorktreeError, WorktreeOptions, WorktreeSnapshot, WorktreeView,
 };
@@ -1137,11 +1139,16 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             | "vimgrep"
             | "detail"
             | "positions"
+            | "count"
             | "count_matches"
             | "ordered_filters"
             | "multiline_replace"
             | "report_replacements"
+            | "search_stats"
             | "stats" => value.is_boolean(),
+            "content_eligibility" => {
+                serde_json::from_value::<ContentEligibility>(value.clone()).is_ok()
+            }
             _ => false,
         };
         ensure!(valid, "unknown or malformed shared query option: {key}");
@@ -1234,6 +1241,8 @@ impl State {
 
 pub(super) trait QuerySource {
     fn root(&self) -> &Path;
+    /// Content eligibility of the exact generation profile being served.
+    fn eligibility(&self) -> Result<ContentEligibility>;
     fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T>;
     fn invalidate(&self, error: &anyhow::Error) -> Result<()>;
     fn check(&self) -> Result<()> {
@@ -1249,6 +1258,9 @@ struct LegacyQuery<'a> {
 impl QuerySource for LegacyQuery<'_> {
     fn root(&self) -> &Path {
         self.entry.view.root()
+    }
+    fn eligibility(&self) -> Result<ContentEligibility> {
+        Ok(self.entry.view.generation().key().profile().eligibility)
     }
     fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
         self.state.query_snapshot(self.entry, read)
@@ -1268,6 +1280,18 @@ pub(super) fn search_snapshot(
     metadata: Value,
 ) -> Result<Value> {
     validate_query(query, files)?;
+    if !files {
+        // Filename membership is identical across eligibilities; content is not.
+        let requested = query
+            .get("content_eligibility")
+            .map(|value| serde_json::from_value::<ContentEligibility>(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        ensure!(
+            requested == source.eligibility()?,
+            "view content eligibility differs from the query; scan instead"
+        );
+    }
     let scope = crate::serve::SearchScope::parse(query).map_err(anyhow::Error::msg)?;
     let scoped_root = source.root().join(&scope.prefix);
     ensure!(scoped_root.is_dir(), "scope must be an existing directory");
@@ -1321,30 +1345,47 @@ pub(super) fn search_snapshot(
         budget.charge(&index_stats)?;
         let mut rows = Vec::new();
         let mut stats = Vec::new();
-        for relative in &paths {
-            let bytes = read_candidate(source, relative)?;
-            if bytes.len() > 64 * 1024 * 1024 {
-                continue;
+        let mut search_stats = Vec::new();
+        for siblings in tgrep_core::rooted::sibling_batches(&paths) {
+            let batch = (siblings.len() > 1)
+                .then(|| {
+                    candidate_snapshot(source, &siblings[0], |snapshot| {
+                        snapshot.candidate_batch(&siblings[0])
+                    })
+                })
+                .transpose()?;
+            for relative in siblings {
+                let bytes = read_candidate(source, batch.as_ref(), relative)?;
+                if bytes.len() > 64 * 1024 * 1024 {
+                    continue;
+                }
+                let decoded = crate::serve::DecodedFile::new(bytes, request.encoding);
+                let found = crate::serve::search_file_matches_bounded(
+                    relative,
+                    &decoded,
+                    &request.matcher,
+                    &request.opts,
+                    Some(&mut budget),
+                )?;
+                rows.extend(found.rows);
+                stats.extend(found.stats);
+                search_stats.extend(found.search_stats);
             }
-            let decoded = crate::serve::DecodedFile::new(bytes, request.encoding);
-            let found = crate::serve::search_file_matches_bounded(
-                relative,
-                &decoded,
-                &request.matcher,
-                &request.opts,
-                Some(&mut budget),
-            )?;
-            rows.extend(found.rows);
-            stats.extend(found.stats);
+            if let Some(batch) = batch
+                && let Err(error) = batch.finish()
+            {
+                return candidate_failed(source, &siblings[0], error.into());
+            }
         }
-        (
-            json!({
-                "matches":rows, "file_stats":stats, "epoch":epoch,
-                "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
-                "index_stats":index_stats
-            }),
-            epoch,
-        )
+        let mut result = json!({
+            "matches":rows, "file_stats":stats, "epoch":epoch,
+            "elapsed_ms":start.elapsed().as_secs_f64()*1000.0,
+            "index_stats":index_stats
+        });
+        if request.opts.search_stats {
+            result["search_stats"] = json!(search_stats);
+        }
+        (result, epoch)
     };
     ensure!(
         source.snapshot(|snapshot| snapshot.epoch() == epoch)?,
@@ -1359,26 +1400,51 @@ pub(super) fn search_snapshot(
 /// Only an open, stat or read failure of the candidate itself closes the view
 /// for full repair. Snapshot validation, deadline and cancellation failures say
 /// nothing about the file, so they propagate unchanged and leave the view ready.
-fn read_candidate(source: &impl QuerySource, relative: &str) -> Result<Vec<u8>> {
-    let failed = |error: anyhow::Error| -> Result<Vec<u8>> {
-        let error = error.context(format!("reading shared candidate {relative}"));
-        source.invalidate(&error)?;
-        Err(error)
-    };
+fn candidate_failed<T>(
+    source: &impl QuerySource,
+    relative: &str,
+    error: anyhow::Error,
+) -> Result<T> {
+    let error = error.context(format!("reading shared candidate {relative}"));
+    source.invalidate(&error)?;
+    Err(error)
+}
+
+fn candidate_snapshot<T>(
+    source: &impl QuerySource,
+    relative: &str,
+    open: impl FnOnce(WorktreeSnapshot<'_>) -> std::io::Result<T>,
+) -> Result<T> {
     let mut opened = None;
-    let snapshot = source.snapshot(|snapshot| opened = Some(snapshot.open_candidate(relative)));
-    let file = match opened {
+    let snapshot = source.snapshot(|snapshot| opened = Some(open(snapshot)));
+    match opened {
         // A failed open also fails the snapshot; keep the snapshot's typed error.
-        Some(Err(error)) => return failed(snapshot.err().unwrap_or_else(|| error.into())),
+        Some(Err(error)) => candidate_failed(
+            source,
+            relative,
+            snapshot.err().unwrap_or_else(|| error.into()),
+        ),
         Some(Ok(file)) => {
             snapshot?;
-            file
+            Ok(file)
         }
         None => {
             snapshot?;
             bail!("shared snapshot did not open candidate {relative}");
         }
-    };
+    }
+}
+
+fn read_candidate(
+    source: &impl QuerySource,
+    batch: Option<&tgrep_core::worktrees::CandidateBatch>,
+    relative: &str,
+) -> Result<Vec<u8>> {
+    let failed = |error| candidate_failed(source, relative, error);
+    let file = candidate_snapshot(source, relative, |snapshot| match batch {
+        Some(batch) => snapshot.open_candidate_in(batch, relative),
+        None => snapshot.open_candidate(relative),
+    })?;
     match file.metadata() {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => {
@@ -1407,9 +1473,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn count_projection_query_fields_require_booleans() {
+        for field in ["count", "count_matches", "search_stats"] {
+            for value in [json!(true), json!(false)] {
+                let query = json!({"pattern":"return",field:value});
+                validate_query(&query, false).unwrap();
+                assert!(validate_query(&query, true).is_err());
+            }
+            for value in [Value::Null, json!(1), json!("true"), json!([])] {
+                assert!(validate_query(&json!({"pattern":"return",field:value}), false).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn response_budgets_count_escaped_rows_paths_and_serialized_envelopes() {
         let request = crate::serve::parse_search_params(&json!({
-            "pattern":"x", "detail":true, "positions":true, "stats":true,
+            "pattern":"x", "detail":true, "positions":true, "stats":true, "search_stats":true,
             "before_context":1, "after_context":1
         }))
         .unwrap();
@@ -1429,6 +1509,10 @@ mod tests {
             .map(|row| serde_json::to_vec(row).unwrap().len() + 1)
             .sum::<usize>()
             + serde_json::to_vec(expected.stats.as_ref().unwrap())
+                .unwrap()
+                .len()
+            + 1
+            + serde_json::to_vec(expected.search_stats.as_ref().unwrap())
                 .unwrap()
                 .len()
             + 1;
@@ -1503,7 +1587,7 @@ mod tests {
         assert!(budget.charge(&"").is_err());
         for value in [
             json!({"files":paths}),
-            json!({"matches":expected.rows,"file_stats":expected.stats}),
+            json!({"matches":expected.rows,"file_stats":expected.stats,"search_stats":expected.search_stats}),
         ] {
             let envelope = json!({"jsonrpc":"2.0","id":"\"\\\n","result":value});
             let expected = serde_json::to_vec(&envelope).unwrap();
@@ -1512,6 +1596,60 @@ mod tests {
                 expected
             );
             assert!(bounded_response(&envelope, expected.len() - 1).is_err());
+        }
+    }
+
+    #[test]
+    fn json_search_stats_charge_no_output_candidates_to_response_budget() {
+        for bytes in [b"absent\n".as_slice(), b"absent\0\n".as_slice()] {
+            let request = crate::serve::parse_search_params(&json!({
+                "pattern":"needle", "search_stats":true
+            }))
+            .unwrap();
+            let file = crate::serve::DecodedFile::new(bytes.to_vec(), request.encoding);
+            let result = crate::serve::search_file_matches(
+                "no-output.txt",
+                &file,
+                &request.matcher,
+                &request.opts,
+            )
+            .unwrap();
+            assert!(result.rows.is_empty());
+            assert!(result.stats.is_none());
+            let work = result.search_stats.unwrap();
+            assert_eq!(work.file, "no-output.txt");
+            let binary_offset = bytes.iter().position(|&b| b == 0).map(|n| n as u64);
+            assert_eq!(work.binary_offset, binary_offset);
+            assert_eq!(
+                work.bytes_searched,
+                binary_offset.unwrap_or(bytes.len() as u64)
+            );
+            let required = serde_json::to_vec(&work).unwrap().len() + 1;
+            let mut exact = crate::serve::JsonBudget {
+                remaining: required,
+            };
+            crate::serve::search_file_matches_bounded(
+                "no-output.txt",
+                &file,
+                &request.matcher,
+                &request.opts,
+                Some(&mut exact),
+            )
+            .unwrap();
+            assert_eq!(exact.remaining, 0);
+            let mut short = crate::serve::JsonBudget {
+                remaining: required - 1,
+            };
+            assert!(
+                crate::serve::search_file_matches_bounded(
+                    "no-output.txt",
+                    &file,
+                    &request.matcher,
+                    &request.opts,
+                    Some(&mut short),
+                )
+                .is_err()
+            );
         }
     }
 

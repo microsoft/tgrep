@@ -605,6 +605,57 @@ fn word_boundary_patterns_print_each_matching_line_once() {
     });
 }
 
+/// ripgrep 15.2.0 totals a file's `bytes_printed` from its `begin`, `match`
+/// and `context` messages before writing that file's `end`, and the summary
+/// sums those per-file totals. Neither `end` nor `summary` counts itself.
+#[test]
+fn json_bytes_printed_excludes_end_messages_on_every_backend() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("probe.cs"),
+        "// ActivityScope\n// ActivityScope second\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("other.cs"),
+        "before\nActivityScope three\nafter\n",
+    )
+    .unwrap();
+    fs::write(root.join("miss.cs"), "no hit\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        let output = tgrep()
+            .args(backend)
+            .args(["--stats", "--json", "--color", "never", "-C", "1"])
+            .args(["-e", "ActivityScope", "--"])
+            .arg(&root)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(marker))
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let (mut printed, mut ends, mut summary) = (0, Vec::new(), Vec::new());
+        for line in stdout.split_inclusive('\n') {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let reported = &row["data"]["stats"]["bytes_printed"];
+            match row["type"].as_str().unwrap() {
+                "begin" | "match" | "context" => printed += line.len() as u64,
+                "end" => ends.push((reported.as_u64().unwrap(), std::mem::take(&mut printed))),
+                "summary" => summary.push(reported.as_u64().unwrap()),
+                kind => panic!("{marker}: unexpected {kind}: {stdout}"),
+            }
+        }
+        assert_eq!(ends.len(), 2, "{marker}: {stdout}");
+        for (reported, emitted) in &ends {
+            assert_eq!(reported, emitted, "{marker}: {stdout}");
+        }
+        let total: u64 = ends.iter().map(|(reported, _)| reported).sum();
+        assert_eq!(summary, [total], "{marker}: {stdout}");
+    });
+}
+
 #[test]
 fn reported_multiline_preserves_adjacent_matches_in_every_output() {
     let dir = TempDir::new().unwrap();
@@ -2019,7 +2070,6 @@ fn stable_json_output(stdout: &[u8]) -> Vec<serde_json::Value> {
             let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
             if let Some(stats) = event["data"]["stats"].as_object_mut() {
                 stats.remove("elapsed");
-                stats.remove("bytes_printed");
             }
             event["data"]
                 .as_object_mut()

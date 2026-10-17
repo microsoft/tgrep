@@ -433,7 +433,8 @@ impl OutputWriter {
             },
         });
         let line = format!("{msg}\n");
-        self.file_stats.bytes_printed += line.len() as u64;
+        // ripgrep totals bytes_printed before writing `end`, so neither `end`
+        // nor `summary` counts itself.
         self.stdout.write_all(line.as_bytes())?;
         self.total_stats.add(&self.file_stats);
         self.file_stats = Stats::default();

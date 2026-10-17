@@ -1356,6 +1356,23 @@ fn v2_cli_real_backend_migration_replay_and_idle_shutdown() {
         rows
     };
     assert_eq!(matches(&indexed), matches(&scan));
+    // ripgrep's per-file `bytes_printed` excludes `end`; the summary sums them.
+    let printed = |output: &Output| {
+        let (mut emitted, mut ends, mut summary) = (0, Vec::new(), None);
+        for line in String::from_utf8_lossy(&output.stdout).split_inclusive('\n') {
+            let row: Value = serde_json::from_str(line).unwrap();
+            let reported = row["data"]["stats"]["bytes_printed"].as_u64();
+            match row["type"].as_str().unwrap() {
+                "end" => ends.push((reported.unwrap(), std::mem::take(&mut emitted))),
+                "summary" => summary = reported,
+                _ => emitted += line.len() as u64,
+            }
+        }
+        assert!(ends.iter().all(|(r, e)| r == e), "{ends:?}");
+        assert_eq!(summary, Some(ends.iter().map(|(r, _)| r).sum()));
+        summary
+    };
+    assert_eq!(printed(&indexed), printed(&scan));
     assert!(
         String::from_utf8_lossy(&indexed.stderr).contains("(via shared daemon v2)"),
         "{}",

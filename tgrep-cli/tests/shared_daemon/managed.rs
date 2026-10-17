@@ -283,6 +283,12 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
                 .unwrap()
                 .contains(&json!("event-driven-native-reconciliation"))
         );
+        assert!(
+            hello["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("serving-native-periodic-verification"))
+        );
         for method in ["namespace.status", "maintenance.status"] {
             let report = daemon.rpc(method, json!({}));
             let repair = &report["reconciliation_policy"];
@@ -290,8 +296,15 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
                 repair["configured_watch_mode"],
                 if automatic { "poll" } else { "disabled" }
             );
-            assert_eq!(repair["periodic_full_verification"], false);
-            assert!(repair["interval_ms"].is_null());
+            assert_eq!(repair["periodic_full_verification"], automatic);
+            assert_eq!(
+                repair["interval_ms"],
+                if automatic {
+                    json!(120_000)
+                } else {
+                    Value::Null
+                }
+            );
             assert_eq!(repair["poll_interval_ms"], 120_000);
             assert_eq!(repair["native_views"], 0);
             assert_eq!(repair["polling_views"], 0);
@@ -384,7 +397,7 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
         for report in [&status, &namespace, &maintenance, &ordinary] {
             let repair = &report["reconciliation_policy"];
             assert_eq!(repair["periodic_full_verification"], automatic);
-            assert_eq!(repair["native_periodic_full_verification"], false);
+            assert_eq!(repair["native_periodic_full_verification"], automatic);
             assert_eq!(
                 repair["interval_ms"],
                 if automatic {
@@ -402,7 +415,11 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
             assert_eq!(repair["change_journal"], "not-integrated");
             assert_eq!(
                 repair["native_missed_changes"],
-                "may-remain-stale-indefinitely"
+                if automatic {
+                    "repaired-by-periodic-verification"
+                } else {
+                    "requires-explicit-refresh"
+                }
             );
             assert_eq!(
                 repair["full_verification_reason"],

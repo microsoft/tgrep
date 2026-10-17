@@ -191,6 +191,7 @@ fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
         view: first.id.clone(),
         expected_version: first.version,
         allocation_version: 1,
+        verify: false,
     };
     let queued = manager
         .accept_reconciliation(token.clone(), request.clone())
@@ -251,6 +252,7 @@ fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
                 view: first.id.clone(),
                 expected_version: first.version,
                 allocation_version: 1,
+                verify: false,
             },
         )
         .unwrap();
@@ -336,6 +338,7 @@ fn ready_reconciliation_preserves_forced_repairs_and_rejects_invalid_work() {
                     view: first.id.clone(),
                     expected_version: first.version,
                     allocation_version: 1,
+                    verify: false,
                 },
             )
             .unwrap();
@@ -369,6 +372,7 @@ fn ready_reconciliation_preserves_forced_repairs_and_rejects_invalid_work() {
                     view: first.id.clone(),
                     expected_version: version,
                     allocation_version: allocation,
+                    verify: false,
                 },
             )
             .unwrap();
@@ -420,6 +424,7 @@ fn coalesced_reconciliation_rechecks_cancellation_and_allocation_before_receipt(
                     view: first.id.clone(),
                     expected_version: first.version,
                     allocation_version: 1,
+                    verify: false,
                 },
             )
             .unwrap();

@@ -2307,3 +2307,274 @@ fn symlinks_executable_modes_and_materialized_gitlinks_match_walker() {
         &["needle", "source", "executable", "materialized", ".*"],
     );
 }
+
+fn same_stat_write(root: &Path, path: &str, bytes: &[u8]) {
+    let path = root.join(path);
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, bytes).unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+}
+
+fn query_in_thread(view: &WorktreeView, pattern: &str) -> Vec<String> {
+    std::thread::scope(|scope| scope.spawn(|| matches(view, pattern)).join().unwrap())
+}
+
+#[test]
+fn serving_verification_keeps_unchanged_views_ready_and_repairs_missed_changes() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "one.txt", b"alpha needle\n");
+    write(&fixture.root, "two.txt", b"beta needle\n");
+    write(&fixture.root, "nested/deep/three.txt", b"gamma needle\n");
+    write(&fixture.root, "binary.dat", b"bin\0needle");
+    write(&fixture.root, ".gitignore", b"*.log\n");
+    write(&fixture.root, "ignored.log", b"ignored needle\n");
+    commit(&fixture.root);
+    write(&fixture.root, "untracked.txt", b"overlay needle\n");
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let published = view.status().unwrap().published_epoch;
+    let expected = query_in_thread(&view, "needle");
+    assert_eq!(
+        expected,
+        [
+            "nested/deep/three.txt",
+            "one.txt",
+            "two.txt",
+            "untracked.txt"
+        ]
+    );
+
+    let mut during = None;
+    let verified = view
+        .verify_inner(
+            || {
+                assert!(view.status().unwrap().ready);
+                during = Some(query_in_thread(&view, "needle"));
+            },
+            || assert!(view.status().unwrap().ready),
+            None,
+        )
+        .unwrap();
+    assert_eq!(during.as_deref(), Some(expected.as_slice()));
+    let Verification::Unchanged(stats) = verified else {
+        panic!("unchanged checkout must verify while serving: {verified:?}");
+    };
+    assert!(stats.full);
+    assert_eq!(stats.content_reads_avoided, 0, "no FileVersion shortcut");
+    assert_eq!(stats.files_read, 6, "every admitted file is reread");
+    assert_eq!(stats.files_extracted, 0);
+    let status = view.status().unwrap();
+    assert!(status.ready && !status.full_required);
+    assert_eq!(status.published_epoch, published, "no republication");
+
+    // A same-stat edit no watcher reported, invisible to Git status.
+    git(
+        &fixture.root,
+        &["update-index", "--assume-unchanged", "one.txt"],
+    );
+    same_stat_write(&fixture.root, "one.txt", b"zzzzzz needle\n");
+    assert!(
+        git(
+            &fixture.root,
+            &["status", "--porcelain", "--untracked-files=no"]
+        )
+        .is_empty()
+    );
+    assert!(
+        candidates(&view, "zzz").is_empty(),
+        "the missed edit is stale"
+    );
+    let mut closed = false;
+    let repaired = view
+        .verify_inner(
+            || {},
+            || {
+                let status = view.status().unwrap();
+                closed = !status.ready
+                    && status.full_required
+                    && matches!(view.with_snapshot(|_| ()), Err(WorktreeError::NotReady));
+            },
+            None,
+        )
+        .unwrap();
+    assert!(
+        closed,
+        "a detected difference closes readiness before publication"
+    );
+    assert!(matches!(repaired, Verification::Published(ref stats) if stats.full));
+    assert!(view.status().unwrap().ready);
+    assert!(view.status().unwrap().published_epoch > published);
+    assert_eq!(matches(&view, "zzz"), ["one.txt"]);
+    assert_scan_parity(&view, &["needle", "zzz", "alpha"]);
+
+    // Membership: additions in new directories and deletions.
+    write(&fixture.root, "added/dir/four.txt", b"delta needle\n");
+    fs::remove_file(fixture.root.join("two.txt")).unwrap();
+    assert!(matches!(view.verify().unwrap(), Verification::Published(_)));
+    assert_eq!(matches(&view, "delta"), ["added/dir/four.txt"]);
+    assert!(candidates(&view, "beta").is_empty());
+    // Ignore rules changing admitted membership.
+    write(&fixture.root, ".gitignore", b"*.log\nadded/\n");
+    assert!(matches!(view.verify().unwrap(), Verification::Published(_)));
+    assert!(candidates(&view, "delta").is_empty());
+    // Reverting an overlay to the committed base content.
+    git(
+        &fixture.root,
+        &["update-index", "--no-assume-unchanged", "one.txt"],
+    );
+    same_stat_write(&fixture.root, "one.txt", b"alpha needle\n");
+    assert!(matches!(view.verify().unwrap(), Verification::Published(_)));
+    assert!(candidates(&view, "zzz").is_empty());
+    assert_scan_parity(&view, &["needle", "zzz", "alpha", "delta", "beta"]);
+    assert!(matches!(view.verify().unwrap(), Verification::Unchanged(_)));
+}
+
+#[test]
+fn serving_verification_yields_to_invalidations_and_fails_closed() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "one.txt", b"alpha needle\n");
+    write(&fixture.root, "two.txt", b"beta needle\n");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    assert_eq!(view.verify().unwrap(), Verification::Ineligible);
+    view.refresh().unwrap();
+
+    view.invalidate_path(Path::new("one.txt")).unwrap();
+    assert_eq!(view.verify().unwrap(), Verification::Ineligible);
+    assert_eq!(view.status().unwrap().pending_paths, 1);
+    assert!(!view.refresh().unwrap().full);
+
+    // A concurrent event during an unchanged verification keeps its hint.
+    let result = view.verify_inner(
+        || {
+            view.invalidate_path(Path::new("one.txt")).unwrap();
+        },
+        || {},
+        None,
+    );
+    assert!(matches!(result, Err(WorktreeError::ChangedDuringReconcile)));
+    let status = view.status().unwrap();
+    assert!(!status.ready && !status.full_required);
+    assert_eq!(status.pending_paths, 1);
+    assert!(!view.refresh().unwrap().full);
+
+    // A concurrent event after an observed difference requires a full pass.
+    same_stat_write(&fixture.root, "two.txt", b"zzzzz needle\n");
+    let result = view.verify_inner(
+        || {},
+        || {
+            view.invalidate_path(Path::new("one.txt")).unwrap();
+        },
+        None,
+    );
+    assert!(matches!(result, Err(WorktreeError::ChangedDuringReconcile)));
+    let status = view.status().unwrap();
+    assert!(!status.ready && status.full_required);
+    assert!(view.refresh().unwrap().full);
+    assert_eq!(matches(&view, "zzz"), ["two.txt"]);
+
+    // Read failures are not budget exhaustion: fail closed.
+    let error = view
+        .verify_inner(
+            || fs::remove_file(fixture.root.join("two.txt")).unwrap(),
+            || {},
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(error, WorktreeError::Io(_)), "{error:?}");
+    let status = view.status().unwrap();
+    assert!(!status.ready && status.full_required);
+    assert!(matches!(
+        view.with_snapshot(|_| ()),
+        Err(WorktreeError::NotReady)
+    ));
+    assert!(view.refresh().unwrap().full);
+    assert!(candidates(&view, "zzz").is_empty());
+    assert_scan_parity(&view, &["needle", "zzz"]);
+}
+
+#[test]
+fn managed_serving_verification_stays_available_and_respects_budget_semantics() {
+    use crate::managed::faults::{Action, Point, Specification, Stage};
+    for policy_change in [false, true] {
+        let fixture = Fixture::new();
+        for index in 0..40 {
+            write(
+                &fixture.root,
+                &format!("siblings/file-{index:03}.txt"),
+                b"stable needle\n",
+            );
+        }
+        commit(&fixture.root);
+        let (namespace, permit, view) = fixture.controlled();
+        view.refresh_controlled(&permit).unwrap();
+        let published = view.status().unwrap().published_epoch;
+        let fault = namespace
+            .install_test_fault(Specification {
+                point: Point::ReconcileBatchOpened,
+                operation: Some(permit.operation_id().clone()),
+                skip_hits: 0,
+                action: Action::Pause { timeout_ms: 30_000 },
+            })
+            .unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| view.verify_controlled(&permit));
+            let deadline = Instant::now() + std::time::Duration::from_secs(20);
+            while namespace.test_fault_status().unwrap().unwrap().stage != Stage::Waiting {
+                assert!(
+                    Instant::now() < deadline,
+                    "verification did not open a batch"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(view.status().unwrap().ready);
+            assert_eq!(
+                matches(&view, "needle").len(),
+                40,
+                "serving mid-verification"
+            );
+            if policy_change {
+                let mut policy = namespace.policy().unwrap();
+                policy.policy.work.blob_bytes /= 2;
+                namespace
+                    .update_policy(policy.version, policy.policy)
+                    .unwrap();
+            } else {
+                permit.cancel();
+            }
+            namespace.release_test_fault(&fault.ticket).unwrap();
+            let error = worker.join().unwrap().unwrap_err();
+            let expected = if policy_change {
+                crate::managed::ErrorCategory::StaleVersion
+            } else {
+                crate::managed::ErrorCategory::Cancelled
+            };
+            assert!(
+                matches!(error, WorktreeError::Index(crate::Error::Managed(ref error))
+                if error.category == expected),
+                "{error:?}"
+            );
+        });
+        let status = view.status().unwrap();
+        if policy_change {
+            assert!(
+                !status.ready && status.full_required,
+                "stale policy fails closed"
+            );
+        } else {
+            assert!(
+                status.ready && !status.full_required,
+                "cancellation proves nothing"
+            );
+            assert_eq!(status.published_epoch, published);
+            assert_eq!(matches(&view, "needle").len(), 40);
+        }
+        drop((view, permit));
+        assert_eq!(namespace.work_usage().unwrap().reservations, 0);
+    }
+}

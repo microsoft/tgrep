@@ -10,7 +10,7 @@ use crate::generations::GenerationKey;
 use crate::generations::{BuildStats, Generation, GenerationManager, IndexingProfile, Repository};
 use crate::rooted::RootedDir;
 use crate::worktrees::{
-    OverlayCost, ReconcileStats, WorktreeOptions, WorktreeSnapshot, WorktreeView,
+    OverlayCost, ReconcileStats, Verification, WorktreeOptions, WorktreeSnapshot, WorktreeView,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -80,6 +80,10 @@ pub struct ReconcileRequest {
     pub view: Id,
     pub expected_version: u64,
     pub allocation_version: u64,
+    /// Fully verify a ready view while it keeps serving. Omitted when false so
+    /// ordinary journals are unchanged and older services reject verification.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -717,6 +721,7 @@ impl ViewManager {
                     request.expected_version,
                     request.allocation_version,
                     None,
+                    request.verify,
                 )
             }
             "adaptive" => self.execute_adaptive(
@@ -1385,9 +1390,11 @@ impl ViewManager {
             request.expected_version,
             request.allocation_version,
             Some(&request.owner),
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn refresh_view(
         &self,
         operation: &OperationRecord,
@@ -1395,6 +1402,7 @@ impl ViewManager {
         expected_version: u64,
         allocation_version: u64,
         owner: Option<&Id>,
+        verify: bool,
     ) -> Result<()> {
         let slot = self.slot(view)?;
         let _serial = slot
@@ -1408,7 +1416,16 @@ impl ViewManager {
         let permit = self.reserve(&operation.id, owner, allocation_version)?;
         let _work = slot.begin_work(operation)?;
         if operation.kind == "reconcile"
-            && self.complete_current_reconciliation(&slot, operation, &record, &permit)?
+            && verify
+            && self.verify_current(&slot, operation, &record, &permit)?
+        {
+            return Ok(());
+        }
+        // A superseded verification is never coalesced into a completion
+        // that could be mistaken for a verified view.
+        if operation.kind == "reconcile"
+            && !verify
+            && self.complete_current_reconciliation(&slot, operation, &record, &permit, None)?
         {
             return Ok(());
         }
@@ -1445,14 +1462,96 @@ impl ViewManager {
         )
     }
 
+    /// Serving full verification of the current publication. Returns false
+    /// when the ordinary reconciliation path must handle the view, including
+    /// a concurrent invalidation. A repaired difference publishes as a
+    /// normal reconciliation; failures leave the record/worktree epochs
+    /// unequal or the worktree unready, so queries stay closed.
+    fn verify_current(
+        &self,
+        slot: &ViewSlot,
+        operation: &OperationRecord,
+        record: &ViewRecord,
+        permit: &Arc<WorkPermit>,
+    ) -> Result<bool> {
+        let (view, input) = {
+            let state = slot
+                .state
+                .lock()
+                .map_err(|_| Error::corrupt("view lock poisoned"))?;
+            if state.closing {
+                return Err(Error::busy("view-closing"));
+            }
+            let Some(current) = &state.current else {
+                return Ok(false);
+            };
+            let status = current.view.status()?;
+            let input = slot.epoch.load(Ordering::Acquire);
+            if !current.record.same_publication(record)
+                || input != record.input_epoch
+                || !status.ready
+                || status.published_epoch != record.reconciled_epoch
+            {
+                return Ok(false);
+            }
+            (Arc::clone(&current.view), input)
+        };
+        match view.verify_controlled(permit) {
+            Ok(Verification::Ineligible)
+            | Err(crate::worktrees::WorktreeError::ChangedDuringReconcile) => Ok(false),
+            Ok(Verification::Unchanged(stats)) => {
+                self.complete_current_reconciliation(slot, operation, record, permit, Some(stats))
+            }
+            Ok(Verification::Published(mut stats)) => {
+                if slot.epoch.load(Ordering::Acquire) != input {
+                    return Ok(false);
+                }
+                let checkpoint_start = std::time::Instant::now();
+                let checkpoint = self.namespace.save_checkpoint(
+                    &view,
+                    &record.id,
+                    record.version,
+                    input,
+                    record.pin()?,
+                    permit,
+                )?;
+                stats.timings.checkpoint_us = super::work::micros(checkpoint_start.elapsed());
+                permit.observe_reconciliation(&mut stats);
+                if slot.epoch.load(Ordering::Acquire) != input
+                    || view.status()?.published_epoch != Some(stats.epoch)
+                {
+                    return Ok(false);
+                }
+                self.publish(
+                    slot,
+                    operation,
+                    record.clone(),
+                    view,
+                    checkpoint,
+                    stats,
+                    input,
+                    json!({"verified":true,"changed":true}),
+                    permit,
+                    false,
+                )?;
+                Ok(true)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Without `verified`, completes a reconciliation whose current
+    /// publication is already ready as coalesced. With `verified`, records the
+    /// serving full verification that found the same publication unchanged.
     fn complete_current_reconciliation(
         &self,
         slot: &ViewSlot,
         operation: &OperationRecord,
         record: &ViewRecord,
         permit: &WorkPermit,
+        verified: Option<ReconcileStats>,
     ) -> Result<bool> {
-        let state = slot
+        let mut state = slot
             .state
             .lock()
             .map_err(|_| Error::corrupt("view lock poisoned"))?;
@@ -1470,11 +1569,16 @@ impl ViewManager {
         {
             return Ok(false);
         }
-        let stats = ReconcileStats {
-            epoch: record
-                .reconciled_epoch
-                .ok_or_else(|| Error::corrupt("ready view has no reconciled epoch"))?,
-            ..ReconcileStats::default()
+        let reconciled = record
+            .reconciled_epoch
+            .ok_or_else(|| Error::corrupt("ready view has no reconciled epoch"))?;
+        let stats = match &verified {
+            Some(stats) if stats.epoch != reconciled => return Ok(false),
+            Some(stats) => stats.clone(),
+            None => ReconcileStats {
+                epoch: reconciled,
+                ..ReconcileStats::default()
+            },
         };
         self.namespace.fault(
             super::faults::Point::ReconcileBeforeComplete,
@@ -1513,13 +1617,25 @@ impl ViewManager {
             }
             receipt.committed_state = CommitState::Committed;
             receipt.state = OperationState::Completed;
-            receipt.result = Some(json!({
-                "current": previous,
-                "reconcile": stats,
-                "coalesced": true,
-            }));
+            receipt.result = Some(if verified.is_some() {
+                json!({
+                    "current": previous,
+                    "reconcile": stats,
+                    "verified": true,
+                    "changed": false,
+                })
+            } else {
+                json!({
+                    "current": previous,
+                    "reconcile": stats,
+                    "coalesced": true,
+                })
+            });
             Namespace::save_operation(transaction, &receipt)
         })?;
+        if verified.is_some() {
+            state.last_stats = Some(stats);
+        }
         Ok(true)
     }
 

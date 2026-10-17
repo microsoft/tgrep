@@ -1375,15 +1375,32 @@ Explicit refresh always verifies; polling repair, watcher uncertainty and
 rescan events invalidate for full verification before queuing reconciliation.
 A newer invalidation therefore cannot be skipped by the coalescing check.
 
-**Managed update policy:** healthy native-watcher views have no timer-driven
-full-reconciliation safety pass. Elapsing the former 120-second interval does
-not invalidate or reread an otherwise quiet ready view. Silently missed changes
-can therefore remain stale indefinitely, even while ready. This is an explicitly
-accepted staleness tradeoff, not proven coverage. There is no integrated lossless
-checkout change journal; timestamps, Windows `ChangeTime`, clean Git status and
-a drained watcher queue still do not prove absence of unreported writes
-(including active/mapped writers). An unavailable/inactive journal is not an
-empty journal and does not justify skipping initial content verification.
+**Managed update policy:** healthy native-watcher views receive a serving
+periodic full verification. Once `--poll-interval` seconds (default 120) have
+elapsed since the view's last completed full pass, the scheduler queues one
+`reconcile` operation with `verify: true` without invalidating the view. It
+uses the ordinary operation worker, deadline (`operation_timeout_ms`) and
+CPU/input/handle budgets. It reads, decodes and hashes every admitted file and
+compares searchable membership and visibility against the published snapshot.
+Queries keep using that snapshot throughout. If nothing differs, the operation
+completes with `{"verified":true,"changed":false}` and publishes nothing.
+The first detected difference marks the view stale, which closes readiness
+before the next query can use it; the pass then publishes a full repair and
+reports `changed: true`. Silently missed changes are therefore repaired within
+one interval plus verification time, not left stale indefinitely.
+
+Deadline exhaustion and cancellation of a serving verification leave the view
+ready but unverified; the outcome is `failed` or `cancelled`, and the next
+attempt waits a further interval. Other verification errors close readiness.
+Watch errors/overflow, explicit full invalidation, observed Git/ignore changes
+and normal invalidating events keep their existing fail-closed semantics and
+take precedence over a pending verification. Continuous mutation can postpone
+verification, because those events already require reconciliation. Older
+binaries reject the `verify` journal field and fail closed. There is still no
+integrated lossless checkout change journal; timestamps, Windows `ChangeTime`,
+clean Git status and a drained watcher queue do not prove absence of unreported
+writes (including active/mapped writers). An unavailable/inactive journal is not
+an empty journal and does not justify skipping initial content verification.
 
 Managed native registration uses recursive roots on Windows
 (`ReadDirectoryChangesW`) and macOS (FSEvents), without enumerating worktree
@@ -1412,21 +1429,28 @@ or rescan, and observed Git/ignore changes retain full verification and the
 existing publication gates. Normal native file events still invalidate their
 paths. Explicit `--watch-mode poll` and actual native-watcher unavailability,
 failure or budget exhaustion use periodic full reconciliation as their update
-mechanism, not a redundant native safety pass. They wait `--poll-interval`
+mechanism; they close readiness for each pass and wait `--poll-interval`
 seconds after completion (default 120). `--no-watch` disables both automatic
-update mechanisms but not initial verification or explicit refresh. Legacy v1
-and ordinary-server policies are unchanged.
+update mechanisms and serving verification, but not initial verification or
+explicit refresh. Legacy v1 and ordinary-server policies are unchanged.
 
-`hello` advertises `event-driven-native-reconciliation`. Online `views.status`
-and ordinary `status` expose the effective `watch_mode`, `watch_fallback` and
-`reconciliation_policy`. It reports `native_periodic_full_verification: false`,
-`native_missed_changes: "may-remain-stale-indefinitely"`,
-`incremental_coverage: "unavailable"` and `change_journal: "not-integrated"`.
-`periodic_full_verification` is true only for an effectively polling view;
-`interval_ms` is then its active interval and `full_verification_reason` is
-`"polling-update-mechanism"`. Both fields are null otherwise. The configured
-`poll_interval_ms` remains visible even when no periodic work is enabled;
-`configured_watch_mode` is `auto`, `poll` or `disabled`.
+`hello` advertises `event-driven-native-reconciliation` and
+`serving-native-periodic-verification`. Online `views.status` and ordinary
+`status` expose the effective `watch_mode`, `watch_fallback`,
+`reconciliation_policy` and `last_verification`. The policy reports
+`incremental_coverage: "unavailable"`, `change_journal: "not-integrated"` and
+`native_verification_availability: "serving-until-difference"`. Unless watching
+is disabled, `native_periodic_full_verification` and
+`periodic_full_verification` are true, `interval_ms` is the active interval,
+and `native_missed_changes` is `"repaired-by-periodic-verification"`.
+`full_verification_reason` is `"polling-update-mechanism"` for a polling view
+(or configured poll mode) and `"periodic-native-verification"` otherwise. With
+`--no-watch`, the periodic fields are false/null and `native_missed_changes` is
+`"requires-explicit-refresh"`. The configured `poll_interval_ms` is always
+visible; `configured_watch_mode` is `auto`, `poll` or `disabled`.
+`last_verification` has `outcome` and `age_ms`. The outcome is `full-pass` after
+attachment or any other completed full reconciliation; for a serving
+verification it is `unchanged`, `repaired`, `failed` or `cancelled`.
 `native_registration_mode` distinguishes `recursive-roots` from `per-directory`,
 and `native_watch_budget_per_view` reports the startup allocation. Per-view
 `watch_count` counts live subscriptions (zero after fallback or drain); namespace
@@ -1435,13 +1459,12 @@ and `native_watch_budget_per_view` reports the startup allocation. Per-view
 Online `namespace.status` and `maintenance.status` distinguish configuration
 from effective per-view behavior: the same policy has
 `scope: "monitored-views"` plus `native_views`, `polling_views` and `disabled_views`
-counts. Its `periodic_full_verification` means at least one monitored view is
-polling, not that all views have a safety timer. A namespace configured as
-`auto` can contain both healthy native views and fallback-polling views. With
-no polling monitors its active interval/reason are null, even if polling is
-configured for future views. Repair triggers include `poll-interval` only when
-polling is active. Use explicit refresh or `--no-index` when watcher-dependent
-freshness is insufficient.
+counts. A namespace configured as `auto` can contain both healthy native views
+and fallback-polling views. Its `full_verification_reason` is
+`"polling-update-mechanism"` when at least one monitored view polls, and repair
+triggers then include `poll-interval`; otherwise they include
+`periodic-verification`. Use explicit refresh or `--no-index` when bytes newer
+than the last verification or processed event are required.
 
 `views.adaptive` takes `view`, `owner`, `expected_version`, `allocation_version`
 in an operation envelope. Adaptive policy evaluates the worktree's captured

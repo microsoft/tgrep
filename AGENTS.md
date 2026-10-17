@@ -101,13 +101,17 @@ Legacy/unmanaged v1 storage remains retain-all.
 Managed attachments use bounded parallel verified-read batches without raising
 namespace operation-worker limits. Inspect `last_reconcile.timings` and its
 read/reuse/resource counters to distinguish queueing, discovery, verification,
-catalog/control and checkpoint work. Healthy native managed views have no
-periodic safety rescan: silently missed notifications can leave results stale
-indefinitely, even while ready. This is an accepted staleness tradeoff, not
-proof of change coverage. `views.refresh` explicitly verifies all admitted
-contents; use `--no-index` when current disk bytes are required.
-`--watch-mode poll` and actual native-watcher failure/budget fallback still
-perform full verification after `--poll-interval` seconds (default 120).
+catalog/control and checkpoint work. Healthy native managed views also get a
+periodic full verification every `--poll-interval` seconds (default 120) while
+they keep serving. It rereads all admitted contents under the normal operation
+budgets, and closes readiness only when it finds a difference, then publishes
+the repair. A deadline or cancellation leaves the view ready but unverified
+(`last_verification.outcome` `failed`/`cancelled`) until the next interval, so
+results may lag missed changes by one interval plus verification time.
+`views.refresh` explicitly verifies all admitted contents; use `--no-index`
+when current disk bytes are required.
+`--watch-mode poll` and actual native-watcher failure/budget fallback instead
+close readiness for full verification after `--poll-interval` seconds.
 `reconciliation_policy` distinguishes configured mode from each view's effective
 polling and reports namespace monitor counts. First attachment/restore and
 reported watcher errors/rescans retain full verification. A clean Git status

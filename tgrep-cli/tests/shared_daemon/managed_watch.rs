@@ -25,7 +25,11 @@ fn native_ready(daemon: &Daemon, view: &Value, after: Option<u64>) -> Value {
             );
             assert_eq!(
                 status["reconciliation_policy"]["periodic_full_verification"],
-                false
+                true
+            );
+            assert_eq!(
+                status["reconciliation_policy"]["full_verification_reason"],
+                "periodic-native-verification"
             );
             assert_eq!(status["reconciliation_policy"]["poll_interval_ms"], 120_000);
             if since.elapsed() >= Duration::from_millis(500) {

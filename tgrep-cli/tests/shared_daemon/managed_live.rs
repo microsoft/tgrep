@@ -742,8 +742,46 @@ fn independent_repository_allocations_and_offline_collection_preserve_a_live_sib
     stop(&mut b);
 }
 
+fn wait_verified(daemon: &Daemon, view: &Value, outcome: &str, since: Instant) -> Value {
+    wait_for(
+        daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["work"].is_null()
+                && status["last_verification"]["outcome"] == outcome
+                && u128::from(status["last_verification"]["age_ms"].as_u64().unwrap())
+                    <= since.elapsed().as_millis()
+        },
+    )
+}
+
+fn assert_native_verification_policy(report: &Value) {
+    let repair = &report["reconciliation_policy"];
+    assert_eq!(repair["configured_watch_mode"], "auto");
+    assert_eq!(repair["periodic_full_verification"], true);
+    assert_eq!(repair["native_periodic_full_verification"], true);
+    assert_eq!(repair["interval_ms"], 120_000);
+    assert_eq!(repair["poll_interval_ms"], 120_000);
+    assert_eq!(
+        repair["full_verification_reason"],
+        "periodic-native-verification"
+    );
+    assert_eq!(
+        repair["native_missed_changes"],
+        "repaired-by-periodic-verification"
+    );
+    assert_eq!(
+        repair["native_verification_availability"],
+        "serving-until-difference"
+    );
+    let triggers = repair["full_repair_triggers"].as_array().unwrap();
+    assert!(triggers.contains(&json!("periodic-verification")));
+    assert!(!triggers.contains(&json!("poll-interval")));
+}
+
 #[test]
-fn healthy_native_views_do_not_reconcile_on_elapsed_poll_intervals() {
+fn healthy_native_views_verify_on_elapsed_poll_intervals_while_serving() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
     let (claim, guard) = owner(&daemon);
@@ -763,16 +801,48 @@ fn healthy_native_views_do_not_reconcile_on_elapsed_poll_intervals() {
             status["ready"] == true && status["work"].is_null() && status["watch_mode"] == "native"
         },
     );
-    for elapsed_ms in [121_000, 86_400_000] {
+    assert_eq!(before["last_verification"]["outcome"], "full-pass");
+    let not_due = daemon.rpc(
+        "testing.reconcile-timer",
+        json!({"view":view["view"],"elapsed_ms":119_999}),
+    );
+    assert_eq!(not_due["input_epoch"], before["input_epoch"]);
+    let idle = daemon.rpc("views.status", json!({"id":view["view"]}));
+    assert!(idle["work"].is_null());
+    assert_eq!(idle["last_verification"]["outcome"], "full-pass");
+    assert_eq!(idle["last_reconcile"], before["last_reconcile"]);
+    let search = json!({"root":view["root"],"view":view["view"],"expected_version":view["version"],
+        "query":{"pattern":"shared_term","hidden":true}});
+    let baseline = daemon.rpc("search", search.clone());
+    for (sequence, elapsed_ms) in [(0, 120_000), (1, 86_400_000)] {
+        let hook = (sequence == 1).then(|| pause(&daemon, "reconcile-batch-opened"));
+        let since = Instant::now();
         let timer = daemon.rpc(
             "testing.reconcile-timer",
             json!({"view":view["view"],"elapsed_ms":elapsed_ms}),
         );
         assert_eq!(timer["input_epoch"], before["input_epoch"]);
-        let after = daemon.rpc("views.status", json!({"id":view["view"]}));
+        if let Some(hook) = hook {
+            reached(&daemon, &hook);
+            let during = daemon.rpc("views.status", json!({"id":view["view"]}));
+            assert_eq!(during["ready"], true, "{during}");
+            assert!(!during["work"].is_null(), "{during}");
+            let served = daemon.rpc("search", search.clone());
+            assert_eq!(served["backend"], "shared-v2");
+            assert_eq!(served["ready"], true);
+            assert_eq!(served["matches"], baseline["matches"]);
+            release(&daemon, &hook);
+        }
+        let after = wait_verified(&daemon, &view, "unchanged", since);
         assert_eq!(after["ready"], true);
         assert_eq!(after["input_epoch"], before["input_epoch"]);
-        assert_eq!(after["last_reconcile"], before["last_reconcile"]);
+        assert_eq!(after["authoritative"], before["authoritative"]);
+        assert_eq!(after["last_reconcile"]["full"], true);
+        assert_eq!(after["last_reconcile"]["content_reads_avoided"], 0);
+        assert_eq!(
+            after["last_reconcile"]["files_read"],
+            before["last_reconcile"]["files_read"]
+        );
         let ordinary: Value =
             serde_json::from_str(&success(cli(&fixture.a, &["status", "."]))).unwrap();
         assert_eq!(
@@ -782,26 +852,14 @@ fn healthy_native_views_do_not_reconcile_on_elapsed_poll_intervals() {
         let namespace = daemon.rpc("namespace.status", json!({}));
         let maintenance = daemon.rpc("maintenance.status", json!({}));
         for report in [&after, &namespace, &maintenance] {
-            let repair = &report["reconciliation_policy"];
-            assert_eq!(repair["configured_watch_mode"], "auto");
-            assert_eq!(repair["periodic_full_verification"], false);
-            assert_eq!(repair["native_periodic_full_verification"], false);
-            assert!(repair["interval_ms"].is_null());
-            assert_eq!(repair["poll_interval_ms"], 120_000);
-            assert!(repair["full_verification_reason"].is_null());
-            assert_eq!(
-                repair["native_missed_changes"],
-                "may-remain-stale-indefinitely"
-            );
-            assert!(
-                !repair["full_repair_triggers"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!("poll-interval"))
-            );
+            assert_native_verification_policy(report);
         }
         assert_eq!(namespace["reconciliation_policy"]["native_views"], 1);
         assert_eq!(namespace["reconciliation_policy"]["polling_views"], 0);
+        assert_eq!(
+            daemon.rpc("search", search.clone())["matches"],
+            baseline["matches"]
+        );
     }
 
     fs::write(fixture.a.join("notes.txt"), "shared_term native_edit\n").unwrap();
@@ -828,6 +886,119 @@ fn healthy_native_views_do_not_reconcile_on_elapsed_poll_intervals() {
     assert_eq!(refreshed["result"]["reconcile"]["full"], true);
     assert_eq!(refreshed["result"]["reconcile"]["files_read"], 3);
     assert_eq!(refreshed["result"]["reconcile"]["content_reads_avoided"], 0);
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
+fn periodic_native_verification_repairs_missed_nested_changes() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    let before = wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["ready"] == true && status["work"].is_null() && status["watch_mode"] == "native"
+        },
+    );
+    let missed = json!({"root":view["root"],"view":view["view"],"expected_version":view["version"],
+        "query":{"pattern":"missed_term"}});
+    assert_eq!(
+        daemon.rpc(
+            "testing.suppress-watch-events",
+            json!({"view":view["view"],"suppress":true})
+        )["suppressed"],
+        true
+    );
+    let nested = fixture.a.join("missed").join("deep");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("found.txt"), "missed_term nested\n").unwrap();
+    fs::write(
+        fixture.a.join("notes.txt"),
+        "shared_term missed_term edit\n",
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let stale = daemon.rpc("views.status", json!({"id":view["view"]}));
+    assert_eq!(stale["ready"], true);
+    assert_eq!(stale["input_epoch"], before["input_epoch"]);
+    assert!(
+        daemon.rpc("search", missed.clone())["matches"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let since = Instant::now();
+    daemon.rpc(
+        "testing.reconcile-timer",
+        json!({"view":view["view"],"elapsed_ms":121_000}),
+    );
+    let repaired = wait_verified(&daemon, &view, "repaired", since);
+    assert_eq!(repaired["ready"], true);
+    assert_eq!(repaired["watch_mode"], "native");
+    assert!(repaired["watch_fallback"].is_null());
+    assert!(
+        repaired["authoritative"]["reconciled_epoch"]
+            .as_u64()
+            .unwrap()
+            > before["authoritative"]["reconciled_epoch"]
+                .as_u64()
+                .unwrap(),
+        "{repaired}"
+    );
+    assert_eq!(repaired["last_reconcile"]["full"], true);
+    assert_eq!(repaired["last_reconcile"]["content_reads_avoided"], 0);
+    let found = retry_busy(&daemon, "search", missed.clone());
+    let mut paths: Vec<_> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["file"].as_str().unwrap().replace('\\', "/"))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths, ["missed/deep/found.txt", "notes.txt"], "{found}");
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+
+    daemon.rpc(
+        "testing.suppress-watch-events",
+        json!({"view":view["view"],"suppress":false}),
+    );
+    let live = daemon.rpc("views.status", json!({"id":view["view"]}));
+    fs::write(nested.join("live.txt"), "live_nested_term\n").unwrap();
+    wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["ready"] == true
+                && status["input_epoch"].as_u64().unwrap() > live["input_epoch"].as_u64().unwrap()
+        },
+    );
+    let watched = retry_busy(
+        &daemon,
+        "search",
+        json!({"root":view["root"],"view":view["view"],"expected_version":view["version"],
+            "query":{"pattern":"live_nested_term"}}),
+    );
+    assert_eq!(watched["matches"].as_array().unwrap().len(), 1, "{watched}");
     assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
     daemon.rpc(
         "views.detach",
@@ -902,16 +1073,17 @@ fn native_failure_enables_polling_only_for_the_affected_view() {
     );
     let native_status = daemon.rpc("views.status", json!({"id":native["view"]}));
     assert_eq!(native_status["watch_mode"], "native");
-    assert_eq!(
-        native_status["reconciliation_policy"]["periodic_full_verification"],
-        false
-    );
+    assert_native_verification_policy(&native_status);
     for method in ["namespace.status", "maintenance.status"] {
         let status = daemon.rpc(method, json!({}));
         let repair = &status["reconciliation_policy"];
         assert_eq!(repair["configured_watch_mode"], "auto");
-        assert_eq!(repair["native_periodic_full_verification"], false);
+        assert_eq!(repair["native_periodic_full_verification"], true);
         assert_eq!(repair["periodic_full_verification"], true);
+        assert_eq!(
+            repair["full_verification_reason"],
+            "polling-update-mechanism"
+        );
         assert_eq!(repair["native_views"], 1);
         assert_eq!(repair["polling_views"], 1);
         assert_eq!(repair["interval_ms"], 120_000);
@@ -1003,6 +1175,11 @@ fn no_watch_has_no_timer_repair_but_initial_and_explicit_refresh_verify() {
         false
     );
     assert!(after["reconciliation_policy"]["interval_ms"].is_null());
+    assert_eq!(
+        after["reconciliation_policy"]["native_missed_changes"],
+        "requires-explicit-refresh"
+    );
+    assert_eq!(after["last_verification"]["outcome"], "full-pass");
     let refreshed = completed(&daemon, &daemon.rpc("views.refresh", json!({
         "token":token(&claim,2),"request":{"view":view["view"],"expected_version":view["version"],
             "owner":claim.owner,"allocation_version":1}

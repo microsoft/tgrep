@@ -110,7 +110,7 @@ fn hello(namespace: &Namespace) -> Result<Value> {
             "versioned-allocations","bound-checkpoints","offline-maintenance","stop-if-idle",
             "bounded-storage-inventory","namespace-discovery","maintenance-diagnostics",
             "private-rpc-authentication","bounded-reconciliation","reconciliation-phase-metrics",
-            "event-driven-native-reconciliation"
+            "event-driven-native-reconciliation","serving-native-periodic-verification"
         ],
         "profile":IndexingProfile::default(),
         "policy":namespace.policy()?,"allocation":namespace.allocation()?,
@@ -315,8 +315,13 @@ struct Monitor {
     watch_failure: Arc<Mutex<Option<String>>>,
     last_schedule: Instant,
     last_reconcile: Instant,
+    /// Last completed full pass or terminal serving-verification attempt.
+    last_verification: Instant,
+    verification: Option<&'static str>,
     pending: HashSet<Id>,
     failures: u32,
+    #[cfg(feature = "managed-test-hooks")]
+    suppress_events: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct WatchSettings {
@@ -351,24 +356,31 @@ impl WatchSettings {
         if !self.no_watch {
             triggers.extend(["watcher-error-or-overflow", "git-or-ignore-change"]);
         }
+        let periodic = !self.no_watch;
+        let polling = polling || (periodic && matches!(self.mode, crate::serve::WatchMode::Poll));
         if polling {
             triggers.push("poll-interval");
+        } else if periodic {
+            triggers.push("periodic-verification");
         }
         json!({
             "configured_watch_mode": if self.no_watch { "disabled" }
                 else if matches!(self.mode, crate::serve::WatchMode::Poll) { "poll" } else { "auto" },
-            "native_periodic_full_verification": false,
-            "periodic_full_verification": polling,
-            "interval_ms": polling.then_some(self.interval.as_millis()),
+            "native_periodic_full_verification": periodic,
+            "periodic_full_verification": periodic,
+            "interval_ms": periodic.then_some(self.interval.as_millis()),
             "poll_interval_ms": self.interval.as_millis(),
             "incremental_coverage": "unavailable",
             "change_journal": "not-integrated",
-            "native_missed_changes": "may-remain-stale-indefinitely",
+            "native_missed_changes": if periodic { "repaired-by-periodic-verification" }
+                else { "requires-explicit-refresh" },
+            "native_verification_availability": "serving-until-difference",
             "native_registration_mode": if matches!(self.registration_mode(), notify::RecursiveMode::Recursive) {
                 "recursive-roots"
             } else { "per-directory" },
             "native_watch_budget_per_view": self.watches_per_view,
-            "full_verification_reason": polling.then_some("polling-update-mechanism"),
+            "full_verification_reason": if polling { Some("polling-update-mechanism") }
+                else if periodic { Some("periodic-native-verification") } else { None },
             "full_repair_triggers": triggers
         })
     }
@@ -739,7 +751,13 @@ fn sync_monitor(
         let weak = Arc::downgrade(slot);
         let watch_failure = Arc::clone(&monitor.watch_failure);
         let storage = storage.to_path_buf();
+        #[cfg(feature = "managed-test-hooks")]
+        let suppress = Arc::clone(&monitor.suppress_events);
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            #[cfg(feature = "managed-test-hooks")]
+            if suppress.load(Ordering::Acquire) {
+                return;
+            }
             let Some(slot) = weak.upgrade() else {
                 return;
             };
@@ -811,6 +829,10 @@ impl State {
                 else if monitor.is_some() { "native" } else { "unavailable" },
             "watch_fallback": monitor.as_ref().and_then(|monitor| monitor.fallback.as_ref()),
             "watch_count": monitor.as_ref().map_or(0, |monitor| monitor.watched.len()),
+            "last_verification": monitor.as_ref().map(|monitor| json!({
+                "outcome": monitor.verification,
+                "age_ms": monitor.last_verification.elapsed().as_millis(),
+            })),
             "reconciliation_policy": self.watches.reconciliation_status(polling)
         }))
     }
@@ -994,6 +1016,7 @@ impl State {
                         view: input.view.clone(),
                         expected_version: self.views.recover(&input.view)?.version,
                         allocation_version: self.namespace.allocation()?.version,
+                        verify: false,
                     },
                 )?;
                 let _receipt = self.namespace.hold_operation(&operation.id)?;
@@ -1145,9 +1168,34 @@ impl State {
                     (
                         Duration::from_secs(30),
                         Duration::from_millis(input.elapsed_ms),
+                        Duration::from_millis(input.elapsed_ms),
                     )
                 })?;
                 Ok(json!({"input_epoch":slot.input_epoch()}))
+            }
+            #[cfg(feature = "managed-test-hooks")]
+            "testing.suppress-watch-events" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Input {
+                    view: Id,
+                    suppress: bool,
+                }
+                let input: Input = decode(request.params.clone())?;
+                let monitor = self
+                    .monitors
+                    .lock()
+                    .map_err(|_| Error::corrupt("monitor registry poisoned"))?
+                    .get(&input.view)
+                    .cloned()
+                    .ok_or_else(|| Error::invalid("view has no monitor"))?;
+                let monitor = monitor
+                    .lock()
+                    .map_err(|_| Error::corrupt("monitor poisoned"))?;
+                monitor
+                    .suppress_events
+                    .store(input.suppress, Ordering::Release);
+                Ok(json!({"suppressed":input.suppress}))
             }
             #[cfg(feature = "managed-test-hooks")]
             "testing.watch-event" => {
@@ -1227,6 +1275,7 @@ impl State {
                     "watch_mode",
                     "watch_fallback",
                     "watch_count",
+                    "last_verification",
                     "reconciliation_policy",
                 ] {
                     status[field] = watch[field].clone();
@@ -1406,6 +1455,7 @@ impl State {
                 "watch_mode":watch["watch_mode"],
                 "watch_fallback":watch["watch_fallback"],
                 "watch_count":watch["watch_count"],
+                "last_verification":watch["last_verification"],
                 "reconciliation_policy":watch["reconciliation_policy"],
                 "policy":self.namespace.policy()?,"usage":self.namespace.work_usage()?,
                 "adaptive":self.views.last_adaptive(slot.id())?,
@@ -1488,6 +1538,33 @@ impl State {
                     {
                         state.last_reconcile = Instant::now();
                     }
+                    let verify =
+                        operation.kind == "reconcile" && operation.request["verify"] == true;
+                    let result = final_operation.result.as_ref();
+                    let outcome = match final_operation.state {
+                        OperationState::Completed
+                            if verify
+                                && result.is_some_and(|result| result["verified"] == true) =>
+                        {
+                            Some(if result.is_some_and(|result| result["changed"] == true) {
+                                "repaired"
+                            } else {
+                                "unchanged"
+                            })
+                        }
+                        OperationState::Completed
+                            if result.is_some_and(|result| result["reconcile"]["full"] == true) =>
+                        {
+                            Some("full-pass")
+                        }
+                        OperationState::Failed if verify => Some("failed"),
+                        OperationState::Cancelled if verify => Some("cancelled"),
+                        _ => None,
+                    };
+                    if let Some(outcome) = outcome {
+                        state.last_verification = Instant::now();
+                        state.verification = Some(outcome);
+                    }
                     state.failures = if final_operation.state == OperationState::Completed {
                         0
                     } else {
@@ -1521,6 +1598,7 @@ impl State {
             (
                 monitor.last_schedule.elapsed(),
                 monitor.last_reconcile.elapsed(),
+                monitor.last_verification.elapsed(),
             )
         })
     }
@@ -1528,7 +1606,7 @@ impl State {
     fn schedule_view_with_elapsed(
         &self,
         slot: &Arc<ViewSlot>,
-        elapsed: impl FnOnce(&Monitor) -> (Duration, Duration),
+        elapsed: impl FnOnce(&Monitor) -> (Duration, Duration, Duration),
     ) -> Result<()> {
         let status = self.views.status(slot.id())?;
         if status.leases == 0 {
@@ -1588,9 +1666,18 @@ impl State {
             return Ok(());
         }
         let retry = Duration::from_millis(200_u64.saturating_mul(1_u64 << monitor.failures.min(7)));
-        let (schedule_elapsed, reconcile_elapsed) = elapsed(&monitor);
-        let periodic = self.watches.polling(&monitor) && reconcile_elapsed >= self.watches.interval;
-        if (!status.ready || periodic) && schedule_elapsed >= retry {
+        let (schedule_elapsed, reconcile_elapsed, verification_elapsed) = elapsed(&monitor);
+        let polling = self.watches.polling(&monitor);
+        let periodic = polling && reconcile_elapsed >= self.watches.interval;
+        // Healthy native views are verified while serving; only a detected
+        // difference closes readiness.
+        let verify = !periodic
+            && status.ready
+            && !polling
+            && !self.watches.no_watch
+            && monitor.watcher.is_some()
+            && verification_elapsed >= self.watches.interval;
+        if (!status.ready || periodic || verify) && schedule_elapsed >= retry {
             monitor.last_schedule = Instant::now();
             drop(monitor);
             if periodic {
@@ -1602,6 +1689,7 @@ impl State {
                     view: slot.id().clone(),
                     expected_version: status.authoritative.version,
                     allocation_version: self.namespace.allocation()?.version,
+                    verify,
                 },
             )?;
             self.enqueue(&operation)?;
@@ -1794,8 +1882,12 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
             last_schedule: Instant::now(),
             watch_failure: Arc::new(Mutex::new(None)),
             last_reconcile: Instant::now(),
+            last_verification: Instant::now(),
+            verification: None,
             pending: HashSet::new(),
             failures: 0,
+            #[cfg(feature = "managed-test-hooks")]
+            suppress_events: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }));
         sync_monitor(slot, &monitor, &observer_watches, &observer_storage).map_err(|error| {
             Error::new(

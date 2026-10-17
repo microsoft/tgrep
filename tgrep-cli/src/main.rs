@@ -694,7 +694,7 @@ enum Command {
         watch_mode: serve::WatchMode,
 
         /// Seconds to wait after a polling reconciliation completes (1-86400).
-        /// Managed v2 uses this only for polling views, not healthy native watchers.
+        /// Managed v2 also uses it to verify healthy native views while they serve.
         #[arg(
             long,
             default_value_t = 120,

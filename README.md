@@ -266,7 +266,7 @@ Automatic refresh has two modes, configured on `tgrep serve`:
 | Flag | Default | Effect |
 |------|---------|--------|
 | `--watch-mode <auto\|poll>` | `auto` | Prefer native notifications with polling fallback, or use polling only |
-| `--poll-interval <SECONDS>` | `120` | Wait after each polling reconciliation completes; range 1-86400; does not schedule healthy native managed views |
+| `--poll-interval <SECONDS>` | `120` | Wait after each polling reconciliation, or since a healthy native managed view's last full verification; range 1-86400 |
 | `--watch-budget <N>` | `8192` | Conservative process-local native watch ceiling; range 1-4294967295 |
 | `--no-watch` | off | Disable all automatic refresh: native watching, polling, and periodic reconciliation |
 
@@ -971,13 +971,19 @@ A [same-binary Windows/ReFS measurement](SHARED_INDEX_BENCHMARKS.md#large-checko
 completed a fresh warm-base attachment in 186.144 seconds versus 542.469 seconds
 for a standalone full build (2.914x), while still reading every required file.
 That result is one ordered pair without a file-cache flush, not a universal speedup.
-Healthy native managed views do **not** run the former 120-second periodic
-safety rescan. Watcher notifications still invalidate and reconcile views, but
-silently missed changes can leave results stale indefinitely, even while ready.
-This deliberately accepts staleness, not proven change coverage; timestamps,
-clean Git status and an unavailable journal do not prove that nothing changed.
-Initial attachment/restore, explicit `views.refresh`, and reported watcher
-errors/rescans retain verified repair. Use `--no-index` for current disk bytes.
+Healthy native managed views also run a periodic full verification every
+`--poll-interval` seconds (default 120), measured from their last completed
+full pass, while they keep serving queries. It reads and hashes every admitted
+file under the existing operation and resource budgets. An unchanged result
+keeps the view ready and changes nothing. Readiness closes only when it finds a
+difference, after which it publishes a full repair; silently missed changes
+are therefore repaired within one interval plus the verification time.
+Watcher errors/rescans, explicit full invalidation and concurrent edits still
+close readiness first. A verification that exhausts its deadline or is
+cancelled leaves the view ready but unverified, reports `failed`/`cancelled`,
+and retries after the next interval. Timestamps, clean Git status and an
+unavailable journal never prove that nothing changed. Status reports
+`last_verification` with its outcome and age. Use `--no-index` for current disk bytes.
 
 On Windows/macOS, managed views use recursive worktree and Git metadata-root
 subscriptions, without pre-enumerating descendant directories. The unchanged
@@ -993,8 +999,10 @@ Explicit `--watch-mode poll` and actual native-watcher failure/budget fallback
 still perform full reconciliation after `--poll-interval` seconds (default 120)
 following completion. `--no-watch` disables watching and polling, not initial
 verification or explicit refresh. `reconciliation_policy` distinguishes these
-per-view modes and namespace monitor counts. This recurring-mode change is
-subsequent to the immutable benchmark source, not a measured idle-work saving.
+per-view modes and namespace monitor counts. Polling views close readiness for
+each pass; healthy native views keep serving through theirs. These
+recurring-mode changes postdate the immutable benchmark source and are not
+measured there.
 Legacy v1 and ordinary-server refresh policies are unchanged.
 
 `views.advance` prepares and reconciles a complete replacement while unrelated
@@ -1195,9 +1203,9 @@ Later reads through that handle remain caller-owned: report read errors and call
 `invalidate_all()` after leaving the guard rather than publishing partial results.
 Do not reenter the view from its closure. A refresh acknowledges processed hints,
 **not an atomic filesystem snapshot**. For verification independent of
-notifications, use explicit or polling full repair: healthy native managed views
-no longer promise eventual periodic repair, and no-watch callers must explicitly
-refresh. Final reads can race subsequent edits.
+notifications, use explicit, polling or periodic full repair: healthy native
+managed views are verified within one `--poll-interval` plus verification time,
+and no-watch callers must explicitly refresh. Final reads can race subsequent edits.
 
 Full verification reads, auto-decodes and hashes checkout bytes; clean Git
 status, blob identity and index stat data are never byte-equivalence proofs.

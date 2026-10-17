@@ -3,7 +3,7 @@
 /// Keeps the trigram index in memory (HybridIndex), watches for filesystem
 /// changes, and serves search/status queries over TCP.
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -1443,16 +1443,113 @@ fn publish_collected_ignore_matcher(
     )
 }
 
+/// Maximum size (in bytes, including the trailing newline) accepted for a
+/// single request line on the primary `tgrep serve` socket. Without this
+/// bound a connected client could stream unbounded data without ever
+/// sending a newline, causing `line` below to grow without limit and
+/// eventually exhaust process memory (local unauthenticated DoS).
+///
+/// Reuses the same limit already enforced by the managed shared-daemon
+/// protocol (`tgrep_core::managed::MAX_REQUEST_BYTES`) so both server paths
+/// agree on what counts as an oversized request.
+const MAX_CONNECTION_LINE_BYTES: u64 = tgrep_core::managed::MAX_REQUEST_BYTES as u64;
+
+/// Read a single `\n`-terminated line from `reader`, capped at
+/// `MAX_CONNECTION_LINE_BYTES`. Returns `Ok(None)` on clean EOF (no bytes
+/// read at all). Returns `Err` if the peer sends more than the limit without
+/// a newline, or disconnects mid-line.
+fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.by_ref().take(MAX_CONNECTION_LINE_BYTES + 1);
+    let read = limited.read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_CONNECTION_LINE_BYTES && bytes.last() == Some(&b'\n'),
+        "request line missing newline or exceeds {MAX_CONNECTION_LINE_BYTES} bytes"
+    );
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(test)]
+mod read_bounded_line_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn reads_a_normal_line() {
+        let mut reader = Cursor::new(b"hello world\n".to_vec());
+        let line = read_bounded_line(&mut reader).unwrap();
+        assert_eq!(line.as_deref(), Some("hello world\n"));
+    }
+
+    #[test]
+    fn returns_none_on_clean_eof() {
+        let mut reader = Cursor::new(Vec::<u8>::new());
+        assert!(read_bounded_line(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn reads_multiple_lines_from_one_stream() {
+        let mut reader = Cursor::new(b"first\nsecond\n".to_vec());
+        assert_eq!(
+            read_bounded_line(&mut reader).unwrap().as_deref(),
+            Some("first\n")
+        );
+        assert_eq!(
+            read_bounded_line(&mut reader).unwrap().as_deref(),
+            Some("second\n")
+        );
+        assert!(read_bounded_line(&mut reader).unwrap().is_none());
+    }
+
+    /// Regression test for the unbounded-memory-growth DoS (MSRC #162882 /
+    /// ICM 31000000761603): a peer that never sends a newline must be cut
+    /// off once it exceeds `MAX_CONNECTION_LINE_BYTES`, instead of being
+    /// allowed to grow the buffer without limit.
+    #[test]
+    fn rejects_a_line_with_no_newline_once_it_exceeds_the_limit() {
+        let oversized = vec![b'a'; MAX_CONNECTION_LINE_BYTES as usize + 1];
+        let mut reader = Cursor::new(oversized);
+        let err = read_bounded_line(&mut reader).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "error was: {err}");
+    }
+
+    /// A line that is exactly at the limit (including the newline) must
+    /// still be accepted -- the bound is inclusive, not off-by-one.
+    #[test]
+    fn accepts_a_line_exactly_at_the_limit() {
+        let mut body = vec![b'a'; MAX_CONNECTION_LINE_BYTES as usize - 1];
+        body.push(b'\n');
+        assert_eq!(body.len() as u64, MAX_CONNECTION_LINE_BYTES);
+        let mut reader = Cursor::new(body.clone());
+        let line = read_bounded_line(&mut reader).unwrap().unwrap();
+        assert_eq!(line.as_bytes(), body.as_slice());
+    }
+
+    /// If the peer disconnects mid-line (no trailing newline, but also not
+    /// over the byte limit), that is still an error -- not silently treated
+    /// as a complete request.
+    #[test]
+    fn rejects_a_line_missing_its_newline_even_under_the_limit() {
+        let mut reader = Cursor::new(b"no newline here".to_vec());
+        let err = read_bounded_line(&mut reader).unwrap_err();
+        assert!(
+            err.to_string().contains("missing newline"),
+            "error was: {err}"
+        );
+    }
+}
+
 fn handle_connection(stream: TcpStream, state: &Arc<ServerState>) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
-    let mut line = String::new();
-    while reader.read_line(&mut line)? > 0 {
+    while let Some(line) = read_bounded_line(&mut reader)? {
         let response = process_request(&line, state);
         writeln!(writer, "{response}")?;
         writer.flush()?;
-        line.clear();
     }
 
     Ok(())

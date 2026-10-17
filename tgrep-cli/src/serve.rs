@@ -1469,7 +1469,12 @@ fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<String>> {
         bytes.len() as u64 <= MAX_CONNECTION_LINE_BYTES && bytes.last() == Some(&b'\n'),
         "request line missing newline or exceeds {MAX_CONNECTION_LINE_BYTES} bytes"
     );
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    // Reject invalid UTF-8 instead of lossily decoding it: silently replacing
+    // malformed bytes with U+FFFD would let JSON parsing succeed with a
+    // *different* request than the one the client actually sent (e.g. a
+    // corrupted `params.pattern`), rather than surfacing the malformed input
+    // as an error the way the original `read_line(&mut String)` did.
+    Ok(Some(String::from_utf8(bytes)?))
 }
 
 #[cfg(test)]
@@ -1539,6 +1544,21 @@ mod read_bounded_line_tests {
             err.to_string().contains("missing newline"),
             "error was: {err}"
         );
+    }
+
+    /// A line that is well-formed (newline-terminated, under the byte
+    /// limit) but contains invalid UTF-8 must be rejected outright, not
+    /// lossily decoded into replacement characters -- silently mutating an
+    /// attacker- or bug-corrupted `params.pattern` into something else would
+    /// let JSON parsing succeed against a *different* request than the one
+    /// actually sent. (PR review regression test.)
+    #[test]
+    fn rejects_invalid_utf8_in_an_otherwise_valid_line() {
+        let mut body = b"{\"id\":1,\"method\":\"search\",\"params\":{\"pattern\":\"".to_vec();
+        body.push(0xFF); // invalid UTF-8 byte, never a valid continuation/start byte
+        body.extend_from_slice(b"\"}}\n");
+        let mut reader = Cursor::new(body);
+        assert!(read_bounded_line(&mut reader).is_err());
     }
 }
 

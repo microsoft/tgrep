@@ -3,6 +3,9 @@
 use super::*;
 use tgrep_core::managed::{CommitState, ErrorCategory, OwnerClaim, OwnerGuard};
 
+#[path = "managed_diagnostics.rs"]
+mod diagnostics;
+
 #[path = "managed_watch.rs"]
 mod watch;
 
@@ -677,12 +680,11 @@ fn ordered_filters_and_replacements_use_managed_views() {
 }
 
 fn completed(daemon: &Daemon, operation: &Value) -> Value {
-    let record = terminal(daemon, operation);
-    assert_eq!(
-        record["state"], "completed",
-        "operation did not succeed: {record}"
-    );
-    record
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let record = terminal_before(daemon, operation, deadline);
+    diagnostics::completed_record(record, |view| {
+        diagnostics::view_status_before(daemon, view, deadline)
+    })
 }
 
 fn terminal(daemon: &Daemon, operation: &Value) -> Value {
@@ -696,7 +698,10 @@ fn terminal_before(daemon: &Daemon, operation: &Value, deadline: Instant) -> Val
             "completed" | "failed" | "cancelled" => return record,
             _ => assert!(
                 Instant::now() < deadline,
-                "operation did not complete: {record}"
+                "operation did not complete: {record}; view diagnostic: {}",
+                diagnostics::operation_context(&record, |view| {
+                    diagnostics::view_status_before(daemon, view, deadline)
+                })
             ),
         }
         thread::sleep(Duration::from_millis(20));
@@ -719,33 +724,57 @@ fn search(daemon: &Daemon, root: &Path) -> Value {
 }
 
 fn stop(daemon: &mut Daemon) {
-    let started = Instant::now();
+    let mut timing = diagnostics::StopTiming::new(Instant::now());
     let mut request = idle_request(daemon);
     loop {
-        let response = daemon.try_rpc("stop-if-idle", request.clone()).unwrap();
+        let response = daemon
+            .try_rpc("stop-if-idle", request.clone())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "stop-if-idle: {error}; timing: {}",
+                    timing.snapshot(Instant::now())
+                )
+            });
         if let Some(error) = response.get("error") {
-            assert_eq!(error["data"]["category"], "busy", "{response}");
-            assert_eq!(error["data"]["retryable"], true, "{response}");
             assert_eq!(
-                error["data"]["committed_state"], "not-committed",
-                "{response}"
+                error["data"]["category"],
+                "busy",
+                "{response}; timing: {}",
+                timing.snapshot(Instant::now())
+            );
+            assert_eq!(
+                error["data"]["retryable"],
+                true,
+                "{response}; timing: {}",
+                timing.snapshot(Instant::now())
+            );
+            assert_eq!(
+                error["data"]["committed_state"],
+                "not-committed",
+                "{response}; timing: {}",
+                timing.snapshot(Instant::now())
             );
         } else if response["result"]["data"]["stopping"] == true {
+            timing.accepted(Instant::now());
             break;
         } else {
             request = idle_request(daemon);
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "idle shutdown is still busy: {response}"
-        );
+        timing.assert_within_budget(Instant::now(), Some(&response));
         thread::sleep(Duration::from_millis(20));
     }
-    while daemon.child.try_wait().unwrap().is_none() {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "stopped daemon did not exit"
-        );
+    while daemon
+        .child
+        .try_wait()
+        .unwrap_or_else(|error| {
+            panic!(
+                "daemon exit check: {error}; timing: {}",
+                timing.snapshot(Instant::now())
+            )
+        })
+        .is_none()
+    {
+        timing.assert_within_budget(Instant::now(), None);
         thread::sleep(Duration::from_millis(20));
     }
 }

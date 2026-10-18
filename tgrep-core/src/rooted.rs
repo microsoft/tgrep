@@ -1,9 +1,20 @@
 //! Handle-rooted regular-file opens shared by reconciliation and serving.
 
+use std::borrow::Borrow;
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+const READ_BATCH_FILES: usize = 64;
+
+/// Bound sibling pin lifetimes without reordering or dropping candidates.
+pub fn sibling_batches(paths: &[String]) -> impl Iterator<Item = &[String]> {
+    paths
+        .chunk_by(|left, right| Path::new(left).parent() == Path::new(right).parent())
+        .flat_map(|siblings| siblings.chunks(READ_BATCH_FILES))
+}
 
 /// Validate normalized root-relative index paths using the host's path rules.
 pub fn validate_index_path(path: &str) -> io::Result<()> {
@@ -117,21 +128,39 @@ impl RootedDir {
 
     /// Pin one ancestor chain for a bounded group of sibling reads. Finishing
     /// releases the pins; the returned IDs are observations, not lifetime proof.
-    pub(crate) fn batch(&self, parent: &Path) -> io::Result<RootedBatch<'_>> {
+    pub(crate) fn batch(&self, parent: &Path) -> io::Result<RootedBatch<&Self>> {
+        Self::batch_with(self, parent)
+    }
+
+    pub(crate) fn owned_batch(
+        self: &Arc<Self>,
+        parent: &Path,
+    ) -> io::Result<RootedBatch<Arc<Self>>> {
+        Self::batch_with(Arc::clone(self), parent)
+    }
+
+    /// Reuse pinned ancestors for one bounded group from [`sibling_batches`].
+    /// Call `finish` to verify ancestor identities before reporting success.
+    pub fn read_batch(&self, parent: &Path) -> io::Result<FileBatch<'_>> {
+        self.batch(parent).map(FileBatch)
+    }
+
+    fn batch_with<R: Borrow<Self>>(root: R, parent: &Path) -> io::Result<RootedBatch<R>> {
+        let rooted = root.borrow();
         let names = if parent.as_os_str().is_empty() {
             Vec::new()
         } else {
             components(parent)?
         };
-        self.verify_root()?;
+        rooted.verify_root()?;
         let mut guards = Vec::with_capacity(names.len());
         let mut identities = Vec::with_capacity(names.len());
         #[cfg(windows)]
-        let anchor = final_path_of(&self.directory)?;
+        let anchor = final_path_of(&rooted.directory)?;
         #[cfg(windows)]
-        let mut path = self.path.clone();
+        let mut path = rooted.path.clone();
         for name in names {
-            let parent_file = guards.last().unwrap_or(&self.directory);
+            let parent_file = guards.last().unwrap_or(&rooted.directory);
             #[cfg(unix)]
             let file = open_child(parent_file, &name, true)?;
             #[cfg(windows)]
@@ -155,9 +184,9 @@ impl RootedDir {
             guards.push(file);
         }
         #[cfg(windows)]
-        let resolved = final_path_of(guards.last().unwrap_or(&self.directory))?;
+        let resolved = final_path_of(guards.last().unwrap_or(&rooted.directory))?;
         Ok(RootedBatch {
-            root: self,
+            root,
             observation: ParentObservation {
                 path: parent.into(),
                 identities,
@@ -280,8 +309,8 @@ impl ParentObservation {
     }
 }
 
-pub(crate) struct RootedBatch<'a> {
-    root: &'a RootedDir,
+pub(crate) struct RootedBatch<R> {
+    root: R,
     observation: ParentObservation,
     guards: Vec<File>,
     #[cfg(windows)]
@@ -297,7 +326,24 @@ pub(crate) struct OpenedFile {
     pub(crate) metadata: Metadata,
 }
 
-impl RootedBatch<'_> {
+/// A sibling reader retaining its ancestor handles until final verification.
+pub struct FileBatch<'a>(RootedBatch<&'a RootedDir>);
+
+impl FileBatch<'_> {
+    pub fn open_file(&self, relative: &Path) -> io::Result<File> {
+        self.0.open_observed(relative).map(|opened| opened.file)
+    }
+
+    pub fn finish(self) -> io::Result<()> {
+        self.0.finish().map(|_| ())
+    }
+}
+
+impl<R: Borrow<RootedDir>> RootedBatch<R> {
+    pub(crate) fn root(&self) -> &RootedDir {
+        self.root.borrow()
+    }
+
     #[cfg(test)]
     pub(crate) fn open_file(&self, relative: &Path) -> io::Result<File> {
         self.open_observed(relative).map(|opened| opened.file)
@@ -317,7 +363,7 @@ impl RootedBatch<'_> {
         #[cfg(unix)]
         {
             let file = open_child(
-                self.guards.last().unwrap_or(&self.root.directory),
+                self.guards.last().unwrap_or(&self.root().directory),
                 name,
                 false,
             )?;
@@ -358,7 +404,7 @@ impl RootedBatch<'_> {
             self.guards.len(),
             usize::from(!self.observation.identities.is_empty())
         );
-        self.observation.check_current_ids(self.root)?;
+        self.observation.check_current_ids(self.root())?;
         Ok(self.observation)
     }
 }

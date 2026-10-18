@@ -15,6 +15,136 @@ pub(super) fn manage(root: &Path, method: &str, params: Value) -> Value {
     response["result"].clone()
 }
 
+/// A client-side guarded generation open takes the catalog writer lock, so it
+/// may legally fail with retryable, uncommitted `busy`/`catalog-io`.
+fn open_guarded<T>(open: impl FnMut() -> tgrep_core::managed::Result<T>) -> T {
+    retry_catalog_busy(open, Instant::now() + CATALOG_BUSY_DEADLINE).unwrap()
+}
+
+fn assert_catalog_contention(error: &tgrep_core::managed::Error) {
+    assert_eq!(error.category, ErrorCategory::Busy, "{error:?}");
+    assert_eq!(error.reason_code, "catalog-io", "{error:?}");
+    assert!(error.retryable, "{error:?}");
+    assert_eq!(
+        error.committed_state,
+        CommitState::NotCommitted,
+        "{error:?}"
+    );
+}
+
+#[test]
+fn guarded_generation_open_retries_only_exact_catalog_writer_contention() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    let attached = completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let storage = PathBuf::from(daemon.marker["storage"].as_str().unwrap());
+    let incarnation = Id::parse(
+        attached["result"]["current"]["current"]["incarnation"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let open = || tgrep_core::managed::open_generation(&storage, &incarnation);
+    let generation = thread::scope(|scope| {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let catalog = storage.join("catalog.sqlite");
+        let holder = scope.spawn(move || {
+            let mut connection = rusqlite::Connection::open(catalog).unwrap();
+            connection.busy_timeout(Duration::from_secs(10)).unwrap();
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            transaction.rollback().unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut attempts = 0;
+        let expired = retry_catalog_busy(
+            || {
+                attempts += 1;
+                open()
+            },
+            Instant::now(),
+        );
+        assert_catalog_contention(
+            expired
+                .as_ref()
+                .err()
+                .expect("writer lock must block the guarded open"),
+        );
+        assert_eq!(attempts, 1, "an expired bound must not be extended");
+        let mut attempts = 0;
+        let generation = open_guarded(|| {
+            attempts += 1;
+            let result = open();
+            if attempts == 1 {
+                assert_catalog_contention(
+                    result
+                        .as_ref()
+                        .err()
+                        .expect("writer lock must block the guarded open"),
+                );
+                release_tx.send(()).unwrap();
+            }
+            result
+        });
+        holder.join().unwrap();
+        assert!(attempts >= 2, "{attempts}");
+        generation
+    });
+    assert!(
+        generation
+            .base()
+            .reader()
+            .all_paths()
+            .contains(&"notes.txt".to_owned())
+    );
+    drop(generation);
+
+    let missing = Id::parse("f".repeat(32)).unwrap();
+    let mut outcomes = Vec::new();
+    let error = retry_catalog_busy(
+        || {
+            let result = tgrep_core::managed::open_generation(&storage, &missing);
+            outcomes.push(result.as_ref().err().map(|error| {
+                (
+                    error.category,
+                    error.reason_code.clone(),
+                    error.retryable,
+                    error.committed_state,
+                )
+            }));
+            result
+        },
+        Instant::now() + CATALOG_BUSY_DEADLINE,
+    )
+    .err()
+    .expect("an unpublished generation must not open");
+    assert_ne!(error.category, ErrorCategory::Busy, "{error:?}");
+    let (last, retried) = outcomes.split_last().unwrap();
+    assert_eq!(last.as_ref().unwrap().1, error.reason_code);
+    for retried in retried {
+        assert_eq!(
+            retried.as_ref().unwrap(),
+            &(
+                ErrorCategory::Busy,
+                "catalog-io".to_owned(),
+                true,
+                CommitState::NotCommitted
+            )
+        );
+    }
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
 fn wait_json(process: &mut runtime::Process, flag: &str) -> Value {
     let started = Instant::now();
     loop {
@@ -405,11 +535,9 @@ fn actual_legacy_core_readers_reject_staged_and_published_managed_storage() {
         stage["id"]
     );
     probe(&directory, 1);
-    let guarded = tgrep_core::managed::open_generation(
-        Path::new(daemon.marker["storage"].as_str().unwrap()),
-        &Id::parse(stage["id"].as_str().unwrap()).unwrap(),
-    )
-    .unwrap();
+    let storage = PathBuf::from(daemon.marker["storage"].as_str().unwrap());
+    let incarnation = Id::parse(stage["id"].as_str().unwrap()).unwrap();
+    let guarded = open_guarded(|| tgrep_core::managed::open_generation(&storage, &incarnation));
     assert!(
         guarded
             .base()
@@ -525,11 +653,10 @@ fn guarded_reader_process() {
     let journal =
         PathBuf::from(std::env::var_os("TGREP_MANAGED_READER").expect("owned reader journal"));
     let request: Value = serde_json::from_slice(&fs::read(journal).unwrap()).unwrap();
-    let generation = tgrep_core::managed::open_generation(
-        Path::new(request["namespace"].as_str().unwrap()),
-        &Id::parse(request["incarnation"].as_str().unwrap()).unwrap(),
-    )
-    .unwrap();
+    let namespace = PathBuf::from(request["namespace"].as_str().unwrap());
+    let incarnation = Id::parse(request["incarnation"].as_str().unwrap()).unwrap();
+    let generation =
+        open_guarded(|| tgrep_core::managed::open_generation(&namespace, &incarnation));
     if request["candidate"] == true {
         let view = tgrep_core::worktrees::WorktreeView::new(
             Path::new(request["root"].as_str().unwrap()),
@@ -887,6 +1014,155 @@ fn owner_holder_enforces_claim_file_size_limit() {
             child.close_input();
             success(child.finish(Duration::from_secs(30)).unwrap());
         }
+    }
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+fn owner_hold(path: &Path) -> runtime::Process {
+    runtime::Process::start(Command::new(assert_cmd::cargo::cargo_bin("tgrep")).args([
+        "shared",
+        "owner-hold",
+        "--claim",
+        path.to_str().unwrap(),
+    ]))
+}
+
+fn stdout_lines(bytes: &[u8]) -> Vec<Value> {
+    let text = std::str::from_utf8(bytes).unwrap();
+    assert!(text.is_empty() || text.ends_with('\n'), "{text:?}");
+    text.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The exact pre-handshake contract: one `{ok:false,error}` line, exit 2 and
+/// the unchanged human diagnostic, never a `holding` success.
+fn pre_handshake_failure(output: &Output, category: &str, reason: &str, retryable: bool) -> Value {
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let lines = stdout_lines(&output.stdout);
+    assert_eq!(lines.len(), 1, "{output:?}");
+    let frame = &lines[0];
+    let mut keys: Vec<_> = frame
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["error", "ok"], "{frame}");
+    assert_eq!(frame["ok"], false, "{frame}");
+    let error = &frame["error"];
+    assert_eq!(error["category"], category, "{frame}");
+    assert_eq!(error["reason_code"], reason, "{frame}");
+    assert_eq!(error["retryable"], retryable, "{frame}");
+    assert_eq!(error["committed_state"], "not-committed", "{frame}");
+    let detail = error["detail"].as_str().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr).trim_end(),
+        format!("tgrep: {reason}: {detail}"),
+        "{output:?}"
+    );
+    error.clone()
+}
+
+fn holding_handshake(process: &mut runtime::Process, prepared: &Value) {
+    let holding = wait_json(process, "holding");
+    assert_eq!(holding["claim"], prepared["claim"]);
+    // The success handshake is unchanged and is never preceded by a failure frame.
+    assert_eq!(stdout_lines(&process.stdout()), [holding]);
+}
+
+#[test]
+fn owner_holder_frames_catalog_contention_and_the_same_claim_then_holds() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let prepared = daemon.rpc("owners.prepare", json!({"token":"framed-contention"}));
+    let claim: OwnerClaim = serde_json::from_value(prepared["claim"].clone()).unwrap();
+    let path = fixture.temp.path().join("framed-contention.claim.json");
+    fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
+
+    // Hold the catalog writer until the failed helper has exited.
+    let mut connection = rusqlite::Connection::open(claim.storage.join("catalog.sqlite")).unwrap();
+    connection.busy_timeout(Duration::from_secs(10)).unwrap();
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+    transaction.rollback().unwrap();
+    drop(connection);
+    let error = pre_handshake_failure(&output, "busy", "catalog-io", true);
+    assert_eq!(error["detail"], "database is locked");
+
+    // The confirmed-exited helper left no claim state: the SAME claim now holds.
+    let mut holder = owner_hold(&path);
+    holding_handshake(&mut holder, &prepared);
+    daemon.rpc("owners.register", json!({"claim":claim}));
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    holder.close_input();
+    success(holder.finish(Duration::from_secs(30)).unwrap());
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn owner_holder_frames_typed_refusals_without_inferring_retry_safety() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let prepared = daemon.rpc("owners.prepare", json!({"token":"framed-refusals"}));
+    let claim: OwnerClaim = serde_json::from_value(prepared["claim"].clone()).unwrap();
+    let path = fixture.temp.path().join("framed-refusals.claim.json");
+    fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
+
+    // A live holder's OS lock is reported as typed busy; the holder is unaffected.
+    let mut holder = owner_hold(&path);
+    holding_handshake(&mut holder, &prepared);
+    let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+    pre_handshake_failure(&output, "busy", "owner-guard-already-held", true);
+    assert!(holder.running());
+    daemon.rpc("owners.register", json!({"claim":claim}));
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    holder.close_input();
+    success(holder.finish(Duration::from_secs(30)).unwrap());
+
+    // An ended lifetime is framed as non-retryable, never as a fresh claim.
+    // Housekeeping may already have removed the released owner record, which
+    // reports the same stale identity as retired.
+    let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+    let reason = stdout_lines(&output.stdout)
+        .first()
+        .and_then(|frame| frame["error"]["reason_code"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    assert!(
+        matches!(reason.as_str(), "owner-lifetime-ended" | "owner-retired"),
+        "{output:?}"
+    );
+    pre_handshake_failure(&output, "stale-identity", &reason, false);
+
+    // Untyped claim-file failures have no managed classification and stay unframed.
+    for (name, bytes) in [
+        ("malformed", b"{".to_vec()),
+        (
+            "unknown-field",
+            serde_json::to_vec(&{
+                let mut value = prepared["claim"].clone();
+                value["unexpected"] = json!(true);
+                value
+            })
+            .unwrap(),
+        ),
+    ] {
+        let path = fixture.temp.path().join(format!("{name}.claim.json"));
+        fs::write(&path, bytes).unwrap();
+        let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{name}: {output:?}");
+        assert!(output.stdout.is_empty(), "{name}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).starts_with("tgrep: "),
+            "{name}: {output:?}"
+        );
     }
     stop(&mut daemon);
     drop(daemon);

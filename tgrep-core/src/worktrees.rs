@@ -13,6 +13,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -266,6 +267,44 @@ pub struct WorktreeView {
     control: Mutex<Control>,
     state: RwLock<State>,
     reconcile: Mutex<()>,
+    /// Set by a serving verification as soon as it observes any difference
+    /// from the published state. Closes readiness without taking `control`
+    /// from verification workers, which hold `state` for reading.
+    stale: AtomicBool,
+}
+
+/// Outcome of a full content verification of a ready, published view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Verification {
+    /// Not ready, or invalidations/hints are queued; ordinary refresh owns it.
+    Ineligible,
+    /// Every admitted file was read and matched the published state. The
+    /// view stayed ready throughout and its epoch is unchanged.
+    Unchanged(ReconcileStats),
+    /// A difference closed readiness and the verified state was published.
+    Published(ReconcileStats),
+}
+
+/// Fails a verification closed if it observed a difference but did not
+/// publish the repaired state, including on panic.
+struct StaleGuard<'a>(&'a WorktreeView);
+
+impl Drop for StaleGuard<'_> {
+    fn drop(&mut self) {
+        if self.0.stale.load(Ordering::Acquire) {
+            let mut control = self
+                .0
+                .control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            control.full = true;
+            control.hints.clear();
+            if control.invalidate().is_err() {
+                control.ready = false;
+            }
+            self.0.stale.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl WorktreeView {
@@ -374,6 +413,7 @@ impl WorktreeView {
                 cost: OverlayCost::default(),
             }),
             reconcile: Mutex::new(()),
+            stale: AtomicBool::new(false),
         })
     }
 
@@ -418,13 +458,18 @@ impl WorktreeView {
             .control
             .lock()
             .map_err(|_| WorktreeError::Synchronization)?;
+        let stale = self.stale.load(Ordering::Acquire);
         Ok(WorktreeStatus {
-            ready: control.ready,
+            ready: control.ready && !stale,
             epoch: control.epoch,
             published_epoch: control.published_epoch,
             pending_paths: control.hints.len(),
-            full_required: control.full,
+            full_required: control.full || stale,
         })
+    }
+
+    fn serving(&self, control: &Control) -> bool {
+        control.ready && !self.stale.load(Ordering::Acquire)
     }
 
     /// Queue a root-relative file or subtree, including missing/renamed paths.
@@ -553,9 +598,148 @@ impl WorktreeView {
             control.full = true;
             (epoch, full, control.hints.clone())
         };
-        let mut prepared = self.prepare(full, &hints, after_discovery, permit)?;
+        let mut prepared = self.prepare(full, &hints, after_discovery, permit, false)?;
         before_publish();
         let assembly = Instant::now();
+        self.check_parents(&mut prepared, permit)?;
+        self.files.verify_root()?;
+        if let Some(permit) = permit {
+            permit.check_now().map_err(crate::Error::from)?;
+        }
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        if control.epoch == u64::MAX {
+            return Err(WorktreeError::Synchronization);
+        }
+        if control.epoch != epoch {
+            return Err(WorktreeError::ChangedDuringReconcile);
+        }
+        self.publish_prepared(&mut control, prepared, epoch, permit, assembly)
+    }
+
+    /// Fully verify a ready view while it keeps serving its published state.
+    ///
+    /// Reads every admitted checkout file regardless of stat or Git status,
+    /// rewalks membership/visibility and rechecks parents. Readiness closes
+    /// as soon as any difference is observed; that pass then publishes the
+    /// verified state. A concurrent invalidation returns
+    /// `ChangedDuringReconcile` and leaves the invalidation queued. Failures
+    /// after an observed difference, and any failure other than budget
+    /// cancellation, deadline or resource pressure, leave a full refresh
+    /// required. Budget failures with no observed difference keep serving.
+    pub fn verify_controlled(
+        &self,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<Verification> {
+        if self
+            .root_protection
+            .as_ref()
+            .is_none_or(|root| root.namespace != permit.namespace.header().namespace)
+        {
+            return Err(WorktreeError::InvalidInput(
+                "verification reservation belongs to another namespace".into(),
+            ));
+        }
+        self.verify_inner(|| {}, || {}, Some(permit))
+    }
+
+    /// Unmanaged equivalent of [`Self::verify_controlled`].
+    pub fn verify(&self) -> Result<Verification> {
+        self.verify_inner(|| {}, || {}, None)
+    }
+
+    fn verify_inner(
+        &self,
+        after_discovery: impl FnOnce(),
+        before_publish: impl FnOnce(),
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Verification> {
+        let _serial = self
+            .reconcile
+            .lock()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        if permit.is_none()
+            && self
+                .state
+                .read()
+                .map_err(|_| WorktreeError::Synchronization)?
+                .memory
+                .is_some()
+        {
+            return Err(WorktreeError::InvalidInput(
+                "managed views require a reserved reconciliation operation".into(),
+            ));
+        }
+        let epoch = {
+            let control = self
+                .control
+                .lock()
+                .map_err(|_| WorktreeError::Synchronization)?;
+            if !self.serving(&control)
+                || control.full
+                || !control.hints.is_empty()
+                || control.published_epoch != Some(control.epoch)
+            {
+                return Ok(Verification::Ineligible);
+            }
+            control.epoch
+        };
+        let guard = StaleGuard(self);
+        let result = self.verify_serving(epoch, after_discovery, before_publish, permit);
+        match &result {
+            Ok(_) | Err(WorktreeError::ChangedDuringReconcile) => {}
+            Err(error) if is_budget_failure(error) => {}
+            Err(_) => self.stale.store(true, Ordering::Release),
+        }
+        drop(guard);
+        result
+    }
+
+    fn verify_serving(
+        &self,
+        epoch: u64,
+        after_discovery: impl FnOnce(),
+        before_publish: impl FnOnce(),
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Verification> {
+        let mut prepared = self.prepare(true, &BTreeSet::new(), after_discovery, permit, true)?;
+        before_publish();
+        let assembly = Instant::now();
+        self.check_parents(&mut prepared, permit)?;
+        self.files.verify_root()?;
+        if let Some(permit) = permit {
+            permit.check_now().map_err(crate::Error::from)?;
+        }
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        if control.epoch != epoch {
+            return Err(WorktreeError::ChangedDuringReconcile);
+        }
+        if !self.stale.load(Ordering::Acquire) {
+            let mut stats = prepared.stats;
+            if let Some(permit) = permit {
+                permit.observe_reconciliation(&mut stats);
+            }
+            stats.timings.assembly_us += crate::managed::work::micros(assembly.elapsed());
+            stats.epoch = epoch;
+            return Ok(Verification::Unchanged(stats));
+        }
+        control.full = true;
+        control.hints.clear();
+        let published = control.invalidate()?;
+        self.publish_prepared(&mut control, prepared, published, permit, assembly)
+            .map(Verification::Published)
+    }
+
+    fn check_parents(
+        &self,
+        prepared: &mut Prepared,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<()> {
         timed(
             &mut prepared.stats.timings.parent_verify_us,
             || -> Result<()> {
@@ -599,21 +783,19 @@ impl WorktreeView {
                 }
                 Ok(())
             },
-        )?;
-        self.files.verify_root()?;
-        if let Some(permit) = permit {
-            permit.check_now().map_err(crate::Error::from)?;
-        }
-        let mut control = self
-            .control
-            .lock()
-            .map_err(|_| WorktreeError::Synchronization)?;
-        if control.epoch == u64::MAX {
-            return Err(WorktreeError::Synchronization);
-        }
-        if control.epoch != epoch {
-            return Err(WorktreeError::ChangedDuringReconcile);
-        }
+        )
+    }
+
+    /// Publish a fully prepared pass. Requires the reconcile mutex and the
+    /// control guard with an unchanged `epoch`.
+    fn publish_prepared(
+        &self,
+        control: &mut Control,
+        prepared: Prepared,
+        epoch: u64,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+        assembly: Instant,
+    ) -> Result<ReconcileStats> {
         let mut state = self
             .state
             .write()
@@ -708,6 +890,7 @@ impl WorktreeView {
         control.full = false;
         control.hints.clear();
         control.ready = true;
+        self.stale.store(false, Ordering::Release);
         Ok(stats)
     }
 
@@ -723,6 +906,7 @@ impl WorktreeView {
         hints: &BTreeSet<String>,
         after_discovery: impl FnOnce(),
         permit: Option<&Arc<crate::managed::WorkPermit>>,
+        verify: bool,
     ) -> Result<Prepared> {
         let discovery = Instant::now();
         self.files.verify_root()?;
@@ -797,6 +981,13 @@ impl WorktreeView {
         let base_contents = BaseContents::default();
         let mut copies: HashMap<u32, Vec<String>> = HashMap::new();
         let mut paths = walk.listed_files;
+        if verify
+            && (prepared.visibility != state.visibility
+                || paths.len() != state.evidence.len()
+                || paths.iter().any(|path| !state.evidence.contains_key(path)))
+        {
+            self.stale.store(true, Ordering::Release);
+        }
         if let Some(memory) = &mut prepared.memory {
             memory
                 .grow(paths.len() as u64 * 128)
@@ -861,7 +1052,8 @@ impl WorktreeView {
                     .map(|permit| permit.parallelism(wanted))
                     .transpose()
                     .map_err(crate::Error::from)?;
-                let batch = VerificationBatch::new(&self.files, files, &base_contents, permit)?;
+                let mut batch = VerificationBatch::new(&self.files, files, &base_contents, permit)?;
+                batch.verify = verify;
                 let failure = Mutex::new(None);
                 let verify = |paths: &[String]| {
                     let start = Instant::now();
@@ -997,6 +1189,7 @@ impl WorktreeView {
         timings: &mut ReconcileTimings,
     ) -> Result<VerifiedChunk> {
         let permit = batch.permit;
+        let verify = batch.verify;
         let mut chunk = VerifiedChunk::default();
         let mut start_path = 0;
         while start_path < paths.len() {
@@ -1047,7 +1240,13 @@ impl WorktreeView {
                         .walk
                         .max_file_size
                         .is_none_or(|limit| read.bytes.len() as u64 <= limit);
-                    let content = if listed && !walker::is_binary_extension(relative) {
+                    let eligible = !self
+                        .generation
+                        .key()
+                        .profile()
+                        .eligibility
+                        .excludes_by_extension(relative);
+                    let content = if listed && eligible {
                         chunk.stats.files_decoded += 1;
                         let (text, id) =
                             timed(&mut timings.worker_decode_hash_us, || -> Result<_> {
@@ -1068,13 +1267,24 @@ impl WorktreeView {
                             })?;
                         if let Some(id) = id {
                             timed(&mut timings.worker_compare_extract_us, || -> Result<()> {
-                                if self.base_content(path) != Some(id)
+                                let differs_from_published = self.base_content(path) != Some(id)
                                     && !(previous
                                         .and_then(|entry| entry.content)
                                         .or_else(|| state.restored_content.get(path).copied())
                                         == Some(id)
-                                        && state.index.live.has_path(path))
-                                {
+                                        && state.index.live.has_path(path));
+                                if differs_from_published {
+                                    if verify {
+                                        self.stale.store(true, Ordering::Release);
+                                        if let Some(permit) = permit {
+                                            let point =
+                                                crate::managed::faults::Point::VerificationContentHashed;
+                                            permit
+                                                .namespace
+                                                .fault(point, Some(permit.operation_id()))
+                                                .map_err(crate::Error::from)?;
+                                        }
+                                    }
                                     if let Some(file_id) =
                                         batch.base_contents.find(self, id, permit)?
                                     {
@@ -1109,6 +1319,14 @@ impl WorktreeView {
                         content,
                     }
                 };
+                if verify
+                    && (updated
+                        || previous.is_none_or(|entry| {
+                            entry.listed != evidence.listed || entry.content != evidence.content
+                        }))
+                {
+                    self.stale.store(true, Ordering::Release);
+                }
                 if let Some(id) = evidence.content {
                     if self.base_content(path) == Some(id) {
                         chunk.stats.base_reused += 1;
@@ -1135,7 +1353,7 @@ impl WorktreeView {
             .control
             .lock()
             .map_err(|_| WorktreeError::Synchronization)?;
-        if !control.ready {
+        if !self.serving(&control) {
             return Err(WorktreeError::NotReady);
         }
         self.verify_snapshot_root(&mut control)?;
@@ -1192,7 +1410,7 @@ impl WorktreeView {
             .control
             .lock()
             .map_err(|_| WorktreeError::Synchronization)?;
-        if !control.ready {
+        if !self.serving(&control) {
             return Err(WorktreeError::NotReady);
         }
         let state = self
@@ -1250,7 +1468,7 @@ impl WorktreeView {
             .control
             .lock()
             .map_err(|_| crate::managed::Error::corrupt("view lock poisoned"))?;
-        if !control.ready {
+        if !self.serving(&control) {
             return Err(crate::managed::Error::busy("view-not-ready"));
         }
         self.files.verify_root()?;
@@ -1357,7 +1575,7 @@ impl WorktreeView {
             .control
             .lock()
             .map_err(|_| crate::managed::Error::corrupt("view lock poisoned"))?;
-        if !control.ready {
+        if !self.serving(&control) {
             return Err(crate::managed::Error::busy("view-not-ready"));
         }
         let state = self
@@ -1501,6 +1719,20 @@ pub struct CandidateFile {
     _protection: Option<Arc<crate::managed::roots::RootProtection>>,
 }
 
+/// A bounded sibling-read group retaining the same root and generation pins
+/// as escaped candidates. Open through a snapshot and finish before publishing.
+pub struct CandidateBatch {
+    batch: RootedBatch<Arc<RootedDir>>,
+    generation: Arc<Generation>,
+    _protection: Option<Arc<crate::managed::roots::RootProtection>>,
+}
+
+impl CandidateBatch {
+    pub fn finish(self) -> std::io::Result<()> {
+        self.batch.finish().map(|_| ())
+    }
+}
+
 impl CandidateFile {
     pub fn metadata(&self) -> std::io::Result<fs::Metadata> {
         self.file.metadata()
@@ -1568,8 +1800,47 @@ impl WorktreeSnapshot<'_> {
         })
     }
 
+    /// Pin the ancestors of one candidate for a bounded sibling group.
+    pub fn candidate_batch(&self, relative: &str) -> std::io::Result<CandidateBatch> {
+        crate::rooted::validate_index_path(relative)?;
+        let parent = Path::new(relative)
+            .parent()
+            .expect("validated relative path");
+        let batch = self.record_open(relative, self.rooted.owned_batch(parent))?;
+        Ok(CandidateBatch {
+            batch,
+            generation: Arc::clone(self.generation),
+            _protection: self.protection.clone(),
+        })
+    }
+
+    pub fn open_candidate_in(
+        &self,
+        batch: &CandidateBatch,
+        relative: &str,
+    ) -> std::io::Result<CandidateFile> {
+        if !std::ptr::eq(batch.batch.root(), self.rooted.as_ref())
+            || !Arc::ptr_eq(&batch.generation, self.generation)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "candidate batch belongs to a different snapshot",
+            ));
+        }
+        let opened = self.record_open(relative, batch.batch.open_observed(Path::new(relative)))?;
+        Ok(CandidateFile {
+            file: opened.file,
+            _root: Arc::clone(self.rooted),
+            _generation: Arc::clone(self.generation),
+            _protection: self.protection.clone(),
+        })
+    }
+
     fn open_inner(&self, relative: &str) -> std::io::Result<File> {
-        let result = self.rooted.open_file(Path::new(relative));
+        self.record_open(relative, self.rooted.open_file(Path::new(relative)))
+    }
+
+    fn record_open<T>(&self, relative: &str, result: std::io::Result<T>) -> std::io::Result<T> {
         if let Err(error) = &result {
             let mut first_error = self
                 .open_error
@@ -1660,7 +1931,7 @@ impl PreparedUpsert {
 }
 
 struct ParentBatch<'a> {
-    reader: OnceLock<RootedBatch<'a>>,
+    reader: OnceLock<RootedBatch<&'a RootedDir>>,
     initialize: Mutex<()>,
 }
 
@@ -1669,6 +1940,7 @@ struct VerificationBatch<'root, 'inputs> {
     parents: HashMap<&'inputs str, ParentBatch<'root>>,
     base_contents: &'inputs BaseContents,
     permit: Option<&'inputs Arc<crate::managed::WorkPermit>>,
+    verify: bool,
     memory: Option<crate::managed::work::MemoryCharge>,
     _pins: Option<crate::managed::work::ParentAdmission<'inputs>>,
 }
@@ -1713,12 +1985,13 @@ impl<'root, 'inputs> VerificationBatch<'root, 'inputs> {
             parents,
             base_contents,
             permit,
+            verify: false,
             memory,
             _pins: pins,
         })
     }
 
-    fn reader(&self, parent: &str) -> Result<&RootedBatch<'root>> {
+    fn reader(&self, parent: &str) -> Result<&RootedBatch<&'root RootedDir>> {
         let entry = self.parents.get(parent).expect("planned parent batch");
         if entry.reader.get().is_none() {
             let _initialize = entry
@@ -1985,6 +2258,17 @@ fn record_failure(failure: &mut Option<WorktreeError>, error: WorktreeError) {
 fn is_peer_cancellation(error: &WorktreeError) -> bool {
     matches!(error, WorktreeError::Index(crate::Error::Managed(error))
         if error.category == crate::managed::ErrorCategory::Cancelled)
+}
+
+/// Operation budget exhaustion carries no evidence about checkout content.
+fn is_budget_failure(error: &WorktreeError) -> bool {
+    matches!(error, WorktreeError::Index(crate::Error::Managed(error))
+    if matches!(
+        error.category,
+        crate::managed::ErrorCategory::Cancelled
+            | crate::managed::ErrorCategory::Deadline
+            | crate::managed::ErrorCategory::ResourcePressure
+    ))
 }
 
 fn read_file<'a>(

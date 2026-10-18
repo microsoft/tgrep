@@ -605,6 +605,186 @@ fn word_boundary_patterns_print_each_matching_line_once() {
     });
 }
 
+/// ripgrep 15.2.0 totals a file's `bytes_printed` from its `begin`, `match`
+/// and `context` messages before writing that file's `end`, and the summary
+/// sums those per-file totals. Neither `end` nor `summary` counts itself.
+#[test]
+fn json_bytes_printed_excludes_end_messages_on_every_backend() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("probe.cs"),
+        "// ActivityScope\n// ActivityScope second\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("other.cs"),
+        "before\nActivityScope three\nafter\n",
+    )
+    .unwrap();
+    fs::write(root.join("miss.cs"), "no hit\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        let output = tgrep()
+            .args(backend)
+            .args(["--stats", "--json", "--color", "never", "-C", "1"])
+            .args(["-e", "ActivityScope", "--"])
+            .arg(&root)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(marker))
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let (mut printed, mut ends, mut summary) = (0, Vec::new(), Vec::new());
+        for line in stdout.split_inclusive('\n') {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let reported = &row["data"]["stats"]["bytes_printed"];
+            match row["type"].as_str().unwrap() {
+                "begin" | "match" | "context" => printed += line.len() as u64,
+                "end" => ends.push((reported.as_u64().unwrap(), std::mem::take(&mut printed))),
+                "summary" => summary.push(reported.as_u64().unwrap()),
+                kind => panic!("{marker}: unexpected {kind}: {stdout}"),
+            }
+        }
+        assert_eq!(ends.len(), 2, "{marker}: {stdout}");
+        for (reported, emitted) in &ends {
+            assert_eq!(reported, emitted, "{marker}: {stdout}");
+        }
+        let total: u64 = ends.iter().map(|(reported, _)| reported).sum();
+        assert_eq!(summary, [total], "{marker}: {stdout}");
+    });
+}
+
+#[test]
+fn json_backend_search_work_stats_include_candidates_without_output() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(root.join("nested")).unwrap();
+    let probe = "// ActivityScope\n// ActivityScope second\n";
+    let other = "ActivityScope three\n";
+    // The literal is present, but its word boundary never matches.
+    let false_positive = "ActivityScopeExtra\n";
+    let miss = "no hit\n";
+    for (file, contents) in [
+        ("probe.cs", probe),
+        ("nested/other.cs", other),
+        ("candidate.cs", false_positive),
+        ("miss.cs", miss),
+    ] {
+        fs::write(root.join(file), contents).unwrap();
+    }
+    let assert_stats = |output: std::process::Output,
+                        searches: u64,
+                        bytes: u64,
+                        matching_files: u64,
+                        matches: u64| {
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let rows: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for row in rows.iter().filter(|row| row["type"] == "end") {
+            let path = row["data"]["path"]["text"].as_str().unwrap();
+            let expected = if path.ends_with("probe.cs") {
+                probe
+            } else {
+                other
+            };
+            assert_eq!(
+                row["data"]["stats"]["bytes_searched"],
+                expected.len(),
+                "{stdout}"
+            );
+            assert_eq!(row["data"]["stats"]["searches"], 1, "{stdout}");
+        }
+        let summaries: Vec<_> = rows.iter().filter(|row| row["type"] == "summary").collect();
+        assert_eq!(summaries.len(), 1, "{stdout}");
+        let stats = &summaries[0]["data"]["stats"];
+        assert_eq!(stats["searches"], searches, "{stdout}");
+        assert_eq!(stats["bytes_searched"], bytes, "{stdout}");
+        assert_eq!(stats["searches_with_match"], matching_files, "{stdout}");
+        assert_eq!(stats["matches"], matches, "{stdout}");
+        assert_eq!(stats["matched_lines"], matches, "{stdout}");
+    };
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for diagnostics in [false, true] {
+            for (paths, pattern, searches, bytes, matching_files, matches) in [
+                (
+                    vec![root.clone()],
+                    r"ActivityScope\b",
+                    if marker == "Brute-force search completed" {
+                        4
+                    } else {
+                        3
+                    },
+                    probe.len()
+                        + other.len()
+                        + false_positive.len()
+                        + if marker == "Brute-force search completed" {
+                            miss.len()
+                        } else {
+                            0
+                        },
+                    2,
+                    3,
+                ),
+                (
+                    vec![root.join("nested")],
+                    r"ActivityScope\b",
+                    1,
+                    other.len(),
+                    1,
+                    1,
+                ),
+                (
+                    vec![root.join("nested"), root.join("nested")],
+                    r"ActivityScope\b",
+                    2,
+                    2 * other.len(),
+                    2,
+                    2,
+                ),
+                (
+                    vec![root.clone()],
+                    "no-such-literal",
+                    if marker == "Brute-force search completed" {
+                        4
+                    } else {
+                        0
+                    },
+                    if marker == "Brute-force search completed" {
+                        probe.len() + other.len() + false_positive.len() + miss.len()
+                    } else {
+                        0
+                    },
+                    0,
+                    0,
+                ),
+            ] {
+                let mut command = tgrep();
+                command.args(backend).args(["--json", "--color", "never"]);
+                if diagnostics {
+                    command.arg("--stats");
+                }
+                let output = command
+                    .args(["-e", pattern, "--"])
+                    .args(paths)
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(if matches == 0 { 1 } else { 0 }));
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!stderr.contains("falling back"), "{stderr}");
+                if diagnostics {
+                    assert!(stderr.contains(marker), "{stderr}");
+                }
+                assert_stats(output, searches, bytes as u64, matching_files, matches);
+            }
+        }
+    });
+}
+
 #[test]
 fn reported_multiline_preserves_adjacent_matches_in_every_output() {
     let dir = TempDir::new().unwrap();
@@ -2019,7 +2199,6 @@ fn stable_json_output(stdout: &[u8]) -> Vec<serde_json::Value> {
             let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
             if let Some(stats) = event["data"]["stats"].as_object_mut() {
                 stats.remove("elapsed");
-                stats.remove("bytes_printed");
             }
             event["data"]
                 .as_object_mut()
@@ -2393,13 +2572,18 @@ fn server_count_matches_returns_totals_without_stats() {
         format!("{}\nb\n", "a".repeat(repeats)),
     )
     .unwrap();
+    fs::write(
+        root.join("line-heavy.txt"),
+        "return return return\nmiss\n".repeat(4096),
+    )
+    .unwrap();
     let index_dir = dir.path().join("idx");
     let _server = start_passthru_server(&root, &index_dir);
     let info: serde_json::Value =
         serde_json::from_slice(&fs::read(index_dir.join("serve.json")).unwrap()).unwrap();
     let port = info["port"].as_u64().unwrap() as u16;
     for stats in [false, true] {
-        for count_matches in [false, true] {
+        for count_field in [None, Some("count"), Some("count_matches")] {
             let mut request = serde_json::json!({
                 "jsonrpc": "2.0", "method": "search", "id": 1,
                 "params": {
@@ -2407,8 +2591,8 @@ fn server_count_matches_returns_totals_without_stats() {
                     "stats": stats, "detail": false,
                 },
             });
-            if count_matches {
-                request["params"]["count_matches"] = serde_json::json!(true);
+            if let Some(field) = count_field {
+                request["params"][field] = serde_json::json!(true);
             }
             let response: serde_json::Value =
                 serde_json::from_str(&send_rpc_request(port, &request.to_string()).unwrap())
@@ -2416,9 +2600,12 @@ fn server_count_matches_returns_totals_without_stats() {
             assert!(response.get("error").is_none(), "{response}");
             let result = &response["result"];
             assert_eq!(result["hidden_complete"], true);
-            assert_eq!(result["num_matches"], 6);
+            assert_eq!(
+                result["num_matches"],
+                if count_field.is_some() { 2 } else { 6 }
+            );
             assert_eq!(result.get("index_stats").is_some(), stats);
-            if stats || count_matches {
+            if stats || count_field == Some("count_matches") {
                 let mut totals = result["file_stats"].as_array().unwrap().clone();
                 totals.sort_by_key(|s| s["file"].as_str().unwrap().to_string());
                 assert_eq!(
@@ -2435,36 +2622,58 @@ fn server_count_matches_returns_totals_without_stats() {
     }
     for engine in ["default", "pcre2"] {
         for stats in [false, true] {
-            for (pattern, multiline, matches, lines) in
-                [("a", false, repeats, 1), (r"a|\nb", true, repeats + 1, 2)]
-            {
+            for (path, pattern, multiline, matches, lines, field) in [
+                ("count-heavy.txt", "a", false, repeats, 1, "count_matches"),
+                (
+                    "count-heavy.txt",
+                    r"a|\nb",
+                    true,
+                    repeats + 1,
+                    2,
+                    "count_matches",
+                ),
+                ("line-heavy.txt", "return", false, 3 * 4096, 4096, "count"),
+                (
+                    "line-heavy.txt",
+                    "return",
+                    false,
+                    3 * 4096,
+                    4096,
+                    "count_matches",
+                ),
+            ] {
                 let request = serde_json::json!({
                     "jsonrpc": "2.0", "method": "search", "id": 1,
                     "params": {
                         "pattern": pattern, "multiline": multiline, "engine": engine,
-                        "glob": ["count-heavy.txt"], "count_matches": true,
+                        "glob": [path], field: true,
                         "stats": stats, "detail": false,
                     },
                 });
                 let raw = send_rpc_request(port, &request.to_string()).unwrap();
-                assert!(raw.len() < 40 * 1024, "count response: {} bytes", raw.len());
+                assert!(raw.len() < 4 * 1024, "count response: {} bytes", raw.len());
                 let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
                 assert!(response.get("error").is_none(), "{response}");
                 let result = &response["result"];
                 assert_eq!(result["hidden_complete"], true);
                 assert_eq!(result.get("index_stats").is_some(), stats);
-                assert_eq!(
-                    result["file_stats"],
-                    serde_json::json!([{
-                        "file":"count-heavy.txt","matches":matches,"matched_lines":lines,
-                    }])
-                );
-                let rows = result["matches"].as_array().unwrap();
-                assert_eq!(rows.len(), lines);
-                for row in rows {
-                    assert!(row.get("spans").is_none());
-                    assert!(row.get("columns").is_none());
+                if stats || field == "count_matches" {
+                    assert_eq!(
+                        result["file_stats"],
+                        serde_json::json!([{
+                            "file":path,"matches":matches,"matched_lines":lines,
+                        }])
+                    );
+                } else {
+                    assert!(result.get("file_stats").is_none());
                 }
+                let rows = result["matches"].as_array().unwrap();
+                let expected = if field == "count" {
+                    serde_json::json!({"type":"count","file":path,"lines":lines})
+                } else {
+                    serde_json::json!({"type":"match","file":path})
+                };
+                assert_eq!(rows, &[expected]);
             }
         }
     }
@@ -2503,7 +2712,7 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
         ])
         .assert()
         .success();
-    for (flag, metadata) in [
+    let mut cases: Vec<_> = [
         ("-c", None),
         ("--count-matches", None),
         ("--count-matches", Some(serde_json::json!(null))),
@@ -2529,7 +2738,27 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                 {"file":"b.txt","matches":2,"matched_lines":4},
             ])),
         ),
+    ]
+    .into_iter()
+    .map(|(flag, metadata)| (flag, metadata, None))
+    .collect();
+    for invalid in [
+        serde_json::json!({"type":"count","file":"b.txt"}),
+        serde_json::json!({"type":"count","file":"b.txt","lines":-1}),
+        serde_json::json!({"type":"count","lines":4}),
+        serde_json::json!({"type":"count","file":"a.txt","lines":4}),
+        serde_json::json!({"type":"match","file":"b.txt","line":1}),
     ] {
+        cases.push((
+            "-c",
+            None,
+            Some(vec![
+                serde_json::json!({"type":"count","file":"a.txt","lines":999}),
+                invalid,
+            ]),
+        ));
+    }
+    for (flag, metadata, projected) in cases {
         for stats in [false, true] {
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -2559,16 +2788,17 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                     BufReader::new(&stream).read_line(&mut line).unwrap();
                     let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                     assert_eq!(request["params"].get("count_matches").is_some(), flag != "-c");
+                    assert_eq!(request["params"].get("count").is_some(), flag == "-c");
                     assert_eq!(request["params"]["stats"], stats);
-                    if flag == "--count-matches" {
-                        assert_eq!(request["params"]["detail"], false);
-                    }
-                    let rows: Vec<_> = [("a.txt", 2), ("b.txt", 4)]
-                        .into_iter()
-                        .flat_map(|(file, lines)| (1..=lines).map(move |line| {
-                            serde_json::json!({"file":file,"line":line,"spans":[[0,5]],"type":"match"})
-                        }))
-                        .collect();
+                    assert_eq!(request["params"]["detail"], flag == "-c" && stats);
+                    let rows = projected.clone().unwrap_or_else(|| {
+                        [("a.txt", 2), ("b.txt", 4)]
+                            .into_iter()
+                            .flat_map(|(file, lines)| (1..=lines).map(move |line| {
+                                serde_json::json!({"file":file,"line":line,"spans":[[0,5]],"type":"match"})
+                            }))
+                            .collect()
+                    });
                     let mut result = serde_json::json!({
                         "hidden_complete":true,"matches":rows,"elapsed_ms":1,
                     });
@@ -2583,6 +2813,9 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                     .args(["-U", flag, "--no-filename", "--sort", "path"]);
                 if stats {
                     cmd.arg("--stats");
+                }
+                if projected.is_some() {
+                    cmd.args(["--max-depth", "1"]);
                 }
                 let output = cmd
                     .args(["--", r"hello\nworld"])
@@ -2599,10 +2832,20 @@ fn count_matches_rejects_old_or_incomplete_server_totals_before_output() {
                 "{flag} {metadata:?} stats={stats}"
             );
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if flag == "-c" {
+            if flag == "-c" && projected.is_none() {
                 assert!(!stderr.contains("falling back"), "{stderr}");
+                if stats {
+                    assert_eq!(stats_totals(&output.stderr), [(6, 6)]);
+                }
             } else {
-                assert!(stderr.contains("match totals"), "{stderr}");
+                assert!(
+                    stderr.contains(if projected.is_some() {
+                        "count"
+                    } else {
+                        "match totals"
+                    }),
+                    "{stderr}"
+                );
                 assert!(stderr.contains("falling back to local index"), "{stderr}");
                 assert!(!stderr.contains("(via server)"), "{stderr}");
                 if stats {
@@ -2665,6 +2908,13 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
             "(hello)",
             &["report_replacements"][..],
             Some("JSON replacements"),
+            None,
+        ),
+        (
+            vec!["--json"],
+            "needle",
+            &[][..],
+            Some("JSON search statistics"),
             None,
         ),
         // Definitions that no `-t`/`-T` consumes are not sent at all, so an
@@ -2776,9 +3026,20 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
                         })
                     })
                     .collect();
-                let result = serde_json::json!({
+                let mut result = serde_json::json!({
                     "hidden_complete":true,"matches":rows,"elapsed_ms":1,
                 });
+                assert_eq!(
+                    request["params"].get("search_stats").is_some(),
+                    flags.contains(&"--json")
+                );
+                if flags.contains(&"--json") && reason != Some("JSON search statistics") {
+                    result["search_stats"] = serde_json::json!([
+                        {"file":"a.rs","bytes_searched":7,"binary_offset":null},
+                        {"file":"a.txt","bytes_searched":7,"binary_offset":null},
+                        {"file":"m.txt","bytes_searched":12,"binary_offset":null}
+                    ]);
+                }
                 writeln!(
                     stream,
                     "{}",
@@ -2825,6 +3086,13 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
         assert!(!stdout.contains("STALE"), "{flags:?}: {stdout}");
         match expected {
             Some(expected) => assert_eq!(stdout, expected, "{flags:?}"),
+            None if reason == "JSON search statistics" => {
+                let rows = stable_json_output(&output.stdout);
+                let summary = rows.iter().find(|row| row["type"] == "summary").unwrap();
+                assert_eq!(summary["data"]["stats"]["searches"], 2);
+                assert_eq!(summary["data"]["stats"]["bytes_searched"], 14);
+                assert_eq!(summary["data"]["stats"]["matches"], 2);
+            }
             None => assert!(stdout.contains(r#""replacement":{"text":"R"}"#), "{stdout}"),
         }
     }

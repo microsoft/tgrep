@@ -317,7 +317,8 @@ Clean Git status and equal blob IDs do not prove equivalence of worktree bytes.
 The synchronization layer verifies decoded identities from checkout reads, or
 overlays transformed/changed files. It also applies worktree-specific membership,
 including ignored/extension-filtered files, sparse checkout and filesystem case
-behavior. Non-UTF-8 tracked names, unsafe relative paths, and paths unrepresentable
+behavior. The profile's optional content eligibility selects whether the
+extension filter applies ([content eligibility profiles](#content-eligibility-profiles)). Non-UTF-8 tracked names, unsafe relative paths, and paths unrepresentable
 on the current platform are explicit unsupported errors, not lossy aliases.
 Native repository paths are retained losslessly. Content/coverage enum versions
 must advance if their semantics change, independently of the index format.
@@ -591,9 +592,70 @@ The `profile` is required on attach:
 {"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864}
 ```
 
+#### Content eligibility profiles
+
+The profile may also carry `"eligibility":"content-only"`. The default,
+`extension-and-content`, is omitted from the wire form, so default profiles,
+generation keys, storage names and `hello.profile` are unchanged. Daemons that
+support the optional field advertise the `content-eligibility-profile`
+capability; older daemons reject the unknown field on attach.
+
+| Stage | `extension-and-content` (default) | `content-only` |
+|-------|-----------------------------------|----------------|
+| Committed base | Raw tracked blobs, content-classified; no extension rule | Same corpus, but a distinct generation key and storage name |
+| Overlay/verification | Binary-extension paths have no content and hide the base entry | All listed files are decoded and classified by content; clean text reuses the base, NUL content is excluded |
+| Incremental and full refresh | Same path rules | Same path rules; the profile is never re-chosen |
+| `--files` | Unaffected | Identical filename membership |
+
+Ignore, hidden, size, symlink and NUL/binary classification are the same in
+both profiles. The profile is part of the pin: a join, accept-current attach
+or migration with a different profile fails, so every client of one worktree
+root must request the same eligibility. Checkpoints restore only into the same
+profile. Unmanaged v1 leases accept only the default. To change a root's
+profile, release every lease; a fresh `views.attach` with an explicit
+`revision` and no `accept_current` then replaces the inactive view (retryable
+`previous-root-readers-active` while old readers drain). No close RPC is needed.
+
+Queries state their eligibility. The CLI sends `content_eligibility:
+"content-only"` in the search query when run with `--content-eligibility
+content`, and omits the field otherwise. Before using a discovered view, the
+client compares the requested eligibility with the view's generation profile.
+The server makes the same check for content queries (not `files`). A mismatch
+in either direction is refused with the shared-fallback warning, and the
+client scans the filesystem using the requested rule. A legacy view is never
+served under a wider-coverage request, and a content-only view is never
+served to a default request. Older clients see a non-default profile and fall
+back. Content-eligibility queries never use an ordinary server or local index.
+
+A runtime that wants ripgrep-compatible extension handling should check
+`content-eligibility-profile`, attach with:
+
+```json
+{"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864,"eligibility":"content-only"}
+```
+
+and query with `tgrep --content-eligibility content ...`. With `--stats`, a
+managed answer reports `(via shared daemon v2)`. A content-only base is
+built and stored separately from a default base for the same tree.
+
 `query` uses the existing search RPC fields built by `server_search_request`:
 pattern/extra_patterns, matcher flags, types/type_add/type_clear, globs,
-context/output-detail fields, hidden, scope and max_depth. Only default automatic
+context/output-detail fields, `count`/`count_matches`, hidden, scope and max_depth.
+`count: true` returns one `{"type":"count","file":"...","lines":N}` row per
+matching text file. `count_matches: true` returns one path row plus the original
+per-file totals. Binary markers retain their counts and client-side visibility
+filtering; `stats` still returns the original match totals without restoring
+content rows. Legacy non-counting requests keep their existing response shape.
+JSON clients additionally send `search_stats: true`. The response's
+`search_stats` array contains `{"file":"...","bytes_searched":N,"binary_offset":null}`
+for every candidate searched, including those with no matching rows; a binary
+candidate carries its numeric detection offset. These receipts are collected
+at matching time, charged to the existing response budget, and filtered by the
+client's normal scope/binary visibility rules. They require no extra reads and
+do not claim full-scan work. Missing or malformed receipts are rejected before
+output; older shared servers reject the new query field, causing the usual
+diagnosed scan fallback. Queries without this field keep their prior shape.
+Only default automatic
 decoding and the 64 MiB profile are compatible. `scope` is empty or an existing
 relative directory, never a regular file; it cannot escape the root or cross a nested repository. Content reads
 use no-follow root-contained handles, never another worktree's content cache.
@@ -654,6 +716,14 @@ refresh and checkpoint publication finish, including failed checkpoint retries.
 Candidate files are opened through the view's retained snapshot reader. Every
 query ends with a root-verified epoch check, including empty and filename-only
 responses; replacing the directory cannot pair old candidates with a new root.
+Local-index and shared searches amortize ancestor opens across bounded groups
+of up to 64 consecutive siblings. Each group retains one parent chain, not an
+unbounded directory cache or a batch of file contents. Shared candidate batches
+retain the generation and root protection, validate each candidate through its
+snapshot, and verify ancestor identities before returning results. Open/read or
+final ancestor-verification failures close the view for repair; deadline and
+snapshot-validation failures do not masquerade as filesystem failures. This
+does not change admission, matching, response limits or fallback semantics.
 In the legacy v1 daemon, both auto and poll modes perform full
 verification every `--poll-interval` seconds after completion (default 120), also
 repairing missed bytes, ignores and external Git/global configuration changes.
@@ -1199,6 +1269,22 @@ writers, as does the trusted-storage contract.
 2. Start and supervise `tgrep shared owner-hold --claim CLAIM_FILE`, keeping its
    stdin open. After its `holding:true` response, call `owners.register` with
    `{"claim":<issued-claim>}`. A Rust client can instead retain `OwnerGuard`.
+   If typed claim acquisition fails before that handshake, the helper writes
+   exactly one newline-terminated `{"ok":false,"error":...}` stdout line whose
+   managed failure fields (`category`, `reason_code`, `retryable`,
+   `committed_state`, `detail`) are reported as returned, then exits with
+   status 2 and its unchanged `tgrep: <reason_code>: <detail>` stderr diagnostic.
+   Examples are `busy`/`catalog-io` (another catalog writer outlasted the fixed
+   SQLite wait), `busy`/`owner-guard-already-held`, `busy`/`namespace-admission-*`
+   and non-retryable `stale-identity` claims whose namespace, instance or
+   lifetime ended. Claim acquisition writes nothing to the catalog.
+   Claim-file read, size and parse errors are not classified and write no stdout
+   line; neither does any failure after `holding:true`, such as a lost handshake.
+   Reuse the same claim file only after a frame with `retryable:true` and
+   `committed_state:"not-committed"`, after confirming that the failed helper
+   exited, within the client's existing attempt and time bounds. Treat no frame,
+   an unparsable line or any other classification as a failed owner handshake.
+   Clients that accept only `holding:true` fail closed on this frame.
 3. Persist a unique lease token and the complete operation token/request before
    calling `views.attach`. Poll `operations.inspect`, then verify `views.status`
    or `lookup` reports ready. A routing-ready daemon is not a search-ready view.
@@ -1325,6 +1411,13 @@ inputs, not every concurrent filesystem write. Native/poll watching and full
 repair use the same reconciliation path. Git metadata events use the most
 specific matching metadata root, including a linked worktree's private Git
 directory nested under the common directory; lock-file traffic is ignored.
+Readiness is a snapshot, not a notification-drain barrier: a later event can
+advance the input epoch and make the next query return `busy` /
+`view-input-pending`. Epoch advancement alone also need not acknowledge a
+particular write. To qualify a change, verify its expected content through a
+managed response (`backend: shared-v2`, `ready: true`), including empty results.
+Bound retries of known retryable invalidations; never count a CLI fallback scan
+as indexed success.
 `--no-index` remains the way to search
 current disk bytes without relying on watcher delivery.
 
@@ -1338,47 +1431,96 @@ Explicit refresh always verifies; polling repair, watcher uncertainty and
 rescan events invalidate for full verification before queuing reconciliation.
 A newer invalidation therefore cannot be skipped by the coalescing check.
 
-**Managed update policy:** healthy native-watcher views have no timer-driven
-full-reconciliation safety pass. Elapsing the former 120-second interval does
-not invalidate or reread an otherwise quiet ready view. Silently missed changes
-can therefore remain stale indefinitely, even while ready. This is an explicitly
-accepted staleness tradeoff, not proven coverage. There is no integrated lossless
-checkout change journal; timestamps, Windows `ChangeTime`, clean Git status and
-a drained watcher queue still do not prove absence of unreported writes
-(including active/mapped writers). An unavailable/inactive journal is not an
-empty journal and does not justify skipping initial content verification.
+**Managed update policy:** healthy native-watcher views receive a serving
+periodic full verification. Once `--poll-interval` seconds (default 120) have
+elapsed since the view's last completed full pass, the scheduler queues one
+`reconcile` operation with `verify: true` without invalidating the view. It
+uses the ordinary operation worker, deadline (`operation_timeout_ms`) and
+CPU/input/handle budgets. It reads, decodes and hashes every admitted file and
+compares searchable membership and visibility against the published snapshot.
+Queries keep using that snapshot throughout. If nothing differs, the operation
+completes with `{"verified":true,"changed":false}` and publishes nothing.
+The first detected difference marks the view stale, which closes readiness
+before the next query can use it; the pass then publishes a full repair and
+reports `changed: true`. Silently missed changes are therefore repaired within
+one interval plus verification time, not left stale indefinitely.
+
+Deadline exhaustion and cancellation of a serving verification leave the view
+ready but unverified; the outcome is `failed` or `cancelled`, and the next
+attempt waits a further interval. Other verification errors close readiness.
+Watch errors/overflow, explicit full invalidation, observed Git/ignore changes
+and normal invalidating events keep their existing fail-closed semantics and
+take precedence over a pending verification. Continuous mutation can postpone
+verification, because those events already require reconciliation. Older
+binaries reject the `verify` journal field and fail closed. There is still no
+integrated lossless checkout change journal; timestamps, Windows `ChangeTime`,
+clean Git status and a drained watcher queue do not prove absence of unreported
+writes (including active/mapped writers). An unavailable/inactive journal is not
+an empty journal and does not justify skipping initial content verification.
+
+Managed native registration uses recursive roots on Windows
+(`ReadDirectoryChangesW`) and macOS (FSEvents), without enumerating worktree
+descendants first. It watches the canonical worktree and Git/common metadata
+roots, omitting subscriptions already covered by another recursive root.
+New and moved-in directory trees are covered by those same subscriptions;
+Git metadata events still use the most specific metadata root. Cache and
+irrelevant Git events are filtered after delivery, not by pruning OS coverage.
+The per-view share of `--watch-budget` is unchanged: the startup budget divided
+by the policy's `work.max_views` (8192 / 32 = 256 for the runtime defaults).
+It counts registered roots on these backends, not descendant directories.
+Typically a main worktree costs one subscription and a linked worktree costs
+two; external Git layouts may need three. Each view owns and releases its own
+subscriptions, including any shared metadata-root subscription.
+
+Linux/Android retain bounded, non-recursive per-directory registration; other
+backends are also conservatively per-directory. Their directory-count,
+entry-traversal and 100-ms planning bounds are unchanged, and large trees may
+still require polling. This process-local budget does not reserve or raise OS
+capacity; another process can exhaust it first. Registration failures retire
+the affected view's entire watcher and select polling, rather than advertising
+partial native coverage. Ordinary-server and legacy v1 registration are unchanged.
 
 First attachment/restore, explicit full refresh, reported watcher error/overflow
 or rescan, and observed Git/ignore changes retain full verification and the
 existing publication gates. Normal native file events still invalidate their
 paths. Explicit `--watch-mode poll` and actual native-watcher unavailability,
 failure or budget exhaustion use periodic full reconciliation as their update
-mechanism, not a redundant native safety pass. They wait `--poll-interval`
+mechanism; they close readiness for each pass and wait `--poll-interval`
 seconds after completion (default 120). `--no-watch` disables both automatic
-update mechanisms but not initial verification or explicit refresh. Legacy v1
-and ordinary-server policies are unchanged.
+update mechanisms and serving verification, but not initial verification or
+explicit refresh. Legacy v1 and ordinary-server policies are unchanged.
 
-`hello` advertises `event-driven-native-reconciliation`. Online `views.status`
-and ordinary `status` expose the effective `watch_mode`, `watch_fallback` and
-`reconciliation_policy`. It reports `native_periodic_full_verification: false`,
-`native_missed_changes: "may-remain-stale-indefinitely"`,
-`incremental_coverage: "unavailable"` and `change_journal: "not-integrated"`.
-`periodic_full_verification` is true only for an effectively polling view;
-`interval_ms` is then its active interval and `full_verification_reason` is
-`"polling-update-mechanism"`. Both fields are null otherwise. The configured
-`poll_interval_ms` remains visible even when no periodic work is enabled;
-`configured_watch_mode` is `auto`, `poll` or `disabled`.
+`hello` advertises `event-driven-native-reconciliation` and
+`serving-native-periodic-verification`. Online `views.status` and ordinary
+`status` expose the effective `watch_mode`, `watch_fallback`,
+`reconciliation_policy` and `last_verification`. The policy reports
+`incremental_coverage: "unavailable"`, `change_journal: "not-integrated"` and
+`native_verification_availability: "serving-until-difference"`. Unless watching
+is disabled, `native_periodic_full_verification` and
+`periodic_full_verification` are true, `interval_ms` is the active interval,
+and `native_missed_changes` is `"repaired-by-periodic-verification"`.
+`full_verification_reason` is `"polling-update-mechanism"` for a polling view
+(or configured poll mode) and `"periodic-native-verification"` otherwise. With
+`--no-watch`, the periodic fields are false/null and `native_missed_changes` is
+`"requires-explicit-refresh"`. The configured `poll_interval_ms` is always
+visible; `configured_watch_mode` is `auto`, `poll` or `disabled`.
+`last_verification` has `outcome` and `age_ms`. The outcome is `full-pass` after
+attachment or any other completed full reconciliation; for a serving
+verification it is `unchanged`, `repaired`, `failed` or `cancelled`.
+`native_registration_mode` distinguishes `recursive-roots` from `per-directory`,
+and `native_watch_budget_per_view` reports the startup allocation. Per-view
+`watch_count` counts live subscriptions (zero after fallback or drain); namespace
+`reconciliation_policy.watch_count` sums those subscriptions across monitored views.
 
 Online `namespace.status` and `maintenance.status` distinguish configuration
 from effective per-view behavior: the same policy has
 `scope: "monitored-views"` plus `native_views`, `polling_views` and `disabled_views`
-counts. Its `periodic_full_verification` means at least one monitored view is
-polling, not that all views have a safety timer. A namespace configured as
-`auto` can contain both healthy native views and fallback-polling views. With
-no polling monitors its active interval/reason are null, even if polling is
-configured for future views. Repair triggers include `poll-interval` only when
-polling is active. Use explicit refresh or `--no-index` when watcher-dependent
-freshness is insufficient.
+counts. A namespace configured as `auto` can contain both healthy native views
+and fallback-polling views. Its `full_verification_reason` is
+`"polling-update-mechanism"` when at least one monitored view polls, and repair
+triggers then include `poll-interval`; otherwise they include
+`periodic-verification`. Use explicit refresh or `--no-index` when bytes newer
+than the last verification or processed event are required.
 
 `views.adaptive` takes `view`, `owner`, `expected_version`, `allocation_version`
 in an operation envelope. Adaptive policy evaluates the worktree's captured
@@ -1541,6 +1683,11 @@ include protected/unknown/retry reasons. Passes bound examined objects, successf
 removals, deletion bytes, pages and elapsed work, including partial-file
 continuations. In-flight OS calls may overrun a deadline; progress reports
 elapsed time and budget exhaustion rather than claiming hard real-time preemption.
+A pass with no errors can therefore leave an object `PendingDeletion` after
+consuming a bound, even after a conflicting native handle has closed. Preserve
+its actual and recovered credits and continue from the returned cursor with a
+fresh operation token and current policy/allocation versions. Require the final
+`Removed` state and complete accounting before claiming the object was reclaimed.
 
 ```bash
 tgrep shared discover /trusted/cache
@@ -1615,8 +1762,10 @@ authorization. Recover the retained token and exact current state.
 `stop-if-idle` first closes admission, then accounts for leases, owners,
 reservations, operations and receipt readers, independent namespace/root/object
 guards, requests, queries, queued jobs and background batches. Idle verifier
-caches are discarded while active verification remains protected by its work
-lifetime. A retained cache alone does not make a daemon permanently busy.
+caches are discarded only when those other shutdown blockers are clear; a busy
+probe preserves bounded member-verification progress until its normal expiry.
+Active verification remains protected by its work lifetime. A retained cache
+alone does not make a daemon permanently busy.
 A busy decision reopens admission; a committed stop leaves it closed before exit.
 An uncommitted lock-admission Busy error leaves the accepted token pending;
 retry that same token rather than abandoning it and consuming another queue

@@ -2341,16 +2341,15 @@ fn json_ignores_only_matching() {
                 .args(["--no-index", "--json", "alpha", "a.txt"]),
         );
 
-    // `elapsed` is wall clock, and `bytes_printed` counts the serialized JSON
-    // itself -- including the variable-width `nanos` of the event before it --
-    // so both move run to run. Every other field has to match exactly.
+    // `elapsed` is wall clock and moves run to run. `bytes_printed` excludes
+    // the timed `end` and `summary` events, so it and every other field have
+    // to match exactly.
     let strip_volatile = |out: &str| {
         json_events(out)
             .into_iter()
             .map(|mut e| {
                 if let Some(stats) = e["data"]["stats"].as_object_mut() {
                     stats.remove("elapsed");
-                    stats.remove("bytes_printed");
                 }
                 e["data"].as_object_mut().map(|d| d.remove("elapsed_total"));
                 e

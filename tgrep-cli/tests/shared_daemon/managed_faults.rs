@@ -113,209 +113,31 @@ fn initial_attach(daemon: &Daemon, claim: &OwnerClaim, attach: Value, point: &st
     })
 }
 
-fn recover_initial_intent(
-    daemon: &Daemon,
-    attach: &Value,
-    pending: &mut Option<Value>,
-    point: &str,
-) {
-    let lookup = daemon
-        .try_rpc("lookup", json!({"root":attach["request"]["root"]}))
-        .unwrap();
-    if let Some(error) = lookup.get("error") {
-        assert_eq!(error["data"]["category"], "busy", "{point}: {lookup}");
-        assert_eq!(
-            error["data"]["reason_code"], "worktree-not-attached",
-            "{point}: {lookup}"
-        );
-        assert_eq!(error["data"]["retryable"], true, "{point}: {lookup}");
-        assert_eq!(
-            error["data"]["committed_state"], "not-committed",
-            "{point}: {lookup}"
-        );
-        assert!(
-            pending.is_none(),
-            "{point}: the known pending view disappeared"
-        );
-        // No catalog root is not a claim that all preparation state rolled back.
-        return;
-    }
-    assert_eq!(lookup["result"]["instance"], daemon.marker["instance"]);
-    assert_eq!(lookup["result"]["namespace"], daemon.marker["namespace"]);
-    let current = daemon.rpc(
-        "views.recover",
-        json!({"id":lookup["result"]["data"]["view"]}),
-    );
-    assert_eq!(current["version"], 1, "{point}: {current}");
-    assert_eq!(current["committed"], false, "{point}: {current}");
-    assert_eq!(current["active"], true, "{point}: {current}");
-    assert!(current["current"].is_null(), "{point}: {current}");
-    assert_eq!(
-        current["pending"]["commit"], attach["request"]["revision"],
-        "{point}: the pending exact target changed"
-    );
-    if let Some(previous) = pending {
-        for field in [
-            "id",
-            "version",
-            "root",
-            "root_identity",
-            "root_anchor",
-            "pending",
-            "checkpoint",
-            "checkpoint_binding",
-            "input_epoch",
-            "reconciled_epoch",
-            "instance",
-        ] {
-            assert_eq!(current[field], previous[field], "{point}: {field} changed");
-        }
-    } else {
-        *pending = Some(current);
-    }
-}
-
 fn retry_attach(
     daemon: &Daemon,
     claim: &OwnerClaim,
     view: Option<&Value>,
-    mut attach: Value,
+    attach: Value,
     point: &str,
     deadline: Instant,
-    mut before_attempt: impl FnMut(&Value),
+    before_attempt: impl FnMut(&Value),
 ) -> Result<Value, Vec<Value>> {
-    let mut failures: Vec<Value> = Vec::new();
-    let mut pending = None;
-    let first_sequence = attach["token"]["sequence"].as_u64().unwrap();
-    assert_eq!(attach["token"]["scope"], json!(claim.owner));
-    assert_eq!(attach["request"]["owner"], json!(claim.owner));
-    if view.is_none() {
-        let revision = attach["request"]["revision"].as_str().unwrap();
-        assert!(
-            matches!(revision.len(), 40 | 64)
-                && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "initial retry requires an already captured exact commit"
-        );
-        assert!(attach["request"]["accept_current"].is_null());
-    }
-    for attempt in 0..8 {
-        if Instant::now() >= deadline {
-            break;
-        }
-        let sequence = first_sequence.checked_add(attempt).unwrap();
-        if attempt != 0 {
-            attach["token"] = token(claim, sequence);
-        }
-        if attempt != 0 && view.is_none() {
-            recover_initial_intent(daemon, &attach, &mut pending, point);
-        }
-        before_attempt(&attach);
-        if Instant::now() >= deadline {
-            break;
-        }
-        let accepted = daemon.rpc("views.attach", attach.clone());
-        let record = terminal_before(daemon, &accepted, deadline);
-        assert_eq!(record["request"], attach["request"], "{point}: {record}");
-        assert_eq!(record["token"], attach["token"], "{point}: {record}");
-        if record["state"] == "completed" {
-            assert_eq!(record["committed_state"], "committed", "{point}: {record}");
-            let current = &record["result"]["current"];
-            let lease = &record["result"]["lease"];
-            assert_eq!(lease["token"], attach["request"]["lease"], "{point}");
-            assert_eq!(lease["owner"], attach["request"]["owner"], "{point}");
-            assert_eq!(lease["released"], false, "{point}");
-            for field in ["revision", "profile", "accept_current", "migratable"] {
-                assert_eq!(
-                    lease["original"][field], attach["request"][field],
-                    "{point}: {field}"
-                );
-            }
-            assert_eq!(lease["original"]["root"], current["root"], "{point}");
-            if let Some(view) = view {
-                assert_eq!(current["id"], view["id"], "{point}");
-                assert_eq!(current["version"], view["version"], "{point}");
-                assert_eq!(current["current"], view["current"], "{point}");
-            } else {
-                assert_eq!(current["version"], 1, "{point}");
-                assert_eq!(current["committed"], true, "{point}");
-                assert_eq!(
-                    current["current"]["commit"], attach["request"]["revision"],
-                    "{point}"
-                );
-                assert_eq!(
-                    lease["exact_original_commit"], attach["request"]["revision"],
-                    "{point}"
-                );
-                if let Some(pending) = &pending {
-                    for field in ["id", "version", "root", "root_identity", "instance"] {
-                        assert_eq!(current[field], pending[field], "{point}: {field}");
-                    }
-                    assert_eq!(
-                        current["current"]["key"], pending["pending"]["key"],
-                        "{point}"
-                    );
-                }
-            }
-            for failed in failures {
-                assert_eq!(
-                    daemon.rpc(
-                        "views.attach",
-                        json!({
-                            "token":failed["token"],"request":failed["request"]
-                        })
-                    ),
-                    failed,
-                    "{point}: a new attempt must not rewrite a failed receipt"
-                );
-            }
-            return Ok(record);
-        }
-        assert!(
-            retryable_attach_catalog_error(&record),
-            "{point}: attach failed without safe retry authorization: {record}"
-        );
-        assert_eq!(
-            daemon.rpc("views.attach", attach.clone()),
-            record,
-            "{point}: a failed token must replay its original receipt"
-        );
-        if let Some(view) = view {
-            let current = daemon.rpc("views.recover", json!({"id":view["id"]}));
-            assert_eq!(current["version"], view["version"], "{point}: {current}");
-            assert_eq!(current["current"], view["current"], "{point}: {current}");
-        } else {
-            recover_initial_intent(daemon, &attach, &mut pending, point);
-            if record["progress"]["view"].is_string() {
-                let pending = pending
-                    .as_ref()
-                    .expect("the recorded pending view must still exist");
-                assert_eq!(record["progress"]["view"], pending["id"], "{point}");
-                assert_eq!(
-                    record["progress"]["resolved_commit"], pending["pending"]["commit"],
-                    "{point}"
-                );
-            }
-        }
-        eprintln!("{point}: attach attempt {sequence} had uncommitted catalog contention");
-        failures.push(record);
-        if attempt < 7 {
-            thread::sleep(
-                Duration::from_millis(25).min(deadline.saturating_duration_since(Instant::now())),
-            );
-        }
-    }
-    Err(failures)
+    super::attach_retry::retry_attach(
+        daemon,
+        claim,
+        view,
+        attach,
+        super::attach_retry::Retry {
+            point,
+            deadline,
+            allowance: super::attach_retry::RetryableAttach::CatalogIo,
+        },
+        before_attempt,
+    )
 }
 
 fn retryable_attach_catalog_error(record: &Value) -> bool {
-    record["kind"] == "attach"
-        && record["state"] == "failed"
-        && record["cancelled"] == false
-        && record["committed_state"] == "not-committed"
-        && record["error"]["category"] == "busy"
-        && record["error"]["reason_code"] == "catalog-io"
-        && record["error"]["retryable"] == true
-        && record["error"]["committed_state"] == "not-committed"
+    super::attach_retry::RetryableAttach::CatalogIo.permits(record)
 }
 
 #[test]
@@ -1052,6 +874,453 @@ fn process_crashes_at_generation_and_view_boundaries_recover_the_exact_pin() {
     }
 }
 
+const COLLECTION_PASSES: u64 = 16;
+
+/// Collection passes that ended in this daemon instance. The in-memory count
+/// is read without the catalog, which a pass may hold at its barrier.
+fn ended_collection_passes(daemon: &Daemon) -> u64 {
+    let pass = &daemon.rpc("maintenance.status", json!({}))["aggregate"]["collection"];
+    pass["completed"].as_u64().unwrap() + pass["failed"].as_u64().unwrap()
+}
+
+/// Waits for an operation-scoped barrier, or returns the operation's terminal
+/// record when that operation ended without crossing the armed point.
+fn reached_or_finished(
+    daemon: &Daemon,
+    hook: &Value,
+    operation: &Value,
+    ended_before: u64,
+) -> Result<Value, Value> {
+    let started = Instant::now();
+    loop {
+        let status = daemon.rpc("testing.status", json!({}));
+        assert_eq!(status["ticket"], hook["ticket"]);
+        match status["stage"].as_str().unwrap() {
+            "waiting" => return Ok(status),
+            "armed" => {}
+            _ => panic!("hook did not remain armed or reach its barrier: {status}"),
+        }
+        if ended_collection_passes(daemon) > ended_before {
+            let record = daemon.rpc("operations.inspect", json!({"id":operation["id"]}));
+            assert!(
+                matches!(
+                    record["state"].as_str().unwrap(),
+                    "completed" | "failed" | "cancelled"
+                ),
+                "another collection pass ended: {record}"
+            );
+            let status = daemon.rpc("testing.status", json!({}));
+            assert_eq!(status["ticket"], hook["ticket"], "{record}");
+            assert_eq!(status["stage"], "armed", "{status}; operation: {record}");
+            assert_eq!(status["hits"], 0, "{status}; operation: {record}");
+            return Err(record);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "boundary was not reached: {status}; maintenance: {}; pending operations: {}",
+            daemon.rpc("maintenance.status", json!({})),
+            daemon.rpc("operations.pending", json!({}))
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A bounded collection pass may legitimately complete before a later boundary
+/// when its elapsed budget ends with a resumable cursor, or when a reader still
+/// holds the object's guard. Any error, cancellation or other ineligibility of
+/// the target object is not accepted.
+fn collection_pass_short_of_boundary(record: &Value, object: &Value) -> bool {
+    let result = &record["result"];
+    let Some(details) = result["details"].as_array() else {
+        return false;
+    };
+    let target = details
+        .iter()
+        .filter(|detail| detail["object"] == *object)
+        .collect::<Vec<_>>();
+    let readers_only = target.iter().all(|detail| {
+        detail["reasons"] == json!(["object-readers-active"]) && detail["error"].is_null()
+    });
+    let elapsed = result["elapsed_budget_exceeded"] == true && result["next"].is_object();
+    record["kind"] == "collection"
+        && record["state"] == "completed"
+        && record["cancelled"] == false
+        && record["error"].is_null()
+        && result["cancelled"] == false
+        && result["errors"] == 0
+        && result["omitted_skip_details"] == 0
+        && readers_only
+        && (elapsed || !target.is_empty())
+}
+
+#[test]
+fn collection_boundary_waits_accept_only_resumable_bounded_outcomes() {
+    let object = json!("0123456789abcdef0123456789abcdef");
+    let cursor = json!({"phase":0,"after":null,"after_use":0,"current":object});
+    let elapsed = json!({
+        "kind":"collection","state":"completed","cancelled":false,"error":null,
+        "result":{"cancelled":false,"errors":0,"omitted_skip_details":0,
+            "elapsed_budget_exceeded":true,"next":cursor,"details":[
+                {"object":"fedcba9876543210fedcba9876543210","reasons":["catalog-references"],"error":null}
+            ]}
+    });
+    let mut readers = elapsed.clone();
+    readers["result"]["elapsed_budget_exceeded"] = json!(false);
+    readers["result"]["next"] = Value::Null;
+    readers["result"]["details"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"object":object,"reasons":["object-readers-active"],"error":null}));
+    for permitted in [&elapsed, &readers] {
+        assert!(
+            collection_pass_short_of_boundary(permitted, &object),
+            "{permitted}"
+        );
+    }
+    let mut readers_after_budget = readers.clone();
+    readers_after_budget["result"]["elapsed_budget_exceeded"] = json!(true);
+    assert!(collection_pass_short_of_boundary(
+        &readers_after_budget,
+        &object
+    ));
+    for (permitted, pointer, value) in [
+        (&elapsed, "/kind", json!("attach")),
+        (&elapsed, "/state", json!("failed")),
+        (&elapsed, "/state", json!("cancelled")),
+        (&elapsed, "/state", json!("preparing")),
+        (&elapsed, "/cancelled", json!(true)),
+        (&elapsed, "/error", json!({"category":"busy"})),
+        (&elapsed, "/result/cancelled", json!(true)),
+        (&elapsed, "/result/errors", json!(1)),
+        (&elapsed, "/result/omitted_skip_details", json!(1)),
+        (&elapsed, "/result/elapsed_budget_exceeded", json!(false)),
+        (&elapsed, "/result/elapsed_budget_exceeded", Value::Null),
+        (&elapsed, "/result/next", Value::Null),
+        (&elapsed, "/result/details", Value::Null),
+        (
+            &readers,
+            "/result/details/1/reasons",
+            json!(["catalog-references"]),
+        ),
+        (
+            &readers,
+            "/result/details/1/reasons",
+            json!(["control-verifier-active"]),
+        ),
+        (
+            &readers,
+            "/result/details/1/reasons",
+            json!(["object-readers-active", "catalog-references"]),
+        ),
+        (
+            &readers,
+            "/result/details/1/error",
+            json!({"category":"busy"}),
+        ),
+        (
+            &readers,
+            "/result/details/1/object",
+            json!("fedcba9876543210fedcba9876543210"),
+        ),
+        (&readers, "/result/errors", json!(1)),
+        (&readers, "/state", json!("failed")),
+    ] {
+        let mut rejected = permitted.clone();
+        *rejected.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            !collection_pass_short_of_boundary(&rejected, &object),
+            "{pointer}: {rejected}"
+        );
+    }
+    let mut deferred = elapsed.clone();
+    deferred["result"]["details"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "object":object,"reasons":["control-verifier-active"],
+            "error":{"category":"busy","reason_code":"control-verifier-active","retryable":true}
+        }));
+    assert!(!collection_pass_short_of_boundary(&deferred, &object));
+}
+
+struct ParkedCollection {
+    operation: Value,
+    hook: Value,
+    token: Value,
+    request: Value,
+    short: Vec<Value>,
+    next_sequence: u64,
+}
+
+/// Starts bounded collection passes until one parks at `point`, continuing
+/// from each accepted short pass's durable cursor with a fresh token.
+fn collection_at_boundary(
+    daemon: &Daemon,
+    claim: &OwnerClaim,
+    first_sequence: u64,
+    request: &Value,
+    point: &str,
+    object: &Value,
+    mut after_short: impl FnMut(&Value),
+) -> ParkedCollection {
+    let mut request = request.clone();
+    let mut short = Vec::new();
+    for sequence in first_sequence..first_sequence + COLLECTION_PASSES {
+        let token = token(claim, sequence);
+        let hook = pause_for_operation(daemon, point, &token);
+        let ended_before = ended_collection_passes(daemon);
+        let operation = daemon.rpc(
+            "collections.start",
+            json!({"token":token,"request":request}),
+        );
+        match reached_or_finished(daemon, &hook, &operation, ended_before) {
+            Ok(barrier) => {
+                assert_eq!(barrier["reached_operation"], operation["id"], "{point}");
+                return ParkedCollection {
+                    operation,
+                    hook,
+                    token,
+                    request,
+                    short,
+                    next_sequence: sequence + 1,
+                };
+            }
+            Err(record) => {
+                assert!(
+                    collection_pass_short_of_boundary(&record, object),
+                    "{point}: collection pass ended before its boundary for an unaccepted reason: {record}"
+                );
+                assert!(!collected(daemon, object), "{point}: {record}");
+                daemon.rpc("testing.release", json!({"id":hook["ticket"]}));
+                request["cursor"] = record["result"]["next"].clone();
+                after_short(&record);
+                short.push(record);
+            }
+        }
+    }
+    panic!(
+        "{point}: {COLLECTION_PASSES} bounded collection passes did not reach the boundary: {short:?}"
+    );
+}
+
+fn finish_collection(
+    daemon: &Daemon,
+    claim: &OwnerClaim,
+    parked: &ParkedCollection,
+    object: &Value,
+) {
+    daemon.rpc("testing.release", json!({"id":parked.hook["ticket"]}));
+    let mut continuation = completed(daemon, &parked.operation)["result"]["next"].clone();
+    let mut next = parked.next_sequence;
+    while !collected(daemon, object) {
+        assert!(
+            next < parked.next_sequence + COLLECTION_PASSES,
+            "bounded collection did not finish: {continuation}"
+        );
+        let mut request = parked.request.clone();
+        request["cursor"] = continuation;
+        continuation = completed(
+            daemon,
+            &daemon.rpc(
+                "collections.start",
+                json!({"token":token(claim,next),"request":request}),
+            ),
+        )["result"]["next"]
+            .clone();
+        next += 1;
+    }
+}
+
+struct RetainedCheckpoint {
+    fixture: Fixture,
+    daemon: Daemon,
+    claim: OwnerClaim,
+    guard: OwnerGuard,
+    sequence: u64,
+    checkpoint: Value,
+    namespace: PathBuf,
+    request: Value,
+}
+
+fn retained_checkpoint(label: &str) -> RetainedCheckpoint {
+    let fixture = Fixture::new();
+    let mut configured = policy();
+    configured["retention"] = json!({"mode":"bounded","target_bytes":1});
+    configured["collection"]["max_pages"] = json!(64);
+    configured["collection"]["max_duration_ms"] = json!(5000);
+    let daemon = start(&fixture, &configured, &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    let attached = initial_attach(&daemon, &claim, attach_input(&fixture, &claim), label);
+    let sequence = next_sequence(&attached);
+    let current = &attached["result"]["current"];
+    let checkpoint = current["checkpoint"].clone();
+    completed(
+        &daemon,
+        &daemon.rpc(
+            "views.refresh",
+            json!({"token":token(&claim,sequence),"request":{
+                "view":current["id"],"expected_version":1,"owner":claim.owner,"allocation_version":1
+            }}),
+        ),
+    );
+    let namespace = fixture
+        .storage
+        .join(tgrep_core::managed::STORE_DIRECTORY)
+        .join(daemon.marker["repository"].as_str().unwrap());
+    let request = json!({
+        "policy_version":1,"allocation_version":1,"cursor":null,
+        "bounds":{"max_duration_ms":5000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,"max_pages":64}
+    });
+    RetainedCheckpoint {
+        fixture,
+        daemon,
+        claim,
+        guard,
+        sequence: sequence + 1,
+        checkpoint,
+        namespace,
+        request,
+    }
+}
+
+fn release_retained_checkpoint(mut retained: RetainedCheckpoint) {
+    assert_scan_parity(
+        &retained.daemon,
+        &retained.fixture.a,
+        retained.fixture.temp.path(),
+    );
+    retained.daemon.rpc(
+        "views.detach",
+        json!({"owner":retained.claim.owner,"lease":"managed-client"}),
+    );
+    retained
+        .daemon
+        .rpc("owners.release", json!({"claim":retained.claim}));
+    drop(retained.guard);
+    stop(&mut retained.daemon);
+}
+
+#[test]
+fn collection_boundaries_continue_after_passes_that_legitimately_end_before_member_io() {
+    // An escaped reader of the retired checkpoint makes the first pass skip it
+    // without error, leaving an armed member-before-io hook with no hits.
+    let retained = retained_checkpoint("readers-active");
+    let lock = retained
+        .namespace
+        .join("guards")
+        .join(format!("{}.lock", retained.checkpoint.as_str().unwrap()));
+    let reader = fs::File::open(&lock).unwrap();
+    fs2::FileExt::try_lock_shared(&reader).unwrap();
+    let mut reader = Some(reader);
+    let parked = collection_at_boundary(
+        &retained.daemon,
+        &retained.claim,
+        retained.sequence,
+        &retained.request,
+        "member-before-io",
+        &retained.checkpoint,
+        |record| {
+            let result = &record["result"];
+            assert_eq!(result["verification_pages"], 0, "{record}");
+            let guarded = result["details"].as_array().unwrap().contains(&json!({
+                "object":retained.checkpoint,"reasons":["object-readers-active"],"error":null
+            }));
+            if guarded {
+                assert_eq!(result["retired"], 0, "{record}");
+                drop(reader.take().expect("the reader skips only one pass"));
+            }
+        },
+    );
+    assert!(reader.is_none(), "{:?}", parked.short);
+    assert_eq!(
+        parked
+            .short
+            .iter()
+            .filter(|record| record["result"]["details"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|detail| detail["object"] == retained.checkpoint))
+            .count(),
+        1,
+        "{:?}",
+        parked.short
+    );
+    finish_collection(
+        &retained.daemon,
+        &retained.claim,
+        &parked,
+        &retained.checkpoint,
+    );
+    release_retained_checkpoint(retained);
+
+    // A pass that exhausts its elapsed budget after retirement completes with
+    // a cursor at the same object and no member verification or I/O.
+    let retained = retained_checkpoint("elapsed-budget");
+    let object_path = retained
+        .namespace
+        .join("objects")
+        .join(retained.checkpoint.as_str().unwrap());
+    let original = container_contents(&object_path);
+    let retiring = collection_at_boundary(
+        &retained.daemon,
+        &retained.claim,
+        retained.sequence,
+        &retained.request,
+        "object-pending-deletion",
+        &retained.checkpoint,
+        |_| {},
+    );
+    // The pass fixed its deadline before parking, so this wait exhausts it.
+    thread::sleep(Duration::from_millis(
+        retained.request["bounds"]["max_duration_ms"]
+            .as_u64()
+            .unwrap(),
+    ));
+    retained
+        .daemon
+        .rpc("testing.release", json!({"id":retiring.hook["ticket"]}));
+    let record = terminal(&retained.daemon, &retiring.operation);
+    let result = &record["result"];
+    assert_eq!(result["elapsed_budget_exceeded"], true, "{record}");
+    assert_eq!(result["next"]["current"], retained.checkpoint, "{record}");
+    assert_eq!(result["verification_pages"], 0, "{record}");
+    assert_eq!(result["retired"], 1, "{record}");
+    assert_eq!(result["removed"], 0, "{record}");
+    assert_eq!(result["logical_bytes_reclaimed"], 0, "{record}");
+    assert!(
+        collection_pass_short_of_boundary(&record, &retained.checkpoint),
+        "{record}"
+    );
+    assert!(!collected(&retained.daemon, &retained.checkpoint));
+    assert_eq!(container_contents(&object_path), original);
+    let mut request = retained.request.clone();
+    request["cursor"] = result["next"].clone();
+    let parked = collection_at_boundary(
+        &retained.daemon,
+        &retained.claim,
+        retiring.next_sequence,
+        &request,
+        "member-before-io",
+        &retained.checkpoint,
+        |_| {},
+    );
+    // Retirement was credited to the earlier pass, not to the parked one.
+    let paused = retained
+        .daemon
+        .rpc("operations.inspect", json!({"id":parked.operation["id"]}));
+    assert_eq!(paused["progress"]["retired"], 0, "{paused}");
+    assert_eq!(container_contents(&object_path), original);
+    finish_collection(
+        &retained.daemon,
+        &retained.claim,
+        &parked,
+        &retained.checkpoint,
+    );
+    assert!(!object_path.exists());
+    release_retained_checkpoint(retained);
+}
+
 #[test]
 fn collection_crash_boundaries_preserve_live_views_and_resumable_progress() {
     for point in [
@@ -1096,16 +1365,24 @@ fn collection_crash_boundaries_preserve_live_views_and_resumable_progress() {
             "policy_version":1,"allocation_version":1,"cursor":null,
             "bounds":{"max_duration_ms":5000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,"max_pages":64}
         });
-        let collection_token = token(&claim, sequence + 1);
-        let hook = pause_for_operation(&daemon, point, &collection_token);
-        let operation = daemon.rpc(
-            "collections.start",
-            json!({"token":collection_token,"request":request}),
+        let parked = collection_at_boundary(
+            &daemon,
+            &claim,
+            sequence + 1,
+            &request,
+            point,
+            &old_checkpoint,
+            |_| {},
         );
-        assert_eq!(
-            reached(&daemon, &hook)["reached_operation"],
-            operation["id"]
-        );
+        // The credit barrier holds the catalog transaction; its pass has
+        // already committed this member's deletion intent.
+        let paused_state = if point == "member-before-credit" {
+            json!("committed")
+        } else {
+            daemon.rpc("operations.inspect", json!({"id":parked.operation["id"]}))
+                ["committed_state"]
+                .clone()
+        };
         if point != "member-before-credit" {
             search(&daemon, &fixture.a);
         }
@@ -1117,18 +1394,40 @@ fn collection_crash_boundaries_preserve_live_views_and_resumable_progress() {
         assert_eq!(recovered["current"], current["current"], "{point}");
         let (new_claim, new_guard, next) =
             reconnect(&fixture, &restarted, &recovered, &claim, point);
-        let recovered_operation = terminal(&restarted, &operation);
+        let recovered_operation = terminal(&restarted, &parked.operation);
         assert_eq!(
-            recovered_operation["committed_state"], "committed",
+            recovered_operation["committed_state"], paused_state,
             "{point}: {recovered_operation}"
         );
-        assert!(
-            recovered_operation["result"].is_object(),
-            "{point}: {recovered_operation}"
-        );
-        assert_eq!(recovered_operation["result"]["elapsed_nanos"], Value::Null);
+        if paused_state == "committed" {
+            assert!(
+                recovered_operation["result"].is_object(),
+                "{point}: {recovered_operation}"
+            );
+            assert_eq!(recovered_operation["result"]["elapsed_nanos"], Value::Null);
+        } else {
+            // Earlier bounded passes can delete every member, leaving the
+            // parked continuation with no catalog transition before removal.
+            assert!(
+                !parked.short.is_empty()
+                    && matches!(
+                        point,
+                        "object-before-remove" | "object-after-remove" | "guard-after-remove"
+                    ),
+                "{point}: {paused_state}; earlier passes: {:?}",
+                parked.short
+            );
+            assert_eq!(
+                recovered_operation["state"], "cancelled",
+                "{point}: {recovered_operation}"
+            );
+            assert_eq!(
+                recovered_operation["error"]["reason_code"], "interrupted-operation",
+                "{point}: {recovered_operation}"
+            );
+        }
         let mut continuation = recovered_operation["result"]["next"].clone();
-        for sequence in next..next + 16 {
+        for sequence in next..next + COLLECTION_PASSES {
             let mut next_request = request.clone();
             next_request["cursor"] = continuation;
             let result = completed(
@@ -1159,6 +1458,214 @@ fn collection_crash_boundaries_preserve_live_views_and_resumable_progress() {
         restarted.rpc("owners.release", json!({"claim":new_claim}));
         drop((guard, new_guard));
         stop(&mut restarted);
+    }
+}
+
+fn container_contents(path: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            assert!(
+                entry.file_type().unwrap().is_file(),
+                "unexpected container entry {:?}",
+                entry.path()
+            );
+            (
+                entry.file_name().into_string().unwrap(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn operations_cancel_stops_an_in_flight_collection_without_later_delete_credit() {
+    for point in [
+        "object-withdrawn",
+        "object-pending-deletion",
+        "member-intent-saved",
+        "member-before-io",
+        "collection-before-complete",
+    ] {
+        let before_io = point != "collection-before-complete";
+        let fixture = Fixture::new();
+        let mut configured = policy();
+        configured["retention"] = json!({"mode":"bounded","target_bytes":1});
+        configured["collection"]["max_pages"] = json!(64);
+        configured["collection"]["max_duration_ms"] = json!(5000);
+        let mut daemon = start(&fixture, &configured, &["--no-watch"]);
+        let (claim, guard) = owner(&daemon);
+        let attached = initial_attach(&daemon, &claim, attach_input(&fixture, &claim), point);
+        let sequence = next_sequence(&attached);
+        let current = &attached["result"]["current"];
+        let old_checkpoint = current["checkpoint"].clone();
+        let namespace = daemon.rpc("namespace.status", json!({}));
+        let object_path = fixture
+            .storage
+            .join(tgrep_core::managed::STORE_DIRECTORY)
+            .join(namespace["header"]["repository"].as_str().unwrap())
+            .join("objects")
+            .join(old_checkpoint.as_str().unwrap());
+        completed(&daemon, &daemon.rpc("views.refresh", json!({"token":token(&claim,sequence),"request":{
+            "view":current["id"],"expected_version":1,"owner":claim.owner,"allocation_version":1
+        }})));
+        let original = container_contents(&object_path);
+        assert!(!original.is_empty(), "{point}: checkpoint has no members");
+        let retained_memory = |usage: &Value| {
+            (
+                usage["memory"]["retained_allocations"].clone(),
+                usage["memory"]["retained_private_estimate_bytes"].clone(),
+            )
+        };
+        let memory_before = retained_memory(&daemon.rpc("namespace.status", json!({}))["usage"]);
+        let request = json!({
+            "policy_version":1,"allocation_version":1,"cursor":null,
+            "bounds":{"max_duration_ms":5000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,"max_pages":64}
+        });
+        let parked = collection_at_boundary(
+            &daemon,
+            &claim,
+            sequence + 1,
+            &request,
+            point,
+            &old_checkpoint,
+            |_| {},
+        );
+        let (operation, hook) = (&parked.operation, &parked.hook);
+        let paused = daemon.rpc("operations.inspect", json!({"id":operation["id"]}));
+        let cancelling = daemon.rpc("operations.cancel", json!({"id":operation["id"]}));
+        // The cancel request must be serviced while the worker is still parked.
+        let barrier = daemon.rpc("testing.status", json!({}));
+        daemon.rpc("testing.release", json!({"id":hook["ticket"]}));
+        assert_eq!(paused["state"], "preparing", "{point}: {paused}");
+        assert_eq!(barrier["ticket"], hook["ticket"], "{point}");
+        assert_eq!(barrier["stage"], "waiting", "{point}: {barrier}");
+        assert_eq!(cancelling["cancelled"], true, "{point}: {cancelling}");
+        assert_eq!(cancelling["state"], "cancelling", "{point}: {cancelling}");
+
+        let cancelled = terminal(&daemon, operation);
+        let result = &cancelled["result"];
+        assert_eq!(cancelled["state"], "cancelled", "{point}: {cancelled}");
+        assert_eq!(cancelled["cancelled"], true, "{point}: {cancelled}");
+        assert_eq!(cancelled["progress"], *result, "{point}: {cancelled}");
+        assert_eq!(result["cancelled"], true, "{point}: {cancelled}");
+        assert_eq!(
+            result["verification_context_retained"], false,
+            "{point}: {cancelled}"
+        );
+        if before_io {
+            assert_eq!(
+                cancelled["committed_state"], "committed",
+                "{point}: {cancelled}"
+            );
+            // An earlier bounded pass may already have retired the object.
+            let retired = parked
+                .short
+                .iter()
+                .chain([&cancelled])
+                .map(|record| record["result"]["retired"].as_u64().unwrap())
+                .sum::<u64>();
+            assert!(
+                retired >= 1,
+                "{point}: {cancelled}; earlier passes: {:?}",
+                parked.short
+            );
+            for field in [
+                "removed",
+                "logical_bytes_reclaimed",
+                "recovered_logical_bytes",
+            ] {
+                assert_eq!(result[field], 0, "{point} {field}: {cancelled}");
+                for record in &parked.short {
+                    assert_eq!(record["result"][field], 0, "{point} {field}: {record}");
+                }
+            }
+            assert!(result["next"].is_object(), "{point}: {cancelled}");
+            assert!(!collected(&daemon, &old_checkpoint), "{point}");
+            assert_eq!(
+                container_contents(&object_path),
+                original,
+                "{point}: cancelled collection changed checkpoint members"
+            );
+        } else {
+            for field in [
+                "removed",
+                "logical_bytes_reclaimed",
+                "recovered_logical_bytes",
+            ] {
+                assert_eq!(
+                    result[field], paused["progress"][field],
+                    "{point} {field}: {cancelled}; paused: {paused}"
+                );
+            }
+        }
+        let maintenance =
+            super::live::wait_for(&daemon, "maintenance.status", json!({}), |status| {
+                let state = &status["details"]["verification"]["state"];
+                assert_ne!(state, "cached", "{point}: {status}");
+                state == "empty"
+            });
+        let verification = &maintenance["details"]["verification"];
+        assert_eq!(
+            verification["retained_contexts"],
+            json!({"status":"observed","value":0}),
+            "{point}: {maintenance}"
+        );
+        assert_eq!(
+            verification["retained_capacity_bytes"], 0,
+            "{point}: {maintenance}"
+        );
+        let usage = daemon.rpc("namespace.status", json!({}))["usage"].clone();
+        assert_eq!(
+            retained_memory(&usage),
+            memory_before,
+            "{point}: cancelled collection retained memory: {usage}"
+        );
+
+        let replay = daemon.rpc(
+            "collections.start",
+            json!({"token":parked.token,"request":parked.request}),
+        );
+        assert_eq!(replay["id"], operation["id"], "{point}: {replay}");
+        assert_eq!(
+            terminal(&daemon, &replay)["result"],
+            *result,
+            "{point}: replay"
+        );
+
+        let mut continuation = result["next"].clone();
+        let mut next = parked.next_sequence;
+        while !collected(&daemon, &old_checkpoint) {
+            assert!(
+                next < parked.next_sequence + COLLECTION_PASSES,
+                "{point}: cancelled collection did not resume to completion"
+            );
+            let mut next_request = parked.request.clone();
+            next_request["cursor"] = continuation;
+            let resumed = completed(
+                &daemon,
+                &daemon.rpc(
+                    "collections.start",
+                    json!({"token":token(&claim,next),"request":next_request}),
+                ),
+            );
+            assert_eq!(resumed["result"]["cancelled"], false, "{point}: {resumed}");
+            continuation = resumed["result"]["next"].clone();
+            next += 1;
+        }
+        assert!(
+            !object_path.exists(),
+            "{point}: collected container still exists"
+        );
+        assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+        daemon.rpc(
+            "views.detach",
+            json!({"owner":claim.owner,"lease":"managed-client"}),
+        );
+        daemon.rpc("owners.release", json!({"claim":claim}));
+        drop(guard);
+        stop(&mut daemon);
     }
 }
 

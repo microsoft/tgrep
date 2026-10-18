@@ -808,6 +808,10 @@ struct SearchOpts {
     positions: bool,
     /// Return original per-file totals and index diagnostics.
     stats: bool,
+    /// Return searched-file work, including candidates with no matching rows.
+    search_stats: bool,
+    /// Project matching-line counts instead of rendering matching lines.
+    count: bool,
     /// Return original per-file totals even when diagnostics are not requested.
     count_matches: bool,
     /// Render `-U --replace` as ripgrep's multiline printer does. Only sent by
@@ -1930,6 +1934,14 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
                 .get("stats")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            search_stats: params
+                .get("search_stats")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            count: params
+                .get("count")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             count_matches: params
                 .get("count_matches")
                 .and_then(|v| v.as_bool())
@@ -2197,9 +2209,11 @@ fn handle_search(
     };
     let mut matches = Vec::new();
     let mut file_stats = Vec::new();
+    let mut search_stats = Vec::new();
     for file in per_file {
         matches.extend(file.rows);
         file_stats.extend(file.stats);
+        search_stats.extend(file.search_stats);
     }
 
     let search_ms = t_search.elapsed().as_secs_f64() * 1000.0;
@@ -2236,6 +2250,9 @@ fn handle_search(
     });
     if opts.stats || opts.count_matches {
         result["file_stats"] = serde_json::json!(file_stats);
+    }
+    if opts.search_stats {
+        result["search_stats"] = serde_json::json!(search_stats);
     }
     if let Some(total_files) = total_files {
         result["index_stats"] = serde_json::json!({
@@ -2296,6 +2313,7 @@ fn invalidate_cached_paths_locked<'a>(
 struct FileSearchResult {
     rows: Vec<serde_json::Value>,
     stats: Option<crate::search::FileMatchStats>,
+    search_stats: Option<crate::search::FileSearchStats>,
 }
 
 /// Counts encoded bytes without allocating a serialized copy.
@@ -2380,11 +2398,26 @@ fn search_file_matches_bounded(
     };
 
     let found = FileMatches::find(content, matcher, &match_opts)?;
+    let search_stats = opts.search_stats.then(|| crate::search::FileSearchStats {
+        file: rel_path.to_string(),
+        bytes_searched: binary_offset.unwrap_or_else(|| fixups.to_source_offset(content.len()))
+            as u64,
+        binary_offset: binary_offset.map(|offset| offset as u64),
+    });
+    if let Some(stats) = &search_stats
+        && let Some(budget) = &mut budget
+    {
+        budget.charge(stats)?;
+    }
     if found.is_empty() {
-        return Ok(FileSearchResult::default());
+        return Ok(FileSearchResult {
+            search_stats,
+            ..FileSearchResult::default()
+        });
     }
     let mut result = FileSearchResult {
         rows: Vec::new(),
+        search_stats,
         stats: (opts.stats || opts.count_matches).then(|| {
             let (matches, matched_lines) = found.match_totals();
             crate::search::FileMatchStats {
@@ -2415,23 +2448,23 @@ fn search_file_matches_bounded(
         // `--json` reports binary matches as ordinary match events carrying a
         // `binary_offset`, so those clients ask for the lines as well.
         push_row(&mut result.rows, marker, &mut budget)?;
-        if !opts.binary_lines || (opts.files_only && opts.stats) {
+        if !opts.binary_lines || opts.count || opts.count_matches || (opts.files_only && opts.stats)
+        {
             return Ok(result);
         }
     }
 
-    if opts.files_only && opts.stats {
-        // Totals need the full search, but files-only clients consume just the
-        // path. Avoid rendering content or span arrays proportional to hits.
-        // Keep legacy replies unchanged when per-file stats were not requested.
-        push_row(
-            &mut result.rows,
+    if opts.count || opts.count_matches || (opts.files_only && opts.stats) {
+        // Only the final totals/path are consumed. Keep match totals separate:
+        // multiline display flags can change the line count used by `-c`.
+        let row = if opts.count && !opts.count_matches && !opts.files_only {
             serde_json::json!({
-                "type": "match",
-                "file": rel_path,
-            }),
-            &mut budget,
-        )?;
+                "type": "count", "file": rel_path, "lines": found.matched_lines(),
+            })
+        } else {
+            serde_json::json!({"type": "match", "file": rel_path})
+        };
+        push_row(&mut result.rows, row, &mut budget)?;
         return Ok(result);
     }
 
@@ -9893,6 +9926,135 @@ mod tests {
             "offset must be the byte on disk (9), not the decoded position \
              (13): {marker}"
         );
+    }
+
+    #[test]
+    fn count_projection_is_bounded_by_files_not_matches() {
+        let path = "src/\"escaped\\path\t.rs";
+        for field in ["count", "count_matches"] {
+            for stats in [false, true] {
+                for repeats in [1, 4096] {
+                    let request = parse_search_params(&serde_json::json!({
+                        "pattern":"return", field:true, "stats":stats,
+                        "detail":true, "positions":true, "only_matching":true,
+                        "before_context":1, "after_context":1,
+                        "replace":"unconsumed replacement",
+                    }))
+                    .unwrap();
+                    let file = DecodedFile::new(
+                        "return return\ncontext\n".repeat(repeats).into_bytes(),
+                        request.encoding,
+                    );
+                    let mut budget = JsonBudget { remaining: 512 };
+                    let result = search_file_matches_bounded(
+                        path,
+                        &file,
+                        &request.matcher,
+                        &request.opts,
+                        Some(&mut budget),
+                    )
+                    .unwrap();
+                    let expected = if field == "count" {
+                        serde_json::json!({"type":"count","file":path,"lines":repeats})
+                    } else {
+                        serde_json::json!({"type":"match","file":path})
+                    };
+                    assert_eq!(result.rows, [expected]);
+                    assert_eq!(result.stats.is_some(), stats || field == "count_matches");
+                    if let Some(totals) = &result.stats {
+                        assert_eq!(totals.matches, 2 * repeats as u64);
+                        assert_eq!(totals.matched_lines, repeats as u64);
+                    }
+                    let required = serde_json::to_vec(&result.rows[0]).unwrap().len()
+                        + 1
+                        + result
+                            .stats
+                            .as_ref()
+                            .map_or(0, |totals| serde_json::to_vec(totals).unwrap().len() + 1);
+                    assert_eq!(budget.remaining, 512 - required);
+                    let mut short = JsonBudget {
+                        remaining: required - 1,
+                    };
+                    assert!(
+                        search_file_matches_bounded(
+                            path,
+                            &file,
+                            &request.matcher,
+                            &request.opts,
+                            Some(&mut short),
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn count_projection_preserves_multiline_vimgrep_line_counts() {
+        for vimgrep in [false, true] {
+            let request = parse_search_params(&serde_json::json!({
+                "pattern":"hello\\nworld", "count":true, "multiline":true,
+                "vimgrep":vimgrep, "stats":true,
+            }))
+            .unwrap();
+            let file = DecodedFile::new(b"hello\nworld hello\nworld\n".to_vec(), request.encoding);
+            let result =
+                search_file_matches("a.txt", &file, &request.matcher, &request.opts).unwrap();
+            assert_eq!(
+                result.rows,
+                [serde_json::json!({
+                    "type":"count","file":"a.txt","lines":if vimgrep { 2 } else { 3 },
+                })]
+            );
+            let totals = result.stats.unwrap();
+            assert_eq!((totals.matches, totals.matched_lines), (2, 3));
+        }
+    }
+
+    #[test]
+    fn count_projection_preserves_binary_markers_and_empty_results() {
+        for field in ["count", "count_matches"] {
+            for stats in [false, true] {
+                let request = parse_search_params(&serde_json::json!({
+                    "pattern":"return", field:true, "stats":stats, "binary_lines":true,
+                }))
+                .unwrap();
+                let bytes = b"return return\nreturn\n\0tail\n";
+                let file = DecodedFile::new(bytes.to_vec(), request.encoding);
+                let result =
+                    search_file_matches("binary.txt", &file, &request.matcher, &request.opts)
+                        .unwrap();
+                assert_eq!(
+                    result.rows,
+                    [serde_json::json!({
+                        "type":"binary","file":"binary.txt","lines":2,
+                        "offset":bytes.iter().position(|&byte| byte == 0).unwrap(),
+                    })]
+                );
+                assert_eq!(result.stats.is_some(), stats || field == "count_matches");
+                if let Some(totals) = result.stats {
+                    assert_eq!((totals.matches, totals.matched_lines), (3, 2));
+                }
+                for params in [
+                    serde_json::json!({"pattern":"absent",field:true,"stats":stats}),
+                    serde_json::json!({"pattern":"return",field:true,"stats":stats,"max_count":0}),
+                ] {
+                    let request = parse_search_params(&params).unwrap();
+                    let mut budget = JsonBudget { remaining: 0 };
+                    let result = search_file_matches_bounded(
+                        "binary.txt",
+                        &file,
+                        &request.matcher,
+                        &request.opts,
+                        Some(&mut budget),
+                    )
+                    .unwrap();
+                    assert!(result.rows.is_empty());
+                    assert!(result.stats.is_none());
+                }
+            }
+        }
     }
 
     #[test]

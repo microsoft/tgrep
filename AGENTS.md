@@ -80,6 +80,9 @@ operation/lease tokens, register an instance-bound owner guard, and attach a
 versioned view. `shared owner-hold --claim <issued-claim.json>` retains ownership
 until stdin closes; supervise that process too. Do not replace its guard with a
 PID check or inactivity timeout. Unknown ownership proof protects the lease.
+Before `holding:true`, a typed claim failure is one `{"ok":false,"error":...}`
+stdout line plus exit 2. Retry the same claim only for retryable
+`not-committed` failures after the failed helper exits.
 Normal queries discover a ready managed attachment without new search flags.
 Managed RPC also requires a per-daemon private credential; the CLI loads it
 automatically from an owner-only file. Public namespace/instance IDs are not
@@ -98,13 +101,17 @@ Legacy/unmanaged v1 storage remains retain-all.
 Managed attachments use bounded parallel verified-read batches without raising
 namespace operation-worker limits. Inspect `last_reconcile.timings` and its
 read/reuse/resource counters to distinguish queueing, discovery, verification,
-catalog/control and checkpoint work. Healthy native managed views have no
-periodic safety rescan: silently missed notifications can leave results stale
-indefinitely, even while ready. This is an accepted staleness tradeoff, not
-proof of change coverage. `views.refresh` explicitly verifies all admitted
-contents; use `--no-index` when current disk bytes are required.
-`--watch-mode poll` and actual native-watcher failure/budget fallback still
-perform full verification after `--poll-interval` seconds (default 120).
+catalog/control and checkpoint work. Healthy native managed views also get a
+periodic full verification every `--poll-interval` seconds (default 120) while
+they keep serving. It rereads all admitted contents under the normal operation
+budgets, and closes readiness only when it finds a difference, then publishes
+the repair. A deadline or cancellation leaves the view ready but unverified
+(`last_verification.outcome` `failed`/`cancelled`) until the next interval, so
+results may lag missed changes by one interval plus verification time.
+`views.refresh` explicitly verifies all admitted contents; use `--no-index`
+when current disk bytes are required.
+`--watch-mode poll` and actual native-watcher failure/budget fallback instead
+close readiness for full verification after `--poll-interval` seconds.
 `reconciliation_policy` distinguishes configured mode from each view's effective
 polling and reports namespace monitor counts. First attachment/restore and
 reported watcher errors/rescans retain full verification. A clean Git status
@@ -219,8 +226,8 @@ tgrep --json -F -- "fn main" tgrep-cli/build.rs
 ```json
 {"data":{"path":{"text":"tgrep-cli/build.rs"}},"type":"begin"}
 {"data":{"absolute_offset":400,"line_number":11,"lines":{"text":"fn main() {\n"},"path":{"text":"tgrep-cli/build.rs"},"submatches":[{"end":7,"match":{"text":"fn main"},"start":0}]},"type":"match"}
-{"data":{"binary_offset":null,"path":{"text":"tgrep-cli/build.rs"},"stats":{"bytes_printed":260,"bytes_searched":1775,"elapsed":{"human":"0.000010s","nanos":9709,"secs":0},"matched_lines":1,"matches":1,"searches":1,"searches_with_match":1}},"type":"end"}
-{"data":{"elapsed_total":{"human":"0.000470s","nanos":469542,"secs":0},"stats":{"bytes_printed":515,"bytes_searched":1775,"elapsed":{"human":"0.000470s","nanos":469542,"secs":0},"matched_lines":1,"matches":1,"searches":1,"searches_with_match":1}},"type":"summary"}
+{"data":{"binary_offset":null,"path":{"text":"tgrep-cli/build.rs"},"stats":{"bytes_printed":260,"bytes_searched":1775,"elapsed":{"human":"0.000086s","nanos":86400,"secs":0},"matched_lines":1,"matches":1,"searches":1,"searches_with_match":1}},"type":"end"}
+{"data":{"elapsed_total":{"human":"0.002651s","nanos":2651400,"secs":0},"stats":{"bytes_printed":260,"bytes_searched":1775,"elapsed":{"human":"0.002651s","nanos":2651400,"secs":0},"matched_lines":1,"matches":1,"searches":1,"searches_with_match":1}},"type":"summary"}
 ```
 
 Any parser written for `rg --json` works as is, with one exception: on a line
@@ -248,6 +255,8 @@ These fall back to a full scan even with a server running:
 
 - `--no-ignore` and variants, `-u`/`-uu`/`-uuu`
 - `-a`/`--text`, `--binary`, non-`auto` `-E`/`--encoding`
+- `--content-eligibility content`, unless a managed v2 view was attached with
+  the `content-only` profile
 - `--no-index` (explicit)
 - naming a single file instead of a directory
 

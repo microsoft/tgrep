@@ -158,12 +158,14 @@ limit, not a higher searchable file-size cap or a count of allocated buffers.
 It does not enlarge the 64 MiB concurrent-input gate.
 Private charges remained within the unchanged 8 GiB private-work limit.
 
-**Post-measurement recurring-mode change:** measured source `58fdda8` retained
-the normal 120-second native safety pass. A subsequent user-directed change
-removes that timer for healthy native managed views, accepting that silently
-missed notifications may leave results stale indefinitely rather than claiming
-trusted change coverage. Explicit polling and actual native-watcher-unavailable
-fallback still perform full verification after `--poll-interval` (default 120
+**Post-measurement recurring-mode changes:** measured source `58fdda8` retained
+the normal 120-second native safety pass, which closed readiness while it ran.
+A subsequent user-directed change removed that timer for healthy native managed
+views. A later change restores periodic full verification at the same
+`--poll-interval` for those views, but keeps them serving while it runs and
+closes readiness only when it finds a difference. Neither change is measured
+here. Explicit polling and actual native-watcher-unavailable fallback still
+close readiness for full verification after `--poll-interval` (default 120
 seconds); initial/restore verification, explicit refresh and reported
 watcher-error/rescan recovery remain intact. Legacy v1 and ordinary-server
 policies are unchanged.

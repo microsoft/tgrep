@@ -117,6 +117,86 @@ fn local_index_rejects_final_file_symlinks() {
     );
 }
 
+/// Pipe backpressure holds the real CLI inside the first sibling's output
+/// while the test replaces their parent, so the next sibling must be resolved
+/// again instead of read through the replaced parent. Windows pins an open
+/// parent against replacement, so the transition is Unix-only.
+#[cfg(unix)]
+#[test]
+fn local_index_streams_siblings_without_reading_through_a_replaced_parent() {
+    use std::io::Read;
+    use std::process::{Command as Process, Stdio};
+    use std::time::Instant;
+
+    const FIRST_LINES: usize = 100_000;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    let parent = root.join("parent");
+    fs::create_dir_all(&parent).unwrap();
+    // Megabytes of output: far beyond a pipe, the stdout buffer and the probe.
+    fs::write(parent.join("a.txt"), "needle first\n".repeat(FIRST_LINES)).unwrap();
+    fs::write(parent.join("b.txt"), "needle ORIGINAL_SENTINEL\n").unwrap();
+    let index = root.join(".tgrep");
+    builder::build_index(&root, Some(&index), true, false, &[]).unwrap();
+
+    let mut child = Process::new(env!("CARGO_BIN_EXE_tgrep"))
+        .current_dir(&root)
+        .arg("--index-path")
+        .arg(&index)
+        .args(["--stats", "--sort", "path", "-F", "--", "needle"])
+        .arg(&root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let (status, stdout, stderr) = std::thread::scope(|scope| {
+        let errors = scope.spawn(move || {
+            let mut text = String::new();
+            stderr.read_to_string(&mut text).unwrap();
+            text
+        });
+        let output = scope.spawn(|| {
+            // First-sibling output proves its parent was already resolved;
+            // the unread remainder keeps the search inside that sibling.
+            let mut first = vec![0; 4096];
+            stdout.read_exact(&mut first).unwrap();
+            fs::rename(&parent, temp.path().join("saved")).unwrap();
+            fs::create_dir(&parent).unwrap();
+            fs::write(parent.join("b.txt"), "needle REPLACEMENT_SENTINEL\n").unwrap();
+            stdout.read_to_end(&mut first).unwrap();
+            String::from_utf8(first).unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("indexed search did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        (status, output.join().unwrap(), errors.join().unwrap())
+    });
+
+    assert!(
+        !stdout.contains("ORIGINAL_SENTINEL"),
+        "printed a sibling through the replaced parent; status {status:?}: {stderr}"
+    );
+    assert!(status.success(), "{status:?}: {stderr}");
+    assert!(
+        stderr.contains("Query plan:"),
+        "must exercise the index: {stderr}"
+    );
+    assert!(stdout.contains("needle REPLACEMENT_SENTINEL"), "{stderr}");
+    assert_eq!(stdout.matches("needle first").count(), FIRST_LINES);
+}
+
 #[test]
 fn unavailable_relative_and_unrelated_metadata_roots_fall_back_to_scanning() {
     let fixture = Fixture::new();

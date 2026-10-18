@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use tgrep_core::generations::{GenerationManager, IndexingProfile, Repository};
+use tgrep_core::generations::{ContentEligibility, GenerationManager, IndexingProfile, Repository};
 use tgrep_core::managed::{
     self, AdaptiveRequest, AttachRequest, CatalogCursor, CollectionBounds, CollectionProgress,
     CollectionRequest, Error, ErrorCategory, ExternalWork, Id, LegacyAttachRequest,
@@ -110,7 +110,8 @@ fn hello(namespace: &Namespace) -> Result<Value> {
             "versioned-allocations","bound-checkpoints","offline-maintenance","stop-if-idle",
             "bounded-storage-inventory","namespace-discovery","maintenance-diagnostics",
             "private-rpc-authentication","bounded-reconciliation","reconciliation-phase-metrics",
-            "event-driven-native-reconciliation"
+            "event-driven-native-reconciliation","serving-native-periodic-verification",
+            "content-eligibility-profile"
         ],
         "profile":IndexingProfile::default(),
         "policy":namespace.policy()?,"allocation":namespace.allocation()?,
@@ -315,8 +316,13 @@ struct Monitor {
     watch_failure: Arc<Mutex<Option<String>>>,
     last_schedule: Instant,
     last_reconcile: Instant,
+    /// Last completed full pass or terminal serving-verification attempt.
+    last_verification: Instant,
+    verification: Option<&'static str>,
     pending: HashSet<Id>,
     failures: u32,
+    #[cfg(feature = "managed-test-hooks")]
+    suppress_events: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct WatchSettings {
@@ -327,6 +333,14 @@ struct WatchSettings {
 }
 
 impl WatchSettings {
+    fn registration_mode(&self) -> notify::RecursiveMode {
+        if cfg!(any(windows, target_os = "macos")) {
+            notify::RecursiveMode::Recursive
+        } else {
+            notify::RecursiveMode::NonRecursive
+        }
+    }
+
     fn polling(&self, monitor: &Monitor) -> bool {
         !self.no_watch
             && (matches!(self.mode, crate::serve::WatchMode::Poll)
@@ -343,20 +357,31 @@ impl WatchSettings {
         if !self.no_watch {
             triggers.extend(["watcher-error-or-overflow", "git-or-ignore-change"]);
         }
+        let periodic = !self.no_watch;
+        let polling = polling || (periodic && matches!(self.mode, crate::serve::WatchMode::Poll));
         if polling {
             triggers.push("poll-interval");
+        } else if periodic {
+            triggers.push("periodic-verification");
         }
         json!({
             "configured_watch_mode": if self.no_watch { "disabled" }
                 else if matches!(self.mode, crate::serve::WatchMode::Poll) { "poll" } else { "auto" },
-            "native_periodic_full_verification": false,
-            "periodic_full_verification": polling,
-            "interval_ms": polling.then_some(self.interval.as_millis()),
+            "native_periodic_full_verification": periodic,
+            "periodic_full_verification": periodic,
+            "interval_ms": periodic.then_some(self.interval.as_millis()),
             "poll_interval_ms": self.interval.as_millis(),
             "incremental_coverage": "unavailable",
             "change_journal": "not-integrated",
-            "native_missed_changes": "may-remain-stale-indefinitely",
-            "full_verification_reason": polling.then_some("polling-update-mechanism"),
+            "native_missed_changes": if periodic { "repaired-by-periodic-verification" }
+                else { "requires-explicit-refresh" },
+            "native_verification_availability": "serving-until-difference",
+            "native_registration_mode": if matches!(self.registration_mode(), notify::RecursiveMode::Recursive) {
+                "recursive-roots"
+            } else { "per-directory" },
+            "native_watch_budget_per_view": self.watches_per_view,
+            "full_verification_reason": if polling { Some("polling-update-mechanism") }
+                else if periodic { Some("periodic-native-verification") } else { None },
             "full_repair_triggers": triggers
         })
     }
@@ -503,6 +528,16 @@ impl QuerySource for ManagedQuery {
     fn root(&self) -> &Path {
         self.slot.root()
     }
+    fn eligibility(&self) -> Result<ContentEligibility> {
+        Ok(self
+            .query
+            .published()
+            .record
+            .pin()?
+            .key
+            .profile()
+            .eligibility)
+    }
     fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
         Ok(self.query.with_snapshot(read)?)
     }
@@ -523,11 +558,12 @@ fn monitor_directories(
     root: &Path,
     storage: &Path,
     budget: usize,
+    mode: notify::RecursiveMode,
+    deadline: Instant,
 ) -> Result<(HashSet<PathBuf>, Vec<PathBuf>)> {
     let mut directories = HashSet::new();
     let mut stack = vec![(root.to_path_buf(), false)];
     let mut examined = 0_usize;
-    let deadline = Instant::now() + Duration::from_millis(100);
     let (git, common) = tgrep_core::git_index::read_repository_dirs_bounded(root)?;
     let mut metadata = vec![std::fs::canonicalize(git)?, std::fs::canonicalize(common)?];
     metadata.dedup();
@@ -542,6 +578,22 @@ fn monitor_directories(
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+    if matches!(mode, notify::RecursiveMode::Recursive) {
+        // ReadDirectoryChangesW and FSEvents cover descendants, including new
+        // directories. Count subscriptions, not the directories they cover.
+        directories.insert(root.to_path_buf());
+        let candidates = directories.clone();
+        directories.retain(|directory| {
+            !candidates
+                .iter()
+                .any(|parent| parent != directory && directory.starts_with(parent))
+        });
+        ensure!(
+            directories.len() <= budget,
+            "native watch count budget; polling"
+        );
+        return Ok((directories, metadata));
     }
     while let Some((directory, git_metadata)) = stack.pop() {
         ensure!(
@@ -593,6 +645,7 @@ fn process_memory() -> Value {
 fn watch_event(
     slot: &ViewSlot,
     metadata: &[PathBuf],
+    storage: &Path,
     watch_failure: &Mutex<Option<String>>,
     event: notify::Result<notify::Event>,
 ) -> managed::Result<()> {
@@ -604,6 +657,9 @@ fn watch_event(
                 || event.paths.is_empty()
                 || matches!(event.kind, EventKind::Any | EventKind::Other);
             for path in event.paths {
+                if path.starts_with(storage) {
+                    continue;
+                }
                 if let Some(relative) = metadata
                     .iter()
                     .filter_map(|directory| path.strip_prefix(directory).ok())
@@ -685,25 +741,38 @@ fn sync_monitor(
         monitor.watched.clear();
         return Ok(());
     }
-    let (desired, metadata) =
-        match monitor_directories(slot.root(), storage, settings.watches_per_view) {
-            Ok(desired) => desired,
-            Err(error) => {
-                monitor.fallback = Some(format!("{error:#}"));
-                monitor.watcher = None;
-                monitor.watched.clear();
-                slot.invalidate(&[], true)?;
-                return Ok(());
-            }
-        };
+    let mode = settings.registration_mode();
+    let (desired, metadata) = match monitor_directories(
+        slot.root(),
+        storage,
+        settings.watches_per_view,
+        mode,
+        Instant::now() + Duration::from_millis(100),
+    ) {
+        Ok(desired) => desired,
+        Err(error) => {
+            monitor.fallback = Some(format!("{error:#}"));
+            monitor.watcher = None;
+            monitor.watched.clear();
+            slot.invalidate(&[], true)?;
+            return Ok(());
+        }
+    };
     if monitor.watcher.is_none() {
         let weak = Arc::downgrade(slot);
         let watch_failure = Arc::clone(&monitor.watch_failure);
+        let storage = storage.to_path_buf();
+        #[cfg(feature = "managed-test-hooks")]
+        let suppress = Arc::clone(&monitor.suppress_events);
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            #[cfg(feature = "managed-test-hooks")]
+            if suppress.load(Ordering::Acquire) {
+                return;
+            }
             let Some(slot) = weak.upgrade() else {
                 return;
             };
-            let result = watch_event(&slot, &metadata, &watch_failure, event);
+            let result = watch_event(&slot, &metadata, &storage, &watch_failure, event);
             if let Err(error) = result {
                 eprintln!("managed watcher invalidation {}: {error}", slot.id());
             }
@@ -722,10 +791,15 @@ fn sync_monitor(
     let result = (|| -> notify::Result<()> {
         let watcher = monitor.watcher.as_mut().expect("installed watcher");
         for directory in &removed {
-            watcher.unwatch(directory)?;
+            // inotify can retire a deleted or moved directory before this sync.
+            if let Err(error) = watcher.unwatch(directory)
+                && !matches!(error.kind, notify::ErrorKind::WatchNotFound)
+            {
+                return Err(error);
+            }
         }
         for directory in &added {
-            watcher.watch(directory, notify::RecursiveMode::NonRecursive)?;
+            watcher.watch(directory, mode)?;
         }
         Ok(())
     })();
@@ -765,6 +839,11 @@ impl State {
                 else if polling { "poll" }
                 else if monitor.is_some() { "native" } else { "unavailable" },
             "watch_fallback": monitor.as_ref().and_then(|monitor| monitor.fallback.as_ref()),
+            "watch_count": monitor.as_ref().map_or(0, |monitor| monitor.watched.len()),
+            "last_verification": monitor.as_ref().map(|monitor| json!({
+                "outcome": monitor.verification,
+                "age_ms": monitor.last_verification.elapsed().as_millis(),
+            })),
             "reconciliation_policy": self.watches.reconciliation_status(polling)
         }))
     }
@@ -775,10 +854,12 @@ impl State {
             .lock()
             .map_err(|_| Error::corrupt("monitor registry poisoned"))?;
         let (mut native, mut polling, mut disabled) = (0_usize, 0_usize, 0_usize);
+        let mut watch_count = 0_usize;
         for monitor in monitors.values() {
             let monitor = monitor
                 .lock()
                 .map_err(|_| Error::corrupt("monitor poisoned"))?;
+            watch_count += monitor.watched.len();
             if self.watches.no_watch {
                 disabled += 1;
             } else if self.watches.polling(&monitor) {
@@ -792,6 +873,7 @@ impl State {
         status["native_views"] = json!(native);
         status["polling_views"] = json!(polling);
         status["disabled_views"] = json!(disabled);
+        status["watch_count"] = json!(watch_count);
         Ok(status)
     }
 
@@ -945,6 +1027,7 @@ impl State {
                         view: input.view.clone(),
                         expected_version: self.views.recover(&input.view)?.version,
                         allocation_version: self.namespace.allocation()?.version,
+                        verify: false,
                     },
                 )?;
                 let _receipt = self.namespace.hold_operation(&operation.id)?;
@@ -1096,9 +1179,34 @@ impl State {
                     (
                         Duration::from_secs(30),
                         Duration::from_millis(input.elapsed_ms),
+                        Duration::from_millis(input.elapsed_ms),
                     )
                 })?;
                 Ok(json!({"input_epoch":slot.input_epoch()}))
+            }
+            #[cfg(feature = "managed-test-hooks")]
+            "testing.suppress-watch-events" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Input {
+                    view: Id,
+                    suppress: bool,
+                }
+                let input: Input = decode(request.params.clone())?;
+                let monitor = self
+                    .monitors
+                    .lock()
+                    .map_err(|_| Error::corrupt("monitor registry poisoned"))?
+                    .get(&input.view)
+                    .cloned()
+                    .ok_or_else(|| Error::invalid("view has no monitor"))?;
+                let monitor = monitor
+                    .lock()
+                    .map_err(|_| Error::corrupt("monitor poisoned"))?;
+                monitor
+                    .suppress_events
+                    .store(input.suppress, Ordering::Release);
+                Ok(json!({"suppressed":input.suppress}))
             }
             #[cfg(feature = "managed-test-hooks")]
             "testing.watch-event" => {
@@ -1139,7 +1247,7 @@ impl State {
                         "injected native watcher uncertainty",
                     )),
                 };
-                watch_event(&slot, &[], &failure, event)?;
+                watch_event(&slot, &[], self.namespace.path(), &failure, event)?;
                 Ok(json!({"input_epoch":slot.input_epoch()}))
             }
             "views.attach" => {
@@ -1174,7 +1282,13 @@ impl State {
                 let id = decode::<ObjectId>(request.params.clone())?.id;
                 let mut status = serde_json::to_value(self.views.status(&id)?)?;
                 let watch = self.watch_status(&id)?;
-                for field in ["watch_mode", "watch_fallback", "reconciliation_policy"] {
+                for field in [
+                    "watch_mode",
+                    "watch_fallback",
+                    "watch_count",
+                    "last_verification",
+                    "reconciliation_policy",
+                ] {
                     status[field] = watch[field].clone();
                 }
                 Ok(status)
@@ -1351,6 +1465,8 @@ impl State {
                 "ready":status.ready,"epoch":status.input_epoch,"backend":"shared-v2","status":status,
                 "watch_mode":watch["watch_mode"],
                 "watch_fallback":watch["watch_fallback"],
+                "watch_count":watch["watch_count"],
+                "last_verification":watch["last_verification"],
                 "reconciliation_policy":watch["reconciliation_policy"],
                 "policy":self.namespace.policy()?,"usage":self.namespace.work_usage()?,
                 "adaptive":self.views.last_adaptive(slot.id())?,
@@ -1433,6 +1549,33 @@ impl State {
                     {
                         state.last_reconcile = Instant::now();
                     }
+                    let verify =
+                        operation.kind == "reconcile" && operation.request["verify"] == true;
+                    let result = final_operation.result.as_ref();
+                    let outcome = match final_operation.state {
+                        OperationState::Completed
+                            if verify
+                                && result.is_some_and(|result| result["verified"] == true) =>
+                        {
+                            Some(if result.is_some_and(|result| result["changed"] == true) {
+                                "repaired"
+                            } else {
+                                "unchanged"
+                            })
+                        }
+                        OperationState::Completed
+                            if result.is_some_and(|result| result["reconcile"]["full"] == true) =>
+                        {
+                            Some("full-pass")
+                        }
+                        OperationState::Failed if verify => Some("failed"),
+                        OperationState::Cancelled if verify => Some("cancelled"),
+                        _ => None,
+                    };
+                    if let Some(outcome) = outcome {
+                        state.last_verification = Instant::now();
+                        state.verification = Some(outcome);
+                    }
                     state.failures = if final_operation.state == OperationState::Completed {
                         0
                     } else {
@@ -1466,6 +1609,7 @@ impl State {
             (
                 monitor.last_schedule.elapsed(),
                 monitor.last_reconcile.elapsed(),
+                monitor.last_verification.elapsed(),
             )
         })
     }
@@ -1473,7 +1617,7 @@ impl State {
     fn schedule_view_with_elapsed(
         &self,
         slot: &Arc<ViewSlot>,
-        elapsed: impl FnOnce(&Monitor) -> (Duration, Duration),
+        elapsed: impl FnOnce(&Monitor) -> (Duration, Duration, Duration),
     ) -> Result<()> {
         let status = self.views.status(slot.id())?;
         if status.leases == 0 {
@@ -1533,9 +1677,18 @@ impl State {
             return Ok(());
         }
         let retry = Duration::from_millis(200_u64.saturating_mul(1_u64 << monitor.failures.min(7)));
-        let (schedule_elapsed, reconcile_elapsed) = elapsed(&monitor);
-        let periodic = self.watches.polling(&monitor) && reconcile_elapsed >= self.watches.interval;
-        if (!status.ready || periodic) && schedule_elapsed >= retry {
+        let (schedule_elapsed, reconcile_elapsed, verification_elapsed) = elapsed(&monitor);
+        let polling = self.watches.polling(&monitor);
+        let periodic = polling && reconcile_elapsed >= self.watches.interval;
+        // Healthy native views are verified while serving; only a detected
+        // difference closes readiness.
+        let verify = !periodic
+            && status.ready
+            && !polling
+            && !self.watches.no_watch
+            && monitor.watcher.is_some()
+            && verification_elapsed >= self.watches.interval;
+        if (!status.ready || periodic || verify) && schedule_elapsed >= retry {
             monitor.last_schedule = Instant::now();
             drop(monitor);
             if periodic {
@@ -1547,6 +1700,7 @@ impl State {
                     view: slot.id().clone(),
                     expected_version: status.authoritative.version,
                     allocation_version: self.namespace.allocation()?.version,
+                    verify,
                 },
             )?;
             self.enqueue(&operation)?;
@@ -1739,8 +1893,12 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
             last_schedule: Instant::now(),
             watch_failure: Arc::new(Mutex::new(None)),
             last_reconcile: Instant::now(),
+            last_verification: Instant::now(),
+            verification: None,
             pending: HashSet::new(),
             failures: 0,
+            #[cfg(feature = "managed-test-hooks")]
+            suppress_events: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }));
         sync_monitor(slot, &monitor, &observer_watches, &observer_storage).map_err(|error| {
             Error::new(
@@ -2213,6 +2371,161 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
 }
 
 #[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use std::fs;
+
+    fn repository() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        let storage = temp.path().join("storage");
+        fs::create_dir_all(root.join(".git").join("refs")).unwrap();
+        fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        fs::create_dir(&storage).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let storage = fs::canonicalize(storage).unwrap();
+        (temp, root, storage)
+    }
+
+    #[test]
+    fn recursive_roots_do_not_spend_the_budget_on_descendants() {
+        let (temp, root, storage) = repository();
+        let budget = 8192 / 32;
+        for index in 0..budget + 64 {
+            fs::create_dir(root.join(format!("directory-{index}"))).unwrap();
+        }
+        let (directories, metadata) = monitor_directories(
+            &root,
+            &storage,
+            budget,
+            notify::RecursiveMode::Recursive,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("recursive roots must not exhaust the descendant count budget");
+        assert_eq!(directories, HashSet::from([root.clone()]));
+        assert_eq!(metadata, vec![root.join(".git")]);
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn recursive_roots_do_not_require_a_descendant_traversal_deadline() {
+        let (temp, root, storage) = repository();
+        let (directories, _) = monitor_directories(
+            &root,
+            &storage,
+            8192 / 32,
+            notify::RecursiveMode::Recursive,
+            Instant::now(),
+        )
+        .expect("recursive roots must not depend on the traversal deadline");
+        assert_eq!(directories, HashSet::from([root]));
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn per_directory_planning_retains_count_and_traversal_limits() {
+        let (temp, root, storage) = repository();
+        let budget = 8192 / 32;
+        for index in 0..budget + 64 {
+            fs::create_dir(root.join(format!("directory-{index}"))).unwrap();
+        }
+        let count = monitor_directories(
+            &root,
+            &storage,
+            budget,
+            notify::RecursiveMode::NonRecursive,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert_eq!(count.to_string(), "native watch count budget; polling");
+        let deadline = monitor_directories(
+            &root,
+            &storage,
+            budget,
+            notify::RecursiveMode::NonRecursive,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            deadline.to_string(),
+            "native watch registration budget; polling"
+        );
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn linked_metadata_is_covered_without_duplicate_recursive_subscriptions() {
+        let (temp, root, storage) = repository();
+        let linked = temp.path().join("linked");
+        let common = root.join(".git");
+        let private = common.join("worktrees").join("linked");
+        fs::create_dir(&linked).unwrap();
+        fs::create_dir_all(&private).unwrap();
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .unwrap();
+        fs::write(private.join("commondir"), format!("{}\n", common.display())).unwrap();
+        let linked = fs::canonicalize(linked).unwrap();
+        let (directories, metadata) = monitor_directories(
+            &linked,
+            &storage,
+            2,
+            notify::RecursiveMode::Recursive,
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(directories, HashSet::from([linked.clone(), common.clone()]));
+        assert_eq!(metadata, vec![private, common]);
+        let error = monitor_directories(
+            &linked,
+            &storage,
+            1,
+            notify::RecursiveMode::Recursive,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "native watch count budget; polling");
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn recursive_roots_still_reject_non_directory_git_watch_inputs() {
+        let (temp, root, storage) = repository();
+        fs::remove_dir(root.join(".git").join("refs")).unwrap();
+        fs::write(root.join(".git").join("refs"), "not a directory").unwrap();
+        let error = monitor_directories(
+            &root,
+            &storage,
+            8192 / 32,
+            notify::RecursiveMode::Recursive,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "non-directory Git watch input; polling");
+        temp.close().unwrap();
+    }
+
+    #[test]
+    fn native_registration_mode_matches_the_backend_resource_model() {
+        let settings = WatchSettings {
+            no_watch: false,
+            mode: crate::serve::WatchMode::Auto,
+            interval: Duration::from_secs(120),
+            watches_per_view: 8192 / 32,
+        };
+        assert_eq!(
+            matches!(
+                settings.registration_mode(),
+                notify::RecursiveMode::Recursive
+            ),
+            cfg!(any(windows, target_os = "macos"))
+        );
+    }
+}
+
+#[cfg(test)]
 mod scheduling_tests {
     use super::*;
 
@@ -2347,6 +2660,7 @@ mod scheduling_tests {
                     watch_event(
                         &slot,
                         &roots,
+                        &storage,
                         &failure,
                         Ok(
                             notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
@@ -2373,6 +2687,7 @@ mod scheduling_tests {
                     watch_event(
                         &slot,
                         &roots,
+                        &storage,
                         &failure,
                         Ok(
                             notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
@@ -2391,6 +2706,7 @@ mod scheduling_tests {
             watch_event(
                 &slot,
                 &roots,
+                &storage,
                 &failure,
                 Ok(
                     notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
@@ -2402,6 +2718,7 @@ mod scheduling_tests {
             watch_event(
                 &slot,
                 &roots,
+                &storage,
                 &failure,
                 Ok(
                     notify::Event::new(EventKind::Access(notify::event::AccessKind::Any))
@@ -2410,8 +2727,55 @@ mod scheduling_tests {
             )
             .unwrap();
             assert_eq!(slot.input_epoch(), before);
+            for path in [
+                storage.join("checkpoint"),
+                slot.root().join(".tgrep").join("index"),
+            ] {
+                watch_event(
+                    &slot,
+                    &roots,
+                    &storage,
+                    &failure,
+                    Ok(
+                        notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                            .add_path(path),
+                    ),
+                )
+                .unwrap();
+                assert_eq!(slot.input_epoch(), before);
+            }
         }
-        assert!(failure.into_inner().unwrap().is_none());
+        assert!(failure.lock().unwrap().is_none());
+        let before = slot.input_epoch();
+        watch_event(
+            &slot,
+            &[common, private],
+            &storage,
+            &failure,
+            Ok(
+                notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(storage.join("checkpoint"))
+                    .set_flag(notify::event::Flag::Rescan),
+            ),
+        )
+        .unwrap();
+        assert_eq!(slot.input_epoch(), before + 1);
+        watch_event(
+            &slot,
+            &[],
+            &storage,
+            &failure,
+            Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
+        )
+        .unwrap();
+        assert_eq!(slot.input_epoch(), before + 2);
+        assert!(
+            failure
+                .into_inner()
+                .unwrap()
+                .unwrap()
+                .starts_with("native watcher failed:")
+        );
         drop((slot, manager, owner, namespace, repository));
         temp.close().unwrap();
     }
@@ -2510,7 +2874,7 @@ mod candidate_read_tests {
         );
     }
 
-    /// Snapshot call 0 lists candidates and call 1 opens the only candidate.
+    /// Call 0 lists candidates, 1 pins their parent, and 2/3 open candidates.
     #[derive(Clone, Copy, Debug)]
     enum Inject {
         Nothing,
@@ -2531,6 +2895,9 @@ mod candidate_read_tests {
     impl QuerySource for Scripted {
         fn root(&self) -> &Path {
             self.inner.root()
+        }
+        fn eligibility(&self) -> Result<ContentEligibility> {
+            self.inner.eligibility()
         }
         fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
             let call = self.snapshots.get();
@@ -2572,6 +2939,7 @@ mod candidate_read_tests {
         std::fs::create_dir(&storage).unwrap();
         git(&root, &["init", "--quiet"]);
         std::fs::write(root.join("source.txt"), "shared_term\n").unwrap();
+        std::fs::write(root.join("sibling.txt"), "shared_term sibling\n").unwrap();
         git(&root, &["add", "."]);
         git(&root, &["commit", "--quiet", "-m", "initial"]);
         let repository = Repository::discover(&root).unwrap();
@@ -2649,12 +3017,18 @@ mod candidate_read_tests {
 
         let (result, snapshots, invalidations) = run(Inject::Nothing);
         let result = result.unwrap();
-        assert_eq!(result["matches"].as_array().unwrap().len(), 1, "{result}");
-        assert_eq!((snapshots, invalidations), (3, 0));
+        assert_eq!(result["matches"].as_array().unwrap().len(), 2, "{result}");
+        assert_eq!((snapshots, invalidations), (5, 0));
         let epoch = slot.input_epoch();
         for (inject, reason) in [
             (Inject::SnapshotBeforeRead(1), "query-input-changed"),
             (Inject::SnapshotAfterRead(1), "query-snapshot-changed"),
+            (Inject::SnapshotBeforeRead(2), "query-input-changed"),
+            (Inject::SnapshotAfterRead(2), "query-snapshot-changed"),
+            (Inject::SnapshotBeforeRead(3), "query-input-changed"),
+            (Inject::SnapshotAfterRead(3), "query-snapshot-changed"),
+            (Inject::SnapshotBeforeRead(4), "query-input-changed"),
+            (Inject::SnapshotAfterRead(4), "query-snapshot-changed"),
             (Inject::Check, "query-deadline"),
         ] {
             let (result, _, invalidations) = run(inject);
@@ -2672,7 +3046,7 @@ mod candidate_read_tests {
             assert!(manager.status(&record.id).unwrap().ready, "{inject:?}");
         }
         let (result, _, invalidations) = run(Inject::Nothing);
-        assert_eq!(result.unwrap()["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(result.unwrap()["matches"].as_array().unwrap().len(), 2);
         assert_eq!(invalidations, 0);
 
         std::fs::remove_file(root.join("source.txt")).unwrap();

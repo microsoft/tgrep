@@ -1457,6 +1457,8 @@ fn write_index_files<'a>(
     flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
     postings_file.flush()?;
     lookup_file.flush()?;
+    postings_file.get_ref().sync_all()?;
+    lookup_file.get_ref().sync_all()?;
 
     write_files_and_meta(
         index_dir,
@@ -1525,6 +1527,8 @@ fn write_index_files_from_postings<'a>(
     flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
     postings_file.flush()?;
     lookup_file.flush()?;
+    postings_file.get_ref().sync_all()?;
+    lookup_file.get_ref().sync_all()?;
 
     write_files_and_meta(index_dir, root, path_count, paths, trigram_count, complete)
 }
@@ -1634,6 +1638,7 @@ pub fn stage_file_table_upgrade(index_dir: &Path, staging_dir: &Path) -> Result<
     ondisk::write_file_table_header(&mut target)?;
     std::io::copy(&mut source, &mut target)?;
     target.flush()?;
+    target.get_ref().sync_all()?;
     Ok(true)
 }
 
@@ -1842,6 +1847,8 @@ pub fn append_overlay_to_index(
     flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
     postings_file.flush()?;
     lookup_file.flush()?;
+    postings_file.get_ref().sync_all()?;
+    lookup_file.get_ref().sync_all()?;
 
     // files.bin + meta.json: existing files keep IDs [0, base), overlay files
     // follow at [base, base + N). Reader paths stream from its already-loaded
@@ -2051,6 +2058,8 @@ pub fn merge_index_with_delta(
     flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
     postings_file.flush()?;
     lookup_file.flush()?;
+    postings_file.get_ref().sync_all()?;
+    lookup_file.get_ref().sync_all()?;
 
     let paths = reader
         .all_paths()

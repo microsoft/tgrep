@@ -1197,7 +1197,8 @@ impl Cli {
             stop_on_nonmatch: self.stop_on_nonmatch,
             column: self.column || self.vimgrep,
             byte_offset: self.byte_offset,
-            max_columns: self.max_columns,
+            // ripgrep treats `-M 0` as "no limit", not "omit every line".
+            max_columns: self.max_columns.filter(|&limit| limit > 0),
             max_columns_preview: self.max_columns_preview,
             count_matches: self.count_matches,
             include_zero: self.include_zero,

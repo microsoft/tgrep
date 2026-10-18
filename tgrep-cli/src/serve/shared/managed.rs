@@ -2322,12 +2322,20 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                 }
             }
         });
+        let mut accept_failures = super::AcceptRetry::new();
         while !state.stopping.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                    accept_failures.accepted();
+                    // One unusable socket is dropped; it must not end the daemon.
+                    let configured = stream
+                        .set_nonblocking(false)
+                        .and_then(|()| stream.set_read_timeout(Some(Duration::from_secs(5))))
+                        .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(5))));
+                    if let Err(error) = configured {
+                        eprintln!("managed daemon dropped an unconfigurable connection: {error}");
+                        continue;
+                    }
                     let admission = state
                         .admission
                         .lock()
@@ -2361,8 +2369,10 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                     thread::sleep(Duration::from_millis(10))
                 }
                 Err(error) => {
-                    state.stopping.store(true, Ordering::Release);
-                    return Err(error.into());
+                    if let Err(error) = accept_failures.failed(error) {
+                        state.stopping.store(true, Ordering::Release);
+                        return Err(error.into());
+                    }
                 }
             }
         }

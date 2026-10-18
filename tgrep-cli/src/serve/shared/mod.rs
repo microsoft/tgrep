@@ -66,6 +66,65 @@ fn validate_repository(root: &Path, repository: &Repository) -> Result<()> {
     Ok(())
 }
 
+/// Tolerates transient `accept` failures, such as a peer that reset before it
+/// was accepted or a brief descriptor shortage. Either daemon holds every
+/// attached lease, so one such failure must not end it; a failure that
+/// persists for [`AcceptRetry::LIMIT`] consecutive attempts is still fatal.
+struct AcceptRetry {
+    consecutive: u32,
+    backoff: std::time::Duration,
+}
+
+impl AcceptRetry {
+    const LIMIT: u32 = 100;
+
+    fn new() -> Self {
+        Self {
+            consecutive: 0,
+            backoff: std::time::Duration::from_millis(100),
+        }
+    }
+
+    fn accepted(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Log and back off after a failed accept, or return the error once the
+    /// failures have persisted.
+    fn failed(&mut self, error: std::io::Error) -> std::io::Result<()> {
+        self.consecutive += 1;
+        if self.consecutive >= Self::LIMIT {
+            return Err(error);
+        }
+        eprintln!("shared daemon accept failed; retrying: {error}");
+        std::thread::sleep(self.backoff);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::AcceptRetry;
+
+    #[test]
+    fn transient_accept_failures_are_retried_until_they_persist() {
+        let failure = || std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        let mut retry = AcceptRetry {
+            consecutive: 0,
+            backoff: std::time::Duration::ZERO,
+        };
+        for _ in 1..AcceptRetry::LIMIT {
+            retry.failed(failure()).unwrap();
+        }
+        retry.accepted();
+        for _ in 1..AcceptRetry::LIMIT {
+            retry.failed(failure()).unwrap();
+        }
+        let error = retry.failed(failure()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+    }
+}
+
 pub fn status(root: &Path, index_path: Option<&Path>) -> Result<()> {
     anyhow::ensure!(index_path.is_none(), "--shared does not use --index-path");
     let (client, view) = Client::registered(root)?;

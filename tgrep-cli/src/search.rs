@@ -584,13 +584,12 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
     let type_filter = opts.type_filter()?;
 
     if root.is_file() {
+        // As in ripgrep, a file named on the command line is listed even when
+        // `-g`/`-t` would have skipped it during a directory walk.
         let rel_path = explicit_file_display_path(&root);
-
-        if passes_filters(&rel_path, &glob_filter, &type_filter, true) {
-            let mut writer = OutputWriter::new(opts.make_output_config());
-            writer.write_file(&rel_path)?;
-            writer.flush()?;
-        }
+        let mut writer = OutputWriter::new(opts.make_output_config());
+        writer.write_file(&rel_path)?;
+        writer.flush()?;
         return Ok(());
     }
 
@@ -1769,7 +1768,9 @@ fn search_local_index(
                 .then_some(())?;
             let rel = scope.relativize(indexed, root)?;
             within_max_depth(&rel, opts).then_some(())?;
-            passes_filters(&rel, &glob_filter, &type_filter, true).then_some(())?;
+            (matches!(scope, IndexScope::File(_))
+                || passes_filters(&rel, &glob_filter, &type_filter, true))
+            .then_some(())?;
             Some(rel)
         })
         .collect();
@@ -1937,10 +1938,10 @@ fn brute_force_search(
     let mut had_matches = false;
 
     if root.is_file() {
+        // As in ripgrep, `-g`/`-t` only filter files found by a walk; a file
+        // named on the command line is always searched.
         let rel_path = explicit_file_display_path(root);
-        if passes_filters(&rel_path, &glob_filter, &type_filter, true)
-            && let Some(read) = read_text_lossy(root, opts.encoding, read_size_limit(opts, true))?
-        {
+        if let Some(read) = read_text_lossy(root, opts.encoding, read_size_limit(opts, true))? {
             had_matches = search_file(&read, &matcher, &rel_path, opts, writer, true)?;
         }
 

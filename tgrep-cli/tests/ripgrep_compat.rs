@@ -3381,6 +3381,32 @@ fn explicit_file_search_bypasses_hidden_walk_filter() {
         .stdout(predicate::str::contains(".hidden.rs"));
 }
 
+// ripgrep never applies `-g`/`-t` to a path named on the command line; they
+// only filter what a directory walk finds.
+#[test]
+fn explicit_file_bypasses_glob_and_type_filters() {
+    let dir = setup_fixture();
+    let hello = dir.path().join("testdata").join("hello.rs");
+    let hello = hello.to_str().unwrap();
+
+    for filter in [["-g", "*.py"], ["-t", "py"], ["-T", "rust"]] {
+        tgrep()
+            .args(["--no-index", "--no-heading", "-H"])
+            .args(filter)
+            .args(["fn", hello])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("hello.rs"));
+        tgrep()
+            .args(["--files"])
+            .args(filter)
+            .arg(hello)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("hello.rs"));
+    }
+}
+
 // ─── --glob / -g (multiple) ───────────────────────────────────────────
 
 #[test]
@@ -8066,6 +8092,31 @@ fn max_columns_omits_long_lines() {
         .assert()
         .success()
         .stdout(predicate::str::contains("[Omitted long matching line]"));
+}
+
+#[test]
+fn max_columns_zero_means_no_limit() {
+    // ripgrep: "When this flag is omitted or is set to 0, then it has no
+    // effect."
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    let line = format!("needle {}", "x".repeat(200));
+    fs::write(sub.join("long.txt"), format!("{line}\n")).unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-M",
+            "0",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(line.as_str()))
+        .stdout(predicate::str::contains("Omitted").not());
 }
 
 #[test]

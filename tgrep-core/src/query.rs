@@ -145,7 +145,12 @@ enum GroupKind {
 /// Every rewrite only ever *widens* the matched language, so
 /// `L(pattern) ⊆ L(relaxed)`:
 ///
-/// * deleting a zero-width lookaround removes a constraint on the match;
+/// * replacing a zero-width lookaround with the empty group `(?:)` removes a
+///   constraint on the match. The placeholder keeps the neighbouring tokens
+///   apart: deleting the group outright could fuse them into new syntax, as
+///   in `a{(?=2)2}` becoming the repetition `a{2}`, or hand a quantifier
+///   that applied to the lookaround to the preceding atom, as in `a(?=x){2}`
+///   becoming `a{2}`. Either would narrow the language;
 /// * turning `(?>…)` into `(?:…)` only restores backtracking paths.
 ///
 /// That direction is the one the index needs. A trigram the relaxed pattern
@@ -195,7 +200,10 @@ pub fn relax_for_indexing(pattern: &str) -> Option<String> {
             }
             '(' => {
                 match group_kind(&chars, i) {
-                    GroupKind::Lookaround => i = skip_group(&chars, i)?,
+                    GroupKind::Lookaround => {
+                        i = skip_group(&chars, i)?;
+                        out.push_str("(?:)");
+                    }
                     GroupKind::Atomic => {
                         out.push_str("(?:");
                         i += 3;
@@ -784,7 +792,7 @@ mod tests {
     fn negative_lookbehind_is_dropped_but_its_literal_survives() {
         // The Substrate benchmark's `pcre2-lookaround` query. `ExchangePrincipal`
         // is mandatory for any match, so the plan must be able to see it.
-        assert_relaxes_to("(?<!//)ExchangePrincipal", "ExchangePrincipal");
+        assert_relaxes_to("(?<!//)ExchangePrincipal", "(?:)ExchangePrincipal");
 
         let plan = build_query_plan("ExchangePrincipal", false).unwrap();
         assert!(
@@ -795,22 +803,22 @@ mod tests {
 
     #[test]
     fn every_lookaround_flavour_is_dropped() {
-        assert_relaxes_to("(?=foo)bar", "bar");
-        assert_relaxes_to("(?!foo)bar", "bar");
-        assert_relaxes_to("(?<=foo)bar", "bar");
-        assert_relaxes_to("(?<!foo)bar", "bar");
+        assert_relaxes_to("(?=foo)bar", "(?:)bar");
+        assert_relaxes_to("(?!foo)bar", "(?:)bar");
+        assert_relaxes_to("(?<=foo)bar", "(?:)bar");
+        assert_relaxes_to("(?<!foo)bar", "(?:)bar");
     }
 
     #[test]
     fn nested_groups_inside_a_lookaround_are_skipped_wholesale() {
-        assert_relaxes_to("(?=a(b(c))d)needle", "needle");
+        assert_relaxes_to("(?=a(b(c))d)needle", "(?:)needle");
         // A `)` inside a character class must not be mistaken for the closer.
-        assert_relaxes_to("(?![)])needle", "needle");
+        assert_relaxes_to("(?![)])needle", "(?:)needle");
         // Nor must an escaped one.
-        assert_relaxes_to(r"(?=a\))needle", "needle");
+        assert_relaxes_to(r"(?=a\))needle", "(?:)needle");
         // A class whose first member is a literal `]` still has to be skipped as
         // a unit, or the `)` after it ends the group early.
-        assert_relaxes_to("(?=[])])needle", "needle");
+        assert_relaxes_to("(?=[])])needle", "(?:)needle");
     }
 
     // A `]` in first position is a class member, and `[` nests. Getting either
@@ -843,7 +851,7 @@ mod tests {
         // `\p{L}+` is not a possessive quantifier, and bailing on it would
         // forfeit the optimisation for a common construct.
         assert_relaxes_to(r"\p{L}+x", r"\p{L}+x");
-        assert_relaxes_to(r"\p{Greek}+(?=x)", r"\p{Greek}+");
+        assert_relaxes_to(r"\p{Greek}+(?=x)", r"\p{Greek}+(?:)");
         // A literal brace is not one either.
         assert_relaxes_to("a{x}+b", "a{x}+b");
         // But a real repetition still guards against the possessive form.
@@ -888,11 +896,11 @@ mod tests {
 
         // Flag groups that do not enable `x` are still relaxable, and `x` after
         // a `-` is being switched off, not on.
-        assert_relaxes_to("(?i)needle(?=s)", "(?i)needle");
-        assert_relaxes_to("(?i:needle)(?=s)", "(?i:needle)");
-        assert_relaxes_to("(?-x)needle(?=s)", "(?-x)needle");
+        assert_relaxes_to("(?i)needle(?=s)", "(?i)needle(?:)");
+        assert_relaxes_to("(?i:needle)(?=s)", "(?i:needle)(?:)");
+        assert_relaxes_to("(?-x)needle(?=s)", "(?-x)needle(?:)");
         // `(?<name>` must not be mistaken for a flag group.
-        assert_relaxes_to("(?<name>needle)(?=s)", "(?<name>needle)");
+        assert_relaxes_to("(?<name>needle)(?=s)", "(?<name>needle)(?:)");
     }
 
     #[test]
@@ -959,6 +967,24 @@ mod tests {
         // plan.
         let plan = build_relaxed_multi_pattern_plan(&["^(?=.*foo)".to_string()], false);
         assert!(plan.is_match_all());
+    }
+
+    #[test]
+    fn a_dropped_lookaround_cannot_fuse_its_neighbours() {
+        // Deleting the group outright produced the repetitions `abc{2}`, which
+        // demand `abcc` and so lost every match of the original.
+        assert_relaxes_to("abc{(?=2)2}", "abc{(?:)2}");
+        assert_relaxes_to("abc(?=x){2}", "abc(?:){2}");
+        for (pattern, haystack) in [("abc{(?=2)2}", "abc{2}"), ("abc(?=x){2}", "abcx")] {
+            let relaxed = relax_for_indexing(pattern).expect("relaxable");
+            // A relaxed pattern that does not parse degrades to a full scan.
+            if let Ok(re) = regex::Regex::new(&relaxed) {
+                assert!(
+                    re.is_match(haystack),
+                    "{relaxed:?} (from {pattern:?}) must still match {haystack:?}"
+                );
+            }
+        }
     }
 
     #[test]

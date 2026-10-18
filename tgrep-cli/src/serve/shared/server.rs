@@ -370,16 +370,31 @@ pub fn run(root: &Path, options: Options<'_>) -> Result<()> {
         "Shared repository daemon v{PROTOCOL} listening on 127.0.0.1:{}",
         state.registration.port
     );
+    let mut accept_failures = super::AcceptRetry::new();
     for connection in listener.incoming() {
-        let stream = connection?;
+        let stream = match connection {
+            Ok(stream) => {
+                accept_failures.accepted();
+                stream
+            }
+            Err(error) => {
+                accept_failures.failed(error)?;
+                continue;
+            }
+        };
         if let Err(error) = incoming_tx.try_send(stream) {
             let mut stream = unsent(error);
-            stream.set_write_timeout(Some(Duration::from_millis(100)))?;
-            send_error(
-                &mut stream,
-                Value::Null,
-                &anyhow::anyhow!("shared connection queue full"),
-            );
+            // Without a write timeout the reply could stall the accept loop.
+            if stream
+                .set_write_timeout(Some(Duration::from_millis(100)))
+                .is_ok()
+            {
+                send_error(
+                    &mut stream,
+                    Value::Null,
+                    &anyhow::anyhow!("shared connection queue full"),
+                );
+            }
         }
     }
     Ok(())

@@ -1,0 +1,77 @@
+name: Benchmark Chromium worktrees
+
+on:
+  workflow_dispatch:
+    inputs:
+      worktrees:
+        description: Linked worktrees to add after the primary checkout (at least 2)
+        default: "3"
+      repeat:
+        description: Timed rounds per query and target
+        default: "3"
+      dirty_files:
+        description: Tracked files to modify in the last worktree before attaching it
+        default: "16"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Chromium worktrees (${{ matrix.os }})
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: python3
+          - os: macos-latest
+            python: python3
+          - os: windows-latest
+            python: python
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h
+
+      # The first worktree shares the primary commit (generation reuse), the
+      # second is one commit older (a new generation), and the last is dirty.
+      - name: Run benchmark
+        shell: bash
+        env:
+          WORKTREES: ${{ inputs.worktrees }}
+          REPEAT: ${{ inputs.repeat }}
+          DIRTY_FILES: ${{ inputs.dirty_files }}
+        run: |
+          ${{ matrix.python }} -B scripts/benchmark_worktrees.py \
+            --bench-dir "$RUNNER_TEMP/tgrep-worktree-bench" \
+            --worktrees "$WORKTREES" \
+            --worktree-rev HEAD --worktree-rev HEAD~1 \
+            --dirty-files "$DIRTY_FILES" \
+            --repeat "$REPEAT" \
+            --results-json worktree-benchmark.json \
+            --results-md worktree-benchmark.md
+
+      - name: Print results
+        if: always()
+        shell: bash
+        run: cat worktree-benchmark.md || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: benchmark-chromium-worktrees-${{ matrix.os }}
+          path: |
+            worktree-benchmark.json
+            worktree-benchmark.md
+          if-no-files-found: ignore

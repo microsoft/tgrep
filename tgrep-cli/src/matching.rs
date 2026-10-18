@@ -2204,6 +2204,8 @@ mod tests {
             r"[]a]n",
             r"[[:alpha:]]eedle(?!s)",
             r"\p{L}+(?=dle)",
+            // A dropped lookaround must not fuse its neighbours into a repeat.
+            r"Nee{(?=2)2}",
         ];
         let haystacks = [
             "",
@@ -2238,6 +2240,7 @@ mod tests {
             "3n",
             "Needle(?=a)",
             "\u{3b1}\u{3b2}dle",
+            "Nee{2}",
         ];
 
         for pattern in patterns {

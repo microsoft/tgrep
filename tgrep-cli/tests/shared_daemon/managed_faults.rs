@@ -984,6 +984,204 @@ fn collection_crash_boundaries_preserve_live_views_and_resumable_progress() {
     }
 }
 
+fn container_contents(path: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fs::read_dir(path)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            assert!(
+                entry.file_type().unwrap().is_file(),
+                "unexpected container entry {:?}",
+                entry.path()
+            );
+            (
+                entry.file_name().into_string().unwrap(),
+                fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn operations_cancel_stops_an_in_flight_collection_without_later_delete_credit() {
+    for point in [
+        "object-withdrawn",
+        "object-pending-deletion",
+        "member-intent-saved",
+        "member-before-io",
+        "collection-before-complete",
+    ] {
+        let before_io = point != "collection-before-complete";
+        let fixture = Fixture::new();
+        let mut configured = policy();
+        configured["retention"] = json!({"mode":"bounded","target_bytes":1});
+        configured["collection"]["max_pages"] = json!(64);
+        configured["collection"]["max_duration_ms"] = json!(5000);
+        let mut daemon = start(&fixture, &configured, &["--no-watch"]);
+        let (claim, guard) = owner(&daemon);
+        let attached = initial_attach(&daemon, &claim, attach_input(&fixture, &claim), point);
+        let sequence = next_sequence(&attached);
+        let current = &attached["result"]["current"];
+        let old_checkpoint = current["checkpoint"].clone();
+        let namespace = daemon.rpc("namespace.status", json!({}));
+        let object_path = fixture
+            .storage
+            .join(tgrep_core::managed::STORE_DIRECTORY)
+            .join(namespace["header"]["repository"].as_str().unwrap())
+            .join("objects")
+            .join(old_checkpoint.as_str().unwrap());
+        completed(&daemon, &daemon.rpc("views.refresh", json!({"token":token(&claim,sequence),"request":{
+            "view":current["id"],"expected_version":1,"owner":claim.owner,"allocation_version":1
+        }})));
+        let original = container_contents(&object_path);
+        assert!(!original.is_empty(), "{point}: checkpoint has no members");
+        let retained_memory = |usage: &Value| {
+            (
+                usage["memory"]["retained_allocations"].clone(),
+                usage["memory"]["retained_private_estimate_bytes"].clone(),
+            )
+        };
+        let memory_before = retained_memory(&daemon.rpc("namespace.status", json!({}))["usage"]);
+        let request = json!({
+            "policy_version":1,"allocation_version":1,"cursor":null,
+            "bounds":{"max_duration_ms":5000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,"max_pages":64}
+        });
+        let collection_token = token(&claim, sequence + 1);
+        let hook = pause_for_operation(&daemon, point, &collection_token);
+        let operation = daemon.rpc(
+            "collections.start",
+            json!({"token":collection_token,"request":request}),
+        );
+        assert_eq!(
+            reached(&daemon, &hook)["reached_operation"],
+            operation["id"],
+            "{point}"
+        );
+        let paused = daemon.rpc("operations.inspect", json!({"id":operation["id"]}));
+        let cancelling = daemon.rpc("operations.cancel", json!({"id":operation["id"]}));
+        // The cancel request must be serviced while the worker is still parked.
+        let barrier = daemon.rpc("testing.status", json!({}));
+        daemon.rpc("testing.release", json!({"id":hook["ticket"]}));
+        assert_eq!(paused["state"], "preparing", "{point}: {paused}");
+        assert_eq!(barrier["ticket"], hook["ticket"], "{point}");
+        assert_eq!(barrier["stage"], "waiting", "{point}: {barrier}");
+        assert_eq!(cancelling["cancelled"], true, "{point}: {cancelling}");
+        assert_eq!(cancelling["state"], "cancelling", "{point}: {cancelling}");
+
+        let cancelled = terminal(&daemon, &operation);
+        let result = &cancelled["result"];
+        assert_eq!(cancelled["state"], "cancelled", "{point}: {cancelled}");
+        assert_eq!(cancelled["cancelled"], true, "{point}: {cancelled}");
+        assert_eq!(cancelled["progress"], *result, "{point}: {cancelled}");
+        assert_eq!(result["cancelled"], true, "{point}: {cancelled}");
+        assert_eq!(
+            result["verification_context_retained"], false,
+            "{point}: {cancelled}"
+        );
+        if before_io {
+            assert_eq!(
+                cancelled["committed_state"], "committed",
+                "{point}: {cancelled}"
+            );
+            assert!(
+                result["retired"].as_u64().unwrap() >= 1,
+                "{point}: {cancelled}"
+            );
+            for field in [
+                "removed",
+                "logical_bytes_reclaimed",
+                "recovered_logical_bytes",
+            ] {
+                assert_eq!(result[field], 0, "{point} {field}: {cancelled}");
+            }
+            assert!(result["next"].is_object(), "{point}: {cancelled}");
+            assert!(!collected(&daemon, &old_checkpoint), "{point}");
+            assert_eq!(
+                container_contents(&object_path),
+                original,
+                "{point}: cancelled collection changed checkpoint members"
+            );
+        } else {
+            for field in [
+                "removed",
+                "logical_bytes_reclaimed",
+                "recovered_logical_bytes",
+            ] {
+                assert_eq!(
+                    result[field], paused["progress"][field],
+                    "{point} {field}: {cancelled}; paused: {paused}"
+                );
+            }
+        }
+        let maintenance =
+            super::live::wait_for(&daemon, "maintenance.status", json!({}), |status| {
+                let state = &status["details"]["verification"]["state"];
+                assert_ne!(state, "cached", "{point}: {status}");
+                state == "empty"
+            });
+        let verification = &maintenance["details"]["verification"];
+        assert_eq!(
+            verification["retained_contexts"],
+            json!({"status":"observed","value":0}),
+            "{point}: {maintenance}"
+        );
+        assert_eq!(
+            verification["retained_capacity_bytes"], 0,
+            "{point}: {maintenance}"
+        );
+        let usage = daemon.rpc("namespace.status", json!({}))["usage"].clone();
+        assert_eq!(
+            retained_memory(&usage),
+            memory_before,
+            "{point}: cancelled collection retained memory: {usage}"
+        );
+
+        let replay = daemon.rpc(
+            "collections.start",
+            json!({"token":collection_token,"request":request}),
+        );
+        assert_eq!(replay["id"], operation["id"], "{point}: {replay}");
+        assert_eq!(
+            terminal(&daemon, &replay)["result"],
+            *result,
+            "{point}: replay"
+        );
+
+        let mut continuation = result["next"].clone();
+        let mut next = sequence + 2;
+        while !collected(&daemon, &old_checkpoint) {
+            assert!(
+                next < sequence + 18,
+                "{point}: cancelled collection did not resume to completion"
+            );
+            let mut next_request = request.clone();
+            next_request["cursor"] = continuation;
+            let resumed = completed(
+                &daemon,
+                &daemon.rpc(
+                    "collections.start",
+                    json!({"token":token(&claim,next),"request":next_request}),
+                ),
+            );
+            assert_eq!(resumed["result"]["cancelled"], false, "{point}: {resumed}");
+            continuation = resumed["result"]["next"].clone();
+            next += 1;
+        }
+        assert!(
+            !object_path.exists(),
+            "{point}: collected container still exists"
+        );
+        assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+        daemon.rpc(
+            "views.detach",
+            json!({"owner":claim.owner,"lease":"managed-client"}),
+        );
+        daemon.rpc("owners.release", json!({"claim":claim}));
+        drop(guard);
+        stop(&mut daemon);
+    }
+}
+
 #[test]
 fn owner_release_drains_roots_while_unrelated_control_cleanup_is_paused() {
     let fixture = Fixture::new();

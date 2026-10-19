@@ -76,6 +76,30 @@ In that run, one timed `#include "base/` query on a worktree view exceeded
 the 600 s query timeout during round 3 while all other queries completed; the
 harness now records such failures per query instead of discarding the run.
 
+#### Query latency: base versus worktree views
+
+A second run (`--worktrees 2 --dirty-files 16 --repeat 2 --query-limit 12
+--query-timeout 900`) completed every timed query. The host was roughly 4-5x
+slower that day (file creation under an endpoint filter), so its attach times
+are not comparable with the table above: base 4,095.6 s, worktree attaches
+2,371.3 s and 2,883.7 s, still with full generation reuse.
+
+| Query (p50 ms, client wall) | Managed base | Worktree 1 | Worktree 2 (dirty) | Matches |
+| --- | ---: | ---: | ---: | ---: |
+| `blink::LocalFrame` | 4,238.3 | 4,224.0 | 4,229.8 | 659 |
+| `content::RenderFrameHost` | 5,818.4 | 5,873.3 | 5,959.5 | 10,694 |
+| `base::BindOnce` | 12,637.3 | 11,879.1 | 12,798.2 | 55,806 |
+| `GURL` | 15,884.2 | 15,998.5 | 15,804.6 | 162,396 |
+| Sum of 12 queries (client) | 107,030.6 | 108,067.3 | 107,286.5 | |
+| Sum of 12 queries (server-reported) | 53,047.7 | 53,389.3 | 55,665.7 | |
+
+Worktree views answer at the same cost as the base view (within 1% client,
+5% server): queries over a reused generation plus a private overlay do not
+pay a per-worktree penalty. Latency scales with match count and output
+volume; about half of client wall time is CLI startup, transfer and printing.
+The harness dirties only non-hidden tracked files, because default queries
+skip hidden paths such as `.agents/`.
+
 ## Large-checkout reconciliation: RC2
 
 **A fresh managed attachment to an already published base took 186.144 seconds

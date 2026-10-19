@@ -577,8 +577,9 @@ class Benchmark:
         }
 
     def make_dirty(self, path, count):
+        # Default queries skip hidden paths, so only dirty files they can see.
         names = [name for name in decode(self.git("ls-files", "-z", cwd=path).stdout).split("\0")
-                 if name]
+                 if name and not any(part.startswith(".") for part in name.split("/"))]
         text = [name for name in names if name.endswith(DIRTY_SUFFIXES)] or names
         regular = []
         step = max(1, len(text) // (count * 4))

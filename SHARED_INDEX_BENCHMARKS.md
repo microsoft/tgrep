@@ -12,6 +12,70 @@ V1 is deprecated as of tgrep 1.2.1 but remains supported; new integrations shoul
 use [managed v2](README.md#managed-shared-lifecycle-opt-in). The historical v1
 measurements and their pinned controls remain unchanged.
 
+## Multi-worktree large-repository benchmark
+
+[`scripts/benchmark_worktrees.py`](scripts/benchmark_worktrees.py) measures one
+managed v2 daemon serving a large repository (default `chromium/chromium`)
+and several linked worktrees: the ordinary `tgrep index` baseline, the cold
+base attachment (committed-tree generation build plus primary verification),
+`git worktree add` and attach-to-ready for every worktree, and per-query
+latency on the base index, the managed primary view and every worktree view.
+It checks result parity across clean targets, expected backends, and base
+generation reuse. Timed queries that exceed `--query-timeout` are recorded as
+failures; the remaining measurements are still reported.
+
+```bash
+cargo build --release -p tgrep-cli
+python -B scripts/benchmark_worktrees.py --bench-dir /tmp/tgrep-wt-bench \
+  --worktrees 4 --worktree-rev HEAD --worktree-rev HEAD --worktree-rev HEAD~1 \
+  --dirty-files 16 --repeat 3
+```
+
+The [Chromium worktree workflow](.github/workflows/benchmark-chromium-worktrees.yml)
+runs the same harness manually on a large runner.
+
+### Windows, Chromium @ 4ea1cdf4aa65 (issue #210 work)
+
+Host: Windows 11, 16 logical CPUs, 64 GiB; 510,793 tracked files;
+`--no-watch`, one namespace operation worker, warm file cache. Ordinary
+`tgrep index`: 258.5 s; its server answered queries after 6.7 s.
+
+The cold managed base attachment on the same host fell from 3,575 s (the
+pre-change build) to 838.8 s through this work:
+
+| Change | Base attach (s) |
+| --- | ---: |
+| Before (v1.2.3 sources) | 3,575 |
+| Batched catalog commits, `work_revision` bumped only on row changes, recovery backoff | 1,351.6 |
+| Windows parent-handle gate raised to 8,192 | 1,215.8 |
+| Binary-extension files no longer split verified-read batches | 838.8 |
+
+Worktree attachments, run sequentially against that daemon (four worktrees,
+three at the base commit, one at `HEAD~1`, the last with 16 dirty files):
+
+| View | `git worktree add` (s) | Attach to ready (s) | Base generation |
+| --- | ---: | ---: | --- |
+| Worktree 1 | 463.2 | 686.7 | reused |
+| Worktree 2 | 575.8 | 1,647.6 | reused |
+| Worktree 3 (`HEAD~1`) | 583.1 | 2,532.7 | new (1,213 s build) |
+| Worktree 4 (16 dirty) | 490.3 | 1,769.7 | reused |
+
+Every same-commit worktree reused the published generation (`blobs_read=0`)
+and still read every file once, because a first attachment always performs
+full content verification; private overlays stayed at 46-63 files. Storage
+grew from 4.49 GiB (base) to 8.99 GiB (two generations plus overlays).
+Later attachments were slower than the first because earlier views shared the
+same disk: per-view namespace catalog time rose from 433 s to 1,829-3,093 s.
+The idle scheduler pacing described in
+[SHARED_WORKTREE_INDEXES.md](SHARED_WORKTREE_INDEXES.md) reduces that
+contention from ready views; remaining cost is dominated by per-file open and
+verification I/O, which is the next optimization target (for example
+trusting same-commit Git index stat data instead of rereading content).
+
+In that run, one timed `#include "base/` query on a worktree view exceeded
+the 600 s query timeout during round 3 while all other queries completed; the
+harness now records such failures per query instead of discarding the run.
+
 ## Large-checkout reconciliation: RC2
 
 **A fresh managed attachment to an already published base took 186.144 seconds

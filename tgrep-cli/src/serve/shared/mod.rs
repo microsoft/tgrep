@@ -66,6 +66,14 @@ fn validate_repository(root: &Path, repository: &Repository) -> Result<()> {
     Ok(())
 }
 
+pub fn status(root: &Path, index_path: Option<&Path>) -> Result<()> {
+    anyhow::ensure!(index_path.is_none(), "--shared does not use --index-path");
+    let (client, view) = Client::registered(root)?;
+    let result = client.view_request("status", &view, serde_json::json!({}))?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
 /// Tolerates transient `accept` failures, such as a peer that reset before it
 /// was accepted or a brief descriptor shortage. Either daemon holds every
 /// attached lease, so one such failure must not end it; a failure that
@@ -123,12 +131,4 @@ mod accept_tests {
         let error = retry.failed(failure()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
     }
-}
-
-pub fn status(root: &Path, index_path: Option<&Path>) -> Result<()> {
-    anyhow::ensure!(index_path.is_none(), "--shared does not use --index-path");
-    let (client, view) = Client::registered(root)?;
-    let result = client.view_request("status", &view, serde_json::json!({}))?;
-    println!("{}", serde_json::to_string_pretty(&result)?);
-    Ok(())
 }

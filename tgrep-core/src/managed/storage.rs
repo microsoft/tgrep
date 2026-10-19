@@ -453,8 +453,26 @@ impl Directory {
     /// Closing any independently opened descriptor releases this process's POSIX
     /// locks on that inode, including SQLite's database and shared-memory locks.
     pub(crate) fn observe_file(&self, name: &str) -> Result<FileObservation> {
-        component(name)?;
+        Ok(self.observe_files(&[name])?.remove(0))
+    }
+
+    /// Observe several children between one pair of directory verifications.
+    /// Each verification reopens the pinned root, which dominates catalog-call
+    /// latency on Windows when repeated per child and per nested open.
+    pub(crate) fn observe_files(&self, names: &[&str]) -> Result<Vec<FileObservation>> {
+        for name in names {
+            component(name)?;
+        }
         self.verify()?;
+        let observations = names
+            .iter()
+            .map(|name| self.observe_unverified(name))
+            .collect::<Result<Vec<_>>>()?;
+        self.verify()?;
+        Ok(observations)
+    }
+
+    fn observe_unverified(&self, name: &str) -> Result<FileObservation> {
         #[cfg(unix)]
         let observation = {
             use std::os::fd::AsRawFd;
@@ -498,7 +516,7 @@ impl Directory {
         };
         #[cfg(windows)]
         let observation = {
-            let file = self.open_native(name, false, false, false)?;
+            let file = self.open_unverified(name, false, false, false, false, false)?;
             FileObservation {
                 identity: FileIdentity::of(&file)?,
                 logical_bytes: file.metadata()?.len(),
@@ -509,7 +527,6 @@ impl Directory {
         return Err(Error::incompatible(
             "native file observation is unsupported",
         ));
-        self.verify()?;
         Ok(observation)
     }
 
@@ -532,6 +549,22 @@ impl Directory {
     ) -> Result<File> {
         component(name)?;
         self.verify()?;
+        let file =
+            self.open_unverified(name, write, create, directory, protect_contents, private)?;
+        self.verify()?;
+        Ok(file)
+    }
+
+    /// Callers must bracket this with directory verification.
+    fn open_unverified(
+        &self,
+        name: &str,
+        write: bool,
+        create: bool,
+        directory: bool,
+        protect_contents: bool,
+        private: bool,
+    ) -> Result<File> {
         #[cfg(unix)]
         let file = {
             let _ = (protect_contents, private);
@@ -611,7 +644,6 @@ impl Directory {
                 ));
             }
         }
-        self.verify()?;
         Ok(file)
     }
 

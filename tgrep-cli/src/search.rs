@@ -609,9 +609,10 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
             let (client, view) = crate::serve::shared::Client::registered(&root)?;
             let scope = IndexScope::resolve(&view.root, &root)
                 .ok_or_else(|| anyhow::anyhow!("search root outside shared worktree"))?;
-            let result = client.view_request(
+            let result = client.view_pages(
                 "files", &view,
                 serde_json::json!({"hidden":opts.hidden,"scope":scope.prefix(),"max_depth":opts.max_depth}),
+                |_| false,
             )?;
             let paths: Vec<String> = serde_json::from_value(
                 result
@@ -955,7 +956,13 @@ pub fn run(
                 let scope = IndexScope::resolve(&view.root, &root)
                     .ok_or_else(|| anyhow::anyhow!("search root outside shared worktree"))?;
                 let request = server_search_request(&scope, opts, ci)?;
-                let result = client.view_request("search", &view, request["params"].clone())?;
+                let result =
+                    client.view_pages("search", &view, request["params"].clone(), |result| {
+                        opts.quiet
+                            && !opts.stats
+                            && opts.max_depth.is_none()
+                            && quiet_answered(result)
+                    })?;
                 require_server_coverage(&result)?;
                 require_ordered_filters(&result, &request)?;
                 require_replace_support(&result, &request)?;
@@ -1275,6 +1282,40 @@ fn flag_set(value: &serde_json::Value, key: &str) -> bool {
     value.get(key).and_then(|v| v.as_bool()) == Some(true)
 }
 
+fn server_spans(value: Option<&serde_json::Value>) -> Vec<(usize, usize)> {
+    value
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let p = p.as_array()?;
+                    Some((p.first()?.as_u64()? as usize, p.get(1)?.as_u64()? as usize))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether merged shared pages already contain a visible match for `-q`.
+/// Binary files may be hidden later, so their rows never answer it.
+fn quiet_answered(result: &serde_json::Value) -> bool {
+    let rows = result["matches"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let binary: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|row| row["type"] == "binary")
+        .filter_map(|row| row["file"].as_str())
+        .collect();
+    rows.iter().any(|row| {
+        row.get("type").is_none_or(|kind| kind == "match")
+            && row["file"]
+                .as_str()
+                .is_some_and(|file| !binary.contains(file))
+    })
+}
+
 fn projected_line_count(row: &serde_json::Value) -> Result<(&str, usize)> {
     anyhow::ensure!(
         matches!(
@@ -1552,8 +1593,15 @@ fn render_server_result(
             let offset = m.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
             // `-M/--max-columns` counts the line terminator, which only the
             // server knows; an older server omits it and simply measures the
-            // visible text.
-            let terminator_len = m.get("term").and_then(|t| t.as_u64()).unwrap_or(0) as usize;
+            // visible text, and its JSON lines always ended in `\n`.
+            let terminator_len = m
+                .get("term")
+                .and_then(|t| t.as_u64())
+                .map_or(usize::from(opts.json), |t| t as usize);
+            let raw = m
+                .get("raw")
+                .and_then(|r| r.as_str())
+                .and_then(crate::output::base64_decode);
             if mtype == "context" {
                 writer.write_context_separator(file, line)?;
                 writer.write_context_line(&ContextLine {
@@ -1562,22 +1610,16 @@ fn render_server_result(
                     content: content.to_string(),
                     absolute_offset: offset,
                     terminator_len,
+                    raw,
                 })?;
             } else if mtype == "binary" {
                 writer.write_binary_note(file, offset)?;
             } else {
-                let spans = m
-                    .get("spans")
-                    .and_then(|s| s.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|p| {
-                                let p = p.as_array()?;
-                                Some((p.first()?.as_u64()? as usize, p.get(1)?.as_u64()? as usize))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let spans = server_spans(m.get("spans"));
+                let raw = raw.map(|bytes| crate::output::RawLine {
+                    bytes,
+                    spans: server_spans(m.get("raw_spans")),
+                });
                 // `-U --replace` rows carry the source lines of their block,
                 // which is what decides context gaps.
                 let block = m.get("block").and_then(|b| b.as_array()).and_then(|b| {
@@ -1608,6 +1650,7 @@ fn render_server_result(
                     block,
                     hidden: m.get("hidden").and_then(|h| h.as_bool()).unwrap_or(false),
                     replacements,
+                    raw,
                 })?;
             }
         }
@@ -2298,6 +2341,36 @@ pub(crate) fn to_source_positions(
     (columns, offset)
 }
 
+/// The source bytes of one emitted line, for JSON, when lossy decoding
+/// repaired it. `absolute_offset` and `spans` are in decoded terms; the
+/// result's spans are source offsets relative to the line.
+pub(crate) fn raw_line(
+    text: &str,
+    fixups: &tgrep_core::encoding::LossyFixups,
+    content: &str,
+    absolute_offset: usize,
+    spans: &[(usize, usize)],
+) -> Option<crate::output::RawLine> {
+    if fixups.is_empty() {
+        return None;
+    }
+    let end = absolute_offset.checked_add(content.len())?;
+    if text.get(absolute_offset..end)? != content {
+        return None;
+    }
+    let bytes = fixups.source_bytes(text, absolute_offset, end)?;
+    let base = fixups.to_source_offset(absolute_offset);
+    let source = |at: usize| {
+        fixups
+            .to_source_offset(absolute_offset + at)
+            .saturating_sub(base)
+    };
+    Some(crate::output::RawLine {
+        bytes,
+        spans: spans.iter().map(|&(s, e)| (source(s), source(e))).collect(),
+    })
+}
+
 /// What happened to one file during a search.
 ///
 /// `Skipped` exists because ripgrep hides binary files found by traversal
@@ -2449,6 +2522,10 @@ fn search_decoded_file(
             } => {
                 // A rewritten block is a gap only if its source lines are.
                 writer.write_context_separator(rel_path, block.map_or(line_number, |b| b.0))?;
+                let raw = writer
+                    .is_json()
+                    .then(|| raw_line(text.as_str(), fixups, &content, absolute_offset, &spans))
+                    .flatten();
                 let (columns, absolute_offset) = to_source_positions(
                     &columns,
                     &column_shifts,
@@ -2468,6 +2545,7 @@ fn search_decoded_file(
                     block,
                     hidden,
                     replacements,
+                    raw,
                 })?;
             }
             crate::matching::Emit::Context {
@@ -2477,12 +2555,18 @@ fn search_decoded_file(
                 terminator_len,
             } => {
                 writer.write_context_separator(rel_path, line_number)?;
+                let raw = writer
+                    .is_json()
+                    .then(|| raw_line(text.as_str(), fixups, content, absolute_offset, &[]))
+                    .flatten()
+                    .map(|raw| raw.bytes);
                 writer.write_context_line(&ContextLine {
                     file: rel_path.to_string(),
                     line_number,
                     content: content.to_string(),
                     absolute_offset: fixups.to_source_offset(absolute_offset),
                     terminator_len,
+                    raw,
                 })?;
             }
         }

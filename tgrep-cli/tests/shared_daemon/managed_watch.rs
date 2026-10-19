@@ -170,7 +170,7 @@ fn matches(daemon: &Daemon, view: &Value, pattern: &str) -> Vec<Value> {
 
 #[test]
 #[cfg(feature = "managed-test-hooks")]
-fn parity_rejects_invalidation_after_an_earlier_ready_snapshot() {
+fn lagging_view_serves_its_last_publication_then_converges() {
     for files in [true, false] {
         let fixture = Fixture::new();
         let pattern = "native_ready_snapshot_only";
@@ -203,41 +203,42 @@ fn parity_rejects_invalidation_after_an_earlier_ready_snapshot() {
         } else {
             vec!["--stats", "--json", "-F", "--", pattern, "."]
         };
-        let mut invocations = 0;
-        let indexed = managed_cli(&daemon, &view, || {
-            invocations += 1;
-            if invocations == 1 {
-                // Deliver a real ignore event after the caller's ready snapshot.
-                fs::write(common.join("info").join("exclude"), "ignored/\n").unwrap();
-                faults::reached(&daemon, &hook);
-                let pending = daemon.rpc("views.status", json!({"id":view["view"]}));
-                assert_eq!(pending["ready"], false, "{pending}");
-                assert_eq!(pending["watch_mode"], "native", "{pending}");
-                assert!(pending["watch_fallback"].is_null(), "{pending}");
-                assert!(epoch(&pending) > epoch(&ready), "{pending}");
-                eprintln!(
-                    "late invalidation control: {}",
-                    json!({"files":files,"ready_epoch":epoch(&ready),
-                        "pending_epoch":epoch(&pending),"pending_ready":pending["ready"]})
-                );
-            }
-            let output = runtime::output(
+        let run = || {
+            runtime::output(
                 Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
                     .current_dir(&fixture.b)
                     .env("HOME", fixture.temp.path())
                     .env("USERPROFILE", fixture.temp.path())
                     .env("XDG_CONFIG_HOME", fixture.temp.path())
                     .args(&args),
-            );
-            if invocations == 1 {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                assert!(stderr.contains("view-input-pending"), "{output:?}");
-                assert!(stderr.contains("scanning filesystem"), "{output:?}");
-                assert!(!stderr.contains("(via shared daemon v2)"), "{output:?}");
-                daemon.rpc("testing.release", json!({"id":hook["ticket"]}));
-            }
-            output
-        });
+            )
+        };
+        // Deliver a real ignore event after the caller's ready snapshot.
+        fs::write(common.join("info").join("exclude"), "ignored/\n").unwrap();
+        faults::reached(&daemon, &hook);
+        let pending = daemon.rpc("views.status", json!({"id":view["view"]}));
+        assert_eq!(pending["ready"], false, "{pending}");
+        assert_eq!(pending["serving"], true, "{pending}");
+        assert_eq!(pending["watch_mode"], "native", "{pending}");
+        assert!(pending["watch_fallback"].is_null(), "{pending}");
+        assert!(epoch(&pending) > epoch(&ready), "{pending}");
+        // Eventual consistency: a lagging view keeps answering from its last
+        // publication instead of sending the client to a filesystem scan.
+        let lagging = run();
+        let stderr = String::from_utf8_lossy(&lagging.stderr);
+        assert!(matches!(lagging.status.code(), Some(0 | 1)), "{lagging:?}");
+        assert!(!stderr.contains("scanning filesystem"), "{lagging:?}");
+        assert!(!stderr.contains("view-input-pending"), "{lagging:?}");
+        // The paused pass has already swapped its reconciled state in memory;
+        // only its durable commit waits, so either membership may be served.
+        if files {
+            assert!(lagging.stderr.is_empty(), "{lagging:?}");
+        } else {
+            assert!(stderr.contains("(via shared daemon v2)"), "{lagging:?}");
+        }
+        daemon.rpc("testing.release", json!({"id":hook["ticket"]}));
+        native_ready(&daemon, &view, Some(epoch(&ready)));
+        let indexed = managed_cli(&daemon, &view, run);
         if files {
             assert!(indexed.stderr.is_empty(), "{indexed:?}");
             let paths = success(indexed);
@@ -257,7 +258,6 @@ fn parity_rejects_invalidation_after_an_earlier_ready_snapshot() {
             let summary = rows.iter().find(|row| row["type"] == "summary").unwrap();
             assert_eq!(summary["data"]["stats"]["matches"], 0, "{summary}");
         }
-        assert!(invocations >= 2, "fallback output was not discarded");
         assert!(matches(&daemon, &view, pattern).is_empty());
         assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
         native_ready(&daemon, &view, Some(epoch(&ready)));

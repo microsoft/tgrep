@@ -1635,6 +1635,134 @@ fn indexed_json_preserves_utf8_match_and_context_offsets() {
 }
 
 #[test]
+fn indexed_json_keeps_line_terminators_and_raw_invalid_utf8() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("crlf.txt"),
+        "alpha\r\nneedle one\r\nbeta\r\nneedle end",
+    )
+    .unwrap();
+    fs::write(
+        root.join("latin.txt"),
+        b"caf\xe9 needle\nok needle\n\xff\n".as_slice(),
+    )
+    .unwrap();
+    // Verified against rg 15.2.0 with `--json -C 1 -F needle`.
+    let expected = [
+        (
+            "crlf.txt",
+            "context",
+            1,
+            0,
+            serde_json::json!({"text":"alpha\r\n"}),
+            vec![],
+        ),
+        (
+            "crlf.txt",
+            "match",
+            2,
+            7,
+            serde_json::json!({"text":"needle one\r\n"}),
+            vec![(0, 6)],
+        ),
+        (
+            "crlf.txt",
+            "context",
+            3,
+            19,
+            serde_json::json!({"text":"beta\r\n"}),
+            vec![],
+        ),
+        (
+            "crlf.txt",
+            "match",
+            4,
+            25,
+            serde_json::json!({"text":"needle end"}),
+            vec![(0, 6)],
+        ),
+        (
+            "latin.txt",
+            "match",
+            1,
+            0,
+            serde_json::json!({"bytes":"Y2Fm6SBuZWVkbGUK"}),
+            vec![(5, 11)],
+        ),
+        (
+            "latin.txt",
+            "match",
+            2,
+            12,
+            serde_json::json!({"text":"ok needle\n"}),
+            vec![(3, 9)],
+        ),
+        (
+            "latin.txt",
+            "context",
+            3,
+            22,
+            serde_json::json!({"bytes":"/wo="}),
+            vec![],
+        ),
+    ];
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        let output = tgrep()
+            .args(backend)
+            .args(["--json", "--stats", "-F", "-C", "1", "--", "needle"])
+            .arg(&root)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert!(String::from_utf8_lossy(&output.stderr).contains(marker));
+        let mut rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|row: &serde_json::Value| row["type"] == "match" || row["type"] == "context")
+            .collect();
+        let name = |row: &serde_json::Value| {
+            let path = row["data"]["path"]["text"].as_str().unwrap();
+            std::path::Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        rows.sort_by_key(|row| (name(row), row["data"]["line_number"].as_u64()));
+        assert_eq!(rows.len(), expected.len(), "{marker}: {rows:#?}");
+        for (row, (file, kind, line, offset, lines, spans)) in rows.iter().zip(&expected) {
+            assert_eq!(name(row), *file, "{marker}");
+            assert_eq!(row["type"], *kind, "{marker}");
+            assert_eq!(row["data"]["line_number"], *line, "{marker}");
+            assert_eq!(row["data"]["absolute_offset"], *offset, "{marker}: {row}");
+            assert_eq!(row["data"]["lines"], *lines, "{marker}: {row}");
+            let actual: Vec<_> = row["data"]["submatches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|span| {
+                    assert_eq!(
+                        span["match"],
+                        serde_json::json!({"text":"needle"}),
+                        "{marker}"
+                    );
+                    (
+                        span["start"].as_u64().unwrap(),
+                        span["end"].as_u64().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(&actual, spans, "{marker}: {row}");
+        }
+    });
+}
+
+#[test]
 fn indexed_inline_case_flags_keep_candidates_selective() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");

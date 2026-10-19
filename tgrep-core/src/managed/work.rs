@@ -765,6 +765,13 @@ pub(crate) struct ReconciliationResources {
     ready: Condvar,
 }
 
+// Windows charges every component of a retained parent chain, so a 256 gate
+// splits deep checkouts into ranges of a few parents and serializes
+// verification. Kernel handles are not a scarce per-process descriptor table
+// there; Unix keeps the conservative bound for RLIMIT_NOFILE.
+#[cfg(windows)]
+pub(crate) const RECONCILE_PARENT_HANDLES: u64 = 8192;
+#[cfg(not(windows))]
 pub(crate) const RECONCILE_PARENT_HANDLES: u64 = 256;
 
 #[derive(Default)]

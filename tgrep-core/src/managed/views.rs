@@ -216,6 +216,9 @@ pub struct ViewManager {
 pub struct ViewStatus {
     pub authoritative: ViewRecord,
     pub ready: bool,
+    /// Queries are admitted. Equal to `ready` for strict views; eventual
+    /// views keep serving their last publication while reconciliation lags.
+    pub serving: bool,
     pub input_epoch: u64,
     pub queries: u32,
     pub old_snapshots: usize,
@@ -1665,6 +1668,7 @@ impl ViewManager {
         } else {
             RECONCILE_ATTEMPTS
         };
+        let eventual = view.stale_reads();
         for _ in 0..attempts {
             permit.check()?;
             let input = slot.epoch.load(Ordering::Acquire);
@@ -1673,7 +1677,9 @@ impl ViewManager {
                 Err(crate::worktrees::WorktreeError::ChangedDuringReconcile) => continue,
                 Err(error) => return Err(error.into()),
             };
-            if slot.epoch.load(Ordering::Acquire) != input {
+            // Eventual views publish what this pass reconciled; invalidations
+            // that arrived since `input` stay queued for the next pass.
+            if !eventual && slot.epoch.load(Ordering::Acquire) != input {
                 continue;
             }
             let checkpoint_start = std::time::Instant::now();
@@ -1698,7 +1704,7 @@ impl ViewManager {
                 }
                 return Err(error);
             }
-            if slot.epoch.load(Ordering::Acquire) == input
+            if (eventual || slot.epoch.load(Ordering::Acquire) == input)
                 && view.status()?.published_epoch == Some(stats.epoch)
             {
                 return Ok((checkpoint, stats, input));
@@ -1735,7 +1741,7 @@ impl ViewManager {
         if state.closing {
             return Err(Error::busy("view-closing"));
         }
-        if slot.epoch.load(Ordering::Acquire) != input {
+        if !view.stale_reads() && slot.epoch.load(Ordering::Acquire) != input {
             return Err(Error::busy("publication-epoch-changed"));
         }
         if view.status()?.published_epoch != Some(stats.epoch) {
@@ -1808,7 +1814,8 @@ impl ViewManager {
             return Err(error);
         }
         // Invalidation advances the common clock before taking this publication gate.
-        if slot.epoch.load(Ordering::Acquire) != input {
+        // Eventual views already hold those invalidations as queued hints.
+        if !view.stale_reads() && slot.epoch.load(Ordering::Acquire) != input {
             view.invalidate_all()
                 .map_err(|error| Error::from(error).committed(CommitState::Committed))?;
         }
@@ -1839,6 +1846,7 @@ impl ViewManager {
                 authoritative,
                 leases,
                 ready: false,
+                serving: false,
                 queries: 0,
                 old_snapshots: 0,
                 work: None,
@@ -1851,19 +1859,26 @@ impl ViewManager {
             .state
             .lock()
             .map_err(|_| Error::corrupt("view lock poisoned"))?;
-        let ready = if let Some(current) = &state.current {
+        let (ready, serving) = if let Some(current) = &state.current {
             let status = current.view.status()?;
-            !state.closing
+            let ready = !state.closing
                 && current.record.same_publication(&authoritative)
                 && current.record.input_epoch == slot.epoch.load(Ordering::Acquire)
                 && status.ready
-                && status.published_epoch == current.record.reconciled_epoch
+                && status.published_epoch == current.record.reconciled_epoch;
+            let serving = if current.view.stale_reads() {
+                !state.closing && status.serving
+            } else {
+                ready
+            };
+            (ready, serving)
         } else {
-            false
+            (false, false)
         };
         Ok(ViewStatus {
             authoritative,
             ready,
+            serving,
             input_epoch: slot.epoch.load(Ordering::Acquire),
             queries: state.queries,
             old_snapshots: state
@@ -2069,6 +2084,17 @@ impl ViewSlot {
         self.epoch.load(Ordering::Acquire)
     }
 
+    /// Whether a watched file still matches the trusted evidence of the
+    /// current publication. Conservatively false while a replacement is being
+    /// prepared, so its independent reads never depend on a dropped event.
+    pub fn unchanged_file(&self, relative: &Path, metadata: &std::fs::Metadata) -> bool {
+        let current = match self.state.lock() {
+            Ok(state) if !state.closing && state.preparing.is_none() => state.current.clone(),
+            _ => None,
+        };
+        current.is_some_and(|current| current.view.unchanged_file(relative, metadata))
+    }
+
     pub fn current(&self) -> Result<Arc<PublishedView>> {
         let state = self
             .state
@@ -2199,12 +2225,20 @@ impl ViewSlot {
             return Err(Error::stale_version(published.record.version));
         }
         let epoch = self.epoch.load(Ordering::Acquire);
-        if epoch != published.record.input_epoch {
-            return Err(Error::busy("view-input-pending"));
-        }
         let status = published.view.status()?;
-        if !status.ready || status.published_epoch != published.record.reconciled_epoch {
-            return Err(Error::busy("checkpoint-not-current"));
+        if published.view.stale_reads() {
+            // Eventual views serve their last published snapshot while newer
+            // invalidations wait for the next reconciliation.
+            if !status.serving {
+                return Err(Error::busy("view-not-ready"));
+            }
+        } else {
+            if epoch != published.record.input_epoch {
+                return Err(Error::busy("view-input-pending"));
+            }
+            if !status.ready || status.published_epoch != published.record.reconciled_epoch {
+                return Err(Error::busy("checkpoint-not-current"));
+            }
         }
         state.queries += 1;
         let deadline = Instant::now()
@@ -2304,6 +2338,21 @@ impl ViewQuery {
         &self.published
     }
 
+    /// Whether this query serves a possibly lagging publication.
+    pub fn eventual(&self) -> bool {
+        self.published.view.stale_reads()
+    }
+
+    /// Whether invalidations newer than the served publication are pending.
+    pub fn lagging(&self) -> bool {
+        self.eventual()
+            && !self
+                .published
+                .view
+                .status()
+                .is_ok_and(|status| status.ready)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if Instant::now() >= self.deadline {
             return Err(Error::new(
@@ -2311,6 +2360,9 @@ impl ViewQuery {
                 "query-deadline",
                 "query time budget exhausted",
             ));
+        }
+        if self.published.view.stale_reads() {
+            return Ok(());
         }
         if self.slot.epoch.load(Ordering::Acquire) != self.input_epoch {
             return Err(Error::busy("query-input-changed"));

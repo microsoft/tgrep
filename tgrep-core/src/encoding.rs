@@ -147,6 +147,9 @@ pub struct LossyFixups {
     /// `(offset of the replacement in the decoded text, total bytes gained up
     /// to and including it)`, ascending by offset.
     shifts: Vec<(usize, usize)>,
+    /// The source bytes each replacement stood in for, concatenated in shift
+    /// order. Each replacement covers one to three source bytes.
+    replaced: Vec<u8>,
 }
 
 impl LossyFixups {
@@ -160,7 +163,34 @@ impl LossyFixups {
     /// this can rival the decoded text itself. Callers that budget memory (the
     /// `serve` content cache) must count it.
     pub fn heap_bytes(&self) -> u64 {
-        (self.shifts.capacity() * std::mem::size_of::<(usize, usize)>()) as u64
+        (self.shifts.capacity() * std::mem::size_of::<(usize, usize)>() + self.replaced.capacity())
+            as u64
+    }
+
+    /// The source bytes behind `text[start..end]`, or `None` when that range
+    /// holds no repair and so is its own source.
+    ///
+    /// `text` must be the decoded text these fixups were recorded for, and
+    /// `start..end` must lie on character boundaries.
+    pub fn source_bytes(&self, text: &str, start: usize, end: usize) -> Option<Vec<u8>> {
+        let first = self.shifts.partition_point(|&(at, _)| at < start);
+        let last = self.shifts.partition_point(|&(at, _)| at < end);
+        if first == last {
+            return None;
+        }
+        let gained_before = |i: usize| if i == 0 { 0 } else { self.shifts[i - 1].1 };
+        let mut out = Vec::with_capacity(end - start);
+        let mut pos = start;
+        for i in first..last {
+            let (at, gained) = self.shifts[i];
+            let from = REPLACEMENT_LEN * i - gained_before(i);
+            let len = REPLACEMENT_LEN - (gained - gained_before(i));
+            out.extend_from_slice(text.get(pos..at)?.as_bytes());
+            out.extend_from_slice(self.replaced.get(from..from + len)?);
+            pos = at + REPLACEMENT_LEN;
+        }
+        out.extend_from_slice(text.get(pos..end)?.as_bytes());
+        Some(out)
     }
 
     /// Map an offset in the decoded text to the corresponding offset in the
@@ -320,14 +350,14 @@ fn transcode(enc: &'static Encoding, bytes: &[u8]) -> String {
 /// The loop mirrors the standard library's: one `U+FFFD` per maximal invalid
 /// subsequence, so the text produced here is identical.
 fn lossy_utf8(bytes: &[u8]) -> (String, LossyFixups) {
-    let mut shifts = Vec::new();
-    let out = lossy_utf8_into(bytes, Some(&mut shifts));
-    (out, LossyFixups { shifts })
+    let mut fixups = LossyFixups::default();
+    let out = lossy_utf8_into(bytes, Some(&mut fixups));
+    (out, fixups)
 }
 
 /// The repair loop, shared so the two callers cannot drift apart.
 ///
-/// `shifts` is `None` for indexing, which only needs the repaired bytes. That
+/// `fixups` is `None` for indexing, which only needs the repaired bytes. That
 /// is not just a micro-optimisation: one entry is recorded per repair, so a
 /// large file of single-byte-invalid text (a 135 MB Latin-1 log, say) builds
 /// tens of megabytes of offset table that indexing then drops on the floor.
@@ -337,16 +367,16 @@ fn lossy_utf8(bytes: &[u8]) -> (String, LossyFixups) {
 /// triggers a doubling reallocation — turning a 135 MB decode into a 270 MB
 /// buffer with both halves live during the copy. Sizing it exactly costs one
 /// extra validation pass, which is SIMD-fast and far cheaper than that copy.
-fn lossy_utf8_into(bytes: &[u8], shifts: Option<&mut Vec<(usize, usize)>>) -> String {
+fn lossy_utf8_into(bytes: &[u8], fixups: Option<&mut LossyFixups>) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
     }
 
     let (out_len, repairs) = lossy_utf8_shape(bytes);
     let mut out = String::with_capacity(out_len);
-    let mut shifts = shifts;
-    if let Some(shifts) = shifts.as_deref_mut() {
-        shifts.reserve_exact(repairs);
+    let mut fixups = fixups;
+    if let Some(fixups) = fixups.as_deref_mut() {
+        fixups.shifts.reserve_exact(repairs);
     }
 
     let mut rest = bytes;
@@ -364,9 +394,12 @@ fn lossy_utf8_into(bytes: &[u8], shifts: Option<&mut Vec<(usize, usize)>>) -> St
         // `None` means the input ended mid-sequence: everything left is one
         // replacement and there is nothing after it.
         let replaced = err.error_len().unwrap_or(rest.len() - valid);
-        if let Some(shifts) = shifts.as_deref_mut() {
+        if let Some(fixups) = fixups.as_deref_mut() {
             gained += REPLACEMENT_LEN - replaced.min(REPLACEMENT_LEN);
-            shifts.push((out.len(), gained));
+            fixups.shifts.push((out.len(), gained));
+            fixups
+                .replaced
+                .extend_from_slice(&rest[valid..valid + replaced.min(REPLACEMENT_LEN)]);
         }
         out.push(char::REPLACEMENT_CHARACTER);
         match err.error_len() {
@@ -656,8 +689,27 @@ mod tests {
             if std::str::from_utf8(raw).is_err() {
                 assert_eq!(predicted, repaired.len(), "bad length for {raw:?}");
                 assert_eq!(repairs, fixups.shifts.len(), "bad count for {raw:?}");
+                assert_eq!(
+                    fixups.source_bytes(&repaired, 0, repaired.len()).as_deref(),
+                    Some(*raw),
+                    "bad source bytes for {raw:?}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn source_bytes_restores_only_repaired_ranges() {
+        let raw = [&b"a"[..], "\u{FFFD}".as_bytes(), b"b ", b"\xff", b" c"].concat();
+        let (text, fixups) = lossy_utf8(&raw);
+        assert_eq!(text, "a\u{FFFD}b \u{FFFD} c");
+        assert_eq!(fixups.source_bytes(&text, 0, 5), None);
+        assert_eq!(fixups.source_bytes(&text, 5, 6), None);
+        assert_eq!(
+            fixups.source_bytes(&text, 6, text.len()).as_deref(),
+            Some(&b"\xff c"[..])
+        );
+        assert_eq!(fixups.source_bytes(&text, 0, text.len()), Some(raw));
     }
 
     #[test]

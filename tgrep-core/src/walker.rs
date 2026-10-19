@@ -584,6 +584,9 @@ pub struct MetaWalkResult {
     pub files: Vec<FileMeta>,
     /// Root-relative files admitted before binary extension filtering.
     pub listed_files: Vec<String>,
+    /// Sizes of listed binary-extension files absent from `files`, when the
+    /// walk observed them (size-capped or managed walks).
+    pub listed_sizes: Vec<(String, u64)>,
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
     pub visibility: crate::visibility::PathVisibility,
@@ -706,6 +709,7 @@ fn walk_metadata_inner(
     let max_file_size = opts.max_file_size;
     let results = std::sync::Mutex::new(Vec::new());
     let listed_files = std::sync::Mutex::new(Vec::new());
+    let listed_sizes = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
     let visibility = std::sync::Mutex::new(crate::visibility::PathVisibility::default());
@@ -789,6 +793,7 @@ fn walk_metadata_inner(
         let root = root.clone();
         let results = &results;
         let listed_files = &listed_files;
+        let listed_sizes = &listed_sizes;
         let gitignore_files = &gitignore_files;
         let ignore_files = &ignore_files;
         let visibility = &visibility;
@@ -873,18 +878,28 @@ fn walk_metadata_inner(
             let rel_path = relative.replace('\\', "/");
 
             if is_binary_extension(path) {
-                let too_large = match exceeds_size_limit(max_file_size, || {
-                    entry.metadata().map(|meta| meta.len())
-                }) {
-                    Ok(too_large) => too_large,
-                    Err(_) => {
-                        skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return ignore::WalkState::Continue;
+                // Managed reconciliation plans verification batches by size.
+                // An unknown size is charged a whole batch, which split large
+                // checkouts into one range per binary file.
+                let size = if max_file_size.is_some() || permit.is_some() {
+                    match entry.metadata() {
+                        Ok(meta) => Some(meta.len()),
+                        Err(_) if max_file_size.is_none() => None,
+                        Err(_) => {
+                            skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return ignore::WalkState::Continue;
+                        }
                     }
+                } else {
+                    None
                 };
-                if !too_large {
-                    listed_files.lock().unwrap().push(rel_path);
+                if max_file_size.is_some_and(|limit| size.is_some_and(|size| size > limit)) {
+                    return ignore::WalkState::Continue;
                 }
+                if let Some(size) = size {
+                    listed_sizes.lock().unwrap().push((rel_path.clone(), size));
+                }
+                listed_files.lock().unwrap().push(rel_path);
                 return ignore::WalkState::Continue;
             }
 
@@ -939,6 +954,7 @@ fn walk_metadata_inner(
         MetaWalkResult {
             files: results.into_inner().unwrap(),
             listed_files: listed_files.into_inner().unwrap(),
+            listed_sizes: listed_sizes.into_inner().unwrap(),
             gitignore_files,
             ignore_files,
             visibility,

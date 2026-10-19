@@ -324,9 +324,13 @@ Native repository paths are retained losslessly. Content/coverage enum versions
 must advance if their semantics change, independently of the index format.
 
 A supplied compatible predecessor provides postings by blob identity, including
-renames/copies, without reading unchanged blob contents. Changed/new blobs use
-one `git cat-file --batch` process and the existing spill sorter, then publish a
-complete streamed index. Memory includes one blob, its decoded text/masks,
+renames/copies, without reading unchanged blob contents. Changed/new blobs are
+read and extracted in byte-bounded batches by parallel `git cat-file --batch`
+readers (bounded by available/namespace workers and the private reservation),
+with the next batch prefetched while file IDs are assigned and pushed to the
+existing spill sorter in the serial order, so output stays deterministic; private
+pressure falls back to one blob at a time. The build then publishes a complete
+streamed index. Memory includes at most two batches of extracted masks,
 O(tracked paths) metadata and the bounded sorter arena, not all postings.
 Without a predecessor the first build extracts the full committed corpus.
 `BuildStats` counts actual blob reads/bytes, extraction calls, reused indexed
@@ -714,14 +718,17 @@ Status exposes `reconcile_attempts`, `consecutive_failures`, `retry_delay_ms` an
 the retained `last_error`. Daemon readiness stays closed until both the core
 refresh and checkpoint publication finish, including failed checkpoint retries.
 Candidate files are opened through the view's retained snapshot reader. Every
-query ends with a root-verified epoch check, including empty and filename-only
-responses; replacing the directory cannot pair old candidates with a new root.
+query ends with a root-verified snapshot, including empty and filename-only
+responses (strict views also reject a changed epoch there); replacing the
+directory cannot pair old candidates with a new root.
 Local-index and shared searches amortize ancestor opens across bounded groups
 of up to 64 consecutive siblings. Each group retains one parent chain, not an
 unbounded directory cache or a batch of file contents. Shared candidate batches
 retain the generation and root protection, validate each candidate through its
 snapshot, and verify ancestor identities before returning results. Open/read or
-final ancestor-verification failures close the view for repair; deadline and
+final ancestor-verification failures close the view for repair (eventual
+managed v2 views instead skip that candidate and queue it as a path hint; see
+**Eventual serving**); deadline and
 snapshot-validation failures do not masquerade as filesystem failures. This
 does not change admission, matching, response limits or fallback semantics.
 In the legacy v1 daemon, both auto and poll modes perform full
@@ -1090,7 +1097,9 @@ attachment.
 
 The normal builder's file-count/byte batch planner is reused, **not** its file
 opening or mmap path. Batches are further split by distinct-parent handle cost,
-and a namespace-wide 256-credit handle gate bounds simultaneous parent pins.
+and a namespace-wide handle gate bounds simultaneous parent pins: 256 credits on
+Unix (descriptor limits) and 8192 on Windows, where each deep parent chain costs
+many credits and a smaller gate degenerated into near-serial ranges.
 Credits cover retained and verification chains plus root-check scratch. A single
 unusually deep Windows parent takes the whole gate alone; its actual memory is
 still charged. Unix retains only the last ancestor descriptor while keeping the
@@ -1411,13 +1420,35 @@ inputs, not every concurrent filesystem write. Native/poll watching and full
 repair use the same reconciliation path. Git metadata events use the most
 specific matching metadata root, including a linked worktree's private Git
 directory nested under the common directory; lock-file traffic is ignored.
+**Eventual serving.** Managed v2 daemon views favor availability over
+freshness. After a view's first publication, `views.status` and `status`
+report `serving: true`, and queries are answered from the latest published
+snapshot while later invalidations wait for reconciliation. A newer input
+epoch no longer makes a query return `busy` / `view-input-pending` or
+`checkpoint-not-current`, and does not cancel an in-flight query with
+`query-input-changed`. `ready` keeps its stricter meaning: the publication
+covers the current input epoch and no invalidation is pending. It still drives
+scheduling. A reconciliation pass takes the queued path hints and publishes
+what it reconciled even when newer events arrived meanwhile; those newer hints
+stay queued for the next pass. A partially reconciled pass is never
+published. A failed pass keeps the previous publication serving and queues a
+full repair. Results can therefore lag disk by the reconciliation backlog.
+Candidate bytes are read live from disk, so a candidate that vanished or
+stopped being a regular file since the publication is skipped and queued as a
+path hint instead of failing the query or forcing a full pass, and a
+publication made during the query does not fail it. Query responses carry
+`lagging: true` while invalidations newer than the served publication are
+pending. Use `--no-index` when current disk bytes are required.
+Legacy v1 views and the core `WorktreeOptions` default keep strict,
+fail-closed reads.
+
 Readiness is a snapshot, not a notification-drain barrier: a later event can
-advance the input epoch and make the next query return `busy` /
-`view-input-pending`. Epoch advancement alone also need not acknowledge a
-particular write. To qualify a change, verify its expected content through a
-managed response (`backend: shared-v2`, `ready: true`), including empty results.
-Bound retries of known retryable invalidations; never count a CLI fallback scan
-as indexed success.
+advance the input epoch. Epoch advancement alone also need not acknowledge a
+particular write. To qualify a change, wait until `views.status` reports
+`ready: true` with an input epoch newer than the write, then verify the
+expected content through a managed response (`backend: shared-v2`), including
+empty results. Bound retries of known retryable invalidations; never count a
+CLI fallback scan as indexed success.
 `--no-index` remains the way to search
 current disk bytes without relying on watcher delivery.
 
@@ -1440,9 +1471,9 @@ CPU/input/handle budgets. It reads, decodes and hashes every admitted file and
 compares searchable membership and visibility against the published snapshot.
 Queries keep using that snapshot throughout. If nothing differs, the operation
 completes with `{"verified":true,"changed":false}` and publishes nothing.
-The first detected difference marks the view stale, which closes readiness
-before the next query can use it; the pass then publishes a full repair and
-reports `changed: true`. Silently missed changes are therefore repaired within
+The first detected difference marks the view stale, which closes `ready`
+(queries keep using the previous publication); the pass then publishes a full
+repair and reports `changed: true`. Silently missed changes are therefore repaired within
 one interval plus verification time, not left stale indefinitely.
 
 Deadline exhaustion and cancellation of a serving verification leave the view
@@ -1485,15 +1516,25 @@ or rescan, and observed Git/ignore changes retain full verification and the
 existing publication gates. Normal native file events still invalidate their
 paths. Explicit `--watch-mode poll` and actual native-watcher unavailability,
 failure or budget exhaustion use periodic full reconciliation as their update
-mechanism; they close readiness for each pass and wait `--poll-interval`
-seconds after completion (default 120). `--no-watch` disables both automatic
+mechanism; they close `ready` for each pass (the previous publication keeps
+serving) and wait `--poll-interval` seconds after completion (default 120). `--no-watch` disables both automatic
 update mechanisms and serving verification, but not initial verification or
 explicit refresh. Legacy v1 and ordinary-server policies are unchanged.
 
 `hello` advertises `event-driven-native-reconciliation` and
 `serving-native-periodic-verification`. Online `views.status` and ordinary
 `status` expose the effective `watch_mode`, `watch_fallback`,
-`reconciliation_policy` and `last_verification`. The policy reports
+`reconciliation_policy`, `last_verification` and `watch_events`. Native
+`Modify` notifications other than renames are dropped when the file's current
+metadata matches the trusted read evidence of the current publication and its
+recorded hidden status (Windows `FILE_NOTIFY_CHANGE_ATTRIBUTES`, `LAST_ACCESS`
+and duplicate-write churn). Creates, removes, renames, rescans and Git/ignore
+inputs are never filtered, and nothing is filtered while a replacement is being
+prepared. A same-size, same-timestamp content rewrite is left to periodic
+verification. `watch_events` reports cumulative `events`, `by_kind`
+(`access`, `create`, `modify`, `remove`, `other`, `error`),
+`unchanged_paths_filtered`, `invalidated_paths`, `full_invalidations` and
+`epoch_advances`, so watcher input churn can be measured directly. The policy reports
 `incremental_coverage: "unavailable"`, `change_journal: "not-integrated"` and
 `native_verification_availability: "serving-until-difference"`. Unless watching
 is disabled, `native_periodic_full_verification` and
@@ -1601,6 +1642,25 @@ Caller bounds may tighten, not enlarge, policy bounds. Persist the returned
 `next` cursor and use a new operation token for the next pass; retry the old token
 only to recover that pass's receipt. A one-page pass can resume an already
 selected object's members without spending its only page selecting it again.
+
+The managed daemon schedules background recovery and collection traversals
+with an exponential backoff (base `retry_ms`, up to 64x). A pass that reclaims
+or changes something resets the backoff, and the rest of that traversal
+continues at the base interval. A traversal that changes nothing keeps its
+current backoff on every continuation and doubles it on completion, so an idle
+namespace is paced rather than rescanned back to back. Lifecycle triggers
+still run the next pass at the base interval. Catalog transactions that change
+no rows do not invalidate workers' cached operation control.
+
+The scheduler itself polls every 100 ms, but each full tick reads the catalog
+(and re-verifies its anchors) several times per view. When consecutive full
+ticks find nothing to do, ticks back off exponentially to at most every
+1.6 seconds (`scheduler.idle_tick_ms`). Any change to the in-memory pacing
+signature (a lifecycle trigger, a view input epoch from a watcher event or
+refresh, an attached or detached view, or a job finishing) runs the next full
+tick immediately. Other changes, such as a lease release on an otherwise idle
+namespace, may be noticed up to one idle tick later. This trades a bounded
+scheduling lag for less catalog I/O competing with running reconciliation.
 
 Checkpoints are delta-only, bound to exact namespace, repository, root identity,
 view/version, base key/incarnation/fingerprint and processed epoch. Publication

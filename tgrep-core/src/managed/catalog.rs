@@ -617,18 +617,24 @@ impl Namespace {
                 }
             };
         self.observe_catalog_write(&budget)?;
+        let changes_before = transaction.total_changes();
         let result = action(&transaction)?;
+        let changed = transaction.total_changes() != changes_before || change.is_some();
         budget.cache_used_before_commit_bytes = super::catalog_io::cache_used(&transaction);
         self.observe_catalog_write(&budget)?;
         self.fault(super::faults::Point::CatalogBeforeCommit, None)?;
         // Invalidate under the database lock, even if commit has an unknown
         // outcome. Readers sample this revision while holding the same lock.
+        // Transactions that changed no rows leave cached work control valid,
+        // so idle maintenance does not force every worker back to the catalog.
         #[allow(deprecated, reason = "Rust 1.88 compatibility")]
-        let _ = self
-            .work_revision
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |revision| {
-                Some(revision.saturating_add(1))
-            });
+        if changed {
+            let _ =
+                self.work_revision
+                    .fetch_update(Ordering::Release, Ordering::Relaxed, |revision| {
+                        Some(revision.saturating_add(1))
+                    });
+        }
         transaction
             .commit()
             .map_err(|error| Error::from(error).committed(CommitState::Unknown))?;
@@ -641,13 +647,14 @@ impl Namespace {
     }
 
     fn verify_identity(&self) -> Result<()> {
-        self.directory.verify()?;
-        for (name, expected) in [
-            ("owner.lock", &self.header.owner_identity),
-            ("activity.lock", &self.header.activity_identity),
-            ("catalog.sqlite", &self.header.catalog_identity),
-        ] {
-            if &self.directory.observe_file(name)?.identity != expected {
+        const ANCHORS: [&str; 3] = ["owner.lock", "activity.lock", "catalog.sqlite"];
+        let observed = self.directory.observe_files(&ANCHORS)?;
+        for ((name, observed), expected) in ANCHORS.iter().zip(observed).zip([
+            &self.header.owner_identity,
+            &self.header.activity_identity,
+            &self.header.catalog_identity,
+        ]) {
+            if &observed.identity != expected {
                 return Err(Error::corrupt(format!(
                     "namespace anchor {name} was replaced"
                 )));

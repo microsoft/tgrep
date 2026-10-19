@@ -38,6 +38,11 @@ impl PathVisibility {
         self.hidden.is_empty()
     }
 
+    /// Whether `relative` itself is recorded as a hidden entry.
+    pub(crate) fn records_hidden(&self, relative: &str) -> bool {
+        self.hidden.contains_key(relative)
+    }
+
     /// Record an entry using metadata already obtained by a walk or watcher.
     /// On Windows the walker caches directory-entry attributes, so this adds no
     /// per-candidate filesystem queries to an indexed search.

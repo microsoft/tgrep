@@ -385,7 +385,7 @@ fn conflicting_process_migrations_commit_once_and_replay_each_original_receipt()
 }
 
 #[test]
-fn preparation_invalidations_close_readiness_without_mixing_or_disrupting_a_sibling() {
+fn preparation_invalidations_publish_eventually_without_mixing_or_disrupting_a_sibling() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
@@ -434,28 +434,27 @@ fn preparation_invalidations_close_readiness_without_mixing_or_disrupting_a_sibl
     );
     assert_eq!(search(&daemon, &fixture.b)["version"], 1);
     release(&daemon, &hook);
-    let failed = terminal(&daemon, &operation);
+    // Eventual publication: the prepared pin commits, while the invalidation
+    // that arrived during preparation stays queued on the new view.
+    let advanced = completed(&daemon, &operation);
+    assert_eq!(advanced["committed_state"], "committed", "{advanced}");
+    let published = daemon.rpc("views.status", json!({"id":view["view"]}));
+    assert_eq!(published["authoritative"]["version"], 2, "{published}");
     assert_eq!(
-        failed["error"]["reason_code"], "publication-epoch-changed",
-        "{failed}"
+        published["authoritative"]["current"]["commit"], target,
+        "{published}"
     );
-    assert_eq!(failed["committed_state"], "not-committed");
-    assert_eq!(
-        daemon.rpc("views.recover", json!({"id":view["view"]}))["version"],
-        1
-    );
+    assert_eq!(published["serving"], true, "{published}");
+    assert_eq!(search(&daemon, &fixture.a)["version"], 2);
+    assert_eq!(search(&daemon, &fixture.b)["version"], 1);
     completed(
         &daemon,
         &daemon.rpc(
             "views.refresh",
             json!({"token":token(&claim,5),"request":{
-                "view":view["view"],"expected_version":1,"owner":claim.owner,"allocation_version":1
+                "view":view["view"],"expected_version":2,"owner":claim.owner,"allocation_version":1
             }}),
         ),
-    );
-    completed(
-        &daemon,
-        &daemon.rpc("views.advance", advance(&claim, 6, &view, &target)),
     );
     let current = daemon.rpc("views.status", json!({"id":view["view"]}));
     assert_eq!(current["ready"], true);

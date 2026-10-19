@@ -325,6 +325,7 @@ class Benchmark:
         self.run_id = f"wtb{os.getpid()}x{int(time.time())}"
         self.stack = ExitStack()
         self.failures = []
+        self.query_results = None
         self.repo = None
         self.base_commit = None
         self.ordinary_index = self.bench / "ordinary-index"
@@ -647,21 +648,31 @@ class Benchmark:
                 }
         self.check_parity(results, targets)
         log(f"Queries: {self.args.repeat} timed round(s) of {len(queries)} queries")
-        for round_number in range(self.args.repeat):
+        try:
+            for round_number in range(self.args.repeat):
+                for query in queries:
+                    for target in targets:
+                        record = results[query]["targets"][target["label"]]
+                        try:
+                            wall_ms, stats, _, stderr = self.search(target, query)
+                        except BenchError as error:
+                            # One slow query must not discard every other
+                            # measurement; it is reported as a failure.
+                            record.setdefault("errors", []).append(str(error))
+                            self.fail("query", f"round {round_number}: {error}")
+                            continue
+                        if stats["backend"] != target["backend"]:
+                            self.fail("backend", f"{target['label']} {query!r} round {round_number}: "
+                                      f"{stderr[-500:]}")
+                            continue
+                        record["wall_ms"].append(wall_ms)
+                        record["server_ms"].append(stats["server_ms"])
+        finally:
             for query in queries:
-                for target in targets:
-                    wall_ms, stats, _, stderr = self.search(target, query)
-                    record = results[query]["targets"][target["label"]]
-                    if stats["backend"] != target["backend"]:
-                        self.fail("backend", f"{target['label']} {query!r} round {round_number}: "
-                                  f"{stderr[-500:]}")
-                        continue
-                    record["wall_ms"].append(wall_ms)
-                    record["server_ms"].append(stats["server_ms"])
-        for query in queries:
-            for record in results[query]["targets"].values():
-                record["wall"] = summarize(record["wall_ms"])
-                record["server"] = summarize(record["server_ms"])
+                for record in results[query]["targets"].values():
+                    record["wall"] = summarize(record["wall_ms"])
+                    record["server"] = summarize(record["server_ms"])
+            self.query_results = results
         return results
 
     def check_parity(self, results, targets):
@@ -846,7 +857,8 @@ def render_markdown(report):
             cells = []
             for label in labels:
                 record = result["targets"][label]
-                cells.append(millis(record["wall"]["p50"]))
+                errors = len(record.get("errors", ()))
+                cells.append(millis(record["wall"]["p50"]) + (f" ({errors} failed)" if errors else ""))
                 totals[label] += record["wall"]["p50"] or 0
                 server_totals[label] += record["server"]["p50"] or 0
             reference = result["targets"][labels[0]]["matches"]
@@ -861,6 +873,7 @@ def render_markdown(report):
     lines += ["", "## Checks", ""]
     lines.append(f"- Result parity across clean targets: {'ok' if checks['parity_ok'] else 'FAILED'}")
     lines.append(f"- Expected backends on every run: {'ok' if checks['backend_ok'] else 'FAILED'}")
+    lines.append(f"- Every timed query completed: {'ok' if checks.get('query_ok', True) else 'FAILED'}")
     lines.append(f"- Same-commit worktrees reused the base generation: "
                  f"{'ok' if checks['reuse_ok'] else 'FAILED'}")
     overlay = report.get("private_overlay")
@@ -965,7 +978,7 @@ def main(argv=None):
             report["ordinary"] = bench.ordinary_phase()
         report["managed"] = bench.managed_phase()
         targets = bench.targets(not args.skip_ordinary)
-        report["queries"] = bench.query_phase(queries, targets)
+        bench.query_phase(queries, targets)
         report["private_overlay"] = bench.check_private_overlay(targets)
     except (BenchError, OSError, KeyError, ValueError) as caught:
         error = caught
@@ -974,6 +987,8 @@ def main(argv=None):
         error = BenchError("interrupted")
         log("interrupted; cleaning up")
     finally:
+        # Completed rounds are kept even when a later query aborts the run.
+        report["queries"] = bench.query_results
         report["worktrees"] = [
             {key: value for key, value in entry.items()} for entry in bench.worktrees]
         report["cleanup"] = bench.teardown()
@@ -983,6 +998,7 @@ def main(argv=None):
     report["checks"] = {
         "parity_ok": "parity" not in kinds, "backend_ok": "backend" not in kinds,
         "reuse_ok": "reuse" not in kinds, "overlay_ok": "overlay" not in kinds,
+        "query_ok": "query" not in kinds,
         "ok": error is None and not bench.failures,
     }
     report = jsonable(report)

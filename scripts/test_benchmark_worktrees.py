@@ -150,6 +150,15 @@ class Markdown(unittest.TestCase):
                          "- Private overlay isolated to the dirty worktree: ok"):
             self.assertIn(expected, markdown)
 
+    def test_marks_failed_queries(self):
+        report = synthetic_report()
+        failed = {"matches": 5, "matched_lines": 5, "wall": {"p50": None}, "server": {"p50": None},
+                  "errors": ["timed out"]}
+        report["queries"]["a|b"]["targets"]["worktree-1"] = failed
+        report["checks"]["query_ok"] = False
+        markdown = wt.render_markdown(report)
+        self.assertIn("| `a\\|b` | 12.0 | - (1 failed) | 5 |", markdown)
+        self.assertIn("- Every timed query completed: FAILED", markdown)
 
 def binary_or_none():
     try:

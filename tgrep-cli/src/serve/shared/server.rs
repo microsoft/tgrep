@@ -752,6 +752,7 @@ impl State {
                     exclude_paths: vec![self.registration.storage.clone()],
                     ..Default::default()
                 },
+                stale_reads: false,
             };
             let restored = directory.join("overlay.json").try_exists()?;
             let view = if restored {
@@ -917,7 +918,7 @@ impl State {
                 ensure!(request.params == json!({}), "hello params must be empty");
                 Ok(json!({
                     "capabilities":["leases","recoverable-attach","worktree-overlays","refresh","search","files"],
-                    "profile":IndexingProfile::default(), "retention":"retain-all",
+                    "profile":IndexingProfile::default(), "retention":"retain-all", "paged_results":true,
                     "limits":{"views":self.policy.max_views, "leases":self.policy.max_leases,
                         "watches_per_view":self.policy.watches_per_view, "hints_per_view":self.policy.hints_per_view,
                         "reconcile_workers":1, "query_workers":QUERY_WORKERS, "query_queue":QUERY_QUEUE,
@@ -1126,6 +1127,7 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             "scope" => value.is_string(),
             "hidden" => value.is_boolean(),
             "max_depth" => value.is_null() || value.is_u64(),
+            "page" => value.is_null() || value.is_string(),
             _ if files => false,
             "pattern" | "encoding" | "engine" => value.is_string(),
             "replace" => value.is_null() || value.is_string(),
@@ -1242,12 +1244,13 @@ impl State {
             "protocol":PROTOCOL, "instance":self.registration.instance,
             "repository":self.registration.repository
         });
-        let result = search_snapshot(
+        let result = search_snapshot_parallel(
             &LegacyQuery { state: self, entry },
             query,
             files,
             id,
             metadata,
+            PAGE_TIME,
         )?;
         entry.queries.fetch_add(1, Ordering::SeqCst);
         Ok(result)
@@ -1262,6 +1265,15 @@ pub(super) trait QuerySource {
     fn invalidate(&self, error: &anyhow::Error) -> Result<()>;
     fn check(&self) -> Result<()> {
         self.snapshot(|_| ())
+    }
+    /// Eventual sources serve their last publication, so a candidate that
+    /// changed or vanished since is skipped and requeued, not a query failure.
+    fn eventual(&self) -> bool {
+        false
+    }
+    /// Queue root-relative candidates for an incremental eventual refresh.
+    fn requeue(&self, _relative: &[String]) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -1287,12 +1299,179 @@ impl QuerySource for LegacyQuery<'_> {
     }
 }
 
+/// How long a paged query searches before returning a partial page.
+pub(super) const PAGE_TIME: Duration = Duration::from_secs(60);
+
+/// Serial search for sources that cannot be shared between threads.
+#[cfg(test)]
 pub(super) fn search_snapshot(
     source: &impl QuerySource,
     query: &Value,
     files: bool,
     id: &Value,
     metadata: Value,
+) -> Result<Value> {
+    search_snapshot_with(
+        source,
+        query,
+        files,
+        id,
+        metadata,
+        PAGE_TIME,
+        |groups, search| {
+            groups
+                .iter()
+                .map(|siblings| search.search(source, siblings))
+                .collect()
+        },
+    )
+}
+
+/// Searches bounded windows of sibling groups on the rayon pool.
+pub(super) fn search_snapshot_parallel(
+    source: &(impl QuerySource + Sync),
+    query: &Value,
+    files: bool,
+    id: &Value,
+    metadata: Value,
+    page_time: Duration,
+) -> Result<Value> {
+    use rayon::prelude::*;
+    search_snapshot_with(
+        source,
+        query,
+        files,
+        id,
+        metadata,
+        page_time,
+        |groups, search| {
+            groups
+                .par_iter()
+                .map(|siblings| search.search(source, siblings))
+                .collect()
+        },
+    )
+}
+
+type Searched = Vec<(crate::serve::FileSearchResult, usize)>;
+
+/// One window's shared response budget. A worker that cannot charge a whole
+/// file stops the window, which then ends the page or fails the query.
+struct GroupSearch<'a> {
+    matcher: &'a crate::matching::SearchMatcher,
+    opts: &'a crate::serve::SearchOpts,
+    encoding: tgrep_core::encoding::EncodingMode,
+    remaining: std::sync::atomic::AtomicUsize,
+    stopped: AtomicBool,
+}
+
+impl<'a> GroupSearch<'a> {
+    fn new(request: &'a crate::serve::SearchRequest, remaining: usize) -> Self {
+        Self {
+            matcher: &request.matcher,
+            opts: &request.opts,
+            encoding: request.encoding,
+            remaining: remaining.into(),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// Searched files in order; fewer than `siblings` means the rest did not
+    /// fit or were not searched.
+    fn search(&self, source: &impl QuerySource, siblings: &[String]) -> Result<Searched> {
+        let mut files = Vec::new();
+        if self.stopped.load(Ordering::Relaxed) {
+            return Ok(files);
+        }
+        let result = (|| {
+            // An eventual source whose shared parent cannot be pinned falls
+            // back to per-file opens, which skip and requeue what is missing.
+            let batch = (siblings.len() > 1)
+                .then(|| {
+                    candidate_snapshot(source, &siblings[0], |snapshot| {
+                        snapshot.candidate_batch(&siblings[0])
+                    })
+                })
+                .transpose()?
+                .flatten();
+            for relative in siblings {
+                if self.stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Some(bytes) = read_candidate(source, batch.as_ref(), relative)? else {
+                    files.push(Default::default());
+                    continue;
+                };
+                if bytes.len() > 64 * 1024 * 1024 {
+                    files.push(Default::default());
+                    continue;
+                }
+                let decoded = crate::serve::DecodedFile::new(bytes, self.encoding);
+                let cap = self.remaining.load(Ordering::Relaxed);
+                let mut budget = crate::serve::JsonBudget { remaining: cap };
+                match crate::serve::search_file_matches_bounded(
+                    relative,
+                    &decoded,
+                    self.matcher,
+                    self.opts,
+                    Some(&mut budget),
+                ) {
+                    Ok(found) if self.claim(cap - budget.remaining) => {
+                        files.push((found, cap - budget.remaining));
+                    }
+                    Ok(_) => break,
+                    Err(error) if error.is::<crate::serve::ResponseLimit>() => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Some(batch) = batch
+                && let Err(error) = batch.finish()
+            {
+                if !source.eventual() {
+                    return candidate_failed(source, &siblings[0], error.into())
+                        .map(|_: Option<()>| ());
+                }
+                // The group's reads may have crossed a replaced parent.
+                source.requeue(siblings)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() || files.len() < siblings.len() {
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+        result.map(|()| files)
+    }
+
+    fn claim(&self, bytes: usize) -> bool {
+        let mut left = self.remaining.load(Ordering::Acquire);
+        loop {
+            let Some(next) = left.checked_sub(bytes) else {
+                return false;
+            };
+            match self.remaining.compare_exchange_weak(
+                left,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => left = actual,
+            }
+        }
+    }
+}
+
+/// `page` absent keeps the whole-result contract. Otherwise a page ends at a
+/// file boundary when the response budget or `page_time` runs out, and
+/// `next_page` names the first path it did not search.
+fn search_snapshot_with<S: QuerySource>(
+    source: &S,
+    query: &Value,
+    files: bool,
+    id: &Value,
+    metadata: Value,
+    page_time: Duration,
+    run: impl for<'a> Fn(&[&[String]], &GroupSearch<'a>) -> Vec<Result<Searched>>,
 ) -> Result<Value> {
     validate_query(query, files)?;
     if !files {
@@ -1320,18 +1499,43 @@ pub(super) fn search_snapshot(
         remaining: MAX_RESPONSE as usize - 1024,
     };
     budget.charge(&json!({"jsonrpc":"2.0","id":id,"result":metadata}))?;
+    let page = query.get("page");
+    let paged = page.is_some();
+    let cursor = page.and_then(Value::as_str);
     let (mut result, epoch) = if files {
-        let (paths, epoch) = source.snapshot(|snapshot| -> Result<_> {
+        let (paths, next, epoch) = source.snapshot(|snapshot| -> Result<_> {
+            let listed = snapshot.files(&scope.prefix, scope.hidden);
+            if paged {
+                reserve_cursor(&mut budget, &listed)?;
+            }
             let mut paths = Vec::new();
-            for path in snapshot.files(&scope.prefix, scope.hidden) {
-                if scope.relative(&path).is_some() {
-                    budget.charge(&path)?;
-                    paths.push(path);
+            let mut next = None;
+            for path in listed {
+                if cursor.is_some_and(|cursor| path.as_str() < cursor)
+                    || scope.relative(&path).is_none()
+                {
+                    continue;
+                }
+                match budget.charge(&path) {
+                    Ok(()) => paths.push(path),
+                    Err(error)
+                        if paged
+                            && !paths.is_empty()
+                            && error.is::<crate::serve::ResponseLimit>() =>
+                    {
+                        next = Some(path);
+                        break;
+                    }
+                    Err(error) => return Err(error),
                 }
             }
-            Ok((paths, snapshot.epoch()))
+            Ok((paths, next, snapshot.epoch()))
         })??;
-        (json!({"files":paths, "epoch":epoch}), epoch)
+        let mut result = json!({"files":paths, "epoch":epoch});
+        if paged {
+            result["next_page"] = json!(next);
+        }
+        (result, epoch)
     } else {
         let request = crate::serve::parse_search_params(query).map_err(anyhow::Error::msg)?;
         let (paths, total, epoch) = source.snapshot(|snapshot| {
@@ -1358,38 +1562,58 @@ pub(super) fn search_snapshot(
         let index_stats = json!({"query_plan":crate::search::plan_summary(&request.plan),
                 "raw_candidates":raw_count,"candidates":paths.len(),"total_files":total});
         budget.charge(&index_stats)?;
+        let first = cursor.map_or(0, |cursor| {
+            paths.partition_point(|path| path.as_str() < cursor)
+        });
+        let paths = &paths[first..];
+        if paged {
+            reserve_cursor(&mut budget, paths)?;
+        }
+        let groups: Vec<_> = tgrep_core::rooted::sibling_batches(paths).collect();
         let mut rows = Vec::new();
         let mut stats = Vec::new();
         let mut search_stats = Vec::new();
-        for siblings in tgrep_core::rooted::sibling_batches(&paths) {
-            let batch = (siblings.len() > 1)
-                .then(|| {
-                    candidate_snapshot(source, &siblings[0], |snapshot| {
-                        snapshot.candidate_batch(&siblings[0])
-                    })
-                })
-                .transpose()?;
-            for relative in siblings {
-                let bytes = read_candidate(source, batch.as_ref(), relative)?;
-                if bytes.len() > 64 * 1024 * 1024 {
-                    continue;
-                }
-                let decoded = crate::serve::DecodedFile::new(bytes, request.encoding);
-                let found = crate::serve::search_file_matches_bounded(
-                    relative,
-                    &decoded,
-                    &request.matcher,
-                    &request.opts,
-                    Some(&mut budget),
-                )?;
-                rows.extend(found.rows);
-                stats.extend(found.stats);
-                search_stats.extend(found.search_stats);
+        let mut searched = 0_usize;
+        let mut next = None;
+        let width = rayon::current_num_threads().max(1) * 4;
+        'page: for (number, window) in groups.chunks(width).enumerate() {
+            if paged && number > 0 && start.elapsed() >= page_time {
+                next = Some(&window[0][0]);
+                break;
             }
-            if let Some(batch) = batch
-                && let Err(error) = batch.finish()
-            {
-                return candidate_failed(source, &siblings[0], error.into());
+            let search = GroupSearch::new(&request, budget.remaining);
+            let results = run(window, &search)
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            for (siblings, found) in window.iter().zip(results) {
+                let mut found = found.into_iter();
+                for relative in siblings.iter() {
+                    let found = match found.next() {
+                        Some(found) => Some(found),
+                        // A page always makes progress unless one file alone
+                        // exceeds the response cap.
+                        None if paged && searched == 0 => {
+                            GroupSearch::new(&request, budget.remaining)
+                                .search(source, std::slice::from_ref(relative))?
+                                .pop()
+                        }
+                        None => None,
+                    };
+                    let Some((found, bytes)) =
+                        found.filter(|(_, bytes)| *bytes <= budget.remaining)
+                    else {
+                        if !paged || searched == 0 {
+                            return Err(crate::serve::ResponseLimit.into());
+                        }
+                        next = Some(relative);
+                        break 'page;
+                    };
+                    budget.remaining -= bytes;
+                    searched += 1;
+                    rows.extend(found.rows);
+                    stats.extend(found.stats);
+                    search_stats.extend(found.search_stats);
+                }
             }
         }
         let mut result = json!({
@@ -1400,10 +1624,17 @@ pub(super) fn search_snapshot(
         if request.opts.search_stats {
             result["search_stats"] = json!(search_stats);
         }
+        if paged {
+            result["next_page"] = json!(next);
+        }
         (result, epoch)
     };
+    // The final snapshot re-verifies the pinned root. Candidates come from one
+    // publication either way; eventual sources read live bytes and requeue
+    // misses, so only strict sources reject a newer publication.
+    let current = source.snapshot(|snapshot| snapshot.epoch())?;
     ensure!(
-        source.snapshot(|snapshot| snapshot.epoch() == epoch)?,
+        source.eventual() || current == epoch,
         "view changed during query; retry or scan"
     );
     for (key, value) in metadata.as_object().expect("metadata object") {
@@ -1412,14 +1643,29 @@ pub(super) fn search_snapshot(
     Ok(result)
 }
 
+/// Keep room for the `next_page` cursor that may end this page.
+fn reserve_cursor(budget: &mut crate::serve::JsonBudget, paths: &[String]) -> Result<()> {
+    let longest = paths.iter().map(String::len).max().unwrap_or(0);
+    budget.remaining = budget
+        .remaining
+        .checked_sub(longest.saturating_mul(6).saturating_add(32))
+        .ok_or(crate::serve::ResponseLimit)?;
+    Ok(())
+}
+
 /// Only an open, stat or read failure of the candidate itself closes the view
 /// for full repair. Snapshot validation, deadline and cancellation failures say
 /// nothing about the file, so they propagate unchanged and leave the view ready.
+/// Eventual sources instead skip the candidate (`None`) and requeue its path.
 fn candidate_failed<T>(
     source: &impl QuerySource,
     relative: &str,
     error: anyhow::Error,
-) -> Result<T> {
+) -> Result<Option<T>> {
+    if source.eventual() {
+        source.requeue(&[relative.to_owned()])?;
+        return Ok(None);
+    }
     let error = error.context(format!("reading shared candidate {relative}"));
     source.invalidate(&error)?;
     Err(error)
@@ -1429,7 +1675,7 @@ fn candidate_snapshot<T>(
     source: &impl QuerySource,
     relative: &str,
     open: impl FnOnce(WorktreeSnapshot<'_>) -> std::io::Result<T>,
-) -> Result<T> {
+) -> Result<Option<T>> {
     let mut opened = None;
     let snapshot = source.snapshot(|snapshot| opened = Some(open(snapshot)));
     match opened {
@@ -1441,7 +1687,7 @@ fn candidate_snapshot<T>(
         ),
         Some(Ok(file)) => {
             snapshot?;
-            Ok(file)
+            Ok(Some(file))
         }
         None => {
             snapshot?;
@@ -1454,12 +1700,15 @@ fn read_candidate(
     source: &impl QuerySource,
     batch: Option<&tgrep_core::worktrees::CandidateBatch>,
     relative: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
     let failed = |error| candidate_failed(source, relative, error);
-    let file = candidate_snapshot(source, relative, |snapshot| match batch {
+    let Some(file) = candidate_snapshot(source, relative, |snapshot| match batch {
         Some(batch) => snapshot.open_candidate_in(batch, relative),
         None => snapshot.open_candidate(relative),
-    })?;
+    })?
+    else {
+        return Ok(None);
+    };
     match file.metadata() {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => {
@@ -1475,7 +1724,7 @@ fn read_candidate(
     loop {
         source.check()?;
         match file.read(&mut chunk) {
-            Ok(0) => return Ok(bytes),
+            Ok(0) => return Ok(Some(bytes)),
             Ok(count) => bytes.extend_from_slice(&chunk[..count]),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return failed(error.into()),
@@ -1573,6 +1822,7 @@ mod tests {
                 &request.opts.match_options(),
                 &request.matcher,
                 path,
+                &file.text,
                 &file.fixups,
                 true,
                 true,
@@ -1666,6 +1916,39 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn page_cursors_are_optional_strings_and_reserve_their_reply_space() {
+        for (files, query) in [(false, json!({"pattern":"x"})), (true, json!({}))] {
+            for page in [Value::Null, json!("src/a.rs")] {
+                let mut query = query.clone();
+                query["page"] = page;
+                validate_query(&query, files).unwrap();
+            }
+            for page in [json!(1), json!([]), json!(true)] {
+                let mut query = query.clone();
+                query["page"] = page;
+                assert!(validate_query(&query, files).is_err());
+            }
+        }
+
+        let paths = vec!["a".to_string(), "dir/\u{1}".to_string()];
+        let longest = serde_json::to_vec(&paths[1]).unwrap().len();
+        let mut budget = crate::serve::JsonBudget { remaining: 1000 };
+        reserve_cursor(&mut budget, &paths).unwrap();
+        assert!(1000 - budget.remaining >= longest + 16);
+        let mut short = crate::serve::JsonBudget { remaining: 8 };
+        let error = reserve_cursor(&mut short, &paths).unwrap_err();
+        assert!(error.is::<crate::serve::ResponseLimit>());
+
+        let mut budget = crate::serve::JsonBudget { remaining: 5 };
+        let error = budget.charge(&"too long").unwrap_err();
+        assert!(error.is::<crate::serve::ResponseLimit>());
+        assert!(error.to_string().contains("response exceeds 64 MiB"));
+        assert_eq!(budget.remaining, 5, "a failed charge reserves nothing");
+        budget.charge(&"ab").unwrap();
+        assert_eq!(budget.remaining, 0);
     }
 
     #[test]

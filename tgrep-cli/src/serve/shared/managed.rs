@@ -111,7 +111,7 @@ fn hello(namespace: &Namespace) -> Result<Value> {
             "bounded-storage-inventory","namespace-discovery","maintenance-diagnostics",
             "private-rpc-authentication","bounded-reconciliation","reconciliation-phase-metrics",
             "event-driven-native-reconciliation","serving-native-periodic-verification",
-            "content-eligibility-profile"
+            "content-eligibility-profile","paged-results"
         ],
         "profile":IndexingProfile::default(),
         "policy":namespace.policy()?,"allocation":namespace.allocation()?,
@@ -314,6 +314,7 @@ struct Monitor {
     watched: HashSet<PathBuf>,
     fallback: Option<String>,
     watch_failure: Arc<Mutex<Option<String>>>,
+    watch_counters: Arc<WatchCounters>,
     last_schedule: Instant,
     last_reconcile: Instant,
     /// Last completed full pass or terminal serving-verification attempt.
@@ -330,6 +331,47 @@ struct WatchSettings {
     mode: crate::serve::WatchMode,
     interval: Duration,
     watches_per_view: usize,
+}
+
+/// Native watcher input accounting, reported per view in status.
+#[derive(Default)]
+struct WatchCounters {
+    events: AtomicU64,
+    access: AtomicU64,
+    create: AtomicU64,
+    modify: AtomicU64,
+    remove: AtomicU64,
+    other: AtomicU64,
+    errors: AtomicU64,
+    unchanged_paths: AtomicU64,
+    invalidated_paths: AtomicU64,
+    full_invalidations: AtomicU64,
+    epoch_advances: AtomicU64,
+}
+
+impl WatchCounters {
+    fn add(counter: &AtomicU64, value: u64) {
+        counter.fetch_add(value, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Value {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        json!({
+            "events": load(&self.events),
+            "by_kind": {
+                "access": load(&self.access),
+                "create": load(&self.create),
+                "modify": load(&self.modify),
+                "remove": load(&self.remove),
+                "other": load(&self.other),
+                "error": load(&self.errors),
+            },
+            "unchanged_paths_filtered": load(&self.unchanged_paths),
+            "invalidated_paths": load(&self.invalidated_paths),
+            "full_invalidations": load(&self.full_invalidations),
+            "epoch_advances": load(&self.epoch_advances),
+        })
+    }
 }
 
 impl WatchSettings {
@@ -508,20 +550,111 @@ impl RetrySchedule {
             .is_none_or(|last| now.saturating_duration_since(last) >= self.delay(base))
     }
 
+    /// `progress` resets the backoff. An unproductive continuation keeps the
+    /// current backoff so a traversal that reclaims nothing is paced instead
+    /// of spinning; the backoff grows when such a traversal completes.
     fn completed(&mut self, now: Instant, progress: bool, more: bool) {
         self.last = Some(now);
-        self.requested = more;
-        self.exponent = if progress || more {
-            0
-        } else {
-            (self.exponent + 1).min(6)
-        };
+        if progress {
+            self.exponent = 0;
+        } else if !more {
+            self.exponent = (self.exponent + 1).min(6);
+        }
+        self.requested = more && self.exponent == 0;
+    }
+}
+
+const SCHEDULER_TICK: Duration = Duration::from_millis(100);
+const SCHEDULER_IDLE_TICK: Duration = Duration::from_millis(1600);
+
+/// Paces catalog-backed scheduler ticks. Each base tick compares a cheap
+/// in-memory signature (lifecycle epoch, view input epochs, queued jobs); a
+/// change runs a full tick at once. Otherwise consecutive quiet full ticks
+/// back off to `SCHEDULER_IDLE_TICK`, so an idle namespace does not spend
+/// catalog and anchor-verification I/O that competes with running work.
+#[derive(Default)]
+struct IdlePacer {
+    signature: Option<(u64, u64, usize, usize)>,
+    last: Option<Instant>,
+    quiet: u32,
+}
+
+impl IdlePacer {
+    fn delay(&self) -> Duration {
+        SCHEDULER_TICK
+            .saturating_mul(1 << self.quiet.min(4))
+            .min(SCHEDULER_IDLE_TICK)
+    }
+
+    fn due(&self, now: Instant, signature: (u64, u64, usize, usize)) -> bool {
+        self.signature != Some(signature)
+            || self
+                .last
+                .is_none_or(|last| now.saturating_duration_since(last) >= self.delay())
+    }
+
+    fn completed(&mut self, now: Instant, signature: (u64, u64, usize, usize), quiet: bool) {
+        self.signature = Some(signature);
+        self.last = Some(now);
+        self.quiet = if quiet { (self.quiet + 1).min(4) } else { 0 };
     }
 }
 
 struct ManagedQuery {
     query: ViewQuery,
     slot: Arc<ViewSlot>,
+}
+
+/// Recovery counts as productive only when it actually changed or reclaimed
+/// something. Verification bytes and committed-error flags alone do not reset
+/// the backoff, so a pass that reclaims nothing cannot spin hot.
+fn recovery_productive(progress: &managed::RecoveryProgress) -> bool {
+    let mut cleanup = progress.cleanup.clone();
+    cleanup.control_verification_bytes = 0;
+    progress.owners_reaped != 0
+        || progress.reservations_released != 0
+        || progress.views_retired != 0
+        || progress.operations_recovered != 0
+        || progress.objects_retired != 0
+        || progress.objects_quarantined != 0
+        || progress.members_refreshed != 0
+        || cleanup != managed::CleanupCounts::default()
+}
+
+/// Scheduler phase failures. A failed phase is reported, but never prevents
+/// the remaining phases of the same tick from running.
+#[derive(Default)]
+struct PhaseFailures(Vec<(&'static str, anyhow::Error)>);
+
+impl PhaseFailures {
+    fn record(&mut self, phase: &'static str, error: anyhow::Error) {
+        self.0.push((phase, error));
+    }
+
+    fn check(&mut self, phase: &'static str, result: Result<()>) {
+        if let Err(error) = result {
+            self.record(phase, error);
+        }
+    }
+
+    fn names(&self) -> Vec<&'static str> {
+        let mut names: Vec<_> = self.0.iter().map(|(phase, _)| *phase).collect();
+        names.dedup();
+        names
+    }
+
+    fn into_result(self) -> Result<()> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        let detail = self
+            .0
+            .iter()
+            .map(|(phase, error)| format!("{phase}: {error:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(anyhow::anyhow!(detail))
+    }
 }
 
 impl QuerySource for ManagedQuery {
@@ -551,6 +684,14 @@ impl QuerySource for ManagedQuery {
     }
     fn check(&self) -> Result<()> {
         Ok(self.query.validate()?)
+    }
+    fn eventual(&self) -> bool {
+        self.query.eventual()
+    }
+    fn requeue(&self, relative: &[String]) -> Result<()> {
+        let paths: Vec<_> = relative.iter().map(PathBuf::from).collect();
+        self.slot.invalidate(&paths, false)?;
+        Ok(())
     }
 }
 
@@ -647,11 +788,36 @@ fn watch_event(
     metadata: &[PathBuf],
     storage: &Path,
     watch_failure: &Mutex<Option<String>>,
+    counters: &WatchCounters,
     event: notify::Result<notify::Event>,
 ) -> managed::Result<()> {
+    WatchCounters::add(&counters.events, 1);
     match event {
-        Ok(event) if matches!(event.kind, EventKind::Access(_)) => Ok(()),
+        Ok(event) if matches!(event.kind, EventKind::Access(_)) => {
+            WatchCounters::add(&counters.access, 1);
+            Ok(())
+        }
         Ok(event) => {
+            WatchCounters::add(
+                match event.kind {
+                    EventKind::Create(_) => &counters.create,
+                    EventKind::Modify(_) => &counters.modify,
+                    EventKind::Remove(_) => &counters.remove,
+                    _ => &counters.other,
+                },
+                1,
+            );
+            // Windows reports attribute-only changes as Modify(Any); renames
+            // are excluded because both endpoints must be rechecked.
+            let content_candidate = matches!(
+                event.kind,
+                EventKind::Modify(
+                    notify::event::ModifyKind::Any
+                        | notify::event::ModifyKind::Data(_)
+                        | notify::event::ModifyKind::Metadata(_)
+                        | notify::event::ModifyKind::Other
+                )
+            ) && !event.need_rescan();
             let mut paths = Vec::new();
             let mut full = event.need_rescan()
                 || event.paths.is_empty()
@@ -694,18 +860,35 @@ fn watch_event(
                             && (relative != Path::new(".git") || path.is_dir()) => {}
                     Ok(relative) if relative == Path::new(".git") => full = true,
                     Ok(relative) if !relative.as_os_str().is_empty() => {
+                        // Drop notifications that left a file's trusted
+                        // metadata equal to the indexed evidence, so external
+                        // walkers and attribute churn do not trigger passes.
+                        if content_candidate
+                            && std::fs::metadata(&path).is_ok_and(|metadata| {
+                                metadata.is_file() && slot.unchanged_file(relative, &metadata)
+                            })
+                        {
+                            WatchCounters::add(&counters.unchanged_paths, 1);
+                            continue;
+                        }
                         paths.push(relative.to_path_buf())
                     }
                     _ => full = true,
                 }
             }
             if full || !paths.is_empty() {
+                WatchCounters::add(&counters.invalidated_paths, paths.len() as u64);
+                WatchCounters::add(&counters.full_invalidations, u64::from(full));
+                WatchCounters::add(&counters.epoch_advances, 1);
                 slot.invalidate(&paths, full).map(|_| ())
             } else {
                 Ok(())
             }
         }
         Err(error) => {
+            WatchCounters::add(&counters.errors, 1);
+            WatchCounters::add(&counters.full_invalidations, 1);
+            WatchCounters::add(&counters.epoch_advances, 1);
             eprintln!("managed watcher {}: {error}", slot.id());
             match watch_failure.lock() {
                 Ok(mut failure) => *failure = Some(format!("native watcher failed: {error}")),
@@ -761,6 +944,7 @@ fn sync_monitor(
     if monitor.watcher.is_none() {
         let weak = Arc::downgrade(slot);
         let watch_failure = Arc::clone(&monitor.watch_failure);
+        let watch_counters = Arc::clone(&monitor.watch_counters);
         let storage = storage.to_path_buf();
         #[cfg(feature = "managed-test-hooks")]
         let suppress = Arc::clone(&monitor.suppress_events);
@@ -772,7 +956,14 @@ fn sync_monitor(
             let Some(slot) = weak.upgrade() else {
                 return;
             };
-            let result = watch_event(&slot, &metadata, &storage, &watch_failure, event);
+            let result = watch_event(
+                &slot,
+                &metadata,
+                &storage,
+                &watch_failure,
+                &watch_counters,
+                event,
+            );
             if let Err(error) = result {
                 eprintln!("managed watcher invalidation {}: {error}", slot.id());
             }
@@ -840,6 +1031,7 @@ impl State {
                 else if monitor.is_some() { "native" } else { "unavailable" },
             "watch_fallback": monitor.as_ref().and_then(|monitor| monitor.fallback.as_ref()),
             "watch_count": monitor.as_ref().map_or(0, |monitor| monitor.watched.len()),
+            "watch_events": monitor.as_ref().map(|monitor| monitor.watch_counters.snapshot()),
             "last_verification": monitor.as_ref().map(|monitor| json!({
                 "outcome": monitor.verification,
                 "age_ms": monitor.last_verification.elapsed().as_millis(),
@@ -899,7 +1091,7 @@ impl State {
             .ok_or_else(|| Error::corrupt("view has neither a pin nor an intent"))?;
         Ok(
             json!({"root":record.root.to_path()?,"view":record.id,"generation":key,"version":record.version,
-            "ready":status.ready,"epoch":status.input_epoch,"leases":status.leases,
+            "ready":status.ready,"serving":status.serving,"epoch":status.input_epoch,"leases":status.leases,
             "reconcile_running":status.work.is_some(),"last_error":status.error,
             "last_reconcile":status.last_reconcile,"backend":"shared-v2"}),
         )
@@ -1231,12 +1423,15 @@ impl State {
                     .get(&input.view)
                     .cloned()
                     .ok_or_else(|| Error::invalid("view has no monitor"))?;
-                let failure = Arc::clone(
-                    &monitor
+                let (failure, counters) = {
+                    let monitor = monitor
                         .lock()
-                        .map_err(|_| Error::corrupt("monitor poisoned"))?
-                        .watch_failure,
-                );
+                        .map_err(|_| Error::corrupt("monitor poisoned"))?;
+                    (
+                        Arc::clone(&monitor.watch_failure),
+                        Arc::clone(&monitor.watch_counters),
+                    )
+                };
                 let event = match input.kind {
                     Kind::Rescan => Ok(notify::Event::new(EventKind::Modify(
                         notify::event::ModifyKind::Any,
@@ -1247,7 +1442,14 @@ impl State {
                         "injected native watcher uncertainty",
                     )),
                 };
-                watch_event(&slot, &[], self.namespace.path(), &failure, event)?;
+                watch_event(
+                    &slot,
+                    &[],
+                    self.namespace.path(),
+                    &failure,
+                    &counters,
+                    event,
+                )?;
                 Ok(json!({"input_epoch":slot.input_epoch()}))
             }
             "views.attach" => {
@@ -1286,6 +1488,7 @@ impl State {
                     "watch_mode",
                     "watch_fallback",
                     "watch_count",
+                    "watch_events",
                     "last_verification",
                     "reconciliation_policy",
                 ] {
@@ -1462,10 +1665,11 @@ impl State {
             let watch = self.watch_status(slot.id())?;
             return Ok(json!({
                 "root":slot.root(),"view":slot.id(),"generation":pin.key,"version":status.authoritative.version,
-                "ready":status.ready,"epoch":status.input_epoch,"backend":"shared-v2","status":status,
+                "ready":status.ready,"serving":status.serving,"epoch":status.input_epoch,"backend":"shared-v2","status":status,
                 "watch_mode":watch["watch_mode"],
                 "watch_fallback":watch["watch_fallback"],
                 "watch_count":watch["watch_count"],
+                "watch_events":watch["watch_events"],
                 "last_verification":watch["last_verification"],
                 "reconciliation_policy":watch["reconciliation_policy"],
                 "policy":self.namespace.policy()?,"usage":self.namespace.work_usage()?,
@@ -1480,15 +1684,22 @@ impl State {
         let published = &query.published().record;
         let pin = published.pin()?;
         let metadata = json!({"root":slot.root(),"view":slot.id(),"generation":pin.key,"version":published.version,
-            "incarnation":pin.incarnation,"commit":pin.commit,"ready":true,"hidden_complete":true,"ordered_filters":true,
+            "incarnation":pin.incarnation,"commit":pin.commit,"ready":true,"lagging":query.lagging(),
+            "hidden_complete":true,"ordered_filters":true,
             "multiline_replace":true,"report_replacements":true,"backend":"shared-v2"});
         let source = ManagedQuery { query, slot };
-        let result = super::server::search_snapshot(
+        // Pages end well before the operation deadline so long scans resume
+        // instead of failing.
+        let page_time =
+            Duration::from_millis(self.namespace.policy()?.policy.work.operation_timeout_ms / 2)
+                .min(super::server::PAGE_TIME);
+        let result = super::server::search_snapshot_parallel(
             &source,
             &input.query,
             request.method == "files",
             &request.id,
             metadata,
+            page_time,
         )?;
         source.query.complete()?;
         Ok(result)
@@ -1604,7 +1815,9 @@ impl State {
         Ok(())
     }
 
-    fn schedule_view(&self, slot: &Arc<ViewSlot>) -> Result<()> {
+    /// Returns whether the view still needs prompt scheduler attention: it
+    /// accepted work, or it is stale with no reconciliation running.
+    fn schedule_view(&self, slot: &Arc<ViewSlot>) -> Result<bool> {
         self.schedule_view_with_elapsed(slot, |monitor| {
             (
                 monitor.last_schedule.elapsed(),
@@ -1618,13 +1831,13 @@ impl State {
         &self,
         slot: &Arc<ViewSlot>,
         elapsed: impl FnOnce(&Monitor) -> (Duration, Duration, Duration),
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let status = self.views.status(slot.id())?;
         if status.leases == 0 {
-            return Ok(());
+            return Ok(false);
         }
         if status.closing || status.work.is_some() || !status.authoritative.committed {
-            return Ok(());
+            return Ok(false);
         }
         let monitor = self
             .monitors
@@ -1633,7 +1846,7 @@ impl State {
             .get(slot.id())
             .cloned();
         let Some(monitor) = monitor else {
-            return Ok(());
+            return Ok(false);
         };
         let mut monitor = monitor
             .lock()
@@ -1674,7 +1887,7 @@ impl State {
             }
         }
         if !monitor.pending.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         let retry = Duration::from_millis(200_u64.saturating_mul(1_u64 << monitor.failures.min(7)));
         let (schedule_elapsed, reconcile_elapsed, verification_elapsed) = elapsed(&monitor);
@@ -1704,6 +1917,7 @@ impl State {
                 },
             )?;
             self.enqueue(&operation)?;
+            return Ok(true);
         } else if status.ready
             && schedule_elapsed >= retry
             && matches!(
@@ -1726,9 +1940,10 @@ impl State {
                     },
                 )?;
                 self.enqueue(&operation)?;
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(!status.ready)
     }
 }
 
@@ -1892,6 +2107,7 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
             fallback: None,
             last_schedule: Instant::now(),
             watch_failure: Arc::new(Mutex::new(None)),
+            watch_counters: Arc::new(WatchCounters::default()),
             last_reconcile: Instant::now(),
             last_verification: Instant::now(),
             verification: None,
@@ -1938,6 +2154,9 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
         legacy,
         WorktreeOptions {
             hint_capacity: options.hint_budget / policy.work.max_views as usize,
+            // Managed views favor availability: queries keep using the last
+            // published snapshot while newer changes reconcile.
+            stale_reads: true,
             ..WorktreeOptions::default()
         },
         Some(observer),
@@ -2202,8 +2421,22 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
             let mut collection_changes = false;
             let mut view_after: Option<Id> = None;
             let mut drain_after: Option<Id> = None;
+            let mut pacer = IdlePacer::default();
             while !scheduler.stopping.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(SCHEDULER_TICK);
+                let signature = (|| -> Result<(u64, u64, usize, usize)> {
+                    let slots = scheduler.views.slots()?;
+                    let epochs = slots.iter().fold(0_u64, |sum, slot| sum.wrapping_add(slot.input_epoch()));
+                    let queued = scheduler.queued.lock().map_err(|_| Error::corrupt("job registry poisoned"))?.len();
+                    Ok((scheduler.lifecycle_epoch.load(Ordering::Acquire), epochs, slots.len(), queued))
+                })();
+                let tick_started = Instant::now();
+                if let Ok(signature) = signature
+                    && !pacer.due(tick_started, signature)
+                {
+                    continue;
+                }
+                let mut quiet = signature.is_ok();
                 let tick = (|| -> Result<()> {
                     {
                         let admission = scheduler.admission.lock().map_err(|_| Error::corrupt("admission gate poisoned"))?;
@@ -2217,21 +2450,22 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                     let epoch = scheduler.lifecycle_epoch.load(Ordering::Acquire);
                     if epoch != lifecycle_epoch {
                         lifecycle_epoch = epoch;
+                        quiet = false;
                         recovery_schedule.request();
                         pending_schedule.request();
                         collection_requested = true;
                         collection_schedule.request();
                     }
+                    // Each phase fails independently: unproductive or failing
+                    // maintenance must never stop view reconciliation.
+                    let mut failures = PhaseFailures::default();
                     if recovery_schedule.due(now, retry) {
                         match scheduler.namespace.recover_pass(recovery.clone()) {
                             Ok(progress) => {
-                                recovered_changes |= progress.mutation_committed || progress.owners_reaped != 0
-                                    || progress.reservations_released != 0 || progress.views_retired != 0
-                                    || progress.operations_recovered != 0 || progress.objects_retired != 0
-                                    || progress.objects_quarantined != 0 || progress.members_refreshed != 0
-                                    || progress.cleanup != managed::CleanupCounts::default();
+                                recovered_changes |= recovery_productive(&progress);
                                 recovery = progress.next;
                                 recovery_schedule.completed(Instant::now(), recovered_changes, recovery.is_some());
+                                if recovered_changes || recovery.is_some() { quiet = false; }
                                 if recovery.is_none() { recovered_changes = false; }
                                 for issue in progress.issues {
                                     eprintln!("managed recovery {} {}: {}", issue.kind, issue.identity, issue.error);
@@ -2239,83 +2473,163 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                             }
                             Err(error) => {
                                 recovery_schedule.completed(Instant::now(), false, false);
-                                return Err(error.into());
+                                failures.record("recovery", error.into());
                             }
                         }
                     }
                     if pending_schedule.due(now, Duration::from_millis(100)) {
-                        let pending = scheduler.namespace.pending_operations(pending_after.as_ref())?;
-                        for operation in &pending {
-                            if operation.instance == *scheduler.namespace.instance() { scheduler.enqueue(operation)?; }
-                        }
-                        pending_after = if pending.len() == policy.policy.work.page_objects as usize {
-                            pending.last().map(|operation| operation.id.clone())
-                        } else { None };
-                        pending_schedule.completed(Instant::now(), false, pending_after.is_some());
+                        let mut enqueued = false;
+                        let result = (|| -> Result<()> {
+                            let pending = scheduler.namespace.pending_operations(pending_after.as_ref())?;
+                            for operation in &pending {
+                                if operation.instance == *scheduler.namespace.instance() {
+                                    let fresh = !scheduler.queued.lock().map_err(|_| Error::corrupt("job registry poisoned"))?
+                                        .contains_key(&operation.id);
+                                    scheduler.enqueue(operation)?;
+                                    enqueued |= fresh;
+                                }
+                            }
+                            pending_after = if pending.len() == policy.policy.work.page_objects as usize {
+                                pending.last().map(|operation| operation.id.clone())
+                            } else { None };
+                            Ok(())
+                        })();
+                        // Re-enqueueing yielded or dropped work is progress: it
+                        // must not grow the backoff for the next continuation.
+                        let progress = enqueued || pending_after.is_some();
+                        pending_schedule.completed(Instant::now(), progress, pending_after.is_some());
+                        if progress { quiet = false; }
+                        failures.check("pending", result);
                     }
-                    drain_after = scheduler.views.drain_released_page(drain_after.as_ref())?.1;
-                    let (slots, next) = scheduler.views.slots_page(view_after.as_ref())?;
-                    for slot in &slots { scheduler.schedule_view(slot)?; }
-                    view_after = next;
+                    match scheduler.views.drain_released_page(drain_after.as_ref()) {
+                        Ok((drained, next)) => {
+                            if drained != 0 || next.is_some() { quiet = false; }
+                            drain_after = next;
+                        }
+                        Err(error) => { drain_after = None; failures.record("drain", error.into()); }
+                    }
+                    match scheduler.views.slots_page(view_after.as_ref()) {
+                        Ok((slots, next)) => {
+                            for slot in &slots {
+                                match scheduler.schedule_view(slot) {
+                                    Ok(active) => quiet &= !active,
+                                    Err(error) => failures.record("views", error),
+                                }
+                            }
+                            if next.is_some() { quiet = false; }
+                            view_after = next;
+                        }
+                        Err(error) => { view_after = None; failures.record("views", error.into()); }
+                    }
+                    let mut collection_state = Value::Null;
                     if let Some(id) = collection.take() {
-                        let previous = scheduler.namespace.operation(&id)?;
-                        if !matches!(previous.state, OperationState::Completed | OperationState::Failed | OperationState::Cancelled) {
-                            collection = Some(id);
-                        } else if let Some(result) = previous.result {
-                            let progress: CollectionProgress = serde_json::from_value(result)?;
-                            collection_changes |= progress.retired != 0 || progress.removed != 0 || progress.recovered_objects != 0
-                                || progress.logical_bytes_reclaimed != 0 || progress.recovered_logical_bytes != 0;
-                            collection_cursor = progress.next;
-                            collection_schedule.completed(Instant::now(), collection_changes, collection_cursor.is_some());
-                            if collection_cursor.is_none() { collection_changes = false; }
-                        } else {
-                            collection_schedule.completed(Instant::now(), false, false);
-                            if let Some(error) = previous.error { eprintln!("managed collection failed: {error}"); }
+                        match scheduler.namespace.operation(&id) {
+                            Err(error) => {
+                                // An unreadable receipt must not keep
+                                // collection marked in flight forever.
+                                collection_schedule.completed(Instant::now(), false, false);
+                                failures.record("collection", error.into());
+                            }
+                            Ok(previous) if !matches!(previous.state, OperationState::Completed | OperationState::Failed | OperationState::Cancelled) => {
+                                // A durable receipt dropped by a full job
+                                // queue is re-enqueued; enqueue is idempotent.
+                                failures.check("collection", scheduler.enqueue(&previous));
+                                collection_state = serde_json::to_value(previous.state)?;
+                                collection = Some(id);
+                            }
+                            Ok(previous) => match previous.result.map(serde_json::from_value::<CollectionProgress>) {
+                                Some(Ok(progress)) => {
+                                    collection_changes |= progress.retired != 0 || progress.removed != 0 || progress.recovered_objects != 0
+                                        || progress.logical_bytes_reclaimed != 0 || progress.recovered_logical_bytes != 0;
+                                    collection_cursor = progress.next;
+                                    collection_schedule.completed(Instant::now(), collection_changes, collection_cursor.is_some());
+                                    if collection_cursor.is_none() { collection_changes = false; }
+                                }
+                                Some(Err(error)) => {
+                                    collection_cursor = None;
+                                    collection_schedule.completed(Instant::now(), false, false);
+                                    failures.record("collection", error.into());
+                                }
+                                None => {
+                                    collection_schedule.completed(Instant::now(), false, false);
+                                    if let Some(error) = previous.error { eprintln!("managed collection failed: {error}"); }
+                                }
+                            },
                         }
                     }
-                    {
+                    let collection_queued = match &collection {
+                        Some(id) => scheduler.queued.lock().map_err(|_| Error::corrupt("job registry poisoned"))?.contains_key(id),
+                        None => false,
+                    };
+                    let acknowledged = (|| -> Result<()> {
                         let queued = scheduler.queued.lock().map_err(|_| Error::corrupt("job registry poisoned"))?;
                         let mut protected: Vec<Id> = queued.keys().cloned().collect();
                         protected.extend(collection.iter().cloned());
                         scheduler.namespace.acknowledge_system_operations(&protected)?;
-                    }
-                    let usage = scheduler.namespace.work_usage()?;
-                    let pressure = policy.policy.collection.on_pressure
-                        && usage.storage.charged_budget_shortfall_bytes.is_some_and(|shortfall| shortfall != 0);
+                        Ok(())
+                    })();
+                    failures.check("acknowledge", acknowledged);
                     let enabled = policy.policy.collection.on_pressure
                         || matches!(policy.policy.collection.schedule, managed::policy::Schedule::Periodic { .. });
-                    let periodic = match policy.policy.collection.schedule {
-                        managed::policy::Schedule::Disabled => false,
-                        managed::policy::Schedule::Periodic { interval_ms } => last_collection.elapsed() >= Duration::from_millis(interval_ms),
-                    };
-                    if collection.is_none() && enabled
-                        && (periodic || pressure || collection_requested || collection_cursor.is_some())
-                        && collection_schedule.due(Instant::now(), retry)
-                    {
-                        if collection_version != Some(policy.version) {
+                    let mut pressure = false;
+                    let started_collection = (|| -> Result<()> {
+                        let usage = scheduler.namespace.work_usage()?;
+                        pressure = policy.policy.collection.on_pressure
+                            && usage.storage.charged_budget_shortfall_bytes.is_some_and(|shortfall| shortfall != 0);
+                        let periodic = match policy.policy.collection.schedule {
+                            managed::policy::Schedule::Disabled => false,
+                            managed::policy::Schedule::Periodic { interval_ms } => last_collection.elapsed() >= Duration::from_millis(interval_ms),
+                        };
+                        if collection.is_none() && enabled
+                            && (periodic || pressure || collection_requested || collection_cursor.is_some())
+                            && collection_schedule.due(Instant::now(), retry)
+                        {
+                            if collection_version != Some(policy.version) {
+                                collection_cursor = None;
+                                collection_version = Some(policy.version);
+                            }
+                            let request = CollectionRequest { policy_version: policy.version,
+                                allocation_version: scheduler.namespace.allocation()?.version,
+                                bounds: CollectionBounds::from_policy(&policy.policy.collection), cursor: collection_cursor.clone() };
+                            // A failed acceptance backs off instead of being
+                            // retried on every tick.
+                            last_collection = Instant::now();
+                            let operation = match scheduler.namespace.accept_system_operation(Token::parse(Id::new()?.to_string())?, "collection", serde_json::to_value(request)?) {
+                                Ok(operation) => operation,
+                                Err(error) => {
+                                    collection_schedule.completed(Instant::now(), false, false);
+                                    return Err(error.into());
+                                }
+                            };
+                            collection_requested = false;
                             collection_cursor = None;
-                            collection_version = Some(policy.version);
+                            collection = Some(operation.id.clone());
+                            scheduler.enqueue(&operation)?;
                         }
-                        let request = CollectionRequest { policy_version: policy.version,
-                            allocation_version: scheduler.namespace.allocation()?.version,
-                            bounds: CollectionBounds::from_policy(&policy.policy.collection), cursor: collection_cursor.take() };
-                        let operation = scheduler.namespace.accept_system_operation(Token::parse(Id::new()?.to_string())?, "collection", serde_json::to_value(request)?)?;
-                        scheduler.enqueue(&operation)?;
-                        collection = Some(operation.id);
-                        last_collection = Instant::now();
-                        collection_requested = false;
-                    }
+                        Ok(())
+                    })();
+                    failures.check("collection", started_collection);
+                    if collection.is_some() || collection_cursor.is_some() || !failures.names().is_empty() { quiet = false; }
+                    let phase_failures = failures.names();
                     *scheduler.scheduler_snapshot.lock().map_err(|_| Error::corrupt("scheduler observations poisoned"))? = json!({
-                        "initializing":false,"tick_ms":100,"maximum_backoff_multiplier":64,
+                        "initializing":false,"tick_ms":SCHEDULER_TICK.as_millis(),"idle_tick_ms":SCHEDULER_IDLE_TICK.as_millis(),"maximum_backoff_multiplier":64,
                         "automatic_collection_enabled":enabled,"pressure":pressure,
                         "recovery_continuation":recovery.is_some(),"collection_continuation":collection_cursor.is_some(),
+                        // Accepted is not running: the operation state and
+                        // queue membership distinguish waiting from active.
                         "collection_in_flight":collection.is_some(),
+                        "collection_operation_state":collection_state,
+                        "collection_queued":collection_queued,
+                        "failed_phases":phase_failures,
                         "recovery_retry_ms":recovery_schedule.delay(retry).as_millis(),
                         "collection_retry_ms":collection_schedule.delay(retry).as_millis(),
                         "pending_retry_ms":pending_schedule.delay(Duration::from_millis(100)).as_millis()
                     });
-                    Ok(())
+                    failures.into_result()
                 })();
+                if let Ok(signature) = signature {
+                    pacer.completed(tick_started, signature, quiet && tick.is_ok());
+                }
                 let mut diagnostics = scheduler.scheduler_diagnostics.lock().expect("scheduler diagnostics");
                 if diagnostics.observe(started.elapsed(), tick.err().map(|error| format!("{error:#}"))) {
                     eprintln!("managed scheduler: {}", diagnostics.last_error_detail.as_deref().expect("observed error"));
@@ -2644,13 +2958,52 @@ mod scheduling_tests {
         assert!(record.pin().unwrap().incarnation.is_some());
         assert!(manager.status(&record.id).unwrap().ready);
         let slot = manager.slot(&record.id).unwrap();
+        let failure = Mutex::new(None);
+        let counters = WatchCounters::default();
+        let source = slot.root().join("source.txt");
+        let modify =
+            |kind| Ok(notify::Event::new(EventKind::Modify(kind)).add_path(source.clone()));
+        let before = slot.input_epoch();
+        for kind in [
+            notify::event::ModifyKind::Any,
+            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Any),
+        ] {
+            watch_event(&slot, &[], &storage, &failure, &counters, modify(kind)).unwrap();
+        }
+        assert_eq!(
+            slot.input_epoch(),
+            before,
+            "metadata-only churn on an indexed file must not advance the epoch"
+        );
+        assert!(manager.status(&record.id).unwrap().ready);
+        watch_event(
+            &slot,
+            &[],
+            &storage,
+            &failure,
+            &counters,
+            modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Any,
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            slot.input_epoch(),
+            before + 1,
+            "renames are always rechecked"
+        );
+        let events = counters.snapshot();
+        assert_eq!(events["events"], 3);
+        assert_eq!(events["by_kind"]["modify"], 3);
+        assert_eq!(events["unchanged_paths_filtered"], 2);
+        assert_eq!(events["invalidated_paths"], 1);
+        assert_eq!(events["epoch_advances"], 1);
         let (private, common) =
             tgrep_core::git_index::read_repository_dirs_bounded(&linked).unwrap();
         let private = fs::canonicalize(private).unwrap();
         let common = fs::canonicalize(common).unwrap();
         assert_ne!(private, common);
         assert!(private.starts_with(&common));
-        let failure = Mutex::new(None);
         for roots in [
             [common.clone(), private.clone()],
             [private.clone(), common.clone()],
@@ -2672,6 +3025,7 @@ mod scheduling_tests {
                         &roots,
                         &storage,
                         &failure,
+                        &counters,
                         Ok(
                             notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
                                 .add_path(directory.join(name)),
@@ -2699,6 +3053,7 @@ mod scheduling_tests {
                         &roots,
                         &storage,
                         &failure,
+                        &counters,
                         Ok(
                             notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
                                 .add_path(directory.join(name)),
@@ -2718,6 +3073,7 @@ mod scheduling_tests {
                 &roots,
                 &storage,
                 &failure,
+                &counters,
                 Ok(
                     notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
                         .add_path(common.join("worktrees").join("unrelated").join("HEAD")),
@@ -2730,6 +3086,7 @@ mod scheduling_tests {
                 &roots,
                 &storage,
                 &failure,
+                &counters,
                 Ok(
                     notify::Event::new(EventKind::Access(notify::event::AccessKind::Any))
                         .add_path(private.join("HEAD")),
@@ -2746,6 +3103,7 @@ mod scheduling_tests {
                     &roots,
                     &storage,
                     &failure,
+                    &counters,
                     Ok(
                         notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
                             .add_path(path),
@@ -2762,6 +3120,7 @@ mod scheduling_tests {
             &[common, private],
             &storage,
             &failure,
+            &counters,
             Ok(
                 notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
                     .add_path(storage.join("checkpoint"))
@@ -2775,6 +3134,7 @@ mod scheduling_tests {
             &[],
             &storage,
             &failure,
+            &counters,
             Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch)),
         )
         .unwrap();
@@ -2838,9 +3198,88 @@ mod scheduling_tests {
         schedule.completed(now + base, false, true);
         assert_eq!(
             schedule.delay(base),
-            base,
-            "bounded traversal continuations should progress"
+            base * 64,
+            "unproductive continuations keep the backoff"
         );
+        schedule.completed(now + base, true, true);
+        assert_eq!(
+            schedule.delay(base),
+            base,
+            "productive bounded traversal continuations should progress"
+        );
+        schedule.completed(now + base, false, true);
+        assert_eq!(
+            schedule.delay(base),
+            base,
+            "a traversal that started productive continues at the base interval"
+        );
+        schedule.completed(now + base, false, false);
+        assert_eq!(schedule.delay(base), base * 2);
+        schedule.completed(now + base, false, true);
+        assert_eq!(
+            schedule.delay(base),
+            base * 2,
+            "a repeated unproductive traversal is paced at its backoff"
+        );
+    }
+
+    fn recovery(
+        cleanup: managed::CleanupCounts,
+        objects_retired: u32,
+    ) -> managed::RecoveryProgress {
+        serde_json::from_value(json!({
+            "examined":100,"owners_reaped":0,"reservations_released":0,"members_refreshed":0,
+            "objects_retired":objects_retired,"objects_quarantined":0,"views_retired":0,
+            "operations_recovered":0,"cleanup":cleanup,"cancelled":false,
+            "measurements_complete":true,"mutation_committed":true,"issues":[],"next":null,
+            "elapsed_nanos":1
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn recovery_that_only_verifies_or_commits_flags_backs_off() {
+        let verified = managed::CleanupCounts {
+            control_verification_bytes: 4096,
+            ..Default::default()
+        };
+        assert!(!recovery_productive(&recovery(verified.clone(), 0)));
+        assert!(recovery_productive(&recovery(verified, 1)));
+        assert!(recovery_productive(&recovery(
+            managed::CleanupCounts {
+                receipts: 1,
+                ..Default::default()
+            },
+            0
+        )));
+    }
+
+    #[test]
+    fn scheduler_phase_failures_do_not_hide_each_other() {
+        let mut failures = PhaseFailures::default();
+        failures.check("recovery", Ok(()));
+        failures.check("recovery", Err(anyhow::anyhow!("stuck")));
+        failures.record("collection", anyhow::anyhow!("busy"));
+        assert_eq!(failures.names(), ["recovery", "collection"]);
+        let error = format!("{:#}", failures.into_result().unwrap_err());
+        assert!(error.contains("recovery: stuck"), "{error}");
+        assert!(error.contains("collection: busy"), "{error}");
+        assert!(PhaseFailures::default().into_result().is_ok());
+    }
+
+    #[test]
+    fn watch_counters_report_kinds_and_filtered_paths() {
+        let counters = WatchCounters::default();
+        WatchCounters::add(&counters.events, 3);
+        WatchCounters::add(&counters.modify, 2);
+        WatchCounters::add(&counters.errors, 1);
+        WatchCounters::add(&counters.unchanged_paths, 5);
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot["events"], 3);
+        assert_eq!(snapshot["by_kind"]["modify"], 2);
+        assert_eq!(snapshot["by_kind"]["error"], 1);
+        assert_eq!(snapshot["unchanged_paths_filtered"], 5);
+        assert_eq!(snapshot["full_invalidations"], 0);
     }
 }
 
@@ -2900,6 +3339,7 @@ mod candidate_read_tests {
         inject: Inject,
         snapshots: Cell<usize>,
         invalidations: Cell<usize>,
+        requeues: Cell<usize>,
     }
 
     impl QuerySource for Scripted {
@@ -2938,10 +3378,26 @@ mod candidate_read_tests {
             }
             self.inner.check()
         }
+        fn eventual(&self) -> bool {
+            self.inner.eventual()
+        }
+        fn requeue(&self, relative: &[String]) -> Result<()> {
+            self.requeues.set(self.requeues.get() + relative.len());
+            self.inner.requeue(relative)
+        }
     }
 
     #[test]
     fn only_candidate_read_failures_close_a_ready_managed_view() {
+        candidate_read_failures(false);
+    }
+
+    #[test]
+    fn eventual_views_skip_and_requeue_failed_candidates() {
+        candidate_read_failures(true);
+    }
+
+    fn candidate_read_failures(stale_reads: bool) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repository");
         let storage = temp.path().join("storage");
@@ -2977,7 +3433,10 @@ mod candidate_read_tests {
         let manager = ViewManager::new(
             Arc::clone(&namespace),
             None,
-            WorktreeOptions::default(),
+            WorktreeOptions {
+                stale_reads,
+                ..WorktreeOptions::default()
+            },
             None,
         )
         .unwrap();
@@ -3014,6 +3473,7 @@ mod candidate_read_tests {
                 inject,
                 snapshots: Cell::new(0),
                 invalidations: Cell::new(0),
+                requeues: Cell::new(0),
             };
             let result = super::super::server::search_snapshot(
                 &source,
@@ -3022,13 +3482,18 @@ mod candidate_read_tests {
                 &json!(1),
                 json!({}),
             );
-            (result, source.snapshots.get(), source.invalidations.get())
+            (
+                result,
+                source.snapshots.get(),
+                source.invalidations.get(),
+                source.requeues.get(),
+            )
         };
 
-        let (result, snapshots, invalidations) = run(Inject::Nothing);
+        let (result, snapshots, invalidations, requeues) = run(Inject::Nothing);
         let result = result.unwrap();
         assert_eq!(result["matches"].as_array().unwrap().len(), 2, "{result}");
-        assert_eq!((snapshots, invalidations), (5, 0));
+        assert_eq!((snapshots, invalidations, requeues), (5, 0, 0));
         let epoch = slot.input_epoch();
         for (inject, reason) in [
             (Inject::SnapshotBeforeRead(1), "query-input-changed"),
@@ -3041,7 +3506,7 @@ mod candidate_read_tests {
             (Inject::SnapshotAfterRead(4), "query-snapshot-changed"),
             (Inject::Check, "query-deadline"),
         ] {
-            let (result, _, invalidations) = run(inject);
+            let (result, _, invalidations, requeues) = run(inject);
             let error = result.unwrap_err();
             let typed = error
                 .downcast_ref::<Error>()
@@ -3051,25 +3516,40 @@ mod candidate_read_tests {
                 !format!("{error:#}").contains("reading shared candidate"),
                 "{inject:?}: {error:#}"
             );
-            assert_eq!(invalidations, 0, "{inject:?}");
+            assert_eq!((invalidations, requeues), (0, 0), "{inject:?}");
             assert_eq!(slot.input_epoch(), epoch, "{inject:?}");
             assert!(manager.status(&record.id).unwrap().ready, "{inject:?}");
         }
-        let (result, _, invalidations) = run(Inject::Nothing);
+        let (result, _, invalidations, _) = run(Inject::Nothing);
         assert_eq!(result.unwrap()["matches"].as_array().unwrap().len(), 2);
         assert_eq!(invalidations, 0);
 
         std::fs::remove_file(root.join("source.txt")).unwrap();
         std::fs::create_dir(root.join("source.txt")).unwrap();
-        let (result, _, invalidations) = run(Inject::Nothing);
-        let error = result.unwrap_err();
-        assert!(
-            format!("{error:#}").contains("reading shared candidate source.txt"),
-            "{error:#}"
-        );
-        assert_eq!(invalidations, 1);
-        assert_eq!(slot.input_epoch(), epoch + 1);
-        assert!(!manager.status(&record.id).unwrap().ready);
+        if stale_reads {
+            // The vanished candidate is skipped and queued as a path hint;
+            // the view keeps serving its publication while it catches up.
+            for round in 1..=2 {
+                let (result, _, invalidations, requeues) = run(Inject::Nothing);
+                let result = result.unwrap();
+                let matches = result["matches"].as_array().unwrap();
+                assert_eq!(matches.len(), 1, "{result}");
+                assert_eq!((invalidations, requeues), (0, 1));
+                assert_eq!(slot.input_epoch(), epoch + round);
+                let status = manager.status(&record.id).unwrap();
+                assert!(!status.ready && status.serving, "{status:?}");
+            }
+        } else {
+            let (result, _, invalidations, _) = run(Inject::Nothing);
+            let error = result.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("reading shared candidate source.txt"),
+                "{error:#}"
+            );
+            assert_eq!(invalidations, 1);
+            assert_eq!(slot.input_epoch(), epoch + 1);
+            assert!(!manager.status(&record.id).unwrap().ready);
+        }
         drop((slot, manager, owner, namespace, repository));
         temp.close().unwrap();
     }

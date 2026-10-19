@@ -34,6 +34,17 @@ pub struct Match {
     /// `--json --replace`: each span's expanded replacement, parallel to
     /// `spans`.
     pub replacements: Option<Vec<String>>,
+    /// Source bytes of a line that is not valid UTF-8. JSON reports these as
+    /// base64 `bytes`, as ripgrep does.
+    pub raw: Option<RawLine>,
+}
+
+/// The undecoded bytes of a line, without its terminator, and its match spans
+/// in source-byte terms.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawLine {
+    pub bytes: Vec<u8>,
+    pub spans: Vec<(usize, usize)>,
 }
 
 impl Match {
@@ -52,6 +63,8 @@ pub struct ContextLine {
     pub absolute_offset: usize,
     /// See [`Match::terminator_len`].
     pub terminator_len: usize,
+    /// See [`Match::raw`].
+    pub raw: Option<Vec<u8>>,
 }
 
 /// ANSI escape wrapping a matched substring: bold red, as ripgrep does.
@@ -592,11 +605,15 @@ impl OutputWriter {
         if self.is_json() {
             self.ensure_json_begin(&ctx.file)?;
             let (content, _) = self.trim_adjust(&ctx.content, &[]);
+            let raw = ctx
+                .raw
+                .as_deref()
+                .map(|raw| self.trim_raw(&ctx.content, raw, &[], &[]).0);
             let msg = serde_json::json!({
                 "type": "context",
                 "data": {
                     "path": { "text": self.display_path(&ctx.file) },
-                    "lines": { "text": format!("{content}\n") },
+                    "lines": json_line(content, raw.as_deref(), ctx.terminator_len),
                     "line_number": ctx.line_number,
                     "absolute_offset": ctx.absolute_offset,
                     "submatches": [],
@@ -675,18 +692,28 @@ impl OutputWriter {
             }
             OutputFormat::Json => {
                 self.ensure_json_begin(&m.file)?;
-                // `start`/`end` index `lines.text` as emitted, which is the
-                // decoded text. ripgrep sidesteps the question by emitting
-                // `lines.bytes` (base64 of the raw line) whenever a line is not
-                // valid UTF-8, and then reporting source offsets. tgrep always
-                // emits `text`, so its offsets stay usable for slicing it —
-                // they can differ from `absolute_offset`, which is a real file
-                // offset, on a line containing invalid UTF-8.
+                // As in ripgrep, a line that is not valid UTF-8 is reported as
+                // base64 `lines.bytes`, and then `start`/`end` and
+                // non-UTF-8 submatches are in source bytes. Otherwise they
+                // index `lines.text` as emitted.
+                let raw = m.raw.as_ref().map(|raw| {
+                    let indices: Vec<usize> = kept.iter().map(|&(i, _)| i).collect();
+                    self.trim_raw(&m.content, &raw.bytes, &raw.spans, &indices)
+                });
                 let submatches: Vec<serde_json::Value> = kept
                     .iter()
-                    .map(|&(i, (s, e))| {
+                    .enumerate()
+                    .map(|(k, &(i, (s, e)))| {
+                        let (matched, s, e) = match &raw {
+                            Some((bytes, spans)) => {
+                                let (s, e) = spans.get(k).copied().unwrap_or((s, e));
+                                let bytes = bytes.get(s..e).unwrap_or_default();
+                                (json_data(std::str::from_utf8(bytes).ok(), bytes), s, e)
+                            }
+                            None => (serde_json::json!({ "text": &content[s..e] }), s, e),
+                        };
                         let mut submatch = serde_json::json!({
-                            "match": { "text": &content[s..e] },
+                            "match": matched,
                             "start": s,
                             "end": e,
                         });
@@ -715,7 +742,11 @@ impl OutputWriter {
                     "type": "match",
                     "data": {
                         "path": { "text": self.display_path(&m.file) },
-                        "lines": { "text": format!("{content}\n") },
+                        "lines": json_line(
+                            &content,
+                            raw.as_ref().map(|(bytes, _)| bytes.as_slice()),
+                            m.terminator_len,
+                        ),
                         "line_number": m.line_number,
                         "absolute_offset": m.absolute_offset,
                         "submatches": submatches,
@@ -874,6 +905,105 @@ impl OutputWriter {
             .collect();
         (trimmed, adjusted)
     }
+
+    /// Apply `--trim` to a line's source bytes as
+    /// [`trim_adjust_indexed`](Self::trim_adjust_indexed) trims its text,
+    /// keeping the spans at `kept`. Trimmed whitespace is valid UTF-8, so it
+    /// has the same length in both.
+    fn trim_raw(
+        &self,
+        content: &str,
+        raw: &[u8],
+        spans: &[(usize, usize)],
+        kept: &[usize],
+    ) -> (Vec<u8>, Vec<(usize, usize)>) {
+        let (lead, trail) = if self.config.trim {
+            let lead = content.len() - content.trim_start().len();
+            (lead, content.len() - lead - content.trim().len())
+        } else {
+            (0, 0)
+        };
+        let lead = lead.min(raw.len());
+        let end = raw.len().saturating_sub(trail).max(lead);
+        let bytes = raw[lead..end].to_vec();
+        let spans = kept
+            .iter()
+            .map(|&i| {
+                let (a, b) = spans.get(i).copied().unwrap_or_default();
+                let clamp = |x: usize| x.saturating_sub(lead).min(bytes.len());
+                (clamp(a), clamp(b))
+            })
+            .collect();
+        (bytes, spans)
+    }
+}
+
+/// A JSON data object: `text` when the data is UTF-8, otherwise base64
+/// `bytes`, as ripgrep reports it.
+fn json_data(text: Option<&str>, bytes: &[u8]) -> serde_json::Value {
+    match text {
+        Some(text) => serde_json::json!({ "text": text }),
+        None => serde_json::json!({ "bytes": base64_encode(bytes) }),
+    }
+}
+
+/// JSON `lines` for one record, ending in the line's own terminator.
+fn json_line(content: &str, raw: Option<&[u8]>, terminator_len: usize) -> serde_json::Value {
+    let terminator = match terminator_len {
+        0 => "",
+        2 => "\r\n",
+        _ => "\n",
+    };
+    match raw {
+        Some(raw) => {
+            let bytes = [raw, terminator.as_bytes()].concat();
+            json_data(std::str::from_utf8(&bytes).ok(), &bytes)
+        }
+        None => serde_json::json!({ "text": format!("{content}{terminator}") }),
+    }
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard padded base64, as ripgrep's JSON uses.
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(BASE64[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`base64_encode`]; `None` on malformed input.
+pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let text = text.as_bytes();
+    if !text.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    for (index, chunk) in text.chunks(4).enumerate() {
+        let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && index + 1 != text.len() / 4) {
+            return None;
+        }
+        let mut n = 0u32;
+        for (i, &c) in chunk[..4 - pad].iter().enumerate() {
+            let value = BASE64.iter().position(|&b| b == c)? as u32;
+            n |= value << (18 - 6 * i);
+        }
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    Some(out)
 }
 
 /// Simple TTY check using std::io::IsTerminal (stable since Rust 1.70).
@@ -888,5 +1018,43 @@ fn native_separators(path: &str) -> String {
         path.to_string()
     } else {
         path.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_round_trips_and_json_lines_keep_terminators() {
+        for (bytes, encoded) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"caf\xe9 needle\n", "Y2Fm6SBuZWVkbGUK"),
+            (b"\xff\n", "/wo="),
+        ] {
+            assert_eq!(base64_encode(bytes), encoded);
+            assert_eq!(base64_decode(encoded).as_deref(), Some(bytes));
+        }
+        for bad in ["Zg=", "Z===", "Zg==Zg==", "Zm9*"] {
+            assert_eq!(base64_decode(bad), None, "{bad}");
+        }
+
+        assert_eq!(
+            json_line("a", None, 2),
+            serde_json::json!({"text": "a\r\n"})
+        );
+        assert_eq!(json_line("a", None, 1), serde_json::json!({"text": "a\n"}));
+        assert_eq!(json_line("a", None, 0), serde_json::json!({"text": "a"}));
+        assert_eq!(
+            json_line("\u{fffd}", Some(b"\xff"), 1),
+            serde_json::json!({"bytes": "/wo="})
+        );
+        assert_eq!(
+            json_line("ok", Some(b"ok"), 2),
+            serde_json::json!({"text": "ok\r\n"})
+        );
     }
 }

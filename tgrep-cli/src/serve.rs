@@ -840,7 +840,11 @@ impl SearchOpts {
             replace: self.replace.clone(),
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
-            all_spans: self.detail || self.stats || self.count_matches,
+            // Counts and `-l` need only whether a line matched, not every
+            // span on it.
+            all_spans: self.stats
+                || self.count_matches
+                || (self.detail && !self.count && !self.files_only),
             replace_blocks: self.multiline_replace,
             report_replacements: self.report_replacements,
         }
@@ -2316,6 +2320,18 @@ struct FileSearchResult {
     search_stats: Option<crate::search::FileSearchStats>,
 }
 
+/// A shared response would exceed its encoded size cap.
+#[derive(Debug)]
+pub(crate) struct ResponseLimit;
+
+impl std::fmt::Display for ResponseLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("shared response exceeds 64 MiB; narrow the query or scan")
+    }
+}
+
+impl std::error::Error for ResponseLimit {}
+
 /// Counts encoded bytes without allocating a serialized copy.
 struct JsonBudget {
     remaining: usize,
@@ -2323,19 +2339,29 @@ struct JsonBudget {
 
 impl JsonBudget {
     fn charge(&mut self, value: &impl serde::Serialize) -> anyhow::Result<()> {
+        let mut left = JsonBudget {
+            remaining: self.remaining,
+        };
         // One byte also covers a separator between array items.
-        self.write_all(b",")?;
-        serde_json::to_writer(self, value)?;
-        Ok(())
+        match left
+            .write_all(b",")
+            .map_err(serde_json::Error::io)
+            .and_then(|()| serde_json::to_writer(&mut left, value))
+        {
+            Ok(()) => {
+                self.remaining = left.remaining;
+                Ok(())
+            }
+            Err(error) if error.is_io() => Err(ResponseLimit.into()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
 impl std::io::Write for JsonBudget {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > self.remaining {
-            return Err(std::io::Error::other(
-                "shared response exceeds 64 MiB; narrow the query or scan",
-            ));
+            return Err(std::io::Error::other(ResponseLimit));
         }
         self.remaining -= bytes.len();
         Ok(bytes.len())
@@ -2448,15 +2474,15 @@ fn search_file_matches_bounded(
         // `--json` reports binary matches as ordinary match events carrying a
         // `binary_offset`, so those clients ask for the lines as well.
         push_row(&mut result.rows, marker, &mut budget)?;
-        if !opts.binary_lines || opts.count || opts.count_matches || (opts.files_only && opts.stats)
-        {
+        if !opts.binary_lines || opts.count || opts.count_matches || opts.files_only {
             return Ok(result);
         }
     }
 
-    if opts.count || opts.count_matches || (opts.files_only && opts.stats) {
+    if opts.count || opts.count_matches || opts.files_only {
         // Only the final totals/path are consumed. Keep match totals separate:
         // multiline display flags can change the line count used by `-c`.
+        // `-l` needs only the path, so it never ships a matching line.
         let row = if opts.count && !opts.count_matches && !opts.files_only {
             serde_json::json!({
                 "type": "count", "file": rel_path, "lines": found.matched_lines(),
@@ -2473,6 +2499,7 @@ fn search_file_matches_bounded(
         &match_opts,
         matcher,
         rel_path,
+        content,
         fixups,
         opts.detail,
         opts.positions,
@@ -2489,6 +2516,7 @@ fn collect_match_rows_bounded(
     match_opts: &crate::matching::MatchOptions,
     matcher: &crate::matching::SearchMatcher,
     rel_path: &str,
+    text: &str,
     fixups: &tgrep_core::encoding::LossyFixups,
     detail: bool,
     positions: bool,
@@ -2521,7 +2549,21 @@ fn collect_match_rows_bounded(
         /// `--json --replace`: each span's replacement.
         #[serde(skip_serializing_if = "Option::is_none")]
         replacements: Option<&'a [String]>,
+        /// Base64 source bytes of a line lossy decoding repaired.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        raw: Option<String>,
+        /// `spans` in source bytes, relative to `raw`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        raw_spans: Option<Vec<(usize, usize)>>,
     }
+
+    // Only JSON asks for positions together with detail, and only JSON
+    // reports the source bytes of a repaired line.
+    let raw = |content: &str, absolute_offset: usize, spans: &[(usize, usize)]| {
+        (positions && detail)
+            .then(|| crate::search::raw_line(text, fixups, content, absolute_offset, spans))
+            .flatten()
+    };
 
     found.for_each(match_opts, matcher, |emit| -> anyhow::Result<()> {
         match emit {
@@ -2539,6 +2581,7 @@ fn collect_match_rows_bounded(
                 hidden,
                 replacements,
             } => {
+                let raw = raw(&content, absolute_offset, &spans);
                 let (columns, offset) = crate::search::to_source_positions(
                     &columns,
                     &column_shifts,
@@ -2561,6 +2604,10 @@ fn collect_match_rows_bounded(
                         block: block.map(|(first, last)| [first, last]),
                         hidden,
                         replacements: replacements.as_deref(),
+                        raw: raw
+                            .as_ref()
+                            .map(|raw| crate::output::base64_encode(&raw.bytes)),
+                        raw_spans: raw.map(|raw| raw.spans),
                     },
                     &mut budget,
                 )?;
@@ -2585,6 +2632,9 @@ fn collect_match_rows_bounded(
                         block: None,
                         hidden: false,
                         replacements: None,
+                        raw: raw(content, absolute_offset, &[])
+                            .map(|raw| crate::output::base64_encode(&raw.bytes)),
+                        raw_spans: None,
                     },
                     &mut budget,
                 )?;
@@ -10119,6 +10169,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn files_only_reply_stops_at_one_path_row_without_spans() {
+        let matcher = crate::matching::build_search_matcher(
+            &["hello".to_string()],
+            &crate::matching::MatcherConfig::default(),
+        )
+        .unwrap();
+        let file = DecodedFile::new(
+            "hello hello\n".repeat(4096).into_bytes(),
+            tgrep_core::encoding::EncodingMode::Auto,
+        );
+        let opts = SearchOpts {
+            files_only: true,
+            detail: true,
+            positions: true,
+            ..Default::default()
+        };
+        let options = opts.match_options();
+        assert_eq!(options.max_count, Some(1));
+        assert!(!options.all_spans);
+        let result = search_file_matches("many.txt", &file, &matcher, &opts).unwrap();
+        assert_eq!(
+            result.rows,
+            [serde_json::json!({"type": "match", "file": "many.txt"})]
+        );
+        assert!(result.stats.is_none());
+        let counted = SearchOpts {
+            count: true,
+            detail: true,
+            ..Default::default()
+        };
+        assert!(!counted.match_options().all_spans);
     }
 
     #[test]

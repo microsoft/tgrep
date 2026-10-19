@@ -1267,6 +1267,24 @@ impl Namespace {
                 )? as u32))?;
             }
             5 => {
+                // Most members belong to live objects; a read avoids two
+                // durable write transactions per member on every traversal.
+                let reclaimable: bool = self.read(|connection| {
+                    Ok(connection
+                        .query_row(
+                            "SELECT o.state='removed' OR (o.state='quarantined'
+                               AND json_extract(m.record,'$.seal') IS NULL)
+                             FROM members m JOIN objects o ON o.id=m.object_id
+                             WHERE m.rowid=CAST(?1 AS INTEGER)",
+                            [id],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .unwrap_or(false))
+                })?;
+                if !reclaimable {
+                    return Ok(());
+                }
                 counts.proof_rows += self.transaction(|transaction| Ok(transaction.execute(
                     "DELETE FROM member_seals WHERE rowid IN (
                       SELECT s.rowid FROM member_seals s
@@ -1275,7 +1293,7 @@ impl Namespace {
                       WHERE m.rowid=CAST(?1 AS INTEGER) AND
                         (o.state='removed' OR (o.state='quarantined' AND json_extract(m.record,'$.seal') IS NULL))
                       ORDER BY s.block_index LIMIT ?2)",
-                    params![id, super::authentication::PROOF_BATCH as u32],
+                    params![id, super::authentication::PROOF_RECLAIM_BATCH as u32],
                 )? as u32))?;
                 counts.member_rows += self.transaction(|transaction| Ok(transaction.execute(
                     "DELETE FROM members WHERE rowid=CAST(?1 AS INTEGER)

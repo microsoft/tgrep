@@ -98,6 +98,13 @@ pub struct WorktreeOptions {
     /// is excluded from discovery, including atomic-checkpoint staging files.
     /// Must not be a worktree ancestor, Git metadata, or an index snapshot.
     pub checkpoint_directory: Option<PathBuf>,
+    /// Eventually consistent serving. Once a state has been published,
+    /// snapshots keep answering from it while invalidations are pending and
+    /// while a refresh runs. A refresh that observes concurrent invalidations
+    /// publishes what it reconciled and leaves only the newer hints queued,
+    /// rather than discarding the pass. Candidate open failures queue path
+    /// hints instead of failing the query. `ready` still means caught up.
+    pub stale_reads: bool,
 }
 
 impl Default for WorktreeOptions {
@@ -106,13 +113,18 @@ impl Default for WorktreeOptions {
             walk: MetaWalkOptions::default(),
             hint_capacity: 4096,
             checkpoint_directory: None,
+            stale_reads: false,
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeStatus {
+    /// Published state reflects every invalidation observed so far.
     pub ready: bool,
+    /// Snapshots are answered, possibly from a state older than `epoch`.
+    #[serde(default)]
+    pub serving: bool,
     /// Advances for invalidations and at the start of every reconciliation.
     pub epoch: u64,
     pub published_epoch: Option<u64>,
@@ -307,6 +319,28 @@ impl Drop for StaleGuard<'_> {
     }
 }
 
+/// An eventually consistent pass takes its hints up front; failure or panic
+/// before publication must leave a full reconciliation queued instead.
+struct TakenHints<'a> {
+    view: &'a WorktreeView,
+    armed: bool,
+}
+
+impl Drop for TakenHints<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut control = self
+                .view
+                .control
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            control.full = true;
+            control.hints.clear();
+            control.ready = false;
+        }
+    }
+}
+
 impl WorktreeView {
     pub fn new(root: &Path, generation: Arc<Generation>, options: WorktreeOptions) -> Result<Self> {
         Self::new_inner(root, generation, options, None)
@@ -461,6 +495,7 @@ impl WorktreeView {
         let stale = self.stale.load(Ordering::Acquire);
         Ok(WorktreeStatus {
             ready: control.ready && !stale,
+            serving: self.serving(&control),
             epoch: control.epoch,
             published_epoch: control.published_epoch,
             pending_paths: control.hints.len(),
@@ -468,8 +503,46 @@ impl WorktreeView {
         })
     }
 
-    fn serving(&self, control: &Control) -> bool {
+    /// Whether this view uses [`WorktreeOptions::stale_reads`].
+    pub fn stale_reads(&self) -> bool {
+        self.options.stale_reads
+    }
+
+    /// Whether the regular file at `relative`, described by `metadata`, has
+    /// trusted indexed evidence and recorded hidden status equal to its
+    /// current state. Watchers may drop metadata-only notifications for such
+    /// files; a content change that preserves size and timestamps is left to
+    /// full verification.
+    pub fn unchanged_file(&self, relative: &Path, metadata: &std::fs::Metadata) -> bool {
+        let version = crate::meta::file_version(metadata);
+        if !metadata.is_file() || !version.is_trusted() {
+            return false;
+        }
+        let Ok(relative) = relative_path(relative) else {
+            return false;
+        };
+        let hidden = crate::visibility::is_hidden(Path::new(&relative), Some(metadata));
+        self.state.read().is_ok_and(|state| {
+            state.visibility.records_hidden(&relative) == hidden
+                && state
+                    .evidence
+                    .get(&relative)
+                    .is_some_and(|evidence| evidence.version == version)
+        })
+    }
+
+    /// Caught up: the published state reflects every observed invalidation.
+    fn current(&self, control: &Control) -> bool {
         control.ready && !self.stale.load(Ordering::Acquire)
+    }
+
+    /// Snapshots and checkpoints may use the published state.
+    fn serving(&self, control: &Control) -> bool {
+        if self.options.stale_reads {
+            control.published_epoch.is_some()
+        } else {
+            self.current(control)
+        }
     }
 
     /// Queue a root-relative file or subtree, including missing/renamed paths.
@@ -535,6 +608,10 @@ impl WorktreeView {
     /// call. Churn never causes unbounded retries or stale ready publication.
     /// Discovery/read failures likewise leave the gate closed and require a
     /// full retry. Matching decoded content never re-extracts existing postings.
+    ///
+    /// With [`WorktreeOptions::stale_reads`], a concurrent invalidation does
+    /// not discard the pass: it publishes what it reconciled, stays not ready,
+    /// and leaves only the invalidations that arrived during the pass queued.
     pub fn refresh(&self) -> Result<ReconcileStats> {
         self.refresh_inner(|| {}, || {})
     }
@@ -587,6 +664,7 @@ impl WorktreeView {
                 "managed views require a reserved reconciliation operation".into(),
             ));
         }
+        let stale_reads = self.options.stale_reads;
         let (epoch, full, hints) = {
             let mut control = self
                 .control
@@ -594,9 +672,19 @@ impl WorktreeView {
                 .map_err(|_| WorktreeError::Synchronization)?;
             let epoch = control.invalidate()?;
             let full = control.full || control.hints.is_empty();
-            // Any failed/panicking pass leaves a full retry queued.
-            control.full = true;
-            (epoch, full, control.hints.clone())
+            if stale_reads {
+                // Invalidations during this pass queue normally for the next.
+                control.full = false;
+                (epoch, full, std::mem::take(&mut control.hints))
+            } else {
+                // Any failed/panicking pass leaves a full retry queued.
+                control.full = true;
+                (epoch, full, control.hints.clone())
+            }
+        };
+        let mut taken = TakenHints {
+            view: self,
+            armed: stale_reads,
         };
         let mut prepared = self.prepare(full, &hints, after_discovery, permit, false)?;
         before_publish();
@@ -613,10 +701,14 @@ impl WorktreeView {
         if control.epoch == u64::MAX {
             return Err(WorktreeError::Synchronization);
         }
-        if control.epoch != epoch {
+        let current = control.epoch == epoch;
+        if !current && !stale_reads {
             return Err(WorktreeError::ChangedDuringReconcile);
         }
-        self.publish_prepared(&mut control, prepared, epoch, permit, assembly)
+        let stats =
+            self.publish_prepared(&mut control, prepared, epoch, permit, assembly, current)?;
+        taken.armed = false;
+        Ok(stats)
     }
 
     /// Fully verify a ready view while it keeps serving its published state.
@@ -677,7 +769,7 @@ impl WorktreeView {
                 .control
                 .lock()
                 .map_err(|_| WorktreeError::Synchronization)?;
-            if !self.serving(&control)
+            if !self.current(&control)
                 || control.full
                 || !control.hints.is_empty()
                 || control.published_epoch != Some(control.epoch)
@@ -731,7 +823,7 @@ impl WorktreeView {
         control.full = true;
         control.hints.clear();
         let published = control.invalidate()?;
-        self.publish_prepared(&mut control, prepared, published, permit, assembly)
+        self.publish_prepared(&mut control, prepared, published, permit, assembly, true)
             .map(Verification::Published)
     }
 
@@ -787,7 +879,8 @@ impl WorktreeView {
     }
 
     /// Publish a fully prepared pass. Requires the reconcile mutex and the
-    /// control guard with an unchanged `epoch`.
+    /// control guard. `current` means `epoch` is unchanged since the pass
+    /// started; otherwise (stale reads only) newer invalidations stay queued.
     fn publish_prepared(
         &self,
         control: &mut Control,
@@ -795,6 +888,7 @@ impl WorktreeView {
         epoch: u64,
         permit: Option<&Arc<crate::managed::WorkPermit>>,
         assembly: Instant,
+        current: bool,
     ) -> Result<ReconcileStats> {
         let mut state = self
             .state
@@ -887,9 +981,11 @@ impl WorktreeView {
         stats.timings.assembly_us += crate::managed::work::micros(assembly.elapsed());
         stats.epoch = epoch;
         control.published_epoch = Some(epoch);
-        control.full = false;
-        control.hints.clear();
-        control.ready = true;
+        if current {
+            control.full = false;
+            control.hints.clear();
+            control.ready = true;
+        }
         self.stale.store(false, Ordering::Release);
         Ok(stats)
     }
@@ -1002,6 +1098,11 @@ impl WorktreeView {
             .files
             .iter()
             .map(|file| (file.relative_path.as_str(), file.size))
+            .chain(
+                walk.listed_sizes
+                    .iter()
+                    .map(|(path, size)| (path.as_str(), *size)),
+            )
             .collect();
         let charges: Vec<_> = paths
             .iter()
@@ -1348,7 +1449,15 @@ impl WorktreeView {
     /// cache. Root verification brackets the callback, including empty results;
     /// root or candidate-open failure closes readiness and requires full
     /// reconciliation, even if the callback handles the candidate's error.
+    ///
+    /// With [`WorktreeOptions::stale_reads`], the last published state is
+    /// served even while invalidations are pending, the readiness guard is
+    /// released before the callback so invalidations never wait for a query,
+    /// and a candidate-open failure only queues that path for refresh.
     pub fn with_snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
+        if self.options.stale_reads {
+            return self.with_published_snapshot(read);
+        }
         let mut control = self
             .control
             .lock()
@@ -1370,6 +1479,7 @@ impl WorktreeView {
             state: &state,
             epoch: control.epoch,
             open_error: &open_error,
+            failed_paths: None,
         });
         self.verify_snapshot_root(&mut control)?;
         let failure = match open_error.into_inner() {
@@ -1381,6 +1491,55 @@ impl WorktreeView {
             control.hints.clear();
             control.invalidate()?;
             return Err(error);
+        }
+        Ok(result)
+    }
+
+    fn with_published_snapshot<T>(
+        &self,
+        read: impl FnOnce(WorktreeSnapshot<'_>) -> T,
+    ) -> Result<T> {
+        // Lock order is control then state; publication holds control while
+        // it waits for readers, so control is never reacquired under state.
+        let (state, epoch) = {
+            let mut control = self
+                .control
+                .lock()
+                .map_err(|_| WorktreeError::Synchronization)?;
+            let epoch = control.published_epoch.ok_or(WorktreeError::NotReady)?;
+            self.verify_snapshot_root(&mut control)?;
+            let state = self
+                .state
+                .read()
+                .map_err(|_| WorktreeError::Synchronization)?;
+            (state, epoch)
+        };
+        let open_error = Mutex::new(None);
+        let failed_paths = Mutex::new(BTreeSet::new());
+        let result = read(WorktreeSnapshot {
+            root: &self.root,
+            rooted: &self.files,
+            generation: &self.generation,
+            protection: &self.root_protection,
+            state: &state,
+            epoch,
+            open_error: &open_error,
+            failed_paths: Some(&failed_paths),
+        });
+        drop(state);
+        if let Err(error) = self.files.verify_root() {
+            self.invalidate_all()?;
+            return Err(error.into());
+        }
+        let failed_paths = failed_paths
+            .into_inner()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        if failed_paths.len() > self.options.hint_capacity {
+            self.invalidate_all()?;
+        } else {
+            for path in failed_paths {
+                self.invalidate_path(Path::new(&path))?;
+            }
         }
         Ok(result)
     }
@@ -1410,7 +1569,7 @@ impl WorktreeView {
             .control
             .lock()
             .map_err(|_| WorktreeError::Synchronization)?;
-        if !self.serving(&control) {
+        if !self.current(&control) {
             return Err(WorktreeError::NotReady);
         }
         let state = self
@@ -1476,6 +1635,17 @@ impl WorktreeView {
             .state
             .read()
             .map_err(|_| crate::managed::Error::corrupt("view state poisoned"))?;
+        let epoch = control
+            .published_epoch
+            .ok_or_else(|| crate::managed::Error::busy("view-not-ready"))?;
+        // The state guard alone pins the published state; eventual views
+        // must not block invalidations for the duration of the capture.
+        let _control = if self.options.stale_reads {
+            drop(control);
+            None
+        } else {
+            Some(control)
+        };
         let cost = &state.cost;
         let amount = cost
             .bytes
@@ -1506,7 +1676,7 @@ impl WorktreeView {
         Ok(CapturedCheckpoint {
             checkpoint,
             contents,
-            epoch: control.epoch,
+            epoch,
             _charge: charge,
         })
     }
@@ -1575,7 +1745,7 @@ impl WorktreeView {
             .control
             .lock()
             .map_err(|_| crate::managed::Error::corrupt("view lock poisoned"))?;
-        if !self.serving(&control) {
+        if !self.current(&control) {
             return Err(crate::managed::Error::busy("view-not-ready"));
         }
         let state = self
@@ -1768,6 +1938,8 @@ pub struct WorktreeSnapshot<'a> {
     state: &'a State,
     epoch: u64,
     open_error: &'a Mutex<Option<std::io::Error>>,
+    /// Stale-read snapshots queue failed candidates as path hints instead.
+    failed_paths: Option<&'a Mutex<BTreeSet<String>>>,
 }
 
 impl WorktreeSnapshot<'_> {
@@ -1775,11 +1947,18 @@ impl WorktreeSnapshot<'_> {
         self.root
     }
 
+    /// Whether this snapshot may lag pending invalidations; see
+    /// [`WorktreeOptions::stale_reads`].
+    pub fn eventual(&self) -> bool {
+        self.failed_paths.is_some()
+    }
+
     /// Open a root-relative candidate through the view's retained root handle.
     /// The returned read-only regular-file handle may outlive this guard, but
     /// does not freeze file contents. Bound reads and check the final snapshot
     /// epoch before publishing a result assembled outside the guard.
-    /// An open failure also makes `with_snapshot` fail and invalidate readiness.
+    /// An open failure also makes `with_snapshot` fail and invalidate readiness
+    /// (stale-read views instead queue the path for refresh).
     /// Report later handle-read failures through the view after leaving the guard.
     pub fn open_file(&self, relative: &str) -> std::io::Result<File> {
         if self.generation.base().reader().managed_identity().is_some() {
@@ -1842,6 +2021,13 @@ impl WorktreeSnapshot<'_> {
 
     fn record_open<T>(&self, relative: &str, result: std::io::Result<T>) -> std::io::Result<T> {
         if let Err(error) = &result {
+            if let Some(failed) = self.failed_paths {
+                failed
+                    .lock()
+                    .map_err(|_| std::io::Error::other("snapshot error lock is poisoned"))?
+                    .insert(relative.to_owned());
+                return result;
+            }
             let mut first_error = self
                 .open_error
                 .lock()
@@ -1856,6 +2042,8 @@ impl WorktreeSnapshot<'_> {
         result
     }
 
+    /// Strict views: the input epoch the snapshot was taken at. Stale-read
+    /// views: the epoch of the published state being served.
     pub fn epoch(&self) -> u64 {
         self.epoch
     }

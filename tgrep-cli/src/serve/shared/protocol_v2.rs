@@ -98,6 +98,8 @@ impl Authentication {
 pub(super) struct Client {
     pub registration: Registration,
     authentication: Authentication,
+    /// The daemon can split a query result into resumable pages.
+    pub paged: bool,
 }
 
 impl Client {
@@ -113,9 +115,10 @@ impl Client {
             "incompatible managed daemon registration"
         );
         let authentication = Authentication::read(repository, &registration)?;
-        let client = Self {
+        let mut client = Self {
             registration,
             authentication,
+            paged: false,
         };
         let hello = client.request("hello", json!({}))?;
         ensure!(
@@ -132,6 +135,9 @@ impl Client {
             "daemon does not support managed view negotiation for {}",
             root.display()
         );
+        client.paged = hello["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.contains(&json!("paged-results")));
         Ok(client)
     }
 

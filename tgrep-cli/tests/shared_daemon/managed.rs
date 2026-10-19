@@ -397,7 +397,8 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
                 <= configured["work"]["private_work_bytes"].as_u64().unwrap()
         );
         assert!(stats["peak_read_bytes"].as_u64().unwrap() <= 64 * 1024 * 1024);
-        assert!(stats["peak_parent_handles"].as_u64().unwrap() <= 256);
+        let parent_gate = if cfg!(windows) { 8192 } else { 256 };
+        assert!(stats["peak_parent_handles"].as_u64().unwrap() <= parent_gate);
         let view = &receipt["result"]["current"];
         let status = daemon.rpc("views.status", json!({"id":view["id"]}));
         assert_eq!(status["last_reconcile"], *stats);
@@ -640,6 +641,38 @@ fn multiline_count_matches_uses_managed_per_file_totals() {
     assert_multiline_counts(&fixture.a.join("counts"), "(via shared daemon v2)");
     assert_return_count_parity(&fixture.a, "(via shared daemon v2)");
     assert_compact_shared_count_responses(&daemon, &fixture.a);
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn large_managed_results_are_paged_instead_of_failing() {
+    let fixture = Fixture::new();
+    prepare_paged_results(&fixture.a);
+    let mut policy = policy();
+    policy["work"]["blob_bytes"] = json!(4 * 1024 * 1024);
+    let mut daemon = start(&fixture, &policy, &["--no-watch"]);
+    let hello = daemon.rpc("hello", json!({}));
+    assert!(
+        hello["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("paged-results")),
+        "{hello}"
+    );
+    let (claim, guard) = owner(&daemon);
+    completed(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    assert_paged_results(&daemon, &fixture.a, "(via shared daemon v2)");
     daemon.rpc(
         "views.detach",
         json!({"owner":claim.owner,"lease":"managed-client"}),

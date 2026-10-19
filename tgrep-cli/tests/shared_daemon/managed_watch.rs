@@ -187,7 +187,7 @@ fn lagging_view_serves_its_last_publication_then_converges() {
         let (claim, guard) = owner(&daemon);
         let mut input = attach_input(&fixture, &claim);
         input["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
-        completed(&daemon, &daemon.rpc("views.attach", input));
+        attached(&daemon, &daemon.rpc("views.attach", input));
         let view = daemon.rpc(
             "lookup",
             json!({"root":fs::canonicalize(&fixture.b).unwrap()}),
@@ -473,7 +473,7 @@ fn recursive_root_budget_fallback_is_per_view_and_releases_subscriptions() {
         input["token"] = token(&claim, index as u64 + 1);
         input["request"]["root"] = json!(fs::canonicalize(root).unwrap());
         input["request"]["lease"] = json!(format!("budget-client-{index}"));
-        completed(&daemon, &daemon.rpc("views.attach", input));
+        attached(&daemon, &daemon.rpc("views.attach", input));
         views.push(daemon.rpc("lookup", json!({"root":fs::canonicalize(root).unwrap()})));
     }
     let native = daemon.rpc("views.status", json!({"id":views[0]["view"]}));

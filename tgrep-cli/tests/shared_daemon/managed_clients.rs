@@ -37,7 +37,7 @@ fn guarded_generation_open_retries_only_exact_catalog_writer_contention() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    let attached = completed(
+    let attached = attached(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -397,7 +397,7 @@ fn managed_search_preserves_pattern_files_boundaries_and_multiline_spans() {
 
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    completed(
+    attached(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -711,7 +711,7 @@ fn a_native_namespace_owner_excludes_startup_and_other_maintenance_until_release
     let configured = policy();
     let mut daemon = start(&fixture, &configured, &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    let original = completed(
+    let original = attached(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -791,7 +791,7 @@ fn a_native_namespace_owner_excludes_startup_and_other_maintenance_until_release
     );
     let mut restarted = start(&fixture, &configured, &["--no-watch"]);
     let (claim, guard) = owner(&restarted);
-    let current = completed(
+    let current = attached(
         &restarted,
         &restarted.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -889,7 +889,7 @@ fn escaped_cross_process_readers_block_collection_and_idle_stop_then_allow_exact
         configured["collection"]["max_pages"] = json!(64);
         let mut daemon = start(&fixture, &configured, &["--no-watch"]);
         let (claim, guard) = owner(&daemon);
-        completed(
+        attached(
             &daemon,
             &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
         );
@@ -945,7 +945,7 @@ fn escaped_cross_process_readers_block_collection_and_idle_stop_then_allow_exact
         sequence += 1;
         let mut input = attach_input(&fixture, &claim);
         input["token"] = token(&claim, sequence);
-        completed(&daemon, &daemon.rpc("views.attach", input));
+        attached(&daemon, &daemon.rpc("views.attach", input));
         let rebuilt = daemon.rpc(
             "lookup",
             json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
@@ -1200,7 +1200,7 @@ fn a_missing_evicted_exact_commit_never_substitutes_a_newer_head_and_scans_expli
     configured["collection"]["max_pages"] = json!(64);
     let mut daemon = start(&fixture, &configured, &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    completed(
+    attached(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -1278,7 +1278,7 @@ fn a_missing_evicted_exact_commit_never_substitutes_a_newer_head_and_scans_expli
     request["token"] = token(&claim, sequence);
     request["request"]["revision"] = json!(newer);
     request["request"]["lease"] = json!("available-target");
-    completed(&daemon, &manage(&fixture.a, "views.attach", request));
+    attached(&daemon, &manage(&fixture.a, "views.attach", request));
     let available = daemon.rpc(
         "lookup",
         json!({"root":fs::canonicalize(&fixture.a).unwrap()}),

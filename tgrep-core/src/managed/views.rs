@@ -1060,7 +1060,8 @@ impl ViewManager {
         )?;
         let _work = slot.begin_work(operation)?;
         let materialization = std::time::Instant::now();
-        let first_attachment = record.current.is_none();
+        // Legacy v1 attachments keep their contract of returning a ready view.
+        let first_attachment = record.current.is_none() && operation.kind == "attach";
         let (record, view, stats) = self.materialize_view(record, root, &permit)?;
         let materialization_us = super::work::micros(materialization.elapsed());
         slot.install_preparing(Arc::clone(&view))?;

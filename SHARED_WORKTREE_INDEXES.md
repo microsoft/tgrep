@@ -1162,6 +1162,9 @@ published provisionally after the tracked membership/visibility metadata walk;
 queries can start while the required full content verification runs. This
 provisional publication is not `ready`, and its paths have no read-version
 evidence, so incremental refreshes cannot skip them based on stat metadata.
+An attach receipt therefore no longer implies readiness; wait for `ready: true`
+when verified results are required. Legacy v1 `shared attach` is never
+provisional and still returns a ready view.
 First verification and restores still read the checkout, including
 CRLF/filter differences and hidden/untracked membership. A clean Git status is
 not content evidence.

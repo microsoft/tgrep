@@ -139,6 +139,9 @@ pub struct ReconcileStats {
     pub epoch: u64,
     pub full: bool,
     pub files_discovered: usize,
+    /// Searchable files provisionally served from the pinned generation before
+    /// checkout content has been verified.
+    pub provisional_files: u64,
     pub files_read: u64,
     pub bytes_read: u64,
     pub files_decoded: u64,
@@ -206,6 +209,7 @@ impl ReconcileStats {
         self.base_files_copied += other.base_files_copied;
         self.overlay_reused += other.overlay_reused;
         self.content_reads_avoided += other.content_reads_avoided;
+        self.provisional_files += other.provisional_files;
         self.hint_lookups += other.hint_lookups;
         self.parent_batches += other.parent_batches;
     }
@@ -250,7 +254,8 @@ impl Control {
 
 #[derive(Clone)]
 struct Evidence {
-    version: FileVersion,
+    /// Present only when validated around the read that produced this content.
+    version: Option<FileVersion>,
     listed: bool,
     content: Option<ContentId>,
 }
@@ -527,7 +532,7 @@ impl WorktreeView {
                 && state
                     .evidence
                     .get(&relative)
-                    .is_some_and(|evidence| evidence.version == version)
+                    .is_some_and(|evidence| evidence.version.as_ref() == Some(&version))
         })
     }
 
@@ -598,6 +603,170 @@ impl WorktreeView {
     pub fn reconcile_full(&self) -> Result<ReconcileStats> {
         self.invalidate_all()?;
         self.refresh()
+    }
+
+    /// Publish the pinned generation as a provisional first-attach snapshot.
+    ///
+    /// Membership and visibility come from a metadata walk, but indexed content
+    /// still comes from the committed generation until the first full refresh.
+    /// Provisional versions are deliberately absent so no later hinted pass can
+    /// mistake an observed stat for evidence from an indexed read.
+    pub(crate) fn bootstrap_base_controlled(
+        &self,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<ReconcileStats> {
+        if !self.options.stale_reads
+            || self
+                .root_protection
+                .as_ref()
+                .is_none_or(|root| root.namespace != permit.namespace.header().namespace)
+        {
+            return Err(WorktreeError::InvalidInput(
+                "provisional bootstrap requires an eventual view and its namespace reservation"
+                    .into(),
+            ));
+        }
+        let _serial = self
+            .reconcile
+            .lock()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        let discovery = Instant::now();
+        self.files.verify_root()?;
+        let repository = Repository::discover_controlled(
+            &self.root,
+            &crate::managed::process::Control::work(permit),
+        )?;
+        let worktree_root = Repository::root_controlled(
+            &self.root,
+            &crate::managed::process::Control::work(permit),
+        )?;
+        if fs::canonicalize(&self.root)? != self.root
+            || repository != self.repository
+            || repository.git_dir() != self.repository.git_dir()
+            || worktree_root != self.root
+        {
+            return Err(WorktreeError::InvalidInput(
+                "worktree identity changed".into(),
+            ));
+        }
+        let mut options = self.options.walk.clone();
+        options.max_file_size = None;
+        let (walk, mut memory) =
+            walker::walk_file_metadata_controlled(&self.root, &options, &repository, permit)
+                .map_err(crate::Error::from)?;
+        if walk.skipped_error != 0 {
+            return Err(WorktreeError::IncompleteWalk(walk.skipped_error));
+        }
+        let assembly = Instant::now();
+        let mut sizes: HashMap<&str, u64> = walk
+            .files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.size))
+            .collect();
+        sizes.extend(
+            walk.listed_sizes
+                .iter()
+                .map(|(path, size)| (path.as_str(), *size)),
+        );
+        memory
+            .grow((walk.listed_files.len() as u64).saturating_mul(512))
+            .map_err(crate::Error::from)?;
+        let mut evidence = BTreeMap::new();
+        let mut listed = BTreeSet::new();
+        let mut stats = ReconcileStats {
+            full: true,
+            files_discovered: walk.listed_files.len(),
+            timings: ReconcileTimings {
+                discovery_us: crate::managed::work::micros(discovery.elapsed()),
+                ..ReconcileTimings::default()
+            },
+            ..ReconcileStats::default()
+        };
+        for path in walk.listed_files {
+            permit.check().map_err(crate::Error::from)?;
+            let size = sizes
+                .get(path.as_str())
+                .copied()
+                .ok_or(WorktreeError::IncompleteWalk(1))?;
+            let is_listed = self
+                .options
+                .walk
+                .max_file_size
+                .is_none_or(|limit| size <= limit);
+            let eligible = !self
+                .generation
+                .key()
+                .profile()
+                .eligibility
+                .excludes_by_extension(Path::new(&path));
+            let content = if is_listed && eligible {
+                self.base_content(&path)
+            } else {
+                None
+            };
+            if is_listed {
+                listed.insert(path.clone());
+            }
+            if content.is_some() {
+                stats.provisional_files += 1;
+                stats.base_reused += 1;
+            }
+            evidence.insert(
+                path,
+                Evidence {
+                    version: None,
+                    listed: is_listed,
+                    content,
+                },
+            );
+        }
+        self.files.verify_root()?;
+        permit.check_now().map_err(crate::Error::from)?;
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        if control.published_epoch.is_some() {
+            return Err(WorktreeError::InvalidInput(
+                "worktree already has a published snapshot".into(),
+            ));
+        }
+        let epoch = control.epoch;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        if !state.evidence.is_empty() || !state.listed.is_empty() {
+            return Err(WorktreeError::InvalidInput(
+                "provisional bootstrap requires an empty worktree state".into(),
+            ));
+        }
+        for path in self.generation.base().reader().all_paths() {
+            permit.check().map_err(crate::Error::from)?;
+            if evidence.get(path).and_then(|entry| entry.content).is_none() {
+                state
+                    .index
+                    .live
+                    .delete_file_controlled(path, permit, &mut memory)
+                    .map_err(crate::Error::from)?;
+            }
+        }
+        let bytes =
+            retained_view_bytes(&state.index.live, evidence.keys(), &walk.visibility, permit)
+                .map_err(crate::Error::from)?;
+        memory.resize(bytes).map_err(crate::Error::from)?;
+        state.memory = Some(memory.retain(0).map_err(crate::Error::from)?);
+        state.listed = listed;
+        state.evidence = evidence;
+        state.visibility = walk.visibility;
+        state.restored_content.clear();
+        state.cost = measure_overlay_cost(&state, Some(permit)).map_err(crate::Error::from)?;
+        stats.epoch = epoch;
+        stats.timings.assembly_us = crate::managed::work::micros(assembly.elapsed());
+        control.published_epoch = Some(epoch);
+        control.ready = false;
+        control.full = true;
+        Ok(stats)
     }
 
     /// Rewalk membership/visibility and process pending hints. With no hints,
@@ -1320,7 +1489,7 @@ impl WorktreeView {
                 let evidence = if !full
                     && !hinted
                     && version.is_trusted()
-                    && previous.is_some_and(|entry| entry.version == version)
+                    && previous.is_some_and(|entry| entry.version.as_ref() == Some(&version))
                 {
                     chunk.stats.content_reads_avoided += 1;
                     previous.expect("verified previous entry").clone()
@@ -1415,7 +1584,7 @@ impl WorktreeView {
                         None
                     };
                     Evidence {
-                        version: read.version,
+                        version: Some(read.version),
                         listed,
                         content,
                     }

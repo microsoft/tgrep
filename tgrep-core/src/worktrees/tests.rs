@@ -114,6 +114,17 @@ impl Fixture {
         Arc<crate::managed::WorkPermit>,
         WorktreeView,
     ) {
+        self.controlled_with_options(WorktreeOptions::default())
+    }
+
+    fn controlled_with_options(
+        &self,
+        options: WorktreeOptions,
+    ) -> (
+        Arc<crate::managed::Namespace>,
+        Arc<crate::managed::WorkPermit>,
+        WorktreeView,
+    ) {
         let namespace = crate::managed::Namespace::initialize(
             &Repository::discover(&self.root).unwrap(),
             &self.storage,
@@ -140,13 +151,8 @@ impl Fixture {
                 },
             )
             .unwrap();
-        let view = WorktreeView::new_controlled(
-            &self.root,
-            self.generation(),
-            WorktreeOptions::default(),
-            &permit,
-        )
-        .unwrap();
+        let view =
+            WorktreeView::new_controlled(&self.root, self.generation(), options, &permit).unwrap();
         (namespace, permit, view)
     }
 }
@@ -196,6 +202,34 @@ fn managed_batches_reuse_exact_contents_copies_and_overlay_postings() {
     assert_eq!(second.files_extracted, 0);
     assert_eq!(second.base_files_copied, 0);
     assert_scan_parity(&view, &["common", "private", "hidden", "changed"]);
+}
+
+#[test]
+fn provisional_base_serves_first_attach_before_full_content_verification() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"committed needle");
+    commit(&fixture.root);
+    write(&fixture.root, "file.txt", b"worktree changed");
+    let (_namespace, permit, view) = fixture.controlled_with_options(WorktreeOptions {
+        stale_reads: true,
+        ..WorktreeOptions::default()
+    });
+
+    let provisional = view.bootstrap_base_controlled(&permit).unwrap();
+    assert_eq!(provisional.files_read, 0);
+    assert_eq!(provisional.provisional_files, 1);
+    let status = view.status().unwrap();
+    assert!(!status.ready);
+    assert!(status.serving);
+    assert_eq!(candidates(&view, "committed"), ["file.txt"]);
+
+    let verified = view.refresh_controlled(&permit).unwrap();
+    assert!(verified.full);
+    assert_eq!(verified.files_read, 1);
+    assert_eq!(verified.provisional_files, 0);
+    assert!(view.status().unwrap().ready);
+    assert!(candidates(&view, "committed").is_empty());
+    assert_eq!(candidates(&view, "worktree"), ["file.txt"]);
 }
 
 #[test]

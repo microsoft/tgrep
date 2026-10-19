@@ -69,8 +69,8 @@ PHASES = (
     ("admitted_us", "Admitted lifetime"),
 )
 RECONCILE_COUNTERS = (
-    "full", "files_discovered", "files_read", "bytes_read", "files_extracted",
-    "base_reused", "overlay_reused", "content_reads_avoided", "peak_workers",
+    "full", "files_discovered", "provisional_files", "files_read", "bytes_read",
+    "files_extracted", "base_reused", "overlay_reused", "content_reads_avoided", "peak_workers",
     "peak_private_bytes",
 )
 
@@ -482,16 +482,22 @@ class Benchmark:
         receipt_seconds = time.perf_counter() - start
         view = record["result"]["current"]["id"]
         status = None
+        serving_seconds = None
 
         def ready():
-            nonlocal status
+            nonlocal status, serving_seconds
             status = self.manage("views.status", {"id": view})
+            if serving_seconds is None and status.get("serving") is True:
+                serving_seconds = time.perf_counter() - start
             return status["ready"] is True and status["work"] is None
 
         wait_until(ready, f"managed view {view} readiness", self.args.timeout, self.daemon)
         ready_seconds = time.perf_counter() - start
         after = self.daemon.resources()
         reconcile = record["result"].get("reconcile") or {}
+        # An eventual first attach may publish provisionally; the scheduler's
+        # content verification that made the view ready is the last reconcile.
+        verification = status.get("last_reconcile") or reconcile
         cpu = None
         if isinstance(before.get("cpu_seconds"), (int, float)) and isinstance(
                 after.get("cpu_seconds"), (int, float)):
@@ -499,10 +505,13 @@ class Benchmark:
         return {
             "root": str(root), "lease": lease, "revision": revision, "view": view,
             "ready_seconds": ready_seconds, "receipt_seconds": receipt_seconds,
+            "serving_seconds": serving_seconds,
             "incarnation": record["result"]["current"]["current"].get("incarnation"),
             "build": record["result"].get("build"),
             "reconcile": {key: reconcile.get(key) for key in RECONCILE_COUNTERS},
             "timings_us": reconcile.get("timings", {}),
+            "verification": {key: verification.get(key) for key in RECONCILE_COUNTERS},
+            "verification_timings_us": verification.get("timings", {}),
             "overlay": status.get("overlay"),
             "daemon_cpu_seconds": cpu, "daemon_after": after,
         }
@@ -790,6 +799,13 @@ def millis(value):
     return "-" if value is None else f"{value:,.1f}"
 
 
+def serving_row(label, attach):
+    provisional = attach["reconcile"].get("provisional_files") or 0
+    detail = (f"provisional base, provisional_files={provisional:,}" if provisional
+              else "verified on publication")
+    return f"| {label} | {seconds(attach.get('serving_seconds'))} | {detail} |"
+
+
 def render_markdown(report):
     repo, env, params = report["repository"], report["environment"], report["parameters"]
     managed, ordinary = report.get("managed") or {}, report.get("ordinary")
@@ -815,7 +831,8 @@ def render_markdown(report):
     if managed:
         lines.append(f"| Managed daemon start | {seconds(managed['daemon_start_seconds'])} | |")
         base = managed["base"]
-        build, rec = base["build"] or {}, base["reconcile"]
+        build, rec = base["build"] or {}, base.get("verification") or base["reconcile"]
+        lines.append(serving_row("Managed base attach to serving", base))
         lines.append(
             f"| Managed base attach (cold generation build + primary verification) "
             f"| {seconds(base['ready_seconds'])} | published={build.get('published')}, "
@@ -823,10 +840,11 @@ def render_markdown(report):
             f"storage {managed['storage_after_base']['bytes'] / GIB:.2f} GiB |")
     for entry in worktrees:
         attach = entry["attach"]
-        build, rec = attach["build"] or {}, attach["reconcile"]
+        build, rec = attach["build"] or {}, attach.get("verification") or attach["reconcile"]
         dirty = f", dirty files={len(entry['dirty']['modified'])}" if entry.get("dirty") else ""
         lines.append(f"| Worktree {entry['number']}: `git worktree add` "
                      f"| {seconds(entry['checkout_seconds'])} | revision {entry['revision'][:12]} |")
+        lines.append(serving_row(f"Worktree {entry['number']}: attach to serving", attach))
         lines.append(
             f"| Worktree {entry['number']}: attach to ready | {seconds(attach['ready_seconds'])} "
             f"| reused_generation={build.get('reused_generation')}, "
@@ -846,6 +864,19 @@ def render_markdown(report):
             timings = attach["timings_us"]
             lines.append(f"| {name} | " + " | ".join(
                 seconds(timings[key] / 1e6) if key in timings else "-" for key, _ in PHASES) + " |")
+        provisional = [(name, attach) for name, attach in views
+                       if (attach["reconcile"].get("provisional_files") or 0) > 0
+                       and attach.get("verification_timings_us")]
+        if provisional:
+            lines += ["", "## Content verification after provisional serving "
+                      "(seconds, last reconcile at ready)", "",
+                      "| View | " + " | ".join(name for _, name in PHASES) + " |",
+                      "| --- |" + " ---: |" * len(PHASES)]
+            for name, attach in provisional:
+                timings = attach["verification_timings_us"]
+                lines.append(f"| {name} | " + " | ".join(
+                    seconds(timings[key] / 1e6) if key in timings else "-"
+                    for key, _ in PHASES) + " |")
     queries = report.get("queries") or {}
     if queries:
         labels = list(next(iter(queries.values()))["targets"])

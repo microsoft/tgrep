@@ -113,9 +113,13 @@ def synthetic_report():
     attach = {"ready_seconds": 10.0, "receipt_seconds": 9.0, "incarnation": 1, "timings_us": timing,
               "build": {"published": True, "blobs_read": 100, "reused_generation": False},
               "reconcile": {"files_read": 100, "base_reused": 0, "files_extracted": 0}}
-    worktree_attach = dict(attach, ready_seconds=2.0, build={
+    worktree_attach = dict(attach, ready_seconds=2.0, serving_seconds=0.5, build={
         "published": False, "blobs_read": 0, "reused_generation": True},
-        reconcile={"files_read": 100, "base_reused": 100, "files_extracted": 0})
+        reconcile={"provisional_files": 90, "files_read": 0, "base_reused": 0,
+                   "files_extracted": 0},
+        verification={"files_read": 100, "base_reused": 100, "files_extracted": 0},
+        verification_timings_us={"discovery_us": 1_000_000,
+                                 "content_verification_us": 4_000_000})
     target = {"matches": 5, "matched_lines": 5, "wall": {"p50": 12.0}, "server": {"p50": 2.0}}
     return {
         "repository": {"name": "repo", "commit": "0123456789abcdef", "tracked_files": 100,
@@ -144,6 +148,12 @@ class Markdown(unittest.TestCase):
         for expected in ("# tgrep multi-worktree benchmark: repo @ 0123456789ab",
                          "| Ordinary base index (`tgrep index`) | 30.0 | 1.00 GiB index |",
                          "| Worktree 1: attach to ready | 2.0 | reused_generation=True",
+                         "| Worktree 1: attach to serving | 0.5 | provisional base, "
+                         "provisional_files=90 |",
+                         "| Managed base attach to serving | - | verified on publication |",
+                         "files_read=100, base_reused=100",
+                         "## Content verification after provisional serving",
+                         "| Worktree 1 | - | - | 1.0 | 4.0 |",
                          "dirty files=1", "| Base | 0.0 | - | 2.0 | 3.0 |",
                          "| `a\\|b` | 12.0 | 12.0 | 5 |", "| **Sum of p50 (client)** | **12.0** |",
                          "| Sum of p50 (server-reported) | 2.0 | 2.0 | |",

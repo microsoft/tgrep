@@ -3461,9 +3461,38 @@ mod candidate_read_tests {
             .unwrap();
         let completed = manager.execute(&operation.id).unwrap();
         assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+        let result = completed.result.unwrap();
+        if stale_reads {
+            assert_eq!(result["reconcile"]["provisional_files"], 2);
+        }
         let record: managed::ViewRecord =
-            serde_json::from_value(completed.result.unwrap()["current"].clone()).unwrap();
+            serde_json::from_value(result["current"].clone()).unwrap();
         let slot = manager.slot(&record.id).unwrap();
+        if stale_reads {
+            let status = manager.status(&record.id).unwrap();
+            assert!(!status.ready);
+            assert!(status.serving);
+            let operation = manager
+                .accept_refresh(
+                    OperationToken {
+                        scope: owner.registration().owner.clone(),
+                        sequence: 2,
+                        token: Token::parse("first-verify").unwrap(),
+                    },
+                    RefreshRequest {
+                        view: record.id.clone(),
+                        expected_version: record.version,
+                        owner: owner.registration().owner.clone(),
+                        allocation_version: 1,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                manager.execute(&operation.id).unwrap().state,
+                OperationState::Completed
+            );
+            assert!(manager.status(&record.id).unwrap().ready);
+        }
         let run = |inject: Inject| {
             let source = Scripted {
                 inner: ManagedQuery {

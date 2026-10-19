@@ -1157,12 +1157,18 @@ the existing budget without normalizing bytes, weakening masks or raising limits
 Workers verify and decode/hash every required file, compare exact indexed content
 identities, and extract only differences. A single assembler preserves base,
 overlay and rename/copy reuse and publishes only after epoch, identity, policy and
-allocation checks. A clean Git status is not content evidence: first attachments
-and restores still read the checkout, including CRLF/filter differences and
-hidden/untracked membership.
+allocation checks. For an eventual first attachment, the pinned generation is
+published provisionally after the tracked membership/visibility metadata walk;
+queries can start while the required full content verification runs. This
+provisional publication is not `ready`, and its paths have no read-version
+evidence, so incremental refreshes cannot skip them based on stat metadata.
+First verification and restores still read the checkout, including
+CRLF/filter differences and hidden/untracked membership. A clean Git status is
+not content evidence.
 
 Successful operation receipts expose `result.reconcile`, also available as
 `last_reconcile` in view status. `hello` advertises `reconciliation-phase-metrics`.
+`provisional_files` counts paths served from the base before verification.
 Its `timings` fields are integer microseconds:
 
 | Field | Scope |

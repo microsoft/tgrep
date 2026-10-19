@@ -1060,11 +1060,12 @@ impl ViewManager {
         )?;
         let _work = slot.begin_work(operation)?;
         let materialization = std::time::Instant::now();
+        let first_attachment = record.current.is_none();
         let (record, view, stats) = self.materialize_view(record, root, &permit)?;
         let materialization_us = super::work::micros(materialization.elapsed());
         slot.install_preparing(Arc::clone(&view))?;
         let (checkpoint, mut reconcile, input) =
-            self.prepare_checkpoint(&slot, &view, &record, &permit)?;
+            self.prepare_checkpoint(&slot, &view, &record, &permit, first_attachment)?;
         reconcile.timings.base_materialization_us = materialization_us;
         self.publish(
             &slot,
@@ -1339,7 +1340,7 @@ impl ViewManager {
         record.current = Some(pin);
         slot.install_preparing(Arc::clone(&replacement))?;
         let (checkpoint, reconcile, input) =
-            self.prepare_checkpoint(&slot, &replacement, &record, &permit)?;
+            self.prepare_checkpoint(&slot, &replacement, &record, &permit, false)?;
         self.check_migratable(&request.view, &request.owner, request.expected_version)?;
         if operation.kind == "adaptive" {
             let decision: super::AdaptiveDecision =
@@ -1464,7 +1465,7 @@ impl ViewManager {
             }
         };
         let (checkpoint, reconcile, input) =
-            self.prepare_checkpoint(&slot, &view, &record, &permit)?;
+            self.prepare_checkpoint(&slot, &view, &record, &permit, false)?;
         self.publish(
             &slot, operation, record, view, checkpoint, reconcile, input, result, &permit, false,
         )
@@ -1653,6 +1654,7 @@ impl ViewManager {
         view: &WorktreeView,
         record: &ViewRecord,
         permit: &Arc<WorkPermit>,
+        first_attachment: bool,
     ) -> Result<(super::ProtectedCheckpoint, ReconcileStats, u64)> {
         let attempts = if self.namespace.operation(permit.operation_id())?.kind == "adaptive" {
             match self.namespace.policy()?.policy.advancement {
@@ -1669,13 +1671,21 @@ impl ViewManager {
             RECONCILE_ATTEMPTS
         };
         let eventual = view.stale_reads();
+        let mut provisional = if first_attachment && eventual {
+            Some(view.bootstrap_base_controlled(permit)?)
+        } else {
+            None
+        };
         for _ in 0..attempts {
             permit.check()?;
             let input = slot.epoch.load(Ordering::Acquire);
-            let mut stats = match view.refresh_controlled(permit) {
-                Ok(stats) => stats,
-                Err(crate::worktrees::WorktreeError::ChangedDuringReconcile) => continue,
-                Err(error) => return Err(error.into()),
+            let mut stats = match provisional.take() {
+                Some(stats) => stats,
+                None => match view.refresh_controlled(permit) {
+                    Ok(stats) => stats,
+                    Err(crate::worktrees::WorktreeError::ChangedDuringReconcile) => continue,
+                    Err(error) => return Err(error.into()),
+                },
             };
             // Eventual views publish what this pass reconciled; invalidations
             // that arrived since `input` stay queued for the next pass.

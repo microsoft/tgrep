@@ -18,7 +18,8 @@ measurements and their pinned controls remain unchanged.
 managed v2 daemon serving a large repository (default `chromium/chromium`)
 and several linked worktrees: the ordinary `tgrep index` baseline, the cold
 base attachment (committed-tree generation build plus primary verification),
-`git worktree add` and attach-to-ready for every worktree, and per-query
+`git worktree add`, attach-to-serving and attach-to-ready for every worktree,
+the content-verification phases after provisional serving, and per-query
 latency on the base index, the managed primary view and every worktree view.
 It checks result parity across clean targets, expected backends, and base
 generation reuse. Timed queries that exceed `--query-timeout` are recorded as
@@ -69,8 +70,8 @@ same disk: per-view namespace catalog time rose from 433 s to 1,829-3,093 s.
 The idle scheduler pacing described in
 [SHARED_WORKTREE_INDEXES.md](SHARED_WORKTREE_INDEXES.md) reduces that
 contention from ready views; remaining cost is dominated by per-file open and
-verification I/O, which is the next optimization target (for example
-trusting same-commit Git index stat data instead of rereading content).
+verification I/O. Provisional first attach (below) takes that verification
+off the path to the first query.
 
 In that run, one timed `#include "base/` query on a worktree view exceeded
 the 600 s query timeout during round 3 while all other queries completed; the
@@ -99,6 +100,37 @@ pay a per-worktree penalty. Latency scales with match count and output
 volume; about half of client wall time is CLI startup, transfer and printing.
 The harness dirties only non-hidden tracked files, because default queries
 skip hidden paths such as `.agents/`.
+
+#### Provisional first attach: time to serving
+
+An eventual view's first attachment now publishes the pinned generation after
+the metadata walk and runs full content verification afterwards (see
+[SHARED_WORKTREE_INDEXES.md](SHARED_WORKTREE_INDEXES.md)). Same flags as the
+query run, on a host as fast as the first table's run (base ready 834.7 s
+versus 838.8 s):
+
+| View | Attach to serving (s) | Attach to ready (s) | Earlier run: attach to ready (s) |
+| --- | ---: | ---: | ---: |
+| Base (cold generation build) | 412.8 | 834.7 | 838.8 |
+| Worktree 1 | 37.0 | 744.5 | 686.7 |
+| Worktree 2 (16 dirty) | 50.4 | 1,061.6 | 1,647.6 (clean) |
+
+Before this change a view answered queries only once ready. Linked worktrees
+now serve after 37-50 s, about 20x sooner than they become ready. The base
+view serves after its 389 s generation build. The provisional
+publication serves 465,947 of 510,793 tracked paths from the base.
+Dirty and untracked contents are found once verification finishes. Candidate
+bytes are always read from disk, so provisional results never contain false
+positives. Time to ready is unchanged in kind:
+verification still reads every file (664.7 s and 952.8 s of content
+verification for the two worktrees), and namespace catalog work during
+verification (263 s and 625 s) is the next contention target. All parity,
+backend, generation-reuse and overlay-isolation checks passed; the dirty
+worktree's private overlay held 17 files.
+
+Query latency was again equal across views. The sums of the 12 p50 client
+wall times were 78.9 s, 79.1 s and 78.3 s for the base, worktree 1 and
+worktree 2. The server-reported sums were 53.1 s, 52.9 s and 52.4 s.
 
 ## Large-checkout reconciliation: RC2
 

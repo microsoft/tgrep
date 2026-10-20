@@ -87,16 +87,32 @@ fn accepts_multiple_path_arguments() {
         .stdout(predicate::str::contains("lib.rs"));
 }
 
+/// As in ripgrep, a path argument names exactly the file it spells: the shell
+/// has already removed the user's quoting, and spaces and quotes are legal in
+/// file names.
 #[test]
-fn strips_extra_quotes_from_path_argument() {
+fn path_arguments_are_used_verbatim() {
     let dir = setup_fixture();
-    let quoted = format!("\"{}\"", fixture_path(&dir));
+    let root = dir.path().join("testdata");
+    fs::write(root.join(" spaced.txt"), "fn spaced\n").unwrap();
+
+    for typed in [
+        format!("\"{}\"", fixture_path(&dir)),
+        format!(" {}", root.join("hello.rs").display()),
+    ] {
+        tgrep()
+            .args(["--no-index", "--no-heading", "fn main", &typed])
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty());
+    }
 
     tgrep()
-        .args(["--no-index", "--no-heading", "fn main", &quoted])
+        .current_dir(&root)
+        .args(["--no-index", "--no-heading", "fn spaced", " spaced.txt"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("hello.rs"));
+        .stdout(predicate::str::contains("fn spaced"));
 }
 
 #[test]
@@ -1630,6 +1646,134 @@ fn indexed_json_preserves_utf8_match_and_context_offsets() {
             direct = rows;
         } else {
             assert_eq!(rows, direct, "{marker}");
+        }
+    });
+}
+
+#[test]
+fn indexed_json_keeps_line_terminators_and_raw_invalid_utf8() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(
+        root.join("crlf.txt"),
+        "alpha\r\nneedle one\r\nbeta\r\nneedle end",
+    )
+    .unwrap();
+    fs::write(
+        root.join("latin.txt"),
+        b"caf\xe9 needle\nok needle\n\xff\n".as_slice(),
+    )
+    .unwrap();
+    // Verified against rg 15.2.0 with `--json -C 1 -F needle`.
+    let expected = [
+        (
+            "crlf.txt",
+            "context",
+            1,
+            0,
+            serde_json::json!({"text":"alpha\r\n"}),
+            vec![],
+        ),
+        (
+            "crlf.txt",
+            "match",
+            2,
+            7,
+            serde_json::json!({"text":"needle one\r\n"}),
+            vec![(0, 6)],
+        ),
+        (
+            "crlf.txt",
+            "context",
+            3,
+            19,
+            serde_json::json!({"text":"beta\r\n"}),
+            vec![],
+        ),
+        (
+            "crlf.txt",
+            "match",
+            4,
+            25,
+            serde_json::json!({"text":"needle end"}),
+            vec![(0, 6)],
+        ),
+        (
+            "latin.txt",
+            "match",
+            1,
+            0,
+            serde_json::json!({"bytes":"Y2Fm6SBuZWVkbGUK"}),
+            vec![(5, 11)],
+        ),
+        (
+            "latin.txt",
+            "match",
+            2,
+            12,
+            serde_json::json!({"text":"ok needle\n"}),
+            vec![(3, 9)],
+        ),
+        (
+            "latin.txt",
+            "context",
+            3,
+            22,
+            serde_json::json!({"bytes":"/wo="}),
+            vec![],
+        ),
+    ];
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        let output = tgrep()
+            .args(backend)
+            .args(["--json", "--stats", "-F", "-C", "1", "--", "needle"])
+            .arg(&root)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert!(String::from_utf8_lossy(&output.stderr).contains(marker));
+        let mut rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|row: &serde_json::Value| row["type"] == "match" || row["type"] == "context")
+            .collect();
+        let name = |row: &serde_json::Value| {
+            let path = row["data"]["path"]["text"].as_str().unwrap();
+            std::path::Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        rows.sort_by_key(|row| (name(row), row["data"]["line_number"].as_u64()));
+        assert_eq!(rows.len(), expected.len(), "{marker}: {rows:#?}");
+        for (row, (file, kind, line, offset, lines, spans)) in rows.iter().zip(&expected) {
+            assert_eq!(name(row), *file, "{marker}");
+            assert_eq!(row["type"], *kind, "{marker}");
+            assert_eq!(row["data"]["line_number"], *line, "{marker}");
+            assert_eq!(row["data"]["absolute_offset"], *offset, "{marker}: {row}");
+            assert_eq!(row["data"]["lines"], *lines, "{marker}: {row}");
+            let actual: Vec<_> = row["data"]["submatches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|span| {
+                    assert_eq!(
+                        span["match"],
+                        serde_json::json!({"text":"needle"}),
+                        "{marker}"
+                    );
+                    (
+                        span["start"].as_u64().unwrap(),
+                        span["end"].as_u64().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(&actual, spans, "{marker}: {row}");
         }
     });
 }
@@ -3381,6 +3525,32 @@ fn explicit_file_search_bypasses_hidden_walk_filter() {
         .stdout(predicate::str::contains(".hidden.rs"));
 }
 
+// ripgrep never applies `-g`/`-t` to a path named on the command line; they
+// only filter what a directory walk finds.
+#[test]
+fn explicit_file_bypasses_glob_and_type_filters() {
+    let dir = setup_fixture();
+    let hello = dir.path().join("testdata").join("hello.rs");
+    let hello = hello.to_str().unwrap();
+
+    for filter in [["-g", "*.py"], ["-t", "py"], ["-T", "rust"]] {
+        tgrep()
+            .args(["--no-index", "--no-heading", "-H"])
+            .args(filter)
+            .args(["fn", hello])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("hello.rs"));
+        tgrep()
+            .args(["--files"])
+            .args(filter)
+            .arg(hello)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("hello.rs"));
+    }
+}
+
 // ─── --glob / -g (multiple) ───────────────────────────────────────────
 
 #[test]
@@ -5040,15 +5210,19 @@ fn vimgrep_column_is_one_based() {
 
 // ─── Trim (--trim) ────────────────────────────────────────────────
 
+/// ripgrep trims only leading ASCII whitespace: trailing blanks and Unicode
+/// spaces survive, and JSON lines are reported untouched.
 #[test]
-fn trim_strips_whitespace() {
+fn trim_strips_leading_ascii_whitespace_only() {
     let dir = setup_fixture();
     let sub = dir.path().join("testdata");
     fs::write(
         sub.join("indented.txt"),
-        "    indented line\n  another indented\n",
+        "  \t indented line  \n\u{3000}wide indented\n",
     )
     .unwrap();
+    let file = sub.join("indented.txt");
+    let file = file.to_str().unwrap();
 
     let output = tgrep()
         .args([
@@ -5057,23 +5231,83 @@ fn trim_strips_whitespace() {
             "--no-filename",
             "-N",
             "--trim",
-            "indented",
-            sub.join("indented.txt").to_str().unwrap(),
+        ])
+        .args(["indented", file])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "indented line  \n\u{3000}wide indented\n"
+    );
+
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--trim",
+            "--json",
+            "-F",
+            "indented line",
+            file,
         ])
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        assert!(
-            !line.starts_with(' '),
-            "expected trimmed line, got: '{line}'"
-        );
-    }
-    assert!(stdout.contains("indented line"));
-    assert!(stdout.contains("another indented"));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let line = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| record["type"] == "match")
+        .unwrap();
+    assert_eq!(line["data"]["lines"]["text"], "  \t indented line  \n");
+    assert_eq!(line["data"]["submatches"][0]["start"], 4);
 }
 
 // ─── Null separator (-0 / --null) ──────────────────────────────────
+
+/// ripgrep's `-0` ends the path field with NUL in every output mode, and the
+/// heading with NUL instead of a newline.
+#[test]
+fn null_separator_follows_the_path_in_every_mode() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("a.txt"),
+        "needle one\nctx line\nneedle two\n",
+    )
+    .unwrap();
+    for (flags, expected) in [
+        (
+            vec!["--no-heading", "-n"],
+            "a.txt\x001:needle one\na.txt\x003:needle two\n",
+        ),
+        (
+            vec!["--heading", "-n"],
+            "a.txt\x001:needle one\n3:needle two\n",
+        ),
+        (
+            vec!["--no-heading", "-n", "-A1", "-m1"],
+            "a.txt\x001:needle one\na.txt\x002-ctx line\n",
+        ),
+        (
+            vec!["--vimgrep"],
+            "a.txt\x001:1:needle one\na.txt\x003:1:needle two\n",
+        ),
+        (vec!["-c"], "a.txt\x002\n"),
+        (vec!["--count-matches"], "a.txt\x002\n"),
+        (vec!["-l"], "a.txt\0"),
+    ] {
+        let output = tgrep()
+            .current_dir(dir.path())
+            .args(["--no-index", "--color", "never", "-0"])
+            .args(&flags)
+            .arg("needle")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{flags:?}"
+        );
+    }
+}
 
 #[test]
 fn null_separator_in_files_mode() {
@@ -8066,6 +8300,31 @@ fn max_columns_omits_long_lines() {
         .assert()
         .success()
         .stdout(predicate::str::contains("[Omitted long matching line]"));
+}
+
+#[test]
+fn max_columns_zero_means_no_limit() {
+    // ripgrep: "When this flag is omitted or is set to 0, then it has no
+    // effect."
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("testdata");
+    fs::create_dir_all(&sub).unwrap();
+    let line = format!("needle {}", "x".repeat(200));
+    fs::write(sub.join("long.txt"), format!("{line}\n")).unwrap();
+
+    tgrep()
+        .args([
+            "--no-index",
+            "--no-heading",
+            "-M",
+            "0",
+            "needle",
+            &fixture_path(&dir),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(line.as_str()))
+        .stdout(predicate::str::contains("Omitted").not());
 }
 
 #[test]

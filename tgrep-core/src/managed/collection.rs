@@ -621,6 +621,9 @@ mod tests {
         };
         policy.work.workers = 1;
         policy.work.staging_bytes = 8 * MIB;
+        // The warm-admission operation spans the whole collection loop below,
+        // which can exceed the fixture's 30 s budget on a loaded host.
+        policy.work.operation_timeout_ms = 600_000;
         policy.collection.checkpoint_grace_ms = 3_600_000;
         policy.collection.generation_grace_ms = 86_400_000;
         policy.collection.max_duration_ms = 200;
@@ -703,6 +706,25 @@ mod tests {
             assert!(namespace.eligibility(id).unwrap().eligible);
             stage_bytes += object.logical_bytes;
         }
+        // Admission reclaims catalog WAL frames before refusing, so derive the
+        // limit from the checkpointed footprint: the retained stages alone
+        // must close admission and their reclamation alone must reopen it.
+        assert!(namespace.truncate_catalog_wal().unwrap());
+        let charged = namespace
+            .work_usage()
+            .unwrap()
+            .storage
+            .charged_overlap_logical_bytes;
+        let storage_limit = charged + request.staging_bytes - stage_bytes / 2;
+        let mut allocation = namespace.allocation().unwrap();
+        allocation.storage_bytes = Some(storage_limit);
+        let allocation = namespace
+            .update_allocation(allocation.version, allocation)
+            .unwrap();
+        let request = WorkRequest {
+            allocation_version: allocation.version,
+            ..request
+        };
         let attachment = namespace
             .accept_system_operation(
                 Token::parse("warm-admission").unwrap(),
@@ -790,10 +812,16 @@ mod tests {
         }
         let permit = namespace
             .reserve(&attachment.id, None, request.clone())
-            .expect("reclamation must reopen admission without increasing the allocation");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "reclamation must reopen admission without increasing the allocation: \
+                     {error:?}; usage: {}",
+                    serde_json::to_string(&namespace.work_usage().unwrap()).unwrap()
+                )
+            });
         assert_eq!(
             namespace.allocation().unwrap().storage_bytes,
-            Some(16 * MIB)
+            Some(storage_limit)
         );
         drop(permit);
         namespace

@@ -959,7 +959,7 @@ fn build_index_impl(
     if let Some(hint) = gitignore_gate_hint(&root, opts) {
         eprintln!("{hint}");
     }
-    let walk = walker::walk_dir_with_ignorecase(
+    let mut walk = walker::walk_dir_with_ignorecase(
         &root,
         &walker::WalkOptions {
             include_hidden,
@@ -975,6 +975,13 @@ fn build_index_impl(
         },
         ignorecase,
     );
+    let unrepresentable = walk.retain_index_keys(&root);
+    if unrepresentable > 0 {
+        eprintln!(
+            "tgrep: {unrepresentable} files have names an index cannot represent \
+             (not UTF-8, or containing '\\' outside Windows); use --no-index to search them"
+        );
+    }
     eprintln!(
         "Found {} text files ({} binary skipped, {} too large, {} errors)",
         walk.files.len(),
@@ -1323,29 +1330,37 @@ pub fn build_index_for_files(
         let batch_data: Vec<std::result::Result<ExtractedFile, std::path::PathBuf>> = batch
             .par_iter()
             .zip(batch_sizes.par_iter())
-            .map(|(path, &size)| {
+            .filter_map(|(path, &size)| {
+                // Callers feed this from metadata walks that already exclude
+                // these; keep a native name from ever taking another's key.
+                let Some(rel) = path
+                    .strip_prefix(&root)
+                    .or_else(|_| path.strip_prefix(input_root))
+                    .ok()
+                    .and_then(walker::index_key)
+                else {
+                    eprintln!(
+                        "tgrep: skipping {}: name cannot be represented in an index",
+                        path.display()
+                    );
+                    return None;
+                };
                 let data = match read_for_index(path, size, &owned_budget, None) {
                     Ok(data) => data,
                     Err(error) => {
                         eprintln!("tgrep: skipping {}: {error}", path.display());
-                        return Err(path.clone());
+                        return Some(Err(path.clone()));
                     }
                 };
-                let rel = path
-                    .strip_prefix(&root)
-                    .or_else(|_| path.strip_prefix(input_root))
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
                 let extracted = extract_indexed_file(rel, &data);
                 if extracted.version.is_none() {
                     eprintln!(
                         "tgrep: skipping {}: file changed during extraction or precise metadata is unavailable",
                         path.display()
                     );
-                    return Err(path.clone());
+                    return Some(Err(path.clone()));
                 }
-                Ok(extracted)
+                Some(Ok(extracted))
             })
             .collect();
 
@@ -1457,6 +1472,8 @@ fn write_index_files<'a>(
     flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
     postings_file.flush()?;
     lookup_file.flush()?;
+    postings_file.get_ref().sync_all()?;
+    lookup_file.get_ref().sync_all()?;
 
     write_files_and_meta(
         index_dir,
@@ -1525,6 +1542,8 @@ fn write_index_files_from_postings<'a>(
     flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
     postings_file.flush()?;
     lookup_file.flush()?;
+    postings_file.get_ref().sync_all()?;
+    lookup_file.get_ref().sync_all()?;
 
     write_files_and_meta(index_dir, root, path_count, paths, trigram_count, complete)
 }
@@ -1634,6 +1653,7 @@ pub fn stage_file_table_upgrade(index_dir: &Path, staging_dir: &Path) -> Result<
     ondisk::write_file_table_header(&mut target)?;
     std::io::copy(&mut source, &mut target)?;
     target.flush()?;
+    target.get_ref().sync_all()?;
     Ok(true)
 }
 
@@ -1842,6 +1862,8 @@ pub fn append_overlay_to_index(
     flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
     postings_file.flush()?;
     lookup_file.flush()?;
+    postings_file.get_ref().sync_all()?;
+    lookup_file.get_ref().sync_all()?;
 
     // files.bin + meta.json: existing files keep IDs [0, base), overlay files
     // follow at [base, base + N). Reader paths stream from its already-loaded
@@ -2051,6 +2073,8 @@ pub fn merge_index_with_delta(
     flush_lookup_entries(&mut lookup_file, &mut lookup_scratch)?;
     postings_file.flush()?;
     lookup_file.flush()?;
+    postings_file.get_ref().sync_all()?;
+    lookup_file.get_ref().sync_all()?;
 
     let paths = reader
         .all_paths()

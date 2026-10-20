@@ -80,9 +80,9 @@ impl GlobFilter {
         if self.is_empty() {
             return GlobDecision::Unmatched;
         }
-        // Normalize backslashes only when needed (index paths use forward slashes)
+        // Index paths use `/`; only Windows paths also use `\` as a separator.
         let normalized;
-        let path = if path.contains('\\') {
+        let path = if cfg!(windows) && path.contains('\\') {
             normalized = path.replace('\\', "/");
             &*normalized
         } else {

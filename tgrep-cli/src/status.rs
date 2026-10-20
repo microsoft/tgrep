@@ -1,6 +1,5 @@
 /// `tgrep status` — show index and server status.
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::path::Path;
 
 use anyhow::Result;
@@ -18,9 +17,21 @@ pub fn run(root: &Path, index_path: Option<&Path>) -> Result<()> {
         .unwrap_or_else(|| builder::default_index_dir(&root));
 
     // Try connecting to a running server
-    if let Ok(info) = ServerInfo::load(&index_dir)
-        && let Ok(status) = query_server_status(&info)
-    {
+    let server =
+        ServerInfo::load(&index_dir)
+            .ok()
+            .and_then(|info| match query_server_status(&info) {
+                Ok(status) => Some((info, status)),
+                Err(error) => {
+                    eprintln!(
+                        "warning: server on port {} did not answer ({error}); \
+                     showing on-disk index status",
+                        info.port
+                    );
+                    None
+                }
+            });
+    if let Some((info, status)) = server {
         println!("Server status for {}", root.display());
         println!("  PID:        {}", info.pid);
         println!("  Port:       {}", info.port);
@@ -209,8 +220,12 @@ fn write_refresh_status(writer: &mut impl Write, status: &StatusResult) -> std::
     Ok(())
 }
 
+/// How long `status` waits for a server's answer before reporting the
+/// on-disk index instead. Status never waits on a search or a build.
+const STATUS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn query_server_status(info: &ServerInfo) -> Result<StatusResult> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
+    let mut stream = info.connect(STATUS_READ_TIMEOUT)?;
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "status",
@@ -224,6 +239,7 @@ fn query_server_status(info: &ServerInfo) -> Result<StatusResult> {
     reader.read_line(&mut line)?;
 
     let response: serde_json::Value = serde_json::from_str(&line)?;
+    info.verify_response(&response)?;
     let result = response
         .get("result")
         .ok_or_else(|| anyhow::anyhow!("no result in response"))?;

@@ -61,6 +61,7 @@ pub struct Client {
     registration: Registration,
     managed: Option<super::protocol_v2::Client>,
     root: PathBuf,
+    paged: bool,
 }
 
 impl Client {
@@ -150,6 +151,7 @@ impl Client {
             };
             return Ok(Self {
                 registration,
+                paged: managed.paged,
                 managed: Some(managed),
                 root,
             });
@@ -170,10 +172,11 @@ impl Client {
                 && registration.port != 0,
             "incompatible shared daemon registration"
         );
-        let client = Self {
+        let mut client = Self {
             registration,
             managed: None,
             root,
+            paged: false,
         };
         let hello = client.request("hello", json!({}))?;
         ensure!(
@@ -189,6 +192,7 @@ impl Client {
                 && hello["profile"] == json!(IndexingProfile::default()),
             "shared daemon capabilities/profile are incompatible"
         );
+        client.paged = hello["paged_results"] == true;
         Ok(client)
     }
 
@@ -236,6 +240,57 @@ impl Client {
             );
         }
         Ok(result)
+    }
+
+    /// Request every page of a query, merging rows in path order. Pages are
+    /// separate snapshots, so a multi-page result is eventually consistent.
+    /// `done` may stop early once the merged rows answer the query.
+    pub fn view_pages(
+        &self,
+        method: &str,
+        view: &View,
+        mut query: Value,
+        done: impl Fn(&Value) -> bool,
+    ) -> Result<Value> {
+        if !self.paged {
+            return self.view_request(method, view, query);
+        }
+        query["page"] = Value::Null;
+        let mut result = self.view_request(method, view, query.clone())?;
+        loop {
+            let next = result
+                .as_object_mut()
+                .and_then(|object| object.remove("next_page"))
+                .unwrap_or(Value::Null);
+            if next.is_null() || done(&result) {
+                return Ok(result);
+            }
+            let cursor = next.as_str().context("invalid shared page cursor")?;
+            ensure!(
+                query["page"]
+                    .as_str()
+                    .is_none_or(|previous| previous < cursor),
+                "shared page cursor did not advance"
+            );
+            query["page"] = next;
+            let mut page = self.view_request(method, view, query.clone())?;
+            for key in ["files", "matches", "file_stats", "search_stats"] {
+                let Some(rows) = page.get_mut(key).and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                result
+                    .get_mut(key)
+                    .and_then(Value::as_array_mut)
+                    .context("shared pages disagree on result fields")?
+                    .append(rows);
+            }
+            if let (Some(total), Some(elapsed)) =
+                (result["elapsed_ms"].as_f64(), page["elapsed_ms"].as_f64())
+            {
+                result["elapsed_ms"] = json!(total + elapsed);
+            }
+            result["next_page"] = page["next_page"].take();
+        }
     }
 
     pub fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -435,6 +490,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let client = Client {
             managed: None,
+            paged: false,
             registration: Registration {
                 protocol: PROTOCOL,
                 instance: "test-instance".into(),

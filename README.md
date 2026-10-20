@@ -225,6 +225,10 @@ including nested repositories' Git internals. `--hidden` does not override this;
 use `--no-ignore` consistently on `index` and `serve` to include them. Explicit
 filesystem scans (`--no-index`) retain ripgrep-style hidden and ignore behavior.
 Git metadata needed for ignore rules and tracked-file detection is still read.
+As in ripgrep, a file a scan cannot read is reported and makes the exit code 2.
+On Windows a shared daemon holds a byte-range lock on
+`.git/tgrep-daemon-v1.lock`, so `--no-index --hidden` scans of that checkout
+report it; add `-g '!.git'` when Git internals are not wanted.
 
 On Windows, replaced index generations stay in `.retired` while readers have
 them memory-mapped. Cleanup retries after publication, every minute, and on
@@ -426,8 +430,8 @@ These tables describe search flags. Use `tgrep index --help` and
 | `--json` | ripgrep-compatible JSON stream (one object per line) |
 | `--vimgrep` | Vim-compatible `file:line:col:content`, one row per match |
 | `--color auto/always/never` | Color mode control |
-| `-0, --null` | NUL byte filename separator (for xargs) |
-| `--trim` | Trim leading/trailing whitespace |
+| `-0, --null` | Follow every printed file path with a NUL byte instead of its separator, in all output modes except JSON (for xargs) |
+| `--trim` | Trim leading ASCII whitespace from printed lines (JSON lines are unchanged) |
 | `-., --hidden` | Include hidden files and directories |
 | `--no-ignore` | Don't respect `.gitignore` or `p4ignore.ini` files |
 | `-a, --text` | Search binary files as if they were text |
@@ -662,6 +666,8 @@ matching file, rather than transmitting every matching line, span and column.
 `--stats` still reports the original match and matched-line totals; it does not
 restore unused line detail. Counts therefore do not consume reply space
 proportional to matching content, but remain subject to the same response limit.
+Server `-l` returns one path row per file and, without `--stats`, stops at the
+first match in each file.
 Ordinary older servers that ignore `-c` projection retain line-row counting.
 Shared servers that reject the new option, and servers without metadata needed
 for `--count-matches`, fall back with a diagnostic. Malformed projected counts
@@ -762,8 +768,11 @@ UTF-8 sequences with `U+FFFD`. A pattern can match those replacement characters.
 For UTF-8 repair, text-output columns and byte offsets are mapped back to the
 source bytes.
 
-JSON output uses `lines.text` with replacements and submatch offsets into that
-text. ripgrep instead emits base64 `lines.bytes` for invalid UTF-8.
+JSON output follows ripgrep for invalid UTF-8: such a line is emitted as base64
+`lines.bytes` of the original source bytes, with submatch offsets into those
+bytes and each submatch as `text` when valid UTF-8, otherwise `bytes`.
+`lines.text` keeps each line's own terminator, including `\r\n`.
+Paths are always emitted as `path.text`.
 Transcoded encodings use decoded-text offsets rather than original byte
 positions; offsets also exclude stripped BOM bytes.
 
@@ -929,7 +938,13 @@ index/reconcile worker, two independent query workers, bounded connection and
 work queues, 1 MiB requests and 64 MiB responses. There is no content cache.
 The response limit is enforced while producing individual match/context rows,
 file paths and statistics, including JSON escaping and envelope overhead, and
-again during final serialization. Large queries fail explicitly and CLI queries scan;
+again during final serialization. Daemons advertising `paged_results` (v1) or
+the `paged-results` capability (managed v2) split a large search or `--files`
+result into pages of at most that size, ending a page after about a minute of
+work; clients request each `next_page` cursor in path order and merge the rows.
+Each page reads the then-current snapshot, so a multi-page result is
+eventually consistent. Only a single file whose rows exceed the limit, or a
+daemon without paging, fails explicitly, and CLI queries then scan;
 generation mappings and private posting memory still scale with admitted data.
 
 Storage must already exist, be trusted and outside **all** registered worktrees,
@@ -1020,15 +1035,21 @@ Healthy native managed views also run a periodic full verification every
 `--poll-interval` seconds (default 120), measured from their last completed
 full pass, while they keep serving queries. It reads and hashes every admitted
 file under the existing operation and resource budgets. An unchanged result
-keeps the view ready and changes nothing. Readiness closes only when it finds a
+keeps the view ready and changes nothing. `ready` closes only when it finds a
 difference, after which it publishes a full repair; silently missed changes
 are therefore repaired within one interval plus the verification time.
 Watcher errors/rescans, explicit full invalidation and concurrent edits still
-close readiness first. A verification that exhausts its deadline or is
+close `ready` first. Managed views are eventually consistent: once published
+they report `serving: true` and keep answering from their last publication
+while `ready` is closed, instead of sending clients to a filesystem scan.
+Results can lag recent edits until the next reconciliation publishes. A
+verification that exhausts its deadline or is
 cancelled leaves the view ready but unverified, reports `failed`/`cancelled`,
 and retries after the next interval. Timestamps, clean Git status and an
 unavailable journal never prove that nothing changed. Status reports
-`last_verification` with its outcome and age. Use `--no-index` for current disk bytes.
+`last_verification` with its outcome and age, and `watch_events` counts
+watcher input by kind, metadata-only notifications filtered as unchanged,
+invalidated paths and epoch advances. Use `--no-index` for current disk bytes.
 
 On Windows/macOS, managed views use recursive worktree and Git metadata-root
 subscriptions, without pre-enumerating descendant directories. The unchanged
@@ -1044,8 +1065,9 @@ Explicit `--watch-mode poll` and actual native-watcher failure/budget fallback
 still perform full reconciliation after `--poll-interval` seconds (default 120)
 following completion. `--no-watch` disables watching and polling, not initial
 verification or explicit refresh. `reconciliation_policy` distinguishes these
-per-view modes and namespace monitor counts. Polling views close readiness for
-each pass; healthy native views keep serving through theirs. These
+per-view modes and namespace monitor counts. Polling views close `ready` for
+each pass but keep serving their previous publication; healthy native views
+stay ready through theirs. These
 recurring-mode changes postdate the immutable benchmark source and are not
 measured there.
 Legacy v1 and ordinary-server refresh policies are unchanged.

@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use serde::{Deserialize, Serialize};
@@ -968,6 +969,17 @@ impl GenerationManager {
         predecessor: Option<&Arc<Generation>>,
         output: &crate::output::Output,
     ) -> Result<BuildStats> {
+        Self::build_into_tuned(repository, key, commit, predecessor, output, None)
+    }
+
+    fn build_into_tuned(
+        repository: &Repository,
+        key: &GenerationKey,
+        commit: &str,
+        predecessor: Option<&Arc<Generation>>,
+        output: &crate::output::Output,
+        tuning: Option<ExtractionTuning>,
+    ) -> Result<BuildStats> {
         output.check()?;
         let metadata_limit = output.control().map(|permit| permit.private_limit() / 64);
         let mut metadata_memory = output
@@ -1023,7 +1035,6 @@ impl GenerationManager {
             }
         }
         let mut reuse: HashMap<&str, Vec<u32>> = HashMap::new();
-        let mut blobs = None;
         // Group by blob so repeated files also cause only one extraction.
         let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for (index, entry) in entries.iter_mut().enumerate() {
@@ -1038,104 +1049,194 @@ impl GenerationManager {
                 groups.entry(entry.oid.clone()).or_default().push(index);
             }
         }
-        // Stable file IDs make independent builds deterministic.
-        for (oid, indices) in groups {
-            output.check()?;
-            let previous = previous_blobs.get(oid.as_str()).copied();
-            if let (Some(previous), Some(generation)) = (previous, predecessor) {
-                match previous.content {
-                    EntryContent::Indexed { .. } | EntryContent::Binary => {
-                        let has_postings = if previous.content_id().is_some() {
-                            generation
-                                .base()
-                                .reader()
-                                .snapshot_path_has_postings(&previous.path)
-                                .ok_or_else(|| {
-                                    GenerationError::InvalidMetadata(
-                                        "indexed predecessor lacks validated posting membership"
-                                            .into(),
-                                    )
-                                })?
-                        } else {
-                            false
-                        };
-                        for index in indices {
-                            let entry = &mut entries[index];
-                            if entry.size != previous.size {
-                                return Err(GenerationError::InvalidMetadata(
-                                    "same blob has different sizes".into(),
-                                ));
-                            }
-                            entry.content = previous.content.clone();
-                            if entry.content_id().is_some() {
-                                let id = add_path(&mut paths, &entry.path)?;
-                                if has_postings {
-                                    reuse.entry(&previous.path).or_default().push(id);
+        let groups: Vec<(String, u64, Vec<usize>)> = groups
+            .into_iter()
+            .map(|(oid, indices)| {
+                let size = entries[indices[0]].size.expect("regular blob size");
+                (oid, size, indices)
+            })
+            .collect();
+        let reusable = |oid: &str| {
+            previous_blobs.get(oid).copied().filter(|previous| {
+                matches!(
+                    previous.content,
+                    EntryContent::Indexed { .. } | EntryContent::Binary
+                )
+            })
+        };
+        let extracted_blobs = groups
+            .iter()
+            .filter(|(oid, ..)| reusable(oid).is_none())
+            .count();
+        let mut tuning =
+            tuning.unwrap_or_else(|| ExtractionTuning::new(output.control(), extracted_blobs));
+        let batch_bytes = tuning.batch_bytes;
+        let plan = |position: usize| {
+            let mut end = position;
+            let mut work = Vec::new();
+            let mut charged = 0_u64;
+            while let Some((oid, size, _)) = groups.get(end) {
+                if reusable(oid).is_none() {
+                    let charge = size.saturating_mul(6).saturating_add(64 * 1024);
+                    if !work.is_empty() && charged.saturating_add(charge) > batch_bytes {
+                        break;
+                    }
+                    charged = charged.saturating_add(charge);
+                    work.push((oid.as_str(), *size));
+                }
+                end += 1;
+            }
+            (end, work)
+        };
+        let source = BlobSource {
+            repository,
+            control: control.as_ref(),
+            permit: output.control(),
+        };
+        let abort = AtomicBool::new(false);
+        let mut readers: Vec<Option<git::Blobs>> = vec![None];
+        std::thread::scope(|scope| -> Result<()> {
+            let mut prefetched: Option<Prefetch<'_, '_>> = None;
+            let applied = (|| {
+                let mut position = 0;
+                // Stable file IDs make independent builds deterministic.
+                while position < groups.len() {
+                    let (end, mut results) = match prefetched.take() {
+                        Some(prefetch) => prefetch.join(&mut readers),
+                        None => {
+                            let (end, work) = plan(position);
+                            let (_parallelism, workers) =
+                                parallelism(source.permit, tuning.workers.min(work.len()))?;
+                            let mut results = Vec::new();
+                            if workers > 1 {
+                                if readers.len() < workers {
+                                    readers.resize_with(workers, || None);
                                 }
-                                stats.reused_indexed_files += 1;
+                                results =
+                                    source.extract_parallel(&mut readers[..workers], &work, &abort);
                             }
+                            (end, results)
                         }
-                        continue;
+                    };
+                    if end < groups.len() && tuning.workers > 1 {
+                        // Extraction of the next batch overlaps this batch's
+                        // ordered ID assignment and posting spill.
+                        let (next, work) = plan(end);
+                        let (parallelism, workers) =
+                            parallelism(source.permit, tuning.workers.min(work.len()))?;
+                        if workers > 1 {
+                            // The first reader stays available for serial retries.
+                            let mut owned = readers.split_off(1);
+                            if owned.len() < workers {
+                                owned.resize_with(workers, || None);
+                            }
+                            let abort = &abort;
+                            prefetched = Some(Prefetch {
+                                end: next,
+                                worker: scope.spawn(move || {
+                                    let results = source.extract_parallel(
+                                        &mut owned[..workers],
+                                        &work,
+                                        abort,
+                                    );
+                                    (owned, results)
+                                }),
+                                _parallelism: parallelism,
+                            });
+                        }
                     }
-                    _ => {}
-                }
-            }
-            let batch = match &mut blobs {
-                Some(batch) => batch,
-                None => blobs.insert(match &control {
-                    Some(control) => git::Blobs::controlled(repository, control.clone())?,
-                    None => git::Blobs::new(repository)?,
-                }),
-            };
-            let size = entries[indices[0]].size.expect("regular blob size");
-            let _blob_memory = output
-                .control()
-                .map(|permit| {
-                    let limit = permit.read_limits().blob_bytes;
-                    if size > limit {
-                        return Err(crate::managed::Error::pressure("blob-work-limit"));
+                    let mut next = 0;
+                    for (oid, size, indices) in &groups[position..end] {
+                        output.check()?;
+                        if let (Some(previous), Some(generation)) = (reusable(oid), predecessor) {
+                            let has_postings = if previous.content_id().is_some() {
+                                generation
+                                    .base()
+                                    .reader()
+                                    .snapshot_path_has_postings(&previous.path)
+                                    .ok_or_else(|| {
+                                        GenerationError::InvalidMetadata(
+                                            "indexed predecessor lacks validated posting membership"
+                                                .into(),
+                                        )
+                                    })?
+                            } else {
+                                false
+                            };
+                            for &index in indices {
+                                let entry = &mut entries[index];
+                                if entry.size != previous.size {
+                                    return Err(GenerationError::InvalidMetadata(
+                                        "same blob has different sizes".into(),
+                                    ));
+                                }
+                                entry.content = previous.content.clone();
+                                if entry.content_id().is_some() {
+                                    let id = add_path(&mut paths, &entry.path)?;
+                                    if has_postings {
+                                        reuse.entry(&previous.path).or_default().push(id);
+                                    }
+                                    stats.reused_indexed_files += 1;
+                                }
+                            }
+                            continue;
+                        }
+                        let extraction = match results.get_mut(next).and_then(Option::take) {
+                            Some(Ok(extraction)) => extraction,
+                            Some(Err(error)) if !is_private_pressure(&error) => {
+                                return Err(error);
+                            }
+                            retry => {
+                                if retry.is_some() {
+                                    // Retained results and readers can exhaust private
+                                    // memory; continue with one reservation at a time.
+                                    results.clear();
+                                    tuning.workers = 1;
+                                    abort.store(true, Ordering::Relaxed);
+                                    if let Some(prefetch) = prefetched.take() {
+                                        prefetch.join(&mut readers);
+                                    }
+                                    for reader in readers.drain(1..).flatten() {
+                                        reader.finish()?;
+                                    }
+                                }
+                                source.extract(&mut readers[0], oid, *size, false)?
+                            }
+                        };
+                        next += 1;
+                        stats.blobs_read += 1;
+                        stats.blob_bytes_read += size;
+                        let Some((content_id, masks)) = &extraction.indexed else {
+                            for &index in indices {
+                                entries[index].content = EntryContent::Binary;
+                            }
+                            continue;
+                        };
+                        stats.blobs_extracted += 1;
+                        for &index in indices {
+                            let entry = &mut entries[index];
+                            entry.content = EntryContent::Indexed {
+                                content_id: *content_id,
+                            };
+                            let file_id = add_path(&mut paths, &entry.path)?;
+                            sorter.push_file(
+                                file_id,
+                                masks.iter().map(|(&trigram, &masks)| (trigram, masks)),
+                            )?;
+                        }
                     }
-                    let reservation = size
-                        .checked_mul(6)
-                        .and_then(|bytes| bytes.checked_add(64 * 1024))
-                        .ok_or_else(|| crate::managed::Error::pressure("blob-memory-overflow"))?;
-                    permit.memory(reservation)
-                })
-                .transpose()?;
-            let bytes = batch.read(&oid, size)?;
-            stats.blobs_read += 1;
-            stats.blob_bytes_read += size;
-            let text = encoding::decode_for_index_controlled(&bytes, output.control())?;
-            if trigram::is_binary(&text) {
-                for index in indices {
-                    entries[index].content = EntryContent::Binary;
+                    position = end;
                 }
-                continue;
+                Ok(())
+            })();
+            abort.store(true, Ordering::Relaxed);
+            if let Some(prefetch) = prefetched {
+                prefetch.join(&mut readers);
             }
-            let content_id = ContentId::from_indexed_bytes_controlled(&text, output.control())?;
-            let mut extraction_memory = output
-                .control()
-                .map(|permit| permit.memory(0))
-                .transpose()?;
-            let masks = match (output.control(), &mut extraction_memory) {
-                (Some(permit), Some(memory)) => {
-                    trigram::extract_merged_masks_controlled(&text, permit, memory)?
-                }
-                _ => trigram::extract_merged_masks(&text),
-            };
-            stats.blobs_extracted += 1;
-            for index in indices {
-                let entry = &mut entries[index];
-                entry.content = EntryContent::Indexed { content_id };
-                let file_id = add_path(&mut paths, &entry.path)?;
-                sorter.push_file(
-                    file_id,
-                    masks.iter().map(|(&trigram, &masks)| (trigram, masks)),
-                )?;
-            }
-        }
-        if let Some(blobs) = blobs {
-            blobs.finish()?;
+            applied
+        })?;
+        for reader in readers.into_iter().flatten() {
+            reader.finish()?;
         }
         if !reuse.is_empty()
             && let Some(previous) = predecessor
@@ -1231,6 +1332,192 @@ fn add_path(paths: &mut Vec<String>, path: &str) -> Result<u32> {
     let id = paths.len() as u32;
     paths.push(path.into());
     Ok(id)
+}
+
+const MIN_BLOBS_PER_READER: usize = 16;
+const PRIVATE_BYTES_PER_READER: u64 = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct ExtractionTuning {
+    workers: usize,
+    /// Bounds the blob reservations of one batch; at most two batches of
+    /// extracted trigrams are retained at once.
+    batch_bytes: u64,
+}
+
+impl ExtractionTuning {
+    fn new(permit: Option<&Arc<crate::managed::WorkPermit>>, blobs: usize) -> Self {
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(64)
+            .min(blobs.div_ceil(MIN_BLOBS_PER_READER));
+        let Some(permit) = permit else {
+            return Self {
+                workers,
+                batch_bytes: builder::INDEX_BUILD_BATCH_BYTES / 2,
+            };
+        };
+        let private = permit.private_limit();
+        Self {
+            workers: workers
+                .min(usize::try_from(private / PRIVATE_BYTES_PER_READER).unwrap_or(usize::MAX)),
+            batch_bytes: (private / 8).min(builder::INDEX_BUILD_BATCH_BYTES / 2),
+        }
+    }
+}
+
+struct BlobExtraction {
+    indexed: Option<(ContentId, trigram::TrigramMaskMap)>,
+    _memory: Option<crate::managed::work::MemoryCharge>,
+}
+
+type Extractions = Vec<Option<Result<BlobExtraction>>>;
+
+struct Prefetch<'scope, 'permit> {
+    end: usize,
+    worker: std::thread::ScopedJoinHandle<'scope, (Vec<Option<git::Blobs>>, Extractions)>,
+    _parallelism: Option<crate::managed::work::Parallelism<'permit>>,
+}
+
+impl Prefetch<'_, '_> {
+    fn join(self, readers: &mut Vec<Option<git::Blobs>>) -> (usize, Extractions) {
+        let (owned, results) = self
+            .worker
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        readers.extend(owned);
+        (self.end, results)
+    }
+}
+
+fn parallelism(
+    permit: Option<&Arc<crate::managed::WorkPermit>>,
+    wanted: usize,
+) -> Result<(Option<crate::managed::work::Parallelism<'_>>, usize)> {
+    match permit {
+        Some(permit) if wanted > 1 => {
+            let guard = permit.parallelism(wanted)?;
+            let workers = guard.workers;
+            Ok((Some(guard), workers))
+        }
+        _ => Ok((None, wanted)),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BlobSource<'a> {
+    repository: &'a Repository,
+    control: Option<&'a crate::managed::process::Control>,
+    permit: Option<&'a Arc<crate::managed::WorkPermit>>,
+}
+
+impl BlobSource<'_> {
+    fn extract(
+        self,
+        reader: &mut Option<git::Blobs>,
+        oid: &str,
+        size: u64,
+        admitted: bool,
+    ) -> Result<BlobExtraction> {
+        if reader.is_none() {
+            *reader = Some(match self.control {
+                Some(control) => git::Blobs::controlled(self.repository, control.clone())?,
+                None => git::Blobs::new(self.repository)?,
+            });
+        }
+        let blobs = reader.as_mut().expect("spawned blob reader");
+        let mut admission = None;
+        let mut blob_memory = None;
+        if let Some(permit) = self.permit {
+            if size > permit.read_limits().blob_bytes {
+                return Err(crate::managed::Error::pressure("blob-work-limit").into());
+            }
+            let reservation = size
+                .checked_mul(6)
+                .and_then(|bytes| bytes.checked_add(64 * 1024))
+                .ok_or_else(|| crate::managed::Error::pressure("blob-memory-overflow"))?;
+            if admitted {
+                admission = Some(permit.admit_read(reservation)?);
+            } else {
+                blob_memory = Some(permit.memory(reservation)?);
+            }
+        }
+        let bytes = blobs.read(oid, size)?;
+        let text = encoding::decode_for_index_controlled(&bytes, self.permit)?;
+        if trigram::is_binary(&text) {
+            return Ok(BlobExtraction {
+                indexed: None,
+                _memory: None,
+            });
+        }
+        let content_id = ContentId::from_indexed_bytes_controlled(&text, self.permit)?;
+        let mut memory = self.permit.map(|permit| permit.memory(0)).transpose()?;
+        let masks = match (self.permit, &mut memory) {
+            (Some(permit), Some(memory)) => {
+                trigram::extract_merged_masks_controlled(&text, permit, memory)?
+            }
+            _ => trigram::extract_merged_masks(&text),
+        };
+        drop((admission, blob_memory));
+        Ok(BlobExtraction {
+            indexed: Some((content_id, masks)),
+            _memory: memory,
+        })
+    }
+
+    /// Workers claim blobs in order and stop claiming after any failure, so
+    /// every blob before the first failure has a result.
+    fn extract_parallel(
+        self,
+        readers: &mut [Option<git::Blobs>],
+        work: &[(&str, u64)],
+        abort: &AtomicBool,
+    ) -> Extractions {
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let mut results: Vec<_> = std::iter::repeat_with(|| None).take(work.len()).collect();
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = readers
+                .iter_mut()
+                .map(|reader| {
+                    let (next, stop) = (&next, &stop);
+                    scope.spawn(move || {
+                        let mut done = Vec::new();
+                        while !stop.load(Ordering::Relaxed) && !abort.load(Ordering::Relaxed) {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&(oid, size)) = work.get(index) else {
+                                break;
+                            };
+                            let result = self.extract(reader, oid, size, true);
+                            if result.is_err() {
+                                stop.store(true, Ordering::Relaxed);
+                                *reader = None;
+                            }
+                            done.push((index, result));
+                        }
+                        done
+                    })
+                })
+                .collect();
+            for worker in workers {
+                match worker.join() {
+                    Ok(done) => {
+                        for (index, result) in done {
+                            results[index] = Some(result);
+                        }
+                    }
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+        });
+        results
+    }
+}
+
+fn is_private_pressure(error: &GenerationError) -> bool {
+    matches!(error, GenerationError::Index(crate::Error::Managed(error))
+        if error.category == crate::managed::ErrorCategory::ResourcePressure
+            && error.reason_code == "reserved-private-memory-exhausted")
 }
 
 fn read_manifest(directory: &Path) -> Result<Manifest> {
@@ -1645,5 +1932,385 @@ mod tests {
         ));
         assert!(!manager.directory.join(key.storage_name()).exists());
         assert!(manager.list().unwrap().is_empty());
+    }
+
+    const SERIAL: ExtractionTuning = ExtractionTuning {
+        workers: 1,
+        batch_bytes: u64::MAX,
+    };
+    // Small batches keep a prefetch in flight across many batch boundaries.
+    const PARALLEL: [ExtractionTuning; 2] = [
+        ExtractionTuning {
+            workers: 4,
+            batch_bytes: 256 * 1024,
+        },
+        ExtractionTuning {
+            workers: 8,
+            batch_bytes: u64::MAX,
+        },
+    ];
+
+    struct BuildFixture {
+        _root: tempfile::TempDir,
+        repository: Repository,
+        commit: String,
+        tree: String,
+    }
+
+    type BuildOutput = (BuildStats, Vec<(String, Vec<u8>)>);
+
+    fn git(root: &Path, args: &[&str]) {
+        let mut command = std::process::Command::new("git");
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+            {
+                command.env_remove(key);
+            }
+        }
+        let output = command
+            .current_dir(root)
+            .args(["-c", "user.name=Generation Tests"])
+            .args(["-c", "user.email=generations@example.invalid"])
+            .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn build_fixture(files: &[(String, Vec<u8>)]) -> BuildFixture {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "--quiet", "--initial-branch=main"]);
+        for (path, bytes) in files {
+            let path = root.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        git(root.path(), &["add", "--all"]);
+        git(
+            root.path(),
+            &["commit", "--quiet", "--allow-empty", "-m", "fixture"],
+        );
+        let repository = Repository::discover(root.path()).unwrap();
+        let (commit, tree) = repository.resolve_commit_tree("HEAD").unwrap();
+        BuildFixture {
+            _root: root,
+            repository,
+            commit,
+            tree,
+        }
+    }
+
+    fn noisy_text(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..len)
+            .map(|index| {
+                if index % 64 == 63 {
+                    return b'\n';
+                }
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b'!' + (state % 94) as u8
+            })
+            .collect()
+    }
+
+    fn mixed_corpus() -> Vec<(String, Vec<u8>)> {
+        let mut files = Vec::new();
+        for index in 0..160_usize {
+            let mut text = format!("fn item_{index}() -> usize {{ {index} }}\n");
+            let lines = if index % 40 == 0 { 2500 } else { index % 9 };
+            for line in 0..lines {
+                text.push_str(&format!("let value_{index}_{line} = {};\n", line * index));
+            }
+            files.push((
+                format!("src/{:02}/item-{index:03}.rs", index % 7),
+                text.into_bytes(),
+            ));
+        }
+        let shared = b"contents shared by many paths\n".repeat(40);
+        for index in 0..24 {
+            files.push((format!("copies/copy-{index:02}.txt"), shared.clone()));
+        }
+        for index in 0..6_u8 {
+            files.push((
+                format!("bin/blob-{index}.bin"),
+                [index, 0, 1, 2, 0, 0xff, b'x'].repeat(200),
+            ));
+        }
+        let wide = "utf sixteen needle text\n".repeat(20);
+        let mut le = vec![0xff, 0xfe];
+        le.extend(wide.encode_utf16().flat_map(u16::to_le_bytes));
+        let mut be = vec![0xfe, 0xff];
+        be.extend(wide.encode_utf16().flat_map(u16::to_be_bytes));
+        files.push(("text/utf16le.txt".into(), le));
+        files.push(("text/utf16be.txt".into(), be));
+        files.push((
+            "text/latin1.txt".into(),
+            b"caf\xe9 cr\xe8me br\xfbl\xe9e\n".repeat(30),
+        ));
+        files.push((
+            "text/invalid.txt".into(),
+            b"valid prefix \xc3\x28 then \xa0\xa1 more\n".repeat(30),
+        ));
+        files.push(("text/empty.txt".into(), Vec::new()));
+        files.push((
+            "large/oversized.txt".into(),
+            b"oversized line of text\n".repeat(20_000),
+        ));
+        files
+    }
+
+    fn capped_profile() -> IndexingProfile {
+        IndexingProfile {
+            max_blob_bytes: Some(256 * 1024),
+            ..IndexingProfile::default()
+        }
+    }
+
+    fn build_output(
+        fixture: &BuildFixture,
+        profile: IndexingProfile,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+        tuning: Option<ExtractionTuning>,
+    ) -> Result<BuildOutput> {
+        let stage = tempfile::tempdir().unwrap();
+        let output = match permit {
+            Some(permit) => crate::output::Output::compatibility(stage.path(), permit),
+            None => crate::output::Output::legacy(stage.path()),
+        };
+        let key = GenerationKey::legacy(&fixture.repository, fixture.tree.clone(), profile);
+        let stats = GenerationManager::build_into_tuned(
+            &fixture.repository,
+            &key,
+            &fixture.commit,
+            None,
+            &output,
+            tuning,
+        )?;
+        drop(output);
+        let mut files = Vec::new();
+        for entry in fs::read_dir(stage.path()).unwrap() {
+            let entry = entry.unwrap();
+            assert!(entry.file_type().unwrap().is_file());
+            let name = entry.file_name().into_string().unwrap();
+            let mut bytes = fs::read(entry.path()).unwrap();
+            if name == "meta.json" {
+                let mut meta: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                for timestamp in ["created_at", "updated_at"] {
+                    meta.as_object_mut().unwrap().remove(timestamp).unwrap();
+                }
+                bytes = serde_json::to_vec(&meta).unwrap();
+            }
+            files.push((name, bytes));
+        }
+        files.sort();
+        Ok((stats, files))
+    }
+
+    fn managed_permit(
+        fixture: &BuildFixture,
+        policy: crate::managed::Policy,
+        private_bytes: u64,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::managed::Namespace>,
+        Arc<crate::managed::WorkPermit>,
+    ) {
+        let storage = tempfile::tempdir().unwrap();
+        let namespace =
+            crate::managed::Namespace::initialize(&fixture.repository, storage.path(), policy)
+                .unwrap();
+        namespace.activate().unwrap();
+        let operation = namespace
+            .accept_system_operation(
+                crate::managed::Token::parse("generation-build").unwrap(),
+                "build",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let permit = namespace
+            .reserve(
+                &operation.id,
+                None,
+                crate::managed::WorkRequest {
+                    allocation_version: 1,
+                    private_bytes,
+                    staging_bytes: 32 * 1024 * 1024,
+                    slots: 1,
+                },
+            )
+            .unwrap();
+        (storage, namespace, permit)
+    }
+
+    fn managed_output(
+        fixture: &BuildFixture,
+        policy: crate::managed::Policy,
+        private_bytes: u64,
+        profile: IndexingProfile,
+        tuning: Option<ExtractionTuning>,
+    ) -> Result<BuildOutput> {
+        let (_storage, _namespace, permit) = managed_permit(fixture, policy, private_bytes);
+        build_output(fixture, profile, Some(&permit), tuning)
+    }
+
+    fn pressure_reason(result: Result<BuildOutput>) -> String {
+        match result {
+            Err(GenerationError::Index(crate::Error::Managed(error)))
+                if error.category == crate::managed::ErrorCategory::ResourcePressure =>
+            {
+                error.reason_code
+            }
+            other => panic!(
+                "expected resource pressure, got {:?}",
+                other.map(|(s, _)| s)
+            ),
+        }
+    }
+
+    #[test]
+    fn parallel_blob_extraction_builds_the_serial_generation_bytes() {
+        let fixture = build_fixture(&mixed_corpus());
+        let (stats, files) = build_output(&fixture, capped_profile(), None, Some(SERIAL)).unwrap();
+        assert_eq!(stats.tracked_entries, 196);
+        assert_eq!(stats.blobs_read, 172);
+        assert_eq!(stats.blobs_extracted, 166);
+        let names: Vec<_> = files.iter().map(|(name, _)| name.as_str()).collect();
+        assert!(names.contains(&MANIFEST) && names.contains(&"meta.json"));
+        let manifest: SealedManifest =
+            serde_json::from_slice(&files.iter().find(|(name, _)| name == MANIFEST).unwrap().1)
+                .unwrap();
+        let content = |path: &str| {
+            manifest
+                .manifest
+                .entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap()
+                .content
+                .clone()
+        };
+        assert!(matches!(content("bin/blob-3.bin"), EntryContent::Binary));
+        assert!(matches!(
+            content("large/oversized.txt"),
+            EntryContent::TooLarge
+        ));
+        for path in [
+            "text/utf16le.txt",
+            "text/utf16be.txt",
+            "text/latin1.txt",
+            "text/invalid.txt",
+            "text/empty.txt",
+            "copies/copy-17.txt",
+        ] {
+            assert!(
+                matches!(content(path), EntryContent::Indexed { .. }),
+                "{path}"
+            );
+        }
+        assert_eq!(content("text/utf16le.txt"), content("text/utf16be.txt"));
+        for tuning in PARALLEL.map(Some).into_iter().chain([None]) {
+            let parallel = build_output(&fixture, capped_profile(), None, tuning).unwrap();
+            assert!(parallel == (stats.clone(), files.clone()), "{tuning:?}");
+        }
+    }
+
+    #[test]
+    fn managed_parallel_blob_extraction_builds_the_serial_generation_bytes() {
+        let fixture = build_fixture(&mixed_corpus());
+        let policy = crate::managed::policy::fixture_policy;
+        let serial =
+            managed_output(&fixture, policy(), 32 << 20, capped_profile(), Some(SERIAL)).unwrap();
+        let legacy = build_output(&fixture, capped_profile(), None, Some(SERIAL)).unwrap();
+        assert!(serial == legacy);
+        for tuning in PARALLEL.map(Some).into_iter().chain([None]) {
+            let parallel =
+                managed_output(&fixture, policy(), 32 << 20, capped_profile(), tuning).unwrap();
+            assert!(parallel == serial, "{tuning:?}");
+        }
+    }
+
+    #[test]
+    fn retained_parallel_extractions_fall_back_to_serial_under_private_pressure() {
+        let files: Vec<_> = (0..24)
+            .map(|index| {
+                (
+                    format!("noise/{index:02}.txt"),
+                    noisy_text(index, 16 * 1024),
+                )
+            })
+            .collect();
+        let fixture = build_fixture(&files);
+        let policy = crate::managed::policy::fixture_policy;
+        let private = 16 << 20;
+        let serial =
+            managed_output(&fixture, policy(), private, capped_profile(), Some(SERIAL)).unwrap();
+        assert_eq!(serial.0.blobs_extracted, 24);
+        // One batch would retain every extracted table, far beyond the reservation.
+        let tuning = ExtractionTuning {
+            workers: 8,
+            batch_bytes: u64::MAX,
+        };
+        let parallel =
+            managed_output(&fixture, policy(), private, capped_profile(), Some(tuning)).unwrap();
+        assert!(parallel == serial);
+    }
+
+    #[test]
+    fn parallel_extraction_reports_the_serial_blob_work_limit() {
+        let mut files = mixed_corpus();
+        files.retain(|(path, _)| path != "large/oversized.txt");
+        files.push((
+            "large/over-work-limit.txt".into(),
+            noisy_text(7, 1536 * 1024),
+        ));
+        let fixture = build_fixture(&files);
+        let policy = crate::managed::policy::fixture_policy;
+        let profile = IndexingProfile::default();
+        for tuning in [SERIAL].into_iter().chain(PARALLEL) {
+            let result = managed_output(&fixture, policy(), 32 << 20, profile, Some(tuning));
+            assert_eq!(pressure_reason(result), "blob-work-limit", "{tuning:?}");
+        }
+    }
+
+    #[test]
+    fn parallel_extraction_builds_an_empty_tree() {
+        let fixture = build_fixture(&[]);
+        let serial = build_output(&fixture, capped_profile(), None, Some(SERIAL)).unwrap();
+        assert_eq!(serial.0.tracked_entries, 0);
+        for tuning in PARALLEL {
+            let parallel = build_output(&fixture, capped_profile(), None, Some(tuning)).unwrap();
+            assert!(parallel == serial);
+        }
+    }
+
+    #[test]
+    fn cancellation_stops_parallel_extraction() {
+        let fixture = build_fixture(&mixed_corpus());
+        let policy = crate::managed::policy::fixture_policy;
+        for delay in [0, 2, 10, 40] {
+            let (_storage, _namespace, permit) = managed_permit(&fixture, policy(), 32 << 20);
+            let canceller = {
+                let permit = permit.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(delay));
+                    permit.cancel();
+                })
+            };
+            let result = build_output(&fixture, capped_profile(), Some(&permit), Some(PARALLEL[0]));
+            canceller.join().unwrap();
+            if let Err(error) = result {
+                assert!(permit.check().is_err(), "{error}");
+            }
+        }
     }
 }

@@ -276,11 +276,11 @@ struct Cli {
     #[arg(long = "color", default_value = "auto", global = true)]
     color: String,
 
-    /// Use NUL byte as filename separator (for xargs -0).
+    /// Follow each printed file path with a NUL byte (for xargs -0).
     #[arg(short = '0', long = "null", global = true)]
     null: bool,
 
-    /// Trim leading/trailing whitespace from each line.
+    /// Trim leading ASCII whitespace from each printed line.
     #[arg(long = "trim", global = true)]
     trim: bool,
 
@@ -1197,7 +1197,8 @@ impl Cli {
             stop_on_nonmatch: self.stop_on_nonmatch,
             column: self.column || self.vimgrep,
             byte_offset: self.byte_offset,
-            max_columns: self.max_columns,
+            // ripgrep treats `-M 0` as "no limit", not "omit every line".
+            max_columns: self.max_columns.filter(|&limit| limit > 0),
             max_columns_preview: self.max_columns_preview,
             count_matches: self.count_matches,
             include_zero: self.include_zero,
@@ -1580,28 +1581,14 @@ fn normalize_search_paths(paths: &[String]) -> Vec<SearchTarget> {
         }];
     }
 
+    // Arguments are used verbatim, as ripgrep does: whitespace and quote
+    // characters are legal in file names, and the shell has already removed
+    // any quoting the user typed.
     paths
         .iter()
-        .map(|path| {
-            let mut trimmed = path.trim();
-            loop {
-                let unquoted = trimmed
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .or_else(|| {
-                        trimmed
-                            .strip_prefix('\'')
-                            .and_then(|s| s.strip_suffix('\''))
-                    });
-                match unquoted {
-                    Some(inner) => trimmed = inner.trim(),
-                    None => break,
-                }
-            }
-            SearchTarget {
-                path: PathBuf::from(trimmed),
-                typed: trimmed.to_string(),
-            }
+        .map(|path| SearchTarget {
+            path: PathBuf::from(path),
+            typed: path.clone(),
         })
         .collect()
 }

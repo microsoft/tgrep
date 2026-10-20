@@ -12,6 +12,168 @@ V1 is deprecated as of tgrep 1.2.1 but remains supported; new integrations shoul
 use [managed v2](README.md#managed-shared-lifecycle-opt-in). The historical v1
 measurements and their pinned controls remain unchanged.
 
+## Multi-worktree large-repository benchmark
+
+[`scripts/benchmark_worktrees.py`](scripts/benchmark_worktrees.py) measures one
+managed v2 daemon serving a large repository (default `chromium/chromium`)
+and several linked worktrees: the ordinary `tgrep index` baseline, the cold
+base attachment (committed-tree generation build plus primary verification),
+`git worktree add`, attach-to-serving and attach-to-ready for every worktree,
+the content-verification phases after provisional serving, and per-query
+latency on the base index, the managed primary view and every worktree view.
+It checks result parity across clean targets, expected backends, and base
+generation reuse. Timed queries that exceed `--query-timeout` are recorded as
+failures; the remaining measurements are still reported.
+
+```bash
+cargo build --release -p tgrep-cli
+python -B scripts/benchmark_worktrees.py --bench-dir /tmp/tgrep-wt-bench \
+  --worktrees 4 --worktree-rev HEAD --worktree-rev HEAD --worktree-rev HEAD~1 \
+  --dirty-files 16 --repeat 3
+```
+
+The [Chromium worktree workflow](.github/workflows/benchmark-chromium-worktrees.yml)
+runs the same harness manually on a large runner.
+
+### Windows, Chromium @ 4ea1cdf4aa65 (issue #210 work)
+
+Host: Windows 11, 16 logical CPUs, 64 GiB; 510,793 tracked files;
+`--no-watch`, one namespace operation worker, warm file cache. Ordinary
+`tgrep index`: 258.5 s; its server answered queries after 6.7 s.
+
+The cold managed base attachment on the same host fell from 3,575 s (the
+pre-change build) to 838.8 s through this work:
+
+| Change | Base attach (s) |
+| --- | ---: |
+| Before (v1.2.3 sources) | 3,575 |
+| Batched catalog commits, `work_revision` bumped only on row changes, recovery backoff | 1,351.6 |
+| Windows parent-handle gate raised to 8,192 | 1,215.8 |
+| Binary-extension files no longer split verified-read batches | 838.8 |
+
+Worktree attachments, run sequentially against that daemon (four worktrees,
+three at the base commit, one at `HEAD~1`, the last with 16 dirty files):
+
+| View | `git worktree add` (s) | Attach to ready (s) | Base generation |
+| --- | ---: | ---: | --- |
+| Worktree 1 | 463.2 | 686.7 | reused |
+| Worktree 2 | 575.8 | 1,647.6 | reused |
+| Worktree 3 (`HEAD~1`) | 583.1 | 2,532.7 | new (1,213 s build) |
+| Worktree 4 (16 dirty) | 490.3 | 1,769.7 | reused |
+
+Every same-commit worktree reused the published generation (`blobs_read=0`)
+and still read every file once, because a first attachment always performs
+full content verification; private overlays stayed at 46-63 files. Storage
+grew from 4.49 GiB (base) to 8.99 GiB (two generations plus overlays).
+Later attachments were slower than the first because earlier views shared the
+same disk: per-view namespace catalog time rose from 433 s to 1,829-3,093 s.
+The idle scheduler pacing described in
+[SHARED_WORKTREE_INDEXES.md](SHARED_WORKTREE_INDEXES.md) reduces that
+contention from ready views; remaining cost is dominated by per-file open and
+verification I/O. Provisional first attach (below) takes that verification
+off the path to the first query.
+
+In that run, one timed `#include "base/` query on a worktree view exceeded
+the 600 s query timeout during round 3 while all other queries completed; the
+harness now records such failures per query instead of discarding the run.
+
+#### Query latency: base versus worktree views
+
+A second run (`--worktrees 2 --dirty-files 16 --repeat 2 --query-limit 12
+--query-timeout 900`) completed every timed query. The host was roughly 4-5x
+slower that day (file creation under an endpoint filter), so its attach times
+are not comparable with the table above: base 4,095.6 s, worktree attaches
+2,371.3 s and 2,883.7 s, still with full generation reuse.
+
+| Query (p50 ms, client wall) | Managed base | Worktree 1 | Worktree 2 (dirty) | Matches |
+| --- | ---: | ---: | ---: | ---: |
+| `blink::LocalFrame` | 4,238.3 | 4,224.0 | 4,229.8 | 659 |
+| `content::RenderFrameHost` | 5,818.4 | 5,873.3 | 5,959.5 | 10,694 |
+| `base::BindOnce` | 12,637.3 | 11,879.1 | 12,798.2 | 55,806 |
+| `GURL` | 15,884.2 | 15,998.5 | 15,804.6 | 162,396 |
+| Sum of 12 queries (client) | 107,030.6 | 108,067.3 | 107,286.5 | |
+| Sum of 12 queries (server-reported) | 53,047.7 | 53,389.3 | 55,665.7 | |
+
+Worktree views answer at the same cost as the base view (within 1% client,
+5% server): queries over a reused generation plus a private overlay do not
+pay a per-worktree penalty. Latency scales with match count and output
+volume; about half of client wall time is CLI startup, transfer and printing.
+The harness dirties only non-hidden tracked files, because default queries
+skip hidden paths such as `.agents/`.
+
+#### Provisional first attach: time to serving
+
+An eventual view's first attachment now publishes the pinned generation after
+the metadata walk and runs full content verification afterwards (see
+[SHARED_WORKTREE_INDEXES.md](SHARED_WORKTREE_INDEXES.md)). Same flags as the
+query run, on a host as fast as the first table's run (base ready 834.7 s
+versus 838.8 s):
+
+| View | Attach to serving (s) | Attach to ready (s) | Earlier run: attach to ready (s) |
+| --- | ---: | ---: | ---: |
+| Base (cold generation build) | 412.8 | 834.7 | 838.8 |
+| Worktree 1 | 37.0 | 744.5 | 686.7 |
+| Worktree 2 (16 dirty) | 50.4 | 1,061.6 | 1,647.6 (clean) |
+
+Before this change a view answered queries only once ready. Linked worktrees
+now serve after 37-50 s, about 20x sooner than they become ready. The base
+view serves after its 389 s generation build. The provisional
+publication serves 465,947 of 510,793 tracked paths from the base.
+Dirty and untracked contents are found once verification finishes. Candidate
+bytes are always read from disk, so provisional results never contain false
+positives. Time to ready is unchanged in kind:
+verification still reads every file (664.7 s and 952.8 s of content
+verification for the two worktrees), and namespace catalog work during
+verification (263 s and 625 s) is the next contention target. All parity,
+backend, generation-reuse and overlay-isolation checks passed; the dirty
+worktree's private overlay held 17 files.
+
+Query latency was again equal across views. The sums of the 12 p50 client
+wall times were 78.9 s, 79.1 s and 78.3 s for the base, worktree 1 and
+worktree 2. The server-reported sums were 53.1 s, 52.9 s and 52.4 s.
+
+#### Full validation for PR #211: ordinary versus managed
+
+`--worktrees 3 --worktree-rev HEAD --worktree-rev HEAD~1 --dirty-files 16
+--repeat 2 --query-limit 12 --query-timeout 900` (the third worktree is at
+`HEAD`), same host,
+release build of the provisional-attach sources. Heavy Rust test suites ran
+on the same machine during verification and the timed query rounds, so treat
+the later rows and the query table as a loaded-host measurement.
+
+| Step | Serving (s) | Ready (s) | Notes |
+| --- | ---: | ---: | --- |
+| Ordinary `tgrep index` / server | - | 273.2 / 6.5 | 2.76 GiB index |
+| Managed base (cold generation build) | 398.1 | 908.7 | 4.49 GiB storage |
+| Worktree 1 (`HEAD`) | 32.1 | 781.8 | generation reused, `blobs_read=0` |
+| Worktree 2 (`HEAD~1`) | 772.5 | 1,788.0 | new generation (731.8 s build) |
+| Worktree 3 (`HEAD`, 16 dirty, 1 untracked) | 93.2 | 4,577.7 | reused; 17-file private overlay |
+
+`git worktree add` took 444-454 s per worktree; storage after all attachments
+was 8.99 GiB. Worktree 3 served after 93 s but needed 4,409 s of content
+verification, with 7,219 s of namespace catalog time. Its verification
+competed with the test load and with the periodic full verification of the
+three views already ready: each rereads about 466,000 files every
+`--poll-interval`, about two cores of steady daemon work at this scale.
+Parity, generation-reuse and overlay-isolation checks passed. One ordinary
+round-0 query hit a connect timeout (`os error 10060`) under that load and
+fell back to the on-disk index, so the backend check failed.
+
+| p50 (ms) | Ordinary base | Managed base | Worktree 1 | Worktree 2 | Worktree 3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `blink::Document` (498 matches), client | 484.1 | 2,843.6 | 2,979.2 | 2,730.1 | 2,834.3 |
+| `blink::Document`, server | 188 | 593 | 582 | 579 | 600 |
+| `content::RenderFrameHost` (10,694), client | 1,110.5 | 4,197.5 | 4,429.2 | 4,405.3 | 5,061.8 |
+| Sum of 12 queries, client | 78,843.5 | 86,567.0 | 87,766.5 | 89,648.0 | 90,503.4 |
+| Sum of 12 queries, server | 68,817.5 | 55,406.9 | 55,630.6 | 58,478.1 | 57,383.2 |
+
+Worktree views again match the managed base. Against the ordinary server,
+managed views add about 2.2 s of client time per query beyond the server time
+(ordinary: about 0.3 s), and selective queries spend 2-3x longer in the
+server. Broad queries narrow that gap; total server time is lower for
+managed views. The fixed managed client and per-query server costs are the
+main remaining query-latency targets.
+
 ## Large-checkout reconciliation: RC2
 
 **A fresh managed attachment to an already published base took 186.144 seconds

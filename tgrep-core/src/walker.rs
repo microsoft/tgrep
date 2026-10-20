@@ -103,6 +103,21 @@ pub struct WalkResult {
     pub skipped_too_large: usize,
 }
 
+impl WalkResult {
+    /// Drop files without an [`index_key`], returning how many were dropped.
+    ///
+    /// Index builders call this so a native name is never stored under the
+    /// key of a different file.
+    pub fn retain_index_keys(&mut self, root: &Path) -> usize {
+        let representable =
+            |path: &PathBuf| path.strip_prefix(root).ok().and_then(index_key).is_some();
+        let before = self.listed_files.len();
+        self.files.retain(representable);
+        self.listed_files.retain(representable);
+        before - self.listed_files.len()
+    }
+}
+
 pub struct WalkOptions {
     pub include_hidden: bool,
     pub no_ignore: bool,
@@ -191,6 +206,36 @@ pub fn is_binary_extension(path: &Path) -> bool {
             let lower = ext.to_ascii_lowercase();
             BINARY_EXTENSIONS.iter().any(|&b| b == lower)
         })
+}
+
+/// The index key for a root-relative path: UTF-8 with `/` separators.
+///
+/// `None` when the native name has no exact key. A non-UTF-8 name would be
+/// rewritten by a lossy conversion, and on Unix `\` is an ordinary file-name
+/// byte, so translating it to `/` would name a different file. Such files stay
+/// out of indexes; `--no-index` scans still search them.
+pub fn index_key(relative: &Path) -> Option<String> {
+    let relative = relative.to_str()?;
+    if cfg!(windows) {
+        Some(relative.replace('\\', "/"))
+    } else if relative.contains('\\') {
+        None
+    } else {
+        Some(relative.to_owned())
+    }
+}
+
+/// A root-relative path for display and glob matching.
+///
+/// Only Windows treats `\` as a separator. Elsewhere the native name is kept,
+/// lossy only where it is not UTF-8, as ripgrep prints it.
+pub fn display_relative(relative: &Path) -> String {
+    let lossy = relative.to_string_lossy();
+    if cfg!(windows) {
+        lossy.replace('\\', "/")
+    } else {
+        lossy.into_owned()
+    }
 }
 
 /// Render a non-fatal ignore-file error for display.
@@ -490,9 +535,9 @@ fn record_visibility(
     if !crate::visibility::is_hidden(entry.path(), metadata.as_ref()) {
         return;
     }
-    if let Ok(relative) = entry.path().strip_prefix(root) {
+    if let Some(relative) = entry.path().strip_prefix(root).ok().and_then(index_key) {
         visibility.lock().unwrap().record(
-            &relative.to_string_lossy().replace('\\', "/"),
+            &relative,
             entry.file_type().is_some_and(|kind| kind.is_dir()),
             metadata.as_ref(),
             None,
@@ -584,6 +629,9 @@ pub struct MetaWalkResult {
     pub files: Vec<FileMeta>,
     /// Root-relative files admitted before binary extension filtering.
     pub listed_files: Vec<String>,
+    /// Sizes of listed binary-extension files absent from `files`, when the
+    /// walk observed them (size-capped or managed walks).
+    pub listed_sizes: Vec<(String, u64)>,
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
     pub visibility: crate::visibility::PathVisibility,
@@ -706,6 +754,7 @@ fn walk_metadata_inner(
     let max_file_size = opts.max_file_size;
     let results = std::sync::Mutex::new(Vec::new());
     let listed_files = std::sync::Mutex::new(Vec::new());
+    let listed_sizes = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
     let visibility = std::sync::Mutex::new(crate::visibility::PathVisibility::default());
@@ -789,6 +838,7 @@ fn walk_metadata_inner(
         let root = root.clone();
         let results = &results;
         let listed_files = &listed_files;
+        let listed_sizes = &listed_sizes;
         let gitignore_files = &gitignore_files;
         let ignore_files = &ignore_files;
         let visibility = &visibility;
@@ -873,18 +923,28 @@ fn walk_metadata_inner(
             let rel_path = relative.replace('\\', "/");
 
             if is_binary_extension(path) {
-                let too_large = match exceeds_size_limit(max_file_size, || {
-                    entry.metadata().map(|meta| meta.len())
-                }) {
-                    Ok(too_large) => too_large,
-                    Err(_) => {
-                        skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return ignore::WalkState::Continue;
+                // Managed reconciliation plans verification batches by size.
+                // An unknown size is charged a whole batch, which split large
+                // checkouts into one range per binary file.
+                let size = if max_file_size.is_some() || permit.is_some() {
+                    match entry.metadata() {
+                        Ok(meta) => Some(meta.len()),
+                        Err(_) if max_file_size.is_none() => None,
+                        Err(_) => {
+                            skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return ignore::WalkState::Continue;
+                        }
                     }
+                } else {
+                    None
                 };
-                if !too_large {
-                    listed_files.lock().unwrap().push(rel_path);
+                if max_file_size.is_some_and(|limit| size.is_some_and(|size| size > limit)) {
+                    return ignore::WalkState::Continue;
                 }
+                if let Some(size) = size {
+                    listed_sizes.lock().unwrap().push((rel_path.clone(), size));
+                }
+                listed_files.lock().unwrap().push(rel_path);
                 return ignore::WalkState::Continue;
             }
 
@@ -939,6 +999,7 @@ fn walk_metadata_inner(
         MetaWalkResult {
             files: results.into_inner().unwrap(),
             listed_files: listed_files.into_inner().unwrap(),
+            listed_sizes: listed_sizes.into_inner().unwrap(),
             gitignore_files,
             ignore_files,
             visibility,
@@ -969,6 +1030,35 @@ fn charge_walk_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_keys_never_rename_a_native_name() {
+        assert_eq!(index_key(Path::new("a/b.txt")).as_deref(), Some("a/b.txt"));
+        #[cfg(windows)]
+        {
+            assert_eq!(index_key(Path::new(r"a\b.txt")).as_deref(), Some("a/b.txt"));
+            assert_eq!(display_relative(Path::new(r"a\b.txt")), "a/b.txt");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(index_key(Path::new(r"a\b.txt")), None);
+            assert_eq!(display_relative(Path::new(r"a\b.txt")), r"a\b.txt");
+            let invalid = Path::new(std::ffi::OsStr::from_bytes(b"bad\xff.txt"));
+            assert_eq!(index_key(invalid), None);
+            assert_eq!(display_relative(invalid), "bad\u{FFFD}.txt");
+
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("a")).unwrap();
+            std::fs::write(dir.path().join("a/b.txt"), "x").unwrap();
+            std::fs::write(dir.path().join(r"a\b.txt"), "x").unwrap();
+            let mut walk = walk_dir(dir.path(), &WalkOptions::default());
+            assert_eq!(walk.files.len(), 2);
+            assert_eq!(walk.retain_index_keys(dir.path()), 1);
+            assert_eq!(walk.files, vec![dir.path().join("a/b.txt")]);
+            assert_eq!(walk.listed_files, walk.files);
+        }
+    }
 
     #[test]
     fn metadata_walk_reports_precise_same_second_versions() {

@@ -114,6 +114,17 @@ impl Fixture {
         Arc<crate::managed::WorkPermit>,
         WorktreeView,
     ) {
+        self.controlled_with_options(WorktreeOptions::default())
+    }
+
+    fn controlled_with_options(
+        &self,
+        options: WorktreeOptions,
+    ) -> (
+        Arc<crate::managed::Namespace>,
+        Arc<crate::managed::WorkPermit>,
+        WorktreeView,
+    ) {
         let namespace = crate::managed::Namespace::initialize(
             &Repository::discover(&self.root).unwrap(),
             &self.storage,
@@ -140,13 +151,8 @@ impl Fixture {
                 },
             )
             .unwrap();
-        let view = WorktreeView::new_controlled(
-            &self.root,
-            self.generation(),
-            WorktreeOptions::default(),
-            &permit,
-        )
-        .unwrap();
+        let view =
+            WorktreeView::new_controlled(&self.root, self.generation(), options, &permit).unwrap();
         (namespace, permit, view)
     }
 }
@@ -196,6 +202,34 @@ fn managed_batches_reuse_exact_contents_copies_and_overlay_postings() {
     assert_eq!(second.files_extracted, 0);
     assert_eq!(second.base_files_copied, 0);
     assert_scan_parity(&view, &["common", "private", "hidden", "changed"]);
+}
+
+#[test]
+fn provisional_base_serves_first_attach_before_full_content_verification() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"committed needle");
+    commit(&fixture.root);
+    write(&fixture.root, "file.txt", b"worktree changed");
+    let (_namespace, permit, view) = fixture.controlled_with_options(WorktreeOptions {
+        stale_reads: true,
+        ..WorktreeOptions::default()
+    });
+
+    let provisional = view.bootstrap_base_controlled(&permit).unwrap();
+    assert_eq!(provisional.files_read, 0);
+    assert_eq!(provisional.provisional_files, 1);
+    let status = view.status().unwrap();
+    assert!(!status.ready);
+    assert!(status.serving);
+    assert_eq!(candidates(&view, "committed"), ["file.txt"]);
+
+    let verified = view.refresh_controlled(&permit).unwrap();
+    assert!(verified.full);
+    assert_eq!(verified.files_read, 1);
+    assert_eq!(verified.provisional_files, 0);
+    assert!(view.status().unwrap().ready);
+    assert!(candidates(&view, "committed").is_empty());
+    assert_eq!(candidates(&view, "worktree"), ["file.txt"]);
 }
 
 #[test]
@@ -440,6 +474,32 @@ fn low_descriptor_limit_child() {
     assert!(stats.batches < 512);
     assert!(stats.peak_parent_handles <= crate::managed::work::RECONCILE_PARENT_HANDLES);
     assert!(managed.status().unwrap().ready);
+}
+
+#[test]
+fn managed_batches_are_not_split_by_binary_extension_files() {
+    let fixture = Fixture::new();
+    for index in 0..64 {
+        write(
+            &fixture.root,
+            &format!("assets/file{index:02}.txt"),
+            b"stable content\n",
+        );
+        write(
+            &fixture.root,
+            &format!("assets/image{index:02}.png"),
+            b"\x89PNG",
+        );
+    }
+    commit(&fixture.root);
+    let generation = fixture.generation();
+    let (_namespace, permit, managed) = fixture.controlled();
+    let stats = managed.refresh_controlled(&permit).unwrap();
+    assert_eq!(stats.files_discovered, 128);
+    // Unknown binary sizes used to be charged a whole batch each.
+    assert_eq!(stats.batches, 1);
+    assert!(managed.status().unwrap().ready);
+    drop(generation);
 }
 
 #[test]
@@ -1254,6 +1314,170 @@ fn epoch_change_after_preparation_prevents_stale_ready_publication() {
     assert!(view.refresh().unwrap().full);
     assert_eq!(matches(&view, "new"), ["file.txt"]);
     assert!(candidates(&view, "old").is_empty());
+}
+
+fn stale_view(root: &Path, generation: &Arc<Generation>) -> WorktreeView {
+    WorktreeView::new(
+        root,
+        generation.clone(),
+        WorktreeOptions {
+            stale_reads: true,
+            ..WorktreeOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn stale_reads_serve_published_state_and_keep_newer_hints_after_churn() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"old needle");
+    write(&fixture.root, "other.txt", b"other text");
+    commit(&fixture.root);
+    let view = stale_view(&fixture.root, &fixture.generation());
+    assert!(!view.status().unwrap().serving);
+    assert!(matches!(
+        view.with_snapshot(|_| ()),
+        Err(WorktreeError::NotReady)
+    ));
+    view.refresh().unwrap();
+    write(&fixture.root, "file.txt", b"mid needle");
+    view.invalidate_path(Path::new("file.txt")).unwrap();
+    let status = view.status().unwrap();
+    assert!(!status.ready);
+    assert!(status.serving);
+    assert_eq!(candidates(&view, "old"), ["file.txt"]);
+    let barrier = Barrier::new(2);
+    let stats = std::thread::scope(|scope| {
+        let task = scope.spawn(|| {
+            view.refresh_inner(
+                || {},
+                || {
+                    barrier.wait();
+                    barrier.wait();
+                },
+            )
+        });
+        barrier.wait();
+        assert!(view.status().unwrap().serving);
+        assert_eq!(candidates(&view, "old"), ["file.txt"]);
+        write(&fixture.root, "other.txt", b"other fresh");
+        view.invalidate_path(Path::new("other.txt")).unwrap();
+        barrier.wait();
+        task.join().unwrap().unwrap()
+    });
+    assert!(!stats.full);
+    let status = view.status().unwrap();
+    assert!(!status.ready);
+    assert!(status.serving);
+    assert!(!status.full_required);
+    assert_eq!(status.pending_paths, 1);
+    assert_eq!(status.published_epoch, Some(stats.epoch));
+    assert!(status.epoch > stats.epoch);
+    assert_eq!(matches(&view, "mid"), ["file.txt"]);
+    assert!(candidates(&view, "old").is_empty());
+    assert!(candidates(&view, "fresh").is_empty());
+    assert!(!view.refresh().unwrap().full);
+    assert!(view.status().unwrap().ready);
+    assert_eq!(matches(&view, "fresh"), ["other.txt"]);
+}
+
+#[test]
+fn stale_read_open_failures_queue_hints_instead_of_failing_queries() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"old needle");
+    write(&fixture.root, "keep.txt", b"keep needle");
+    commit(&fixture.root);
+    let view = stale_view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    fs::remove_file(fixture.root.join("file.txt")).unwrap();
+    let plan = query::build_query_plan("needle", false).unwrap();
+    let opened = view
+        .with_snapshot(|snapshot| {
+            snapshot
+                .candidates(&plan, "", true)
+                .into_iter()
+                .filter(|path| snapshot.open_file(path).is_ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert_eq!(opened, ["keep.txt"]);
+    let status = view.status().unwrap();
+    assert!(!status.ready);
+    assert!(status.serving);
+    assert!(!status.full_required);
+    assert_eq!(status.pending_paths, 1);
+    assert!(!view.refresh().unwrap().full);
+    assert!(view.status().unwrap().ready);
+    assert_eq!(matches(&view, "needle"), ["keep.txt"]);
+}
+
+#[test]
+fn stale_read_pass_failures_keep_serving_and_queue_full_repair() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"old needle");
+    commit(&fixture.root);
+    let view = stale_view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let error = view
+        .refresh_inner(
+            || fs::remove_file(fixture.root.join("file.txt")).unwrap(),
+            || {},
+        )
+        .unwrap_err();
+    assert!(matches!(error, WorktreeError::Io(_)));
+    let status = view.status().unwrap();
+    assert!(!status.ready);
+    assert!(status.serving);
+    assert!(status.full_required);
+    assert_eq!(candidates(&view, "old"), ["file.txt"]);
+    write(&fixture.root, "file.txt", b"new needle");
+    assert!(view.refresh().unwrap().full);
+    assert!(view.status().unwrap().ready);
+    assert_eq!(matches(&view, "new"), ["file.txt"]);
+}
+
+#[test]
+fn unchanged_file_requires_equal_trusted_evidence_and_hidden_status() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "file.txt", b"needle");
+    commit(&fixture.root);
+    let view = stale_view(&fixture.root, &fixture.generation());
+    let metadata = || fs::metadata(fixture.root.join("file.txt")).unwrap();
+    assert!(!view.unchanged_file(Path::new("file.txt"), &metadata()));
+    view.refresh().unwrap();
+    assert!(view.unchanged_file(Path::new("file.txt"), &metadata()));
+    assert!(!view.unchanged_file(Path::new("missing.txt"), &metadata()));
+    assert!(!view.unchanged_file(Path::new("../file.txt"), &metadata()));
+    let directory = fs::metadata(&fixture.root).unwrap();
+    assert!(!view.unchanged_file(Path::new("file.txt"), &directory));
+    write(&fixture.root, "file.txt", b"needle, longer");
+    assert!(!view.unchanged_file(Path::new("file.txt"), &metadata()));
+    view.invalidate_path(Path::new("file.txt")).unwrap();
+    view.refresh().unwrap();
+    assert!(view.unchanged_file(Path::new("file.txt"), &metadata()));
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+        let wide: Vec<_> = fixture
+            .root
+            .join("file.txt")
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // The NUL-terminated buffer remains live for the Win32 call.
+        assert_ne!(
+            unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) },
+            0
+        );
+        // Only an attribute changed, but it changes query visibility.
+        assert!(!view.unchanged_file(Path::new("file.txt"), &metadata()));
+        view.invalidate_path(Path::new("file.txt")).unwrap();
+        view.refresh().unwrap();
+        assert!(view.unchanged_file(Path::new("file.txt"), &metadata()));
+    }
 }
 
 #[test]

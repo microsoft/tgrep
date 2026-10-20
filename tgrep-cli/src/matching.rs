@@ -699,6 +699,11 @@ impl RegexEngine {
     }
 }
 
+/// ripgrep's default `--regex-size-limit`.
+pub const DEFAULT_REGEX_SIZE_LIMIT: usize = 100 * (1 << 20);
+/// ripgrep's default `--dfa-size-limit`.
+pub const DEFAULT_DFA_SIZE_LIMIT: usize = 1000 * (1 << 20);
+
 /// Everything that affects how the pattern itself is compiled.
 #[derive(Clone, Debug, Default)]
 pub struct MatcherConfig {
@@ -947,8 +952,8 @@ fn build_regex(
         .multi_line(cfg.multiline)
         .dot_matches_new_line(cfg.dotall)
         .unicode(!cfg.no_unicode)
-        .size_limit(cfg.regex_size_limit.unwrap_or(100 * (1 << 20)))
-        .dfa_size_limit(cfg.dfa_size_limit.unwrap_or(1000 * (1 << 20)))
+        .size_limit(cfg.regex_size_limit.unwrap_or(DEFAULT_REGEX_SIZE_LIMIT))
+        .dfa_size_limit(cfg.dfa_size_limit.unwrap_or(DEFAULT_DFA_SIZE_LIMIT))
         .nest_limit(250)
         .build()
 }
@@ -2204,6 +2209,8 @@ mod tests {
             r"[]a]n",
             r"[[:alpha:]]eedle(?!s)",
             r"\p{L}+(?=dle)",
+            // A dropped lookaround must not fuse its neighbours into a repeat.
+            r"Nee{(?=2)2}",
         ];
         let haystacks = [
             "",
@@ -2238,6 +2245,7 @@ mod tests {
             "3n",
             "Needle(?=a)",
             "\u{3b1}\u{3b2}dle",
+            "Nee{2}",
         ];
 
         for pattern in patterns {

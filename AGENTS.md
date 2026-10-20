@@ -101,17 +101,23 @@ Legacy/unmanaged v1 storage remains retain-all.
 Managed attachments use bounded parallel verified-read batches without raising
 namespace operation-worker limits. Inspect `last_reconcile.timings` and its
 read/reuse/resource counters to distinguish queueing, discovery, verification,
-catalog/control and checkpoint work. Healthy native managed views also get a
+catalog/control and checkpoint work. Managed views are eventually consistent:
+after their first publication they report `serving: true` and keep answering
+queries from the last published snapshot while later edits are reconciled, so
+results may lag recent edits. `ready: true` additionally means the view has
+caught up with every observed invalidation. Healthy native managed views also get a
 periodic full verification every `--poll-interval` seconds (default 120) while
 they keep serving. It rereads all admitted contents under the normal operation
-budgets, and closes readiness only when it finds a difference, then publishes
+budgets, and closes `ready` only when it finds a difference, then publishes
 the repair. A deadline or cancellation leaves the view ready but unverified
 (`last_verification.outcome` `failed`/`cancelled`) until the next interval, so
 results may lag missed changes by one interval plus verification time.
 `views.refresh` explicitly verifies all admitted contents; use `--no-index`
 when current disk bytes are required.
 `--watch-mode poll` and actual native-watcher failure/budget fallback instead
-close readiness for full verification after `--poll-interval` seconds.
+close `ready` for full verification after `--poll-interval` seconds.
+`watch_events` in status counts watcher input by kind, metadata-only
+notifications filtered as unchanged, invalidated paths and epoch advances.
 `reconciliation_policy` distinguishes configured mode from each view's effective
 polling and reports namespace monitor counts. First attachment/restore and
 reported watcher errors/rescans retain full verification. A clean Git status
@@ -230,10 +236,10 @@ tgrep --json -F -- "fn main" tgrep-cli/build.rs
 {"data":{"elapsed_total":{"human":"0.002651s","nanos":2651400,"secs":0},"stats":{"bytes_printed":260,"bytes_searched":1775,"elapsed":{"human":"0.002651s","nanos":2651400,"secs":0},"matched_lines":1,"matches":1,"searches":1,"searches_with_match":1}},"type":"summary"}
 ```
 
-Any parser written for `rg --json` works as is, with one exception: on a line
-that is not valid UTF-8, ripgrep emits base64 `lines.bytes`, while tgrep
-always emits `lines.text` with each bad byte replaced by U+FFFD. A consumer
-that depends on the raw bytes of such lines will see repaired text instead.
+Any parser written for `rg --json` works as is. As in ripgrep, `lines.text`
+keeps each line's own terminator (`\r\n` for CRLF files), and a line that is not
+valid UTF-8 is emitted as base64 `lines.bytes` with submatch offsets into those
+raw bytes. Paths are always `path.text`.
 
 `--vimgrep` gives `file:line:col:text`, one row per match, which is the
 easiest format to feed into a "jump to location" step.

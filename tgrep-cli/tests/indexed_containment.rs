@@ -197,6 +197,202 @@ fn local_index_streams_siblings_without_reading_through_a_replaced_parent() {
     assert_eq!(stdout.matches("needle first").count(), FIRST_LINES);
 }
 
+/// Keeps a file unreadable for other opens until dropped.
+struct ReadLock {
+    #[cfg(windows)]
+    _file: fs::File,
+    #[cfg(unix)]
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for ReadLock {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o644));
+    }
+}
+
+/// `None` when this process cannot take read access away (root ignores modes).
+fn deny_reads(path: &Path) -> Option<ReadLock> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap();
+        Some(ReadLock { _file: file })
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        let lock = ReadLock {
+            path: path.to_path_buf(),
+        };
+        fs::read(path).is_err().then_some(lock)
+    }
+}
+
+/// As in ripgrep, a file that exists but cannot be read is an error: other
+/// matches still print, but the search exits 2. A file deleted since the index
+/// was built is only a stale candidate and keeps the ordinary exit code.
+#[test]
+fn unreadable_files_exit_2_but_stale_index_entries_do_not() {
+    let fixture = Fixture::new();
+    let locked = fixture.root.join("nested/dir/file.txt");
+    let Some(lock) = deny_reads(&locked) else {
+        return;
+    };
+    for (args, mode) in [
+        (vec!["-F", "--", "needle"], "Query plan:"),
+        (vec!["--no-index", "-F", "--", "needle"], "Brute-force"),
+    ] {
+        let output = fixture.query(&fixture.root, &args);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stdout.contains("needle kept"), "{stdout}");
+        assert!(stderr.contains("cannot read"), "{stderr}");
+        assert!(stderr.contains(mode), "{args:?}: {stderr}");
+    }
+    drop(lock);
+
+    fs::remove_file(&locked).unwrap();
+    let output = fixture.query(&fixture.root, &["-F", "--", "needle"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("Query plan:"), "{stderr}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("needle kept")
+    );
+}
+
+/// On Unix `\` is an ordinary file-name byte. Translating it to `/` would store
+/// `a\b.txt` under the key of the unrelated `a/b.txt`, so indexes omit that
+/// name and only scans search it, printing it verbatim.
+#[cfg(unix)]
+#[test]
+fn unix_backslash_names_never_take_another_files_index_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::write(root.join("a/b.txt"), "plain words\n").unwrap();
+    fs::write(root.join(r"a\b.txt"), "needle hidden\n").unwrap();
+    let index = root.join(".tgrep");
+    builder::build_index(&root, Some(&index), true, false, &[]).unwrap();
+    let query = |args: &[&str]| {
+        let output = Command::cargo_bin("tgrep")
+            .unwrap()
+            .timeout(Duration::from_secs(30))
+            .current_dir(&root)
+            .arg("--index-path")
+            .arg(&index)
+            .args(args)
+            .arg(&root)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+
+    let (code, stdout, stderr) = query(&["--files"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let listed: Vec<_> = stdout.lines().collect();
+    assert_eq!(listed.len(), 1, "{stdout}");
+    assert!(listed[0].ends_with("a/b.txt"), "{stdout}");
+
+    let (code, stdout, stderr) = query(&["--stats", "-F", "--", "words"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("Query plan:"), "{stderr}");
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+
+    let (code, stdout, stderr) = query(&["--no-index", "-F", "--", "needle"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains(r"a\b.txt:needle hidden"), "{stdout}");
+
+    let (code, stdout, stderr) = query(&["--no-index", "--files"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains(r"a\b.txt"), "{stdout}");
+    assert!(stdout.contains("a/b.txt"), "{stdout}");
+}
+
+/// A server that died without removing `serve.json` leaves its port free for
+/// any other process. Its identity no longer answers there, so clients ignore
+/// the listener's replies and use the on-disk index instead.
+#[test]
+fn a_listener_without_the_recorded_server_identity_is_not_trusted() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::time::Instant;
+
+    let fixture = Fixture::new();
+    for reply_instance in [None, Some("someone-else")] {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        fs::write(
+            fixture.index.join("serve.json"),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "port": listener.local_addr().unwrap().port(),
+                "instance": "recorded-server",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let output = std::thread::scope(|scope| {
+            let impostor = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "client did not connect");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let mut reply = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"hidden_complete": true, "matches": [], "elapsed_ms": 1},
+                });
+                if let Some(instance) = reply_instance {
+                    reply["instance"] = instance.into();
+                }
+                writeln!(&stream, "{reply}").unwrap();
+            });
+            let output = fixture.query(&fixture.root, &["-F", "--", "needle"]);
+            impostor.join().unwrap();
+            output
+        });
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{reply_instance:?}: {stderr}"
+        );
+        assert!(stderr.contains("stale serve.json"), "{stderr}");
+        assert!(stderr.contains("Query plan:"), "{stderr}");
+        assert!(stdout.contains("needle kept"), "{stdout}");
+        assert!(stdout.contains("needle inside"), "{stdout}");
+    }
+}
+
 #[test]
 fn unavailable_relative_and_unrelated_metadata_roots_fall_back_to_scanning() {
     let fixture = Fixture::new();
@@ -323,6 +519,52 @@ fn index_and_serve_preserve_temporary_output_owned_by_another_writer() {
             .unwrap()
             .contains("Query plan:")
     );
+}
+
+/// Service managers, `kill` and container runtimes stop a server with
+/// SIGTERM. It must shut down like Ctrl-C and withdraw its `serve.json`.
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_server_and_withdraws_its_discovery_file() {
+    use std::time::Instant;
+
+    let fixture = Fixture::new();
+    let serve_json = fixture.index.join("serve.json");
+    let mut server = std::process::Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+        .current_dir(&fixture.root)
+        .args(["serve", ".", "--no-watch", "--index-path"])
+        .arg(&fixture.index)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !serve_json.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "server never published serve.json"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &server.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = server.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = server.kill();
+            panic!("server ignored SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(!serve_json.exists());
 }
 
 #[test]

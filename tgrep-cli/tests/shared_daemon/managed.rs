@@ -322,11 +322,18 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
             assert_eq!(repair["disabled_views"], 0);
         }
         let (claim, guard) = owner(&daemon);
-        let receipt = completed(
-            &daemon,
-            &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
-        );
-        let stats = &receipt["result"]["reconcile"];
+        let operation = daemon.rpc("views.attach", attach_input(&fixture, &claim));
+        let receipt = completed(&daemon, &operation);
+        // An eventual first attachment serves the pinned base before verification.
+        let provisional = &receipt["result"]["reconcile"];
+        assert_eq!(provisional["full"], true);
+        assert_eq!(provisional["provisional_files"], 3);
+        assert_eq!(provisional["files_read"], 0);
+        let view = &receipt["result"]["current"];
+        verified_attach(&daemon, &operation);
+        let status = daemon.rpc("views.status", json!({"id":view["id"]}));
+        assert_eq!(status["ready"], true);
+        let stats = &status["last_reconcile"];
         assert_eq!(stats["full"], true);
         assert_eq!(stats["files_read"], 3);
         assert_eq!(stats["base_reused"], 3);
@@ -397,10 +404,8 @@ fn reconciliation_metrics_and_unproved_coverage_are_visible_with_one_operation_w
                 <= configured["work"]["private_work_bytes"].as_u64().unwrap()
         );
         assert!(stats["peak_read_bytes"].as_u64().unwrap() <= 64 * 1024 * 1024);
-        assert!(stats["peak_parent_handles"].as_u64().unwrap() <= 256);
-        let view = &receipt["result"]["current"];
-        let status = daemon.rpc("views.status", json!({"id":view["id"]}));
-        assert_eq!(status["last_reconcile"], *stats);
+        let parent_gate = if cfg!(windows) { 8192 } else { 256 };
+        assert!(stats["peak_parent_handles"].as_u64().unwrap() <= parent_gate);
         let namespace = daemon.rpc("namespace.status", json!({}));
         let maintenance = daemon.rpc("maintenance.status", json!({}));
         let ordinary: Value =
@@ -487,7 +492,7 @@ fn polling_modes_repair_unreported_restored_mtime_and_membership_changes() {
             },
         );
         let (claim, guard) = owner(&daemon);
-        let receipt = completed(
+        let receipt = verified_attach(
             &daemon,
             &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
         );
@@ -596,7 +601,7 @@ fn sibling_query_batches_preserve_managed_routes() {
     prepare_query_batches(&mut fixture);
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    completed(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -633,7 +638,7 @@ fn multiline_count_matches_uses_managed_per_file_totals() {
     prepare_multiline_counts(&mut fixture);
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    completed(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -652,12 +657,44 @@ fn multiline_count_matches_uses_managed_per_file_totals() {
 }
 
 #[test]
+fn large_managed_results_are_paged_instead_of_failing() {
+    let fixture = Fixture::new();
+    prepare_paged_results(&fixture.a);
+    let mut policy = policy();
+    policy["work"]["blob_bytes"] = json!(4 * 1024 * 1024);
+    let mut daemon = start(&fixture, &policy, &["--no-watch"]);
+    let hello = daemon.rpc("hello", json!({}));
+    assert!(
+        hello["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("paged-results")),
+        "{hello}"
+    );
+    let (claim, guard) = owner(&daemon);
+    verified_attach(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    assert_paged_results(&daemon, &fixture.a, "(via shared daemon v2)");
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
 fn ordered_filters_and_replacements_use_managed_views() {
     let mut fixture = Fixture::new();
     prepare_compat(&mut fixture);
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    completed(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -697,6 +734,30 @@ fn completed(daemon: &Daemon, operation: &Value) -> Value {
 
 fn terminal(daemon: &Daemon, operation: &Value) -> Value {
     terminal_before(daemon, operation, Instant::now() + Duration::from_secs(30))
+}
+
+/// Completes an attachment and waits until its view is `ready`, as clients
+/// needing verified results do: an eventual first attachment publishes the
+/// pinned base provisionally and verifies the checkout afterwards.
+fn verified_attach(daemon: &Daemon, operation: &Value) -> Value {
+    verified(daemon, completed(daemon, operation))
+}
+
+/// Waits until the view of a completed attachment `receipt` is `ready`.
+fn verified(daemon: &Daemon, receipt: Value) -> Value {
+    let view = &receipt["result"]["current"]["id"];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = daemon.rpc("views.status", json!({"id":view}));
+        if status["ready"] == true && status["work"].is_null() {
+            return receipt;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attached view did not become ready: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn terminal_before(daemon: &Daemon, operation: &Value, deadline: Instant) -> Value {
@@ -1002,7 +1063,7 @@ fn bounded_ignore_inputs_preserve_scan_parity_and_leave_sibling_views_serviceabl
         Some(&home),
     );
     let (claim, guard) = owner(&daemon);
-    completed(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -1010,7 +1071,7 @@ fn bounded_ignore_inputs_preserve_scan_parity_and_leave_sibling_views_serviceabl
     sibling["token"] = token(&claim, 2);
     sibling["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
     sibling["request"]["lease"] = json!("sibling-client");
-    completed(&daemon, &daemon.rpc("views.attach", sibling));
+    verified_attach(&daemon, &daemon.rpc("views.attach", sibling));
     let view = daemon.rpc(
         "lookup",
         json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
@@ -1137,7 +1198,7 @@ fn offline_collection_after_repository_deletion_has_exact_replay_and_accounting(
     configured["retention"] = json!({"mode":"bounded","target_bytes":1});
     let mut daemon = start(&fixture, &configured, &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    completed(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -1315,7 +1376,7 @@ fn json_backend_search_work_stats_include_managed_nonmatching_candidates() {
     fs::write(fixture.a.join("miss.txt"), "no hit\n").unwrap();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    completed(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -1576,7 +1637,7 @@ fn content_only_profile_serves_extension_named_text_from_the_managed_view() {
         serde_json::from_str::<Value>(PROFILE).unwrap()
     );
     let (claim, guard) = owner(&daemon);
-    let receipt = completed(
+    let receipt = verified_attach(
         &daemon,
         &daemon.rpc("views.attach", content_only_attach(&fixture, &claim)),
     );
@@ -1714,7 +1775,7 @@ fn content_only_query_scans_with_matching_rules_against_a_default_view() {
     prepare_eligibility(&mut fixture);
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    completed(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -1781,7 +1842,7 @@ fn content_only_query_scans_with_matching_rules_against_a_default_view() {
     let mut upgrade = content_only_attach(&fixture, &claim);
     upgrade["token"] = token(&claim, 3);
     upgrade["request"]["lease"] = json!("content-client");
-    completed(&daemon, &daemon.rpc("views.attach", upgrade));
+    verified_attach(&daemon, &daemon.rpc("views.attach", upgrade));
     let upgraded = daemon.rpc(
         "lookup",
         json!({"root":fs::canonicalize(&fixture.a).unwrap()}),

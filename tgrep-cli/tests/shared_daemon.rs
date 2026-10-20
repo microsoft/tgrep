@@ -1133,7 +1133,9 @@ fn isolated_changes_candidate_masking_membership_and_scan_parity() {
         vec!["-o"],
         vec!["-t", "rust"],
         vec!["-g", "*.txt", "-g", "!ignored.txt"],
-        vec!["--hidden"],
+        // Indexed queries never include `.git`; a scan does, and on Windows
+        // the daemon's locked `.git/tgrep-daemon-v1.lock` is unreadable.
+        vec!["--hidden", "-g", "!.git"],
         vec!["--max-depth", "1"],
         vec!["-i"],
         vec!["-w"],
@@ -1151,7 +1153,13 @@ fn isolated_changes_candidate_masking_membership_and_scan_parity() {
         let mut scan = vec!["--no-index"];
         scan.extend(shared);
         let scanned = cli(&f.a, &scan);
-        assert_eq!(indexed.status.code(), scanned.status.code(), "{args:?}");
+        assert_eq!(
+            indexed.status.code(),
+            scanned.status.code(),
+            "{args:?}\nindexed: {}\nscanned: {}",
+            String::from_utf8_lossy(&indexed.stderr),
+            String::from_utf8_lossy(&scanned.stderr)
+        );
         assert_eq!(
             indexed.stdout,
             scanned.stdout,
@@ -3003,6 +3011,155 @@ fn oversized_single_file_response_errors_and_cli_scans_without_truncation() {
         "{stderr}"
     );
     assert_eq!(d.search(&f.a, "shared_term")["backend"], "shared-v1");
+}
+
+/// Twelve files whose escaped match rows total about 72 MiB, beyond one
+/// 64 MiB shared response, although each file fits comfortably in a page.
+fn prepare_paged_results(root: &Path) {
+    let root = root.join("paged");
+    fs::create_dir(&root).unwrap();
+    let line = format!("page_marker{}\r\nquiet\n", "\u{1}".repeat(1024 * 1024));
+    for index in 0..12 {
+        fs::write(root.join(format!("file-{index:02}.txt")), &line).unwrap();
+    }
+    let fidelity = root.parent().unwrap().join("fidelity");
+    fs::create_dir(&fidelity).unwrap();
+    fs::write(
+        fidelity.join("latin.txt"),
+        b"alpha\r\ncaf\xe9 needle\r\nok needle\n\xff\nneedle end",
+    )
+    .unwrap();
+}
+
+/// `begin`, `match` and `context` records of `--json` output; the others
+/// carry timings.
+fn json_records(stdout: &[u8]) -> Vec<Value> {
+    String::from_utf8(stdout.to_vec())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| ["begin", "match", "context"].contains(&record["type"].as_str().unwrap()))
+        .collect()
+}
+
+fn assert_paged_results(daemon: &Daemon, root: &Path, marker: &str) {
+    let view = daemon.lookup(root);
+    let mut params = json!({"root":root,"view":view["view"],"query":{
+        "pattern":"page_marker","detail":true,"positions":true,"glob":["paged/**"]
+    }});
+    if daemon.marker["protocol"] == 2 {
+        params["expected_version"] = view["version"].clone();
+    }
+    let response = daemon.try_rpc("search", params.clone()).unwrap();
+    assert!(
+        response.get("result").is_none(),
+        "unpaged request must fail"
+    );
+    params["query"]["page"] = Value::Null;
+    let mut files = Vec::new();
+    let mut pages = 0;
+    loop {
+        let raw = daemon
+            .raw_response(&daemon.request("search", params.clone()))
+            .unwrap();
+        assert!(raw.len() <= 64 * 1024 * 1024, "page: {} bytes", raw.len());
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        let result = rpc_data("search", &response, &daemon.marker);
+        assert_eq!(result["ready"], true);
+        pages += 1;
+        for row in result["matches"].as_array().unwrap() {
+            assert_eq!(row["type"], "match", "{}", row["file"]);
+            files.push(row["file"].as_str().unwrap().to_owned());
+        }
+        match result["next_page"].as_str() {
+            Some(next) => {
+                assert!(
+                    params["query"]["page"]
+                        .as_str()
+                        .is_none_or(|previous| previous < next)
+                );
+                params["query"]["page"] = json!(next);
+            }
+            None => {
+                assert!(result["next_page"].is_null(), "{}", result["next_page"]);
+                break;
+            }
+        }
+    }
+    assert!(pages > 1, "{pages} pages");
+    let expected: Vec<String> = (0..12)
+        .map(|index| format!("paged/file-{index:02}.txt"))
+        .collect();
+    assert_eq!(files, expected);
+
+    for flags in [vec![], vec!["-c"], vec!["-l"], vec!["-n", "--column"]] {
+        let mut args = vec!["--color", "never", "--path-separator", "/", "--stats"];
+        args.extend(flags);
+        args.extend(["--sort", "path", "--", "page_marker", "paged"]);
+        let shared = cli(root, &args);
+        let scanned = cli(root, &[&["--no-index"][..], &args].concat());
+        assert_eq!(shared.status.code(), Some(0), "{args:?}");
+        assert!(shared.stdout == scanned.stdout, "{marker} {args:?}");
+        let stderr = String::from_utf8_lossy(&shared.stderr);
+        assert!(stderr.contains(marker), "{args:?}: {stderr}");
+        assert!(!stderr.contains("warning:"), "{args:?}: {stderr}");
+    }
+    let quiet = cli(root, &["-q", "--", "page_marker", "paged"]);
+    assert_eq!(quiet.status.code(), Some(0));
+    assert!(quiet.stdout.is_empty() && quiet.stderr.is_empty());
+
+    for (pattern, path) in [("page_marker", "paged"), ("needle", "fidelity")] {
+        let args = [
+            "--json", "--stats", "-C", "1", "--sort", "path", "--", pattern, path,
+        ];
+        let shared = cli(root, &args);
+        let scanned = cli(root, &[&["--no-index"][..], &args[..]].concat());
+        assert_eq!(shared.status.code(), Some(0), "{args:?}");
+        let stderr = String::from_utf8_lossy(&shared.stderr);
+        assert!(stderr.contains(marker), "{args:?}: {stderr}");
+        assert!(!stderr.contains("warning:"), "{args:?}: {stderr}");
+        let records = json_records(&shared.stdout);
+        assert!(
+            records == json_records(&scanned.stdout),
+            "{marker} {args:?}"
+        );
+        let matches: Vec<&Value> = records
+            .iter()
+            .filter(|record| record["type"] == "match")
+            .map(|record| &record["data"]["lines"])
+            .collect();
+        if path == "paged" {
+            assert_eq!(matches.len(), 12);
+            assert!(
+                matches
+                    .iter()
+                    .all(|lines| { lines["text"].as_str().unwrap().ends_with("\r\n") })
+            );
+        } else {
+            assert_eq!(
+                matches,
+                [
+                    &json!({"bytes":"Y2Fm6SBuZWVkbGUNCg=="}),
+                    &json!({"text":"ok needle\n"}),
+                    &json!({"text":"needle end"}),
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn large_shared_results_are_paged_instead_of_failing() {
+    let f = Fixture::new();
+    prepare_paged_results(&f.a);
+    let d = f.start(&["--no-watch"]);
+    let lease = d.attach(&f.a, &f.revision);
+    assert_eq!(d.rpc("hello", json!({}))["paged_results"], true);
+    assert_paged_results(&d, &f.a, "(via shared daemon v1)");
+    d.rpc(
+        "detach",
+        json!({"root":f.a,"view":lease["view"],"lease":lease["lease"]}),
+    );
 }
 
 #[cfg(unix)]

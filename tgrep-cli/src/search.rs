@@ -3,7 +3,6 @@
 /// If a running server is detected (via serve.json), the search is delegated
 /// over TCP. Otherwise, the on-disk index is loaded directly.
 use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -584,13 +583,12 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
     let type_filter = opts.type_filter()?;
 
     if root.is_file() {
+        // As in ripgrep, a file named on the command line is listed even when
+        // `-g`/`-t` would have skipped it during a directory walk.
         let rel_path = explicit_file_display_path(&root);
-
-        if passes_filters(&rel_path, &glob_filter, &type_filter, true) {
-            let mut writer = OutputWriter::new(opts.make_output_config());
-            writer.write_file(&rel_path)?;
-            writer.flush()?;
-        }
+        let mut writer = OutputWriter::new(opts.make_output_config());
+        writer.write_file(&rel_path)?;
+        writer.flush()?;
         return Ok(());
     }
 
@@ -610,9 +608,10 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
             let (client, view) = crate::serve::shared::Client::registered(&root)?;
             let scope = IndexScope::resolve(&view.root, &root)
                 .ok_or_else(|| anyhow::anyhow!("search root outside shared worktree"))?;
-            let result = client.view_request(
+            let result = client.view_pages(
                 "files", &view,
                 serde_json::json!({"hidden":opts.hidden,"scope":scope.prefix(),"max_depth":opts.max_depth}),
+                |_| false,
             )?;
             let paths: Vec<String> = serde_json::from_value(
                 result
@@ -707,12 +706,10 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         ..opts.walk_options()
     };
     let walk = walker::walk_dir(&root, &walk_opts);
-    let paths = walk.files.iter().map(|path| {
-        path.strip_prefix(&root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/")
-    });
+    let paths = walk
+        .files
+        .iter()
+        .map(|path| walker::display_relative(path.strip_prefix(&root).unwrap_or(path)));
     write_indexed_file_paths(
         &root,
         &root,
@@ -847,13 +844,15 @@ fn write_indexed_file_paths(
     Ok(())
 }
 
+/// How long a client waits for a server's search or file-list answer.
+const SERVER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn list_files_via_server(
     info: &ServerInfo,
     scope: &IndexScope,
     opts: &SearchOptions,
 ) -> Result<Vec<String>> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
+    let mut stream = info.connect(SERVER_READ_TIMEOUT)?;
     writeln!(
         stream,
         "{}",
@@ -870,6 +869,7 @@ fn list_files_via_server(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let response: serde_json::Value = serde_json::from_str(&line)?;
+    info.verify_response(&response)?;
     if let Some(error) = response.get("error") {
         let message = error
             .get("message")
@@ -956,7 +956,13 @@ pub fn run(
                 let scope = IndexScope::resolve(&view.root, &root)
                     .ok_or_else(|| anyhow::anyhow!("search root outside shared worktree"))?;
                 let request = server_search_request(&scope, opts, ci)?;
-                let result = client.view_request("search", &view, request["params"].clone())?;
+                let result =
+                    client.view_pages("search", &view, request["params"].clone(), |result| {
+                        opts.quiet
+                            && !opts.stats
+                            && opts.max_depth.is_none()
+                            && quiet_answered(result)
+                    })?;
                 require_server_coverage(&result)?;
                 require_ordered_filters(&result, &request)?;
                 require_replace_support(&result, &request)?;
@@ -1052,6 +1058,10 @@ fn display_path(p: &Path) -> String {
 /// Kept separate from [`display_path`] because match output also needs it, and
 /// there the string has already been through `strip_prefix`/`to_string_lossy`.
 fn strip_verbatim_prefix(s: &str) -> String {
+    // Only Windows has verbatim paths; elsewhere `\\?\` is an ordinary name.
+    if !cfg!(windows) {
+        return s.to_string();
+    }
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
     } else if let Some(rest) = s.strip_prefix(r"\\?\") {
@@ -1094,8 +1104,7 @@ fn search_via_server(
     ci: bool,
     writer: &mut OutputWriter,
 ) -> Result<bool> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
+    let mut stream = info.connect(SERVER_READ_TIMEOUT)?;
     let request = server_search_request(scope, opts, ci)?;
     writeln!(stream, "{request}")?;
     stream.flush()?;
@@ -1103,6 +1112,7 @@ fn search_via_server(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let response: serde_json::Value = serde_json::from_str(&line)?;
+    info.verify_response(&response)?;
     if let Some(error) = response.get("error") {
         let msg = error
             .get("message")
@@ -1274,6 +1284,40 @@ fn require_ordered_filters(result: &serde_json::Value, request: &serde_json::Val
 
 fn flag_set(value: &serde_json::Value, key: &str) -> bool {
     value.get(key).and_then(|v| v.as_bool()) == Some(true)
+}
+
+fn server_spans(value: Option<&serde_json::Value>) -> Vec<(usize, usize)> {
+    value
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let p = p.as_array()?;
+                    Some((p.first()?.as_u64()? as usize, p.get(1)?.as_u64()? as usize))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether merged shared pages already contain a visible match for `-q`.
+/// Binary files may be hidden later, so their rows never answer it.
+fn quiet_answered(result: &serde_json::Value) -> bool {
+    let rows = result["matches"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let binary: std::collections::HashSet<&str> = rows
+        .iter()
+        .filter(|row| row["type"] == "binary")
+        .filter_map(|row| row["file"].as_str())
+        .collect();
+    rows.iter().any(|row| {
+        row.get("type").is_none_or(|kind| kind == "match")
+            && row["file"]
+                .as_str()
+                .is_some_and(|file| !binary.contains(file))
+    })
 }
 
 fn projected_line_count(row: &serde_json::Value) -> Result<(&str, usize)> {
@@ -1553,8 +1597,15 @@ fn render_server_result(
             let offset = m.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as usize;
             // `-M/--max-columns` counts the line terminator, which only the
             // server knows; an older server omits it and simply measures the
-            // visible text.
-            let terminator_len = m.get("term").and_then(|t| t.as_u64()).unwrap_or(0) as usize;
+            // visible text, and its JSON lines always ended in `\n`.
+            let terminator_len = m
+                .get("term")
+                .and_then(|t| t.as_u64())
+                .map_or(usize::from(opts.json), |t| t as usize);
+            let raw = m
+                .get("raw")
+                .and_then(|r| r.as_str())
+                .and_then(crate::output::base64_decode);
             if mtype == "context" {
                 writer.write_context_separator(file, line)?;
                 writer.write_context_line(&ContextLine {
@@ -1563,22 +1614,16 @@ fn render_server_result(
                     content: content.to_string(),
                     absolute_offset: offset,
                     terminator_len,
+                    raw,
                 })?;
             } else if mtype == "binary" {
                 writer.write_binary_note(file, offset)?;
             } else {
-                let spans = m
-                    .get("spans")
-                    .and_then(|s| s.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|p| {
-                                let p = p.as_array()?;
-                                Some((p.first()?.as_u64()? as usize, p.get(1)?.as_u64()? as usize))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let spans = server_spans(m.get("spans"));
+                let raw = raw.map(|bytes| crate::output::RawLine {
+                    bytes,
+                    spans: server_spans(m.get("raw_spans")),
+                });
                 // `-U --replace` rows carry the source lines of their block,
                 // which is what decides context gaps.
                 let block = m.get("block").and_then(|b| b.as_array()).and_then(|b| {
@@ -1609,6 +1654,7 @@ fn render_server_result(
                     block,
                     hidden: m.get("hidden").and_then(|h| h.as_bool()).unwrap_or(false),
                     replacements,
+                    raw,
                 })?;
             }
         }
@@ -1769,7 +1815,9 @@ fn search_local_index(
                 .then_some(())?;
             let rel = scope.relativize(indexed, root)?;
             within_max_depth(&rel, opts).then_some(())?;
-            passes_filters(&rel, &glob_filter, &type_filter, true).then_some(())?;
+            (matches!(scope, IndexScope::File(_))
+                || passes_filters(&rel, &glob_filter, &type_filter, true))
+            .then_some(())?;
             Some(rel)
         })
         .collect();
@@ -1794,6 +1842,9 @@ fn search_local_index(
             Ok(Some(read)) => read,
             Ok(None) => continue,
             Err(error) => {
+                if !is_skipped_indexed_read(&error) {
+                    crate::ERRORED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 if !opts.no_messages {
                     eprintln!("warning: cannot read indexed file {rel_path:?}: {error}");
                 }
@@ -1852,8 +1903,7 @@ impl IndexScope {
     /// `None` when `search_root` lies outside the indexed tree, which means the
     /// index cannot answer the search at all.
     fn resolve(index_root: &Path, search_root: &Path) -> Option<Self> {
-        let rel = search_root.strip_prefix(index_root).ok()?;
-        let rel = rel.to_string_lossy().replace('\\', "/");
+        let rel = walker::index_key(search_root.strip_prefix(index_root).ok()?)?;
         if rel.is_empty() {
             Some(Self::Whole)
         } else if search_root.is_file() {
@@ -1899,6 +1949,30 @@ fn resolve_scope(index_dir: &Path, root: &Path) -> Option<(PathBuf, IndexScope)>
     Some((index_root, scope))
 }
 
+/// An indexed candidate that cannot be read only because it disappeared since
+/// the last index update, or because a rooted open refused a link or a
+/// replaced ancestor, is a skipped file rather than a failed search. Anything
+/// else, such as a permission or device error, makes the search exit 2 as it
+/// would in ripgrep.
+fn is_skipped_indexed_read(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::NotFound
+            | ErrorKind::InvalidInput
+            | ErrorKind::NotADirectory
+            | ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    // `O_NOFOLLOW` reports a final symlink as ELOOP (EMLINK on FreeBSD).
+    #[cfg(unix)]
+    if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::EMLINK)) {
+        return true;
+    }
+    false
+}
+
 /// `true` when the path is shallow enough to keep under `--max-depth`.
 ///
 /// The walker applies this while descending; the indexed paths never went
@@ -1937,10 +2011,10 @@ fn brute_force_search(
     let mut had_matches = false;
 
     if root.is_file() {
+        // As in ripgrep, `-g`/`-t` only filter files found by a walk; a file
+        // named on the command line is always searched.
         let rel_path = explicit_file_display_path(root);
-        if passes_filters(&rel_path, &glob_filter, &type_filter, true)
-            && let Some(read) = read_text_lossy(root, opts.encoding, read_size_limit(opts, true))?
-        {
+        if let Some(read) = read_text_lossy(root, opts.encoding, read_size_limit(opts, true))? {
             had_matches = search_file(&read, &matcher, &rel_path, opts, writer, true)?;
         }
 
@@ -1974,11 +2048,7 @@ fn brute_force_search(
     }
 
     for path in &walk.files {
-        let rel_path = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel_path = walker::display_relative(path.strip_prefix(root).unwrap_or(path));
 
         if !passes_filters(&rel_path, &glob_filter, &type_filter, true) {
             continue;
@@ -1988,6 +2058,7 @@ fn brute_force_search(
             Ok(Some(read)) => read,
             Ok(None) => continue,
             Err(error) => {
+                crate::ERRORED.store(true, std::sync::atomic::Ordering::SeqCst);
                 if !opts.no_messages {
                     eprintln!("warning: cannot read file {}: {error}", path.display());
                 }
@@ -2297,6 +2368,36 @@ pub(crate) fn to_source_positions(
     (columns, offset)
 }
 
+/// The source bytes of one emitted line, for JSON, when lossy decoding
+/// repaired it. `absolute_offset` and `spans` are in decoded terms; the
+/// result's spans are source offsets relative to the line.
+pub(crate) fn raw_line(
+    text: &str,
+    fixups: &tgrep_core::encoding::LossyFixups,
+    content: &str,
+    absolute_offset: usize,
+    spans: &[(usize, usize)],
+) -> Option<crate::output::RawLine> {
+    if fixups.is_empty() {
+        return None;
+    }
+    let end = absolute_offset.checked_add(content.len())?;
+    if text.get(absolute_offset..end)? != content {
+        return None;
+    }
+    let bytes = fixups.source_bytes(text, absolute_offset, end)?;
+    let base = fixups.to_source_offset(absolute_offset);
+    let source = |at: usize| {
+        fixups
+            .to_source_offset(absolute_offset + at)
+            .saturating_sub(base)
+    };
+    Some(crate::output::RawLine {
+        bytes,
+        spans: spans.iter().map(|&(s, e)| (source(s), source(e))).collect(),
+    })
+}
+
 /// What happened to one file during a search.
 ///
 /// `Skipped` exists because ripgrep hides binary files found by traversal
@@ -2448,6 +2549,10 @@ fn search_decoded_file(
             } => {
                 // A rewritten block is a gap only if its source lines are.
                 writer.write_context_separator(rel_path, block.map_or(line_number, |b| b.0))?;
+                let raw = writer
+                    .is_json()
+                    .then(|| raw_line(text.as_str(), fixups, &content, absolute_offset, &spans))
+                    .flatten();
                 let (columns, absolute_offset) = to_source_positions(
                     &columns,
                     &column_shifts,
@@ -2467,6 +2572,7 @@ fn search_decoded_file(
                     block,
                     hidden,
                     replacements,
+                    raw,
                 })?;
             }
             crate::matching::Emit::Context {
@@ -2476,12 +2582,18 @@ fn search_decoded_file(
                 terminator_len,
             } => {
                 writer.write_context_separator(rel_path, line_number)?;
+                let raw = writer
+                    .is_json()
+                    .then(|| raw_line(text.as_str(), fixups, content, absolute_offset, &[]))
+                    .flatten()
+                    .map(|raw| raw.bytes);
                 writer.write_context_line(&ContextLine {
                     file: rel_path.to_string(),
                     line_number,
                     content: content.to_string(),
                     absolute_offset: fixups.to_source_offset(absolute_offset),
                     terminator_len,
+                    raw,
                 })?;
             }
         }
@@ -2507,7 +2619,12 @@ fn explicit_file_display_path(path: &Path) -> String {
         .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| path.to_path_buf());
 
-    strip_verbatim_prefix(&display_path.to_string_lossy()).replace('\\', "/")
+    let display_path = strip_verbatim_prefix(&display_path.to_string_lossy());
+    if cfg!(windows) {
+        display_path.replace('\\', "/")
+    } else {
+        display_path
+    }
 }
 
 /// Whether a path survives the glob and type filters. As in ripgrep, a glob
@@ -3899,6 +4016,7 @@ mod tests {
         assert!(!opts.wants_match_detail());
     }
 
+    #[cfg(windows)]
     #[test]
     fn display_path_strips_extended_length_prefix() {
         assert_eq!(
@@ -3907,12 +4025,22 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn display_path_restores_unc_paths() {
         // Naively stripping `\\?\` would leave a bogus `UNC\server\...` path.
         assert_eq!(
             display_path(Path::new(r"\\?\UNC\server\share\idx")),
             r"\\server\share\idx"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn display_path_keeps_unix_names_that_look_verbatim() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server")),
+            r"\\?\UNC\server"
         );
     }
 
@@ -3925,6 +4053,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn explicit_file_path_outside_cwd_is_editor_openable() {
         // A file outside the cwd keeps its absolute path, but must not leak
@@ -3935,11 +4064,21 @@ mod tests {
         assert!(!rendered.contains("//?/"), "got: {rendered}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn explicit_file_path_keeps_unc_shares_usable() {
         assert_eq!(
             explicit_file_display_path(Path::new(r"\\?\UNC\server\share\main.rs")),
             "//server/share/main.rs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_file_path_keeps_unix_backslashes() {
+        assert_eq!(
+            explicit_file_display_path(Path::new(r"/nonexistent-root/a\b.rs")),
+            r"/nonexistent-root/a\b.rs"
         );
     }
 }

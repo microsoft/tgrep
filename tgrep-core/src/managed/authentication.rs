@@ -7,9 +7,15 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const FORMAT: u32 = 1;
 pub(crate) const BLOCK_BYTES: usize = 4096;
-pub(crate) const PROOF_BATCH: usize = 64;
+// Each batch is one full-sync catalog transaction, so 4 MiB of producer output
+// per commit keeps proof recording off the critical path of large builds.
+pub(crate) const PROOF_BATCH: usize = 1024;
+// Reclamation keeps its smaller per-step bound so collection budgets are unchanged.
+pub(crate) const PROOF_RECLAIM_BATCH: usize = 64;
 pub(crate) const IO_BYTES: usize = 64 * 1024;
-pub(crate) const PRODUCER_MEMORY: u64 = (16 * 1024 + super::storage::SECURITY_BYTES) as u64;
+pub(crate) const PRODUCER_MEMORY: u64 = (16 * 1024
+    + PROOF_BATCH * std::mem::size_of::<Block>()
+    + super::storage::SECURITY_BYTES) as u64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

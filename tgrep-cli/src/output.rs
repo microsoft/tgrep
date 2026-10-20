@@ -579,7 +579,8 @@ impl OutputWriter {
         let heading_active = self.use_heading && !self.config.no_filename;
         if !heading_active && !self.config.no_filename {
             out.push_str(&self.display_path(file));
-            out.push_str(sep);
+            // ripgrep's `-0` terminates the path field with NUL in every mode.
+            out.push_str(if self.config.null { "\0" } else { sep });
         }
         if !self.config.no_line_number {
             if self.use_color {
@@ -682,11 +683,12 @@ impl OutputWriter {
                 // editors can step through every hit.
                 let rendered = self.highlight(&content, &spans);
                 let file = self.display_path(&m.file);
+                let sep = if self.config.null { "\0" } else { ":" };
                 if m.columns.is_empty() {
-                    writeln!(self.stdout, "{file}:{}:1:{rendered}", m.line_number)?;
+                    writeln!(self.stdout, "{file}{sep}{}:1:{rendered}", m.line_number)?;
                 } else {
                     for col in &m.columns {
-                        writeln!(self.stdout, "{file}:{}:{col}:{rendered}", m.line_number)?;
+                        writeln!(self.stdout, "{file}{sep}{}:{col}:{rendered}", m.line_number)?;
                     }
                 }
             }
@@ -778,7 +780,11 @@ impl OutputWriter {
             writeln!(self.stdout, "{count}")?;
         } else {
             let file = self.display_path(file);
-            let sep = &self.config.field_match_separator;
+            let sep = if self.config.null {
+                "\0"
+            } else {
+                &self.config.field_match_separator
+            };
             writeln!(self.stdout, "{file}{sep}{count}")?;
         }
         self.maybe_flush()
@@ -860,10 +866,12 @@ impl OutputWriter {
                 writeln!(self.stdout)?;
             }
             let shown = self.display_path(file);
+            // With `-0` ripgrep ends the heading with NUL instead of a newline.
+            let end = if self.config.null { "\0" } else { "\n" };
             if self.use_color {
-                writeln!(self.stdout, "\x1b[35m{shown}\x1b[0m")?;
+                write!(self.stdout, "\x1b[35m{shown}\x1b[0m{end}")?;
             } else {
-                writeln!(self.stdout, "{shown}")?;
+                write!(self.stdout, "{shown}{end}")?;
             }
             self.printed_any = true;
             self.current_file = Some(file.to_string());
@@ -889,11 +897,11 @@ impl OutputWriter {
         s: &'a str,
         spans: &[(usize, usize)],
     ) -> (&'a str, Vec<IndexedSpan>) {
-        if !self.config.trim {
+        if !self.trims() {
             return (s, spans.iter().copied().enumerate().collect());
         }
-        let trimmed = s.trim();
-        let delta = s.len() - s.trim_start().len();
+        let delta = leading_ascii_whitespace(s);
+        let trimmed = &s[delta..];
         let adjusted = spans
             .iter()
             .enumerate()
@@ -906,10 +914,16 @@ impl OutputWriter {
         (trimmed, adjusted)
     }
 
+    /// Whether `--trim` applies. ripgrep's JSON printer reports lines as they
+    /// are, so offsets keep indexing the source line.
+    fn trims(&self) -> bool {
+        self.config.trim && !self.is_json()
+    }
+
     /// Apply `--trim` to a line's source bytes as
     /// [`trim_adjust_indexed`](Self::trim_adjust_indexed) trims its text,
-    /// keeping the spans at `kept`. Trimmed whitespace is valid UTF-8, so it
-    /// has the same length in both.
+    /// keeping the spans at `kept`. Trimmed whitespace is ASCII, so it has
+    /// the same length in both.
     fn trim_raw(
         &self,
         content: &str,
@@ -917,15 +931,12 @@ impl OutputWriter {
         spans: &[(usize, usize)],
         kept: &[usize],
     ) -> (Vec<u8>, Vec<(usize, usize)>) {
-        let (lead, trail) = if self.config.trim {
-            let lead = content.len() - content.trim_start().len();
-            (lead, content.len() - lead - content.trim().len())
+        let lead = if self.trims() {
+            leading_ascii_whitespace(content).min(raw.len())
         } else {
-            (0, 0)
+            0
         };
-        let lead = lead.min(raw.len());
-        let end = raw.len().saturating_sub(trail).max(lead);
-        let bytes = raw[lead..end].to_vec();
+        let bytes = raw[lead..].to_vec();
         let spans = kept
             .iter()
             .map(|&i| {
@@ -936,6 +947,14 @@ impl OutputWriter {
             .collect();
         (bytes, spans)
     }
+}
+
+/// Length of the leading ASCII whitespace that ripgrep's `--trim` removes.
+/// The `\n` line terminator is never part of it, and Unicode spaces stay.
+fn leading_ascii_whitespace(s: &str) -> usize {
+    s.bytes()
+        .take_while(|b| matches!(b, b'\t' | b'\x0B' | b'\x0C' | b'\r' | b' '))
+        .count()
 }
 
 /// A JSON data object: `text` when the data is UTF-8, otherwise base64

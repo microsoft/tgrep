@@ -186,14 +186,49 @@ impl RefreshControl {
 pub struct ServerInfo {
     pub pid: u32,
     pub port: u16,
+    /// Random identity of the server process that wrote this file. Every
+    /// response carries it, so a client can tell its server apart from an
+    /// unrelated listener that reused the port of a server that died without
+    /// removing `serve.json`. Absent in files written by older servers, whose
+    /// responses are then accepted unverified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
 }
 
+/// How long a client waits for the loopback connection to a server.
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a client waits to hand its request to a server.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl ServerInfo {
+    pub(crate) fn new(port: u16) -> Result<Self> {
+        let instance = tgrep_core::managed::Id::new()
+            .map_err(|error| anyhow::anyhow!("could not generate server identity: {error}"))?;
+        Ok(Self {
+            pid: std::process::id(),
+            port,
+            instance: Some(instance.as_str().to_string()),
+        })
+    }
+
+    /// Publish atomically: a client never reads a truncated file, and a
+    /// crash leaves either the old file or the new one.
     pub fn save(&self, index_dir: &Path) -> Result<()> {
         let path = index_dir.join("serve.json");
+        let staged = index_dir.join(format!("serve.json.{}.tmp", std::process::id()));
         let json = serde_json::to_string(self)?;
-        std::fs::write(path, json)?;
-        Ok(())
+        let result = (|| -> std::io::Result<()> {
+            let mut file = File::create(&staged)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&staged, &path)?;
+            sync_parent_dir(&path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        Ok(result?)
     }
 
     pub fn load(index_dir: &Path) -> Result<Self> {
@@ -205,6 +240,31 @@ impl ServerInfo {
 
     pub fn cleanup(index_dir: &Path) {
         let _ = std::fs::remove_file(index_dir.join("serve.json"));
+    }
+
+    /// Connect with bounded connect and write timeouts; a dead or wedged
+    /// server must degrade to the local index instead of hanging the client.
+    pub fn connect(&self, read_timeout: Duration) -> Result<TcpStream> {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
+        let stream = TcpStream::connect_timeout(&address, CLIENT_CONNECT_TIMEOUT)?;
+        stream.set_read_timeout(Some(read_timeout))?;
+        stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT))?;
+        Ok(stream)
+    }
+
+    /// Reject a response from a listener that is not the server that wrote
+    /// this `serve.json`.
+    pub fn verify_response(&self, response: &serde_json::Value) -> Result<()> {
+        let Some(expected) = &self.instance else {
+            return Ok(());
+        };
+        let actual = response.get("instance").and_then(|value| value.as_str());
+        anyhow::ensure!(
+            actual == Some(expected.as_str()),
+            "stale serve.json: port {} is not served by tgrep server {expected}",
+            self.port
+        );
+        Ok(())
     }
 }
 
@@ -1007,12 +1067,19 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
 
+    // Handle shutdown signals before advertising the server, so a signal can
+    // never strand the `serve.json` written below.
+    let shutdown_index_dir = index_dir.clone();
+    ctrlc_handler(move || {
+        eprintln!("\n[trace] shutting down...");
+        ServerInfo::cleanup(&shutdown_index_dir);
+        std::process::exit(0);
+    });
+
     // Write server info
-    let info = ServerInfo {
-        pid: std::process::id(),
-        port,
-    };
+    let info = ServerInfo::new(port)?;
     info.save(&index_dir)?;
+    let instance: Arc<str> = Arc::from(info.instance.as_deref().unwrap_or_default());
 
     eprintln!(
         "[trace] serve ready in {:.1}ms. TCP on port {}. Cache: max {} entries / {} MiB \
@@ -1074,14 +1141,6 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         start_file_watcher(watcher_state, &watcher_root, watcher_queue_cap);
     }
 
-    // Set up graceful shutdown
-    let shutdown_index_dir = index_dir.clone();
-    ctrlc_handler(move || {
-        eprintln!("\n[trace] shutting down...");
-        ServerInfo::cleanup(&shutdown_index_dir);
-        std::process::exit(0);
-    });
-
     // Start auto-save thread
     let save_state = Arc::clone(&state);
     thread::spawn(move || auto_save_loop(save_state));
@@ -1099,22 +1158,80 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         });
     }
 
-    // Accept connections
+    // Accept connections. Each is served on its own thread, but only up to
+    // `MAX_CONNECTIONS` at once: past that the accept loop waits for a slot,
+    // and further clients queue in the listen backlog rather than each
+    // costing the server a thread and a search's worth of memory.
+    let slots = Arc::new(ConnectionSlots::new(MAX_CONNECTIONS));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let slot = slots.acquire();
                 let state = Arc::clone(&state);
-                thread::spawn(move || {
-                    if let Err(e) = handle_connection(stream, &state) {
-                        eprintln!("[trace] connection error: {e}");
-                    }
-                });
+                let instance = Arc::clone(&instance);
+                let spawned = thread::Builder::new()
+                    .name("tgrep-connection".to_string())
+                    .spawn(move || {
+                        let _slot = slot;
+                        if let Err(e) = handle_connection(stream, &state, &instance) {
+                            eprintln!("[trace] connection error: {e}");
+                        }
+                    });
+                // A failed spawn drops the closure, which closes the stream
+                // and releases its slot.
+                if let Err(e) = spawned {
+                    eprintln!("[trace] could not start a connection thread: {e}");
+                }
             }
             Err(e) => eprintln!("[trace] accept error: {e}"),
         }
     }
 
     Ok(())
+}
+
+/// Upper bound on concurrently served client connections.
+const MAX_CONNECTIONS: usize = 32;
+/// A client that sends nothing for this long is disconnected, releasing its
+/// connection slot. Every client sends its request immediately.
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A client that stops reading its response for this long is disconnected.
+const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A counting semaphore for client connections.
+struct ConnectionSlots {
+    active: Mutex<usize>,
+    freed: std::sync::Condvar,
+    limit: usize,
+}
+
+impl ConnectionSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            active: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+            limit: limit.max(1),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> ConnectionSlot {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        while *active >= self.limit {
+            active = self.freed.wait(active).unwrap_or_else(|e| e.into_inner());
+        }
+        *active += 1;
+        ConnectionSlot(Arc::clone(self))
+    }
+}
+
+struct ConnectionSlot(Arc<ConnectionSlots>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let mut active = self.0.active.lock().unwrap_or_else(|e| e.into_inner());
+        *active -= 1;
+        self.0.freed.notify_one();
+    }
 }
 
 #[derive(Default)]
@@ -1570,17 +1687,52 @@ mod read_bounded_line_tests {
     }
 }
 
-fn handle_connection(stream: TcpStream, state: &Arc<ServerState>) -> Result<()> {
+fn handle_connection(stream: TcpStream, state: &Arc<ServerState>, instance: &str) -> Result<()> {
+    stream.set_read_timeout(Some(CONNECTION_IDLE_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
-    while let Some(line) = read_bounded_line(&mut reader)? {
+    loop {
+        let line = match read_bounded_line(&mut reader) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            // An idle client is closed quietly; it was told nothing it missed.
+            Err(error) if is_timeout(&error) => break,
+            Err(error) => return Err(error),
+        };
         let response = process_request(&line, state);
-        writeln!(writer, "{response}")?;
+        writeln!(writer, "{}", with_instance(&response, instance))?;
         writer.flush()?;
     }
 
     Ok(())
+}
+
+fn is_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        )
+    })
+}
+
+/// Stamp a JSON-RPC response object with this server's identity, so a client
+/// can reject a listener that merely reused a dead server's port.
+fn with_instance<'a>(response: &'a str, instance: &str) -> std::borrow::Cow<'a, str> {
+    let Some(rest) = response.strip_prefix('{') else {
+        return response.into();
+    };
+    if instance.is_empty() {
+        return response.into();
+    }
+    let instance = serde_json::Value::String(instance.to_string());
+    if rest.trim_start().starts_with('}') {
+        format!("{{\"instance\":{instance}{rest}").into()
+    } else {
+        format!("{{\"instance\":{instance},{rest}").into()
+    }
 }
 
 fn process_request(request: &str, state: &Arc<ServerState>) -> String {
@@ -1822,17 +1974,27 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             .unwrap_or("auto"),
     )
     .ok_or_else(|| "unrecognized regex engine".to_string())?;
-    // Saturate rather than truncate: these arrive from a client that already
-    // rejected values too large for its own `usize`, so this only guards
-    // against a malformed request applying a silently smaller limit.
+    // Saturate rather than truncate, and never exceed ripgrep's defaults: the
+    // server compiles on behalf of every client, so one request must not be
+    // able to make it build an arbitrarily large program. A client that needs
+    // more gets a compile error here and falls back to searching locally with
+    // its own limits.
     let regex_size_limit = params
         .get("regex_size_limit")
         .and_then(|v| v.as_u64())
-        .map(|v| usize::try_from(v).unwrap_or(usize::MAX));
+        .map(|v| {
+            usize::try_from(v)
+                .unwrap_or(usize::MAX)
+                .min(crate::matching::DEFAULT_REGEX_SIZE_LIMIT)
+        });
     let dfa_size_limit = params
         .get("dfa_size_limit")
         .and_then(|v| v.as_u64())
-        .map(|v| usize::try_from(v).unwrap_or(usize::MAX));
+        .map(|v| {
+            usize::try_from(v)
+                .unwrap_or(usize::MAX)
+                .min(crate::matching::DEFAULT_DFA_SIZE_LIMIT)
+        });
     let replace = params
         .get("replace")
         .and_then(|v| v.as_str())
@@ -1964,6 +2126,11 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
     })
 }
 
+/// Candidates resolved and searched together. Bounds the decoded contents a
+/// single broad query holds at once, while keeping enough files per batch to
+/// occupy every search thread.
+const SEARCH_CHUNK_FILES: usize = 2048;
+
 fn handle_search(
     id: Option<serde_json::Value>,
     params: &serde_json::Value,
@@ -2094,7 +2261,6 @@ fn handle_search(
     // Resolve file contents from cache (LRU) or disk.
     // Two-phase approach: read-lock for cache hits, then disk I/O outside the
     // lock, then a single write-lock to promote hits and insert misses.
-    let t_resolve = Instant::now();
     let read_candidate = |path: &Path| {
         let read = (|| -> std::io::Result<Option<Vec<u8>>> {
             let mut file = open_within_root(state, path)?;
@@ -2125,30 +2291,32 @@ fn handle_search(
             }
         }
     };
-    let candidate_contents: Vec<(String, Arc<DecodedFile>)> = if encoding.may_differ_from_index() {
-        // The cache holds text decoded with the default (BOM-sniffing) rules and
-        // is shared by every client. A request that asked for a different
-        // `--encoding` must neither read those entries nor write its own, or one
-        // client's `-E sjis` would silently change what the next client sees.
-        candidate_info
-            .iter()
-            .filter_map(|(rel_path, full_path)| {
-                let bytes = read_candidate(full_path)?;
-                Some((
-                    rel_path.clone(),
-                    Arc::new(DecodedFile::new(bytes, encoding)),
-                ))
-            })
-            .collect()
-    } else {
+    let resolve_chunk = |chunk: &[(String, PathBuf)]| -> Vec<(String, Arc<DecodedFile>)> {
+        if encoding.may_differ_from_index() {
+            // The cache holds text decoded with the default (BOM-sniffing)
+            // rules and is shared by every client. A request that asked for a
+            // different `--encoding` must neither read those entries nor write
+            // its own, or one client's `-E sjis` would silently change what
+            // the next client sees.
+            return chunk
+                .iter()
+                .filter_map(|(rel_path, full_path)| {
+                    let bytes = read_candidate(full_path)?;
+                    Some((
+                        rel_path.clone(),
+                        Arc::new(DecodedFile::new(bytes, encoding)),
+                    ))
+                })
+                .collect();
+        }
         let cache_generation = state.cache_generation.load(Ordering::SeqCst);
         // Phase 1: read-lock to find cache hits (peek avoids write-lock need)
         let mut hit_keys: Vec<String> = Vec::new();
-        let mut hits: Vec<(String, Arc<DecodedFile>)> = Vec::with_capacity(candidate_info.len());
+        let mut hits: Vec<(String, Arc<DecodedFile>)> = Vec::with_capacity(chunk.len());
         let mut misses: Vec<(String, PathBuf)> = Vec::new();
         {
             let cache = state.cache.read().unwrap();
-            for (rel_path, full_path) in &candidate_info {
+            for (rel_path, full_path) in chunk {
                 if let Some(cached) = cache.peek(rel_path).filter(|cached| {
                     opts.max_filesize
                         .is_none_or(|limit| cached.source_bytes <= limit)
@@ -2188,7 +2356,7 @@ fn handle_search(
         for (rel_path, content) in &disk_results {
             result_map.insert(rel_path, Arc::clone(content));
         }
-        candidate_info
+        chunk
             .iter()
             .filter_map(|(rel_path, _)| {
                 result_map
@@ -2197,30 +2365,70 @@ fn handle_search(
             })
             .collect()
     };
-    let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
 
-    // Parallel regex matching across candidate files
-    let t_search = Instant::now();
-    let per_file: std::result::Result<Vec<FileSearchResult>, String> = candidate_contents
-        .par_iter()
-        .map(|(rel_path, content)| {
-            search_file_matches(rel_path, content, &matcher, &opts).map_err(|e| format!("{e}"))
-        })
-        .collect();
-    let per_file = match per_file {
-        Ok(per_file) => per_file,
-        Err(e) => return json_rpc_error(id, -32603, &e),
-    };
+    // Resolve and search in bounded chunks, in candidate order, so a broad
+    // query over a large tree never holds every candidate's decoded contents
+    // at once. Every row is charged against one response budget shared by the
+    // parallel workers; a reply that would exceed it fails, and the client
+    // falls back to its local index rather than the server buffering an
+    // unbounded response.
+    let remaining = std::sync::atomic::AtomicUsize::new(tgrep_core::managed::MAX_RESPONSE_BYTES);
+    let mut resolve_time = Duration::ZERO;
+    let mut search_time = Duration::ZERO;
     let mut matches = Vec::new();
     let mut file_stats = Vec::new();
     let mut search_stats = Vec::new();
-    for file in per_file {
-        matches.extend(file.rows);
-        file_stats.extend(file.stats);
-        search_stats.extend(file.search_stats);
-    }
+    for chunk in candidate_info.chunks(SEARCH_CHUNK_FILES) {
+        let t_resolve = Instant::now();
+        let candidate_contents = resolve_chunk(chunk);
+        resolve_time += t_resolve.elapsed();
 
-    let search_ms = t_search.elapsed().as_secs_f64() * 1000.0;
+        // Parallel regex matching across candidate files
+        let t_search = Instant::now();
+        let per_file: anyhow::Result<Vec<FileSearchResult>> = candidate_contents
+            .par_iter()
+            .map(|(rel_path, content)| {
+                let cap = remaining.load(Ordering::Acquire);
+                let mut budget = JsonBudget { remaining: cap };
+                let found = search_file_matches_bounded(
+                    rel_path,
+                    content,
+                    &matcher,
+                    &opts,
+                    Some(&mut budget),
+                )?;
+                let used = cap - budget.remaining;
+                let mut left = remaining.load(Ordering::Acquire);
+                loop {
+                    let next = left
+                        .checked_sub(used)
+                        .ok_or_else(|| anyhow::Error::from(ResponseLimit))?;
+                    match remaining.compare_exchange_weak(
+                        left,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => left = actual,
+                    }
+                }
+                Ok(found)
+            })
+            .collect();
+        search_time += t_search.elapsed();
+        let per_file = match per_file {
+            Ok(per_file) => per_file,
+            Err(e) => return json_rpc_error(id, -32603, &format!("{e}")),
+        };
+        for file in per_file {
+            matches.extend(file.rows);
+            file_stats.extend(file.stats);
+            search_stats.extend(file.search_stats);
+        }
+    }
+    let resolve_ms = resolve_time.as_secs_f64() * 1000.0;
+    let search_ms = search_time.as_secs_f64() * 1000.0;
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 
@@ -2326,7 +2534,7 @@ pub(crate) struct ResponseLimit;
 
 impl std::fmt::Display for ResponseLimit {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("shared response exceeds 64 MiB; narrow the query or scan")
+        formatter.write_str("response exceeds 64 MiB; narrow the query or scan")
     }
 }
 
@@ -2384,6 +2592,7 @@ fn push_row(
     Ok(())
 }
 
+#[cfg(test)]
 fn search_file_matches(
     rel_path: &str,
     file: &DecodedFile,
@@ -3044,6 +3253,31 @@ fn receive_watcher_burst(
     }
 }
 
+/// How long a watcher overflow may wait for an idle interval before it is
+/// repaired anyway.
+const WATCHER_OVERFLOW_RECOVERY_DELAY: Duration = Duration::from_secs(10);
+
+/// Schedules overflow repair while events keep arriving.
+#[derive(Default)]
+struct OverflowRecovery {
+    since: Option<Instant>,
+}
+
+impl OverflowRecovery {
+    fn due_under_load(&mut self, overflowed: bool, now: Instant) -> bool {
+        if !overflowed {
+            self.since = None;
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now.saturating_duration_since(since) >= WATCHER_OVERFLOW_RECOVERY_DELAY
+    }
+
+    fn recovered(&mut self) {
+        self.since = None;
+    }
+}
+
 fn recover_watcher_overflow(
     state: &Arc<ServerState>,
     root: &Path,
@@ -3290,6 +3524,7 @@ fn start_file_watcher_using(
         .spawn(move || {
             let mut last_tracked_index_poll = Instant::now();
             let mut pending_event = None;
+            let mut overflow_recovery = OverflowRecovery::default();
             loop {
                 if !native_watching(&worker_state) {
                     stop_native_watcher(&worker_state);
@@ -3322,9 +3557,26 @@ fn start_file_watcher_using(
                         if disconnected {
                             break;
                         }
+                        // Continuous churn may never leave an idle interval,
+                        // which would postpone the repair of dropped events
+                        // indefinitely. Repair after a bounded delay instead,
+                        // measured from when the overflow was first seen here
+                        // so queued events still get processed between walks.
+                        if overflow_recovery
+                            .due_under_load(overflowed.load(Ordering::SeqCst), Instant::now())
+                        {
+                            recover_watcher_overflow(
+                                &worker_state,
+                                &worker_root,
+                                &worker_index_dir,
+                                &overflowed,
+                                queue_cap,
+                            );
+                            overflow_recovery.recovered();
+                        }
                     }
                     // A fully idle interval proves the queued backlog has
-                    // drained. Recover only here so an overflowing burst causes
+                    // drained. Recover here so an overflowing burst causes
                     // one stale check, not one after every capped batch.
                     WatcherReceive::Idle => {
                         recover_watcher_overflow(
@@ -3334,6 +3586,7 @@ fn start_file_watcher_using(
                             &overflowed,
                             queue_cap,
                         );
+                        overflow_recovery.recovered();
                     }
                     // The watcher was dropped, so the server is shutting down.
                     WatcherReceive::Disconnected => break,
@@ -4304,10 +4557,13 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
         if dir.starts_with(&state.index_dir) {
             continue;
         }
-        let Ok(rel_dir) = dir.strip_prefix(root) else {
+        let Some(rel_dir) = dir
+            .strip_prefix(root)
+            .ok()
+            .and_then(tgrep_core::walker::index_key)
+        else {
             continue;
         };
-        let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
         if let Ok(metadata) = std::fs::metadata(dir) {
             record_path_visibility(state, &rel_dir, &metadata);
         }
@@ -4334,10 +4590,13 @@ fn reindex_files_in(state: &Arc<ServerState>, root: &Path, dirs: &[PathBuf], sin
             if path.starts_with(&state.index_dir) {
                 continue;
             }
-            let Ok(rel) = path.strip_prefix(root) else {
+            let Some(rel) = path
+                .strip_prefix(root)
+                .ok()
+                .and_then(tgrep_core::walker::index_key)
+            else {
                 continue;
             };
-            let rel = rel.to_string_lossy().replace('\\', "/");
             let Ok(file_type) = entry.file_type() else {
                 // Unclassifiable, so nothing can be concluded about it —
                 // least of all that it is gone.
@@ -4684,10 +4943,13 @@ fn watch_new_subtree(state: &Arc<ServerState>, root: &Path, dir: &Path) {
                 if path.starts_with(&state.index_dir) {
                     continue;
                 }
-                let Ok(rel) = path.strip_prefix(root) else {
+                let Some(rel) = path
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(tgrep_core::walker::index_key)
+                else {
                     continue;
                 };
-                let rel = rel.to_string_lossy().replace('\\', "/");
                 // A subtree that arrives whole — a clone, a `mv`, a branch
                 // switch — can carry its own ignore rules. Refresh the matcher
                 // before indexing the rest of the subtree against stale rules.
@@ -5160,9 +5422,12 @@ fn handle_fs_event(state: &Arc<ServerState>, root: &Path, event: &Event) {
             continue;
         }
 
-        let rel_path = match path.strip_prefix(root) {
-            Ok(p) => p.to_string_lossy().replace('\\', "/"),
-            Err(_) => continue,
+        let Some(rel_path) = path
+            .strip_prefix(root)
+            .ok()
+            .and_then(tgrep_core::walker::index_key)
+        else {
+            continue;
         };
 
         // Mirror the walker's filtering so the watcher does not reindex
@@ -6162,14 +6427,14 @@ fn persist_filename_discovery(
         let files = staging_dir.join("files.bin");
         if files.exists() {
             // Only the header changes; files.bin is read into memory, not mapped.
-            publish_file(&files, &index_dir.join("files.bin"))?;
+            publish_staged_file(&files, &index_dir.join("files.bin"))?;
         }
         let src = staging_dir.join(tgrep_core::path_index::EXTRA_PATHS_FILENAME);
         let dst = index_dir.join(tgrep_core::path_index::EXTRA_PATHS_FILENAME);
-        publish_file(&src, &dst)?;
+        publish_staged_file(&src, &dst)?;
         #[cfg(test)]
         run_stale_refresh_hook(state, StaleRefreshPhase::AfterFilenameSidecarPublish);
-        publish_file(&staging_dir.join("meta.json"), &index_dir.join("meta.json"))?;
+        publish_staged_file(&staging_dir.join("meta.json"), &index_dir.join("meta.json"))?;
         let _index = state.index.write().unwrap();
         state
             .hidden_complete
@@ -7624,7 +7889,7 @@ fn background_index_build_in_pool(state: &Arc<ServerState>, root: &Path, index_d
     // directory but before the matcher is published is invisible to both, and a
     // timestamp taken any later would date it as already accounted for.
     let since = SystemTime::now();
-    let walk = walker::walk_dir_with_ignorecase(
+    let mut walk = walker::walk_dir_with_ignorecase(
         root,
         &WalkOptions {
             include_hidden: true,
@@ -7638,6 +7903,7 @@ fn background_index_build_in_pool(state: &Arc<ServerState>, root: &Path, index_d
         },
         ignorecase.clone(),
     );
+    walk.retain_index_keys(root);
     if let Err(error) =
         builder::check_build_disk_space(index_dir, &walk.files, builder::IndexStrategy::InMemory)
     {
@@ -8681,7 +8947,7 @@ fn move_staged_files(
             }
             moved.backed_up.push(name);
         }
-        if let Err(error) = publish_file(&src, &dst) {
+        if let Err(error) = publish_staged_file(&src, &dst) {
             return Err(moved.fail(error));
         }
         moved.published.push(name);
@@ -8730,6 +8996,42 @@ impl std::error::Error for PublishError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
+}
+
+/// Publish freshly staged data durably: its bytes reach stable storage before
+/// the rename makes them visible, and the rename itself is persisted before
+/// the next file is published. Without both, a power loss could leave a
+/// published name pointing at empty or partial data, or persist `meta.json`
+/// ahead of the files it describes.
+fn publish_staged_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    sync_file(src)?;
+    publish_file(src, dst)?;
+    sync_parent_dir(dst)
+}
+
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    // Windows' FlushFileBuffers requires a handle with write access.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
+/// Persist the directory entry for `path`. Windows has no directory fsync;
+/// NTFS journals the rename itself.
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn publish_file(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -8809,27 +9111,93 @@ fn ctrlc_handler<F: Fn() + Send + Sync + 'static>(handler: F) {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        use std::sync::OnceLock;
-        static HANDLER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
-        HANDLER.get_or_init(|| Box::new(handler));
+        use std::sync::atomic::AtomicI32;
 
-        unsafe extern "C" fn signal_handler(_sig: std::ffi::c_int) {
-            if let Some(h) = HANDLER.get() {
-                h();
+        // Write end of a self-pipe. A signal handler may only make
+        // async-signal-safe calls, so it just writes a byte here; a normal
+        // thread reads it and runs the shutdown closure, which allocates,
+        // prints and touches the filesystem.
+        static WAKE: AtomicI32 = AtomicI32::new(-1);
+
+        extern "C" fn on_signal(_signal: libc::c_int) {
+            let fd = WAKE.load(Ordering::Relaxed);
+            if fd >= 0 {
+                let byte = 1_u8;
+                // SAFETY: write(2) is async-signal-safe, and the descriptor is
+                // a non-blocking pipe this process keeps open. A full pipe
+                // already holds a pending wake-up, so a failed write loses
+                // nothing.
+                unsafe {
+                    libc::write(fd, (&raw const byte).cast(), 1);
+                }
             }
         }
 
-        unsafe extern "C" {
-            fn signal(sig: std::ffi::c_int, handler: unsafe extern "C" fn(std::ffi::c_int));
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe(2) writes two descriptors into the two-element array.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            eprintln!(
+                "[trace] could not install signal handlers: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
         }
-
-        // SAFETY: signal() is a POSIX API. The handler has the correct extern "C"
-        // signature, and HANDLER is 'static. SIGINT (2) is valid on all Unix.
-        // SIGINT = 2 on all Unix platforms
+        // SAFETY: both descriptors were just returned by pipe(2).
         unsafe {
-            signal(2, signal_handler);
+            for fd in fds {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            let flags = libc::fcntl(fds[1], libc::F_GETFL);
+            libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let read_fd = fds[0];
+        let spawned = thread::Builder::new()
+            .name("tgrep-signals".to_string())
+            .spawn(move || {
+                let mut byte = 0_u8;
+                loop {
+                    // SAFETY: reads one byte into a live local from a
+                    // descriptor this thread owns.
+                    let read = unsafe { libc::read(read_fd, (&raw mut byte).cast(), 1) };
+                    if read == 1 {
+                        handler();
+                        return;
+                    }
+                    if read < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    return;
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("[trace] could not install signal handlers: {error}");
+            return;
+        }
+        WAKE.store(fds[1], Ordering::Relaxed);
+
+        // SIGINT for an interactive Ctrl-C, SIGTERM for service managers,
+        // `kill` and container runtimes. SIGHUP keeps its default so
+        // `nohup tgrep serve` still survives a closed terminal.
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: `action` is fully initialised before use, and
+            // `on_signal` only performs async-signal-safe operations.
+            let installed = unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaction(signal, &action, std::ptr::null_mut())
+            };
+            if installed != 0 {
+                eprintln!(
+                    "[trace] could not install handler for signal {signal}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
         }
     }
 }
@@ -8846,6 +9214,85 @@ mod tests {
             paths: paths.iter().map(PathBuf::from).collect(),
             attrs: Default::default(),
         }
+    }
+
+    #[test]
+    fn responses_carry_the_identity_their_client_verifies() {
+        let temp = TempDir::new().unwrap();
+        let info = ServerInfo::new(4242).unwrap();
+        let instance = info.instance.clone().unwrap();
+        info.save(temp.path()).unwrap();
+        let loaded = ServerInfo::load(temp.path()).unwrap();
+        assert_eq!(loaded.instance.as_deref(), Some(instance.as_str()));
+        assert!(
+            std::fs::read_dir(temp.path())
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == "serve.json"),
+            "staged serve.json left behind"
+        );
+        assert_ne!(ServerInfo::new(4242).unwrap().instance, info.instance);
+
+        for response in [
+            r#"{"jsonrpc":"2.0","id":1,"result":{"a":"}"}}"#.to_string(),
+            "{}".to_string(),
+            "{ }".to_string(),
+            json_rpc_error(None, -32700, "bad \"request\""),
+        ] {
+            let stamped = with_instance(&response, &instance);
+            let mut stamped: serde_json::Value = serde_json::from_str(&stamped).unwrap();
+            loaded.verify_response(&stamped).unwrap();
+            let mut original: serde_json::Value = serde_json::from_str(&response).unwrap();
+            stamped.as_object_mut().unwrap().remove("instance");
+            original.as_object_mut().unwrap().remove("instance");
+            assert_eq!(stamped, original, "{response}");
+        }
+        assert_eq!(with_instance("not json", &instance), "not json");
+        assert_eq!(with_instance("{}", ""), "{}");
+
+        for foreign in [
+            serde_json::json!({"result": {}}),
+            serde_json::json!({"instance": "another-server", "result": {}}),
+            serde_json::json!({"instance": 7, "result": {}}),
+        ] {
+            let error = loaded.verify_response(&foreign).unwrap_err();
+            assert!(error.to_string().contains("stale serve.json"), "{error}");
+        }
+
+        // Files written by older servers carry no identity; their responses
+        // are accepted as before.
+        let legacy: ServerInfo = serde_json::from_str(r#"{"pid":1,"port":2}"#).unwrap();
+        assert!(legacy.instance.is_none());
+        legacy
+            .verify_response(&serde_json::json!({"result": {}}))
+            .unwrap();
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("instance"));
+    }
+
+    #[test]
+    fn connection_slots_admit_at_most_their_limit() {
+        let slots = Arc::new(ConnectionSlots::new(2));
+        let first = slots.acquire();
+        let second = slots.acquire();
+        let admitted = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let slots = Arc::clone(&slots);
+            let admitted = Arc::clone(&admitted);
+            thread::spawn(move || {
+                let _third = slots.acquire();
+                admitted.store(true, Ordering::SeqCst);
+            })
+        };
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !admitted.load(Ordering::SeqCst),
+            "third connection admitted"
+        );
+        drop(first);
+        waiter.join().unwrap();
+        assert!(admitted.load(Ordering::SeqCst));
+        drop(second);
+        assert_eq!(*slots.active.lock().unwrap(), 0);
+        assert_eq!(ConnectionSlots::new(0).limit, 1);
     }
 
     #[test]
@@ -8927,6 +9374,30 @@ mod tests {
             assert!(resubscribe.swap(false, Ordering::SeqCst));
             assert_eq!(rx.try_recv().unwrap(), event);
         }
+    }
+
+    #[test]
+    fn watcher_overflow_recovers_under_continuous_events() {
+        let start = Instant::now();
+        let mut recovery = OverflowRecovery::default();
+        assert!(!recovery.due_under_load(false, start));
+        assert!(!recovery.due_under_load(true, start));
+        assert!(!recovery.due_under_load(
+            true,
+            start + WATCHER_OVERFLOW_RECOVERY_DELAY - Duration::from_millis(1)
+        ));
+        assert!(recovery.due_under_load(true, start + WATCHER_OVERFLOW_RECOVERY_DELAY));
+
+        // A repair restarts the delay, so queued events are processed between
+        // walks even when the queue overflows again during one.
+        recovery.recovered();
+        let later = start + WATCHER_OVERFLOW_RECOVERY_DELAY * 2;
+        assert!(!recovery.due_under_load(true, later));
+        assert!(recovery.due_under_load(true, later + WATCHER_OVERFLOW_RECOVERY_DELAY));
+
+        // An overflow that cleared on its own forgets when it was first seen.
+        assert!(!recovery.due_under_load(false, later));
+        assert!(!recovery.due_under_load(true, later + WATCHER_OVERFLOW_RECOVERY_DELAY * 3));
     }
 
     #[test]

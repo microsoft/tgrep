@@ -87,16 +87,32 @@ fn accepts_multiple_path_arguments() {
         .stdout(predicate::str::contains("lib.rs"));
 }
 
+/// As in ripgrep, a path argument names exactly the file it spells: the shell
+/// has already removed the user's quoting, and spaces and quotes are legal in
+/// file names.
 #[test]
-fn strips_extra_quotes_from_path_argument() {
+fn path_arguments_are_used_verbatim() {
     let dir = setup_fixture();
-    let quoted = format!("\"{}\"", fixture_path(&dir));
+    let root = dir.path().join("testdata");
+    fs::write(root.join(" spaced.txt"), "fn spaced\n").unwrap();
+
+    for typed in [
+        format!("\"{}\"", fixture_path(&dir)),
+        format!(" {}", root.join("hello.rs").display()),
+    ] {
+        tgrep()
+            .args(["--no-index", "--no-heading", "fn main", &typed])
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty());
+    }
 
     tgrep()
-        .args(["--no-index", "--no-heading", "fn main", &quoted])
+        .current_dir(&root)
+        .args(["--no-index", "--no-heading", "fn spaced", " spaced.txt"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("hello.rs"));
+        .stdout(predicate::str::contains("fn spaced"));
 }
 
 #[test]
@@ -5194,15 +5210,19 @@ fn vimgrep_column_is_one_based() {
 
 // ─── Trim (--trim) ────────────────────────────────────────────────
 
+/// ripgrep trims only leading ASCII whitespace: trailing blanks and Unicode
+/// spaces survive, and JSON lines are reported untouched.
 #[test]
-fn trim_strips_whitespace() {
+fn trim_strips_leading_ascii_whitespace_only() {
     let dir = setup_fixture();
     let sub = dir.path().join("testdata");
     fs::write(
         sub.join("indented.txt"),
-        "    indented line\n  another indented\n",
+        "  \t indented line  \n\u{3000}wide indented\n",
     )
     .unwrap();
+    let file = sub.join("indented.txt");
+    let file = file.to_str().unwrap();
 
     let output = tgrep()
         .args([
@@ -5211,23 +5231,83 @@ fn trim_strips_whitespace() {
             "--no-filename",
             "-N",
             "--trim",
-            "indented",
-            sub.join("indented.txt").to_str().unwrap(),
+        ])
+        .args(["indented", file])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "indented line  \n\u{3000}wide indented\n"
+    );
+
+    let output = tgrep()
+        .args([
+            "--no-index",
+            "--trim",
+            "--json",
+            "-F",
+            "indented line",
+            file,
         ])
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        assert!(
-            !line.starts_with(' '),
-            "expected trimmed line, got: '{line}'"
-        );
-    }
-    assert!(stdout.contains("indented line"));
-    assert!(stdout.contains("another indented"));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let line = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|record| record["type"] == "match")
+        .unwrap();
+    assert_eq!(line["data"]["lines"]["text"], "  \t indented line  \n");
+    assert_eq!(line["data"]["submatches"][0]["start"], 4);
 }
 
 // ─── Null separator (-0 / --null) ──────────────────────────────────
+
+/// ripgrep's `-0` ends the path field with NUL in every output mode, and the
+/// heading with NUL instead of a newline.
+#[test]
+fn null_separator_follows_the_path_in_every_mode() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("a.txt"),
+        "needle one\nctx line\nneedle two\n",
+    )
+    .unwrap();
+    for (flags, expected) in [
+        (
+            vec!["--no-heading", "-n"],
+            "a.txt\x001:needle one\na.txt\x003:needle two\n",
+        ),
+        (
+            vec!["--heading", "-n"],
+            "a.txt\x001:needle one\n3:needle two\n",
+        ),
+        (
+            vec!["--no-heading", "-n", "-A1", "-m1"],
+            "a.txt\x001:needle one\na.txt\x002-ctx line\n",
+        ),
+        (
+            vec!["--vimgrep"],
+            "a.txt\x001:1:needle one\na.txt\x003:1:needle two\n",
+        ),
+        (vec!["-c"], "a.txt\x002\n"),
+        (vec!["--count-matches"], "a.txt\x002\n"),
+        (vec!["-l"], "a.txt\0"),
+    ] {
+        let output = tgrep()
+            .current_dir(dir.path())
+            .args(["--no-index", "--color", "never", "-0"])
+            .args(&flags)
+            .arg("needle")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected,
+            "{flags:?}"
+        );
+    }
+}
 
 #[test]
 fn null_separator_in_files_mode() {

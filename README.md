@@ -426,8 +426,8 @@ These tables describe search flags. Use `tgrep index --help` and
 | `--json` | ripgrep-compatible JSON stream (one object per line) |
 | `--vimgrep` | Vim-compatible `file:line:col:content`, one row per match |
 | `--color auto/always/never` | Color mode control |
-| `-0, --null` | NUL byte filename separator (for xargs) |
-| `--trim` | Trim leading/trailing whitespace |
+| `-0, --null` | Follow every printed file path with a NUL byte instead of its separator, in all output modes except JSON (for xargs) |
+| `--trim` | Trim leading ASCII whitespace from printed lines (JSON lines are unchanged) |
 | `-., --hidden` | Include hidden files and directories |
 | `--no-ignore` | Don't respect `.gitignore` or `p4ignore.ini` files |
 | `-a, --text` | Search binary files as if they were text |

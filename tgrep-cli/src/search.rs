@@ -3,7 +3,6 @@
 /// If a running server is detected (via serve.json), the search is delegated
 /// over TCP. Otherwise, the on-disk index is loaded directly.
 use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -707,12 +706,10 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
         ..opts.walk_options()
     };
     let walk = walker::walk_dir(&root, &walk_opts);
-    let paths = walk.files.iter().map(|path| {
-        path.strip_prefix(&root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/")
-    });
+    let paths = walk
+        .files
+        .iter()
+        .map(|path| walker::display_relative(path.strip_prefix(&root).unwrap_or(path)));
     write_indexed_file_paths(
         &root,
         &root,
@@ -847,13 +844,15 @@ fn write_indexed_file_paths(
     Ok(())
 }
 
+/// How long a client waits for a server's search or file-list answer.
+const SERVER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn list_files_via_server(
     info: &ServerInfo,
     scope: &IndexScope,
     opts: &SearchOptions,
 ) -> Result<Vec<String>> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
+    let mut stream = info.connect(SERVER_READ_TIMEOUT)?;
     writeln!(
         stream,
         "{}",
@@ -870,6 +869,7 @@ fn list_files_via_server(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let response: serde_json::Value = serde_json::from_str(&line)?;
+    info.verify_response(&response)?;
     if let Some(error) = response.get("error") {
         let message = error
             .get("message")
@@ -1100,8 +1100,7 @@ fn search_via_server(
     ci: bool,
     writer: &mut OutputWriter,
 ) -> Result<bool> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", info.port))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
+    let mut stream = info.connect(SERVER_READ_TIMEOUT)?;
     let request = server_search_request(scope, opts, ci)?;
     writeln!(stream, "{request}")?;
     stream.flush()?;
@@ -1109,6 +1108,7 @@ fn search_via_server(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let response: serde_json::Value = serde_json::from_str(&line)?;
+    info.verify_response(&response)?;
     if let Some(error) = response.get("error") {
         let msg = error
             .get("message")
@@ -1838,6 +1838,9 @@ fn search_local_index(
             Ok(Some(read)) => read,
             Ok(None) => continue,
             Err(error) => {
+                if !is_skipped_indexed_read(&error) {
+                    crate::ERRORED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 if !opts.no_messages {
                     eprintln!("warning: cannot read indexed file {rel_path:?}: {error}");
                 }
@@ -1896,8 +1899,7 @@ impl IndexScope {
     /// `None` when `search_root` lies outside the indexed tree, which means the
     /// index cannot answer the search at all.
     fn resolve(index_root: &Path, search_root: &Path) -> Option<Self> {
-        let rel = search_root.strip_prefix(index_root).ok()?;
-        let rel = rel.to_string_lossy().replace('\\', "/");
+        let rel = walker::index_key(search_root.strip_prefix(index_root).ok()?)?;
         if rel.is_empty() {
             Some(Self::Whole)
         } else if search_root.is_file() {
@@ -1941,6 +1943,30 @@ fn resolve_scope(index_dir: &Path, root: &Path) -> Option<(PathBuf, IndexScope)>
     let index_root = std::fs::canonicalize(recorded_root).ok()?;
     let scope = IndexScope::resolve(&index_root, root)?;
     Some((index_root, scope))
+}
+
+/// An indexed candidate that cannot be read only because it disappeared since
+/// the last index update, or because a rooted open refused a link or a
+/// replaced ancestor, is a skipped file rather than a failed search. Anything
+/// else, such as a permission or device error, makes the search exit 2 as it
+/// would in ripgrep.
+fn is_skipped_indexed_read(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::NotFound
+            | ErrorKind::InvalidInput
+            | ErrorKind::NotADirectory
+            | ErrorKind::Unsupported
+    ) {
+        return true;
+    }
+    // `O_NOFOLLOW` reports a final symlink as ELOOP (EMLINK on FreeBSD).
+    #[cfg(unix)]
+    if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::EMLINK)) {
+        return true;
+    }
+    false
 }
 
 /// `true` when the path is shallow enough to keep under `--max-depth`.
@@ -2018,11 +2044,7 @@ fn brute_force_search(
     }
 
     for path in &walk.files {
-        let rel_path = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel_path = walker::display_relative(path.strip_prefix(root).unwrap_or(path));
 
         if !passes_filters(&rel_path, &glob_filter, &type_filter, true) {
             continue;
@@ -2032,6 +2054,7 @@ fn brute_force_search(
             Ok(Some(read)) => read,
             Ok(None) => continue,
             Err(error) => {
+                crate::ERRORED.store(true, std::sync::atomic::Ordering::SeqCst);
                 if !opts.no_messages {
                     eprintln!("warning: cannot read file {}: {error}", path.display());
                 }
@@ -2592,7 +2615,12 @@ fn explicit_file_display_path(path: &Path) -> String {
         .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| path.to_path_buf());
 
-    strip_verbatim_prefix(&display_path.to_string_lossy()).replace('\\', "/")
+    let display_path = strip_verbatim_prefix(&display_path.to_string_lossy());
+    if cfg!(windows) {
+        display_path.replace('\\', "/")
+    } else {
+        display_path
+    }
 }
 
 /// Whether a path survives the glob and type filters. As in ripgrep, a glob

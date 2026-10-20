@@ -1359,14 +1359,14 @@ impl State {
                     return Err(Error::invalid("test timer exceeds one day").into());
                 }
                 let slot = self.views.slot(&input.view)?;
-                if !self
+                let monitor = self
                     .monitors
                     .lock()
                     .map_err(|_| Error::corrupt("monitor registry poisoned"))?
-                    .contains_key(&input.view)
-                {
-                    return Err(Error::invalid("view has no monitor").into());
-                }
+                    .get(&input.view)
+                    .cloned()
+                    .ok_or_else(|| Error::invalid("view has no monitor"))?;
+                self.settle_view_work(&input.view, &monitor)?;
                 self.schedule_view_with_elapsed(&slot, |_| {
                     (
                         Duration::from_secs(30),
@@ -1861,31 +1861,7 @@ impl State {
             monitor.watcher = None;
             monitor.watched.clear();
         }
-        let pending: Vec<_> = monitor
-            .pending
-            .iter()
-            .take(self.namespace.policy()?.policy.work.page_objects as usize)
-            .cloned()
-            .collect();
-        for id in pending {
-            match self.namespace.operation(&id) {
-                Ok(operation)
-                    if matches!(
-                        operation.state,
-                        OperationState::Completed
-                            | OperationState::Failed
-                            | OperationState::Cancelled
-                    ) =>
-                {
-                    monitor.pending.remove(&id);
-                }
-                Err(error) if error.category == ErrorCategory::ReceiptExpired => {
-                    monitor.pending.remove(&id);
-                }
-                Err(error) => return Err(error.into()),
-                _ => {}
-            }
-        }
+        self.prune_pending(&mut monitor)?;
         if !monitor.pending.is_empty() {
             return Ok(true);
         }
@@ -1944,6 +1920,58 @@ impl State {
             }
         }
         Ok(!status.ready)
+    }
+
+    fn prune_pending(&self, monitor: &mut Monitor) -> Result<()> {
+        let pending: Vec<_> = monitor
+            .pending
+            .iter()
+            .take(self.namespace.policy()?.policy.work.page_objects as usize)
+            .cloned()
+            .collect();
+        for id in pending {
+            match self.namespace.operation(&id) {
+                Ok(operation)
+                    if matches!(
+                        operation.state,
+                        OperationState::Completed
+                            | OperationState::Failed
+                            | OperationState::Cancelled
+                    ) =>
+                {
+                    monitor.pending.remove(&id);
+                }
+                Err(error) if error.category == ErrorCategory::ReceiptExpired => {
+                    monitor.pending.remove(&id);
+                }
+                Err(error) => return Err(error.into()),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits until the view has no running or queued work, so a test timer
+    /// is not silently deferred by a concurrent scheduler pass.
+    #[cfg(feature = "managed-test-hooks")]
+    fn settle_view_work(&self, view: &Id, monitor: &Mutex<Monitor>) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let pending = {
+                let mut monitor = monitor
+                    .lock()
+                    .map_err(|_| Error::corrupt("monitor lock poisoned"))?;
+                self.prune_pending(&mut monitor)?;
+                !monitor.pending.is_empty()
+            };
+            if !pending && self.views.status(view)?.work.is_none() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::busy("view-work-active").into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 

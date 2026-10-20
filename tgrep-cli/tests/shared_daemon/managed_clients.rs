@@ -1037,6 +1037,29 @@ fn stdout_lines(bytes: &[u8]) -> Vec<Value> {
         .collect()
 }
 
+/// Runs a helper expected to refuse before its handshake. Like
+/// `retry_catalog_busy`, the exited helper is rerun with the same claim while
+/// it reports only retryable, uncommitted `busy`/`catalog-io`, which daemon
+/// catalog writes can legally cause.
+fn owner_hold_refusal(path: &Path) -> Output {
+    let deadline = Instant::now() + CATALOG_BUSY_DEADLINE;
+    loop {
+        let output = owner_hold(path).finish(Duration::from_secs(30)).unwrap();
+        let contended = output.status.code() == Some(2)
+            && stdout_lines(&output.stdout).first().is_some_and(|frame| {
+                let error = &frame["error"];
+                error["category"] == "busy"
+                    && error["reason_code"] == "catalog-io"
+                    && error["retryable"] == true
+                    && error["committed_state"] == "not-committed"
+            });
+        if !contended || Instant::now() >= deadline {
+            return output;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The exact pre-handshake contract: one `{ok:false,error}` line, exit 2 and
 /// the unchanged human diagnostic, never a `holding` success.
 fn pre_handshake_failure(output: &Output, category: &str, reason: &str, retryable: bool) -> Value {
@@ -1119,7 +1142,7 @@ fn owner_holder_frames_typed_refusals_without_inferring_retry_safety() {
     // A live holder's OS lock is reported as typed busy; the holder is unaffected.
     let mut holder = owner_hold(&path);
     holding_handshake(&mut holder, &prepared);
-    let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+    let output = owner_hold_refusal(&path);
     pre_handshake_failure(&output, "busy", "owner-guard-already-held", true);
     assert!(holder.running());
     daemon.rpc("owners.register", json!({"claim":claim}));
@@ -1130,7 +1153,7 @@ fn owner_holder_frames_typed_refusals_without_inferring_retry_safety() {
     // An ended lifetime is framed as non-retryable, never as a fresh claim.
     // Housekeeping may already have removed the released owner record, which
     // reports the same stale identity as retired.
-    let output = owner_hold(&path).finish(Duration::from_secs(30)).unwrap();
+    let output = owner_hold_refusal(&path);
     let reason = stdout_lines(&output.stdout)
         .first()
         .and_then(|frame| frame["error"]["reason_code"].as_str().map(str::to_owned))

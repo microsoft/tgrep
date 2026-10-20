@@ -1133,7 +1133,9 @@ fn isolated_changes_candidate_masking_membership_and_scan_parity() {
         vec!["-o"],
         vec!["-t", "rust"],
         vec!["-g", "*.txt", "-g", "!ignored.txt"],
-        vec!["--hidden"],
+        // Indexed queries never include `.git`; a scan does, and on Windows
+        // the daemon's locked `.git/tgrep-daemon-v1.lock` is unreadable.
+        vec!["--hidden", "-g", "!.git"],
         vec!["--max-depth", "1"],
         vec!["-i"],
         vec!["-w"],
@@ -1151,7 +1153,13 @@ fn isolated_changes_candidate_masking_membership_and_scan_parity() {
         let mut scan = vec!["--no-index"];
         scan.extend(shared);
         let scanned = cli(&f.a, &scan);
-        assert_eq!(indexed.status.code(), scanned.status.code(), "{args:?}");
+        assert_eq!(
+            indexed.status.code(),
+            scanned.status.code(),
+            "{args:?}\nindexed: {}\nscanned: {}",
+            String::from_utf8_lossy(&indexed.stderr),
+            String::from_utf8_lossy(&scanned.stderr)
+        );
         assert_eq!(
             indexed.stdout,
             scanned.stdout,

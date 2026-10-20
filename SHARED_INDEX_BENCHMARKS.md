@@ -132,6 +132,48 @@ Query latency was again equal across views. The sums of the 12 p50 client
 wall times were 78.9 s, 79.1 s and 78.3 s for the base, worktree 1 and
 worktree 2. The server-reported sums were 53.1 s, 52.9 s and 52.4 s.
 
+#### Full validation for PR #211: ordinary versus managed
+
+`--worktrees 3 --worktree-rev HEAD --worktree-rev HEAD~1 --dirty-files 16
+--repeat 2 --query-limit 12 --query-timeout 900` (the third worktree is at
+`HEAD`), same host,
+release build of the provisional-attach sources. Heavy Rust test suites ran
+on the same machine during verification and the timed query rounds, so treat
+the later rows and the query table as a loaded-host measurement.
+
+| Step | Serving (s) | Ready (s) | Notes |
+| --- | ---: | ---: | --- |
+| Ordinary `tgrep index` / server | - | 273.2 / 6.5 | 2.76 GiB index |
+| Managed base (cold generation build) | 398.1 | 908.7 | 4.49 GiB storage |
+| Worktree 1 (`HEAD`) | 32.1 | 781.8 | generation reused, `blobs_read=0` |
+| Worktree 2 (`HEAD~1`) | 772.5 | 1,788.0 | new generation (731.8 s build) |
+| Worktree 3 (`HEAD`, 16 dirty, 1 untracked) | 93.2 | 4,577.7 | reused; 17-file private overlay |
+
+`git worktree add` took 444-454 s per worktree; storage after all attachments
+was 8.99 GiB. Worktree 3 served after 93 s but needed 4,409 s of content
+verification, with 7,219 s of namespace catalog time. Its verification
+competed with the test load and with the periodic full verification of the
+three views already ready: each rereads about 466,000 files every
+`--poll-interval`, about two cores of steady daemon work at this scale.
+Parity, generation-reuse and overlay-isolation checks passed. One ordinary
+round-0 query hit a connect timeout (`os error 10060`) under that load and
+fell back to the on-disk index, so the backend check failed.
+
+| p50 (ms) | Ordinary base | Managed base | Worktree 1 | Worktree 2 | Worktree 3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `blink::Document` (498 matches), client | 484.1 | 2,843.6 | 2,979.2 | 2,730.1 | 2,834.3 |
+| `blink::Document`, server | 188 | 593 | 582 | 579 | 600 |
+| `content::RenderFrameHost` (10,694), client | 1,110.5 | 4,197.5 | 4,429.2 | 4,405.3 | 5,061.8 |
+| Sum of 12 queries, client | 78,843.5 | 86,567.0 | 87,766.5 | 89,648.0 | 90,503.4 |
+| Sum of 12 queries, server | 68,817.5 | 55,406.9 | 55,630.6 | 58,478.1 | 57,383.2 |
+
+Worktree views again match the managed base. Against the ordinary server,
+managed views add about 2.2 s of client time per query beyond the server time
+(ordinary: about 0.3 s), and selective queries spend 2-3x longer in the
+server. Broad queries narrow that gap; total server time is lower for
+managed views. The fixed managed client and per-query server costs are the
+main remaining query-latency targets.
+
 ## Large-checkout reconciliation: RC2
 
 **A fresh managed attachment to an already published base took 186.144 seconds

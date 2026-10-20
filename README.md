@@ -225,6 +225,10 @@ including nested repositories' Git internals. `--hidden` does not override this;
 use `--no-ignore` consistently on `index` and `serve` to include them. Explicit
 filesystem scans (`--no-index`) retain ripgrep-style hidden and ignore behavior.
 Git metadata needed for ignore rules and tracked-file detection is still read.
+As in ripgrep, a file a scan cannot read is reported and makes the exit code 2.
+On Windows a shared daemon holds a byte-range lock on
+`.git/tgrep-daemon-v1.lock`, so `--no-index --hidden` scans of that checkout
+report it; add `-g '!.git'` when Git internals are not wanted.
 
 On Windows, replaced index generations stay in `.retired` while readers have
 them memory-mapped. Cleanup retries after publication, every minute, and on

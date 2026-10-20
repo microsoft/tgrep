@@ -201,6 +201,16 @@ fn local_index_streams_siblings_without_reading_through_a_replaced_parent() {
 struct ReadLock {
     #[cfg(windows)]
     _file: fs::File,
+    #[cfg(unix)]
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for ReadLock {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o644));
+    }
 }
 
 /// `None` when this process cannot take read access away (root ignores modes).
@@ -219,7 +229,10 @@ fn deny_reads(path: &Path) -> Option<ReadLock> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
-        fs::read(path).is_err().then_some(ReadLock {})
+        let lock = ReadLock {
+            path: path.to_path_buf(),
+        };
+        fs::read(path).is_err().then_some(lock)
     }
 }
 

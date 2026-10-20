@@ -1151,15 +1151,54 @@ fn retained_checkpoint(label: &str) -> RetainedCheckpoint {
     let daemon = start(&fixture, &configured, &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
     let attached = initial_attach(&daemon, &claim, attach_input(&fixture, &claim), label);
-    let sequence = next_sequence(&attached);
+    let mut sequence = next_sequence(&attached);
     let current = &attached["result"]["current"];
-    let checkpoint = current["checkpoint"].clone();
+    let request = json!({
+        "policy_version":1,"allocation_version":1,"cursor":null,
+        "bounds":{"max_duration_ms":5000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,"max_pages":64}
+    });
+    // An eventual first attachment publishes the pinned base provisionally and
+    // republishes once verification completes. Collect that superseded
+    // checkpoint first, so the refresh below retires the only collectible one.
+    let ready = super::live::wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":current["id"]}),
+        |status| status["ready"] == true && status["work"].is_null(),
+    );
+    let authoritative = &ready["authoritative"];
+    let provisional = &current["checkpoint"];
+    if authoritative["checkpoint"] != *provisional {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut drain = request.clone();
+        while !collected(&daemon, provisional) {
+            assert!(
+                Instant::now() < deadline,
+                "{label}: the provisional checkpoint was not collected: {drain}"
+            );
+            let pass = completed(
+                &daemon,
+                &daemon.rpc(
+                    "collections.start",
+                    json!({"token":token(&claim,sequence),"request":drain}),
+                ),
+            );
+            sequence += 1;
+            assert_eq!(pass["result"]["errors"], 0, "{label}: {pass}");
+            drain["cursor"] = pass["result"]["next"].clone();
+            if drain["cursor"].is_null() {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    let checkpoint = authoritative["checkpoint"].clone();
     completed(
         &daemon,
         &daemon.rpc(
             "views.refresh",
             json!({"token":token(&claim,sequence),"request":{
-                "view":current["id"],"expected_version":1,"owner":claim.owner,"allocation_version":1
+                "view":current["id"],"expected_version":authoritative["version"],
+                "owner":claim.owner,"allocation_version":1
             }}),
         ),
     );
@@ -1167,10 +1206,6 @@ fn retained_checkpoint(label: &str) -> RetainedCheckpoint {
         .storage
         .join(tgrep_core::managed::STORE_DIRECTORY)
         .join(daemon.marker["repository"].as_str().unwrap());
-    let request = json!({
-        "policy_version":1,"allocation_version":1,"cursor":null,
-        "bounds":{"max_duration_ms":5000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,"max_pages":64}
-    });
     RetainedCheckpoint {
         fixture,
         daemon,

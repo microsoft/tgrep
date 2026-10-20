@@ -1301,7 +1301,24 @@ fn a_missing_evicted_exact_commit_never_substitutes_a_newer_head_and_scans_expli
     request["token"] = token(&claim, sequence);
     request["request"]["revision"] = json!(newer);
     request["request"]["lease"] = json!("available-target");
-    verified_attach(&daemon, &manage(&fixture.a, "views.attach", request));
+    // The daemon's catalog writes may contend with this attachment; the
+    // documented client contract retries that with a fresh token.
+    let attached = super::attach_retry::retry_attach(
+        &daemon,
+        &claim,
+        None,
+        request,
+        super::attach_retry::Retry {
+            point: "available exact target",
+            deadline: Instant::now() + Duration::from_secs(30),
+            allowance: super::attach_retry::RetryableAttach::CatalogIo,
+        },
+        |_| {},
+    )
+    .unwrap_or_else(|failures| {
+        panic!("available exact target: attachment exhausted its retry bound: {failures:?}")
+    });
+    verified(&daemon, attached);
     let available = daemon.rpc(
         "lookup",
         json!({"root":fs::canonicalize(&fixture.a).unwrap()}),

@@ -740,7 +740,11 @@ fn terminal(daemon: &Daemon, operation: &Value) -> Value {
 /// needing verified results do: an eventual first attachment publishes the
 /// pinned base provisionally and verifies the checkout afterwards.
 fn verified_attach(daemon: &Daemon, operation: &Value) -> Value {
-    let receipt = completed(daemon, operation);
+    verified(daemon, completed(daemon, operation))
+}
+
+/// Waits until the view of a completed attachment `receipt` is `ready`.
+fn verified(daemon: &Daemon, receipt: Value) -> Value {
     let view = &receipt["result"]["current"]["id"];
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

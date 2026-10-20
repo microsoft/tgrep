@@ -703,6 +703,25 @@ mod tests {
             assert!(namespace.eligibility(id).unwrap().eligible);
             stage_bytes += object.logical_bytes;
         }
+        // Admission reclaims catalog WAL frames before refusing, so derive the
+        // limit from the checkpointed footprint: the retained stages alone
+        // must close admission and their reclamation alone must reopen it.
+        assert!(namespace.truncate_catalog_wal().unwrap());
+        let charged = namespace
+            .work_usage()
+            .unwrap()
+            .storage
+            .charged_overlap_logical_bytes;
+        let storage_limit = charged + request.staging_bytes - stage_bytes / 2;
+        let mut allocation = namespace.allocation().unwrap();
+        allocation.storage_bytes = Some(storage_limit);
+        let allocation = namespace
+            .update_allocation(allocation.version, allocation)
+            .unwrap();
+        let request = WorkRequest {
+            allocation_version: allocation.version,
+            ..request
+        };
         let attachment = namespace
             .accept_system_operation(
                 Token::parse("warm-admission").unwrap(),
@@ -799,7 +818,7 @@ mod tests {
             });
         assert_eq!(
             namespace.allocation().unwrap().storage_bytes,
-            Some(16 * MIB)
+            Some(storage_limit)
         );
         drop(permit);
         namespace

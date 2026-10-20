@@ -41,6 +41,14 @@ pub struct TrackedFiles {
 }
 
 impl TrackedFiles {
+    fn unordered(paths: HashSet<Box<str>>) -> Self {
+        Self {
+            paths,
+            ordered: None,
+            _memory: None,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.paths.len()
     }
@@ -358,8 +366,14 @@ pub(crate) fn index_path(repo_root: &Path) -> Option<PathBuf> {
 }
 
 pub fn load_tracked(repo_root: &Path) -> Option<TrackedFiles> {
-    let bytes = std::fs::read(index_path(repo_root)?).ok()?;
-    parse_index(&bytes)
+    let path = index_path(repo_root)?;
+    let bytes = std::fs::read(&path).ok()?;
+    // A split index names its shared half relative to the directory holding
+    // it, which for a linked worktree is that worktree's private Git dir.
+    let dir = path.parent()?;
+    parse_index_with(&bytes, |hash| {
+        std::fs::read(dir.join(format!("sharedindex.{hash}"))).ok()
+    })
 }
 
 pub(crate) fn load_tracked_controlled(
@@ -411,16 +425,233 @@ pub(crate) fn load_tracked_controlled(
     })
 }
 
-/// Parse the git index format.
-///
-/// Versions 2 and 3 store each path in full, NUL-terminated and padded so the
-/// next entry starts on an 8-byte boundary. Version 4 drops the padding and
-/// stores each path as "strip N bytes off the end of the previous path, then
-/// append this suffix", so entries can only be read in order.
-fn parse_index(bytes: &[u8]) -> Option<TrackedFiles> {
-    /// 62 bytes of stat data, hash and flags precede the path.
-    const ENTRY_HEADER: usize = 62;
+/// 62 bytes of stat data, object id and flags precede each entry's path.
+const ENTRY_HEADER: usize = 62;
+/// Every index ends with a checksum at least this long (SHA-1; SHA-256 is 32).
+const MIN_TRAILER: usize = 20;
 
+/// Parse an index that is known not to be split.
+#[cfg(test)]
+fn parse_index(bytes: &[u8]) -> Option<TrackedFiles> {
+    parse_index_with(bytes, |_| None)
+}
+
+/// Parse the git index format, reading the shared half of a split index
+/// through `shared`, which maps a hex object id to the bytes of
+/// `sharedindex.<id>`.
+///
+/// Returns `None` for anything it cannot read completely: a partial set would
+/// silently drop the exemption for every file it missed.
+fn parse_index_with(
+    bytes: &[u8],
+    shared: impl Fn(&str) -> Option<Vec<u8>>,
+) -> Option<TrackedFiles> {
+    let (_, count) = index_header(bytes)?;
+    let mut paths = HashSet::with_capacity(entry_capacity(bytes, count));
+    let end = walk_entries(bytes, |_, path| insert_path(&mut paths, path))?;
+    let Some(link) = extension(bytes, end, b"link") else {
+        return Some(TrackedFiles::unordered(paths));
+    };
+    // Split index: these entries are only the changes git layered on a shared
+    // index. Without the shared half, most tracked files would look untracked.
+    for hash_len in [20, 32] {
+        let Some(link) = SplitLink::parse(link, hash_len) else {
+            continue;
+        };
+        if link.base.iter().all(|byte| *byte == 0) {
+            // A null base means this index needs no shared file.
+            return Some(TrackedFiles::unordered(paths));
+        }
+        let Some(base) = shared(&hex(link.base)) else {
+            continue;
+        };
+        drop(paths);
+        return merge_split(bytes, &base, &link);
+    }
+    None
+}
+
+/// Apply a split index's `link` to its shared index, as git's
+/// `merge_base_index` does.
+///
+/// The shared index keeps every entry not in the delete bitmap. The first `n`
+/// entries of the split index, where `n` is the number of bits in the replace
+/// bitmap, update shared entries in place without renaming them. The rest are
+/// additions.
+fn merge_split(split: &[u8], base: &[u8], link: &SplitLink) -> Option<TrackedFiles> {
+    // The shared file is named by its own trailing checksum.
+    if base.len() < link.base.len() || &base[base.len() - link.base.len()..] != link.base {
+        return None;
+    }
+    let (_, base_count) = index_header(base)?;
+    let base_count = base_count.min(entry_capacity(base, base_count));
+    let mut deleted = vec![false; base_count];
+    read_ewah(link.delete, base_count, |position| {
+        deleted[position] = true;
+        true
+    })?;
+    let mut replaced = 0usize;
+    read_ewah(link.replace, base_count, |position| {
+        replaced += 1;
+        !deleted[position]
+    })?;
+
+    let (_, split_count) = index_header(split)?;
+    if replaced > split_count {
+        return None;
+    }
+    let added = entry_capacity(split, split_count).saturating_sub(replaced);
+    let mut paths = HashSet::with_capacity(base_count + added);
+    let base_end = walk_entries(base, |entry, path| {
+        // No more entries can parse than `entry_capacity` allows, so every
+        // visited position is inside the bitmap.
+        if deleted.get(entry) == Some(&false) {
+            insert_path(&mut paths, path);
+        }
+    })?;
+    // A shared index is never itself split.
+    if extension(base, base_end, b"link").is_some() {
+        return None;
+    }
+    walk_entries(split, |entry, path| {
+        if entry >= replaced {
+            insert_path(&mut paths, path);
+        }
+    })?;
+    Some(TrackedFiles::unordered(paths))
+}
+
+/// The payload of a split index's `link` extension.
+struct SplitLink<'a> {
+    /// Object id of the shared index.
+    base: &'a [u8],
+    delete: &'a [u8],
+    replace: &'a [u8],
+}
+
+impl<'a> SplitLink<'a> {
+    /// Split the payload assuming an object id of `hash_len` bytes. Both
+    /// bitmaps are optional, but when present they must fill the rest exactly,
+    /// which is what tells a SHA-1 link from a SHA-256 one.
+    fn parse(data: &'a [u8], hash_len: usize) -> Option<Self> {
+        let base = data.get(..hash_len)?;
+        let rest = &data[hash_len..];
+        if rest.is_empty() {
+            return Some(Self {
+                base,
+                delete: &[],
+                replace: &[],
+            });
+        }
+        let delete_len = ewah_len(rest)?;
+        let replace_len = ewah_len(&rest[delete_len..])?;
+        if delete_len + replace_len != rest.len() {
+            return None;
+        }
+        Some(Self {
+            base,
+            delete: &rest[..delete_len],
+            replace: &rest[delete_len..],
+        })
+    }
+}
+
+/// The serialized length of the EWAH bitmap at the start of `bytes`: bit
+/// count, word count, the words, and the position of the last marker word.
+fn ewah_len(bytes: &[u8]) -> Option<usize> {
+    let words = u32::from_be_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
+    let len = words.checked_mul(8)?.checked_add(12)?;
+    (len <= bytes.len()).then_some(len)
+}
+
+/// Visit every set bit of a serialized EWAH bitmap, as git's `ewah_each_bit`.
+///
+/// The words alternate between a marker and the literal words it announces.
+/// A marker's low bit says whether its run is of ones or zeros, the next 32
+/// bits how many 64-bit words the run spans, and the top 31 how many literal
+/// words follow. Every set bit must be below `limit`, so a forged run of ones
+/// cannot drive an unbounded loop. An empty input has no bits.
+fn read_ewah(bytes: &[u8], limit: usize, mut visit: impl FnMut(usize) -> bool) -> Option<()> {
+    if bytes.is_empty() {
+        return Some(());
+    }
+    let words = (ewah_len(bytes)? - 12) / 8;
+    let word = |index: usize| {
+        let at = 8 + index * 8;
+        Some(u64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+    };
+    let mut position = 0usize;
+    let mut index = 0;
+    while index < words {
+        let marker = word(index)?;
+        index += 1;
+        let run = usize::try_from((marker >> 1) & 0xFFFF_FFFF)
+            .ok()?
+            .checked_mul(64)?;
+        let end = position.checked_add(run)?;
+        if marker & 1 != 0 {
+            if end > limit {
+                return None;
+            }
+            for bit in position..end {
+                if !visit(bit) {
+                    return None;
+                }
+            }
+        }
+        position = end;
+        for _ in 0..marker >> 33 {
+            if index >= words {
+                return None;
+            }
+            let mut literal = word(index)?;
+            index += 1;
+            while literal != 0 {
+                let bit = position.checked_add(literal.trailing_zeros() as usize)?;
+                if bit >= limit || !visit(bit) {
+                    return None;
+                }
+                literal &= literal - 1;
+            }
+            position = position.checked_add(64)?;
+        }
+    }
+    Some(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+/// The payload of the first extension named `signature`, scanning from
+/// `pos`, where the entries end.
+///
+/// Each extension is a 4-byte signature, a 4-byte big-endian length and that
+/// much data. The scan stops at the first header that would not leave room for
+/// the trailing checksum, which is how it finds the end without knowing the
+/// repository's hash.
+fn extension<'a>(bytes: &'a [u8], mut pos: usize, signature: &[u8; 4]) -> Option<&'a [u8]> {
+    while let Some(header) = bytes.get(pos..pos.checked_add(8)?) {
+        let size = u32::from_be_bytes(header[4..8].try_into().ok()?) as usize;
+        let start = pos + 8;
+        let end = start.checked_add(size)?;
+        if end.checked_add(MIN_TRAILER)? > bytes.len() {
+            return None;
+        }
+        if &header[..4] == signature {
+            return Some(&bytes[start..end]);
+        }
+        pos = end;
+    }
+    None
+}
+
+/// Validate the 12-byte header, returning the version and declared count.
+fn index_header(bytes: &[u8]) -> Option<(u32, usize)> {
     if bytes.len() < 12 || &bytes[..4] != b"DIRC" {
         return None;
     }
@@ -429,16 +660,38 @@ fn parse_index(bytes: &[u8]) -> Option<TrackedFiles> {
         return None;
     }
     let count = u32::from_be_bytes(bytes[8..12].try_into().ok()?) as usize;
+    Some((version, count))
+}
 
-    // The header is attacker-controlled — reserving `count` outright lets a
-    // 12-byte file claim 4 billion entries and abort the process in the
-    // allocator, which is not catchable. No entry can be shorter than its
-    // 62-byte header plus a NUL and padding, so the file length is a hard
-    // ceiling on how many there really are.
-    let mut paths = HashSet::with_capacity(count.min((bytes.len() - 12) / (ENTRY_HEADER + 1)));
+/// How many entries are worth reserving for.
+///
+/// The header is attacker-controlled — reserving `count` outright lets a
+/// 12-byte file claim 4 billion entries and abort the process in the
+/// allocator, which is not catchable. No entry can be shorter than its
+/// 62-byte header plus a NUL, so the file length is a hard ceiling on how
+/// many there really are.
+fn entry_capacity(bytes: &[u8], count: usize) -> usize {
+    count.min(bytes.len().saturating_sub(12) / (ENTRY_HEADER + 1))
+}
+
+fn insert_path(paths: &mut HashSet<Box<str>>, path: &[u8]) {
+    if let Ok(text) = std::str::from_utf8(path) {
+        paths.insert(normalise(text).into_boxed_str());
+    }
+}
+
+/// Visit each entry's position and path in on-disk order, returning the
+/// offset where the extensions begin.
+///
+/// Versions 2 and 3 store each path in full, NUL-terminated and padded so the
+/// next entry starts on an 8-byte boundary. Version 4 drops the padding and
+/// stores each path as "strip N bytes off the end of the previous path, then
+/// append this suffix", so entries can only be read in order.
+fn walk_entries(bytes: &[u8], mut visit: impl FnMut(usize, &[u8])) -> Option<usize> {
+    let (version, count) = index_header(bytes)?;
     let mut pos = 12;
     let mut previous: Vec<u8> = Vec::new();
-    for _ in 0..count {
+    for entry in 0..count {
         if pos + ENTRY_HEADER > bytes.len() {
             return None;
         }
@@ -455,16 +708,15 @@ fn parse_index(bytes: &[u8]) -> Option<TrackedFiles> {
             }
         }
 
-        let path = if version >= 4 {
+        let path: &[u8] = if version >= 4 {
             let (strip, next) = read_varint(bytes, pos)?;
             pos = next;
             let keep = previous.len().checked_sub(strip)?;
             let end = memchr::memchr(0, bytes.get(pos..)?)? + pos;
-            let mut path = Vec::with_capacity(keep + (end - pos));
-            path.extend_from_slice(&previous[..keep]);
-            path.extend_from_slice(&bytes[pos..end]);
+            previous.truncate(keep);
+            previous.extend_from_slice(&bytes[pos..end]);
             pos = end + 1;
-            path
+            &previous
         } else {
             // The low 12 bits hold the length, but saturate at 0xFFF; a longer
             // path is delimited only by its NUL.
@@ -478,25 +730,15 @@ fn parse_index(bytes: &[u8]) -> Option<TrackedFiles> {
             } else {
                 memchr::memchr(0, bytes.get(pos..)?)? + pos
             };
-            let path = bytes.get(pos..end)?.to_vec();
+            let path = bytes.get(pos..end)?;
             // Pad the whole entry to a multiple of 8, measured from its start.
             let unpadded = end + 1 - entry_start;
             pos = entry_start + unpadded.div_ceil(8) * 8;
             path
         };
-
-        if version >= 4 {
-            previous = path.clone();
-        }
-        if let Ok(text) = String::from_utf8(path) {
-            paths.insert(normalise(&text).into_boxed_str());
-        }
+        visit(entry, path);
     }
-    Some(TrackedFiles {
-        paths,
-        ordered: None,
-        _memory: None,
-    })
+    Some(pos)
 }
 
 /// git's offset-encoded varint, as used by index version 4.
@@ -687,6 +929,216 @@ mod tests {
         assert!(tracked.contains("src/alpha.rs"));
         assert!(tracked.contains("src/beta.rs"));
         assert!(tracked.contains("src/gamma.rs"));
+    }
+
+    /// Serialize `bits` as git's EWAH: one marker announcing literal words.
+    fn ewah(bits: &[usize]) -> Vec<u8> {
+        let literals = bits.iter().max().map_or(0, |max| max / 64 + 1);
+        let mut words = vec![0u64; literals];
+        for bit in bits {
+            words[bit / 64] |= 1 << (bit % 64);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&(literals as u32 * 64).to_be_bytes());
+        out.extend_from_slice(&(literals as u32 + 1).to_be_bytes());
+        out.extend_from_slice(&((literals as u64) << 33).to_be_bytes());
+        for word in words {
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out
+    }
+
+    /// `index` with an extension and a checksum appended.
+    fn with_extension(mut index: Vec<u8>, signature: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        index.extend_from_slice(signature);
+        index.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        index.extend_from_slice(data);
+        index.extend_from_slice(&[0x5a; 20]);
+        index
+    }
+
+    fn link(base: &[u8; 20], deleted: &[usize], replaced: &[usize]) -> Vec<u8> {
+        let mut data = base.to_vec();
+        data.extend(ewah(deleted));
+        data.extend(ewah(replaced));
+        data
+    }
+
+    #[test]
+    fn reads_a_split_index_through_its_shared_half() {
+        let base_id = [0xab; 20];
+        let mut shared = v2_index(&["a.txt", "b.txt", "c.txt", "d.txt"]);
+        shared.extend_from_slice(&base_id);
+        // `b.txt` deleted; `c.txt` replaced by the nameless first entry;
+        // `e.txt` added.
+        let split = with_extension(
+            v2_index(&["", "e.txt"]),
+            b"link",
+            &link(&base_id, &[1], &[2]),
+        );
+        let tracked = parse_index_with(&split, |hash| {
+            (hash == "ab".repeat(20)).then(|| shared.clone())
+        })
+        .expect("parses");
+        assert_eq!(tracked.len(), 4);
+        for path in ["a.txt", "c.txt", "d.txt", "e.txt"] {
+            assert!(tracked.contains(path), "{path}");
+        }
+        assert!(!tracked.contains("b.txt"));
+        assert!(!tracked.contains(""));
+
+        // Without the bitmaps nothing is deleted or replaced.
+        let split = with_extension(v2_index(&["e.txt"]), b"link", &base_id);
+        let tracked = parse_index_with(&split, |_| Some(shared.clone())).expect("parses");
+        assert_eq!(tracked.len(), 5);
+    }
+
+    #[test]
+    fn a_split_index_without_a_matching_shared_half_is_refused() {
+        let base_id = [0xab; 20];
+        let split = with_extension(v2_index(&["e.txt"]), b"link", &link(&base_id, &[], &[]));
+        // Reading only the split half would claim one tracked file.
+        assert!(parse_index(&split).is_none());
+
+        let mut stale = v2_index(&["a.txt"]);
+        stale.extend_from_slice(&[0xcd; 20]);
+        assert!(parse_index_with(&split, |_| Some(stale.clone())).is_none());
+
+        // Bits beyond the shared index, or more replacements than the split
+        // index has entries, are corrupt.
+        let mut shared = v2_index(&["a.txt"]);
+        shared.extend_from_slice(&base_id);
+        for data in [link(&base_id, &[1], &[]), link(&base_id, &[], &[0])] {
+            let split = with_extension(v2_index(&[]), b"link", &data);
+            assert!(parse_index_with(&split, |_| Some(shared.clone())).is_none());
+        }
+
+        // A null base needs no shared half.
+        let split = with_extension(v2_index(&["e.txt"]), b"link", &[0; 20]);
+        assert!(parse_index(&split).expect("parses").contains("e.txt"));
+    }
+
+    #[test]
+    fn ewah_runs_and_literals_are_bounded_by_the_shared_index() {
+        // A run of ones over one word, then one literal with bit 3 set.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&128u32.to_be_bytes());
+        bytes.extend_from_slice(&2u32.to_be_bytes());
+        bytes.extend_from_slice(&(1u64 | (1 << 1) | (1 << 33)).to_be_bytes());
+        bytes.extend_from_slice(&(1u64 << 3).to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        let mut bits = Vec::new();
+        read_ewah(&bytes, 100, |bit| {
+            bits.push(bit);
+            true
+        })
+        .expect("reads");
+        assert_eq!(bits, (0..64).chain([67]).collect::<Vec<_>>());
+        assert!(read_ewah(&bytes, 67, |_| true).is_none());
+        assert!(read_ewah(&bytes, 60, |_| true).is_none());
+        // A marker announcing more literal words than the bitmap holds.
+        bytes[8] = 0x01;
+        assert!(read_ewah(&bytes, 1 << 20, |_| true).is_none());
+    }
+
+    #[test]
+    fn reads_the_split_indexes_git_writes() {
+        let run = |root: &Path, args: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            for (key, _) in std::env::vars_os() {
+                if key
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("GIT_")
+                {
+                    command.env_remove(key);
+                }
+            }
+            let empty = root.join("..").join("empty-config");
+            std::fs::write(&empty, "").expect("write config");
+            let output = command
+                .current_dir(root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &empty)
+                .args([
+                    "-c",
+                    "user.name=Split Index",
+                    "-c",
+                    "user.email=split@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.splitIndex=true",
+                    "-c",
+                    "splitIndex.maxPercentChange=100",
+                    "-c",
+                    "index.skipHash=false",
+                ])
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        for version in ["2", "4"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path().join("repo");
+            std::fs::create_dir_all(root.join("dir")).expect("mkdir");
+            run(&root, &["init", "-q"]);
+            for file in 0..40 {
+                std::fs::write(root.join(format!("dir/f{file:02}.txt")), "base").expect("write");
+            }
+            run(&root, &["add", "."]);
+            run(&root, &["commit", "-q", "-m", "base"]);
+            run(&root, &["update-index", "--index-version", version]);
+            run(&root, &["update-index", "--split-index"]);
+            run(&root, &["rm", "-q", "dir/f03.txt"]);
+            std::fs::write(root.join("dir/f05.txt"), "changed").expect("write");
+            std::fs::create_dir_all(root.join("new")).expect("mkdir");
+            std::fs::write(root.join("new/added.txt"), "added").expect("write");
+            run(&root, &["add", "dir/f05.txt", "new/added.txt"]);
+
+            let shared = std::fs::read_dir(root.join(".git"))
+                .expect("read .git")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("sharedindex.")
+                })
+                .count();
+            assert!(shared > 0, "v{version}: git did not split the index");
+            let index = std::fs::read(root.join(".git").join("index")).expect("read index");
+            assert!(
+                index_header(&index).expect("header").1 > 0,
+                "v{version}: the changes were not layered on the shared index"
+            );
+            assert!(
+                parse_index(&index).is_none(),
+                "v{version}: the split half alone is incomplete"
+            );
+
+            let listed = run(&root, &["ls-files", "-z"]);
+            let expected: Vec<&str> = listed
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| std::str::from_utf8(path).expect("utf-8"))
+                .collect();
+            let tracked = load_tracked(&root).expect("loads a split index");
+            assert_eq!(tracked.len(), expected.len(), "v{version}");
+            for path in &expected {
+                assert!(tracked.contains(path), "v{version}: {path}");
+            }
+            assert!(tracked.contains("new/added.txt"), "v{version}");
+            assert!(tracked.contains("dir/f05.txt"), "v{version}");
+            assert!(!tracked.contains("dir/f03.txt"), "v{version}");
+        }
     }
 
     #[test]

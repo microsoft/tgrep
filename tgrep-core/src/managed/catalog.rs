@@ -646,6 +646,21 @@ impl Namespace {
         Ok(result)
     }
 
+    /// Writers checkpoint only past a quarter of the metadata budget, so up to
+    /// that many reclaimable WAL bytes can count against storage admission.
+    /// Returns whether committed frames were checkpointed and truncated.
+    pub(crate) fn truncate_catalog_wal(&self) -> Result<bool> {
+        let _timing = self.catalog_metrics.start();
+        self.verify_identity()?;
+        let connection = self
+            .database
+            .lock()
+            .map_err(|_| Error::corrupt("catalog lock poisoned"))?;
+        let checkpoint = super::catalog_io::truncate_wal(&connection, &self.directory)?;
+        self.directory.verify()?;
+        Ok(checkpoint.is_some_and(|checkpoint| !checkpoint.busy))
+    }
+
     fn verify_identity(&self) -> Result<()> {
         const ANCHORS: [&str; 3] = ["owner.lock", "activity.lock", "catalog.sqlite"];
         let observed = self.directory.observe_files(&ANCHORS)?;

@@ -790,7 +790,13 @@ mod tests {
         }
         let permit = namespace
             .reserve(&attachment.id, None, request.clone())
-            .expect("reclamation must reopen admission without increasing the allocation");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "reclamation must reopen admission without increasing the allocation: \
+                     {error:?}; usage: {}",
+                    serde_json::to_string(&namespace.work_usage().unwrap()).unwrap()
+                )
+            });
         assert_eq!(
             namespace.allocation().unwrap().storage_bytes,
             Some(16 * MIB)

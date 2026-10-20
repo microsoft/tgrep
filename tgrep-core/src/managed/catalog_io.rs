@@ -98,12 +98,20 @@ pub(super) fn admit_control(connection: &Connection, metadata: u64, additional: 
     Ok(())
 }
 
+/// Checkpoint any committed WAL frames, regardless of the write-time threshold.
+pub(super) fn truncate_wal(
+    connection: &Connection,
+    directory: &Directory,
+) -> Result<Option<Checkpoint>> {
+    checkpoint(connection, directory, 1)
+}
+
 fn checkpoint(
     connection: &Connection,
     directory: &Directory,
-    limit: u64,
+    minimum_wal_bytes: u64,
 ) -> Result<Option<Checkpoint>> {
-    if file_bytes(directory, "catalog.sqlite-wal")? < limit / 4 {
+    if file_bytes(directory, "catalog.sqlite-wal")? < minimum_wal_bytes {
         return Ok(None);
     }
     connection.busy_timeout(Duration::ZERO)?;
@@ -281,7 +289,7 @@ pub(super) fn begin<'a>(
             .metadata_bytes
             .min(change.policy.work.metadata_bytes)
     });
-    let checkpoint = checkpoint(connection, directory, threshold)?;
+    let checkpoint = checkpoint(connection, directory, threshold / 4)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Policy, physical lengths and page ceiling are read after acquiring the actual
     // SQLite writer lock. Independent protected readers cannot spend stale headroom.

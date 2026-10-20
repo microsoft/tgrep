@@ -341,7 +341,7 @@ impl Namespace {
                 "reservations need positive byte and slot limits",
             ));
         }
-        let (metadata, allocated) = self.catalog_file_usage()?;
+        let (mut metadata, mut allocated) = self.catalog_file_usage()?;
         if operation_record.cancelled
             || (!reclamation && operation_record.committed_state != CommitState::NotCommitted)
             || !matches!(
@@ -364,91 +364,109 @@ impl Namespace {
             error: None,
         };
         let mut memory = self.memory.lock()?;
-        self.transaction(|transaction| {
-            ensure_admission(transaction)?;
-            let current: u64 = transaction.query_row(
-                "SELECT policy_version FROM state WHERE singleton=1",
-                [],
-                |row| unsigned(row, 0),
-            )?;
-            if current != versioned.version {
-                return Err(Error::stale_version(current));
-            }
-            let allocation = allocation_row(transaction)?;
-            if allocation.version != record.request.allocation_version {
-                return Err(Error::stale_version(allocation.version));
-            }
-            let already: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM reservations WHERE operation_id=?1)",
-                [operation.as_str()],
-                |row| row.get(0),
-            )?;
-            if already {
-                return Err(Error::busy("operation-already-reserved"));
-            }
-            let usage = reserved_usage(transaction, metadata, allocated, &mut memory)?;
-            let private = usage
-                .reserved_private_bytes
-                .checked_add(usage.memory.unreserved_retained_private_estimate_bytes)
-                .ok_or_else(|| Error::pressure("private-account-overflow"))?;
-            if let Some(minimum) = private_minimum {
-                let remaining = allocation
-                    .private_work_bytes
-                    .min(policy.work.private_work_bytes)
-                    .saturating_sub(private);
-                record.request.private_bytes = record.request.private_bytes.min(remaining);
-                if record.request.private_bytes < minimum {
-                    return Err(Error::pressure("private-work-allocation"));
+        let mut wal_reclaimed = false;
+        loop {
+            let admitted = self.transaction(|transaction| {
+                ensure_admission(transaction)?;
+                let current: u64 = transaction.query_row(
+                    "SELECT policy_version FROM state WHERE singleton=1",
+                    [],
+                    |row| unsigned(row, 0),
+                )?;
+                if current != versioned.version {
+                    return Err(Error::stale_version(current));
                 }
-            }
-            for (used, wanted, limit, reason) in [
-                (
-                    usage.reserved_staging_bytes,
-                    record.request.staging_bytes,
-                    allocation.staging_bytes.min(policy.work.staging_bytes),
-                    "staging-allocation",
-                ),
-                (
-                    private,
-                    record.request.private_bytes,
-                    allocation
+                let allocation = allocation_row(transaction)?;
+                if allocation.version != record.request.allocation_version {
+                    return Err(Error::stale_version(allocation.version));
+                }
+                let already: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM reservations WHERE operation_id=?1)",
+                    [operation.as_str()],
+                    |row| row.get(0),
+                )?;
+                if already {
+                    return Err(Error::busy("operation-already-reserved"));
+                }
+                let usage = reserved_usage(transaction, metadata, allocated, &mut memory)?;
+                let private = usage
+                    .reserved_private_bytes
+                    .checked_add(usage.memory.unreserved_retained_private_estimate_bytes)
+                    .ok_or_else(|| Error::pressure("private-account-overflow"))?;
+                if let Some(minimum) = private_minimum {
+                    let remaining = allocation
                         .private_work_bytes
-                        .min(policy.work.private_work_bytes),
-                    "private-work-allocation",
-                ),
-                (
-                    usage.reserved_slots,
-                    u64::from(record.request.slots),
-                    u64::from(allocation.work_slots.min(policy.work.workers)),
-                    "work-slot-allocation",
-                ),
-            ] {
-                if used.checked_add(wanted).is_none_or(|total| total > limit) {
-                    return Err(Error::pressure(reason));
+                        .min(policy.work.private_work_bytes)
+                        .saturating_sub(private);
+                    record.request.private_bytes = record.request.private_bytes.min(remaining);
+                    if record.request.private_bytes < minimum {
+                        return Err(Error::pressure("private-work-allocation"));
+                    }
                 }
-            }
-            if let Some(limit) = allocation.storage_bytes.filter(|_| !reclamation) {
-                let wanted = usage
-                    .storage
-                    .charged_overlap_logical_bytes
-                    .checked_add(record.request.staging_bytes);
-                if wanted.is_none_or(|value| value > limit) {
-                    return Err(Error::pressure("namespace-storage-allocation"));
+                for (used, wanted, limit, reason) in [
+                    (
+                        usage.reserved_staging_bytes,
+                        record.request.staging_bytes,
+                        allocation.staging_bytes.min(policy.work.staging_bytes),
+                        "staging-allocation",
+                    ),
+                    (
+                        private,
+                        record.request.private_bytes,
+                        allocation
+                            .private_work_bytes
+                            .min(policy.work.private_work_bytes),
+                        "private-work-allocation",
+                    ),
+                    (
+                        usage.reserved_slots,
+                        u64::from(record.request.slots),
+                        u64::from(allocation.work_slots.min(policy.work.workers)),
+                        "work-slot-allocation",
+                    ),
+                ] {
+                    if used.checked_add(wanted).is_none_or(|total| total > limit) {
+                        return Err(Error::pressure(reason));
+                    }
                 }
+                if let Some(limit) = allocation.storage_bytes.filter(|_| !reclamation) {
+                    let wanted = usage
+                        .storage
+                        .charged_overlap_logical_bytes
+                        .checked_add(record.request.staging_bytes);
+                    if wanted.is_none_or(|value| value > limit) {
+                        return Err(Error::pressure("namespace-storage-allocation"));
+                    }
+                }
+                transaction.execute(
+                    "INSERT INTO reservations VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        record.id.as_str(),
+                        operation.as_str(),
+                        owner.map(Id::as_str),
+                        sql_integer(record.request.staging_bytes)?,
+                        record.request.slots,
+                        text(&record)?
+                    ],
+                )?;
+                Ok(())
+            });
+            match admitted {
+                // Charged catalog bytes include WAL frames that a checkpoint
+                // reclaims; refusing on them would hold admission closed until
+                // unrelated writes happen to cross the checkpoint threshold.
+                Err(error)
+                    if error.reason_code == "namespace-storage-allocation" && !wal_reclaimed =>
+                {
+                    wal_reclaimed = true;
+                    if !self.truncate_catalog_wal()? {
+                        return Err(error);
+                    }
+                    (metadata, allocated) = self.catalog_file_usage()?;
+                }
+                admitted => break admitted?,
             }
-            transaction.execute(
-                "INSERT INTO reservations VALUES(?1,?2,?3,?4,?5,?6)",
-                params![
-                    record.id.as_str(),
-                    operation.as_str(),
-                    owner.map(Id::as_str),
-                    sql_integer(record.request.staging_bytes)?,
-                    record.request.slots,
-                    text(&record)?
-                ],
-            )?;
-            Ok(())
-        })?;
+        }
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(remaining_ms))
             .ok_or_else(|| Error::invalid("operation deadline overflow"))?;
@@ -1611,6 +1629,63 @@ pub(crate) mod tests {
         assert_eq!(namespace.work_revision.load(Ordering::Acquire), revision);
         std::thread::sleep(CONTROL_REFRESH + Duration::from_millis(10));
         assert_eq!(permit.check().unwrap_err().reason_code, "owner-ended");
+    }
+
+    #[test]
+    fn storage_admission_reclaims_catalog_wal_before_refusing() {
+        const MIB: u64 = 1024 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = Namespace::initialize_identity(
+            &"a".repeat(64),
+            temp.path(),
+            crate::managed::policy::fixture_policy(),
+        )
+        .unwrap();
+        namespace.activate().unwrap();
+        let wal = || {
+            std::fs::metadata(namespace.path().join("catalog.sqlite-wal"))
+                .map_or(0, |metadata| metadata.len())
+        };
+        // Writers checkpoint only past metadata_bytes / 4 (4 MiB here).
+        let mut allocation = namespace.allocation().unwrap();
+        while wal() < MIB {
+            allocation = namespace
+                .update_allocation(allocation.version, allocation)
+                .unwrap();
+        }
+        let before = wal();
+        assert!(before < 4 * MIB);
+        let charged = namespace
+            .work_usage()
+            .unwrap()
+            .storage
+            .charged_overlap_logical_bytes;
+        // Admission fits only once the WAL frames are reclaimed.
+        allocation.storage_bytes = Some(charged + MIB - before / 2);
+        let allocation = namespace
+            .update_allocation(allocation.version, allocation)
+            .unwrap();
+        let operation = namespace
+            .accept_system_operation(
+                Token::parse("after-wal-growth").unwrap(),
+                "build",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let permit = namespace
+            .reserve(
+                &operation.id,
+                None,
+                WorkRequest {
+                    allocation_version: allocation.version,
+                    staging_bytes: MIB,
+                    private_bytes: MIB,
+                    slots: 1,
+                },
+            )
+            .unwrap();
+        assert!(wal() < before, "{} >= {before}", wal());
+        drop(permit);
     }
 
     #[test]

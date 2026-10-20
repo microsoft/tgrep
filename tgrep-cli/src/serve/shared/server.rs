@@ -1310,6 +1310,7 @@ pub(super) fn search_snapshot(
     files: bool,
     id: &Value,
     metadata: Value,
+    page_time: Duration,
 ) -> Result<Value> {
     search_snapshot_with(
         source,
@@ -1317,7 +1318,7 @@ pub(super) fn search_snapshot(
         files,
         id,
         metadata,
-        PAGE_TIME,
+        page_time,
         |groups, search| {
             groups
                 .iter()
@@ -1355,32 +1356,47 @@ pub(super) fn search_snapshot_parallel(
 
 type Searched = Vec<(crate::serve::FileSearchResult, usize)>;
 
-/// One window's shared response budget. A worker that cannot charge a whole
-/// file stops the window, which then ends the page or fails the query.
+/// One window's shared response budget and page deadline. A worker that
+/// cannot charge a whole file, or reaches the deadline at a file boundary,
+/// stops the window, which then ends the page or fails the query.
 struct GroupSearch<'a> {
     matcher: &'a crate::matching::SearchMatcher,
     opts: &'a crate::serve::SearchOpts,
     encoding: tgrep_core::encoding::EncodingMode,
     remaining: std::sync::atomic::AtomicUsize,
+    deadline: Option<Instant>,
     stopped: AtomicBool,
 }
 
 impl<'a> GroupSearch<'a> {
-    fn new(request: &'a crate::serve::SearchRequest, remaining: usize) -> Self {
+    fn new(
+        request: &'a crate::serve::SearchRequest,
+        remaining: usize,
+        deadline: Option<Instant>,
+    ) -> Self {
         Self {
             matcher: &request.matcher,
             opts: &request.opts,
             encoding: request.encoding,
             remaining: remaining.into(),
+            deadline,
             stopped: AtomicBool::new(false),
         }
+    }
+
+    fn halted(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// Searched files in order; fewer than `siblings` means the rest did not
     /// fit or were not searched.
     fn search(&self, source: &impl QuerySource, siblings: &[String]) -> Result<Searched> {
         let mut files = Vec::new();
-        if self.stopped.load(Ordering::Relaxed) {
+        if self.halted() {
+            self.stopped.store(true, Ordering::Relaxed);
             return Ok(files);
         }
         let result = (|| {
@@ -1395,7 +1411,7 @@ impl<'a> GroupSearch<'a> {
                 .transpose()?
                 .flatten();
             for relative in siblings {
-                if self.stopped.load(Ordering::Relaxed) {
+                if self.halted() {
                     break;
                 }
                 let Some(bytes) = read_candidate(source, batch.as_ref(), relative)? else {
@@ -1431,8 +1447,13 @@ impl<'a> GroupSearch<'a> {
                     return candidate_failed(source, &siblings[0], error.into())
                         .map(|_: Option<()>| ());
                 }
-                // The group's reads may have crossed a replaced parent.
+                // The group's reads may have crossed a replaced parent: skip
+                // them like vanished candidates, refunding their response
+                // budget, and serve the paths once the refresh publishes.
                 source.requeue(siblings)?;
+                let claimed: usize = files.iter().map(|(_, bytes)| bytes).sum();
+                self.remaining.fetch_add(claimed, Ordering::AcqRel);
+                files.fill_with(Default::default);
             }
             Ok(())
         })();
@@ -1576,12 +1597,13 @@ fn search_snapshot_with<S: QuerySource>(
         let mut searched = 0_usize;
         let mut next = None;
         let width = rayon::current_num_threads().max(1) * 4;
+        let deadline = paged.then(|| start.checked_add(page_time)).flatten();
         'page: for (number, window) in groups.chunks(width).enumerate() {
             if paged && number > 0 && start.elapsed() >= page_time {
                 next = Some(&window[0][0]);
                 break;
             }
-            let search = GroupSearch::new(&request, budget.remaining);
+            let search = GroupSearch::new(&request, budget.remaining, deadline);
             let results = run(window, &search)
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
@@ -1591,9 +1613,9 @@ fn search_snapshot_with<S: QuerySource>(
                     let found = match found.next() {
                         Some(found) => Some(found),
                         // A page always makes progress unless one file alone
-                        // exceeds the response cap.
+                        // exceeds the response cap, even past its deadline.
                         None if paged && searched == 0 => {
-                            GroupSearch::new(&request, budget.remaining)
+                            GroupSearch::new(&request, budget.remaining, None)
                                 .search(source, std::slice::from_ref(relative))?
                                 .pop()
                         }

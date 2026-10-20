@@ -3358,6 +3358,10 @@ mod candidate_read_tests {
         SnapshotBeforeRead(usize),
         SnapshotAfterRead(usize),
         Check,
+        /// Swap this root-relative directory for a copy without `shared_term`
+        /// after the call completes, so a pinned batch reads the old one.
+        #[cfg(unix)]
+        ReplaceAfter(usize, &'static str),
     }
 
     /// Wraps the real managed source, injecting the typed failures that
@@ -3387,6 +3391,19 @@ mod candidate_read_tests {
                 Inject::SnapshotAfterRead(at) if at == call => {
                     let _opened = self.inner.snapshot(read)?;
                     Err(Error::busy("query-snapshot-changed").into())
+                }
+                #[cfg(unix)]
+                Inject::ReplaceAfter(at, directory) if at == call => {
+                    let opened = self.inner.snapshot(read)?;
+                    let directory = self.root().join(directory);
+                    let saved = directory.with_file_name("replaced-original");
+                    std::fs::rename(&directory, &saved).unwrap();
+                    std::fs::create_dir(&directory).unwrap();
+                    for entry in std::fs::read_dir(&saved).unwrap() {
+                        let name = entry.unwrap().file_name();
+                        std::fs::write(directory.join(name), "replacement\n").unwrap();
+                    }
+                    Ok(opened)
                 }
                 _ => self.inner.snapshot(read),
             }
@@ -3425,119 +3442,242 @@ mod candidate_read_tests {
         candidate_read_failures(true);
     }
 
-    fn candidate_read_failures(stale_reads: bool) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("repository");
-        let storage = temp.path().join("storage");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(&storage).unwrap();
-        git(&root, &["init", "--quiet"]);
-        std::fs::write(root.join("source.txt"), "shared_term\n").unwrap();
-        std::fs::write(root.join("sibling.txt"), "shared_term sibling\n").unwrap();
-        git(&root, &["add", "."]);
-        git(&root, &["commit", "--quiet", "-m", "initial"]);
-        let repository = Repository::discover(&root).unwrap();
-        let policy: Policy = serde_json::from_value(json!({
-            "schema":2,"storage":"managed","retention":{"mode":"retain-all"},"advancement":{"mode":"fixed"},
-            "work":{
-                "max_views":8,"max_leases":32,"workers":2,"queue_items":16,
-                "staging_bytes":67108864,"private_work_bytes":67108864,
-                "sort_buffer_bytes":1048576,"blob_bytes":1048576,"operation_timeout_ms":30000,
-                "page_objects":16,"max_cursors":8,"cursor_lifetime_ms":30000,"max_receipts":1024,
-                "metadata_bytes":16777216
-            },
-            "collection":{
-                "schedule":{"mode":"disabled"},"on_pressure":false,
-                "checkpoint_grace_ms":0,"generation_grace_ms":0,
-                "max_duration_ms":1000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,
-                "chunk_bytes":65536,"max_pages":4,"retry_ms":100
-            }
-        }))
-        .unwrap();
-        let namespace = Namespace::initialize(&repository, &storage, policy).unwrap();
-        let prepared = namespace.prepare_owner().unwrap();
-        let owner = managed::OwnerGuard::claim(prepared.claim).unwrap();
-        namespace.register_owner(owner.registration()).unwrap();
-        let manager = ViewManager::new(
-            Arc::clone(&namespace),
-            None,
-            WorktreeOptions {
-                stale_reads,
-                ..WorktreeOptions::default()
-            },
-            None,
+    #[test]
+    fn page_deadline_returns_the_searched_prefix_and_a_cursor() {
+        let fixture = Fixture::new(false, &["sibling.txt", "source.txt"]);
+        let page = |page: Value, page_time: Duration| {
+            super::super::server::search_snapshot(
+                &fixture.source(Inject::Nothing),
+                &json!({"pattern":"shared_term","page":page}),
+                false,
+                &json!(1),
+                json!({}),
+                page_time,
+            )
+            .unwrap()
+        };
+        let files = |result: &Value| -> Vec<String> {
+            result["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["file"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let whole = page(Value::Null, super::super::server::PAGE_TIME);
+        assert_eq!(files(&whole), ["sibling.txt", "source.txt"], "{whole}");
+        assert_eq!(whole["next_page"], Value::Null);
+        // An expired deadline stops the sibling group at a file boundary;
+        // each page still searches one file.
+        let first = page(Value::Null, Duration::ZERO);
+        assert_eq!(files(&first), ["sibling.txt"], "{first}");
+        assert_eq!(first["next_page"], "source.txt");
+        let last = page(first["next_page"].clone(), Duration::ZERO);
+        assert_eq!(files(&last), ["source.txt"], "{last}");
+        assert_eq!(last["next_page"], Value::Null);
+        assert!(fixture.ready());
+        fixture.close();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eventual_views_discard_a_group_read_across_a_replaced_parent() {
+        let fixture = Fixture::new(true, &["group/one.txt", "group/two.txt"]);
+        let epoch = fixture.slot.input_epoch();
+        let source = fixture.source(Inject::ReplaceAfter(1, "group"));
+        let result = super::super::server::search_snapshot(
+            &source,
+            &json!({"pattern":"shared_term"}),
+            false,
+            &json!(1),
+            json!({}),
+            super::super::server::PAGE_TIME,
         )
         .unwrap();
-        let operation = manager
-            .accept_attach(
-                OperationToken {
-                    scope: owner.registration().owner.clone(),
-                    sequence: 1,
-                    token: Token::parse("read-attach").unwrap(),
+        // The pinned batch read the original `shared_term` contents, but its
+        // parent changed, so those rows are dropped and both paths requeued.
+        assert_eq!(result["matches"], json!([]), "{result}");
+        assert_eq!((source.invalidations.get(), source.requeues.get()), (0, 2));
+        assert_eq!(fixture.slot.input_epoch(), epoch + 1);
+        assert!(!fixture.ready());
+        drop(source);
+        fixture.close();
+    }
+
+    /// A managed view over committed `files`, each containing `shared_term`.
+    /// Eventual views finish their first verification, so both start ready.
+    struct Fixture {
+        temp: tempfile::TempDir,
+        root: PathBuf,
+        repository: Repository,
+        namespace: Arc<Namespace>,
+        owner: managed::OwnerGuard,
+        manager: ViewManager,
+        record: managed::ViewRecord,
+        slot: Arc<ViewSlot>,
+    }
+
+    impl Fixture {
+        fn new(stale_reads: bool, files: &[&str]) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("repository");
+            let storage = temp.path().join("storage");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&storage).unwrap();
+            git(&root, &["init", "--quiet"]);
+            for file in files {
+                let path = root.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, format!("shared_term {file}\n")).unwrap();
+            }
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "--quiet", "-m", "initial"]);
+            let repository = Repository::discover(&root).unwrap();
+            let policy: Policy = serde_json::from_value(json!({
+                "schema":2,"storage":"managed","retention":{"mode":"retain-all"},"advancement":{"mode":"fixed"},
+                "work":{
+                    "max_views":8,"max_leases":32,"workers":2,"queue_items":16,
+                    "staging_bytes":67108864,"private_work_bytes":67108864,
+                    "sort_buffer_bytes":1048576,"blob_bytes":1048576,"operation_timeout_ms":30000,
+                    "page_objects":16,"max_cursors":8,"cursor_lifetime_ms":30000,"max_receipts":1024,
+                    "metadata_bytes":16777216
                 },
-                AttachRequest {
-                    root: root.clone(),
-                    revision: Some("HEAD".into()),
-                    profile: IndexingProfile::default(),
-                    lease: Token::parse("read-client").unwrap(),
-                    owner: owner.registration().owner.clone(),
-                    accept_current: None,
-                    migratable: true,
-                    allocation_version: 1,
+                "collection":{
+                    "schedule":{"mode":"disabled"},"on_pressure":false,
+                    "checkpoint_grace_ms":0,"generation_grace_ms":0,
+                    "max_duration_ms":1000,"max_examined":64,"max_removed":16,"max_delete_bytes":1048576,
+                    "chunk_bytes":65536,"max_pages":4,"retry_ms":100
+                }
+            }))
+            .unwrap();
+            let namespace = Namespace::initialize(&repository, &storage, policy).unwrap();
+            let prepared = namespace.prepare_owner().unwrap();
+            let owner = managed::OwnerGuard::claim(prepared.claim).unwrap();
+            namespace.register_owner(owner.registration()).unwrap();
+            let manager = ViewManager::new(
+                Arc::clone(&namespace),
+                None,
+                WorktreeOptions {
+                    stale_reads,
+                    ..WorktreeOptions::default()
                 },
+                None,
             )
             .unwrap();
-        let completed = manager.execute(&operation.id).unwrap();
-        assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
-        let result = completed.result.unwrap();
-        if stale_reads {
-            assert_eq!(result["reconcile"]["provisional_files"], 2);
-        }
-        let record: managed::ViewRecord =
-            serde_json::from_value(result["current"].clone()).unwrap();
-        let slot = manager.slot(&record.id).unwrap();
-        if stale_reads {
-            let status = manager.status(&record.id).unwrap();
-            assert!(!status.ready);
-            assert!(status.serving);
             let operation = manager
-                .accept_refresh(
+                .accept_attach(
                     OperationToken {
                         scope: owner.registration().owner.clone(),
-                        sequence: 2,
-                        token: Token::parse("first-verify").unwrap(),
+                        sequence: 1,
+                        token: Token::parse("read-attach").unwrap(),
                     },
-                    RefreshRequest {
-                        view: record.id.clone(),
-                        expected_version: record.version,
+                    AttachRequest {
+                        root: root.clone(),
+                        revision: Some("HEAD".into()),
+                        profile: IndexingProfile::default(),
+                        lease: Token::parse("read-client").unwrap(),
                         owner: owner.registration().owner.clone(),
+                        accept_current: None,
+                        migratable: true,
                         allocation_version: 1,
                     },
                 )
                 .unwrap();
-            assert_eq!(
-                manager.execute(&operation.id).unwrap().state,
-                OperationState::Completed
-            );
-            assert!(manager.status(&record.id).unwrap().ready);
+            let completed = manager.execute(&operation.id).unwrap();
+            assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+            let result = completed.result.unwrap();
+            if stale_reads {
+                assert_eq!(result["reconcile"]["provisional_files"], files.len());
+            }
+            let record: managed::ViewRecord =
+                serde_json::from_value(result["current"].clone()).unwrap();
+            let slot = manager.slot(&record.id).unwrap();
+            if stale_reads {
+                let status = manager.status(&record.id).unwrap();
+                assert!(!status.ready);
+                assert!(status.serving);
+                let operation = manager
+                    .accept_refresh(
+                        OperationToken {
+                            scope: owner.registration().owner.clone(),
+                            sequence: 2,
+                            token: Token::parse("first-verify").unwrap(),
+                        },
+                        RefreshRequest {
+                            view: record.id.clone(),
+                            expected_version: record.version,
+                            owner: owner.registration().owner.clone(),
+                            allocation_version: 1,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    manager.execute(&operation.id).unwrap().state,
+                    OperationState::Completed
+                );
+                assert!(manager.status(&record.id).unwrap().ready);
+            }
+            Self {
+                temp,
+                root,
+                repository,
+                namespace,
+                owner,
+                manager,
+                record,
+                slot,
+            }
         }
-        let run = |inject: Inject| {
-            let source = Scripted {
+
+        fn source(&self, inject: Inject) -> Scripted {
+            Scripted {
                 inner: ManagedQuery {
-                    query: slot.query(record.version).unwrap(),
-                    slot: Arc::clone(&slot),
+                    query: self.slot.query(self.record.version).unwrap(),
+                    slot: Arc::clone(&self.slot),
                 },
                 inject,
                 snapshots: Cell::new(0),
                 invalidations: Cell::new(0),
                 requeues: Cell::new(0),
-            };
+            }
+        }
+
+        fn ready(&self) -> bool {
+            self.manager.status(&self.record.id).unwrap().ready
+        }
+
+        fn close(self) {
+            let Self {
+                temp,
+                repository,
+                namespace,
+                owner,
+                manager,
+                slot,
+                ..
+            } = self;
+            drop((slot, manager, owner, namespace, repository));
+            temp.close().unwrap();
+        }
+    }
+
+    fn candidate_read_failures(stale_reads: bool) {
+        let fixture = Fixture::new(stale_reads, &["source.txt", "sibling.txt"]);
+        let (root, manager, slot, record) = (
+            &fixture.root,
+            &fixture.manager,
+            &fixture.slot,
+            &fixture.record,
+        );
+        let run = |inject: Inject| {
+            let source = fixture.source(inject);
             let result = super::super::server::search_snapshot(
                 &source,
                 &json!({"pattern":"shared_term"}),
                 false,
                 &json!(1),
                 json!({}),
+                super::super::server::PAGE_TIME,
             );
             (
                 result,
@@ -3607,7 +3747,6 @@ mod candidate_read_tests {
             assert_eq!(slot.input_epoch(), epoch + 1);
             assert!(!manager.status(&record.id).unwrap().ready);
         }
-        drop((slot, manager, owner, namespace, repository));
-        temp.close().unwrap();
+        fixture.close();
     }
 }

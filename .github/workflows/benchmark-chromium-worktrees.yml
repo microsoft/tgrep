@@ -13,6 +13,9 @@ on:
         description: Tracked files to modify in the last worktree before attaching it
         default: "16"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

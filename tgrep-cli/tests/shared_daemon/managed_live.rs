@@ -85,7 +85,7 @@ fn ready_views_and_migration_continue_while_a_catalog_reader_pins_the_wal() {
     let configured = policy();
     let mut daemon = start(&fixture, &configured, &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    let attached = attached(
+    let attached = verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -97,7 +97,7 @@ fn ready_views_and_migration_continue_while_a_catalog_reader_pins_the_wal() {
     sibling["token"] = token(&claim, 2);
     sibling["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
     sibling["request"]["lease"] = json!("sibling-client");
-    let sibling = attached(&daemon, &daemon.rpc("views.attach", sibling));
+    let sibling = verified_attach(&daemon, &daemon.rpc("views.attach", sibling));
     let sibling_id = sibling["result"]["current"]["id"].clone();
     wait_for(
         &daemon,
@@ -198,7 +198,7 @@ fn concurrent_clients_share_one_new_publication_with_distinct_exact_commits_and_
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, mut holder) = held_owner(&fixture, &daemon);
-    attached(
+    verified_attach(
         &daemon,
         &manage(&fixture.a, "views.attach", attach_input(&fixture, &claim)),
     );
@@ -309,7 +309,7 @@ fn conflicting_process_migrations_commit_once_and_replay_each_original_receipt()
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (first, mut first_holder) = held_owner(&fixture, &daemon);
-    attached(
+    verified_attach(
         &daemon,
         &manage(&fixture.a, "views.attach", attach_input(&fixture, &first)),
     );
@@ -389,7 +389,7 @@ fn preparation_invalidations_publish_eventually_without_mixing_or_disrupting_a_s
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    attached(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -397,7 +397,7 @@ fn preparation_invalidations_publish_eventually_without_mixing_or_disrupting_a_s
     sibling["token"] = token(&claim, 2);
     sibling["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
     sibling["request"]["lease"] = json!("sibling-view");
-    attached(&daemon, &daemon.rpc("views.attach", sibling));
+    verified_attach(&daemon, &daemon.rpc("views.attach", sibling));
     let view = daemon.rpc(
         "lookup",
         json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
@@ -483,7 +483,7 @@ fn automatic_advancement_recovers_after_a_late_fixed_participant_and_avoids_inef
         "max_paths":32,"max_read_bytes":1048576,"max_attempts":1});
     let mut daemon = start(&fixture, &configured, &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    attached(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -623,7 +623,7 @@ fn independent_repository_allocations_and_offline_collection_preserve_a_live_sib
     let (owner_a, guard_a) = owner(&a);
     let (owner_b, guard_b) = owner(&b);
     for (fixture, daemon, claim) in [(&first, &a, &owner_a), (&second, &b, &owner_b)] {
-        attached(
+        verified_attach(
             daemon,
             &daemon.rpc("views.attach", attach_input(fixture, claim)),
         );
@@ -631,7 +631,7 @@ fn independent_repository_allocations_and_offline_collection_preserve_a_live_sib
         input["token"] = token(claim, 2);
         input["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
         input["request"]["lease"] = json!("linked");
-        attached(daemon, &daemon.rpc("views.attach", input));
+        verified_attach(daemon, &daemon.rpc("views.attach", input));
         let primary = daemon.rpc(
             "lookup",
             json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
@@ -784,7 +784,7 @@ fn healthy_native_views_verify_on_elapsed_poll_intervals_while_serving() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
     let (claim, guard) = owner(&daemon);
-    attached(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -900,7 +900,7 @@ fn periodic_native_verification_repairs_missed_nested_changes() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
     let (claim, guard) = owner(&daemon);
-    attached(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -1013,7 +1013,7 @@ fn native_failure_enables_polling_only_for_the_affected_view() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
     let (claim, guard) = owner(&daemon);
-    attached(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
@@ -1021,7 +1021,7 @@ fn native_failure_enables_polling_only_for_the_affected_view() {
     sibling["token"] = token(&claim, 2);
     sibling["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
     sibling["request"]["lease"] = json!("sibling-client");
-    attached(&daemon, &daemon.rpc("views.attach", sibling));
+    verified_attach(&daemon, &daemon.rpc("views.attach", sibling));
     let native = daemon.rpc(
         "lookup",
         json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
@@ -1129,13 +1129,14 @@ fn no_watch_has_no_timer_repair_but_initial_and_explicit_refresh_verify() {
     fs::write(fixture.a.join("notes.txt"), "shared_term before\n").unwrap();
     let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
     let (claim, guard) = owner(&daemon);
-    let attached = attached(
+    let attached = verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
+    // The first eventual attach serves the base provisionally; the scheduler's
+    // follow-up reconcile performs the initial full content verification.
     assert_eq!(attached["result"]["reconcile"]["full"], true);
-    assert_eq!(attached["result"]["reconcile"]["files_read"], 3);
-    assert_eq!(attached["result"]["reconcile"]["files_extracted"], 1);
+    assert_eq!(attached["result"]["reconcile"]["files_read"], 0);
     let view = daemon.rpc(
         "lookup",
         json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
@@ -1146,6 +1147,9 @@ fn no_watch_has_no_timer_repair_but_initial_and_explicit_refresh_verify() {
         json!({"id":view["view"]}),
         |status| status["ready"] == true && status["work"].is_null(),
     );
+    assert_eq!(before["last_reconcile"]["full"], true);
+    assert_eq!(before["last_reconcile"]["files_read"], 3);
+    assert_eq!(before["last_reconcile"]["files_extracted"], 1);
     let path = fixture.a.join("notes.txt");
     let metadata = fs::metadata(&path).unwrap();
     fs::write(&path, "shared_term missed\n").unwrap();
@@ -1229,7 +1233,7 @@ fn native_watching_smudge_crlf_sparse_and_rescan_repair_preserve_indexed_scan_pa
         &["--watch-mode", "auto", "--poll-interval", "60"],
     );
     let (claim, guard) = owner(&daemon);
-    attached(
+    verified_attach(
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );

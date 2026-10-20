@@ -1058,6 +1058,10 @@ fn display_path(p: &Path) -> String {
 /// Kept separate from [`display_path`] because match output also needs it, and
 /// there the string has already been through `strip_prefix`/`to_string_lossy`.
 fn strip_verbatim_prefix(s: &str) -> String {
+    // Only Windows has verbatim paths; elsewhere `\\?\` is an ordinary name.
+    if !cfg!(windows) {
+        return s.to_string();
+    }
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
     } else if let Some(rest) = s.strip_prefix(r"\\?\") {
@@ -4038,6 +4042,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn explicit_file_path_outside_cwd_is_editor_openable() {
         // A file outside the cwd keeps its absolute path, but must not leak
@@ -4048,11 +4053,21 @@ mod tests {
         assert!(!rendered.contains("//?/"), "got: {rendered}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn explicit_file_path_keeps_unc_shares_usable() {
         assert_eq!(
             explicit_file_display_path(Path::new(r"\\?\UNC\server\share\main.rs")),
             "//server/share/main.rs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_file_path_keeps_unix_backslashes() {
+        assert_eq!(
+            explicit_file_display_path(Path::new(r"/nonexistent-root/a\b.rs")),
+            r"/nonexistent-root/a\b.rs"
         );
     }
 }

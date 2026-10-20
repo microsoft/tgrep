@@ -162,10 +162,20 @@ class Runtime:
         # The server's own serve.lock is the final authority. This lock avoids
         # spawning many competing children before serve.json has been published.
         with (self.state / "start.lock").open("a") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return False
+            # A server inherits this lock for its whole life, so a busy lock
+            # means one is still starting, or is shutting down and has already
+            # withdrawn serve.json. Wait for it to publish or to exit.
+            deadline = time.monotonic() + wait
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if self.status() is not None:
+                        return True
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(0.05)
             if self.status() is not None:
                 return True
             # Keep the lock inherited by the child until it exits. Even slow

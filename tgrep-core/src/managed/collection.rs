@@ -621,6 +621,9 @@ mod tests {
         };
         policy.work.workers = 1;
         policy.work.staging_bytes = 8 * MIB;
+        // The warm-admission operation spans the whole collection loop below,
+        // which can exceed the fixture's 30 s budget on a loaded host.
+        policy.work.operation_timeout_ms = 600_000;
         policy.collection.checkpoint_grace_ms = 3_600_000;
         policy.collection.generation_grace_ms = 86_400_000;
         policy.collection.max_duration_ms = 200;

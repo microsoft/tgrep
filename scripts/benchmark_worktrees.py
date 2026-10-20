@@ -839,11 +839,15 @@ def render_markdown(report):
             f"blobs_read={build.get('blobs_read', 0):,}, files_read={rec.get('files_read') or 0:,}, "
             f"storage {managed['storage_after_base']['bytes'] / GIB:.2f} GiB |")
     for entry in worktrees:
-        attach = entry["attach"]
-        build, rec = attach["build"] or {}, attach.get("verification") or attach["reconcile"]
         dirty = f", dirty files={len(entry['dirty']['modified'])}" if entry.get("dirty") else ""
         lines.append(f"| Worktree {entry['number']}: `git worktree add` "
                      f"| {seconds(entry['checkout_seconds'])} | revision {entry['revision'][:12]} |")
+        attach = entry.get("attach")
+        if attach is None:
+            # A failed or timed-out attachment leaves a partial report entry.
+            lines.append(f"| Worktree {entry['number']}: attach | - | incomplete{dirty} |")
+            continue
+        build, rec = attach["build"] or {}, attach.get("verification") or attach["reconcile"]
         lines.append(serving_row(f"Worktree {entry['number']}: attach to serving", attach))
         lines.append(
             f"| Worktree {entry['number']}: attach to ready | {seconds(attach['ready_seconds'])} "
@@ -856,7 +860,8 @@ def render_markdown(report):
                      f"| {managed['storage_after_worktrees']['bytes'] / GIB:.2f} GiB |")
     if managed:
         views = [("Base", managed["base"])] + [
-            (f"Worktree {entry['number']}", entry["attach"]) for entry in worktrees]
+            (f"Worktree {entry['number']}", entry["attach"]) for entry in worktrees
+            if entry.get("attach") is not None]
         lines += ["", "## Managed attach phases (seconds, from operation receipts)", "",
                   "| View | " + " | ".join(name for _, name in PHASES) + " |",
                   "| --- |" + " ---: |" * len(PHASES)]
@@ -914,6 +919,8 @@ def render_markdown(report):
                      f"{'ok' if overlay['ok'] else 'FAILED'} ({overlay['observed']})")
     for failure in report["failures"]:
         lines.append(f"- FAILED {failure['kind']}: {failure['message']}")
+    if report.get("error"):
+        lines.append(f"- FAILED run: {report['error']}")
     return "\n".join(lines) + "\n"
 
 

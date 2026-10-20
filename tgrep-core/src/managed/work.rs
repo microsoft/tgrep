@@ -341,7 +341,6 @@ impl Namespace {
                 "reservations need positive byte and slot limits",
             ));
         }
-        let (mut metadata, mut allocated) = self.catalog_file_usage()?;
         if operation_record.cancelled
             || (!reclamation && operation_record.committed_state != CommitState::NotCommitted)
             || !matches!(
@@ -388,6 +387,9 @@ impl Namespace {
                 if already {
                     return Err(Error::busy("operation-already-reserved"));
                 }
+                // Sample catalog files under the writer lock: beginning the
+                // transaction may have checkpointed and truncated the WAL.
+                let (metadata, allocated) = self.catalog_file_usage()?;
                 let usage = reserved_usage(transaction, metadata, allocated, &mut memory)?;
                 let private = usage
                     .reserved_private_bytes
@@ -462,7 +464,6 @@ impl Namespace {
                     if !self.truncate_catalog_wal()? {
                         return Err(error);
                     }
-                    (metadata, allocated) = self.catalog_file_usage()?;
                 }
                 admitted => break admitted?,
             }
@@ -1675,6 +1676,70 @@ pub(crate) mod tests {
         let permit = namespace
             .reserve(
                 &operation.id,
+                None,
+                WorkRequest {
+                    allocation_version: allocation.version,
+                    staging_bytes: MIB,
+                    private_bytes: MIB,
+                    slots: 1,
+                },
+            )
+            .unwrap();
+        assert!(wal() < before, "{} >= {before}", wal());
+        drop(permit);
+    }
+
+    #[test]
+    fn storage_admission_samples_catalog_files_after_the_writer_checkpoint() {
+        const MIB: u64 = 1024 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let namespace = Namespace::initialize_identity(
+            &"a".repeat(64),
+            temp.path(),
+            crate::managed::policy::fixture_policy(),
+        )
+        .unwrap();
+        namespace.activate().unwrap();
+        let wal = || {
+            std::fs::metadata(namespace.path().join("catalog.sqlite-wal"))
+                .map_or(0, |metadata| metadata.len())
+        };
+        namespace.truncate_catalog_wal().unwrap();
+        assert_eq!(wal(), 0);
+        let charged = namespace
+            .work_usage()
+            .unwrap()
+            .storage
+            .charged_overlap_logical_bytes;
+        // The reservation fits only without the WAL frames that beginning its
+        // transaction checkpoints.
+        let mut allocation = namespace.allocation().unwrap();
+        allocation.storage_bytes = Some(charged + MIB + MIB / 2);
+        // Writers checkpoint only past metadata_bytes / 4 (4 MiB here); stop
+        // right after a commit crosses it so the next writer truncates first.
+        // The operation is accepted late so its lifetime covers the reserve.
+        let mut operation = None;
+        while wal() < 4 * MIB {
+            if operation.is_none() && wal() >= 3 * MIB {
+                operation = Some(
+                    namespace
+                        .accept_system_operation(
+                            Token::parse("across-wal-threshold").unwrap(),
+                            "build",
+                            serde_json::json!({}),
+                        )
+                        .unwrap(),
+                );
+            } else {
+                allocation = namespace
+                    .update_allocation(allocation.version, allocation)
+                    .unwrap();
+            }
+        }
+        let before = wal();
+        let permit = namespace
+            .reserve(
+                &operation.unwrap().id,
                 None,
                 WorkRequest {
                     allocation_version: allocation.version,

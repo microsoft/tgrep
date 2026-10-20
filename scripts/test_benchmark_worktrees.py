@@ -170,6 +170,22 @@ class Markdown(unittest.TestCase):
         self.assertIn("| `a\\|b` | 12.0 | - (1 failed) | 5 |", markdown)
         self.assertIn("- Every timed query completed: FAILED", markdown)
 
+    def test_partial_report_after_a_failed_worktree_attach(self):
+        # main() writes this shape when attach() raises: managed_phase never
+        # returned, and the last worktree entry has no "attach" field.
+        report = synthetic_report()
+        report["managed"] = None
+        report["queries"] = {}
+        report["private_overlay"] = None
+        report["worktrees"].append({"number": 2, "revision": "0123456789abcdef",
+                                    "checkout_seconds": 7.0, "dirty": None})
+        report["error"] = "attach timed out"
+        markdown = wt.render_markdown(report)
+        self.assertIn("| Worktree 1: attach to ready | 2.0 |", markdown)
+        self.assertIn("| Worktree 2: `git worktree add` | 7.0 | revision 0123456789ab |", markdown)
+        self.assertIn("| Worktree 2: attach | - | incomplete |", markdown)
+        self.assertIn("- FAILED run: attach timed out", markdown)
+
 def binary_or_none():
     try:
         return wt.find_binary()

@@ -4016,6 +4016,7 @@ mod tests {
         assert!(!opts.wants_match_detail());
     }
 
+    #[cfg(windows)]
     #[test]
     fn display_path_strips_extended_length_prefix() {
         assert_eq!(
@@ -4024,12 +4025,22 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn display_path_restores_unc_paths() {
         // Naively stripping `\\?\` would leave a bogus `UNC\server\...` path.
         assert_eq!(
             display_path(Path::new(r"\\?\UNC\server\share\idx")),
             r"\\server\share\idx"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn display_path_keeps_unix_names_that_look_verbatim() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server")),
+            r"\\?\UNC\server"
         );
     }
 

@@ -17,6 +17,7 @@
 #   - Generates a SHA256 sidecar for each signed zip (<zip-name>.sha256)
 #     without modifying the Linux/macOS release workflow's checksums.txt
 #   - Optionally uploads each signed zip and its checksum via GitHubRelease@1 ADO task
+#     (publishing requires ReleaseTag to be a v<version> release tag; each job fails fast otherwise)
 #
 # Prerequisites:
 #   - DeepPrompt ADO project must have access to OneBranch.Pipelines/GovernedTemplates repo
@@ -30,10 +31,13 @@
 trigger: none
 
 parameters:
+  # The default is never a branch name: GitHubRelease@1 creates the tag when no release exists
+  # for it, and a tag named 'main' shadows the 'main' branch (microsoft/tgrep#213).
+  # Outside publishing it only names the artifacts.
   - name: ReleaseTag
-    displayName: 'GitHub Release Tag (e.g. v0.1.10)'
+    displayName: 'GitHub Release Tag (e.g. v0.1.10; required when publishing)'
     type: string
-    default: 'main'
+    default: 'unreleased'
   - name: PublishToGitHub
     displayName: 'Publish signed binary to GitHub Release (only enable after signing is verified)'
     type: boolean
@@ -101,6 +105,25 @@ extends:
               # If BinSkim fails, set to false temporarily and add .config/guardian/.gdnbaselines baseline.
 
             steps:
+              # ---------------------------------------------------------------
+              # Step 0 (publishing only): Fail fast unless ReleaseTag is a release tag.
+              # GitHubRelease@1 'edit' creates the tag when no release exists for it, so a value
+              # such as 'main' would create a tag that shadows the branch (microsoft/tgrep#213).
+              # ---------------------------------------------------------------
+              - ${{ if eq(parameters.PublishToGitHub, true) }}:
+                - powershell: |
+                    $ErrorActionPreference = 'Stop'
+                    $tag = $env:RELEASE_TAG
+                    if ($tag -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') {
+                      throw ("ReleaseTag '$tag' is not a release tag such as v1.2.4. GitHubRelease@1 creates a missing tag, " +
+                             "and a tag named like a branch (for example 'main') shadows that branch (microsoft/tgrep#213). " +
+                             "Set ReleaseTag to the release tag, or turn off PublishToGitHub.")
+                    }
+                    Write-Host "ReleaseTag '$tag' accepted for publishing."
+                  displayName: 'Validate ReleaseTag before publishing'
+                  env:
+                    RELEASE_TAG: ${{ parameters.ReleaseTag }}
+
               # ---------------------------------------------------------------
               # Step 1: Checkout tgrep source code
               # OneBranch checks out the repo containing this YAML (microsoft/tgrep)
@@ -285,6 +308,21 @@ extends:
               ob_sdl_binskim_break: true  # https://aka.ms/obpipelines/sdl
 
             steps:
+              # Same publishing-only ReleaseTag guard as the x64 job (microsoft/tgrep#213).
+              - ${{ if eq(parameters.PublishToGitHub, true) }}:
+                - powershell: |
+                    $ErrorActionPreference = 'Stop'
+                    $tag = $env:RELEASE_TAG
+                    if ($tag -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') {
+                      throw ("ReleaseTag '$tag' is not a release tag such as v1.2.4. GitHubRelease@1 creates a missing tag, " +
+                             "and a tag named like a branch (for example 'main') shadows that branch (microsoft/tgrep#213). " +
+                             "Set ReleaseTag to the release tag, or turn off PublishToGitHub.")
+                    }
+                    Write-Host "ReleaseTag '$tag' accepted for publishing."
+                  displayName: 'Validate ReleaseTag before publishing'
+                  env:
+                    RELEASE_TAG: ${{ parameters.ReleaseTag }}
+
               - task: RustInstaller@1
                 displayName: 'Install Rust toolchain (with arm64 target)'
                 inputs:

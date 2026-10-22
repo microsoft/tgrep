@@ -63,6 +63,11 @@ source commit and `ReleaseTag`; publish its signed archives/checksums to the
 existing GitHub release after verifying signing. The GitHub workflow does not
 start or change that pipeline.
 
+With `PublishToGitHub` enabled, `ReleaseTag` must be that release's
+`v<version>` tag. Each job fails before building for any other value, because
+the publish step creates a missing tag and a tag named like a branch (such as
+`main`) shadows it for `git pull origin main` (#213).
+
 ## Recurring release qualification
 
 The CI workflow runs on PRs and pushes to `main`, weekly on Monday at 08:00 UTC,

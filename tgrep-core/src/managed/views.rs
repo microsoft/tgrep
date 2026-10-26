@@ -91,7 +91,11 @@ pub struct ReconcileRequest {
 
 enum CurrentVerification {
     Handled,
-    Superseded,
+    /// The verification completed, but newer invalidations need an ordinary
+    /// pass. `changed` means its repaired state is already published.
+    Superseded {
+        changed: bool,
+    },
     Ordinary,
 }
 
@@ -1440,11 +1444,11 @@ impl ViewManager {
         let superseded = if operation.kind == "reconcile" && verify {
             match self.verify_current(&slot, operation, &record, &permit, metadata_only)? {
                 CurrentVerification::Handled => return Ok(()),
-                CurrentVerification::Superseded => true,
-                CurrentVerification::Ordinary => false,
+                CurrentVerification::Superseded { changed } => Some(changed),
+                CurrentVerification::Ordinary => None,
             }
         } else {
-            false
+            None
         };
         // A superseded verification is never coalesced into a completion
         // that could be mistaken for a verified view.
@@ -1482,8 +1486,11 @@ impl ViewManager {
         };
         let (checkpoint, reconcile, input) =
             self.prepare_checkpoint(&slot, &view, &record, &permit, false)?;
-        if superseded {
+        if let Some(changed) = superseded {
             result["verification"] = json!("superseded");
+            if changed {
+                result["changed"] = json!(true);
+            }
         }
         self.publish(
             &slot, operation, record, view, checkpoint, reconcile, input, result, &permit, false,
@@ -1491,9 +1498,11 @@ impl ViewManager {
     }
 
     /// Serving verification of the current publication. An ordinary pass
-    /// handles newer invalidations. A repaired difference publishes as a
-    /// normal reconciliation; failures leave the record/worktree epochs
-    /// unequal or the worktree unready, so queries stay closed.
+    /// handles newer invalidations, including after an eventual view has
+    /// already published a difference found alongside them. A repaired
+    /// difference publishes as a normal reconciliation. Until then,
+    /// record/worktree epoch mismatches or an unready worktree block strict
+    /// queries; eventual queries can still use the last publication.
     fn verify_current(
         &self,
         slot: &ViewSlot,
@@ -1534,14 +1543,19 @@ impl ViewManager {
             | Err(crate::worktrees::WorktreeError::ChangedDuringReconcile) => {
                 Ok(CurrentVerification::Ordinary)
             }
-            Ok(Verification::Superseded(_)) => Ok(CurrentVerification::Superseded),
+            Ok(Verification::Superseded(_)) => {
+                Ok(CurrentVerification::Superseded { changed: false })
+            }
+            Ok(Verification::PublishedSuperseded(_)) => {
+                Ok(CurrentVerification::Superseded { changed: true })
+            }
             Ok(Verification::Unchanged(stats)) => self
                 .complete_current_reconciliation(slot, operation, record, permit, Some(stats))
                 .map(|completed| {
                     if completed {
                         CurrentVerification::Handled
                     } else {
-                        CurrentVerification::Superseded
+                        CurrentVerification::Superseded { changed: false }
                     }
                 }),
             Ok(Verification::Published(mut stats)) => {

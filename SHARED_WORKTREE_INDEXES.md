@@ -1521,8 +1521,13 @@ The first detected difference marks the view stale, which closes `ready`
 repair and reports `changed: true`. When content is unchanged but a newer
 notification arrived, verified metadata is retained and the ordinary follow-up
 processes newer hints; its receipt reports `verification: "superseded"`.
+If the pass found a difference and a newer notification also arrived (for
+example, an edit the pass read after its event), the verified state is still
+published but `ready` stays closed; the same operation's ordinary follow-up
+then processes only the newer hints, and the receipt reports
+`verification: "superseded"` with `changed: true`.
 Thus an already completed verification is not discarded and immediately
-repeated just because an event arrived near its end.
+repeated just because an event arrived during it.
 
 Deadline exhaustion and cancellation of a serving verification leave the view
 ready but unverified; the outcome is `failed` or `cancelled`, and the next

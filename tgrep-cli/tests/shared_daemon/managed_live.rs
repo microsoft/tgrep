@@ -971,6 +971,90 @@ fn superseded_native_content_verification_retains_evidence_and_advances_its_time
 }
 
 #[test]
+fn superseded_native_content_verification_publishes_edits_without_a_second_full_pass() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
+    let (claim, guard) = owner(&daemon);
+    verified_attach(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["ready"] == true && status["work"].is_null() && status["watch_mode"] == "native"
+        },
+    );
+    daemon.rpc(
+        "testing.suppress-watch-events",
+        json!({"view":view["view"],"suppress":true}),
+    );
+    fs::write(fixture.a.join("notes.txt"), "shared_term superseded_edit\n").unwrap();
+    // Queue the newer hint after the pass hashes the edit, without a worker race.
+    let hook = pause(&daemon, "verification-content-hashed");
+    let since = Instant::now();
+    daemon.rpc(
+        "testing.reconcile-timer",
+        json!({
+            "view":view["view"],"elapsed_ms":120_000,"reread_elapsed_ms":1_800_000
+        }),
+    );
+    let barrier = reached(&daemon, &hook);
+    daemon.rpc(
+        "views.invalidate",
+        json!({
+            "view":view["view"],"expected_version":view["version"],"owner":claim.owner,
+            "changed":["notes.txt"],"full":false
+        }),
+    );
+    let during = daemon.rpc("views.status", json!({"id":view["view"]}));
+    assert_eq!(during["serving"], true, "{during}");
+    assert_eq!(during["ready"], false, "{during}");
+    release(&daemon, &hook);
+    let receipt = completed(&daemon, &json!({"id":barrier["reached_operation"]}));
+    assert_eq!(receipt["result"]["verification"], "superseded", "{receipt}");
+    assert_eq!(receipt["result"]["changed"], true, "{receipt}");
+    assert_eq!(receipt["result"]["reconcile"]["full"], false, "{receipt}");
+    assert_eq!(receipt["result"]["reconcile"]["files_read"], 1, "{receipt}");
+    assert_eq!(
+        receipt["result"]["reconcile"]["metadata_reused"], 2,
+        "{receipt}"
+    );
+    let after = wait_verified(&daemon, &view, "superseded", since);
+    assert_eq!(after["ready"], true, "{after}");
+    assert_eq!(after["last_verification"]["tier"], "content", "{after}");
+    assert!(
+        after["last_verification"]["content_age_ms"]
+            .as_u64()
+            .unwrap()
+            < 30_000,
+        "{after}"
+    );
+    let found = daemon.rpc(
+        "search",
+        json!({"root":view["root"],"view":view["view"],"expected_version":view["version"],
+            "query":{"pattern":"superseded_edit"}}),
+    );
+    assert_eq!(found["backend"], "shared-v2");
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(found["matches"][0]["file"], "notes.txt", "{found}");
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
 fn periodic_native_verification_repairs_missed_nested_changes() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);

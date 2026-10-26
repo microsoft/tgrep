@@ -309,6 +309,10 @@ pub enum Verification {
     Superseded(ReconcileStats),
     /// A difference closed readiness and the verified state was published.
     Published(ReconcileStats),
+    /// Eventual views only: a difference was found while newer invalidations
+    /// arrived. The verified state was published without restoring readiness;
+    /// only those newer invalidations remain queued.
+    PublishedSuperseded(ReconcileStats),
 }
 
 /// Fails a verification closed if it observed a difference but did not
@@ -957,10 +961,14 @@ impl WorktreeView {
     /// as soon as any difference is observed; that pass then publishes the
     /// verified state. A concurrent invalidation leaves its hints queued;
     /// an otherwise unchanged pass returns `Verification::Superseded` and
-    /// retains verified evidence for the next pass. Failures
-    /// after an observed difference, and any failure other than budget
-    /// cancellation, deadline or resource pressure, leave a full refresh
-    /// required. Budget failures with no observed difference keep serving.
+    /// retains verified evidence for the next pass. On an eventual view, a
+    /// pass that found a difference while a concurrent invalidation arrived
+    /// publishes its verified state as `Verification::PublishedSuperseded`
+    /// without restoring readiness. Failures after an
+    /// observed difference, a difference with a concurrent invalidation on a
+    /// strict view, and any failure other than budget cancellation, deadline
+    /// or resource pressure, leave a full refresh required. Budget failures
+    /// with no observed difference keep serving.
     pub fn verify_controlled(
         &self,
         permit: &Arc<crate::managed::WorkPermit>,
@@ -1100,7 +1108,15 @@ impl WorktreeView {
             });
         }
         if control.epoch != epoch {
-            return Err(WorktreeError::ChangedDuringReconcile);
+            if !self.options.stale_reads {
+                return Err(WorktreeError::ChangedDuringReconcile);
+            }
+            // Eligibility required no queued work when this pass started, so
+            // everything queued now is newer than the state it verified.
+            let published = control.invalidate()?;
+            return self
+                .publish_prepared(&mut control, prepared, published, permit, assembly, false)
+                .map(Verification::PublishedSuperseded);
         }
         control.tree = true;
         control.full |= reread;

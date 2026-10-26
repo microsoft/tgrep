@@ -2921,6 +2921,45 @@ fn superseded_verification_and_failed_hint_pass_keep_bounded_repair_work() {
 }
 
 #[test]
+fn eventual_verification_publishes_a_difference_and_leaves_only_newer_hints() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "one.txt", b"alpha needle\n");
+    write(&fixture.root, "two.txt", b"bravo needle\n");
+    commit(&fixture.root);
+    let view = stale_view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let published = view.status().unwrap().published_epoch;
+    // The pass reads the edited file after its event was queued.
+    let verified = view
+        .verify_inner(
+            || {
+                same_stat_write(&fixture.root, "one.txt", b"zzzzz needle\n");
+                view.invalidate_path(Path::new("one.txt")).unwrap();
+            },
+            || {},
+            None,
+        )
+        .unwrap();
+    let Verification::PublishedSuperseded(stats) = verified else {
+        panic!("a difference with a newer hint must publish: {verified:?}");
+    };
+    assert!(stats.full);
+    assert_eq!(stats.files_read, 2);
+    let status = view.status().unwrap();
+    assert!(status.serving && !status.ready);
+    assert!(!status.full_required && !status.tree_required);
+    assert_eq!(status.pending_paths, 1);
+    assert_ne!(status.published_epoch, published);
+    assert_eq!(matches(&view, "zzz"), ["one.txt"]);
+    let follow_up = view.refresh().unwrap();
+    assert!(!follow_up.full);
+    assert_eq!(follow_up.files_read, 1);
+    assert_eq!(follow_up.metadata_reused, 1);
+    assert!(view.status().unwrap().ready);
+    assert_eq!(matches(&view, "zzz"), ["one.txt"]);
+}
+
+#[test]
 fn overflowing_hints_coarsen_to_ancestors_without_losing_coverage() {
     let mut hints = BTreeSet::new();
     for index in 0..1000 {

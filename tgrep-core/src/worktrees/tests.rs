@@ -912,6 +912,80 @@ fn linked_gitfile_matches_hidden_scan_without_exposing_metadata_directories() {
 }
 
 #[test]
+fn scoped_candidates_and_listing_match_filtered_whole_view_results() {
+    let fixture = Fixture::new();
+    for path in [
+        "src/a.txt",
+        "src/b.txt",
+        "src/.hidden/c.txt",
+        "src2/d.txt",
+        "srcx.txt",
+        "lib/e.txt",
+    ] {
+        write(&fixture.root, path, b"needle base\n");
+    }
+    commit(&fixture.root);
+    let pin = fixture.generation();
+    let linked = fixture.linked("scoped");
+    write(&linked, "src/a.txt", b"replaced\n");
+    write(&linked, "src/new.txt", b"needle new\n");
+    write(&linked, "src2/new.txt", b"needle new\n");
+    fs::remove_file(linked.join("src/b.txt")).unwrap();
+    let view = fixture.view(&linked, &pin);
+    view.refresh().unwrap();
+    let prefixes = ["", "src/", "src/.hidden/", "src2/", "missing/"];
+    view.with_snapshot(|snapshot| {
+        let visible = |paths: &[String], prefix: &str, hidden: bool| -> Vec<String> {
+            paths
+                .iter()
+                .filter(|path| snapshot.visibility().is_visible(path, prefix, hidden))
+                .cloned()
+                .collect()
+        };
+        for pattern in ["needle", "needle|replaced", "base", ".*"] {
+            let plan = query::build_query_plan(pattern, false).unwrap();
+            let whole = snapshot.candidates(&plan, "", true);
+            for hidden in [false, true] {
+                for prefix in prefixes {
+                    assert_eq!(
+                        snapshot.candidates(&plan, prefix, hidden),
+                        visible(&whole, prefix, hidden),
+                        "{pattern:?} in {prefix:?}, hidden {hidden}"
+                    );
+                }
+            }
+        }
+        let needle = query::build_query_plan("needle", false).unwrap();
+        assert_eq!(
+            snapshot.candidates(&needle, "src/", true),
+            ["src/.hidden/c.txt", "src/new.txt"]
+        );
+        assert_eq!(snapshot.candidates(&needle, "src/", false), ["src/new.txt"]);
+
+        let listed = snapshot.files("", true);
+        assert_eq!(snapshot.file_count(), listed.len());
+        for hidden in [false, true] {
+            for prefix in prefixes {
+                for from in ["", "a", "src/", "src/b", "src/new.txt", "src0", "zzz"] {
+                    let expected: Vec<_> = visible(&listed, prefix, hidden)
+                        .into_iter()
+                        .filter(|path| path.as_str() >= from)
+                        .collect();
+                    assert_eq!(
+                        snapshot
+                            .listed_from(prefix, hidden, from)
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "{prefix:?} from {from:?}, hidden {hidden}"
+                    );
+                }
+            }
+        }
+    })
+    .unwrap();
+}
+
+#[test]
 fn identical_tracked_files_share_reader_without_extraction() {
     let fixture = Fixture::new();
     write(&fixture.root, "one.txt", b"base needle\n");
@@ -1588,6 +1662,37 @@ fn snapshot_sibling_batches_reject_foreign_roots_and_record_open_failures() {
 }
 
 #[test]
+fn candidate_batches_open_siblings_without_snapshots() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "dir/one.txt", b"first needle");
+    write(&fixture.root, "dir/two.txt", b"second needle");
+    write(&fixture.root, "other.txt", b"other needle");
+    commit(&fixture.root);
+    let generation = fixture.generation();
+    let view = fixture.view(&fixture.root, &generation);
+    view.refresh().unwrap();
+    let batch = view
+        .with_snapshot(|snapshot| snapshot.candidate_batch("dir/one.txt"))
+        .unwrap()
+        .unwrap();
+    let mut one = batch.open("dir/one.txt").unwrap();
+    for path in ["other.txt", "dir/..", "dir/one.txt/..", "dir/a/b.txt"] {
+        assert!(batch.open(path).is_err(), "{path}");
+    }
+    // A failed sibling open is left to the caller to classify.
+    let before = view.status().unwrap();
+    fs::remove_file(fixture.root.join("dir/two.txt")).unwrap();
+    assert!(batch.open("dir/two.txt").is_err());
+    let after = view.status().unwrap();
+    assert!(after.ready && !after.full_required, "{after:?}");
+    assert_eq!(after.epoch, before.epoch);
+    batch.finish().unwrap();
+    let mut bytes = String::new();
+    one.read_to_string(&mut bytes).unwrap();
+    assert_eq!(bytes, "first needle");
+}
+
+#[test]
 fn snapshot_candidate_opens_reject_directory_link_swaps() {
     let fixture = Fixture::new();
     write(&fixture.root, "dir/file.txt", b"inside needle");
@@ -1822,6 +1927,7 @@ fn observed_parent_replacement_after_batch_drain_blocks_publication() {
                     view.files.verify_root().unwrap();
                 },
                 permit,
+                false,
             );
             assert!(matches!(result, Err(WorktreeError::Io(_))), "{result:?}");
             let status = view.status().unwrap();
@@ -1835,7 +1941,9 @@ fn observed_parent_replacement_after_batch_drain_blocks_publication() {
             let released = fixture._temp.path().join("after-check");
             fs::rename(fixture.root.join("dir"), &released).unwrap();
             fs::rename(&released, fixture.root.join("dir")).unwrap();
-            let repaired = view.refresh_controlled_inner(|| {}, || {}, permit).unwrap();
+            let repaired = view
+                .refresh_controlled_inner(|| {}, || {}, permit, false)
+                .unwrap();
             assert!(repaired.full);
             assert_eq!(repaired.files_read, 1);
             assert_eq!(repaired.content_reads_avoided, 0);
@@ -2202,8 +2310,8 @@ fn hint_lookup_work_depends_on_path_depth_not_queue_size() {
     let stats = view.refresh().unwrap();
     assert!(!stats.full);
     assert_eq!(
-        stats.hint_lookups, 5,
-        "three prefixes plus two, independent of 2001 hints"
+        stats.hint_lookups, 8,
+        "walk: three plus two prefixes; opened file: three, independent of 2001 hints"
     );
     assert_eq!(stats.files_read, 1);
     assert_eq!(
@@ -2216,7 +2324,10 @@ fn hint_lookup_work_depends_on_path_depth_not_queue_size() {
     view.invalidate_path(Path::new("dir/nested/one.txt"))
         .unwrap();
     let stats = view.refresh().unwrap();
-    assert_eq!(stats.hint_lookups, 3, "exact matches stop at the full path");
+    assert_eq!(
+        stats.hint_lookups, 4,
+        "walk and open exact matches stop at the full path"
+    );
     assert_eq!(stats.files_read, 1);
     assert_eq!(stats.files_extracted, 0);
     view.invalidate_path(Path::new("\u{00e9}")).unwrap();
@@ -2665,6 +2776,200 @@ fn serving_verification_keeps_unchanged_views_ready_and_repairs_missed_changes()
 }
 
 #[test]
+fn metadata_verification_carries_evidence_and_content_verification_repairs_same_stat_edits() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "one.txt", b"alpha needle\n");
+    write(&fixture.root, "nested/two.txt", b"bravo needle\n");
+    write(&fixture.root, "image.png", b"binary\0content");
+    commit(&fixture.root);
+    let (_namespace, permit, view) = fixture.controlled();
+    view.refresh_controlled(&permit).unwrap();
+    let before = view.status().unwrap();
+    let Verification::Unchanged(stats) = view.verify_metadata_controlled(&permit).unwrap() else {
+        panic!("unchanged metadata should not publish");
+    };
+    assert!(!stats.full);
+    assert_eq!(stats.metadata_reused, 3);
+    assert_eq!(stats.files_read, 0);
+    assert_eq!(
+        stats.parent_batches, 0,
+        "no per-file or parent opens for carried paths"
+    );
+    assert_eq!(view.status().unwrap(), before);
+
+    // Unknown evidence is never inferred from the current stat.
+    view.state
+        .write()
+        .unwrap()
+        .evidence
+        .get_mut("one.txt")
+        .unwrap()
+        .version = None;
+    let Verification::Unchanged(stats) = view.verify_metadata_controlled(&permit).unwrap() else {
+        panic!("unchanged content should not publish");
+    };
+    assert_eq!(stats.metadata_reused, 2);
+    assert_eq!(stats.files_read, 1);
+    let Verification::Unchanged(stats) = view.verify_metadata_controlled(&permit).unwrap() else {
+        panic!("verified evidence should be retained");
+    };
+    assert_eq!(stats.metadata_reused, 3);
+
+    same_stat_write(&fixture.root, "one.txt", b"zzzzz needle\n");
+    let Verification::Unchanged(stats) = view.verify_metadata_controlled(&permit).unwrap() else {
+        panic!("same-stat rewrite is intentionally left to the content tier");
+    };
+    assert_eq!(stats.files_read, 0);
+    assert!(candidates(&view, "zzz").is_empty());
+    assert!(matches!(
+        view.verify_controlled(&permit).unwrap(),
+        Verification::Published(_)
+    ));
+    assert_eq!(matches(&view, "zzz"), ["one.txt"]);
+
+    write(&fixture.root, "added/three.txt", b"new needle\n");
+    fs::remove_file(fixture.root.join("nested/two.txt")).unwrap();
+    view.invalidate_tree().unwrap();
+    assert!(view.status().unwrap().tree_required);
+    assert!(!view.status().unwrap().full_required);
+    let stats = view.refresh_controlled(&permit).unwrap();
+    assert_eq!(stats.metadata_reused, 2);
+    assert_eq!(stats.files_read, 1);
+    assert_eq!(matches(&view, "needle"), ["added/three.txt", "one.txt"]);
+    assert!(!view.status().unwrap().tree_required);
+}
+
+#[test]
+fn settled_untracked_overlays_carry_metadata_but_subtree_hints_still_reread() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "base.txt", b"base needle\n");
+    commit(&fixture.root);
+    for index in 0..100 {
+        write(
+            &fixture.root,
+            &format!("untracked/file-{index}.txt"),
+            format!("overlay needle {index}\n").as_bytes(),
+        );
+    }
+    let (_namespace, permit, view) = fixture.controlled_with_options(WorktreeOptions {
+        stale_reads: true,
+        ..WorktreeOptions::default()
+    });
+    let initial = view.refresh_controlled(&permit).unwrap();
+    assert_eq!(initial.files_read, 101);
+    assert_eq!(matches(&view, "overlay").len(), 100);
+    let Verification::Unchanged(verified) = view.verify_metadata_controlled(&permit).unwrap()
+    else {
+        panic!("settled overlays must match their metadata");
+    };
+    view.invalidate_tree().unwrap();
+    let tree = view.refresh_controlled(&permit).unwrap();
+    for stats in [verified, tree] {
+        assert_eq!(stats.metadata_reused, 101);
+        assert_eq!(stats.overlay_reused, 100);
+        assert_eq!(stats.files_read, 0);
+        assert_eq!(stats.parent_batches, 0);
+    }
+    view.invalidate_path(Path::new("untracked")).unwrap();
+    let hinted = view.refresh_controlled(&permit).unwrap();
+    assert_eq!(hinted.files_read, 100);
+    assert_eq!(hinted.metadata_reused, 1);
+    assert_eq!(hinted.overlay_reused, 100);
+    assert_eq!(hinted.files_extracted, 0);
+}
+
+#[test]
+fn superseded_verification_and_failed_hint_pass_keep_bounded_repair_work() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "one.txt", b"alpha needle\n");
+    write(&fixture.root, "two.txt", b"bravo needle\n");
+    commit(&fixture.root);
+    let view = stale_view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    let verified = view
+        .verify_inner(
+            || {},
+            || {
+                same_stat_write(&fixture.root, "one.txt", b"zzzzz needle\n");
+                view.invalidate_path(Path::new("one.txt")).unwrap();
+            },
+            None,
+        )
+        .unwrap();
+    assert!(matches!(verified, Verification::Superseded(_)));
+    let stats = view.refresh().unwrap();
+    assert_eq!(stats.metadata_reused, 1);
+    assert_eq!(stats.files_read, 1);
+    assert_eq!(matches(&view, "zzz"), ["one.txt"]);
+
+    view.invalidate_path(Path::new("one.txt")).unwrap();
+    assert!(
+        view.refresh_inner(
+            || fs::remove_file(fixture.root.join("one.txt")).unwrap(),
+            || {},
+        )
+        .is_err()
+    );
+    let status = view.status().unwrap();
+    assert!(status.serving && status.tree_required && !status.full_required);
+    assert_eq!(status.pending_paths, 1);
+    write(&fixture.root, "one.txt", b"fixed needle\n");
+    let stats = view.refresh().unwrap();
+    assert_eq!(stats.files_read, 1);
+    assert_eq!(stats.metadata_reused, 1);
+    assert_eq!(matches(&view, "fixed"), ["one.txt"]);
+}
+
+#[test]
+fn overflowing_hints_coarsen_to_ancestors_without_losing_coverage() {
+    let mut hints = BTreeSet::new();
+    for index in 0..1000 {
+        assert!(queue_hint(
+            &mut hints,
+            format!("src/part-{}/file-{index}.txt", index % 4),
+            16
+        ));
+        assert!(hints.len() <= 16);
+    }
+    for index in 0..1000 {
+        assert!(is_hinted(
+            &format!("src/part-{}/file-{index}.txt", index % 4),
+            &hints,
+            &mut 0
+        ));
+    }
+    let mut hints = BTreeSet::new();
+    assert!(queue_hint(&mut hints, "one.txt".into(), 1));
+    assert!(!queue_hint(&mut hints, "two.txt".into(), 1));
+    assert!(!queue_hint(&mut BTreeSet::new(), "src/one.txt".into(), 0));
+}
+
+#[test]
+fn non_ascii_hints_cover_the_ascii_parent_and_ignore_changes_use_tree_passes() {
+    let fixture = Fixture::new();
+    write(&fixture.root, "src/one.txt", b"needle\n");
+    write(&fixture.root, "other.txt", b"needle\n");
+    commit(&fixture.root);
+    let view = fixture.view(&fixture.root, &fixture.generation());
+    view.refresh().unwrap();
+    view.invalidate_path(Path::new("src/\u{e9}/file.txt"))
+        .unwrap();
+    assert!(!view.status().unwrap().full_required);
+    assert!(view.control.lock().unwrap().hints.contains("src"));
+    let stats = view.refresh().unwrap();
+    assert_eq!(stats.files_read, 1);
+    assert_eq!(stats.metadata_reused, 1);
+    write(&fixture.root, ".gitignore", b"src/\n");
+    view.invalidate_path(Path::new(".gitignore")).unwrap();
+    assert!(view.status().unwrap().tree_required);
+    let stats = view.refresh().unwrap();
+    assert!(!stats.full);
+    assert_eq!(matches(&view, "needle"), ["other.txt"]);
+    view.invalidate_path(Path::new("\u{e9}/file.txt")).unwrap();
+    assert!(view.status().unwrap().full_required);
+}
+
+#[test]
 fn serving_verification_yields_to_invalidations_and_fails_closed() {
     let fixture = Fixture::new();
     write(&fixture.root, "one.txt", b"alpha needle\n");
@@ -2687,7 +2992,7 @@ fn serving_verification_yields_to_invalidations_and_fails_closed() {
         || {},
         None,
     );
-    assert!(matches!(result, Err(WorktreeError::ChangedDuringReconcile)));
+    assert!(matches!(result, Ok(Verification::Superseded(_))));
     let status = view.status().unwrap();
     assert!(!status.ready && !status.full_required);
     assert_eq!(status.pending_paths, 1);

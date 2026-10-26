@@ -67,8 +67,8 @@ impl Authentication {
         })
     }
 
-    pub fn read(repository: &Repository, registration: &Registration) -> Result<Self> {
-        let value = managed::read_private_control_file(&repository.common_dir().join(AUTH_MARKER))?;
+    pub fn read(common_dir: &Path, registration: &Registration) -> Result<Self> {
+        let value = managed::read_private_control_file(&common_dir.join(AUTH_MARKER))?;
         let authentication: Self = serde_json::from_value(value)?;
         if authentication.registration != *registration {
             return Err(Error::new(
@@ -95,30 +95,36 @@ impl Authentication {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Client {
     pub registration: Registration,
     authentication: Authentication,
     /// The daemon can split a query result into resumable pages.
     pub paged: bool,
+    /// The daemon applies glob and type filters to `files` listings.
+    pub filtered_files: bool,
 }
 
 impl Client {
-    pub fn discover(root: &Path, repository: &Repository) -> Result<Self> {
-        let registration: Registration = serde_json::from_reader(
-            File::open(repository.common_dir().join(MARKER))?
-                .take(managed::MAX_REQUEST_BYTES as u64),
+    /// Connect to the managed daemon registered under the canonical
+    /// `common_dir`, whose repository identity must equal `identity`.
+    pub fn discover(root: &Path, common_dir: &Path, identity: &str) -> Result<Self> {
+        let registration: Registration = super::protocol::read_json(
+            File::open(common_dir.join(MARKER))?,
+            managed::MAX_REQUEST_BYTES as u64,
         )?;
         ensure!(
             registration.protocol == managed::PROTOCOL_VERSION
-                && registration.repository == repository.identity()
+                && registration.repository == identity
                 && registration.port != 0,
             "incompatible managed daemon registration"
         );
-        let authentication = Authentication::read(repository, &registration)?;
+        let authentication = Authentication::read(common_dir, &registration)?;
         let mut client = Self {
             registration,
             authentication,
             paged: false,
+            filtered_files: false,
         };
         let hello = client.request("hello", json!({}))?;
         ensure!(
@@ -138,6 +144,9 @@ impl Client {
         client.paged = hello["capabilities"]
             .as_array()
             .is_some_and(|capabilities| capabilities.contains(&json!("paged-results")));
+        client.filtered_files = hello["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.contains(&json!("filtered-files")));
         Ok(client)
     }
 
@@ -270,7 +279,7 @@ pub(super) fn manage(root: &Path, method: &str, params: &str) -> Result<()> {
     output((|| {
         let root = super::canonical_root(root)?;
         let repository = Repository::discover(&root)?;
-        let client = Client::discover(&root, &repository)?;
+        let client = Client::discover(&root, repository.common_dir(), repository.identity())?;
         client.request(method, serde_json::from_str(params)?)
     })())
 }

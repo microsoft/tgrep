@@ -1647,7 +1647,7 @@ pub(crate) mod tests {
             std::fs::metadata(namespace.path().join("catalog.sqlite-wal"))
                 .map_or(0, |metadata| metadata.len())
         };
-        // Writers checkpoint only past metadata_bytes / 4 (4 MiB here).
+        // Writers checkpoint only past metadata_bytes / 4, capped at 64 MiB (4 MiB here).
         let mut allocation = namespace.allocation().unwrap();
         while wal() < MIB {
             allocation = namespace
@@ -1715,8 +1715,9 @@ pub(crate) mod tests {
         // transaction checkpoints.
         let mut allocation = namespace.allocation().unwrap();
         allocation.storage_bytes = Some(charged + MIB + MIB / 2);
-        // Writers checkpoint only past metadata_bytes / 4 (4 MiB here); stop
-        // right after a commit crosses it so the next writer truncates first.
+        // Writers checkpoint only past metadata_bytes / 4, capped at 64 MiB
+        // (4 MiB here); stop right after a commit crosses it so the next
+        // writer truncates first.
         // The operation is accepted late so its lifetime covers the reserve.
         let mut operation = None;
         while wal() < 4 * MIB {

@@ -571,6 +571,23 @@ fn server_backend_label(result: &serde_json::Value) -> &'static str {
     }
 }
 
+/// The `files` query for a shared view. A daemon that filters listings also
+/// receives the glob and type flags, so it sends only the paths that pass them.
+/// The client still applies them, which leaves a filtered listing unchanged.
+fn shared_files_query(opts: &SearchOptions, scope: &str, filtered: bool) -> serde_json::Value {
+    let mut query =
+        serde_json::json!({"hidden":opts.hidden,"scope":scope,"max_depth":opts.max_depth});
+    if filtered && !(opts.glob.is_empty() && opts.iglob.is_empty()) {
+        query["glob"] = serde_json::json!(opts.glob);
+        query["iglob"] = serde_json::json!(opts.iglob);
+        query["glob_case_insensitive"] = serde_json::json!(opts.glob_case_insensitive);
+    }
+    if filtered && opts.selects_types() {
+        query["type_ops"] = type_ops_to_json(&opts.type_ops);
+    }
+    query
+}
+
 /// List files that would be searched (`--files` mode).
 pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) -> Result<()> {
     let start = Instant::now();
@@ -608,11 +625,8 @@ pub fn list_files(root: &Path, index_path: Option<&Path>, opts: &SearchOptions) 
             let (client, view) = crate::serve::shared::Client::registered(&root)?;
             let scope = IndexScope::resolve(&view.root, &root)
                 .ok_or_else(|| anyhow::anyhow!("search root outside shared worktree"))?;
-            let result = client.view_pages(
-                "files", &view,
-                serde_json::json!({"hidden":opts.hidden,"scope":scope.prefix(),"max_depth":opts.max_depth}),
-                |_| false,
-            )?;
+            let query = shared_files_query(opts, scope.prefix(), client.filtered_files());
+            let result = client.view_pages("files", &view, query, |_| false)?;
             let paths: Vec<String> = serde_json::from_value(
                 result
                     .get("files")
@@ -3764,6 +3778,28 @@ mod tests {
             iglob: iglob.iter().map(|g| g.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn shared_files_queries_send_filters_only_to_filtering_daemons() {
+        let bare = serde_json::json!({"hidden":false,"scope":"src/","max_depth":null});
+        for filtered in [false, true] {
+            assert_eq!(
+                shared_files_query(&SearchOptions::default(), "src/", filtered),
+                bare
+            );
+        }
+        let opts = filter_options(&[("select", "rust")], &["*.rs"], &["*.TXT"]);
+        assert_eq!(shared_files_query(&opts, "src/", false), bare);
+        let mut expected = bare.clone();
+        expected["glob"] = serde_json::json!(["*.rs"]);
+        expected["iglob"] = serde_json::json!(["*.TXT"]);
+        expected["glob_case_insensitive"] = serde_json::json!(false);
+        expected["type_ops"] = serde_json::json!([["select", "rust"]]);
+        assert_eq!(shared_files_query(&opts, "src/", true), expected);
+        // Definitions select nothing, so they cannot change the listing.
+        let opts = filter_options(&[("add", "foo:*.foo")], &[], &[]);
+        assert_eq!(shared_files_query(&opts, "src/", true), bare);
     }
 
     #[test]

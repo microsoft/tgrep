@@ -178,6 +178,38 @@ impl Fixture {
 }
 
 #[test]
+fn explicit_refresh_rereads_all_files_even_with_pending_path_hints() {
+    use tgrep_core::managed::{OperationState, RefreshRequest};
+    let mut fixture = Fixture::new();
+    fs::write(fixture.root.join("other.txt"), "untracked needle\n").unwrap();
+    fixture.namespace.activate().unwrap();
+    let manager = fixture.manager();
+    let view = fixture.attach(&manager);
+    manager
+        .slot(&view.id)
+        .unwrap()
+        .invalidate(&[PathBuf::from("source.txt")], false)
+        .unwrap();
+    let operation = manager
+        .accept_refresh(
+            fixture.token("explicit-hinted-refresh"),
+            RefreshRequest {
+                view: view.id,
+                expected_version: view.version,
+                owner: fixture.owner.registration().owner.clone(),
+                allocation_version: 1,
+            },
+        )
+        .unwrap();
+    let completed = manager.execute(&operation.id).unwrap();
+    assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+    let stats = &completed.result.as_ref().unwrap()["reconcile"];
+    assert_eq!(stats["full"], true);
+    assert_eq!(stats["files_read"], 2);
+    assert_eq!(stats["content_reads_avoided"], 0);
+}
+
+#[test]
 fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
     use tgrep_core::managed::{OperationState, ReconcileRequest, RefreshRequest};
     let mut fixture = Fixture::new();
@@ -192,6 +224,7 @@ fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
         expected_version: first.version,
         allocation_version: 1,
         verify: false,
+        metadata_only: false,
     };
     let queued = manager
         .accept_reconciliation(token.clone(), request.clone())
@@ -253,6 +286,7 @@ fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
                 expected_version: first.version,
                 allocation_version: 1,
                 verify: false,
+                metadata_only: false,
             },
         )
         .unwrap();
@@ -339,6 +373,7 @@ fn ready_reconciliation_preserves_forced_repairs_and_rejects_invalid_work() {
                     expected_version: first.version,
                     allocation_version: 1,
                     verify: false,
+                    metadata_only: false,
                 },
             )
             .unwrap();
@@ -373,6 +408,7 @@ fn ready_reconciliation_preserves_forced_repairs_and_rejects_invalid_work() {
                     expected_version: version,
                     allocation_version: allocation,
                     verify: false,
+                    metadata_only: false,
                 },
             )
             .unwrap();
@@ -425,6 +461,7 @@ fn coalesced_reconciliation_rechecks_cancellation_and_allocation_before_receipt(
                     expected_version: first.version,
                     allocation_version: 1,
                     verify: false,
+                    metadata_only: false,
                 },
             )
             .unwrap();

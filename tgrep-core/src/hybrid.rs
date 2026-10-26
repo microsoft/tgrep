@@ -20,6 +20,38 @@ use crate::ondisk::PostingEntry;
 use crate::query::{self, QueryPlan};
 use crate::reader::IndexReader;
 
+/// Reader IDs a scoped query may consider: every valid ID, or a bitset of the
+/// IDs whose paths start with the scope prefix.
+struct ReaderScope {
+    files: usize,
+    words: Option<Vec<u64>>,
+}
+
+impl ReaderScope {
+    fn new(reader: &IndexReader, prefix: &str) -> Self {
+        let files = reader.num_files();
+        let words = (!prefix.is_empty()).then(|| {
+            let mut words = vec![0_u64; files.div_ceil(64)];
+            for id in reader.file_ids_with_prefix(prefix) {
+                let id = id as usize;
+                words[id / 64] |= 1_u64 << (id % 64);
+            }
+            words
+        });
+        Self { files, words }
+    }
+
+    /// Out-of-range IDs (from a corrupt posting) are never in scope.
+    fn contains(&self, id: u32) -> bool {
+        let id = id as usize;
+        id < self.files
+            && self
+                .words
+                .as_ref()
+                .is_none_or(|words| words[id / 64] & (1_u64 << (id % 64)) != 0)
+    }
+}
+
 pub struct HybridIndex {
     reader: RwLock<Arc<IndexReader>>,
     pub live: LiveIndex,
@@ -149,10 +181,10 @@ impl HybridIndex {
         }
     }
 
-    /// Get all file IDs from both layers (overlay takes precedence).
+    /// Get all active file IDs from both layers (overlay takes precedence),
+    /// in ascending order.
     pub fn all_file_ids(&self) -> Vec<u32> {
-        let reader = self.reader();
-        self.all_file_ids_using(&reader)
+        self.execute_query_with_masks(&QueryPlan::MatchAll).0
     }
 
     /// Get every active content-indexed path from a consistent reader snapshot.
@@ -206,26 +238,65 @@ impl HybridIndex {
     /// resolution would resolve IDs against a different reader, silently
     /// dropping every candidate whose ID does not exist in the new reader.
     pub fn execute_query_with_masks(&self, plan: &QueryPlan) -> (Vec<u32>, Arc<IndexReader>) {
-        let reader = self.reader();
-        let ids = if plan.is_match_all() {
-            self.all_file_ids_using(&reader)
-        } else {
-            query::execute_plan_with_masks(plan, &|tri| {
-                self.lookup_trigram_with_masks_using_reader(tri, &reader)
-            })
-        };
-        (ids, reader)
+        self.execute_query_with_masks_in(plan, "")
     }
 
-    /// Like [`all_file_ids`] but uses a caller-provided reader snapshot.
-    fn all_file_ids_using(&self, reader: &Arc<IndexReader>) -> Vec<u32> {
-        let mut ids: Vec<u32> = reader
-            .all_file_ids()
-            .into_iter()
-            .filter(|&fid| self.reader_entry_active(reader, fid))
-            .collect();
-        ids.extend(self.live.all_file_ids());
-        ids
+    /// [`Self::execute_query_with_masks`] restricted to paths that start with
+    /// `prefix`; an empty prefix selects the whole index.
+    ///
+    /// A plan selects each file independently of the others, so dropping
+    /// out-of-scope postings before evaluating it yields exactly the in-scope
+    /// part of the whole-index result. Overlay precedence is likewise checked
+    /// once per selected reader ID instead of once per posting. IDs are
+    /// returned in ascending order, so overlay IDs come last.
+    pub fn execute_query_with_masks_in(
+        &self,
+        plan: &QueryPlan,
+        prefix: &str,
+    ) -> (Vec<u32>, Arc<IndexReader>) {
+        let reader = self.reader();
+        let live_in_scope = |file_id: u32| {
+            prefix.is_empty()
+                || self
+                    .live
+                    .file_path(file_id)
+                    .is_some_and(|path| path.starts_with(prefix))
+        };
+        let mut ids = if plan.is_match_all() {
+            let mut ids = if prefix.is_empty() {
+                reader.all_file_ids()
+            } else {
+                let mut in_scope: Vec<u32> = reader.file_ids_with_prefix(prefix).collect();
+                in_scope.sort_unstable();
+                in_scope
+            };
+            let mut live_ids: Vec<u32> = self
+                .live
+                .all_file_ids()
+                .into_iter()
+                .filter(|&file_id| live_in_scope(file_id))
+                .collect();
+            live_ids.sort_unstable();
+            ids.append(&mut live_ids);
+            ids
+        } else {
+            let scope = ReaderScope::new(&reader, prefix);
+            query::execute_plan_with_masks(plan, &|tri| {
+                let mut entries = reader.lookup_trigram_with_masks(tri);
+                entries.retain(|entry| scope.contains(entry.file_id));
+                let mut live_entries = self.live.lookup_trigram_with_masks(tri);
+                live_entries.retain(|entry| live_in_scope(entry.file_id));
+                // Overlay IDs sort after reader IDs, so the list stays sorted
+                // and the plan does not have to sort it again.
+                live_entries.sort_unstable_by_key(|entry| entry.file_id);
+                entries.append(&mut live_entries);
+                entries
+            })
+        };
+        ids.retain(|&file_id| {
+            live::LiveIndex::is_overlay_id(file_id) || self.reader_entry_active(&reader, file_id)
+        });
+        (ids, reader)
     }
 
     /// Resolve a file ID to a relative path using a specific reader snapshot.

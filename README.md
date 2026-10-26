@@ -270,7 +270,7 @@ Automatic refresh has two modes, configured on `tgrep serve`:
 | Flag | Default | Effect |
 |------|---------|--------|
 | `--watch-mode <auto\|poll>` | `auto` | Prefer native notifications with polling fallback, or use polling only |
-| `--poll-interval <SECONDS>` | `120` | Wait after each polling reconciliation, or since a healthy native managed view's last full verification; range 1-86400 |
+| `--poll-interval <SECONDS>` | `120` | Minimum wait between managed metadata checks; full rereads wait at least 15 intervals, with cost-based backoff. Legacy polling keeps this interval; range 1-86400 |
 | `--watch-budget <N>` | `8192` | Conservative process-local native watch ceiling; range 1-4294967295 |
 | `--no-watch` | off | Disable all automatic refresh: native watching, polling, and periodic reconciliation |
 
@@ -895,9 +895,15 @@ or incompatible registrations **scan the filesystem**, never a legacy index or
 bare base. `status` reports those errors instead of displaying legacy status.
 An explicit `--index-path` retains legacy intent unless `--shared` is also set
 (then queries scan). `--no-index` always reads the filesystem.
-Each attached CLI query validates the repository once (three Git processes);
-daemon lookup/search/files/status reuse the attached identity with filesystem
-boundary/gitfile/common-directory checks and launch no Git subprocesses.
+An attached CLI invocation discovers its daemon once per worktree and reuses
+that client for every path argument, revalidating the view with `lookup`.
+Legacy v1 discovery validates the repository with three Git processes. Managed
+v2 discovery reads the gitfile, `commondir` and markers instead of running Git,
+and proceeds only when the canonical common-directory identity matches the
+registration bound by the daemon's owner-only credential; otherwise it falls
+back to Git discovery. Daemon lookup/search/files/status reuse the attached
+identity with filesystem boundary/gitfile/common-directory checks and launch no
+Git subprocesses.
 Queries open candidates through the view's retained root handle and verify that
 identity before and after snapshot callbacks, including empty and filename-only
 results. Replacing the root closes readiness rather than mixing old candidates
@@ -935,7 +941,9 @@ The daemon bounds views (default 32, `--shared-max-views`), leases (256,
 (16384, `--watcher-queue-cap`). Watch/hint budgets are partitioned equally by
 the configured maximum views; unused shares are not borrowed. There is one
 index/reconcile worker, two independent query workers, bounded connection and
-work queues, 1 MiB requests and 64 MiB responses. There is no content cache.
+work queues, 1 MiB requests and 64 MiB responses. Queries search on their own
+thread pool, so they never wait for threads held by reconciliation, although
+they still share CPU and disk with it. There is no content cache.
 The response limit is enforced while producing individual match/context rows,
 file paths and statistics, including JSON escaping and envelope overhead, and
 again during final serialization. Daemons advertising `paged_results` (v1) or
@@ -946,6 +954,10 @@ Each page reads the then-current snapshot, so a multi-page result is
 eventually consistent. Only a single file whose rows exceed the limit, or a
 daemon without paging, fails explicitly, and CLI queries then scan;
 generation mappings and private posting memory still scale with admitted data.
+Daemons advertising `filtered_files` (v1) or the `filtered-files` capability
+(managed v2) also apply `--glob`/`--iglob` and `-t`/`-T` to a `--files` listing
+before sending it; an older daemon sends the whole scope and the client filters
+it.
 
 Storage must already exist, be trusted and outside **all** registered worktrees,
 Git metadata and index snapshots. It contains separate `bases` and `overlays`
@@ -1031,13 +1043,18 @@ A [same-binary Windows/ReFS measurement](SHARED_INDEX_BENCHMARKS.md#large-checko
 completed a fresh warm-base attachment in 186.144 seconds versus 542.469 seconds
 for a standalone full build (2.914x), while still reading every required file.
 That result is one ordered pair without a file-cache flush, not a universal speedup.
-Healthy native managed views also run a periodic full verification every
-`--poll-interval` seconds (default 120), measured from their last completed
-full pass, while they keep serving queries. It reads and hashes every admitted
-file under the existing operation and resource budgets. An unchanged result
-keeps the view ready and changes nothing. `ready` closes only when it finds a
-difference, after which it publishes a full repair; silently missed changes
-are therefore repaired within one interval plus the verification time.
+Healthy native managed views use two serving verification tiers. A metadata
+check rewalks membership and visibility after at least `--poll-interval`
+seconds (default 120) without reconciliation. It retains content whose trusted
+file identity, size and mtime still match evidence from a verified read; only
+changed, hinted or unverified files need content reads and parent batches.
+Full rereads check every admitted file after at least 15 intervals (30 minutes
+by default), repairing same-stat rewrites and missed notifications. Each tier
+also waits at least 19 times its preceding pass cost before running again,
+limiting its own steady-state idle duty cycle to about 5% for similar-cost passes.
+These are minimum delays, not freshness deadlines: queueing, failures and
+variable pass costs can extend them. An unchanged check keeps the view ready;
+`ready` closes when a difference is found and the repair is published.
 Watcher errors/rescans, explicit full invalidation and concurrent edits still
 close `ready` first. Managed views are eventually consistent: once published
 they report `serving: true` and keep answering from their last publication
@@ -1045,11 +1062,19 @@ while `ready` is closed, instead of sending clients to a filesystem scan.
 Results can lag recent edits until the next reconciliation publishes. A
 verification that exhausts its deadline or is
 cancelled leaves the view ready but unverified, reports `failed`/`cancelled`,
-and retries after the next interval. Timestamps, clean Git status and an
+and retries subject to the same minimum interval and cost backoff. An unchanged
+content pass interrupted by a newer notification retains its verified metadata;
+the follow-up rewalks the tree and reads the queued hints instead of reopening
+every unchanged file. Timestamps, clean Git status and an
 unavailable journal never prove that nothing changed. Status reports
-`last_verification` with its outcome and age, and `watch_events` counts
+`last_verification` with its outcome, tier, ages and effective delays, and `watch_events` counts
 watcher input by kind, metadata-only notifications filtered as unchanged,
-invalidated paths and epoch advances. Use `--no-index` for current disk bytes.
+invalidated paths and epoch advances. `queued_work` shows whether the view's
+accepted work is running or queued, and in which scheduling class; work for a
+view that is not ready runs ahead of other views' background verification.
+Searches are not queued work: they run on their own threads and thread pool,
+so a running reconciliation or verification slows them only by sharing CPU
+and disk. Use `--no-index` for current disk bytes.
 
 On Windows/macOS, managed views use recursive worktree and Git metadata-root
 subscriptions, without pre-enumerating descendant directories. The unchanged
@@ -1062,8 +1087,8 @@ in `reconciliation_policy`. OS resource limits remain independent of this budget
 See [managed registration and update policy](SHARED_WORKTREE_INDEXES.md#advancing-and-reconciling-views).
 
 Explicit `--watch-mode poll` and actual native-watcher failure/budget fallback
-still perform full reconciliation after `--poll-interval` seconds (default 120)
-following completion. `--no-watch` disables watching and polling, not initial
+use the same two tiers and cost backoff following completion.
+`--no-watch` disables watching and polling, not initial
 verification or explicit refresh. `reconciliation_policy` distinguishes these
 per-view modes and namespace monitor counts. Polling views close `ready` for
 each pass but keep serving their previous publication; healthy native views
@@ -1214,19 +1239,23 @@ Query `prefix` is empty or a root-relative directory ending in `/`.
 
 `invalidate_path(relative_path)` immediately closes the query gate and queues
 a bounded file/subtree hint (both paths for renames). Case aliases trigger
-conservative verification; non-ASCII hints and queue overflow force a full pass.
+conservative verification. Non-ASCII hints cover their longest ASCII directory
+ancestor; overflowing queues coarsen to ancestor hints. A full pass is required
+only when those hints cannot be represented within the budget.
 Accepted trailing/repeated separators and interior `.` components are normalized,
 so `dir/` still invalidates the entire `dir` subtree. Absolute paths, parent
 components, and leading `.` remain explicit errors that force full repair.
-`invalidate_all()` handles native watcher overflow, polling uncertainty, Git or
-ignore configuration changes, and missed-event repair. `refresh()` rewalks
-membership/visibility and processes hints; with no hints it does full content
+`invalidate_all()` handles native watcher overflow and full missed-event repair.
+`invalidate_tree()` requests a membership/metadata walk without rereading
+unchanged contents; Git/ignore changes use this walk too.
+`refresh()` rewalks membership/visibility and processes hints; without hints or
+a queued tree check it does full content
 verification. `reconcile_full()` always verifies all admitted bytes, including
 same-size/restored-mtime edits, assume-unchanged and skip-worktree files.
 
 Construction and checkpoint restoration are **not ready**. A successful refresh
 atomically publishes overlay, filenames and visibility. `status()` exposes
-readiness, invalidation/published epochs and pending/full work. A concurrent
+readiness, invalidation/published epochs and pending/tree/full work. A concurrent
 invalidation causes `ChangedDuringReconcile`, not stale ready publication:
 retry or scan. There is one attempt per call, never an unbounded churn loop.
 Every reconciliation advances the epoch, including refreshes without hints;
@@ -1248,12 +1277,20 @@ registration per candidate. Neither API freezes file contents.
 Local-index and shared content queries reuse one pinned ancestor chain for at
 most 64 consecutive sibling candidates, without reordering or limiting results.
 They still read and match one file at a time and verify the ancestors when the
-batch ends. Shared queries retain per-candidate snapshot validation, read-time
-deadline checks, generation/root protection and the final epoch check.
-`RootedDir::read_batch` exposes this scoped reader; managed callers obtain a
-`WorktreeSnapshot::candidate_batch`, use `open_candidate_in` through subsequent
-snapshots, and call `finish` before publishing buffered results. A batch cannot
-be used with another root or generation. Reply and file-size limits are unchanged.
+batch ends. Shared queries size groups so that a small search still uses the
+query threads: the candidate count divided by the smaller of six and the thread
+count, at least 8 files per group. A shared group of two or more siblings pins
+its ancestors through one root-verified snapshot and opens the siblings through
+that pin, without per-candidate snapshots; `finish` verifies the root and
+ancestor identities again, and the final snapshot verifies the root. A single
+candidate still opens through its own snapshot. Every read still revalidates
+the query first, and a failed open counts as a filesystem failure only after
+that check passes. Generation/root protection and the final epoch check are
+unchanged. `RootedDir::read_batch` exposes this scoped reader; managed callers
+obtain a `WorktreeSnapshot::candidate_batch`, open siblings with
+`CandidateBatch::open` (or `open_candidate_in` through a snapshot of the same
+view), and call `finish` before publishing buffered results. A batch stays bound
+to the root and generation it pinned. Reply and file-size limits are unchanged.
 Metadata discovery rejects unrepresentable native names before conversion:
 non-Unicode paths and literal Unix backslashes cannot alias other indexed paths.
 Ordinary full scans retain native paths and remain available as the fallback.
@@ -1270,9 +1307,10 @@ Later reads through that handle remain caller-owned: report read errors and call
 `invalidate_all()` after leaving the guard rather than publishing partial results.
 Do not reenter the view from its closure. A refresh acknowledges processed hints,
 **not an atomic filesystem snapshot**. For verification independent of
-notifications, use explicit, polling or periodic full repair: healthy native
-managed views are verified within one `--poll-interval` plus verification time,
-and no-watch callers must explicitly refresh. Final reads can race subsequent edits.
+notifications, use explicit or periodic full repair. Managed metadata checks
+and content rereads have separate minimum intervals and cost backoff, not a
+fixed freshness bound; no-watch callers must explicitly refresh.
+Final reads can race subsequent edits.
 
 Full verification reads, auto-decodes and hashes checkout bytes; clean Git
 status, blob identity and index stat data are never byte-equivalence proofs.
@@ -1282,7 +1320,11 @@ private overlays also avoid extraction. A hinted refresh can avoid rereading
 unaffected, previously verified files under the event-driven freshness contract,
 but still performs a metadata/membership walk. `ReconcileStats` separates
 reads/bytes/decodes, actual extraction calls, base and overlay reuse, copied
-files/postings, and content reads avoided.
+files/postings, content reads avoided, and `metadata_reused` (paths needing
+neither a content open nor a verification parent batch). Metadata reuse is an
+eventual-consistency optimization, not proof against concurrent writes:
+directory-entry metadata can lag an active writer on Windows, and same-stat
+rewrites need a hint or the full reread tier.
 `hint_lookups` counts ordered-set probes: each file checks its normalized path
 and ancestor prefixes, at most one probe per component rather than a scan of
 all queued hints. Each probe is logarithmic in the hint count. Even a hinted

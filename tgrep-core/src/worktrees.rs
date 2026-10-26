@@ -130,6 +130,8 @@ pub struct WorktreeStatus {
     pub published_epoch: Option<u64>,
     pub pending_paths: usize,
     pub full_required: bool,
+    #[serde(default)]
+    pub tree_required: bool,
 }
 
 /// Work performed by one successful refresh (including no-op verification).
@@ -156,6 +158,8 @@ pub struct ReconcileStats {
     pub overlay_reused: u64,
     /// Prior verified content retained during an event-driven hint pass.
     pub content_reads_avoided: u64,
+    /// Prior verified content retained directly from trusted walk metadata.
+    pub metadata_reused: u64,
     /// Ordered-set probes for hinted paths/ancestors, bounded by path depth
     /// rather than the number of pending hints. Full passes make no probes.
     pub hint_lookups: u64,
@@ -209,6 +213,7 @@ impl ReconcileStats {
         self.base_files_copied += other.base_files_copied;
         self.overlay_reused += other.overlay_reused;
         self.content_reads_avoided += other.content_reads_avoided;
+        self.metadata_reused += other.metadata_reused;
         self.provisional_files += other.provisional_files;
         self.hint_lookups += other.hint_lookups;
         self.parent_batches += other.parent_batches;
@@ -238,6 +243,7 @@ struct Control {
     published_epoch: Option<u64>,
     ready: bool,
     full: bool,
+    tree: bool,
     hints: BTreeSet<String>,
 }
 
@@ -290,45 +296,53 @@ pub struct WorktreeView {
     stale: AtomicBool,
 }
 
-/// Outcome of a full content verification of a ready, published view.
+/// Outcome of a metadata or content verification of a ready, published view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verification {
     /// Not ready, or invalidations/hints are queued; ordinary refresh owns it.
     Ineligible,
-    /// Every admitted file was read and matched the published state. The
-    /// view stayed ready throughout and its epoch is unchanged.
+    /// Every admitted file matched the selected verification tier. The view
+    /// stayed ready throughout and its epoch is unchanged.
     Unchanged(ReconcileStats),
+    /// Content matched, but newer hints still need reconciliation. Verified
+    /// metadata is retained so that the follow-up need not reopen every file.
+    Superseded(ReconcileStats),
     /// A difference closed readiness and the verified state was published.
     Published(ReconcileStats),
 }
 
 /// Fails a verification closed if it observed a difference but did not
 /// publish the repaired state, including on panic.
-struct StaleGuard<'a>(&'a WorktreeView);
+struct StaleGuard<'a> {
+    view: &'a WorktreeView,
+    reread: bool,
+}
 
 impl Drop for StaleGuard<'_> {
     fn drop(&mut self) {
-        if self.0.stale.load(Ordering::Acquire) {
+        if self.view.stale.load(Ordering::Acquire) {
             let mut control = self
-                .0
+                .view
                 .control
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            control.full = true;
-            control.hints.clear();
+            control.full |= self.reread;
+            control.tree = true;
             if control.invalidate().is_err() {
                 control.ready = false;
             }
-            self.0.stale.store(false, Ordering::Release);
+            self.view.stale.store(false, Ordering::Release);
         }
     }
 }
 
 /// An eventually consistent pass takes its hints up front; failure or panic
-/// before publication must leave a full reconciliation queued instead.
+/// before publication must put the original work back beside any newer hints.
 struct TakenHints<'a> {
     view: &'a WorktreeView,
     armed: bool,
+    full: bool,
+    hints: BTreeSet<String>,
 }
 
 impl Drop for TakenHints<'_> {
@@ -339,8 +353,22 @@ impl Drop for TakenHints<'_> {
                 .control
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            control.full = true;
-            control.hints.clear();
+            control.full |= self.full;
+            control.tree = true;
+            for hint in &self.hints {
+                if !control.full
+                    && !queue_hint(
+                        &mut control.hints,
+                        hint.clone(),
+                        self.view.options.hint_capacity,
+                    )
+                {
+                    control.full = true;
+                }
+            }
+            if control.full {
+                control.hints.clear();
+            }
             control.ready = false;
         }
     }
@@ -440,6 +468,7 @@ impl WorktreeView {
                 published_epoch: None,
                 ready: false,
                 full: true,
+                tree: false,
                 hints: BTreeSet::new(),
             }),
             state: RwLock::new(State {
@@ -505,6 +534,7 @@ impl WorktreeView {
             published_epoch: control.published_epoch,
             pending_paths: control.hints.len(),
             full_required: control.full || stale,
+            tree_required: control.tree || stale,
         })
     }
 
@@ -555,7 +585,7 @@ impl WorktreeView {
     /// force a full pass before returning an error; never silently discard one.
     /// Accepted repeated/trailing separators and interior `.` components are
     /// normalized without requiring the hinted path to still exist.
-    /// Git/ignore configuration changes should use `invalidate_all`. A
+    /// Git/ignore configuration changes also rewalk membership. A
     /// successful refresh acknowledges this token with an equal or later epoch.
     pub fn invalidate_path(&self, path: &Path) -> Result<u64> {
         let mut control = self
@@ -563,7 +593,7 @@ impl WorktreeView {
             .lock()
             .map_err(|_| WorktreeError::Synchronization)?;
         let epoch = control.invalidate()?;
-        let relative = match relative_path(path) {
+        let mut relative = match relative_path(path) {
             Ok(relative) => relative.to_ascii_lowercase(),
             Err(error) => {
                 control.full = true;
@@ -571,23 +601,42 @@ impl WorktreeView {
                 return Err(error);
             }
         };
-        if !relative.is_ascii()
-            || relative
+        if !relative.is_ascii() {
+            relative = relative
                 .split('/')
-                .any(|part| matches!(part, ".git" | ".gitignore" | ".ignore" | ".gitattributes"))
-            || control.hints.len() >= self.options.hint_capacity
-                && !control.hints.contains(&relative)
+                .take_while(|part| part.is_ascii())
+                .collect::<Vec<_>>()
+                .join("/");
+        }
+        if relative
+            .split('/')
+            .any(|part| matches!(part, ".git" | ".gitignore" | ".ignore" | ".gitattributes"))
+        {
+            control.tree = true;
+        }
+        if !control.full
+            && (relative.is_empty()
+                || !queue_hint(&mut control.hints, relative, self.options.hint_capacity))
         {
             control.full = true;
             control.hints.clear();
-        } else if !control.full {
-            control.hints.insert(relative);
         }
         Ok(epoch)
     }
 
-    /// Startup, overflow, missed-event repair, Git/config changes and no-watch
-    /// refresh all use this invalidation. Safe to call while a pass is running.
+    /// Rewalk membership and metadata, retaining explicit content-read hints.
+    pub fn invalidate_tree(&self) -> Result<u64> {
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| WorktreeError::Synchronization)?;
+        let epoch = control.invalidate()?;
+        control.tree = true;
+        Ok(epoch)
+    }
+
+    /// Startup, watcher overflow and explicit content repair use this
+    /// invalidation. Safe to call while a pass is running.
     pub fn invalidate_all(&self) -> Result<u64> {
         let mut control = self
             .control
@@ -773,10 +822,10 @@ impl WorktreeView {
     /// performs a full content reconciliation, not a success-shaped no-op.
     ///
     /// At most one pass is attempted. A concurrent invalidation returns
-    /// `ChangedDuringReconcile`, retaining a full invalidation for the next
+    /// `ChangedDuringReconcile`, retaining the invalidation for the next
     /// call. Churn never causes unbounded retries or stale ready publication.
     /// Discovery/read failures likewise leave the gate closed and require a
-    /// full retry. Matching decoded content never re-extracts existing postings.
+    /// retry with its original hints. Matching content never re-extracts postings.
     ///
     /// With [`WorktreeOptions::stale_reads`], a concurrent invalidation does
     /// not discard the pass: it publishes what it reconciled, stays not ready,
@@ -790,7 +839,7 @@ impl WorktreeView {
         after_discovery: impl FnOnce(),
         before_publish: impl FnOnce(),
     ) -> Result<ReconcileStats> {
-        self.refresh_controlled_inner(after_discovery, before_publish, None)
+        self.refresh_controlled_inner(after_discovery, before_publish, None, false)
     }
 
     /// Reconcile a managed view under its namespace's bounded work reservation.
@@ -808,7 +857,24 @@ impl WorktreeView {
                 "reconciliation reservation belongs to another namespace".into(),
             ));
         }
-        self.refresh_controlled_inner(|| {}, || {}, Some(permit))
+        self.refresh_controlled_inner(|| {}, || {}, Some(permit), false)
+    }
+
+    /// Explicit managed refresh, including when path hints are already queued.
+    pub fn reread_controlled(
+        &self,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<ReconcileStats> {
+        if self
+            .root_protection
+            .as_ref()
+            .is_none_or(|root| root.namespace != permit.namespace.header().namespace)
+        {
+            return Err(WorktreeError::InvalidInput(
+                "reconciliation reservation belongs to another namespace".into(),
+            ));
+        }
+        self.refresh_controlled_inner(|| {}, || {}, Some(permit), true)
     }
 
     fn refresh_controlled_inner(
@@ -816,6 +882,7 @@ impl WorktreeView {
         after_discovery: impl FnOnce(),
         before_publish: impl FnOnce(),
         permit: Option<&Arc<crate::managed::WorkPermit>>,
+        reread: bool,
     ) -> Result<ReconcileStats> {
         let _serial = self
             .reconcile
@@ -840,22 +907,25 @@ impl WorktreeView {
                 .lock()
                 .map_err(|_| WorktreeError::Synchronization)?;
             let epoch = control.invalidate()?;
-            let full = control.full || control.hints.is_empty();
+            let full = reread || control.full || (!control.tree && control.hints.is_empty());
             if stale_reads {
                 // Invalidations during this pass queue normally for the next.
                 control.full = false;
+                control.tree = false;
                 (epoch, full, std::mem::take(&mut control.hints))
             } else {
-                // Any failed/panicking pass leaves a full retry queued.
-                control.full = true;
+                control.full |= full;
+                control.tree = true;
                 (epoch, full, control.hints.clone())
             }
         };
         let mut taken = TakenHints {
             view: self,
             armed: stale_reads,
+            full,
+            hints,
         };
-        let mut prepared = self.prepare(full, &hints, after_discovery, permit, false)?;
+        let mut prepared = self.prepare(full, &taken.hints, after_discovery, permit, false)?;
         before_publish();
         let assembly = Instant::now();
         self.check_parents(&mut prepared, permit)?;
@@ -885,8 +955,9 @@ impl WorktreeView {
     /// Reads every admitted checkout file regardless of stat or Git status,
     /// rewalks membership/visibility and rechecks parents. Readiness closes
     /// as soon as any difference is observed; that pass then publishes the
-    /// verified state. A concurrent invalidation returns
-    /// `ChangedDuringReconcile` and leaves the invalidation queued. Failures
+    /// verified state. A concurrent invalidation leaves its hints queued;
+    /// an otherwise unchanged pass returns `Verification::Superseded` and
+    /// retains verified evidence for the next pass. Failures
     /// after an observed difference, and any failure other than budget
     /// cancellation, deadline or resource pressure, leave a full refresh
     /// required. Budget failures with no observed difference keep serving.
@@ -911,8 +982,40 @@ impl WorktreeView {
         self.verify_inner(|| {}, || {}, None)
     }
 
+    /// Verify membership and trusted metadata, reading only changed or
+    /// unverified files. Same-stat rewrites require the content tier.
+    pub fn verify_metadata(&self) -> Result<Verification> {
+        self.verify_tier(false, || {}, || {}, None)
+    }
+
+    pub fn verify_metadata_controlled(
+        &self,
+        permit: &Arc<crate::managed::WorkPermit>,
+    ) -> Result<Verification> {
+        if self
+            .root_protection
+            .as_ref()
+            .is_none_or(|root| root.namespace != permit.namespace.header().namespace)
+        {
+            return Err(WorktreeError::InvalidInput(
+                "verification reservation belongs to another namespace".into(),
+            ));
+        }
+        self.verify_tier(false, || {}, || {}, Some(permit))
+    }
+
     fn verify_inner(
         &self,
+        after_discovery: impl FnOnce(),
+        before_publish: impl FnOnce(),
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Verification> {
+        self.verify_tier(true, after_discovery, before_publish, permit)
+    }
+
+    fn verify_tier(
+        &self,
+        reread: bool,
         after_discovery: impl FnOnce(),
         before_publish: impl FnOnce(),
         permit: Option<&Arc<crate::managed::WorkPermit>>,
@@ -940,6 +1043,7 @@ impl WorktreeView {
                 .map_err(|_| WorktreeError::Synchronization)?;
             if !self.current(&control)
                 || control.full
+                || control.tree
                 || !control.hints.is_empty()
                 || control.published_epoch != Some(control.epoch)
             {
@@ -947,8 +1051,8 @@ impl WorktreeView {
             }
             control.epoch
         };
-        let guard = StaleGuard(self);
-        let result = self.verify_serving(epoch, after_discovery, before_publish, permit);
+        let guard = StaleGuard { view: self, reread };
+        let result = self.verify_serving(epoch, after_discovery, before_publish, permit, reread);
         match &result {
             Ok(_) | Err(WorktreeError::ChangedDuringReconcile) => {}
             Err(error) if is_budget_failure(error) => {}
@@ -964,8 +1068,9 @@ impl WorktreeView {
         after_discovery: impl FnOnce(),
         before_publish: impl FnOnce(),
         permit: Option<&Arc<crate::managed::WorkPermit>>,
+        reread: bool,
     ) -> Result<Verification> {
-        let mut prepared = self.prepare(true, &BTreeSet::new(), after_discovery, permit, true)?;
+        let mut prepared = self.prepare(reread, &BTreeSet::new(), after_discovery, permit, true)?;
         before_publish();
         let assembly = Instant::now();
         self.check_parents(&mut prepared, permit)?;
@@ -977,20 +1082,28 @@ impl WorktreeView {
             .control
             .lock()
             .map_err(|_| WorktreeError::Synchronization)?;
-        if control.epoch != epoch {
-            return Err(WorktreeError::ChangedDuringReconcile);
-        }
         if !self.stale.load(Ordering::Acquire) {
+            self.state
+                .write()
+                .map_err(|_| WorktreeError::Synchronization)?
+                .evidence = prepared.evidence;
             let mut stats = prepared.stats;
             if let Some(permit) = permit {
                 permit.observe_reconciliation(&mut stats);
             }
             stats.timings.assembly_us += crate::managed::work::micros(assembly.elapsed());
             stats.epoch = epoch;
-            return Ok(Verification::Unchanged(stats));
+            return Ok(if control.epoch == epoch {
+                Verification::Unchanged(stats)
+            } else {
+                Verification::Superseded(stats)
+            });
         }
-        control.full = true;
-        control.hints.clear();
+        if control.epoch != epoch {
+            return Err(WorktreeError::ChangedDuringReconcile);
+        }
+        control.tree = true;
+        control.full |= reread;
         let published = control.invalidate()?;
         self.publish_prepared(&mut control, prepared, published, permit, assembly, true)
             .map(Verification::Published)
@@ -1152,6 +1265,7 @@ impl WorktreeView {
         control.published_epoch = Some(epoch);
         if current {
             control.full = false;
+            control.tree = false;
             control.hints.clear();
             control.ready = true;
         }
@@ -1257,6 +1371,46 @@ impl WorktreeView {
             memory
                 .grow(paths.len() as u64 * 128)
                 .map_err(crate::Error::from)?;
+        }
+        if !full {
+            let versions: HashMap<_, _> = walk
+                .files
+                .iter()
+                .filter_map(|file| {
+                    file.version
+                        .as_ref()
+                        .map(|version| (file.relative_path.as_str(), version))
+                })
+                .chain(
+                    walk.listed_versions
+                        .iter()
+                        .map(|(path, version)| (path.as_str(), version)),
+                )
+                .collect();
+            paths.retain(|path| {
+                let Some(previous) = state.evidence.get(path) else {
+                    return true;
+                };
+                if previous
+                    .version
+                    .as_ref()
+                    .is_none_or(|version| versions.get(path.as_str()).copied() != Some(version))
+                    || is_hinted(path, hints, &mut prepared.stats.hint_lookups)
+                {
+                    return true;
+                }
+                prepared.stats.metadata_reused += 1;
+                prepared.stats.content_reads_avoided += 1;
+                if let Some(content) = previous.content {
+                    if self.base_content(path) == Some(content) {
+                        prepared.stats.base_reused += 1;
+                    } else {
+                        prepared.stats.overlay_reused += 1;
+                    }
+                }
+                prepared.evidence.insert(path.clone(), previous.clone());
+                false
+            });
         }
         paths.sort_unstable_by(|left, right| {
             parent_path(left)
@@ -1703,12 +1857,8 @@ impl WorktreeView {
         let failed_paths = failed_paths
             .into_inner()
             .map_err(|_| WorktreeError::Synchronization)?;
-        if failed_paths.len() > self.options.hint_capacity {
-            self.invalidate_all()?;
-        } else {
-            for path in failed_paths {
-                self.invalidate_path(Path::new(&path))?;
-            }
+        for path in failed_paths {
+            self.invalidate_path(Path::new(&path))?;
         }
         Ok(result)
     }
@@ -2059,7 +2209,8 @@ pub struct CandidateFile {
 }
 
 /// A bounded sibling-read group retaining the same root and generation pins
-/// as escaped candidates. Open through a snapshot and finish before publishing.
+/// as escaped candidates. Pin it through a snapshot, open siblings with
+/// [`CandidateBatch::open`], and finish before publishing.
 pub struct CandidateBatch {
     batch: RootedBatch<Arc<RootedDir>>,
     generation: Arc<Generation>,
@@ -2067,6 +2218,21 @@ pub struct CandidateBatch {
 }
 
 impl CandidateBatch {
+    /// Open a sibling through the group's pinned handles without a snapshot.
+    /// The pinning snapshot verified the root and ancestors, and `finish`
+    /// verifies them again: discard the group's reads if it fails. A failed
+    /// open is not recorded on the view, so check the query, then requeue the
+    /// path or invalidate the view.
+    pub fn open(&self, relative: &str) -> std::io::Result<CandidateFile> {
+        let opened = self.batch.open_observed(Path::new(relative))?;
+        Ok(CandidateFile {
+            file: opened.file,
+            _root: Arc::clone(self.batch.pinned_root()),
+            _generation: Arc::clone(&self.generation),
+            _protection: self._protection.clone(),
+        })
+    }
+
     pub fn finish(self) -> std::io::Result<()> {
         self.batch.finish().map(|_| ())
     }
@@ -2222,9 +2388,10 @@ impl WorktreeSnapshot<'_> {
     }
 
     /// Root-relative candidates, resolved while the live-overlay guard is held.
-    /// `prefix` is empty or a root-relative directory with a trailing slash.
+    /// `prefix` is empty or a root-relative directory with a trailing slash;
+    /// postings outside it are skipped before the plan is evaluated.
     pub fn candidates(&self, plan: &QueryPlan, prefix: &str, include_hidden: bool) -> Vec<String> {
-        let (ids, reader) = self.state.index.execute_query_with_masks(plan);
+        let (ids, reader) = self.state.index.execute_query_with_masks_in(plan, prefix);
         let mut paths: Vec<_> = ids
             .into_iter()
             .filter_map(|id| self.state.index.resolve_path(id, &reader))
@@ -2240,16 +2407,35 @@ impl WorktreeSnapshot<'_> {
 
     /// Complete filename membership, including extension-filtered/NUL files.
     pub fn files(&self, prefix: &str, include_hidden: bool) -> Vec<String> {
+        self.listed_from(prefix, include_hidden, "")
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The [`files`](Self::files) entries that sort at or after `from`, in
+    /// path order. Only the paths under `prefix` are visited.
+    pub fn listed_from(
+        &self,
+        prefix: &str,
+        include_hidden: bool,
+        from: &str,
+    ) -> impl Iterator<Item = &str> {
+        let start = std::cmp::max(prefix, from);
         self.state
             .listed
-            .iter()
-            .filter(|path| {
+            .range::<str, _>((std::ops::Bound::Included(start), std::ops::Bound::Unbounded))
+            .map(String::as_str)
+            .take_while(move |path| path.starts_with(prefix))
+            .filter(move |path| {
                 self.state
                     .visibility
                     .is_visible(path, prefix, include_hidden)
             })
-            .cloned()
-            .collect()
+    }
+
+    /// Number of listed paths, hidden ones included.
+    pub fn file_count(&self) -> usize {
+        self.state.listed.len()
     }
 }
 
@@ -2589,6 +2775,43 @@ fn is_hinted(path: &str, hints: &BTreeSet<String>, lookups: &mut u64) -> bool {
         };
         prefix = parent;
     }
+}
+
+fn queue_hint(hints: &mut BTreeSet<String>, path: String, capacity: usize) -> bool {
+    if is_hinted(&path, hints, &mut 0) {
+        return true;
+    }
+    hints.insert(path);
+    if hints.len() <= capacity {
+        return true;
+    }
+    let target = (capacity / 2).max(capacity.min(1));
+    while hints.len() > target {
+        let depth = hints
+            .iter()
+            .map(|path| path.split('/').count())
+            .max()
+            .unwrap_or(0);
+        if depth <= 1 {
+            return false;
+        }
+        let coarsened: BTreeSet<_> = hints
+            .iter()
+            .map(|path| {
+                if path.split('/').count() == depth {
+                    parent_path(path).to_owned()
+                } else {
+                    path.clone()
+                }
+            })
+            .collect();
+        *hints = coarsened
+            .iter()
+            .filter(|path| !is_hinted(parent_path(path), &coarsened, &mut 0))
+            .cloned()
+            .collect();
+    }
+    true
 }
 
 struct VerifiedRead<'a> {

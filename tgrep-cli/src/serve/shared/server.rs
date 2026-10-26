@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -919,6 +919,7 @@ impl State {
                 Ok(json!({
                     "capabilities":["leases","recoverable-attach","worktree-overlays","refresh","search","files"],
                     "profile":IndexingProfile::default(), "retention":"retain-all", "paged_results":true,
+                    "filtered_files":true,
                     "limits":{"views":self.policy.max_views, "leases":self.policy.max_leases,
                         "watches_per_view":self.policy.watches_per_view, "hints_per_view":self.policy.hints_per_view,
                         "reconcile_workers":1, "query_workers":QUERY_WORKERS, "query_queue":QUERY_QUEUE,
@@ -1128,21 +1129,23 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             "hidden" => value.is_boolean(),
             "max_depth" => value.is_null() || value.is_u64(),
             "page" => value.is_null() || value.is_string(),
-            _ if files => false,
-            "pattern" | "encoding" | "engine" => value.is_string(),
-            "replace" => value.is_null() || value.is_string(),
-            "extra_patterns" | "glob" | "iglob" | "types" | "types_not" | "type_add"
-            | "type_clear" => value
+            "glob" | "iglob" | "types" | "types_not" | "type_add" | "type_clear" => value
                 .as_array()
                 .is_some_and(|array| array.iter().all(Value::is_string)),
             "type_ops" => crate::search::type_ops_from_json(value).is_ok(),
+            "glob_case_insensitive" => value.is_boolean(),
+            _ if files => false,
+            "pattern" | "encoding" | "engine" => value.is_string(),
+            "replace" => value.is_null() || value.is_string(),
+            "extra_patterns" => value
+                .as_array()
+                .is_some_and(|array| array.iter().all(Value::is_string)),
             "max_count" | "after_context" | "before_context" | "max_filesize"
             | "regex_size_limit" | "dfa_size_limit" => value.is_null() || value.is_u64(),
             "case_insensitive"
             | "fixed_string"
             | "files_only"
             | "word_boundary"
-            | "glob_case_insensitive"
             | "invert_match"
             | "only_matching"
             | "multiline"
@@ -1319,6 +1322,7 @@ pub(super) fn search_snapshot(
         id,
         metadata,
         page_time,
+        rayon::current_num_threads(),
         |groups, search| {
             groups
                 .iter()
@@ -1328,7 +1332,7 @@ pub(super) fn search_snapshot(
     )
 }
 
-/// Searches bounded windows of sibling groups on the rayon pool.
+/// Searches bounded windows of sibling groups, each window on the query pool.
 pub(super) fn search_snapshot_parallel(
     source: &(impl QuerySource + Sync),
     query: &Value,
@@ -1338,6 +1342,11 @@ pub(super) fn search_snapshot_parallel(
     page_time: Duration,
 ) -> Result<Value> {
     use rayon::prelude::*;
+    let pool = query_pool();
+    let threads = pool.map_or_else(
+        rayon::current_num_threads,
+        rayon::ThreadPool::current_num_threads,
+    );
     search_snapshot_with(
         source,
         query,
@@ -1345,13 +1354,45 @@ pub(super) fn search_snapshot_parallel(
         id,
         metadata,
         page_time,
+        threads,
         |groups, search| {
-            groups
-                .par_iter()
-                .map(|siblings| search.search(source, siblings))
-                .collect()
+            let window = || {
+                groups
+                    .par_iter()
+                    .map(|siblings| search.search(source, siblings))
+                    .collect()
+            };
+            match pool {
+                Some(pool) => pool.install(window),
+                None => window(),
+            }
         },
     )
+}
+
+/// A rayon pool reserved for query windows, as wide as the global pool.
+/// Reconciliation and verification hold global-pool workers in long batches,
+/// and a pool takes work injected from outside it only after its workers' own
+/// queues drain, so a query sharing that pool could wait for a whole pass.
+/// Without the dedicated pool, queries fall back to the global one.
+///
+/// Install one window at a time and keep the rest of a query on its own
+/// thread. A worker blocked in a join may run a job injected from outside the
+/// pool, so installing a whole query would let another query's window wait
+/// for that entire query rather than for one window.
+fn query_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads())
+            .thread_name(|index| format!("tgrep-search-{index}"))
+            .build()
+            .inspect_err(|error| {
+                eprintln!("warning: shared queries use the global thread pool: {error}");
+            })
+            .ok()
+    })
+    .as_ref()
 }
 
 type Searched = Vec<(crate::serve::FileSearchResult, usize)>;
@@ -1450,6 +1491,10 @@ impl<'a> GroupSearch<'a> {
                 // The group's reads may have crossed a replaced parent: skip
                 // them like vanished candidates, refunding their response
                 // budget, and serve the paths once the refresh publishes.
+                // Sibling opens take no snapshot, so one snapshot first
+                // re-verifies the root: a replaced root fails the query and
+                // closes the view instead.
+                source.snapshot(|_| ())?;
                 source.requeue(siblings)?;
                 let claimed: usize = files.iter().map(|(_, bytes)| bytes).sum();
                 self.remaining.fetch_add(claimed, Ordering::AcqRel);
@@ -1484,7 +1529,9 @@ impl<'a> GroupSearch<'a> {
 
 /// `page` absent keeps the whole-result contract. Otherwise a page ends at a
 /// file boundary when the response budget or `page_time` runs out, and
-/// `next_page` names the first path it did not search.
+/// `next_page` names the first path it did not search. Each `run` call
+/// searches one window of up to `threads * 4` sibling groups.
+#[allow(clippy::too_many_arguments)]
 fn search_snapshot_with<S: QuerySource>(
     source: &S,
     query: &Value,
@@ -1492,6 +1539,7 @@ fn search_snapshot_with<S: QuerySource>(
     id: &Value,
     metadata: Value,
     page_time: Duration,
+    threads: usize,
     run: impl for<'a> Fn(&[&[String]], &GroupSearch<'a>) -> Vec<Result<Searched>>,
 ) -> Result<Value> {
     validate_query(query, files)?;
@@ -1524,27 +1572,36 @@ fn search_snapshot_with<S: QuerySource>(
     let paged = page.is_some();
     let cursor = page.and_then(Value::as_str);
     let (mut result, epoch) = if files {
+        let (glob_filter, type_filter) =
+            crate::serve::parse_path_filters(query).map_err(anyhow::Error::msg)?;
         let (paths, next, epoch) = source.snapshot(|snapshot| -> Result<_> {
-            let listed = snapshot.files(&scope.prefix, scope.hidden);
             if paged {
-                reserve_cursor(&mut budget, &listed)?;
+                reserve_cursor(
+                    &mut budget,
+                    snapshot.listed_from(&scope.prefix, scope.hidden, ""),
+                )?;
             }
             let mut paths = Vec::new();
             let mut next = None;
+            // Visits only the scope directory, starting at the page cursor.
+            // Globs and types filter it as the client does, a positive glob
+            // overriding `-t`/`-T`.
+            let listed = snapshot
+                .listed_from(&scope.prefix, scope.hidden, cursor.unwrap_or_default())
+                .filter(|path| {
+                    scope.relative(path).is_some_and(|relative| {
+                        crate::search::passes_filters(relative, &glob_filter, &type_filter, true)
+                    })
+                });
             for path in listed {
-                if cursor.is_some_and(|cursor| path.as_str() < cursor)
-                    || scope.relative(&path).is_none()
-                {
-                    continue;
-                }
                 match budget.charge(&path) {
-                    Ok(()) => paths.push(path),
+                    Ok(()) => paths.push(path.to_owned()),
                     Err(error)
                         if paged
                             && !paths.is_empty()
                             && error.is::<crate::serve::ResponseLimit>() =>
                     {
-                        next = Some(path);
+                        next = Some(path.to_owned());
                         break;
                     }
                     Err(error) => return Err(error),
@@ -1562,7 +1619,7 @@ fn search_snapshot_with<S: QuerySource>(
         let (paths, total, epoch) = source.snapshot(|snapshot| {
             (
                 snapshot.candidates(&request.plan, &scope.prefix, scope.hidden),
-                request.opts.stats.then(|| snapshot.files("", true).len()),
+                request.opts.stats.then(|| snapshot.file_count()),
                 snapshot.epoch(),
             )
         })?;
@@ -1590,13 +1647,14 @@ fn search_snapshot_with<S: QuerySource>(
         if paged {
             reserve_cursor(&mut budget, paths)?;
         }
-        let groups: Vec<_> = tgrep_core::rooted::sibling_batches(paths).collect();
+        let size = group_files(paths.len(), threads);
+        let groups: Vec<_> = tgrep_core::rooted::sibling_batches_sized(paths, size).collect();
         let mut rows = Vec::new();
         let mut stats = Vec::new();
         let mut search_stats = Vec::new();
         let mut searched = 0_usize;
         let mut next = None;
-        let width = rayon::current_num_threads().max(1) * 4;
+        let width = threads.max(1) * 4;
         let deadline = paged.then(|| start.checked_add(page_time)).flatten();
         'page: for (number, window) in groups.chunks(width).enumerate() {
             if paged && number > 0 && start.elapsed() >= page_time {
@@ -1666,13 +1724,29 @@ fn search_snapshot_with<S: QuerySource>(
 }
 
 /// Keep room for the `next_page` cursor that may end this page.
-fn reserve_cursor(budget: &mut crate::serve::JsonBudget, paths: &[String]) -> Result<()> {
-    let longest = paths.iter().map(String::len).max().unwrap_or(0);
+fn reserve_cursor<S: AsRef<str>>(
+    budget: &mut crate::serve::JsonBudget,
+    paths: impl IntoIterator<Item = S>,
+) -> Result<()> {
+    let longest = paths
+        .into_iter()
+        .map(|path| path.as_ref().len())
+        .max()
+        .unwrap_or(0);
     budget.remaining = budget
         .remaining
         .checked_sub(longest.saturating_mul(6).saturating_add(32))
         .ok_or(crate::serve::ResponseLimit)?;
     Ok(())
+}
+
+/// Files per sibling group. Smaller groups let one directory's candidates be
+/// read in parallel, but each group pins its ancestor chain and verifies it
+/// again at `finish`, and concurrent opens in one directory contend. So a
+/// search targets `min(threads, 6)` groups of at least 8 files;
+/// `sibling_batches_sized` caps a group at 64 files.
+fn group_files(candidates: usize, threads: usize) -> usize {
+    candidates.div_ceil(threads.clamp(1, 6)).max(8)
 }
 
 /// Only an open, stat or read failure of the candidate itself closes the view
@@ -1724,12 +1798,27 @@ fn read_candidate(
     relative: &str,
 ) -> Result<Option<Vec<u8>>> {
     let failed = |error| candidate_failed(source, relative, error);
-    let Some(file) = candidate_snapshot(source, relative, |snapshot| match batch {
-        Some(batch) => snapshot.open_candidate_in(batch, relative),
-        None => snapshot.open_candidate(relative),
-    })?
-    else {
-        return Ok(None);
+    // A batch sibling opens through the group's pinned handles without a
+    // snapshot: the pinning snapshot, `finish` and the final snapshot verify
+    // the root, and `check` revalidates the query before every read. Classify
+    // a failed open only once `check` confirms that the query is still valid.
+    let file = match batch {
+        Some(batch) => match batch.open(relative) {
+            Ok(file) => file,
+            Err(error) => {
+                source.check()?;
+                return failed(error.into());
+            }
+        },
+        None => {
+            let Some(file) = candidate_snapshot(source, relative, |snapshot| {
+                snapshot.open_candidate(relative)
+            })?
+            else {
+                return Ok(None);
+            };
+            file
+        }
     };
     match file.metadata() {
         Ok(metadata) if metadata.is_file() => {}
@@ -1759,6 +1848,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn small_searches_split_sibling_groups_across_query_threads() {
+        for (candidates, threads, expected) in [
+            (40, 16, 8),
+            (80, 16, 14),
+            (240, 16, 40),
+            (5, 16, 8),
+            (1000, 16, 167),
+            (40, 1, 40),
+            (40, 4, 10),
+            (0, 0, 8),
+        ] {
+            assert_eq!(
+                group_files(candidates, threads),
+                expected,
+                "{candidates} {threads}"
+            );
+        }
+    }
+
+    #[test]
     fn count_projection_query_fields_require_booleans() {
         for field in ["count", "count_matches", "search_stats"] {
             for value in [json!(true), json!(false)] {
@@ -1770,6 +1879,42 @@ mod tests {
                 assert!(validate_query(&json!({"pattern":"return",field:value}), false).is_err());
             }
         }
+    }
+
+    #[test]
+    fn files_queries_accept_only_path_filters() {
+        let filters = json!({
+            "glob":["*.md"], "iglob":[], "glob_case_insensitive":true,
+            "type_ops":[["select","rust"]], "types":["rust"]
+        });
+        validate_query(&filters, true).unwrap();
+        let mut search = filters.clone();
+        search["pattern"] = json!("x");
+        validate_query(&search, false).unwrap();
+        for (field, value) in [
+            ("glob", json!("*.rs")),
+            ("glob_case_insensitive", json!(1)),
+            ("type_ops", json!([["bogus", "x"]])),
+            ("pattern", json!("x")),
+            ("extra_patterns", json!(["x"])),
+        ] {
+            assert!(
+                validate_query(&json!({field: value}), true).is_err(),
+                "{field}"
+            );
+        }
+
+        // A glob that decides a path overrides the type selection.
+        let passes = |filters: &Value, path: &str| {
+            let (glob, types) = crate::serve::parse_path_filters(filters).unwrap();
+            crate::search::passes_filters(path, &glob, &types, true)
+        };
+        assert!(passes(&filters, "a/notes.md"));
+        assert!(!passes(&filters, "a/main.rs"));
+        assert!(!passes(&filters, "a/x.txt"));
+        let types = json!({"types":["rust"]});
+        assert!(passes(&types, "a/main.rs"));
+        assert!(!passes(&types, "a/notes.md"));
     }
 
     #[test]

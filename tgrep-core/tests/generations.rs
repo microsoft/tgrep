@@ -105,6 +105,35 @@ fn candidates(generation: &Generation, pattern: &str) -> Vec<String> {
 }
 
 #[test]
+fn git_free_identity_matches_discovery() {
+    let fixture = Fixture::new();
+    write(&fixture.repo, "source.txt", b"identity");
+    fixture.commit();
+    let linked = fixture.repo.with_file_name("linked worktree with spaces");
+    let output = command(&fixture.repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(&linked)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for root in [&fixture.repo, &linked] {
+        let (git_dir, common_dir) = tgrep_core::git_index::read_repository_dirs(root).unwrap();
+        let repository = Repository::discover(root).unwrap();
+        let common_dir = fs::canonicalize(common_dir).unwrap();
+        assert_eq!(fs::canonicalize(git_dir).unwrap(), repository.git_dir());
+        assert_eq!(common_dir, repository.common_dir());
+        assert_eq!(
+            Repository::identity_of(&common_dir).unwrap(),
+            repository.identity()
+        );
+    }
+}
+
+#[test]
 fn linked_worktrees_and_equal_trees_share_one_arc() {
     let fixture = Fixture::new();
     write(

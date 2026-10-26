@@ -388,12 +388,12 @@ fn native_subscriptions_cover_nested_worktree_changes_with_default_budgets() {
 
     fs::write(root.join(".gitignore"), "new/\n").unwrap();
     let ignored = native_ready(&daemon, view, Some(epoch(&later)));
-    assert_eq!(ignored["last_reconcile"]["full"], true);
+    assert_eq!(ignored["last_reconcile"]["full"], false);
     assert!(matches(&daemon, view, "recreated_later").is_empty());
     assert_scan_parity(&daemon, root, fixture.temp.path());
     fs::remove_file(root.join(".gitignore")).unwrap();
     let unignored = native_ready(&daemon, view, Some(epoch(&ignored)));
-    assert_eq!(unignored["last_reconcile"]["full"], true);
+    assert_eq!(unignored["last_reconcile"]["full"], false);
     assert_eq!(matches(&daemon, view, "recreated_later").len(), 1);
 
     let (private, common) = tgrep_core::git_index::read_repository_dirs(root).unwrap();
@@ -403,7 +403,8 @@ fn native_subscriptions_cover_nested_worktree_changes_with_default_budgets() {
     )
     .unwrap();
     let private_change = native_ready(&daemon, view, Some(epoch(&unignored)));
-    assert_eq!(private_change["last_reconcile"]["full"], true);
+    assert_eq!(private_change["last_reconcile"]["full"], false);
+    assert_eq!(private_change["last_reconcile"]["files_read"], 0);
     statuses = views
         .iter()
         .map(|view| native_ready(&daemon, view, None))
@@ -418,12 +419,12 @@ fn native_subscriptions_cover_nested_worktree_changes_with_default_budgets() {
     );
     for (view, before) in views.iter().zip(&mut statuses) {
         *before = native_ready(&daemon, view, Some(epoch(before)));
-        assert_eq!(before["last_reconcile"]["full"], true);
+        assert_eq!(before["last_reconcile"]["full"], false);
     }
     fs::write(common.join("info").join("exclude"), "new/\n").unwrap();
     for ((view, before), root) in views.iter().zip(&statuses).zip(roots) {
         let after = native_ready(&daemon, view, Some(epoch(before)));
-        assert_eq!(after["last_reconcile"]["full"], true);
+        assert_eq!(after["last_reconcile"]["full"], false);
         assert!(matches(&daemon, view, "recreated_later").is_empty());
         assert_scan_parity(&daemon, root, fixture.temp.path());
     }

@@ -1062,7 +1062,8 @@ while `ready` is closed, instead of sending clients to a filesystem scan.
 Results can lag recent edits until the next reconciliation publishes. A
 verification that exhausts its deadline or is
 cancelled leaves the view ready but unverified, reports `failed`/`cancelled`,
-and retries subject to the same minimum interval and cost backoff. An unchanged
+and retries subject to interval and cost backoff measured from that attempt's
+completion, without advancing the successful-content age. An unchanged
 content pass interrupted by a newer notification retains its verified metadata;
 the follow-up rewalks the tree and reads the queued hints instead of reopening
 every unchanged file. Timestamps, clean Git status and an

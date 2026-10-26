@@ -907,6 +907,130 @@ fn healthy_native_views_verify_on_elapsed_poll_intervals_while_serving() {
 }
 
 #[test]
+fn failed_and_cancelled_native_content_verifications_back_off_without_resetting_freshness() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
+    let (claim, guard) = owner(&daemon);
+    verified_attach(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["ready"] == true && status["work"].is_null() && status["watch_mode"] == "native"
+        },
+    );
+    daemon.rpc(
+        "testing.suppress-watch-events",
+        json!({"view":view["view"],"suppress":true}),
+    );
+    for (category, outcome) in [("deadline", "failed"), ("cancelled", "cancelled")] {
+        let before = daemon.rpc("views.status", json!({"id":view["view"]}));
+        daemon.rpc(
+            "testing.install",
+            json!({
+                "point":"reconcile-batch-opened","operation":null,"skip_hits":0,
+                "action":{"mode":"error","category":category}
+            }),
+        );
+        let since = Instant::now();
+        daemon.rpc(
+            "testing.reconcile-timer",
+            json!({"view":view["view"],"elapsed_ms":86_400_000}),
+        );
+        let after = wait_verified(&daemon, &view, outcome, since);
+        assert_eq!(after["ready"], true, "{after}");
+        assert_eq!(after["serving"], true, "{after}");
+        assert_eq!(after["last_verification"]["tier"], "content");
+        let verification = &after["last_verification"];
+        let content_age = verification["content_age_ms"].as_u64().unwrap();
+        let attempt_age = verification["content_attempt_age_ms"].as_u64().unwrap();
+        assert!(
+            content_age
+                >= before["last_verification"]["content_age_ms"]
+                    .as_u64()
+                    .unwrap(),
+            "{after}"
+        );
+        assert!(content_age > attempt_age, "{after}");
+        assert!(
+            u128::from(attempt_age) <= since.elapsed().as_millis(),
+            "{after}"
+        );
+        let retry_delay = verification["content_retry_delay_ms"].as_u64().unwrap();
+        assert!(retry_delay >= 120_000, "{after}");
+
+        for attempt_elapsed in [0, retry_delay - 1] {
+            let since = Instant::now();
+            daemon.rpc(
+                "testing.reconcile-timer",
+                json!({
+                    "view":view["view"],"elapsed_ms":120_000,
+                    "reread_elapsed_ms":86_400_000,
+                    "reread_attempt_elapsed_ms":attempt_elapsed
+                }),
+            );
+            let metadata = wait_verified(&daemon, &view, "unchanged", since);
+            assert_eq!(
+                metadata["last_verification"]["tier"], "metadata",
+                "{metadata}"
+            );
+            assert_eq!(metadata["last_reconcile"]["files_read"], 0, "{metadata}");
+            assert!(
+                metadata["last_verification"]["content_age_ms"]
+                    .as_u64()
+                    .unwrap()
+                    >= content_age,
+                "{metadata}"
+            );
+            assert!(
+                metadata["last_verification"]["content_attempt_age_ms"]
+                    .as_u64()
+                    .unwrap()
+                    >= attempt_age,
+                "{metadata}"
+            );
+        }
+
+        let since = Instant::now();
+        daemon.rpc(
+            "testing.reconcile-timer",
+            json!({
+                "view":view["view"],"elapsed_ms":120_000,
+                "reread_elapsed_ms":86_400_000,
+                "reread_attempt_elapsed_ms":retry_delay
+            }),
+        );
+        let retried = wait_verified(&daemon, &view, "unchanged", since);
+        assert_eq!(retried["last_verification"]["tier"], "content", "{retried}");
+        assert_eq!(retried["last_reconcile"]["files_read"], 3, "{retried}");
+        assert!(
+            u128::from(
+                retried["last_verification"]["content_age_ms"]
+                    .as_u64()
+                    .unwrap()
+            ) <= since.elapsed().as_millis(),
+            "{retried}"
+        );
+        assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    }
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
 fn superseded_native_content_verification_retains_evidence_and_advances_its_timer() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);

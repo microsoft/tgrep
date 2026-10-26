@@ -113,7 +113,8 @@ hinted or unverified files. Full content rereads wait at least 15 intervals
 pass cost, so these are minimum delays, not guaranteed freshness bounds.
 `ready` closes only when verification finds a difference. A deadline or
 cancellation leaves the view ready but unverified (`last_verification.outcome`
-`failed`/`cancelled`) and is retried with interval/cost backoff.
+`failed`/`cancelled`) and is retried with interval/cost backoff measured from
+that attempt's completion, without advancing the successful-content age.
 `views.refresh` explicitly verifies all admitted contents; use `--no-index`
 when current disk bytes are required.
 `--watch-mode poll` and actual native-watcher failure/budget fallback instead

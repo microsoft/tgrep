@@ -1502,8 +1502,10 @@ without reconciliation or verification, the scheduler queues a metadata check:
 `reconcile` with `verify: true, metadata_only: true`. A full content reread
 (`verify: true`, no `metadata_only`) becomes due after at least 15 intervals
 (30 minutes by default) since the last completed content verification.
-Each tier also waits at least 19 times its previous admitted pass duration;
-content attempts additionally wait one poll interval since any verification.
+Each tier also waits at least 19 times its previous admitted pass duration,
+measured from that attempt's completion even when it failed or was cancelled.
+Content attempts additionally wait one poll interval since any verification;
+failed or cancelled attempts do not advance the last successful content age.
 This bounds each tier's steady-state idle duty to about 5% for similar-cost
 passes, rather than keeping large checkouts continuously busy.
 The delays are minimums; queueing, errors, churn and variable costs prevent a
@@ -1612,8 +1614,14 @@ and `native_missed_changes` is `"repaired-by-periodic-verification"`.
 `"requires-explicit-refresh"`. The configured `poll_interval_ms` is always
 visible; `configured_watch_mode` is `auto`, `poll` or `disabled`.
 `last_verification` has `outcome`, `tier` (`metadata` or `content`), `age_ms`,
-`content_age_ms`, `metadata_delay_ms` and `content_delay_ms`. Effective delays
-include the observed-cost backoff. The outcome is `full-pass` after
+`content_age_ms`, `content_attempt_age_ms`, `metadata_delay_ms`,
+`content_delay_ms` and `content_retry_delay_ms`. The successful content age
+only advances after a completed content pass; the attempt age also advances
+after failed or cancelled content verification, but not after metadata checks.
+`content_delay_ms` includes the 15-interval successful-pass cadence and cost
+backoff. `content_retry_delay_ms` is the retry minimum since the last terminal
+content attempt: the larger of one poll interval and 19 times its admitted cost.
+The outcome is `full-pass` after
 attachment or any other completed full reconciliation; for a serving
 verification it is `unchanged`, `repaired`, `superseded`, `failed` or `cancelled`.
 A polling metadata reconciliation reports `metadata-pass`.

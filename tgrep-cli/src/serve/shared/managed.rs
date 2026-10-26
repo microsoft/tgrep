@@ -316,6 +316,18 @@ fn verification_delay(interval: Duration, cost: Duration) -> Duration {
     interval.max(cost.saturating_mul(VERIFICATION_DUTY_FACTOR))
 }
 
+fn content_verification_due(
+    interval: Duration,
+    cost: Duration,
+    verification_elapsed: Duration,
+    reread_elapsed: Duration,
+    attempt_elapsed: Duration,
+) -> bool {
+    reread_elapsed >= interval.saturating_mul(REREAD_INTERVALS)
+        && attempt_elapsed >= verification_delay(interval, cost)
+        && verification_elapsed >= interval
+}
+
 struct Monitor {
     watcher: Option<notify::RecommendedWatcher>,
     watched: HashSet<PathBuf>,
@@ -326,7 +338,9 @@ struct Monitor {
     last_reconcile: Instant,
     /// Last completed full pass or terminal serving-verification attempt.
     last_verification: Instant,
+    /// Last successful content pass, not advanced by failed or cancelled attempts.
     last_reread: Instant,
+    last_reread_attempt: Instant,
     stat_cost: Duration,
     reread_cost: Duration,
     verification: Option<&'static str>,
@@ -1325,8 +1339,10 @@ impl State {
                 "tier": monitor.verification_tier,
                 "age_ms": monitor.last_verification.elapsed().as_millis(),
                 "content_age_ms": monitor.last_reread.elapsed().as_millis(),
+                "content_attempt_age_ms": monitor.last_reread_attempt.elapsed().as_millis(),
                 "metadata_delay_ms": verification_delay(self.watches.interval, monitor.stat_cost).as_millis(),
                 "content_delay_ms": verification_delay(self.watches.interval.saturating_mul(REREAD_INTERVALS), monitor.reread_cost).as_millis(),
+                "content_retry_delay_ms": verification_delay(self.watches.interval, monitor.reread_cost).as_millis(),
             })),
             "reconciliation_policy": self.watches.reconciliation_status(polling),
             "queued_work": queued_work
@@ -1639,11 +1655,16 @@ impl State {
                     elapsed_ms: u64,
                     #[serde(default)]
                     reread_elapsed_ms: Option<u64>,
+                    #[serde(default)]
+                    reread_attempt_elapsed_ms: Option<u64>,
                 }
                 let input: Input = decode(request.params.clone())?;
                 if input.elapsed_ms > 86_400_000
                     || input
                         .reread_elapsed_ms
+                        .is_some_and(|elapsed| elapsed > 86_400_000)
+                    || input
+                        .reread_attempt_elapsed_ms
                         .is_some_and(|elapsed| elapsed > 86_400_000)
                 {
                     return Err(Error::invalid("test timer exceeds one day").into());
@@ -1663,6 +1684,12 @@ impl State {
                         Duration::from_millis(input.elapsed_ms),
                         Duration::from_millis(input.elapsed_ms),
                         Duration::from_millis(input.reread_elapsed_ms.unwrap_or(input.elapsed_ms)),
+                        Duration::from_millis(
+                            input
+                                .reread_attempt_elapsed_ms
+                                .or(input.reread_elapsed_ms)
+                                .unwrap_or(input.elapsed_ms),
+                        ),
                     )
                 })?;
                 Ok(json!({"input_epoch":slot.input_epoch()}))
@@ -2092,7 +2119,8 @@ impl State {
                         _ => None,
                     };
                     if let Some(outcome) = outcome {
-                        state.last_verification = Instant::now();
+                        let completed = Instant::now();
+                        state.last_verification = completed;
                         state.verification = Some(outcome);
                         let metadata_only =
                             outcome != "full-pass" && operation.request["metadata_only"] == true;
@@ -2108,11 +2136,12 @@ impl State {
                             state.stat_cost = cost;
                         } else {
                             state.reread_cost = cost;
+                            state.last_reread_attempt = completed;
                             if matches!(
                                 outcome,
                                 "full-pass" | "unchanged" | "repaired" | "superseded"
                             ) {
-                                state.last_reread = Instant::now();
+                                state.last_reread = completed;
                             }
                         }
                     }
@@ -2153,6 +2182,7 @@ impl State {
                 monitor.last_reconcile.elapsed(),
                 monitor.last_verification.elapsed(),
                 monitor.last_reread.elapsed(),
+                monitor.last_reread_attempt.elapsed(),
             )
         })
     }
@@ -2160,7 +2190,7 @@ impl State {
     fn schedule_view_with_elapsed(
         &self,
         slot: &Arc<ViewSlot>,
-        elapsed: impl FnOnce(&Monitor) -> (Duration, Duration, Duration, Duration),
+        elapsed: impl FnOnce(&Monitor) -> (Duration, Duration, Duration, Duration, Duration),
     ) -> Result<bool> {
         let status = self.views.status(slot.id())?;
         if status.leases == 0 {
@@ -2204,17 +2234,23 @@ impl State {
             return Ok(true);
         }
         let retry = Duration::from_millis(200_u64.saturating_mul(1_u64 << monitor.failures.min(7)));
-        let (schedule_elapsed, reconcile_elapsed, verification_elapsed, reread_elapsed) =
-            elapsed(&monitor);
+        let (
+            schedule_elapsed,
+            reconcile_elapsed,
+            verification_elapsed,
+            reread_elapsed,
+            reread_attempt_elapsed,
+        ) = elapsed(&monitor);
         let polling = self.watches.polling(&monitor);
         let stat_due = reconcile_elapsed.min(verification_elapsed)
             >= verification_delay(self.watches.interval, monitor.stat_cost);
-        let reread_due = reread_elapsed
-            >= verification_delay(
-                self.watches.interval.saturating_mul(REREAD_INTERVALS),
-                monitor.reread_cost,
-            )
-            && verification_elapsed >= self.watches.interval;
+        let reread_due = content_verification_due(
+            self.watches.interval,
+            monitor.reread_cost,
+            verification_elapsed,
+            reread_elapsed,
+            reread_attempt_elapsed,
+        );
         let periodic = polling && (stat_due || reread_due);
         // Healthy native views are verified while serving; only a detected
         // difference closes readiness.
@@ -2491,6 +2527,7 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
             last_reconcile: Instant::now(),
             last_verification: Instant::now(),
             last_reread: Instant::now(),
+            last_reread_attempt: Instant::now(),
             stat_cost: Duration::ZERO,
             reread_cost: Duration::ZERO,
             verification: None,
@@ -3602,6 +3639,58 @@ mod scheduling_tests {
         assert_eq!(idle, Duration::from_secs(3135));
         assert_eq!(cost.as_secs() * 20, (idle + cost).as_secs());
         assert_eq!(verification_delay(interval, Duration::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn content_verification_retries_wait_since_the_last_terminal_attempt() {
+        let interval = Duration::from_secs(120);
+        let cost = Duration::from_secs(165);
+        let old_success = Duration::from_secs(86_400);
+        let retry_delay = verification_delay(interval, cost);
+        assert_eq!(retry_delay, Duration::from_secs(3135));
+        for attempt_elapsed in [interval, retry_delay - Duration::from_millis(1)] {
+            assert!(!content_verification_due(
+                interval,
+                cost,
+                interval,
+                old_success,
+                attempt_elapsed,
+            ));
+        }
+        assert!(content_verification_due(
+            interval,
+            cost,
+            interval,
+            old_success,
+            retry_delay,
+        ));
+        assert!(!content_verification_due(
+            interval,
+            cost,
+            interval - Duration::from_millis(1),
+            old_success,
+            retry_delay,
+        ));
+
+        let cheap = Duration::from_secs(1);
+        assert!(content_verification_due(
+            interval,
+            cheap,
+            interval,
+            old_success,
+            interval,
+        ));
+        assert!(!content_verification_due(
+            interval, cheap, interval, interval, interval,
+        ));
+        let content_interval = interval.saturating_mul(REREAD_INTERVALS);
+        assert!(content_verification_due(
+            interval,
+            cheap,
+            content_interval,
+            content_interval,
+            content_interval,
+        ));
     }
 
     #[test]

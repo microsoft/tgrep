@@ -741,14 +741,22 @@ fn independent_repository_allocations_and_offline_collection_preserve_a_live_sib
     stop(&mut b);
 }
 
-fn wait_verified(daemon: &Daemon, view: &Value, outcome: &str, since: Instant) -> Value {
+fn wait_verified(
+    daemon: &Daemon,
+    view: &Value,
+    outcome: &str,
+    tier: &str,
+    since: Instant,
+) -> Value {
     wait_for(
         daemon,
         "views.status",
         json!({"id":view["view"]}),
         |status| {
             status["work"].is_null()
+                && status["queued_work"].as_array().unwrap().is_empty()
                 && status["last_verification"]["outcome"] == outcome
+                && status["last_verification"]["tier"] == tier
                 && u128::from(status["last_verification"]["age_ms"].as_u64().unwrap())
                     <= since.elapsed().as_millis()
         },
@@ -835,7 +843,8 @@ fn healthy_native_views_verify_on_elapsed_poll_intervals_while_serving() {
             assert_eq!(served["matches"], baseline["matches"]);
             release(&daemon, &hook);
         }
-        let after = wait_verified(&daemon, &view, "unchanged", since);
+        let tier = if sequence == 0 { "metadata" } else { "content" };
+        let after = wait_verified(&daemon, &view, "unchanged", tier, since);
         assert_eq!(after["ready"], true);
         assert_eq!(after["input_epoch"], before["input_epoch"]);
         assert_eq!(after["authoritative"], before["authoritative"]);
@@ -945,7 +954,7 @@ fn failed_and_cancelled_native_content_verifications_back_off_without_resetting_
             "testing.reconcile-timer",
             json!({"view":view["view"],"elapsed_ms":86_400_000}),
         );
-        let after = wait_verified(&daemon, &view, outcome, since);
+        let after = wait_verified(&daemon, &view, outcome, "content", since);
         assert_eq!(after["ready"], true, "{after}");
         assert_eq!(after["serving"], true, "{after}");
         assert_eq!(after["last_verification"]["tier"], "content");
@@ -977,7 +986,7 @@ fn failed_and_cancelled_native_content_verifications_back_off_without_resetting_
                     "reread_attempt_elapsed_ms":attempt_elapsed
                 }),
             );
-            let metadata = wait_verified(&daemon, &view, "unchanged", since);
+            let metadata = wait_verified(&daemon, &view, "unchanged", "metadata", since);
             assert_eq!(
                 metadata["last_verification"]["tier"], "metadata",
                 "{metadata}"
@@ -1008,7 +1017,7 @@ fn failed_and_cancelled_native_content_verifications_back_off_without_resetting_
                 "reread_attempt_elapsed_ms":retry_delay
             }),
         );
-        let retried = wait_verified(&daemon, &view, "unchanged", since);
+        let retried = wait_verified(&daemon, &view, "unchanged", "content", since);
         assert_eq!(retried["last_verification"]["tier"], "content", "{retried}");
         assert_eq!(retried["last_reconcile"]["files_read"], 3, "{retried}");
         assert!(
@@ -1072,7 +1081,7 @@ fn superseded_native_content_verification_retains_evidence_and_advances_its_time
         }),
     );
     release(&daemon, &hook);
-    let after = wait_verified(&daemon, &view, "superseded", since);
+    let after = wait_verified(&daemon, &view, "superseded", "content", since);
     assert_eq!(after["ready"], true);
     assert_eq!(after["last_verification"]["tier"], "content");
     assert!(
@@ -1150,7 +1159,7 @@ fn superseded_native_content_verification_publishes_edits_without_a_second_full_
         receipt["result"]["reconcile"]["metadata_reused"], 2,
         "{receipt}"
     );
-    let after = wait_verified(&daemon, &view, "superseded", since);
+    let after = wait_verified(&daemon, &view, "superseded", "content", since);
     assert_eq!(after["ready"], true, "{after}");
     assert_eq!(after["last_verification"]["tier"], "content", "{after}");
     assert!(
@@ -1232,7 +1241,7 @@ fn periodic_native_verification_repairs_missed_nested_changes() {
         "testing.reconcile-timer",
         json!({"view":view["view"],"elapsed_ms":121_000}),
     );
-    let repaired = wait_verified(&daemon, &view, "repaired", since);
+    let repaired = wait_verified(&daemon, &view, "repaired", "metadata", since);
     assert_eq!(repaired["ready"], true);
     assert_eq!(repaired["watch_mode"], "native");
     assert!(repaired["watch_fallback"].is_null());

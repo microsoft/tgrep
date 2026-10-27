@@ -529,6 +529,10 @@ fn polling_modes_repair_unreported_restored_mtime_and_membership_changes() {
             json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
         );
         let started = Instant::now();
+        daemon.rpc(
+            "testing.reconcile-timer",
+            json!({"view":view["id"],"elapsed_ms":86_400_000}),
+        );
         loop {
             let status = daemon.rpc("views.status", json!({"id":view["id"]}));
             if status["ready"] == true
@@ -680,6 +684,123 @@ fn large_managed_results_are_paged_instead_of_failing() {
     daemon.rpc(
         "views.detach",
         json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn managed_file_listings_are_filtered_by_the_daemon() {
+    let fixture = Fixture::new();
+    prepare_filtered_listing(&fixture.a);
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let hello = daemon.rpc("hello", json!({}));
+    assert!(
+        hello["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("filtered-files")),
+        "{hello}"
+    );
+    let (claim, guard) = owner(&daemon);
+    verified_attach(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    assert_filtered_file_listing(&daemon, &fixture.a, "(via shared daemon v2)");
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+    drop(daemon);
+    fixture.temp.close().unwrap();
+}
+
+#[test]
+fn managed_queries_discover_attachments_without_git_processes() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let home = fixture.temp.path().join("trace-home");
+    fs::create_dir(&home).unwrap();
+    let trace = fixture.temp.path().join("git-trace.jsonl");
+    git(
+        &fixture.a,
+        &[
+            "config",
+            "--file",
+            home.join(".gitconfig").to_str().unwrap(),
+            "trace2.eventTarget",
+            trace.to_str().unwrap(),
+        ],
+    );
+    let (claim, guard) = owner(&daemon);
+    verified_attach(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let mut sibling = attach_input(&fixture, &claim);
+    sibling["token"] = token(&claim, 2);
+    sibling["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
+    sibling["request"]["lease"] = json!("sibling-client");
+    verified_attach(&daemon, &daemon.rpc("views.attach", sibling));
+    let starts = || {
+        fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["event"] == "start")
+            .count()
+    };
+    let run = |root: &Path, args: &[&str]| {
+        runtime::output(
+            Command::new(assert_cmd::cargo::cargo_bin("tgrep"))
+                .current_dir(root)
+                .args(args)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", &home),
+        )
+    };
+    let control = starts();
+    success(run(&fixture.a, &["shared", "manage", ".", "hello"]));
+    assert!(starts() > control, "real Git trace must be active");
+    for root in [&fixture.a, &fixture.b] {
+        let view = daemon.rpc("lookup", json!({"root":fs::canonicalize(root).unwrap()}));
+        for args in [
+            vec!["--stats", "--", "shared_term", "src"],
+            vec!["--stats", "--", "shared_term", "src", "."],
+            vec!["--files", "src"],
+            vec!["status", "."],
+        ] {
+            let before = starts();
+            let output = managed_cli(&daemon, &view, || run(root, &args));
+            if args[0] == "--stats" {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("(via shared daemon v2)"),
+                    "{output:?}"
+                );
+            }
+            success(output);
+            assert_eq!(
+                starts(),
+                before,
+                "{args:?}: managed discovery must launch no Git"
+            );
+        }
+    }
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"sibling-client"}),
     );
     daemon.rpc("owners.release", json!({"claim":claim}));
     drop(guard);

@@ -741,14 +741,22 @@ fn independent_repository_allocations_and_offline_collection_preserve_a_live_sib
     stop(&mut b);
 }
 
-fn wait_verified(daemon: &Daemon, view: &Value, outcome: &str, since: Instant) -> Value {
+fn wait_verified(
+    daemon: &Daemon,
+    view: &Value,
+    outcome: &str,
+    tier: &str,
+    since: Instant,
+) -> Value {
     wait_for(
         daemon,
         "views.status",
         json!({"id":view["view"]}),
         |status| {
             status["work"].is_null()
+                && status["queued_work"].as_array().unwrap().is_empty()
                 && status["last_verification"]["outcome"] == outcome
+                && status["last_verification"]["tier"] == tier
                 && u128::from(status["last_verification"]["age_ms"].as_u64().unwrap())
                     <= since.elapsed().as_millis()
         },
@@ -762,6 +770,9 @@ fn assert_native_verification_policy(report: &Value) {
     assert_eq!(repair["native_periodic_full_verification"], true);
     assert_eq!(repair["interval_ms"], 120_000);
     assert_eq!(repair["poll_interval_ms"], 120_000);
+    assert_eq!(repair["metadata_interval_ms"], 120_000);
+    assert_eq!(repair["content_interval_ms"], 1_800_000);
+    assert_eq!(repair["verification_idle_cost_multiplier"], 19);
     assert_eq!(
         repair["full_verification_reason"],
         "periodic-native-verification"
@@ -832,16 +843,25 @@ fn healthy_native_views_verify_on_elapsed_poll_intervals_while_serving() {
             assert_eq!(served["matches"], baseline["matches"]);
             release(&daemon, &hook);
         }
-        let after = wait_verified(&daemon, &view, "unchanged", since);
+        let tier = if sequence == 0 { "metadata" } else { "content" };
+        let after = wait_verified(&daemon, &view, "unchanged", tier, since);
         assert_eq!(after["ready"], true);
         assert_eq!(after["input_epoch"], before["input_epoch"]);
         assert_eq!(after["authoritative"], before["authoritative"]);
-        assert_eq!(after["last_reconcile"]["full"], true);
-        assert_eq!(after["last_reconcile"]["content_reads_avoided"], 0);
-        assert_eq!(
-            after["last_reconcile"]["files_read"],
-            before["last_reconcile"]["files_read"]
-        );
+        if sequence == 0 {
+            assert_eq!(after["last_verification"]["tier"], "metadata");
+            assert_eq!(after["last_reconcile"]["full"], false);
+            assert_eq!(after["last_reconcile"]["files_read"], 0);
+            assert_eq!(after["last_reconcile"]["metadata_reused"], 3);
+        } else {
+            assert_eq!(after["last_verification"]["tier"], "content");
+            assert_eq!(after["last_reconcile"]["full"], true);
+            assert_eq!(after["last_reconcile"]["content_reads_avoided"], 0);
+            assert_eq!(
+                after["last_reconcile"]["files_read"],
+                before["last_reconcile"]["files_read"]
+            );
+        }
         let ordinary: Value =
             serde_json::from_str(&success(cli(&fixture.a, &["status", "."]))).unwrap();
         assert_eq!(
@@ -885,6 +905,434 @@ fn healthy_native_views_verify_on_elapsed_poll_intervals_while_serving() {
     assert_eq!(refreshed["result"]["reconcile"]["full"], true);
     assert_eq!(refreshed["result"]["reconcile"]["files_read"], 3);
     assert_eq!(refreshed["result"]["reconcile"]["content_reads_avoided"], 0);
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
+fn failed_and_cancelled_native_content_verifications_back_off_without_resetting_freshness() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
+    let (claim, guard) = owner(&daemon);
+    verified_attach(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["ready"] == true && status["work"].is_null() && status["watch_mode"] == "native"
+        },
+    );
+    daemon.rpc(
+        "testing.suppress-watch-events",
+        json!({"view":view["view"],"suppress":true}),
+    );
+    for (category, outcome) in [("deadline", "failed"), ("cancelled", "cancelled")] {
+        let before = daemon.rpc("views.status", json!({"id":view["view"]}));
+        daemon.rpc(
+            "testing.install",
+            json!({
+                "point":"reconcile-batch-opened","operation":null,"skip_hits":0,
+                "action":{"mode":"error","category":category}
+            }),
+        );
+        let since = Instant::now();
+        daemon.rpc(
+            "testing.reconcile-timer",
+            json!({"view":view["view"],"elapsed_ms":86_400_000}),
+        );
+        let after = wait_verified(&daemon, &view, outcome, "content", since);
+        assert_eq!(after["ready"], true, "{after}");
+        assert_eq!(after["serving"], true, "{after}");
+        assert_eq!(after["last_verification"]["tier"], "content");
+        let verification = &after["last_verification"];
+        let content_age = verification["content_age_ms"].as_u64().unwrap();
+        let attempt_age = verification["content_attempt_age_ms"].as_u64().unwrap();
+        assert!(
+            content_age
+                >= before["last_verification"]["content_age_ms"]
+                    .as_u64()
+                    .unwrap(),
+            "{after}"
+        );
+        assert!(content_age > attempt_age, "{after}");
+        assert!(
+            u128::from(attempt_age) <= since.elapsed().as_millis(),
+            "{after}"
+        );
+        let retry_delay = verification["content_retry_delay_ms"].as_u64().unwrap();
+        assert!(retry_delay >= 120_000, "{after}");
+
+        for attempt_elapsed in [0, retry_delay - 1] {
+            let since = Instant::now();
+            daemon.rpc(
+                "testing.reconcile-timer",
+                json!({
+                    "view":view["view"],"elapsed_ms":120_000,
+                    "reread_elapsed_ms":86_400_000,
+                    "reread_attempt_elapsed_ms":attempt_elapsed
+                }),
+            );
+            let metadata = wait_verified(&daemon, &view, "unchanged", "metadata", since);
+            assert_eq!(
+                metadata["last_verification"]["tier"], "metadata",
+                "{metadata}"
+            );
+            assert_eq!(metadata["last_reconcile"]["files_read"], 0, "{metadata}");
+            assert!(
+                metadata["last_verification"]["content_age_ms"]
+                    .as_u64()
+                    .unwrap()
+                    >= content_age,
+                "{metadata}"
+            );
+            assert!(
+                metadata["last_verification"]["content_attempt_age_ms"]
+                    .as_u64()
+                    .unwrap()
+                    >= attempt_age,
+                "{metadata}"
+            );
+        }
+
+        let since = Instant::now();
+        daemon.rpc(
+            "testing.reconcile-timer",
+            json!({
+                "view":view["view"],"elapsed_ms":120_000,
+                "reread_elapsed_ms":86_400_000,
+                "reread_attempt_elapsed_ms":retry_delay
+            }),
+        );
+        let retried = wait_verified(&daemon, &view, "unchanged", "content", since);
+        assert_eq!(retried["last_verification"]["tier"], "content", "{retried}");
+        assert_eq!(retried["last_reconcile"]["files_read"], 3, "{retried}");
+        assert!(
+            u128::from(
+                retried["last_verification"]["content_age_ms"]
+                    .as_u64()
+                    .unwrap()
+            ) <= since.elapsed().as_millis(),
+            "{retried}"
+        );
+        assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    }
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
+fn failed_and_cancelled_polling_passes_back_off_until_retry_or_new_input() {
+    for mode in ["poll", "auto"] {
+        let fixture = Fixture::new();
+        let mut daemon = start(&fixture, &policy(), &["--watch-mode", mode]);
+        let (claim, guard) = owner(&daemon);
+        verified_attach(
+            &daemon,
+            &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+        );
+        let view = daemon.rpc(
+            "lookup",
+            json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+        );
+        daemon.rpc(
+            "testing.suppress-watch-events",
+            json!({"view":view["view"],"suppress":true}),
+        );
+        if mode == "auto" {
+            daemon.rpc(
+                "testing.watch-event",
+                json!({"view":view["view"],"kind":"failure"}),
+            );
+        }
+        wait_for(
+            &daemon,
+            "views.status",
+            json!({"id":view["view"]}),
+            |status| {
+                status["ready"] == true
+                    && status["work"].is_null()
+                    && status["queued_work"].as_array().unwrap().is_empty()
+                    && status["watch_mode"] == "poll"
+            },
+        );
+        for (metadata_only, tier) in [(true, "metadata"), (false, "content")] {
+            for (category, outcome) in [("deadline", "failed"), ("cancelled", "cancelled")] {
+                let before = daemon.rpc("views.status", json!({"id":view["view"]}));
+                fs::write(
+                    fixture.a.join("notes.txt"),
+                    format!("shared_term polling_{mode}_{tier}_{outcome}\n"),
+                )
+                .unwrap();
+                daemon.rpc(
+                    "testing.install",
+                    json!({
+                        "point":"reconcile-batch-opened","operation":null,"skip_hits":0,
+                        "action":{"mode":"error","category":category}
+                    }),
+                );
+                let reread_elapsed = if metadata_only { 0 } else { 86_400_000 };
+                let since = Instant::now();
+                daemon.rpc(
+                    "testing.reconcile-timer",
+                    json!({
+                        "view":view["view"],"elapsed_ms":86_400_000,
+                        "reread_elapsed_ms":reread_elapsed
+                    }),
+                );
+                let after = wait_verified(&daemon, &view, outcome, tier, since);
+                assert_eq!(after["ready"], false, "{after}");
+                assert_eq!(after["serving"], true, "{after}");
+                let verification = &after["last_verification"];
+                assert!(
+                    verification["content_age_ms"].as_u64().unwrap()
+                        >= before["last_verification"]["content_age_ms"]
+                            .as_u64()
+                            .unwrap(),
+                    "{after}"
+                );
+                if metadata_only {
+                    assert!(
+                        verification["content_attempt_age_ms"].as_u64().unwrap()
+                            >= before["last_verification"]["content_attempt_age_ms"]
+                                .as_u64()
+                                .unwrap(),
+                        "{after}"
+                    );
+                } else {
+                    assert!(
+                        u128::from(verification["content_attempt_age_ms"].as_u64().unwrap())
+                            <= since.elapsed().as_millis(),
+                        "{after}"
+                    );
+                }
+                let retry_delay = verification[if metadata_only {
+                    "metadata_delay_ms"
+                } else {
+                    "content_retry_delay_ms"
+                }]
+                .as_u64()
+                .unwrap();
+                assert!(retry_delay >= 120_000, "{after}");
+                for elapsed in [0, retry_delay - 1] {
+                    daemon.rpc(
+                        "testing.reconcile-timer",
+                        json!({
+                            "view":view["view"],
+                            "elapsed_ms":if metadata_only { elapsed } else { 120_000 },
+                            "reread_elapsed_ms":reread_elapsed,
+                            "reread_attempt_elapsed_ms":elapsed
+                        }),
+                    );
+                    let idle = daemon.rpc("views.status", json!({"id":view["view"]}));
+                    assert_eq!(idle["input_epoch"], after["input_epoch"], "{idle}");
+                    assert_eq!(idle["last_reconcile"], after["last_reconcile"], "{idle}");
+                    assert_eq!(idle["last_verification"]["outcome"], outcome, "{idle}");
+                    assert!(idle["work"].is_null(), "{idle}");
+                    assert!(idle["queued_work"].as_array().unwrap().is_empty(), "{idle}");
+                }
+
+                let since = Instant::now();
+                if outcome == "cancelled" {
+                    // A newer explicit invalidation bypasses the idle retry delay.
+                    daemon.rpc(
+                        "testing.watch-event",
+                        json!({"view":view["view"],"kind":"rescan"}),
+                    );
+                } else {
+                    daemon.rpc(
+                        "testing.reconcile-timer",
+                        json!({
+                            "view":view["view"],"elapsed_ms":retry_delay,
+                            "reread_elapsed_ms":reread_elapsed,
+                            "reread_attempt_elapsed_ms":retry_delay
+                        }),
+                    );
+                }
+                let full = !metadata_only || outcome == "cancelled";
+                let repaired = wait_verified(
+                    &daemon,
+                    &view,
+                    if full { "full-pass" } else { "metadata-pass" },
+                    if full { "content" } else { "metadata" },
+                    since,
+                );
+                assert_eq!(repaired["ready"], true, "{repaired}");
+                assert_eq!(repaired["last_reconcile"]["full"], full, "{repaired}");
+                assert_eq!(
+                    repaired["last_reconcile"]["files_read"],
+                    if full { 3 } else { 1 },
+                    "{repaired}"
+                );
+                assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+            }
+        }
+        daemon.rpc(
+            "views.detach",
+            json!({"owner":claim.owner,"lease":"managed-client"}),
+        );
+        daemon.rpc("owners.release", json!({"claim":claim}));
+        drop(guard);
+        stop(&mut daemon);
+    }
+}
+
+#[test]
+fn superseded_native_content_verification_retains_evidence_and_advances_its_timer() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
+    let (claim, guard) = owner(&daemon);
+    verified_attach(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["ready"] == true && status["work"].is_null() && status["watch_mode"] == "native"
+        },
+    );
+    daemon.rpc(
+        "testing.suppress-watch-events",
+        json!({"view":view["view"],"suppress":true}),
+    );
+    let hook = pause(&daemon, "reconcile-batch-opened");
+    let since = Instant::now();
+    daemon.rpc(
+        "testing.reconcile-timer",
+        json!({
+            "view":view["view"],"elapsed_ms":120_000,"reread_elapsed_ms":1_800_000
+        }),
+    );
+    reached(&daemon, &hook);
+    daemon.rpc(
+        "views.invalidate",
+        json!({
+            "view":view["view"],"expected_version":view["version"],"owner":claim.owner,
+            "changed":["notes.txt"],"full":false
+        }),
+    );
+    release(&daemon, &hook);
+    let after = wait_verified(&daemon, &view, "superseded", "content", since);
+    assert_eq!(after["ready"], true);
+    assert_eq!(after["last_verification"]["tier"], "content");
+    assert!(
+        after["last_verification"]["content_age_ms"]
+            .as_u64()
+            .unwrap()
+            < 30_000
+    );
+    assert_eq!(after["last_reconcile"]["full"], false);
+    assert_eq!(after["last_reconcile"]["files_read"], 1);
+    assert_eq!(after["last_reconcile"]["metadata_reused"], 2);
+    assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+    daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
+fn superseded_native_content_verification_publishes_edits_without_a_second_full_pass() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);
+    let (claim, guard) = owner(&daemon);
+    verified_attach(
+        &daemon,
+        &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+    );
+    let view = daemon.rpc(
+        "lookup",
+        json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+    );
+    wait_for(
+        &daemon,
+        "views.status",
+        json!({"id":view["view"]}),
+        |status| {
+            status["ready"] == true && status["work"].is_null() && status["watch_mode"] == "native"
+        },
+    );
+    daemon.rpc(
+        "testing.suppress-watch-events",
+        json!({"view":view["view"],"suppress":true}),
+    );
+    fs::write(fixture.a.join("notes.txt"), "shared_term superseded_edit\n").unwrap();
+    // Queue the newer hint after the pass hashes the edit, without a worker race.
+    let hook = pause(&daemon, "verification-content-hashed");
+    let since = Instant::now();
+    daemon.rpc(
+        "testing.reconcile-timer",
+        json!({
+            "view":view["view"],"elapsed_ms":120_000,"reread_elapsed_ms":1_800_000
+        }),
+    );
+    let barrier = reached(&daemon, &hook);
+    daemon.rpc(
+        "views.invalidate",
+        json!({
+            "view":view["view"],"expected_version":view["version"],"owner":claim.owner,
+            "changed":["notes.txt"],"full":false
+        }),
+    );
+    let during = daemon.rpc("views.status", json!({"id":view["view"]}));
+    assert_eq!(during["serving"], true, "{during}");
+    assert_eq!(during["ready"], false, "{during}");
+    release(&daemon, &hook);
+    let receipt = completed(&daemon, &json!({"id":barrier["reached_operation"]}));
+    assert_eq!(receipt["result"]["verification"], "superseded", "{receipt}");
+    assert_eq!(receipt["result"]["changed"], true, "{receipt}");
+    assert_eq!(receipt["result"]["reconcile"]["full"], false, "{receipt}");
+    assert_eq!(receipt["result"]["reconcile"]["files_read"], 1, "{receipt}");
+    assert_eq!(
+        receipt["result"]["reconcile"]["metadata_reused"], 2,
+        "{receipt}"
+    );
+    let after = wait_verified(&daemon, &view, "superseded", "content", since);
+    assert_eq!(after["ready"], true, "{after}");
+    assert_eq!(after["last_verification"]["tier"], "content", "{after}");
+    assert!(
+        after["last_verification"]["content_age_ms"]
+            .as_u64()
+            .unwrap()
+            < 30_000,
+        "{after}"
+    );
+    let found = daemon.rpc(
+        "search",
+        json!({"root":view["root"],"view":view["view"],"expected_version":view["version"],
+            "query":{"pattern":"superseded_edit"}}),
+    );
+    assert_eq!(found["backend"], "shared-v2");
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(found["matches"][0]["file"], "notes.txt", "{found}");
     assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
     daemon.rpc(
         "views.detach",
@@ -949,7 +1397,7 @@ fn periodic_native_verification_repairs_missed_nested_changes() {
         "testing.reconcile-timer",
         json!({"view":view["view"],"elapsed_ms":121_000}),
     );
-    let repaired = wait_verified(&daemon, &view, "repaired", since);
+    let repaired = wait_verified(&daemon, &view, "repaired", "metadata", since);
     assert_eq!(repaired["ready"], true);
     assert_eq!(repaired["watch_mode"], "native");
     assert!(repaired["watch_fallback"].is_null());
@@ -962,8 +1410,10 @@ fn periodic_native_verification_repairs_missed_nested_changes() {
                 .unwrap(),
         "{repaired}"
     );
-    assert_eq!(repaired["last_reconcile"]["full"], true);
-    assert_eq!(repaired["last_reconcile"]["content_reads_avoided"], 0);
+    assert_eq!(repaired["last_verification"]["tier"], "metadata");
+    assert_eq!(repaired["last_reconcile"]["full"], false);
+    assert_eq!(repaired["last_reconcile"]["files_read"], 2);
+    assert_eq!(repaired["last_reconcile"]["metadata_reused"], 2);
     let found = retry_busy(&daemon, "search", missed.clone());
     let mut paths: Vec<_> = found["matches"]
         .as_array()
@@ -1111,8 +1561,17 @@ fn native_failure_enables_polling_only_for_the_affected_view() {
                         >= timer["input_epoch"].as_u64().unwrap()
             },
         );
-        assert_eq!(before["last_reconcile"]["full"], true);
-        assert_eq!(before["last_reconcile"]["content_reads_avoided"], 0);
+        assert_eq!(before["last_reconcile"]["full"], elapsed_ms == 86_400_000);
+        if elapsed_ms == 86_400_000 {
+            assert_eq!(before["last_reconcile"]["content_reads_avoided"], 0);
+        } else {
+            assert!(
+                before["last_reconcile"]["metadata_reused"]
+                    .as_u64()
+                    .unwrap()
+                    >= 3
+            );
+        }
     }
     assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
     for lease in ["managed-client", "sibling-client"] {

@@ -16,6 +16,10 @@ const MAX_SECTOR_BYTES: u64 = 65536;
 const SHM_REGION_BYTES: u64 = 32768;
 const SHM_REGION_FRAMES: u64 = 4096;
 const NAMESPACE_HEADER_BYTES: u64 = 64 * 1024;
+/// Upper bound on the WAL length that triggers a writer's no-wait checkpoint.
+/// `metadata_bytes` must cover the largest catalog, so a quarter of it alone
+/// could let the WAL reach gigabytes before its first checkpoint.
+const WAL_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct Checkpoint {
@@ -96,6 +100,12 @@ pub(super) fn admit_control(connection: &Connection, metadata: u64, additional: 
         return Err(Error::pressure("catalog-control-allocation"));
     }
     Ok(())
+}
+
+/// WAL length at which a writer attempts its pre-mutation checkpoint. A lower
+/// value only checkpoints earlier; admission still reserves each publication.
+fn checkpoint_threshold(metadata_bytes: u64) -> u64 {
+    (metadata_bytes / 4).min(WAL_CHECKPOINT_BYTES)
 }
 
 /// Checkpoint any committed WAL frames, regardless of the write-time threshold.
@@ -282,14 +292,14 @@ pub(super) fn begin<'a>(
     change: Option<&VersionedPolicy>,
 ) -> Result<(Transaction<'a>, WriteBudget)> {
     let previous = policy(connection)?;
-    let threshold = change.map_or(previous.policy.work.metadata_bytes, |change| {
+    let metadata = change.map_or(previous.policy.work.metadata_bytes, |change| {
         previous
             .policy
             .work
             .metadata_bytes
             .min(change.policy.work.metadata_bytes)
     });
-    let checkpoint = checkpoint(connection, directory, threshold / 4)?;
+    let checkpoint = checkpoint(connection, directory, checkpoint_threshold(metadata))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Policy, physical lengths and page ceiling are read after acquiring the actual
     // SQLite writer lock. Independent protected readers cannot spend stale headroom.
@@ -464,5 +474,59 @@ mod tests {
         budget.shm_bytes = u64::MAX;
         budget.journal_bytes = u64::MAX;
         assert!(budget.for_pages(u64::from(u32::MAX - 1)).1 > u128::from(u64::MAX));
+    }
+
+    #[test]
+    fn checkpoint_threshold_is_a_quarter_of_metadata_capped_for_large_budgets() {
+        assert_eq!(checkpoint_threshold(1024 * 1024), 256 * 1024);
+        assert_eq!(checkpoint_threshold(16 * 1024 * 1024), 4 * 1024 * 1024);
+        assert_eq!(
+            checkpoint_threshold(4 * WAL_CHECKPOINT_BYTES),
+            WAL_CHECKPOINT_BYTES
+        );
+        assert_eq!(checkpoint_threshold(4 << 30), WAL_CHECKPOINT_BYTES);
+        assert_eq!(checkpoint_threshold(i64::MAX as u64), WAL_CHECKPOINT_BYTES);
+    }
+
+    #[test]
+    fn writers_checkpoint_a_large_budget_wal_at_the_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut policy = super::super::policy::fixture_policy();
+        policy.work.metadata_bytes = 1 << 40;
+        let namespace =
+            super::super::Namespace::initialize_identity(&"a".repeat(64), temp.path(), policy)
+                .unwrap();
+        let wal = || file_bytes(&namespace.directory, "catalog.sqlite-wal").unwrap();
+        let mut writes = 0_u32;
+        while wal() < WAL_CHECKPOINT_BYTES {
+            // SQLite rewrites a same-length record in place and logs only the
+            // pages that changed, so every write replaces each byte.
+            let record = char::from(b'a' + (writes % 26) as u8)
+                .to_string()
+                .repeat(1 << 20);
+            namespace
+                .transaction(|transaction| {
+                    transaction.execute(
+                        "INSERT INTO records VALUES('probe','wal-cap',1,?1)
+                         ON CONFLICT(kind,id) DO UPDATE SET version=version+1,record=excluded.record",
+                        [record.as_str()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            writes += 1;
+            assert!(writes < 256, "the fixture did not reach the WAL cap");
+        }
+        namespace
+            .transaction(|transaction| {
+                transaction
+                    .execute("INSERT INTO records VALUES('probe','after-cap',1,'{}')", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            wal() < WAL_CHECKPOINT_BYTES / 4,
+            "the first write past the cap must checkpoint before it mutates"
+        );
     }
 }

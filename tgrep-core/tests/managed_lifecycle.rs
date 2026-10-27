@@ -45,6 +45,23 @@ fn git(root: &Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
+fn lock_after_readers_drop(file: &fs::File) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs2::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return,
+            // A concurrent subprocess can inherit the guard until exec closes it.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("guard remained locked after readers dropped: {error}"),
+        }
+    }
+}
+
 fn policy() -> Policy {
     serde_json::from_value(serde_json::json!({
         "schema":2, "storage":"managed",
@@ -178,6 +195,38 @@ impl Fixture {
 }
 
 #[test]
+fn explicit_refresh_rereads_all_files_even_with_pending_path_hints() {
+    use tgrep_core::managed::{OperationState, RefreshRequest};
+    let mut fixture = Fixture::new();
+    fs::write(fixture.root.join("other.txt"), "untracked needle\n").unwrap();
+    fixture.namespace.activate().unwrap();
+    let manager = fixture.manager();
+    let view = fixture.attach(&manager);
+    manager
+        .slot(&view.id)
+        .unwrap()
+        .invalidate(&[PathBuf::from("source.txt")], false)
+        .unwrap();
+    let operation = manager
+        .accept_refresh(
+            fixture.token("explicit-hinted-refresh"),
+            RefreshRequest {
+                view: view.id,
+                expected_version: view.version,
+                owner: fixture.owner.registration().owner.clone(),
+                allocation_version: 1,
+            },
+        )
+        .unwrap();
+    let completed = manager.execute(&operation.id).unwrap();
+    assert_eq!(completed.state, OperationState::Completed, "{completed:?}");
+    let stats = &completed.result.as_ref().unwrap()["reconcile"];
+    assert_eq!(stats["full"], true);
+    assert_eq!(stats["files_read"], 2);
+    assert_eq!(stats["content_reads_avoided"], 0);
+}
+
+#[test]
 fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
     use tgrep_core::managed::{OperationState, ReconcileRequest, RefreshRequest};
     let mut fixture = Fixture::new();
@@ -192,6 +241,7 @@ fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
         expected_version: first.version,
         allocation_version: 1,
         verify: false,
+        metadata_only: false,
     };
     let queued = manager
         .accept_reconciliation(token.clone(), request.clone())
@@ -253,6 +303,7 @@ fn superseded_reconciliation_preserves_ready_queries_and_exact_checkpoint() {
                 expected_version: first.version,
                 allocation_version: 1,
                 verify: false,
+                metadata_only: false,
             },
         )
         .unwrap();
@@ -339,6 +390,7 @@ fn ready_reconciliation_preserves_forced_repairs_and_rejects_invalid_work() {
                     expected_version: first.version,
                     allocation_version: 1,
                     verify: false,
+                    metadata_only: false,
                 },
             )
             .unwrap();
@@ -373,6 +425,7 @@ fn ready_reconciliation_preserves_forced_repairs_and_rejects_invalid_work() {
                     expected_version: version,
                     allocation_version: allocation,
                     verify: false,
+                    metadata_only: false,
                 },
             )
             .unwrap();
@@ -425,6 +478,7 @@ fn coalesced_reconciliation_rechecks_cancellation_and_allocation_before_receipt(
                     expected_version: first.version,
                     allocation_version: 1,
                     verify: false,
+                    metadata_only: false,
                 },
             )
             .unwrap();
@@ -1054,7 +1108,7 @@ fn deferred_adaptive_migration_retains_its_target_and_single_attempt_budget() {
                 .join(format!("{incarnation}.lock")),
         )
         .unwrap();
-    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    lock_after_readers_drop(&guard);
     let operation = manager
         .accept_adaptive(
             fixture.token("contended-adaptive"),
@@ -1424,7 +1478,7 @@ fn transient_retirement_locks_defer_attachment_without_changing_its_exact_intent
                 .join(format!("{incarnation}.lock")),
         )
         .unwrap();
-    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    lock_after_readers_drop(&guard);
     let manager = fixture.manager();
     let operation = manager
         .accept_attach(
@@ -1632,7 +1686,7 @@ fn managed_format_and_escaped_reader_cannot_bypass_ownership() {
         "escaped raw reader must protect the physical object"
     );
     drop(raw);
-    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    lock_after_readers_drop(&guard);
 }
 
 #[test]
@@ -2089,7 +2143,7 @@ fn escaped_candidate_keeps_the_base_and_root_protected() {
     #[cfg(windows)]
     assert!(fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).is_err());
     batch.finish().unwrap();
-    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    lock_after_readers_drop(&guard);
     #[cfg(windows)]
     fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).unwrap();
 }

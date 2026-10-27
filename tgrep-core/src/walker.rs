@@ -632,6 +632,8 @@ pub struct MetaWalkResult {
     /// Sizes of listed binary-extension files absent from `files`, when the
     /// walk observed them (size-capped or managed walks).
     pub listed_sizes: Vec<(String, u64)>,
+    /// Trusted metadata observations for listed binary-extension files.
+    pub listed_versions: Vec<(String, crate::meta::FileVersion)>,
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
     pub visibility: crate::visibility::PathVisibility,
@@ -755,6 +757,7 @@ fn walk_metadata_inner(
     let results = std::sync::Mutex::new(Vec::new());
     let listed_files = std::sync::Mutex::new(Vec::new());
     let listed_sizes = std::sync::Mutex::new(Vec::new());
+    let listed_versions = std::sync::Mutex::new(Vec::new());
     let gitignore_files = std::sync::Mutex::new(Vec::new());
     let ignore_files = std::sync::Mutex::new(Vec::new());
     let visibility = std::sync::Mutex::new(crate::visibility::PathVisibility::default());
@@ -839,6 +842,7 @@ fn walk_metadata_inner(
         let results = &results;
         let listed_files = &listed_files;
         let listed_sizes = &listed_sizes;
+        let listed_versions = &listed_versions;
         let gitignore_files = &gitignore_files;
         let ignore_files = &ignore_files;
         let visibility = &visibility;
@@ -928,7 +932,16 @@ fn walk_metadata_inner(
                 // checkouts into one range per binary file.
                 let size = if max_file_size.is_some() || permit.is_some() {
                     match entry.metadata() {
-                        Ok(meta) => Some(meta.len()),
+                        Ok(meta) => {
+                            let version = crate::meta::file_version(&meta);
+                            if version.is_trusted() {
+                                listed_versions
+                                    .lock()
+                                    .unwrap()
+                                    .push((rel_path.clone(), version));
+                            }
+                            Some(meta.len())
+                        }
                         Err(_) if max_file_size.is_none() => None,
                         Err(_) => {
                             skipped_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1000,6 +1013,7 @@ fn walk_metadata_inner(
             files: results.into_inner().unwrap(),
             listed_files: listed_files.into_inner().unwrap(),
             listed_sizes: listed_sizes.into_inner().unwrap(),
+            listed_versions: listed_versions.into_inner().unwrap(),
             gitignore_files,
             ignore_files,
             visibility,

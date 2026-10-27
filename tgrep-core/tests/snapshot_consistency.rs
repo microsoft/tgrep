@@ -407,3 +407,69 @@ fn concurrent_swap_during_query() {
         "snapshot-based resolution should succeed for all {total} IDs, got {resolved}"
     );
 }
+
+#[test]
+fn scoped_queries_select_the_same_files_as_filtering_whole_index_results() {
+    let root = tempfile::TempDir::new().unwrap();
+    // IDs follow this order, which differs from path order.
+    let index = build_test_index(
+        root.path(),
+        &[
+            ("src2/c.rs", b"needle base"),
+            ("src/z.rs", b"needle base"),
+            ("lib/d.rs", b"needle base"),
+            ("src/b.rs", b"needle base"),
+            ("src/a.rs", b"needle base"),
+            ("srcx.rs", b"needle base"),
+        ],
+    );
+    let mut hybrid = HybridIndex::open(index.path(), root.path()).unwrap();
+    hybrid.live.upsert_file("src/a.rs", b"replaced");
+    hybrid.live.delete_file("src/b.rs");
+    for path in ["src/new1.rs", "src/new2.rs", "lib/new.rs", "src2/new.rs"] {
+        hybrid.live.upsert_file(path, b"needle overlay");
+    }
+    let resolve = |ids: Vec<u32>, reader: &tgrep_core::reader::IndexReader| {
+        let mut paths: Vec<String> = ids
+            .into_iter()
+            .map(|id| hybrid.resolve_path(id, reader).unwrap())
+            .collect();
+        paths.sort_unstable();
+        paths
+    };
+    let plans = [
+        query::build_query_plan("needle", false).unwrap(),
+        query::build_query_plan("needle|replaced", false).unwrap(),
+        query::build_literal_plan("needle o", false),
+        query::QueryPlan::MatchAll,
+    ];
+    for plan in &plans {
+        let (ids, reader) = hybrid.execute_query_with_masks(plan);
+        let whole = resolve(ids, &reader);
+        for prefix in ["", "src/", "src2/", "lib/", "missing/"] {
+            let (ids, reader) = hybrid.execute_query_with_masks_in(plan, prefix);
+            assert!(
+                ids.windows(2).all(|pair| pair[0] < pair[1]),
+                "{plan:?} in {prefix:?}: {ids:?}"
+            );
+            let expected: Vec<_> = whole
+                .iter()
+                .filter(|path| path.starts_with(prefix))
+                .cloned()
+                .collect();
+            assert_eq!(resolve(ids, &reader), expected, "{plan:?} in {prefix:?}");
+        }
+    }
+    let (ids, reader) = hybrid.execute_query_with_masks_in(&plans[0], "src/");
+    assert_eq!(
+        resolve(ids, &reader),
+        ["src/new1.rs", "src/new2.rs", "src/z.rs"]
+    );
+    let (ids, reader) = hybrid.execute_query_with_masks_in(&plans[2], "src/");
+    assert_eq!(resolve(ids, &reader), ["src/new1.rs", "src/new2.rs"]);
+    let (ids, reader) = hybrid.execute_query_with_masks_in(&plans[3], "src/");
+    assert_eq!(
+        resolve(ids, &reader),
+        ["src/a.rs", "src/new1.rs", "src/new2.rs", "src/z.rs"]
+    );
+}

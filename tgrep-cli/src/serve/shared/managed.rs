@@ -8,13 +8,13 @@ use anyhow::{Context, Result, ensure};
 use notify::{EventKind, Watcher};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tgrep_core::generations::{ContentEligibility, GenerationManager, IndexingProfile, Repository};
@@ -111,7 +111,7 @@ fn hello(namespace: &Namespace) -> Result<Value> {
             "bounded-storage-inventory","namespace-discovery","maintenance-diagnostics",
             "private-rpc-authentication","bounded-reconciliation","reconciliation-phase-metrics",
             "event-driven-native-reconciliation","serving-native-periodic-verification",
-            "content-eligibility-profile","paged-results"
+            "content-eligibility-profile","paged-results","filtered-files"
         ],
         "profile":IndexingProfile::default(),
         "policy":namespace.policy()?,"allocation":namespace.allocation()?,
@@ -309,6 +309,25 @@ pub(super) fn storage_request(
     }
 }
 
+const VERIFICATION_DUTY_FACTOR: u32 = 19;
+const REREAD_INTERVALS: u32 = 15;
+
+fn verification_delay(interval: Duration, cost: Duration) -> Duration {
+    interval.max(cost.saturating_mul(VERIFICATION_DUTY_FACTOR))
+}
+
+fn content_verification_due(
+    interval: Duration,
+    cost: Duration,
+    verification_elapsed: Duration,
+    reread_elapsed: Duration,
+    attempt_elapsed: Duration,
+) -> bool {
+    reread_elapsed >= interval.saturating_mul(REREAD_INTERVALS)
+        && attempt_elapsed >= verification_delay(interval, cost)
+        && verification_elapsed >= interval
+}
+
 struct Monitor {
     watcher: Option<notify::RecommendedWatcher>,
     watched: HashSet<PathBuf>,
@@ -317,13 +336,25 @@ struct Monitor {
     watch_counters: Arc<WatchCounters>,
     last_schedule: Instant,
     last_reconcile: Instant,
-    /// Last completed full pass or terminal serving-verification attempt.
+    /// Last completed full pass or terminal verification/polling attempt.
     last_verification: Instant,
+    /// Last successful content pass, not advanced by failed or cancelled attempts.
+    last_reread: Instant,
+    last_reread_attempt: Instant,
+    stat_cost: Duration,
+    reread_cost: Duration,
     verification: Option<&'static str>,
+    verification_tier: Option<&'static str>,
+    poll_retry: Option<PollRetry>,
     pending: HashSet<Id>,
     failures: u32,
     #[cfg(feature = "managed-test-hooks")]
     suppress_events: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PollRetry {
+    epoch: u64,
+    metadata_only: bool,
 }
 
 struct WatchSettings {
@@ -346,6 +377,8 @@ struct WatchCounters {
     unchanged_paths: AtomicU64,
     invalidated_paths: AtomicU64,
     full_invalidations: AtomicU64,
+    tree_invalidations: AtomicU64,
+    git_metadata_ignored: AtomicU64,
     epoch_advances: AtomicU64,
 }
 
@@ -369,6 +402,8 @@ impl WatchCounters {
             "unchanged_paths_filtered": load(&self.unchanged_paths),
             "invalidated_paths": load(&self.invalidated_paths),
             "full_invalidations": load(&self.full_invalidations),
+            "tree_invalidations": load(&self.tree_invalidations),
+            "git_metadata_ignored": load(&self.git_metadata_ignored),
             "epoch_advances": load(&self.epoch_advances),
         })
     }
@@ -413,6 +448,9 @@ impl WatchSettings {
             "periodic_full_verification": periodic,
             "interval_ms": periodic.then_some(self.interval.as_millis()),
             "poll_interval_ms": self.interval.as_millis(),
+            "metadata_interval_ms": periodic.then_some(self.interval.as_millis()),
+            "content_interval_ms": periodic.then_some(self.interval.saturating_mul(REREAD_INTERVALS).as_millis()),
+            "verification_idle_cost_multiplier": VERIFICATION_DUTY_FACTOR,
             "incremental_coverage": "unavailable",
             "change_journal": "not-integrated",
             "native_missed_changes": if periodic { "repaired-by-periodic-verification" }
@@ -462,6 +500,281 @@ impl Drop for Observer {
     }
 }
 
+/// Scheduling class of an accepted managed job. A free worker runs the queued
+/// job that became due first, and a job becomes due its class delay after it
+/// was queued. Newer work of a higher class therefore overtakes a lower class
+/// for at most that delay. Aging leaves execution headroom within the remaining
+/// operation lifetime; older work or a running operation can still delay it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum JobClass {
+    /// Client operations, and reconciliation of a view that is not ready.
+    Foreground,
+    /// Collection passes.
+    Maintenance,
+    /// Serving verification and automatic advancement of ready views.
+    Background,
+}
+
+impl JobClass {
+    const ALL: [Self; 3] = [Self::Foreground, Self::Maintenance, Self::Background];
+
+    fn of(operation: &OperationRecord, instance: &Id) -> Self {
+        Self::classify(
+            &operation.kind,
+            &operation.request,
+            operation.token.scope == *instance,
+        )
+    }
+
+    fn classify(kind: &str, request: &Value, automatic: bool) -> Self {
+        match kind {
+            "collection" => Self::Maintenance,
+            "reconcile" if request["verify"].as_bool() == Some(true) => Self::Background,
+            "adaptive" if automatic => Self::Background,
+            _ => Self::Foreground,
+        }
+    }
+
+    /// How long a queued job of this class yields to newer foreground work.
+    fn delay(self, remaining: Duration) -> Duration {
+        let maximum = match self {
+            Self::Foreground => Duration::ZERO,
+            Self::Maintenance => Duration::from_secs(5),
+            Self::Background => Duration::from_secs(600),
+        };
+        maximum.min(remaining / 4)
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Maintenance => "maintenance",
+            Self::Background => "background",
+        }
+    }
+}
+
+#[derive(Default)]
+struct JobQueueState {
+    queued: [VecDeque<QueuedJob>; 3],
+    running: Vec<(Id, JobClass, Instant)>,
+}
+
+struct QueuedJob {
+    id: Id,
+    at: Instant,
+    due: Instant,
+}
+
+impl JobQueueState {
+    fn len(&self) -> usize {
+        self.queued.iter().map(VecDeque::len).sum()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queued.iter().all(VecDeque::is_empty)
+    }
+
+    fn push(
+        &mut self,
+        id: Id,
+        class: JobClass,
+        at: Instant,
+        capacity: usize,
+        remaining: Duration,
+    ) -> bool {
+        if self.len() >= capacity {
+            return false;
+        }
+        let due = at.checked_add(class.delay(remaining)).unwrap_or(at);
+        self.queued[class.index()].push_back(QueuedJob { id, at, due });
+        true
+    }
+
+    /// Takes the queued job that became due first; ties go to the higher class.
+    fn pop(&mut self) -> Option<(Id, JobClass)> {
+        let (class, position, _) = JobClass::ALL
+            .into_iter()
+            .flat_map(|class| {
+                self.queued[class.index()]
+                    .iter()
+                    .enumerate()
+                    .map(move |(position, job)| (class, position, job.due))
+            })
+            .min_by_key(|(_, _, due)| *due)?;
+        let job = self.queued[class.index()].remove(position)?;
+        Some((job.id, class))
+    }
+
+    /// Moves a queued job into a higher class, keeping its queue time.
+    fn promote(&mut self, id: &Id, class: JobClass) -> bool {
+        for lower in JobClass::ALL.into_iter().filter(|lower| *lower > class) {
+            let queue = &mut self.queued[lower.index()];
+            let Some(position) = queue.iter().position(|job| &job.id == id) else {
+                continue;
+            };
+            let Some(mut job) = queue.remove(position) else {
+                continue;
+            };
+            job.due = job.due.min(
+                job.at
+                    .checked_add(class.delay(Duration::MAX))
+                    .unwrap_or(job.at),
+            );
+            let target = &mut self.queued[class.index()];
+            let position = target.partition_point(|queued| queued.at <= job.at);
+            target.insert(position, job);
+            return true;
+        }
+        false
+    }
+}
+
+/// Bounded queue of accepted managed jobs. Its lock is a leaf held only for
+/// container updates that cannot leave the state inconsistent, so a poisoned
+/// lock is recovered.
+struct JobQueue {
+    capacity: usize,
+    state: Mutex<JobQueueState>,
+    available: Condvar,
+}
+
+impl JobQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(JobQueueState::default()),
+            available: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, JobQueueState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn push(&self, id: Id, class: JobClass, remaining: Duration) -> bool {
+        let pushed = self
+            .lock()
+            .push(id, class, Instant::now(), self.capacity, remaining);
+        if pushed {
+            self.available.notify_one();
+        }
+        pushed
+    }
+
+    /// Waits up to `timeout` for a job and marks it running.
+    fn pop(&self, timeout: Duration) -> Option<RunningJob<'_>> {
+        let (mut state, _) = self
+            .available
+            .wait_timeout_while(self.lock(), timeout, |state| state.is_empty())
+            .unwrap_or_else(PoisonError::into_inner);
+        let (id, class) = state.pop()?;
+        state.running.push((id.clone(), class, Instant::now()));
+        Some(RunningJob { queue: self, id })
+    }
+
+    fn promote(&self, id: &Id, class: JobClass) -> bool {
+        self.lock().promote(id, class)
+    }
+
+    fn running(&self, id: &Id) -> bool {
+        self.lock()
+            .running
+            .iter()
+            .any(|(running, _, _)| running == id)
+    }
+
+    fn snapshot(&self) -> Value {
+        let state = self.lock();
+        let now = Instant::now();
+        let mut queued = serde_json::Map::new();
+        for class in JobClass::ALL {
+            let queue = &state.queued[class.index()];
+            queued.insert(
+                class.name().to_owned(),
+                json!({
+                    "depth": queue.len(),
+                    "oldest_wait_ms": queue
+                        .iter()
+                        .map(|job| job.at)
+                        .min()
+                        .map(|at| now.saturating_duration_since(at).as_millis()),
+                }),
+            );
+        }
+        let running: Vec<Value> = state
+            .running
+            .iter()
+            .map(|(id, class, started)| {
+                json!({
+                    "operation": id,
+                    "class": class.name(),
+                    "elapsed_ms": now.saturating_duration_since(*started).as_millis(),
+                })
+            })
+            .collect();
+        json!({"capacity": self.capacity, "queued": queued, "running": running})
+    }
+
+    /// Reports where each accepted operation waits: running, queued in a class,
+    /// or accepted but not queued in this process.
+    fn describe(&self, ids: &[&Id]) -> Vec<Value> {
+        let state = self.lock();
+        let now = Instant::now();
+        ids.iter()
+            .map(|&id| {
+                if let Some((_, class, started)) =
+                    state.running.iter().find(|(running, _, _)| running == id)
+                {
+                    return json!({
+                        "operation": id,
+                        "state": "running",
+                        "class": class.name(),
+                        "elapsed_ms": now.saturating_duration_since(*started).as_millis(),
+                    });
+                }
+                for class in JobClass::ALL {
+                    if let Some(job) = state.queued[class.index()].iter().find(|job| &job.id == id)
+                    {
+                        return json!({
+                            "operation": id,
+                            "state": "queued",
+                            "class": class.name(),
+                            "wait_ms": now.saturating_duration_since(job.at).as_millis(),
+                        });
+                    }
+                }
+                json!({"operation": id, "state": "accepted"})
+            })
+            .collect()
+    }
+}
+
+/// Marks a job running until it drops, including on panic.
+struct RunningJob<'a> {
+    queue: &'a JobQueue,
+    id: Id,
+}
+
+impl RunningJob<'_> {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+}
+
+impl Drop for RunningJob<'_> {
+    fn drop(&mut self) {
+        self.queue
+            .lock()
+            .running
+            .retain(|(id, _, _)| *id != self.id);
+    }
+}
+
 struct State {
     registration: Registration,
     authentication: Authentication,
@@ -469,7 +782,7 @@ struct State {
     views: ViewManager,
     watches: WatchSettings,
     monitors: Arc<Mutex<HashMap<Id, Arc<Mutex<Monitor>>>>>,
-    jobs: mpsc::SyncSender<Id>,
+    jobs: JobQueue,
     queued: Mutex<HashMap<Id, managed::OperationReadGuard>>,
     admission: Mutex<bool>,
     requests: AtomicU64,
@@ -819,9 +1132,9 @@ fn watch_event(
                 )
             ) && !event.need_rescan();
             let mut paths = Vec::new();
-            let mut full = event.need_rescan()
-                || event.paths.is_empty()
-                || matches!(event.kind, EventKind::Any | EventKind::Other);
+            let full = event.need_rescan();
+            let mut tree =
+                event.paths.is_empty() || matches!(event.kind, EventKind::Any | EventKind::Other);
             for path in event.paths {
                 if path.starts_with(storage) {
                     continue;
@@ -835,21 +1148,27 @@ fn watch_event(
                     if !path
                         .extension()
                         .is_some_and(|extension| extension == "lock")
-                        && (relative.as_os_str().is_empty()
-                            || [
-                                "HEAD",
-                                "index",
-                                "config",
-                                "config.worktree",
-                                "packed-refs",
-                                "commondir",
-                                "refs",
-                                "info",
-                            ]
-                            .iter()
-                            .any(|name| first == Some(std::ffi::OsStr::new(name))))
+                        && ([
+                            "HEAD",
+                            "index",
+                            "config",
+                            "config.worktree",
+                            "commondir",
+                            "info",
+                        ]
+                        .iter()
+                        .any(|name| first == Some(std::ffi::OsStr::new(name)))
+                            || relative.starts_with(Path::new("refs").join("heads")))
                     {
-                        full = true;
+                        // Index membership can change case-insensitive ignore
+                        // exemptions; HEAD also drives adaptive advancement.
+                        tree = true;
+                    } else if relative.as_os_str().is_empty()
+                        && !matches!(event.kind, EventKind::Modify(_))
+                    {
+                        tree = true;
+                    } else {
+                        WatchCounters::add(&counters.git_metadata_ignored, 1);
                     }
                     continue;
                 }
@@ -858,29 +1177,38 @@ fn watch_event(
                     Ok(relative)
                         if relative.components().any(|part| part.as_os_str() == ".git")
                             && (relative != Path::new(".git") || path.is_dir()) => {}
-                    Ok(relative) if relative == Path::new(".git") => full = true,
+                    Ok(relative) if relative == Path::new(".git") => tree = true,
                     Ok(relative) if !relative.as_os_str().is_empty() => {
                         // Drop notifications that left a file's trusted
                         // metadata equal to the indexed evidence, so external
                         // walkers and attribute churn do not trigger passes.
-                        if content_candidate
-                            && std::fs::metadata(&path).is_ok_and(|metadata| {
-                                metadata.is_file() && slot.unchanged_file(relative, &metadata)
-                            })
-                        {
-                            WatchCounters::add(&counters.unchanged_paths, 1);
-                            continue;
+                        if content_candidate && let Ok(metadata) = std::fs::metadata(&path) {
+                            if metadata.is_dir() {
+                                // A parent notification may be the only sign of
+                                // new membership. Rewalk, but do not reread its subtree.
+                                tree = true;
+                                continue;
+                            }
+                            if slot.unchanged_file(relative, &metadata) {
+                                WatchCounters::add(&counters.unchanged_paths, 1);
+                                continue;
+                            }
                         }
                         paths.push(relative.to_path_buf())
                     }
-                    _ => full = true,
+                    _ => tree = true,
                 }
             }
-            if full || !paths.is_empty() {
+            if full || tree || !paths.is_empty() {
                 WatchCounters::add(&counters.invalidated_paths, paths.len() as u64);
                 WatchCounters::add(&counters.full_invalidations, u64::from(full));
+                WatchCounters::add(&counters.tree_invalidations, u64::from(tree && !full));
                 WatchCounters::add(&counters.epoch_advances, 1);
-                slot.invalidate(&paths, full).map(|_| ())
+                if tree && !full {
+                    slot.invalidate_tree(&paths).map(|_| ())
+                } else {
+                    slot.invalidate(&paths, full).map(|_| ())
+                }
             } else {
                 Ok(())
             }
@@ -1025,6 +1353,11 @@ impl State {
         let polling = monitor
             .as_ref()
             .is_some_and(|monitor| self.watches.polling(monitor));
+        let queued_work = monitor.as_ref().map(|monitor| {
+            let mut pending: Vec<&Id> = monitor.pending.iter().collect();
+            pending.sort();
+            self.jobs.describe(&pending)
+        });
         Ok(json!({
             "watch_mode": if self.watches.no_watch { "disabled" }
                 else if polling { "poll" }
@@ -1034,9 +1367,16 @@ impl State {
             "watch_events": monitor.as_ref().map(|monitor| monitor.watch_counters.snapshot()),
             "last_verification": monitor.as_ref().map(|monitor| json!({
                 "outcome": monitor.verification,
+                "tier": monitor.verification_tier,
                 "age_ms": monitor.last_verification.elapsed().as_millis(),
+                "content_age_ms": monitor.last_reread.elapsed().as_millis(),
+                "content_attempt_age_ms": monitor.last_reread_attempt.elapsed().as_millis(),
+                "metadata_delay_ms": verification_delay(self.watches.interval, monitor.stat_cost).as_millis(),
+                "content_delay_ms": verification_delay(self.watches.interval.saturating_mul(REREAD_INTERVALS), monitor.reread_cost).as_millis(),
+                "content_retry_delay_ms": verification_delay(self.watches.interval, monitor.reread_cost).as_millis(),
             })),
-            "reconciliation_policy": self.watches.reconciliation_status(polling)
+            "reconciliation_policy": self.watches.reconciliation_status(polling),
+            "queued_work": queued_work
         }))
     }
 
@@ -1220,6 +1560,7 @@ impl State {
                         expected_version: self.views.recover(&input.view)?.version,
                         allocation_version: self.namespace.allocation()?.version,
                         verify: false,
+                        metadata_only: false,
                     },
                 )?;
                 let _receipt = self.namespace.hold_operation(&operation.id)?;
@@ -1298,28 +1639,27 @@ impl State {
         if queued.contains_key(&operation.id) {
             return Ok(());
         }
+        let remaining = Duration::from_millis(
+            self.namespace
+                .policy()?
+                .policy
+                .work
+                .operation_timeout_ms
+                .saturating_sub(self.namespace.operation_elapsed_ms(operation)?),
+        );
         queued.insert(
             operation.id.clone(),
             self.namespace.hold_operation(&operation.id)?,
         );
-        match self.jobs.try_send(operation.id.clone()) {
-            Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(_)) => {
-                queued.remove(&operation.id);
-                // Acceptance is durable; the bounded scheduler will retry it.
-                Ok(())
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                queued.remove(&operation.id);
-                Err(Error::new(
-                    ErrorCategory::RecoveryRequired,
-                    "workers-unavailable",
-                    "accepted work requires restart recovery",
-                )
-                .operation(operation.id.to_string())
-                .into())
-            }
+        if !self.jobs.push(
+            operation.id.clone(),
+            JobClass::of(operation, self.namespace.instance()),
+            remaining,
+        ) {
+            queued.remove(&operation.id);
+            // Acceptance is durable; the bounded scheduler will retry it.
         }
+        Ok(())
     }
 
     fn lifecycle(&self, request: &Request) -> Result<Value> {
@@ -1353,9 +1693,20 @@ impl State {
                 struct Input {
                     view: Id,
                     elapsed_ms: u64,
+                    #[serde(default)]
+                    reread_elapsed_ms: Option<u64>,
+                    #[serde(default)]
+                    reread_attempt_elapsed_ms: Option<u64>,
                 }
                 let input: Input = decode(request.params.clone())?;
-                if input.elapsed_ms > 86_400_000 {
+                if input.elapsed_ms > 86_400_000
+                    || input
+                        .reread_elapsed_ms
+                        .is_some_and(|elapsed| elapsed > 86_400_000)
+                    || input
+                        .reread_attempt_elapsed_ms
+                        .is_some_and(|elapsed| elapsed > 86_400_000)
+                {
                     return Err(Error::invalid("test timer exceeds one day").into());
                 }
                 let slot = self.views.slot(&input.view)?;
@@ -1372,6 +1723,13 @@ impl State {
                         Duration::from_secs(30),
                         Duration::from_millis(input.elapsed_ms),
                         Duration::from_millis(input.elapsed_ms),
+                        Duration::from_millis(input.reread_elapsed_ms.unwrap_or(input.elapsed_ms)),
+                        Duration::from_millis(
+                            input
+                                .reread_attempt_elapsed_ms
+                                .or(input.reread_elapsed_ms)
+                                .unwrap_or(input.elapsed_ms),
+                        ),
                     )
                 })?;
                 Ok(json!({"input_epoch":slot.input_epoch()}))
@@ -1491,6 +1849,7 @@ impl State {
                     "watch_events",
                     "last_verification",
                     "reconciliation_policy",
+                    "queued_work",
                 ] {
                     status[field] = watch[field].clone();
                 }
@@ -1625,6 +1984,7 @@ impl State {
                         .lock()
                         .map_err(|_| Error::corrupt("scheduler observations poisoned"))?
                         .clone();
+                    result["scheduler"]["job_queue"] = self.jobs.snapshot();
                     let diagnostics = self
                         .scheduler_diagnostics
                         .lock()
@@ -1672,6 +2032,7 @@ impl State {
                 "watch_events":watch["watch_events"],
                 "last_verification":watch["last_verification"],
                 "reconciliation_policy":watch["reconciliation_policy"],
+                "queued_work":watch["queued_work"],
                 "policy":self.namespace.policy()?,"usage":self.namespace.work_usage()?,
                 "adaptive":self.views.last_adaptive(slot.id())?,
                 "adaptive_error":self.views.last_adaptive_error(slot.id())?,
@@ -1706,16 +2067,25 @@ impl State {
     }
 
     fn job(&self, id: &Id) -> Result<()> {
+        let started = Instant::now();
         let _receipt = self.namespace.hold_operation(id)?;
         let operation = self.namespace.operation(id)?;
-        let result = match operation.kind.as_str() {
-            "metadata" => self.namespace.execute_metadata_mutation(id).map(|_| ()),
-            "collection" => {
-                let request: CollectionRequest = serde_json::from_value(operation.request.clone())?;
-                self.namespace.collect_pass(id, &request).map(|_| ())
+        let mut reconcile_epoch = None;
+        let result = (|| {
+            if operation.kind == "reconcile" {
+                let request: ReconcileRequest = serde_json::from_value(operation.request.clone())?;
+                reconcile_epoch = Some(self.views.slot(&request.view)?.input_epoch());
             }
-            _ => self.views.execute(id).map(|_| ()),
-        };
+            match operation.kind.as_str() {
+                "metadata" => self.namespace.execute_metadata_mutation(id).map(|_| ()),
+                "collection" => {
+                    let request: CollectionRequest =
+                        serde_json::from_value(operation.request.clone())?;
+                    self.namespace.collect_pass(id, &request).map(|_| ())
+                }
+                _ => self.views.execute(id).map(|_| ()),
+            }
+        })();
         if let Err(error) = result {
             self.namespace.fail_operation(id, error)?;
         }
@@ -1762,8 +2132,15 @@ impl State {
                     }
                     let verify =
                         operation.kind == "reconcile" && operation.request["verify"] == true;
+                    let polling = reconcile_epoch.is_some() && self.watches.polling(&state);
                     let result = final_operation.result.as_ref();
                     let outcome = match final_operation.state {
+                        OperationState::Completed
+                            if result
+                                .is_some_and(|result| result["verification"] == "superseded") =>
+                        {
+                            Some("superseded")
+                        }
                         OperationState::Completed
                             if verify
                                 && result.is_some_and(|result| result["verified"] == true) =>
@@ -1779,13 +2156,55 @@ impl State {
                         {
                             Some("full-pass")
                         }
-                        OperationState::Failed if verify => Some("failed"),
-                        OperationState::Cancelled if verify => Some("cancelled"),
+                        OperationState::Completed
+                            if operation.kind == "reconcile"
+                                && operation.request["metadata_only"] == true
+                                && !result.is_some_and(|result| result["coalesced"] == true) =>
+                        {
+                            Some("metadata-pass")
+                        }
+                        OperationState::Failed if verify || polling => Some("failed"),
+                        OperationState::Cancelled if verify || polling => Some("cancelled"),
                         _ => None,
                     };
                     if let Some(outcome) = outcome {
-                        state.last_verification = Instant::now();
+                        let completed = Instant::now();
+                        state.last_verification = completed;
                         state.verification = Some(outcome);
+                        let metadata_only =
+                            outcome != "full-pass" && operation.request["metadata_only"] == true;
+                        state.poll_retry = if polling
+                            && matches!(
+                                final_operation.state,
+                                OperationState::Failed | OperationState::Cancelled
+                            ) {
+                            reconcile_epoch.map(|epoch| PollRetry {
+                                epoch,
+                                metadata_only,
+                            })
+                        } else {
+                            None
+                        };
+                        state.verification_tier =
+                            Some(if metadata_only { "metadata" } else { "content" });
+                        let cost = result
+                            .and_then(|result| {
+                                result["reconcile"]["timings"]["admitted_us"].as_u64()
+                            })
+                            .map(Duration::from_micros)
+                            .unwrap_or_else(|| started.elapsed());
+                        if metadata_only {
+                            state.stat_cost = cost;
+                        } else {
+                            state.reread_cost = cost;
+                            state.last_reread_attempt = completed;
+                            if matches!(
+                                outcome,
+                                "full-pass" | "unchanged" | "repaired" | "superseded"
+                            ) {
+                                state.last_reread = completed;
+                            }
+                        }
                     }
                     state.failures = if final_operation.state == OperationState::Completed {
                         0
@@ -1823,6 +2242,8 @@ impl State {
                 monitor.last_schedule.elapsed(),
                 monitor.last_reconcile.elapsed(),
                 monitor.last_verification.elapsed(),
+                monitor.last_reread.elapsed(),
+                monitor.last_reread_attempt.elapsed(),
             )
         })
     }
@@ -1830,7 +2251,7 @@ impl State {
     fn schedule_view_with_elapsed(
         &self,
         slot: &Arc<ViewSlot>,
-        elapsed: impl FnOnce(&Monitor) -> (Duration, Duration, Duration),
+        elapsed: impl FnOnce(&Monitor) -> (Duration, Duration, Duration, Duration, Duration),
     ) -> Result<bool> {
         let status = self.views.status(slot.id())?;
         if status.leases == 0 {
@@ -1863,12 +2284,47 @@ impl State {
         }
         self.prune_pending(&mut monitor)?;
         if !monitor.pending.is_empty() {
+            if !status.ready {
+                // A view that lost readiness must not wait behind other views'
+                // background work; a queued verification of it then reconciles
+                // it as an ordinary pass.
+                for id in &monitor.pending {
+                    self.jobs.promote(id, JobClass::Foreground);
+                }
+            }
             return Ok(true);
         }
         let retry = Duration::from_millis(200_u64.saturating_mul(1_u64 << monitor.failures.min(7)));
-        let (schedule_elapsed, reconcile_elapsed, verification_elapsed) = elapsed(&monitor);
+        let (
+            schedule_elapsed,
+            reconcile_elapsed,
+            verification_elapsed,
+            reread_elapsed,
+            reread_attempt_elapsed,
+        ) = elapsed(&monitor);
+        if let Some(pending) = &monitor.poll_retry
+            && pending.epoch == status.input_epoch
+        {
+            let (attempt_elapsed, cost) = if pending.metadata_only {
+                (verification_elapsed, monitor.stat_cost)
+            } else {
+                (reread_attempt_elapsed, monitor.reread_cost)
+            };
+            if attempt_elapsed < verification_delay(self.watches.interval, cost) {
+                return Ok(false);
+            }
+        }
         let polling = self.watches.polling(&monitor);
-        let periodic = polling && reconcile_elapsed >= self.watches.interval;
+        let stat_due = reconcile_elapsed.min(verification_elapsed)
+            >= verification_delay(self.watches.interval, monitor.stat_cost);
+        let reread_due = content_verification_due(
+            self.watches.interval,
+            monitor.reread_cost,
+            verification_elapsed,
+            reread_elapsed,
+            reread_attempt_elapsed,
+        );
+        let periodic = polling && (stat_due || reread_due);
         // Healthy native views are verified while serving; only a detected
         // difference closes readiness.
         let verify = !periodic
@@ -1876,12 +2332,16 @@ impl State {
             && !polling
             && !self.watches.no_watch
             && monitor.watcher.is_some()
-            && verification_elapsed >= self.watches.interval;
+            && (stat_due || reread_due);
         if (!status.ready || periodic || verify) && schedule_elapsed >= retry {
             monitor.last_schedule = Instant::now();
             drop(monitor);
             if periodic {
-                slot.invalidate(&[], true)?;
+                if reread_due {
+                    slot.invalidate(&[], true)?;
+                } else {
+                    slot.invalidate_tree(&[])?;
+                }
             }
             let operation = self.views.accept_reconciliation(
                 Token::parse(Id::new()?.to_string())?,
@@ -1890,6 +2350,7 @@ impl State {
                     expected_version: status.authoritative.version,
                     allocation_version: self.namespace.allocation()?.version,
                     verify,
+                    metadata_only: (periodic || verify) && !reread_due,
                 },
             )?;
             self.enqueue(&operation)?;
@@ -1930,6 +2391,10 @@ impl State {
             .cloned()
             .collect();
         for id in pending {
+            if self.jobs.running(&id) {
+                // Terminal receipts precede job()'s retry-clock accounting.
+                continue;
+            }
             match self.namespace.operation(&id) {
                 Ok(operation)
                     if matches!(
@@ -2056,8 +2521,8 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
     fs2::FileExt::try_lock_exclusive(&git_lock)
         .context("another shared daemon owns the repository")?;
     namespace.activate()?;
+    // `accept` blocks; a waker thread connects once `stopping` is set.
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    listener.set_nonblocking(true)?;
     let registration = Registration {
         protocol: managed::PROTOCOL_VERSION,
         namespace: namespace.header().namespace.clone(),
@@ -2138,7 +2603,13 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
             watch_counters: Arc::new(WatchCounters::default()),
             last_reconcile: Instant::now(),
             last_verification: Instant::now(),
+            last_reread: Instant::now(),
+            last_reread_attempt: Instant::now(),
+            stat_cost: Duration::ZERO,
+            reread_cost: Duration::ZERO,
             verification: None,
+            verification_tier: None,
+            poll_retry: None,
             pending: HashSet::new(),
             failures: 0,
             #[cfg(feature = "managed-test-hooks")]
@@ -2189,7 +2660,6 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
         },
         Some(observer),
     )?;
-    let (jobs, jobs_rx) = mpsc::sync_channel(policy.work.queue_items as usize);
     let state = Arc::new(State {
         registration: registration.clone(),
         authentication,
@@ -2197,7 +2667,7 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
         views,
         watches,
         monitors,
-        jobs,
+        jobs: JobQueue::new(policy.work.queue_items as usize),
         queued: Mutex::new(HashMap::new()),
         admission: Mutex::new(true),
         requests: AtomicU64::new(0),
@@ -2235,32 +2705,31 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
         "shared-v2 listening on {} (namespace {})",
         registration.port, registration.namespace
     );
+    // Cleared once the accept loop returns; the waker retries until then.
+    let accepting = AtomicBool::new(true);
     thread::scope(|scope| -> Result<()> {
-        struct Shutdown<'a>(&'a AtomicBool);
+        struct Shutdown<'a>(&'a AtomicBool, &'a AtomicBool);
         impl Drop for Shutdown<'_> {
             fn drop(&mut self) {
+                self.1.store(false, Ordering::Release);
                 self.0.store(true, Ordering::Release);
             }
         }
-        let _shutdown = Shutdown(&state.stopping);
-        let jobs_rx = Arc::new(Mutex::new(jobs_rx));
+        let _shutdown = Shutdown(&state.stopping, &accepting);
         for _ in 0..policy.work.workers {
-            let receiver = Arc::clone(&jobs_rx);
             let state = Arc::clone(&state);
             scope.spawn(move || {
                 while !state.stopping.load(Ordering::Acquire) {
-                    let job = receiver
-                        .lock()
-                        .expect("managed job receiver")
-                        .recv_timeout(Duration::from_millis(50));
-                    let id = match job {
-                        Ok(id) => id,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    let Some(job) = state.jobs.pop(Duration::from_millis(50)) else {
+                        continue;
                     };
+                    let id = job.id().clone();
                     if let Err(error) = state.job(&id) {
                         eprintln!("managed operation {id}: {error:#}");
                     }
+                    // Leave the running set before the registry can admit the
+                    // same operation again.
+                    drop(job);
                     state
                         .queued
                         .lock()
@@ -2589,6 +3058,7 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                         Some(id) => scheduler.queued.lock().map_err(|_| Error::corrupt("job registry poisoned"))?.contains_key(id),
                         None => false,
                     };
+                    let collection_running = collection.as_ref().is_some_and(|id| scheduler.jobs.running(id));
                     let acknowledged = (|| -> Result<()> {
                         let queued = scheduler.queued.lock().map_err(|_| Error::corrupt("job registry poisoned"))?;
                         let mut protected: Vec<Id> = queued.keys().cloned().collect();
@@ -2643,11 +3113,13 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                         "initializing":false,"tick_ms":SCHEDULER_TICK.as_millis(),"idle_tick_ms":SCHEDULER_IDLE_TICK.as_millis(),"maximum_backoff_multiplier":64,
                         "automatic_collection_enabled":enabled,"pressure":pressure,
                         "recovery_continuation":recovery.is_some(),"collection_continuation":collection_cursor.is_some(),
-                        // Accepted is not running: the operation state and
-                        // queue membership distinguish waiting from active.
+                        // In flight spans acceptance to completion, including
+                        // time queued. collection_running means a worker is
+                        // executing a pass, as maintenance in_flight counts.
                         "collection_in_flight":collection.is_some(),
                         "collection_operation_state":collection_state,
                         "collection_queued":collection_queued,
+                        "collection_running":collection_running,
                         "failed_phases":phase_failures,
                         "recovery_retry_ms":recovery_schedule.delay(retry).as_millis(),
                         "collection_retry_ms":collection_schedule.delay(retry).as_millis(),
@@ -2662,6 +3134,32 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                 if diagnostics.observe(started.elapsed(), tick.err().map(|error| format!("{error:#}"))) {
                     eprintln!("managed scheduler: {}", diagnostics.last_error_detail.as_deref().expect("observed error"));
                 }
+            }
+        });
+        // `accept` blocks, so once `stopping` is set a loopback connection wakes
+        // it. Retry until the accept loop has returned; hold the wake open (write
+        // side shut) so the loop's busy reply is not reset and no reader waits.
+        let waker = Arc::clone(&state);
+        let accepting = &accepting;
+        scope.spawn(move || {
+            let address = SocketAddr::from((Ipv4Addr::LOCALHOST, waker.registration.port));
+            let mut wake = None;
+            let mut reported = false;
+            while accepting.load(Ordering::Acquire) {
+                if wake.is_none() && waker.stopping.load(Ordering::Acquire) {
+                    match TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
+                        Ok(stream) => {
+                            let _ = stream.shutdown(std::net::Shutdown::Write);
+                            wake = Some(stream);
+                        }
+                        Err(error) if !reported => {
+                            eprintln!("managed daemon retrying listener wake: {error}");
+                            reported = true;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                thread::sleep(Duration::from_millis(50));
             }
         });
         let mut accept_failures = super::AcceptRetry::new();
@@ -2706,9 +3204,6 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
                             );
                         }
                     }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10))
                 }
                 Err(error) => {
                     if let Err(error) = accept_failures.failed(error) {
@@ -3042,10 +3537,9 @@ mod scheduling_tests {
                     "index",
                     "config",
                     "config.worktree",
-                    "packed-refs",
                     "commondir",
-                    "refs",
                     "info",
+                    "refs/heads/own-branch",
                 ] {
                     let before = slot.input_epoch();
                     watch_event(
@@ -3074,6 +3568,11 @@ mod scheduling_tests {
                     "config.worktree.lock",
                     "objects",
                     "logs",
+                    "packed-refs",
+                    "refs",
+                    "refs/prefetch/heads/main",
+                    "FETCH_HEAD",
+                    "ORIG_HEAD",
                 ] {
                     let before = slot.input_epoch();
                     watch_event(
@@ -3201,6 +3700,78 @@ mod scheduling_tests {
     }
 
     #[test]
+    fn verification_cadence_bounds_idle_work_by_its_observed_cost() {
+        let interval = Duration::from_secs(120);
+        assert_eq!(verification_delay(interval, Duration::ZERO), interval);
+        assert_eq!(
+            verification_delay(interval, Duration::from_secs(10)),
+            Duration::from_secs(190)
+        );
+        let content_interval = interval.saturating_mul(REREAD_INTERVALS);
+        assert_eq!(
+            verification_delay(content_interval, Duration::from_secs(10)),
+            Duration::from_secs(1800)
+        );
+        let cost = Duration::from_secs(165);
+        let idle = verification_delay(content_interval, cost);
+        assert_eq!(idle, Duration::from_secs(3135));
+        assert_eq!(cost.as_secs() * 20, (idle + cost).as_secs());
+        assert_eq!(verification_delay(interval, Duration::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn content_verification_retries_wait_since_the_last_terminal_attempt() {
+        let interval = Duration::from_secs(120);
+        let cost = Duration::from_secs(165);
+        let old_success = Duration::from_secs(86_400);
+        let retry_delay = verification_delay(interval, cost);
+        assert_eq!(retry_delay, Duration::from_secs(3135));
+        for attempt_elapsed in [interval, retry_delay - Duration::from_millis(1)] {
+            assert!(!content_verification_due(
+                interval,
+                cost,
+                interval,
+                old_success,
+                attempt_elapsed,
+            ));
+        }
+        assert!(content_verification_due(
+            interval,
+            cost,
+            interval,
+            old_success,
+            retry_delay,
+        ));
+        assert!(!content_verification_due(
+            interval,
+            cost,
+            interval - Duration::from_millis(1),
+            old_success,
+            retry_delay,
+        ));
+
+        let cheap = Duration::from_secs(1);
+        assert!(content_verification_due(
+            interval,
+            cheap,
+            interval,
+            old_success,
+            interval,
+        ));
+        assert!(!content_verification_due(
+            interval, cheap, interval, interval, interval,
+        ));
+        let content_interval = interval.saturating_mul(REREAD_INTERVALS);
+        assert!(content_verification_due(
+            interval,
+            cheap,
+            content_interval,
+            content_interval,
+            content_interval,
+        ));
+    }
+
+    #[test]
     fn empty_passes_back_off_and_lifecycle_triggers_coalesce() {
         let base = Duration::from_millis(100);
         let mut now = Instant::now();
@@ -3309,6 +3880,225 @@ mod scheduling_tests {
         assert_eq!(snapshot["unchanged_paths_filtered"], 5);
         assert_eq!(snapshot["full_invalidations"], 0);
     }
+
+    fn job_ids() -> [Id; 4] {
+        std::array::from_fn(|index| Id::parse(format!("{index:032x}")).unwrap())
+    }
+
+    #[test]
+    fn job_queue_runs_the_earliest_due_job_across_classes() {
+        let [verify, collection, client, late] = job_ids();
+        let base = Instant::now();
+        let mut queue = JobQueueState::default();
+        assert!(queue.push(verify.clone(), JobClass::Background, base, 8, Duration::MAX));
+        let second = base + Duration::from_secs(1);
+        assert!(queue.push(
+            collection.clone(),
+            JobClass::Maintenance,
+            second,
+            8,
+            Duration::MAX
+        ));
+        let later = base + Duration::from_secs(30);
+        assert!(queue.push(
+            client.clone(),
+            JobClass::Foreground,
+            later,
+            8,
+            Duration::MAX
+        ));
+        // Collection became due at 6 s, before the client operation queued at 30 s.
+        assert_eq!(queue.pop(), Some((collection, JobClass::Maintenance)));
+        assert_eq!(queue.pop(), Some((client, JobClass::Foreground)));
+        // Verification became due at 600 s, ahead of foreground work queued later.
+        let after = base + Duration::from_secs(601);
+        assert!(queue.push(late.clone(), JobClass::Foreground, after, 8, Duration::MAX));
+        assert_eq!(queue.pop(), Some((verify, JobClass::Background)));
+        assert_eq!(queue.pop(), Some((late, JobClass::Foreground)));
+        assert_eq!(queue.pop(), None);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn job_queue_breaks_ties_toward_higher_classes_and_bounds_capacity() {
+        let [collection, first, second, verify] = job_ids();
+        let base = Instant::now();
+        let tie = base + JobClass::Maintenance.delay(Duration::MAX);
+        let mut queue = JobQueueState::default();
+        assert!(queue.push(
+            collection.clone(),
+            JobClass::Maintenance,
+            base,
+            4,
+            Duration::MAX
+        ));
+        assert!(queue.push(first.clone(), JobClass::Foreground, tie, 4, Duration::MAX));
+        assert!(queue.push(second.clone(), JobClass::Foreground, tie, 4, Duration::MAX));
+        assert!(queue.push(verify.clone(), JobClass::Background, base, 4, Duration::MAX));
+        assert_eq!(queue.len(), 4);
+        let overflow = Id::parse("f".repeat(32)).unwrap();
+        assert!(!queue.push(overflow, JobClass::Foreground, tie, 4, Duration::MAX));
+        assert_eq!(queue.pop(), Some((first, JobClass::Foreground)));
+        assert_eq!(queue.pop(), Some((second, JobClass::Foreground)));
+        assert_eq!(queue.pop(), Some((collection, JobClass::Maintenance)));
+        assert_eq!(queue.pop(), Some((verify, JobClass::Background)));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn job_queue_promotion_keeps_the_original_queue_time() {
+        let [early, verify, late, unknown] = job_ids();
+        let base = Instant::now();
+        let mut queue = JobQueueState::default();
+        assert!(queue.push(early.clone(), JobClass::Foreground, base, 8, Duration::MAX));
+        let second = base + Duration::from_secs(1);
+        assert!(queue.push(
+            verify.clone(),
+            JobClass::Background,
+            second,
+            8,
+            Duration::MAX
+        ));
+        let third = base + Duration::from_secs(2);
+        assert!(queue.push(late.clone(), JobClass::Foreground, third, 8, Duration::MAX));
+        assert!(!queue.promote(&unknown, JobClass::Foreground));
+        assert!(queue.promote(&verify, JobClass::Foreground));
+        assert!(!queue.promote(&verify, JobClass::Foreground));
+        assert!(!queue.promote(&early, JobClass::Background));
+        assert_eq!(queue.pop(), Some((early, JobClass::Foreground)));
+        assert_eq!(queue.pop(), Some((verify, JobClass::Foreground)));
+        assert_eq!(queue.pop(), Some((late, JobClass::Foreground)));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn job_classes_follow_operation_kind_and_origin() {
+        let verify = json!({"verify": true});
+        let plain = json!({});
+        assert_eq!(
+            JobClass::classify("reconcile", &verify, true),
+            JobClass::Background
+        );
+        assert_eq!(
+            JobClass::classify("reconcile", &plain, true),
+            JobClass::Foreground
+        );
+        assert_eq!(
+            JobClass::classify("adaptive", &plain, true),
+            JobClass::Background
+        );
+        assert_eq!(
+            JobClass::classify("adaptive", &plain, false),
+            JobClass::Foreground
+        );
+        for automatic in [false, true] {
+            assert_eq!(
+                JobClass::classify("collection", &plain, automatic),
+                JobClass::Maintenance
+            );
+        }
+        for kind in ["attach", "legacy-attach", "migrate", "refresh", "metadata"] {
+            assert_eq!(
+                JobClass::classify(kind, &verify, false),
+                JobClass::Foreground
+            );
+        }
+    }
+
+    #[test]
+    fn background_aging_preserves_execution_time_under_continuous_foreground_work() {
+        let [verify, client, _, _] = job_ids();
+        for lifetime_ms in [100, 8_000, 30_000, 120_000] {
+            let lifetime = Duration::from_millis(lifetime_ms);
+            let base = Instant::now();
+            let mut queue = JobQueueState::default();
+            assert!(queue.push(verify.clone(), JobClass::Background, base, 2, lifetime));
+            let step = lifetime / 100;
+            // One free worker sees a fresh short foreground job on every turn.
+            for tick in 1..=26 {
+                let at = base + step * tick;
+                assert!(queue.push(client.clone(), JobClass::Foreground, at, 2, lifetime));
+                if tick <= 25 {
+                    assert_eq!(queue.pop(), Some((client.clone(), JobClass::Foreground)));
+                } else {
+                    assert_eq!(queue.pop(), Some((verify.clone(), JobClass::Background)));
+                    assert!(at.duration_since(base) < lifetime / 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_aging_handles_late_admission_and_shorter_lifetimes_within_a_class() {
+        let [long, late, client, expired] = job_ids();
+        let base = Instant::now();
+        let mut queue = JobQueueState::default();
+        assert!(queue.push(
+            long,
+            JobClass::Background,
+            base,
+            4,
+            Duration::from_secs(120)
+        ));
+        // Already spent 118 s awaiting queue capacity; only 2 s remain.
+        let at = base + Duration::from_secs(1);
+        assert!(queue.push(
+            late.clone(),
+            JobClass::Background,
+            at,
+            4,
+            Duration::from_secs(2)
+        ));
+        assert!(queue.push(
+            client,
+            JobClass::Foreground,
+            at + Duration::from_secs(1),
+            4,
+            Duration::MAX
+        ));
+        assert_eq!(queue.pop(), Some((late, JobClass::Background)));
+        assert_eq!(
+            JobClass::Maintenance.delay(Duration::from_secs(8)),
+            Duration::from_secs(2)
+        );
+        assert!(queue.push(expired.clone(), JobClass::Background, at, 4, Duration::ZERO));
+        assert_eq!(queue.pop(), Some((expired, JobClass::Background)));
+    }
+
+    #[test]
+    fn job_queue_reports_queued_and_running_work() {
+        let [first, second, third, absent] = job_ids();
+        let queue = JobQueue::new(2);
+        assert!(queue.pop(Duration::from_millis(1)).is_none());
+        assert!(queue.push(first.clone(), JobClass::Background, Duration::MAX));
+        assert!(queue.push(second.clone(), JobClass::Foreground, Duration::MAX));
+        assert!(!queue.push(third, JobClass::Foreground, Duration::MAX));
+        let running = queue.pop(Duration::from_millis(1)).unwrap();
+        assert_eq!(running.id(), &second);
+        assert!(queue.running(&second));
+        assert!(!queue.running(&first));
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot["capacity"], 2);
+        assert_eq!(snapshot["queued"]["foreground"]["depth"], 0);
+        assert!(snapshot["queued"]["foreground"]["oldest_wait_ms"].is_null());
+        assert_eq!(snapshot["queued"]["maintenance"]["depth"], 0);
+        assert_eq!(snapshot["queued"]["background"]["depth"], 1);
+        assert!(snapshot["queued"]["background"]["oldest_wait_ms"].is_u64());
+        assert_eq!(snapshot["running"][0]["operation"], second.to_string());
+        assert_eq!(snapshot["running"][0]["class"], "foreground");
+        let described = queue.describe(&[&second, &first, &absent]);
+        assert_eq!(described[0]["state"], "running");
+        assert_eq!(described[0]["class"], "foreground");
+        assert_eq!(described[1]["state"], "queued");
+        assert_eq!(described[1]["class"], "background");
+        assert_eq!(
+            described[2],
+            json!({"operation": absent, "state": "accepted"})
+        );
+        drop(running);
+        assert!(!queue.running(&second));
+        assert_eq!(queue.snapshot()["running"], json!([]));
+    }
 }
 
 #[cfg(test)]
@@ -3351,13 +4141,15 @@ mod candidate_read_tests {
         );
     }
 
-    /// Call 0 lists candidates, 1 pins their parent, and 2/3 open candidates.
+    /// Call 0 lists candidates, 1 pins their parent, and 2 checks the final
+    /// epoch; sibling opens take no snapshot.
     #[derive(Clone, Copy, Debug)]
     enum Inject {
         Nothing,
         SnapshotBeforeRead(usize),
         SnapshotAfterRead(usize),
-        Check,
+        /// Fail `check` calls numbered from this one with `query-deadline`.
+        CheckFrom(usize),
         /// Swap this root-relative directory for a copy without `shared_term`
         /// after the call completes, so a pinned batch reads the old one.
         #[cfg(unix)]
@@ -3370,6 +4162,7 @@ mod candidate_read_tests {
         inner: ManagedQuery,
         inject: Inject,
         snapshots: Cell<usize>,
+        checks: Cell<usize>,
         invalidations: Cell<usize>,
         requeues: Cell<usize>,
     }
@@ -3413,7 +4206,11 @@ mod candidate_read_tests {
             self.inner.invalidate(error)
         }
         fn check(&self) -> Result<()> {
-            if matches!(self.inject, Inject::Check) {
+            let call = self.checks.get();
+            self.checks.set(call + 1);
+            if let Inject::CheckFrom(from) = self.inject
+                && call >= from
+            {
                 return Err(Error::new(
                     ErrorCategory::Deadline,
                     "query-deadline",
@@ -3476,6 +4273,89 @@ mod candidate_read_tests {
         assert_eq!(files(&last), ["source.txt"], "{last}");
         assert_eq!(last["next_page"], Value::Null);
         assert!(fixture.ready());
+        fixture.close();
+    }
+
+    /// Records the threads that take snapshots of the view and check reads.
+    struct ThreadRecording {
+        inner: ManagedQuery,
+        threads: Mutex<Vec<String>>,
+        checks: Mutex<Vec<String>>,
+    }
+
+    impl QuerySource for ThreadRecording {
+        fn root(&self) -> &Path {
+            self.inner.root()
+        }
+        fn eligibility(&self) -> Result<ContentEligibility> {
+            self.inner.eligibility()
+        }
+        fn snapshot<T>(&self, read: impl FnOnce(WorktreeSnapshot<'_>) -> T) -> Result<T> {
+            let name = thread::current().name().unwrap_or_default().to_owned();
+            self.threads.lock().unwrap().push(name);
+            self.inner.snapshot(read)
+        }
+        fn invalidate(&self, error: &anyhow::Error) -> Result<()> {
+            self.inner.invalidate(error)
+        }
+        fn check(&self) -> Result<()> {
+            let name = thread::current().name().unwrap_or_default().to_owned();
+            self.checks.lock().unwrap().push(name);
+            self.inner.check()
+        }
+        fn eventual(&self) -> bool {
+            self.inner.eventual()
+        }
+        fn requeue(&self, relative: &[String]) -> Result<()> {
+            self.inner.requeue(relative)
+        }
+    }
+
+    #[test]
+    fn parallel_queries_run_on_the_dedicated_search_pool() {
+        // Two parent directories make two sibling groups, so the search forks,
+        // and two files per group make each group pin its parent first.
+        let fixture = Fixture::new(false, &["one/a.txt", "one/b.txt", "two/c.txt", "two/d.txt"]);
+        let source = ThreadRecording {
+            inner: ManagedQuery {
+                query: fixture.slot.query(fixture.record.version).unwrap(),
+                slot: Arc::clone(&fixture.slot),
+            },
+            threads: Mutex::new(Vec::new()),
+            checks: Mutex::new(Vec::new()),
+        };
+        let caller = thread::current().name().unwrap_or_default().to_owned();
+        let result = super::super::server::search_snapshot_parallel(
+            &source,
+            &json!({"pattern":"shared_term"}),
+            false,
+            &json!(1),
+            json!({}),
+            super::super::server::PAGE_TIME,
+        )
+        .unwrap();
+        assert_eq!(result["matches"].as_array().unwrap().len(), 4, "{result}");
+        let threads = std::mem::take(&mut *source.threads.lock().unwrap());
+        let checks = std::mem::take(&mut *source.checks.lock().unwrap());
+        // Each group's parent pin and every read check run on the query pool,
+        // never on the global pool that reconciliation batches occupy. Sibling
+        // opens take no snapshot, so each group records only its pin. The
+        // listing and the final epoch check stay on the calling thread,
+        // because only each window is installed on the pool.
+        let (listing, rest) = threads.split_first().unwrap();
+        let (last, groups) = rest.split_last().unwrap();
+        assert_eq!((listing, last), (&caller, &caller), "{threads:?}");
+        assert!(!caller.starts_with("tgrep-search-"), "{threads:?}");
+        assert_eq!(groups.len(), 2, "{threads:?}");
+        assert!(checks.len() >= 4, "{checks:?}");
+        assert!(
+            groups
+                .iter()
+                .chain(&checks)
+                .all(|name| name.starts_with("tgrep-search-")),
+            "{threads:?} {checks:?}"
+        );
+        drop(source);
         fixture.close();
     }
 
@@ -3637,6 +4517,7 @@ mod candidate_read_tests {
                 },
                 inject,
                 snapshots: Cell::new(0),
+                checks: Cell::new(0),
                 invalidations: Cell::new(0),
                 requeues: Cell::new(0),
             }
@@ -3690,18 +4571,16 @@ mod candidate_read_tests {
         let (result, snapshots, invalidations, requeues) = run(Inject::Nothing);
         let result = result.unwrap();
         assert_eq!(result["matches"].as_array().unwrap().len(), 2, "{result}");
-        assert_eq!((snapshots, invalidations, requeues), (5, 0, 0));
+        // Siblings open through the group's pin, so the query takes only the
+        // listing, pin and final snapshots.
+        assert_eq!((snapshots, invalidations, requeues), (3, 0, 0));
         let epoch = slot.input_epoch();
         for (inject, reason) in [
             (Inject::SnapshotBeforeRead(1), "query-input-changed"),
             (Inject::SnapshotAfterRead(1), "query-snapshot-changed"),
             (Inject::SnapshotBeforeRead(2), "query-input-changed"),
             (Inject::SnapshotAfterRead(2), "query-snapshot-changed"),
-            (Inject::SnapshotBeforeRead(3), "query-input-changed"),
-            (Inject::SnapshotAfterRead(3), "query-snapshot-changed"),
-            (Inject::SnapshotBeforeRead(4), "query-input-changed"),
-            (Inject::SnapshotAfterRead(4), "query-snapshot-changed"),
-            (Inject::Check, "query-deadline"),
+            (Inject::CheckFrom(0), "query-deadline"),
         ] {
             let (result, _, invalidations, requeues) = run(inject);
             let error = result.unwrap_err();
@@ -3723,6 +4602,21 @@ mod candidate_read_tests {
 
         std::fs::remove_file(root.join("source.txt")).unwrap();
         std::fs::create_dir(root.join("source.txt")).unwrap();
+        // Reading `sibling.txt` takes checks 0 and 1. Once check 2 fails, the
+        // failed open of `source.txt` is not classified as a filesystem error.
+        let (result, _, invalidations, requeues) = run(Inject::CheckFrom(2));
+        let error = result.unwrap_err();
+        let typed = error
+            .downcast_ref::<Error>()
+            .unwrap_or_else(|| panic!("{error:#}"));
+        assert_eq!(typed.reason_code, "query-deadline");
+        assert!(
+            !format!("{error:#}").contains("reading shared candidate"),
+            "{error:#}"
+        );
+        assert_eq!((invalidations, requeues), (0, 0));
+        assert_eq!(slot.input_epoch(), epoch);
+        assert!(manager.status(&record.id).unwrap().ready);
         if stale_reads {
             // The vanished candidate is skipped and queued as a path hint;
             // the view keeps serving its publication while it catches up.

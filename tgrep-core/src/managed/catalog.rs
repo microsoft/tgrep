@@ -646,8 +646,9 @@ impl Namespace {
         Ok(result)
     }
 
-    /// Writers checkpoint only past a quarter of the metadata budget, so up to
-    /// that many reclaimable WAL bytes can count against storage admission.
+    /// Writers checkpoint only past the smaller of a quarter of the metadata
+    /// budget and 64 MiB, so up to that many reclaimable WAL bytes can count
+    /// against storage admission.
     /// Returns whether committed frames were checkpointed and truncated.
     pub(crate) fn truncate_catalog_wal(&self) -> Result<bool> {
         let _timing = self.catalog_metrics.start();

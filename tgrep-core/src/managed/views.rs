@@ -84,6 +84,19 @@ pub struct ReconcileRequest {
     /// ordinary journals are unchanged and older services reject verification.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub verify: bool,
+    /// Verify trusted metadata instead of rereading unchanged file contents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub metadata_only: bool,
+}
+
+enum CurrentVerification {
+    Handled,
+    /// The verification completed, but newer invalidations need an ordinary
+    /// pass. `changed` means its repaired state is already published.
+    Superseded {
+        changed: bool,
+    },
+    Ordinary,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -730,6 +743,7 @@ impl ViewManager {
                     request.allocation_version,
                     None,
                     request.verify,
+                    request.metadata_only,
                 )
             }
             "adaptive" => self.execute_adaptive(
@@ -1254,7 +1268,7 @@ impl ViewManager {
         }
         self.check_participant(view, owner, version, false)?;
         self.slot(view)?
-            .invalidate_inner(Some(version), changed, full)
+            .invalidate_inner(Some(version), changed, full, false)
     }
 
     pub(super) fn execute_migration(
@@ -1401,6 +1415,7 @@ impl ViewManager {
             request.allocation_version,
             Some(&request.owner),
             false,
+            false,
         )
     }
 
@@ -1413,6 +1428,7 @@ impl ViewManager {
         allocation_version: u64,
         owner: Option<&Id>,
         verify: bool,
+        metadata_only: bool,
     ) -> Result<()> {
         let slot = self.slot(view)?;
         let _serial = slot
@@ -1425,12 +1441,15 @@ impl ViewManager {
         }
         let permit = self.reserve(&operation.id, owner, allocation_version)?;
         let _work = slot.begin_work(operation)?;
-        if operation.kind == "reconcile"
-            && verify
-            && self.verify_current(&slot, operation, &record, &permit)?
-        {
-            return Ok(());
-        }
+        let superseded = if operation.kind == "reconcile" && verify {
+            match self.verify_current(&slot, operation, &record, &permit, metadata_only)? {
+                CurrentVerification::Handled => return Ok(()),
+                CurrentVerification::Superseded { changed } => Some(changed),
+                CurrentVerification::Ordinary => None,
+            }
+        } else {
+            None
+        };
         // A superseded verification is never coalesced into a completion
         // that could be mistaken for a verified view.
         if operation.kind == "reconcile"
@@ -1445,7 +1464,7 @@ impl ViewManager {
             .map_err(|_| Error::corrupt("view lock poisoned"))?
             .current
             .clone();
-        let (view, result) = match current {
+        let (view, mut result) = match current {
             Some(current) if current.record.same_publication(&record) => {
                 (Arc::clone(&current.view), json!({}))
             }
@@ -1467,23 +1486,31 @@ impl ViewManager {
         };
         let (checkpoint, reconcile, input) =
             self.prepare_checkpoint(&slot, &view, &record, &permit, false)?;
+        if let Some(changed) = superseded {
+            result["verification"] = json!("superseded");
+            if changed {
+                result["changed"] = json!(true);
+            }
+        }
         self.publish(
             &slot, operation, record, view, checkpoint, reconcile, input, result, &permit, false,
         )
     }
 
-    /// Serving full verification of the current publication. Returns false
-    /// when the ordinary reconciliation path must handle the view, including
-    /// a concurrent invalidation. A repaired difference publishes as a
-    /// normal reconciliation; failures leave the record/worktree epochs
-    /// unequal or the worktree unready, so queries stay closed.
+    /// Serving verification of the current publication. An ordinary pass
+    /// handles newer invalidations, including after an eventual view has
+    /// already published a difference found alongside them. A repaired
+    /// difference publishes as a normal reconciliation. Until then,
+    /// record/worktree epoch mismatches or an unready worktree block strict
+    /// queries; eventual queries can still use the last publication.
     fn verify_current(
         &self,
         slot: &ViewSlot,
         operation: &OperationRecord,
         record: &ViewRecord,
         permit: &Arc<WorkPermit>,
-    ) -> Result<bool> {
+        metadata_only: bool,
+    ) -> Result<CurrentVerification> {
         let (view, input) = {
             let state = slot
                 .state
@@ -1493,7 +1520,7 @@ impl ViewManager {
                 return Err(Error::busy("view-closing"));
             }
             let Some(current) = &state.current else {
-                return Ok(false);
+                return Ok(CurrentVerification::Ordinary);
             };
             let status = current.view.status()?;
             let input = slot.epoch.load(Ordering::Acquire);
@@ -1502,19 +1529,38 @@ impl ViewManager {
                 || !status.ready
                 || status.published_epoch != record.reconciled_epoch
             {
-                return Ok(false);
+                return Ok(CurrentVerification::Ordinary);
             }
             (Arc::clone(&current.view), input)
         };
-        match view.verify_controlled(permit) {
+        let verified = if metadata_only {
+            view.verify_metadata_controlled(permit)
+        } else {
+            view.verify_controlled(permit)
+        };
+        match verified {
             Ok(Verification::Ineligible)
-            | Err(crate::worktrees::WorktreeError::ChangedDuringReconcile) => Ok(false),
-            Ok(Verification::Unchanged(stats)) => {
-                self.complete_current_reconciliation(slot, operation, record, permit, Some(stats))
+            | Err(crate::worktrees::WorktreeError::ChangedDuringReconcile) => {
+                Ok(CurrentVerification::Ordinary)
             }
+            Ok(Verification::Superseded(_)) => {
+                Ok(CurrentVerification::Superseded { changed: false })
+            }
+            Ok(Verification::PublishedSuperseded(_)) => {
+                Ok(CurrentVerification::Superseded { changed: true })
+            }
+            Ok(Verification::Unchanged(stats)) => self
+                .complete_current_reconciliation(slot, operation, record, permit, Some(stats))
+                .map(|completed| {
+                    if completed {
+                        CurrentVerification::Handled
+                    } else {
+                        CurrentVerification::Superseded { changed: false }
+                    }
+                }),
             Ok(Verification::Published(mut stats)) => {
                 if slot.epoch.load(Ordering::Acquire) != input {
-                    return Ok(false);
+                    return Ok(CurrentVerification::Ordinary);
                 }
                 let checkpoint_start = std::time::Instant::now();
                 let checkpoint = self.namespace.save_checkpoint(
@@ -1530,7 +1576,7 @@ impl ViewManager {
                 if slot.epoch.load(Ordering::Acquire) != input
                     || view.status()?.published_epoch != Some(stats.epoch)
                 {
-                    return Ok(false);
+                    return Ok(CurrentVerification::Ordinary);
                 }
                 self.publish(
                     slot,
@@ -1544,7 +1590,7 @@ impl ViewManager {
                     permit,
                     false,
                 )?;
-                Ok(true)
+                Ok(CurrentVerification::Handled)
             }
             Err(error) => Err(error.into()),
         }
@@ -1657,7 +1703,8 @@ impl ViewManager {
         permit: &Arc<WorkPermit>,
         first_attachment: bool,
     ) -> Result<(super::ProtectedCheckpoint, ReconcileStats, u64)> {
-        let attempts = if self.namespace.operation(permit.operation_id())?.kind == "adaptive" {
+        let kind = self.namespace.operation(permit.operation_id())?.kind;
+        let attempts = if kind == "adaptive" {
             match self.namespace.policy()?.policy.advancement {
                 super::policy::Advancement::Adaptive { max_attempts, .. } => {
                     RECONCILE_ATTEMPTS.min(max_attempts)
@@ -1682,7 +1729,11 @@ impl ViewManager {
             let input = slot.epoch.load(Ordering::Acquire);
             let mut stats = match provisional.take() {
                 Some(stats) => stats,
-                None => match view.refresh_controlled(permit) {
+                None => match if kind == "refresh" {
+                    view.reread_controlled(permit)
+                } else {
+                    view.refresh_controlled(permit)
+                } {
                     Ok(stats) => stats,
                     Err(crate::worktrees::WorktreeError::ChangedDuringReconcile) => continue,
                     Err(error) => return Err(error.into()),
@@ -2121,7 +2172,12 @@ impl ViewSlot {
     }
 
     pub fn invalidate(&self, changed: &[PathBuf], full: bool) -> Result<u64> {
-        self.invalidate_inner(None, changed, full)
+        self.invalidate_inner(None, changed, full, false)
+    }
+
+    /// Rewalk membership and metadata without discarding existing read hints.
+    pub fn invalidate_tree(&self, changed: &[PathBuf]) -> Result<u64> {
+        self.invalidate_inner(None, changed, false, true)
     }
 
     fn invalidate_inner(
@@ -2129,6 +2185,7 @@ impl ViewSlot {
         expected_version: Option<u64>,
         changed: &[PathBuf],
         full: bool,
+        tree: bool,
     ) -> Result<u64> {
         for path in changed {
             crate::worktrees::relative_path(path)?;
@@ -2161,6 +2218,9 @@ impl ViewSlot {
             if full {
                 view.invalidate_all()?;
             } else {
+                if tree {
+                    view.invalidate_tree()?;
+                }
                 for path in changed {
                     view.invalidate_path(path)?;
                 }

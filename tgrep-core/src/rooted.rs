@@ -11,9 +11,16 @@ const READ_BATCH_FILES: usize = 64;
 
 /// Bound sibling pin lifetimes without reordering or dropping candidates.
 pub fn sibling_batches(paths: &[String]) -> impl Iterator<Item = &[String]> {
+    sibling_batches_sized(paths, READ_BATCH_FILES)
+}
+
+/// [`sibling_batches`] with at most `size` files per group, clamped to 1..=64,
+/// so that one directory's candidates can be read in parallel.
+pub fn sibling_batches_sized(paths: &[String], size: usize) -> impl Iterator<Item = &[String]> {
+    let size = size.clamp(1, READ_BATCH_FILES);
     paths
         .chunk_by(|left, right| Path::new(left).parent() == Path::new(right).parent())
-        .flat_map(|siblings| siblings.chunks(READ_BATCH_FILES))
+        .flat_map(move |siblings| siblings.chunks(size))
 }
 
 /// Validate normalized root-relative index paths using the host's path rules.
@@ -342,6 +349,10 @@ impl FileBatch<'_> {
 impl<R: Borrow<RootedDir>> RootedBatch<R> {
     pub(crate) fn root(&self) -> &RootedDir {
         self.root.borrow()
+    }
+
+    pub(crate) fn pinned_root(&self) -> &R {
+        &self.root
     }
 
     #[cfg(test)]

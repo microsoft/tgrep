@@ -1859,6 +1859,51 @@ struct SearchRequest {
     scope: SearchScope,
 }
 
+/// The glob and type filters of a search or `files` query.
+type PathFilters = (
+    crate::glob_filter::GlobFilter,
+    tgrep_core::filetypes::TypeFilter,
+);
+
+/// Parse and validate the glob and type filters of a search or `files` query.
+fn parse_path_filters(params: &serde_json::Value) -> std::result::Result<PathFilters, String> {
+    let str_array = |key: &str| -> Vec<String> {
+        params
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let glob_filter_strs = str_array("glob");
+    let iglob_strs = str_array("iglob");
+    let glob_case_insensitive = params
+        .get("glob_case_insensitive")
+        .and_then(|g| g.as_bool())
+        .unwrap_or(false);
+    let glob_filter =
+        crate::glob_filter::GlobFilter::new(&glob_filter_strs, &iglob_strs, glob_case_insensitive)
+            .map_err(|e| format!("{e}"))?;
+    // The client sends the type flags as per-kind arrays, plus `type_ops` when
+    // their relative order matters, and the server rebuilds the filter with
+    // the same shared code, so both sides derive an identical definition table.
+    let type_ops = match params.get("type_ops") {
+        Some(ops) => crate::search::type_ops_from_json(ops)?,
+        None => tgrep_core::filetypes::TypeOp::from_unordered(
+            &str_array("type_add"),
+            &str_array("type_clear"),
+            &str_array("types"),
+            &str_array("types_not"),
+        ),
+    };
+    let type_filter =
+        tgrep_core::filetypes::build_type_filter(&type_ops).map_err(|e| format!("{e}"))?;
+    Ok((glob_filter, type_filter))
+}
+
 /// Parse and validate all search parameters from a JSON-RPC request.
 /// Returns Err(String) with an error message suitable for json_rpc_error on failure.
 fn parse_search_params(params: &serde_json::Value) -> std::result::Result<SearchRequest, String> {
@@ -1891,29 +1936,7 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .get("max_count")
         .and_then(|m| m.as_u64())
         .map(|m| m as usize);
-    let glob_filter_strs = str_array("glob");
-    let iglob_strs = str_array("iglob");
-    let glob_case_insensitive = params
-        .get("glob_case_insensitive")
-        .and_then(|g| g.as_bool())
-        .unwrap_or(false);
-    let glob_filter =
-        crate::glob_filter::GlobFilter::new(&glob_filter_strs, &iglob_strs, glob_case_insensitive)
-            .map_err(|e| format!("{e}"))?;
-    // The client sends the type flags as per-kind arrays, plus `type_ops` when
-    // their relative order matters, and the server rebuilds the filter with
-    // the same shared code, so both sides derive an identical definition table.
-    let type_ops = match params.get("type_ops") {
-        Some(ops) => crate::search::type_ops_from_json(ops)?,
-        None => tgrep_core::filetypes::TypeOp::from_unordered(
-            &str_array("type_add"),
-            &str_array("type_clear"),
-            &str_array("types"),
-            &str_array("types_not"),
-        ),
-    };
-    let type_filter =
-        tgrep_core::filetypes::build_type_filter(&type_ops).map_err(|e| format!("{e}"))?;
+    let (glob_filter, type_filter) = parse_path_filters(params)?;
     let ordered_filters = params
         .get("ordered_filters")
         .and_then(|v| v.as_bool())

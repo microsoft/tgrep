@@ -374,10 +374,11 @@ no mutable base/flush handle is exposed and no base migration occurs.
 | --- | --- |
 | `WorktreeOptions` | Existing `MetaWalkOptions`, bounded `hint_capacity`, optional existing private `checkpoint_directory` |
 | `invalidate_path(relative)` | Close query gate; queue a file/subtree hint, including old/new rename paths; invalid input errors and forces full repair |
-| `invalidate_all()` | Close gate and require full verification for startup, overflow, Git/config changes, missed events or polling uncertainty |
-| `refresh()` | Rewalk membership/visibility; verify hints/new/stat-changed files or, without hints, all admitted contents |
+| `invalidate_all()` | Close gate and require full verification for startup, watcher overflow or explicit missed-event repair |
+| `invalidate_tree()` | Close gate and request a membership/metadata walk, retaining explicit read hints |
+| `refresh()` | Rewalk membership/visibility; verify hints/new/stat-changed files or, without hints or tree work, all admitted contents |
 | `reconcile_full()` | Always read/verify content, irrespective of size/mtime/Git-status equality |
-| `status()` | Ready flag, invalidation epoch, published epoch, pending-path count and full-required flag |
+| `status()` | Ready flag, invalidation epoch, published epoch, pending-path count and tree/full-required flags |
 | `with_snapshot(closure)` | Guarded query-only view with root/epoch/visibility, resolved paths and read-only candidate opens; verifies pinned-root identity before/after the callback |
 | `save_checkpoint()` | Ready-only, delta-only atomic `overlay.json`, including exact generation key/root/base binding |
 | `restore(root, pin, options)` | Explicit errors for missing/invalid/mismatched checkpoints; successful restore remains not ready |
@@ -389,7 +390,7 @@ Each refresh makes one bounded attempt, serialized per view. Files are prepared
 outside the readiness lock; invalidations can continue to arrive. Overlay,
 visibility and filename membership publish together only if the captured epoch
 still matches. Otherwise `ChangedDuringReconcile` leaves the view not ready with
-full work pending. Retrying replays by full verification; sustained churn must
+the original full/tree/path work pending. Retrying retains read hints; sustained churn must
 scan or wait, never spin indefinitely. Incomplete metadata walks (including
 ignore-rule errors), unreadable tracked exemptions, failed reads and detected
 read instability also keep the gate closed. No base-only success is possible.
@@ -448,13 +449,15 @@ This saves trigram extraction, **not all repository-sized startup work**. Every
 refresh walks metadata and membership. Full passes read/verify all admitted
 content; hinted passes can retain previous evidence for unaffected paths under
 the explicit event-driven freshness contract. Case-alias hints conservatively
-reverify; non-ASCII hints and capacity overflow require full verification.
+reverify. Non-ASCII hints cover the longest ASCII directory ancestor, and
+capacity overflow coarsens hints to ancestors. Only unrepresentable coverage
+requires full verification.
 Accepted hints are rebuilt from normal path components, so trailing/repeated
 separators and interior `.` spellings cannot lose subtree invalidations. Absolute,
 parent-component and leading `.` component hints still error and require full repair.
 Hint matching probes a `BTreeSet` for the normalized full path and ancestor
 prefixes, rather than scanning every hint for every file. `hint_lookups` counts
-these probes (at most path depth per file, each logarithmic in queue size);
+these probes (at most twice the path depth per file, each logarithmic in queue size);
 the regression uses 2,001 pending hints but only five probes for two files.
 Hinted passes still open eligible regular-file handles for safe metadata
 verification even when content reads are avoided.
@@ -524,7 +527,10 @@ last detach removes it only if instance/view still match. Discovery stops at the
 nearest Git boundary and validates capabilities, root/base/profile and readiness
 before emitting any rows. Merely having a daemon is not attachment.
 Client discovery carries one validated root/repository through daemon discovery
-and lookup (three Git subprocesses total per attached CLI query). Daemon query
+and lookup. A CLI invocation discovers once per worktree and revalidates that
+client with `lookup` for each further path argument. Legacy v1 discovery runs
+three Git subprocesses; managed v2 discovery reads the gitfile, `commondir` and
+markers instead and runs none. Daemon query
 workers launch no Git subprocesses: they reuse the attached repository, rechecking
 canonical root, nested boundaries, gitfile target and common-directory identity.
 Real Git trace2 process-start events assert these counts in integration tests.
@@ -562,13 +568,13 @@ user environment are trusted.
 
 | Method | `params` | Result-specific fields |
 | --- | --- | --- |
-| `hello` | `{}` | `capabilities`, `profile`, `retention`, `limits` |
+| `hello` | `{}` | `capabilities`, `profile`, `retention`, `limits`, `paged_results`, `filtered_files` |
 | `attach` | `root`, `revision`, `profile`, `lease` | `view`, `lease`, `root`, `generation`, `requested_commit`, `ready`, `attach_build` |
 | `lookup` | `root` | Current view descriptor and status; does not create a lease |
 | `status` | `root`, `view`, `query: {}` | Readiness, pending/full flags, epoch, last error/success, watcher mode, sharing/extraction counters |
 | `refresh` | `root`, `view`, `lease`, `changed: []`, `full: false` | Descriptor plus `processed_epoch`; no hints means full verification |
 | `detach` | `root`, `view`, `lease` | `remaining_leases`, `detached`, `view`, nullable `registration_warning` |
-| `files` | `root`, `view`, `query: {scope, hidden, max_depth}` | Root-relative `files`, `epoch`, `ready`, `generation`, `backend: "shared-v1"` |
+| `files` | `root`, `view`, `query: {scope, hidden, max_depth}`; with `filtered_files`, optional `glob`, `iglob`, `glob_case_insensitive` and `type_ops` (or the per-kind type arrays) | Root-relative `files`, `epoch`, `ready`, `generation`, `backend: "shared-v1"` |
 | `search` | `root`, `view`, `query` | Root-relative match/context rows, `file_stats`, `index_stats`, `epoch`, same view/base/backend fields |
 
 The `recoverable-attach` capability requires a caller-owned `lease` on every
@@ -695,7 +701,10 @@ is no borrowing. Bounded nonrecursive registration reuses the ordinary watcher
 registry on each platform; too many directories or registration errors select
 polling rather than partially claiming native coverage. There is one serialized
 index/reconcile worker and two separate query workers, so repairing A does not
-take a repository-global search lock or prevent ready B from searching. Work
+take a repository-global search lock or prevent ready B from searching. Query
+workers search on a dedicated thread pool with one thread per logical core
+(or `RAYON_NUM_THREADS`), so reconciliation batches never hold the threads a
+query needs. Work
 queue capacity is max_views; query queue is 16, incoming connection queue 32.
 Two routers enforce 1 MiB requests and timeouts. Responses over 64 MiB fail
 explicitly without truncation. An encoded-byte budget checks borrowed rows before
@@ -723,14 +732,23 @@ responses (strict views also reject a changed epoch there); replacing the
 directory cannot pair old candidates with a new root.
 Local-index and shared searches amortize ancestor opens across bounded groups
 of up to 64 consecutive siblings. Each group retains one parent chain, not an
-unbounded directory cache or a batch of file contents. Shared candidate batches
-retain the generation and root protection, validate each candidate through its
-snapshot, and verify ancestor identities before returning results. Open/read or
-final ancestor-verification failures close the view for repair (eventual
-managed v2 views instead skip that candidate and queue it as a path hint; see
-**Eventual serving**); deadline and
-snapshot-validation failures do not masquerade as filesystem failures. This
-does not change admission, matching, response limits or fallback semantics.
+unbounded directory cache or a batch of file contents. Shared searches size
+groups so that a small search still spreads over the query threads: the
+candidate count divided by the smaller of six and the thread count, at least 8
+files per group. Shared candidate batches retain the generation and root
+protection. For a group of two or more siblings, one snapshot verifies the root
+and pins the ancestors, the siblings open through that pin without
+per-candidate snapshots, and `finish` verifies the root and ancestor identities
+before the group's results are used; the query's final snapshot verifies the
+root again. A single candidate still opens through its own snapshot. Every read
+first revalidates the query. Open/read or final ancestor-verification failures
+close the view for repair (eventual managed v2 views instead skip that candidate
+and queue it as a path hint; see **Eventual serving**). An eventual group whose
+`finish` fails is skipped and requeued once a snapshot confirms the root; a
+replaced root closes the view. Deadline and snapshot-validation failures,
+including those found while classifying a failed open, do not masquerade as
+filesystem failures. This does not change admission, matching, response limits
+or fallback semantics.
 In the legacy v1 daemon, both auto and poll modes perform full
 verification every `--poll-interval` seconds after completion (default 120), also
 repairing missed bytes, ignores and external Git/global configuration changes.
@@ -995,7 +1013,7 @@ policy opts into managed storage but retains fixed-pin/retain-all behavior:
     "max_examined": 128,
     "max_removed": 16,
     "max_delete_bytes": 16777216,
-    "chunk_bytes": 65536,
+    "chunk_bytes": 16777216,
     "max_pages": 16,
     "retry_ms": 1000
   }
@@ -1248,6 +1266,11 @@ The v2 request's top-level `authorization` field carries that token. Namespace,
 instance, owner, lease and operation IDs are not substitutes for it.
 
 `shared manage` and normal managed queries load credentials automatically.
+`shared manage` validates the repository with Git. Normal managed queries find
+the attachment from the worktree's gitfile, `commondir` and markers without
+running Git, and use it only when the identity of the canonical common directory
+equals the registration that the owner-only credential binds; any mismatch falls
+back to Git discovery.
 A direct client must verify native owner-only access, read the bounded private
 file, and compare its **complete registration**, including endpoint and instance,
 with discovery before connecting. `tgrep_core::managed::read_private_control_file`
@@ -1440,8 +1463,9 @@ covers the current input epoch and no invalidation is pending. It still drives
 scheduling. A reconciliation pass takes the queued path hints and publishes
 what it reconciled even when newer events arrived meanwhile; those newer hints
 stay queued for the next pass. A partially reconciled pass is never
-published. A failed pass keeps the previous publication serving and queues a
-full repair. Results can therefore lag disk by the reconciliation backlog.
+published. A failed pass keeps the previous publication serving and restores
+its original full/tree/path work alongside newer hints. Results can therefore
+lag disk by the reconciliation backlog.
 Candidate bytes are read live from disk, so a candidate that vanished or
 stopped being a regular file since the publication is skipped and queued as a
 path hint instead of failing the query or forcing a full pass, and a
@@ -1467,27 +1491,53 @@ checkpoint and input epoch before completing such a job without changing the
 ready view or invalidating its readers. Its original token/request is retained;
 the terminal receipt reports `coalesced: true`, the existing reconciled epoch
 and zero new reconciliation work. This does not postpone polling verification.
-Explicit refresh always verifies; polling repair, watcher uncertainty and
-rescan events invalidate for full verification before queuing reconciliation.
+Explicit refresh always rereads every admitted file, even with pending hints.
+Watcher uncertainty and rescan events invalidate for full verification;
+ordinary polling checks invalidate for a membership/metadata walk.
 A newer invalidation therefore cannot be skipped by the coalescing check.
 
-**Managed update policy:** healthy native-watcher views receive a serving
-periodic full verification. Once `--poll-interval` seconds (default 120) have
-elapsed since the view's last completed full pass, the scheduler queues one
-`reconcile` operation with `verify: true` without invalidating the view. It
-uses the ordinary operation worker, deadline (`operation_timeout_ms`) and
-CPU/input/handle budgets. It reads, decodes and hashes every admitted file and
-compares searchable membership and visibility against the published snapshot.
+**Managed update policy:** healthy native-watcher views have two serving
+verification tiers. After at least `--poll-interval` seconds (default 120)
+without reconciliation or verification, the scheduler queues a metadata check:
+`reconcile` with `verify: true, metadata_only: true`. A full content reread
+(`verify: true`, no `metadata_only`) becomes due after at least 15 intervals
+(30 minutes by default) since the last completed content verification.
+Each tier also waits at least 19 times its previous admitted pass duration,
+measured from that attempt's completion even when it failed or was cancelled.
+Content attempts additionally wait one poll interval since any verification;
+failed or cancelled attempts do not advance the last successful content age.
+This bounds each tier's steady-state idle duty to about 5% for similar-cost
+passes, rather than keeping large checkouts continuously busy.
+The delays are minimums; queueing, errors, churn and variable costs prevent a
+fixed freshness guarantee. Both tiers use the ordinary operation worker,
+deadline (`operation_timeout_ms`) and CPU/input/handle budgets.
+Metadata checks compare membership and visibility and retain evidence from
+verified reads when the walk reports the same trusted identity, size and mtime.
+Those paths need neither a content open nor verification parent batches.
+Changed, explicitly hinted or unverified paths are read, decoded and hashed.
+Content checks read every admitted file, including same-stat rewrites.
 Queries keep using that snapshot throughout. If nothing differs, the operation
 completes with `{"verified":true,"changed":false}` and publishes nothing.
 The first detected difference marks the view stale, which closes `ready`
 (queries keep using the previous publication); the pass then publishes a full
-repair and reports `changed: true`. Silently missed changes are therefore repaired within
-one interval plus verification time, not left stale indefinitely.
+repair and reports `changed: true`. When content is unchanged but a newer
+notification arrived, verified metadata is retained and the ordinary follow-up
+processes newer hints; its receipt reports `verification: "superseded"`.
+If the pass found a difference and a newer notification also arrived (for
+example, an edit the pass read after its event), the verified state is still
+published but `ready` stays closed; the same operation's ordinary follow-up
+then processes only the newer hints, and the receipt reports
+`verification: "superseded"` with `changed: true`.
+Thus an already completed verification is not discarded and immediately
+repeated just because an event arrived during it.
 
 Deadline exhaustion and cancellation of a serving verification leave the view
 ready but unverified; the outcome is `failed` or `cancelled`, and the next
-attempt waits a further interval. Other verification errors close readiness.
+attempt respects interval and cost backoff. Other verification errors close readiness.
+Failed or cancelled polling passes also record their terminal attempt and cost.
+Their retained work waits for that tier's retry delay even while the view is
+not ready; a newer input invalidation bypasses this idle retry delay to request
+prompt repair. Successful-content age advances only after a successful reread.
 Watch errors/overflow, explicit full invalidation, observed Git/ignore changes
 and normal invalidating events keep their existing fail-closed semantics and
 take precedence over a pending verification. Continuous mutation can postpone
@@ -1520,13 +1570,14 @@ capacity; another process can exhaust it first. Registration failures retire
 the affected view's entire watcher and select polling, rather than advertising
 partial native coverage. Ordinary-server and legacy v1 registration are unchanged.
 
-First attachment/restore, explicit full refresh, reported watcher error/overflow
-or rescan, and observed Git/ignore changes retain full verification and the
-existing publication gates. Normal native file events still invalidate their
-paths. Explicit `--watch-mode poll` and actual native-watcher unavailability,
-failure or budget exhaustion use periodic full reconciliation as their update
+First attachment/restore, explicit full refresh and reported watcher error/overflow
+or rescan retain full verification and the existing publication gates.
+Normal native file events still invalidate their paths. Directory modifications
+and Git/ignore inputs request a membership/metadata walk, not a subtree reread.
+Explicit `--watch-mode poll` and actual native-watcher unavailability,
+failure or budget exhaustion use the same metadata/content tiers as their update
 mechanism; they close `ready` for each pass (the previous publication keeps
-serving) and wait `--poll-interval` seconds after completion (default 120). `--no-watch` disables both automatic
+serving), with the same interval and cost delays after completion. `--no-watch` disables both automatic
 update mechanisms and serving verification, but not initial verification or
 explicit refresh. Legacy v1 and ordinary-server policies are unchanged.
 
@@ -1537,26 +1588,47 @@ explicit refresh. Legacy v1 and ordinary-server policies are unchanged.
 `Modify` notifications other than renames are dropped when the file's current
 metadata matches the trusted read evidence of the current publication and its
 recorded hidden status (Windows `FILE_NOTIFY_CHANGE_ATTRIBUTES`, `LAST_ACCESS`
-and duplicate-write churn). Creates, removes, renames, rescans and Git/ignore
-inputs are never filtered, and nothing is filtered while a replacement is being
-prepared. A same-size, same-timestamp content rewrite is left to periodic
-verification. `watch_events` reports cumulative `events`, `by_kind`
+and duplicate-write churn). Creates, removes, renames and rescans are not
+filtered as unchanged files, nor are files while a replacement is being prepared.
+Git metadata-root modifications, remote/prefetch refs, packed refs, lock files, objects, logs,
+FETCH_HEAD and ORIG_HEAD do not invalidate content. Index and HEAD changes still
+request a tree check: index membership can affect case-insensitive ignore
+exemptions. Local branch refs also request tree checks to preserve adaptive
+advancement when a symbolic HEAD moves; those checks are still shared across
+views rather than narrowed to one checked-out branch. A directory modification
+also keeps a tree check, since it may be the only notification of new membership.
+A same-size, same-timestamp rewrite is left to a path hint or the content tier.
+Directory-entry metadata can lag active writers on Windows; metadata reuse is
+eventually consistent, not an atomic snapshot. `watch_events` reports cumulative `events`, `by_kind`
 (`access`, `create`, `modify`, `remove`, `other`, `error`),
-`unchanged_paths_filtered`, `invalidated_paths`, `full_invalidations` and
+`unchanged_paths_filtered`, `invalidated_paths`, `full_invalidations`,
+`tree_invalidations`, `git_metadata_ignored` and
 `epoch_advances`, so watcher input churn can be measured directly. The policy reports
 `incremental_coverage: "unavailable"`, `change_journal: "not-integrated"` and
 `native_verification_availability: "serving-until-difference"`. Unless watching
 is disabled, `native_periodic_full_verification` and
-`periodic_full_verification` are true, `interval_ms` is the active interval,
+`periodic_full_verification` are true (content checks remain enabled).
+`interval_ms` and `metadata_interval_ms` are the metadata minimum;
+`content_interval_ms` is 15 times that minimum and
+`verification_idle_cost_multiplier` is 19,
 and `native_missed_changes` is `"repaired-by-periodic-verification"`.
 `full_verification_reason` is `"polling-update-mechanism"` for a polling view
 (or configured poll mode) and `"periodic-native-verification"` otherwise. With
 `--no-watch`, the periodic fields are false/null and `native_missed_changes` is
 `"requires-explicit-refresh"`. The configured `poll_interval_ms` is always
 visible; `configured_watch_mode` is `auto`, `poll` or `disabled`.
-`last_verification` has `outcome` and `age_ms`. The outcome is `full-pass` after
+`last_verification` has `outcome`, `tier` (`metadata` or `content`), `age_ms`,
+`content_age_ms`, `content_attempt_age_ms`, `metadata_delay_ms`,
+`content_delay_ms` and `content_retry_delay_ms`. The successful content age
+only advances after a completed content pass; the attempt age also advances
+after failed or cancelled content verification, but not after metadata checks.
+`content_delay_ms` includes the 15-interval successful-pass cadence and cost
+backoff. `content_retry_delay_ms` is the retry minimum since the last terminal
+content attempt: the larger of one poll interval and 19 times its admitted cost.
+The outcome is `full-pass` after
 attachment or any other completed full reconciliation; for a serving
-verification it is `unchanged`, `repaired`, `failed` or `cancelled`.
+verification it is `unchanged`, `repaired`, `superseded`, `failed` or `cancelled`.
+A polling metadata reconciliation reports `metadata-pass`.
 `native_registration_mode` distinguishes `recursive-roots` from `per-directory`,
 and `native_watch_budget_per_view` reports the startup allocation. Per-view
 `watch_count` counts live subscriptions (zero after fallback or drain); namespace
@@ -1661,6 +1733,24 @@ namespace is paced rather than rescanned back to back. Lifecycle triggers
 still run the next pass at the base interval. Catalog transactions that change
 no rows do not invalidate workers' cached operation control.
 
+Reclamation throughput follows these bounds, not free space. Before a member's
+first destructive step, a pass reads its current content in verification pages
+of at most 64 KiB and checks it against every producer proof row, as described
+below. Each verification page and each deletion step counts against
+`max_pages`, and verified bytes count against `max_delete_bytes`. The
+verification context survives between passes until it has been idle for
+`cursor_lifetime_ms` or the policy or allocation version changes, so a pass
+that ends mid-verification reclaims nothing and the next pass resumes it. Each
+deletion step then costs two FULL-sync catalog commits and a file sync,
+whatever its length. `chunk_bytes` does not widen the crash window, because
+every step first journals its exact block-aligned target length. To drain large
+stages sooner, raise `chunk_bytes` up to `max_delete_bytes`, raise
+`max_duration_ms` (for example to 1000) together with `max_pages` (for example
+to 256), keep `retry_ms` near 1000, and keep `cursor_lifetime_ms` above the
+longest interval between passes. A longer pass holds its work slot longer.
+macOS discards the proof after every truncation and re-verifies the retained
+content, so small chunks cost the most there.
+
 The scheduler itself polls every 100 ms, but each full tick reads the catalog
 (and re-verifies its anchors) several times per view. When consecutive full
 ticks find nothing to do, ticks back off exponentially to at most every
@@ -1670,6 +1760,41 @@ refresh, an attached or detached view, or a job finishing) runs the next full
 tick immediately. Other changes, such as a lease release on an otherwise idle
 namespace, may be noticed up to one idle tick later. This trades a bounded
 scheduling lag for less catalog I/O competing with running reconciliation.
+
+Accepted work waits in one queue of at most `work.queue_items` jobs, served by
+`work.workers` workers, in three classes. Foreground covers attachment,
+migration, refresh, metadata mutations, owner-requested adaptive advancement
+and reconciliation of a view that is not ready. Maintenance covers collection
+passes. Background covers serving verification and automatic advancement of
+ready views. A free worker runs the job whose queue time plus class delay is
+earliest. The delay is zero for foreground work, at most 5 seconds for maintenance
+and at most 10 minutes for background work. Each delay is also capped at one
+quarter of the operation's remaining lifetime when enqueued, accounting for time
+since durable acceptance. For example, a fresh operation with a 120-second
+timeout yields to newer foreground jobs for at most 30 seconds, leaving execution
+headroom. Selection considers every queued job, including later jobs in the same
+class with shorter remaining lifetimes. Running work is not preempted, and older
+backlogs or later policy reductions can still exhaust a deadline. A job waiting alone
+runs at once. Ties go to the higher class, then preserve queue order. When a view
+loses readiness, its queued work moves to the foreground class with its
+original queue time, and a queued verification of it reconciles it as an
+ordinary pass. A running job is never preempted, so with one worker a view
+still waits for the current job to finish. Searches are not jobs: they run on
+two query threads, and their parallel reads use a dedicated thread pool with
+one thread per logical core (or `RAYON_NUM_THREADS`), so they never wait for
+threads held by a running reconciliation or verification, although they share
+CPU and disk with it. Work that does not fit in the queue
+stays durably accepted and is queued again by the scheduler. Recovery passes
+run on the scheduler thread and never occupy a worker. Online
+`namespace.status` and `maintenance.status` report `scheduler.job_queue` with
+its `capacity`, per-class `depth` and `oldest_wait_ms`, and the `running` jobs
+with their `class` and `elapsed_ms`. `views.status` and ordinary `status`
+report each accepted operation of the view in `queued_work` as `running`,
+`queued` (with its `class` and `wait_ms`) or `accepted` when it is not queued
+in this process. `scheduler.collection_in_flight` spans a collection pass from
+acceptance to completion, `collection_queued` means it is queued or running in
+this process, and `collection_running` means a worker is executing it, which is
+what maintenance `collection.in_flight` counts.
 
 Checkpoints are delta-only, bound to exact namespace, repository, root identity,
 view/version, base key/incarnation/fingerprint and processed epoch. Publication
@@ -1791,8 +1916,11 @@ On POSIX, catalog identity/accounting probes use no-open metadata observation:
 closing an independently opened database/sidecar descriptor can otherwise
 release SQLite's process-wide record locks.
 WAL truncation is attempted without waiting before catalog mutations, never
-after a successful commit. A retained SQLite snapshot does not reject indexed
-queries or lifecycle work while publication headroom remains. After acquiring
+after a successful commit. Writers attempt it once the WAL reaches the smaller
+of a quarter of `metadata_bytes` and 64 MiB, so a budget sized for a large
+catalog does not let the WAL grow to gigabytes before it is checkpointed. A
+retained SQLite snapshot does not reject indexed queries or lifecycle work
+while publication headroom remains. After acquiring
 the actual SQLite writer lock, every managed writer rechecks policy and
 physical lengths and reserves a complete publication: database growth, WAL
 headers and frames, worst-case FULL-sync sector padding (including VFSes

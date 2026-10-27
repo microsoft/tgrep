@@ -2249,6 +2249,7 @@ fn attached_queries_run_one_client_discovery_and_no_server_git_processes() {
     );
     for args in [
         vec!["--stats", "--", "shared_term", "src"],
+        vec!["--stats", "--", "shared_term", "src", "."],
         vec!["--files", "src"],
         vec!["status", "."],
     ] {
@@ -2268,7 +2269,7 @@ fn attached_queries_run_one_client_discovery_and_no_server_git_processes() {
         assert_eq!(
             starts() - before,
             3,
-            "{args:?}: exactly one validated client discovery"
+            "{args:?}: one validated client discovery per invocation"
         );
     }
     let nested = f.b.join("src/nested");
@@ -3146,6 +3147,111 @@ fn assert_paged_results(daemon: &Daemon, root: &Path, marker: &str) {
             );
         }
     }
+}
+
+/// Untracked files under `listing/` that globs, types, depth and visibility
+/// tell apart, plus one outside it.
+fn prepare_filtered_listing(root: &Path) {
+    for path in [
+        "listing/keep.rs",
+        "listing/skip.txt",
+        "listing/.hidden.rs",
+        "listing/nested/deep.rs",
+        "listing/nested/notes.md",
+        "other/also.rs",
+    ] {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "listing\n").unwrap();
+    }
+}
+
+/// The daemon sends only the listed paths that pass the glob and type filters,
+/// paged or not, and `--files` output still matches a filesystem scan.
+fn assert_filtered_file_listing(daemon: &Daemon, root: &Path, marker: &str) {
+    let view = daemon.lookup(root);
+    let params = |query: Value| {
+        let mut params = json!({"root":root,"view":view["view"],"query":query});
+        if daemon.marker["protocol"] == 2 {
+            params["expected_version"] = view["version"].clone();
+        }
+        params
+    };
+    for (query, expected) in [
+        (
+            json!({"scope":"listing","glob":["*.rs"]}),
+            json!(["listing/keep.rs", "listing/nested/deep.rs"]),
+        ),
+        (
+            json!({"scope":"listing","hidden":true,"glob":["*.rs","!nested"]}),
+            json!(["listing/.hidden.rs", "listing/keep.rs"]),
+        ),
+        (
+            json!({"scope":"listing","max_depth":1,"type_ops":[["select","rust"]]}),
+            json!(["listing/keep.rs"]),
+        ),
+        (
+            json!({"scope":"listing","glob":["*.md"],"type_ops":[["select","rust"]]}),
+            json!(["listing/nested/notes.md"]),
+        ),
+        (
+            json!({"glob":["**/deep.rs"],"iglob":["**/ALSO.RS"]}),
+            json!(["listing/nested/deep.rs", "other/also.rs"]),
+        ),
+    ] {
+        let unpaged = daemon.rpc("files", params(query.clone()));
+        assert_eq!(unpaged["files"], expected, "{query}");
+        let mut paged = query.clone();
+        paged["page"] = Value::Null;
+        let paged = daemon.rpc("files", params(paged));
+        assert_eq!(paged["files"], expected, "{query}");
+        assert!(paged["next_page"].is_null(), "{query}");
+    }
+    let malformed = daemon
+        .try_rpc("files", params(json!({"scope":"listing","glob":"*.rs"})))
+        .unwrap();
+    assert!(malformed.get("result").is_none(), "{malformed}");
+
+    for flags in [
+        vec!["--hidden", "-g", "*.rs"],
+        vec!["--hidden", "-g", "*.rs", "-g", "!nested"],
+        vec!["-t", "rust", "--max-depth", "1"],
+        vec!["--hidden", "--iglob", "*.RS"],
+        vec!["-g", "*.md", "-t", "rust"],
+    ] {
+        let mut args = vec![
+            "--files",
+            "--stats",
+            "--sort",
+            "path",
+            "--path-separator",
+            "/",
+        ];
+        args.extend(flags);
+        args.push("listing");
+        let shared = cli(root, &args);
+        let scanned = cli(root, &[&["--no-index"][..], &args].concat());
+        assert_eq!(shared.status.code(), Some(0), "{args:?}");
+        assert!(!shared.stdout.is_empty(), "{args:?}");
+        assert!(shared.stdout == scanned.stdout, "{marker} {args:?}");
+        let stderr = String::from_utf8_lossy(&shared.stderr);
+        assert!(stderr.contains(marker), "{args:?}: {stderr}");
+        assert!(!stderr.contains("warning:"), "{args:?}: {stderr}");
+    }
+}
+
+#[test]
+fn shared_file_listings_are_filtered_by_the_daemon() {
+    let f = Fixture::new();
+    prepare_filtered_listing(&f.a);
+    let d = f.start(&["--no-watch"]);
+    let lease = d.attach(&f.a, &f.revision);
+    assert_eq!(d.rpc("hello", json!({}))["filtered_files"], true);
+    assert_filtered_file_listing(&d, &f.a, "(via shared daemon v1)");
+    d.rpc(
+        "detach",
+        json!({"root":f.a,"view":lease["view"],"lease":lease["lease"]}),
+    );
 }
 
 #[test]

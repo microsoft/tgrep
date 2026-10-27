@@ -109,6 +109,27 @@ fn query_sibling_batches_preserve_order_and_bound_pin_lifetimes() {
 }
 
 #[test]
+fn query_sibling_batches_split_one_directory_into_bounded_groups() {
+    let paths: Vec<_> = (0..80).map(|i| format!("dir/file-{i}")).collect();
+    let sizes = |listed: &[String], size| {
+        sibling_batches_sized(listed, size)
+            .map(<[String]>::len)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(sizes(&paths[..40], 8), [8; 5]);
+    assert_eq!(sizes(&paths, 14), [14, 14, 14, 14, 14, 10]);
+    assert_eq!(sizes(&paths[..3], 0), [1; 3]);
+    assert_eq!(sizes(&paths, 1000), [64, 16]);
+    assert_eq!(
+        sibling_batches_sized(&paths, 14)
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>(),
+        paths
+    );
+}
+
+#[test]
 fn query_sibling_reader_retains_only_its_scoped_parent_pins() {
     let temp = tempfile::tempdir().unwrap();
     let parent = temp.path().join("outer").join("inner");

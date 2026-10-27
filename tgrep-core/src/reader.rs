@@ -457,6 +457,17 @@ impl IndexReader {
             .is_ok()
     }
 
+    /// IDs of the files whose paths start with `prefix`, in path order.
+    pub fn file_ids_with_prefix(&self, prefix: &str) -> impl Iterator<Item = u32> {
+        let lower = self
+            .path_order
+            .partition_point(|&id| self.file_paths[id].as_str() < prefix);
+        self.path_order[lower..]
+            .iter()
+            .take_while(move |&&id| self.file_paths[id].starts_with(prefix))
+            .map(|&id| id as u32)
+    }
+
     /// Posting presence from strict snapshot opening; `None` for absent paths
     /// or readers that have not undergone snapshot validation.
     pub(crate) fn snapshot_path_has_postings(&self, path: &str) -> Option<bool> {
@@ -894,6 +905,23 @@ mod tests {
         assert!(reader.has_descendant_path("src/deep"));
         assert!(!reader.has_descendant_path("sr"));
         assert!(!reader.has_descendant_path("src2/not-a-child.rs"));
+    }
+
+    #[test]
+    fn prefix_lookup_follows_path_order_and_stops_at_the_prefix_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let mut files = Vec::new();
+        for (id, path) in ["a/x", "a0", "ab/y", "a/b/z", "b"].into_iter().enumerate() {
+            files.extend_from_slice(&ondisk::encode_file_entry(id as u32, path).unwrap());
+        }
+        write_index(tmp.path(), &[], &[], &files);
+        let reader = IndexReader::open(tmp.path()).unwrap();
+
+        let ids = |prefix: &str| -> Vec<u32> { reader.file_ids_with_prefix(prefix).collect() };
+        assert_eq!(ids("a/"), [3, 0]);
+        assert_eq!(ids(""), [3, 0, 1, 2, 4]);
+        assert_eq!(ids("ab/"), [2]);
+        assert!(ids("missing/").is_empty());
     }
 
     #[test]

@@ -301,25 +301,7 @@ impl Namespace {
         };
         let policy = &versioned.policy;
         let operation_record = self.operation(operation)?;
-        if operation_record.instance != *self.instance() {
-            return Err(Error::new(
-                ErrorCategory::StaleIdentity,
-                "operation-instance-ended",
-                "old-instance operations require inspection or recovery, not execution",
-            )
-            .committed(operation_record.committed_state));
-        }
-        let now = self.clock.now()?;
-        if now.boot != operation_record.accepted_at.boot
-            || now.millis < operation_record.accepted_at.millis
-        {
-            return Err(Error::new(
-                ErrorCategory::RecoveryRequired,
-                "operation-clock-unknown",
-                "operation lifetime needs restart recovery",
-            ));
-        }
-        let elapsed = now.millis - operation_record.accepted_at.millis;
+        let elapsed = self.operation_elapsed_ms(&operation_record)?;
         let remaining_ms = policy
             .work
             .operation_timeout_ms
@@ -604,6 +586,27 @@ impl Namespace {
             }
             Self::save_operation(transaction, &operation)
         })
+    }
+
+    /// Time since durable acceptance, using the same clock as work admission.
+    pub fn operation_elapsed_ms(&self, operation: &super::OperationRecord) -> Result<u64> {
+        if operation.instance != *self.instance() {
+            return Err(Error::new(
+                ErrorCategory::StaleIdentity,
+                "operation-instance-ended",
+                "old-instance operations require inspection or recovery, not execution",
+            )
+            .committed(operation.committed_state));
+        }
+        let now = self.clock.now()?;
+        if now.boot != operation.accepted_at.boot || now.millis < operation.accepted_at.millis {
+            return Err(Error::new(
+                ErrorCategory::RecoveryRequired,
+                "operation-clock-unknown",
+                "operation lifetime needs restart recovery",
+            ));
+        }
+        Ok(now.millis - operation.accepted_at.millis)
     }
 
     pub fn fail_operation(&self, id: &Id, mut error: Error) -> Result<super::OperationRecord> {
@@ -1647,7 +1650,7 @@ pub(crate) mod tests {
             std::fs::metadata(namespace.path().join("catalog.sqlite-wal"))
                 .map_or(0, |metadata| metadata.len())
         };
-        // Writers checkpoint only past metadata_bytes / 4 (4 MiB here).
+        // Writers checkpoint only past metadata_bytes / 4, capped at 64 MiB (4 MiB here).
         let mut allocation = namespace.allocation().unwrap();
         while wal() < MIB {
             allocation = namespace
@@ -1715,8 +1718,9 @@ pub(crate) mod tests {
         // transaction checkpoints.
         let mut allocation = namespace.allocation().unwrap();
         allocation.storage_bytes = Some(charged + MIB + MIB / 2);
-        // Writers checkpoint only past metadata_bytes / 4 (4 MiB here); stop
-        // right after a commit crosses it so the next writer truncates first.
+        // Writers checkpoint only past metadata_bytes / 4, capped at 64 MiB
+        // (4 MiB here); stop right after a commit crosses it so the next
+        // writer truncates first.
         // The operation is accepted late so its lifetime covers the reserve.
         let mut operation = None;
         while wal() < 4 * MIB {

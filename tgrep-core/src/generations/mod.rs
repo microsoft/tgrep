@@ -132,6 +132,33 @@ impl Repository {
         let root = fs::canonicalize(root)?;
         let common_dir = git::discover_directory(&root, "--git-common-dir", control)?;
         let git_dir = git::discover_directory(&root, "--absolute-git-dir", control)?;
+        let identity = Self::identity_of(&common_dir)?;
+        let mut repository = Self {
+            common_dir,
+            git_dir,
+            identity,
+            oid_length: 0,
+        };
+        repository.oid_length = git::object_format_controlled(&repository, control)?;
+        Ok(repository)
+    }
+
+    pub fn common_dir(&self) -> &Path {
+        &self.common_dir
+    }
+    /// Metadata for the discovered worktree; symbolic revisions (not identity)
+    /// resolve here, so `HEAD` means this worktree's HEAD.
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// The identity [`Repository::discover`] derives for a repository whose
+    /// canonical native Git common directory is `common_dir`. Computing it
+    /// validates nothing and grants no authority.
+    pub fn identity_of(common_dir: &Path) -> Result<String> {
         let mut hash = blake3::Hasher::new();
         hash.update(b"tgrep-repository-v1\0");
         #[cfg(unix)]
@@ -152,26 +179,7 @@ impl Repository {
         return Err(GenerationError::Unsupported(
             "repository identity on this platform".into(),
         ));
-        let mut repository = Self {
-            common_dir,
-            git_dir,
-            identity: hash.finalize().to_hex().to_string(),
-            oid_length: 0,
-        };
-        repository.oid_length = git::object_format_controlled(&repository, control)?;
-        Ok(repository)
-    }
-
-    pub fn common_dir(&self) -> &Path {
-        &self.common_dir
-    }
-    /// Metadata for the discovered worktree; symbolic revisions (not identity)
-    /// resolve here, so `HEAD` means this worktree's HEAD.
-    pub fn git_dir(&self) -> &Path {
-        &self.git_dir
-    }
-    pub fn identity(&self) -> &str {
-        &self.identity
+        Ok(hash.finalize().to_hex().to_string())
     }
 
     /// Resolve a revision to its exact (commit, tree) IDs without building or

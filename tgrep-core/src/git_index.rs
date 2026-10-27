@@ -211,15 +211,18 @@ fn read_common_dir_using(
 
 /// Read native worktree/common-directory paths without spawning Git.
 ///
-/// These are not canonical identities. Authority checks must canonicalize and
-/// compare them against a repository previously validated with Git.
+/// These are not canonical identities. Authority checks must canonicalize them,
+/// then compare them against a repository previously validated with Git or, for
+/// the common directory, require an owner-only credential bound to its
+/// [`Repository::identity_of`](crate::generations::Repository::identity_of).
 pub fn read_repository_dirs(repo_root: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let git_dir = read_git_dir(repo_root)?;
     let common_dir = read_common_dir(&git_dir)?;
     Ok((git_dir, common_dir))
 }
 
-/// Bound the small gitfile/commondir inputs used while registering watchers.
+/// Bound the small gitfile/commondir inputs used while registering watchers and
+/// locating managed attachments.
 pub fn read_repository_dirs_bounded(repo_root: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     use std::io::Read;
     let read = |path: &Path| {

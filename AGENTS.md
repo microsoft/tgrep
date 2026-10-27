@@ -106,20 +106,25 @@ after their first publication they report `serving: true` and keep answering
 queries from the last published snapshot while later edits are reconciled, so
 results may lag recent edits. `ready: true` additionally means the view has
 caught up with every observed invalidation. Healthy native managed views also get a
-periodic full verification every `--poll-interval` seconds (default 120) while
-they keep serving. It rereads all admitted contents under the normal operation
-budgets, and closes `ready` only when it finds a difference, then publishes
-the repair. A deadline or cancellation leaves the view ready but unverified
-(`last_verification.outcome` `failed`/`cancelled`) until the next interval, so
-results may lag missed changes by one interval plus verification time.
+serving metadata verification after at least `--poll-interval` seconds (default
+120) without reconciliation. It rewalks membership and reads only changed,
+hinted or unverified files. Full content rereads wait at least 15 intervals
+(30 minutes by default). Each tier also waits at least 19 times its previous
+pass cost, so these are minimum delays, not guaranteed freshness bounds.
+`ready` closes only when verification finds a difference. A deadline or
+cancellation leaves the view ready but unverified (`last_verification.outcome`
+`failed`/`cancelled`) and is retried with interval/cost backoff measured from
+that attempt's completion, without advancing the successful-content age.
 `views.refresh` explicitly verifies all admitted contents; use `--no-index`
 when current disk bytes are required.
 `--watch-mode poll` and actual native-watcher failure/budget fallback instead
-close `ready` for full verification after `--poll-interval` seconds.
+close `ready` for their passes, using the same metadata/content tiers and delays.
 `watch_events` in status counts watcher input by kind, metadata-only
 notifications filtered as unchanged, invalidated paths and epoch advances.
 `reconciliation_policy` distinguishes configured mode from each view's effective
-polling and reports namespace monitor counts. First attachment/restore and
+polling and reports namespace monitor counts. `last_verification` reports the
+tier and effective delays; `last_reconcile.metadata_reused` counts files not
+reopened after the metadata walk. First attachment/restore and
 reported watcher errors/rescans retain full verification. A clean Git status
 never replaces those reads, even for another worktree at the same commit.
 

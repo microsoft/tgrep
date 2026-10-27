@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -57,11 +58,44 @@ pub(super) struct ViewRegistration {
     pub generation: GenerationKey,
 }
 
+/// Attached clients for this process, one per worktree root, so every path
+/// argument of an invocation reuses one discovery.
+static REGISTERED: Mutex<Vec<Registered>> = Mutex::new(Vec::new());
+
+/// A discovered client and its attached view. Each reuse revalidates the view
+/// with `lookup`: it must be unchanged, versioned if managed, and on the same
+/// generation otherwise.
+#[derive(Clone)]
+struct Registered {
+    client: Client,
+    view: View,
+    versioned: bool,
+}
+
+impl Registered {
+    fn refresh(&self) -> Result<View> {
+        let view = self.client.lookup()?;
+        let current = if self.versioned {
+            view.version.is_some()
+        } else {
+            view.generation == self.view.generation
+        };
+        ensure!(
+            view.view == self.view.view && current,
+            "stale shared view registration"
+        );
+        Ok(view)
+    }
+}
+
+#[derive(Clone)]
 pub struct Client {
     registration: Registration,
     managed: Option<super::protocol_v2::Client>,
     root: PathBuf,
     paged: bool,
+    /// The daemon applies glob and type filters to `files` listings.
+    filtered_files: bool,
 }
 
 impl Client {
@@ -90,36 +124,46 @@ impl Client {
         marker_present(&repo.git_dir().join(VIEW_MARKER))
     }
 
+    /// Discover the attached client for `path`'s worktree once per process;
+    /// later paths in the same worktree reuse it after a `lookup` revalidation.
     pub fn registered(path: &Path) -> Result<(Self, View)> {
         let root = super::worktree_root(path)?;
+        let cached = REGISTERED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|entry| entry.client.root == root)
+            .cloned();
+        if let Some(entry) = cached
+            && let Ok(view) = entry.refresh()
+        {
+            return Ok((entry.client, view));
+        }
+        let registered = Self::register(root.clone());
+        let mut cache = REGISTERED.lock().unwrap_or_else(PoisonError::into_inner);
+        cache.retain(|entry| entry.client.root != root);
+        let entry = registered?;
+        cache.push(entry.clone());
+        Ok((entry.client, entry.view))
+    }
+
+    fn register(root: PathBuf) -> Result<Registered> {
+        if let Some((common_dir, identity, marker)) = managed_attachment(&root) {
+            let managed = super::protocol_v2::Client::discover(&root, &common_dir, &identity)?;
+            return Self::from_managed(root, managed).attached(&marker);
+        }
         let repo = Repository::discover(&root)?;
         if marker_present(&repo.git_dir().join(super::protocol_v2::VIEW_MARKER))? {
-            let marker: super::protocol_v2::ViewRegistration = serde_json::from_reader(
-                File::open(repo.git_dir().join(super::protocol_v2::VIEW_MARKER))?.take(MAX_REQUEST),
+            let marker: super::protocol_v2::ViewRegistration = read_json(
+                File::open(repo.git_dir().join(super::protocol_v2::VIEW_MARKER))?,
+                MAX_REQUEST,
             )?;
-            let client = Self::discover(root.clone(), &repo)?;
-            let managed = client
-                .managed
-                .as_ref()
-                .context("managed attachment has no compatible daemon")?;
-            ensure!(
-                marker.root == root
-                    && marker.daemon.namespace == managed.registration.namespace
-                    && marker.daemon.instance == managed.registration.instance
-                    && marker.daemon.port == managed.registration.port,
-                "stale managed attachment; recover and reattach"
-            );
-            let view = client.lookup()?;
-            ensure!(
-                view.view == marker.view.as_str() && view.version.is_some(),
-                "managed attachment/view mismatch"
-            );
-            return Ok((client, view));
+            return Self::discover(root, &repo)?.attached(&marker);
         }
-        let marker: ViewRegistration = serde_json::from_reader(
+        let marker: ViewRegistration = read_json(
             File::open(repo.git_dir().join(VIEW_MARKER))
-                .context("worktree has no shared attachment")?
-                .take(MAX_REQUEST),
+                .context("worktree has no shared attachment")?,
+            MAX_REQUEST,
         )?;
         let client = Self::discover(root.clone(), &repo)?;
         ensure!(
@@ -135,35 +179,69 @@ impl Client {
             view.view == marker.view && view.generation == marker.generation,
             "stale shared view registration"
         );
-        Ok((client, view))
+        Ok(Registered {
+            client,
+            view,
+            versioned: false,
+        })
+    }
+
+    fn attached(self, marker: &super::protocol_v2::ViewRegistration) -> Result<Registered> {
+        let managed = self
+            .managed
+            .as_ref()
+            .context("managed attachment has no compatible daemon")?;
+        ensure!(
+            marker.root == self.root
+                && marker.daemon.namespace == managed.registration.namespace
+                && marker.daemon.instance == managed.registration.instance
+                && marker.daemon.port == managed.registration.port,
+            "stale managed attachment; recover and reattach"
+        );
+        let view = self.lookup()?;
+        ensure!(
+            view.view == marker.view.as_str() && view.version.is_some(),
+            "managed attachment/view mismatch"
+        );
+        Ok(Registered {
+            client: self,
+            view,
+            versioned: true,
+        })
+    }
+
+    fn from_managed(root: PathBuf, managed: super::protocol_v2::Client) -> Self {
+        let registration = Registration {
+            protocol: managed.registration.protocol,
+            instance: managed.registration.instance.to_string(),
+            repository: managed.registration.repository.clone(),
+            pid: managed.registration.pid,
+            port: managed.registration.port,
+            storage: managed.registration.storage.clone(),
+        };
+        Self {
+            registration,
+            paged: managed.paged,
+            filtered_files: managed.filtered_files,
+            managed: Some(managed),
+            root,
+        }
     }
 
     fn discover(root: PathBuf, repo: &Repository) -> Result<Self> {
         if marker_present(&repo.common_dir().join(super::protocol_v2::MARKER))? {
-            let managed = super::protocol_v2::Client::discover(&root, repo)?;
-            let registration = Registration {
-                protocol: managed.registration.protocol,
-                instance: managed.registration.instance.to_string(),
-                repository: managed.registration.repository.clone(),
-                pid: managed.registration.pid,
-                port: managed.registration.port,
-                storage: managed.registration.storage.clone(),
-            };
-            return Ok(Self {
-                registration,
-                paged: managed.paged,
-                managed: Some(managed),
-                root,
-            });
+            let managed =
+                super::protocol_v2::Client::discover(&root, repo.common_dir(), repo.identity())?;
+            return Ok(Self::from_managed(root, managed));
         }
         Self::discover_legacy(root, repo)
     }
 
     fn discover_legacy(root: PathBuf, repo: &Repository) -> Result<Self> {
-        let registration: Registration = serde_json::from_reader(
-            fs::File::open(repo.common_dir().join(MARKER))
-                .context("no shared daemon registration; start serve --shared")?
-                .take(MAX_REQUEST),
+        let registration: Registration = read_json(
+            File::open(repo.common_dir().join(MARKER))
+                .context("no shared daemon registration; start serve --shared")?,
+            MAX_REQUEST,
         )?;
         ensure!(
             registration.protocol == PROTOCOL
@@ -177,6 +255,7 @@ impl Client {
             managed: None,
             root,
             paged: false,
+            filtered_files: false,
         };
         let hello = client.request("hello", json!({}))?;
         ensure!(
@@ -193,7 +272,13 @@ impl Client {
             "shared daemon capabilities/profile are incompatible"
         );
         client.paged = hello["paged_results"] == true;
+        client.filtered_files = hello["filtered_files"] == true;
         Ok(client)
+    }
+
+    /// Whether the daemon applies glob and type filters to `files` listings.
+    pub fn filtered_files(&self) -> bool {
+        self.filtered_files
     }
 
     /// Filename membership is identical across content eligibilities, so the
@@ -349,6 +434,36 @@ impl Client {
     }
 }
 
+/// Locate a managed attachment from the worktree's gitfile/commondir and
+/// markers without running Git. This grants no authority: the daemon's
+/// owner-only credential binds the canonical common-directory identity, and
+/// any mismatch falls back to Git discovery.
+fn managed_attachment(
+    root: &Path,
+) -> Option<(PathBuf, String, super::protocol_v2::ViewRegistration)> {
+    let (git_dir, common_dir) = tgrep_core::git_index::read_repository_dirs_bounded(root).ok()?;
+    let marker: super::protocol_v2::ViewRegistration = read_json(
+        File::open(git_dir.join(super::protocol_v2::VIEW_MARKER)).ok()?,
+        MAX_REQUEST,
+    )
+    .ok()?;
+    let common_dir = fs::canonicalize(common_dir).ok()?;
+    if !marker_present(&common_dir.join(super::protocol_v2::MARKER)).ok()? {
+        return None;
+    }
+    let identity = Repository::identity_of(&common_dir).ok()?;
+    (marker.root == root && marker.daemon.repository == identity)
+        .then_some((common_dir, identity, marker))
+}
+
+/// Read a bounded JSON document. `serde_json::from_reader` on an unbuffered
+/// file issues one read per byte.
+pub(super) fn read_json<T: serde::de::DeserializeOwned>(file: File, limit: u64) -> Result<T> {
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 pub(super) fn marker_present(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -491,6 +606,7 @@ mod tests {
         let client = Client {
             managed: None,
             paged: false,
+            filtered_files: false,
             registration: Registration {
                 protocol: PROTOCOL,
                 instance: "test-instance".into(),

@@ -1763,11 +1763,15 @@ migration, refresh, metadata mutations, owner-requested adaptive advancement
 and reconciliation of a view that is not ready. Maintenance covers collection
 passes. Background covers serving verification and automatic advancement of
 ready views. A free worker runs the job whose queue time plus class delay is
-earliest. The delay is zero for foreground work, 5 seconds for maintenance and
-10 minutes for background work, so newer foreground work overtakes maintenance
-queued up to 5 seconds earlier and background work queued up to 10 minutes
-earlier. Lower classes are delayed but never starved, and a job waiting alone
-runs at once. Ties go to the higher class, and each class is FIFO. When a view
+earliest. The delay is zero for foreground work, at most 5 seconds for maintenance
+and at most 10 minutes for background work. Each delay is also capped at one
+quarter of the operation's remaining lifetime when enqueued, accounting for time
+since durable acceptance. For example, a fresh operation with a 120-second
+timeout yields to newer foreground jobs for at most 30 seconds, leaving execution
+headroom. Selection considers every queued job, including later jobs in the same
+class with shorter remaining lifetimes. Running work is not preempted, and older
+backlogs or later policy reductions can still exhaust a deadline. A job waiting alone
+runs at once. Ties go to the higher class, then preserve queue order. When a view
 loses readiness, its queued work moves to the foreground class with its
 original queue time, and a queued verification of it reconciles it as an
 ordinary pass. A running job is never preempted, so with one worker a view

@@ -497,7 +497,8 @@ impl Drop for Observer {
 /// Scheduling class of an accepted managed job. A free worker runs the queued
 /// job that became due first, and a job becomes due its class delay after it
 /// was queued. Newer work of a higher class therefore overtakes a lower class
-/// for at most that delay, and no class starves.
+/// for at most that delay. Aging leaves execution headroom within the remaining
+/// operation lifetime; older work or a running operation can still delay it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum JobClass {
     /// Client operations, and reconciliation of a view that is not ready.
@@ -529,12 +530,13 @@ impl JobClass {
     }
 
     /// How long a queued job of this class yields to newer foreground work.
-    fn delay(self) -> Duration {
-        match self {
+    fn delay(self, remaining: Duration) -> Duration {
+        let maximum = match self {
             Self::Foreground => Duration::ZERO,
             Self::Maintenance => Duration::from_secs(5),
             Self::Background => Duration::from_secs(600),
-        }
+        };
+        maximum.min(remaining / 4)
     }
 
     fn index(self) -> usize {
@@ -552,8 +554,14 @@ impl JobClass {
 
 #[derive(Default)]
 struct JobQueueState {
-    queued: [VecDeque<(Id, Instant)>; 3],
+    queued: [VecDeque<QueuedJob>; 3],
     running: Vec<(Id, JobClass, Instant)>,
+}
+
+struct QueuedJob {
+    id: Id,
+    at: Instant,
+    due: Instant,
 }
 
 impl JobQueueState {
@@ -565,39 +573,54 @@ impl JobQueueState {
         self.queued.iter().all(VecDeque::is_empty)
     }
 
-    fn push(&mut self, id: Id, class: JobClass, at: Instant, capacity: usize) -> bool {
+    fn push(
+        &mut self,
+        id: Id,
+        class: JobClass,
+        at: Instant,
+        capacity: usize,
+        remaining: Duration,
+    ) -> bool {
         if self.len() >= capacity {
             return false;
         }
-        self.queued[class.index()].push_back((id, at));
+        let due = at.checked_add(class.delay(remaining)).unwrap_or(at);
+        self.queued[class.index()].push_back(QueuedJob { id, at, due });
         true
     }
 
     /// Takes the queued job that became due first; ties go to the higher class.
     fn pop(&mut self) -> Option<(Id, JobClass)> {
-        let (class, _) = JobClass::ALL
+        let (class, position, _) = JobClass::ALL
             .into_iter()
-            .filter_map(|class| {
-                let (_, at) = self.queued[class.index()].front()?;
-                Some((class, at.checked_add(class.delay()).unwrap_or(*at)))
+            .flat_map(|class| {
+                self.queued[class.index()]
+                    .iter()
+                    .enumerate()
+                    .map(move |(position, job)| (class, position, job.due))
             })
-            .min_by_key(|(_, due)| *due)?;
-        let (id, _) = self.queued[class.index()].pop_front()?;
-        Some((id, class))
+            .min_by_key(|(_, _, due)| *due)?;
+        let job = self.queued[class.index()].remove(position)?;
+        Some((job.id, class))
     }
 
     /// Moves a queued job into a higher class, keeping its queue time.
     fn promote(&mut self, id: &Id, class: JobClass) -> bool {
         for lower in JobClass::ALL.into_iter().filter(|lower| *lower > class) {
             let queue = &mut self.queued[lower.index()];
-            let Some(position) = queue.iter().position(|(queued, _)| queued == id) else {
+            let Some(position) = queue.iter().position(|job| &job.id == id) else {
                 continue;
             };
-            let Some(job) = queue.remove(position) else {
+            let Some(mut job) = queue.remove(position) else {
                 continue;
             };
+            job.due = job.due.min(
+                job.at
+                    .checked_add(class.delay(Duration::MAX))
+                    .unwrap_or(job.at),
+            );
             let target = &mut self.queued[class.index()];
-            let position = target.partition_point(|(_, at)| *at <= job.1);
+            let position = target.partition_point(|queued| queued.at <= job.at);
             target.insert(position, job);
             return true;
         }
@@ -627,8 +650,10 @@ impl JobQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn push(&self, id: Id, class: JobClass) -> bool {
-        let pushed = self.lock().push(id, class, Instant::now(), self.capacity);
+    fn push(&self, id: Id, class: JobClass, remaining: Duration) -> bool {
+        let pushed = self
+            .lock()
+            .push(id, class, Instant::now(), self.capacity, remaining);
         if pushed {
             self.available.notify_one();
         }
@@ -668,8 +693,10 @@ impl JobQueue {
                 json!({
                     "depth": queue.len(),
                     "oldest_wait_ms": queue
-                        .front()
-                        .map(|(_, at)| now.saturating_duration_since(*at).as_millis()),
+                        .iter()
+                        .map(|job| job.at)
+                        .min()
+                        .map(|at| now.saturating_duration_since(at).as_millis()),
                 }),
             );
         }
@@ -705,15 +732,13 @@ impl JobQueue {
                     });
                 }
                 for class in JobClass::ALL {
-                    if let Some((_, at)) = state.queued[class.index()]
-                        .iter()
-                        .find(|(queued, _)| queued == id)
+                    if let Some(job) = state.queued[class.index()].iter().find(|job| &job.id == id)
                     {
                         return json!({
                             "operation": id,
                             "state": "queued",
                             "class": class.name(),
-                            "wait_ms": now.saturating_duration_since(*at).as_millis(),
+                            "wait_ms": now.saturating_duration_since(job.at).as_millis(),
                         });
                     }
                 }
@@ -1608,6 +1633,14 @@ impl State {
         if queued.contains_key(&operation.id) {
             return Ok(());
         }
+        let remaining = Duration::from_millis(
+            self.namespace
+                .policy()?
+                .policy
+                .work
+                .operation_timeout_ms
+                .saturating_sub(self.namespace.operation_elapsed_ms(operation)?),
+        );
         queued.insert(
             operation.id.clone(),
             self.namespace.hold_operation(&operation.id)?,
@@ -1615,6 +1648,7 @@ impl State {
         if !self.jobs.push(
             operation.id.clone(),
             JobClass::of(operation, self.namespace.instance()),
+            remaining,
         ) {
             queued.remove(&operation.id);
             // Acceptance is durable; the bounded scheduler will retry it.
@@ -3812,17 +3846,29 @@ mod scheduling_tests {
         let [verify, collection, client, late] = job_ids();
         let base = Instant::now();
         let mut queue = JobQueueState::default();
-        assert!(queue.push(verify.clone(), JobClass::Background, base, 8));
+        assert!(queue.push(verify.clone(), JobClass::Background, base, 8, Duration::MAX));
         let second = base + Duration::from_secs(1);
-        assert!(queue.push(collection.clone(), JobClass::Maintenance, second, 8));
+        assert!(queue.push(
+            collection.clone(),
+            JobClass::Maintenance,
+            second,
+            8,
+            Duration::MAX
+        ));
         let later = base + Duration::from_secs(30);
-        assert!(queue.push(client.clone(), JobClass::Foreground, later, 8));
+        assert!(queue.push(
+            client.clone(),
+            JobClass::Foreground,
+            later,
+            8,
+            Duration::MAX
+        ));
         // Collection became due at 6 s, before the client operation queued at 30 s.
         assert_eq!(queue.pop(), Some((collection, JobClass::Maintenance)));
         assert_eq!(queue.pop(), Some((client, JobClass::Foreground)));
         // Verification became due at 600 s, ahead of foreground work queued later.
         let after = base + Duration::from_secs(601);
-        assert!(queue.push(late.clone(), JobClass::Foreground, after, 8));
+        assert!(queue.push(late.clone(), JobClass::Foreground, after, 8, Duration::MAX));
         assert_eq!(queue.pop(), Some((verify, JobClass::Background)));
         assert_eq!(queue.pop(), Some((late, JobClass::Foreground)));
         assert_eq!(queue.pop(), None);
@@ -3833,15 +3879,21 @@ mod scheduling_tests {
     fn job_queue_breaks_ties_toward_higher_classes_and_bounds_capacity() {
         let [collection, first, second, verify] = job_ids();
         let base = Instant::now();
-        let tie = base + JobClass::Maintenance.delay();
+        let tie = base + JobClass::Maintenance.delay(Duration::MAX);
         let mut queue = JobQueueState::default();
-        assert!(queue.push(collection.clone(), JobClass::Maintenance, base, 4));
-        assert!(queue.push(first.clone(), JobClass::Foreground, tie, 4));
-        assert!(queue.push(second.clone(), JobClass::Foreground, tie, 4));
-        assert!(queue.push(verify.clone(), JobClass::Background, base, 4));
+        assert!(queue.push(
+            collection.clone(),
+            JobClass::Maintenance,
+            base,
+            4,
+            Duration::MAX
+        ));
+        assert!(queue.push(first.clone(), JobClass::Foreground, tie, 4, Duration::MAX));
+        assert!(queue.push(second.clone(), JobClass::Foreground, tie, 4, Duration::MAX));
+        assert!(queue.push(verify.clone(), JobClass::Background, base, 4, Duration::MAX));
         assert_eq!(queue.len(), 4);
         let overflow = Id::parse("f".repeat(32)).unwrap();
-        assert!(!queue.push(overflow, JobClass::Foreground, tie, 4));
+        assert!(!queue.push(overflow, JobClass::Foreground, tie, 4, Duration::MAX));
         assert_eq!(queue.pop(), Some((first, JobClass::Foreground)));
         assert_eq!(queue.pop(), Some((second, JobClass::Foreground)));
         assert_eq!(queue.pop(), Some((collection, JobClass::Maintenance)));
@@ -3854,11 +3906,17 @@ mod scheduling_tests {
         let [early, verify, late, unknown] = job_ids();
         let base = Instant::now();
         let mut queue = JobQueueState::default();
-        assert!(queue.push(early.clone(), JobClass::Foreground, base, 8));
+        assert!(queue.push(early.clone(), JobClass::Foreground, base, 8, Duration::MAX));
         let second = base + Duration::from_secs(1);
-        assert!(queue.push(verify.clone(), JobClass::Background, second, 8));
+        assert!(queue.push(
+            verify.clone(),
+            JobClass::Background,
+            second,
+            8,
+            Duration::MAX
+        ));
         let third = base + Duration::from_secs(2);
-        assert!(queue.push(late.clone(), JobClass::Foreground, third, 8));
+        assert!(queue.push(late.clone(), JobClass::Foreground, third, 8, Duration::MAX));
         assert!(!queue.promote(&unknown, JobClass::Foreground));
         assert!(queue.promote(&verify, JobClass::Foreground));
         assert!(!queue.promote(&verify, JobClass::Foreground));
@@ -3904,13 +3962,73 @@ mod scheduling_tests {
     }
 
     #[test]
+    fn background_aging_preserves_execution_time_under_continuous_foreground_work() {
+        let [verify, client, _, _] = job_ids();
+        for lifetime_ms in [100, 8_000, 30_000, 120_000] {
+            let lifetime = Duration::from_millis(lifetime_ms);
+            let base = Instant::now();
+            let mut queue = JobQueueState::default();
+            assert!(queue.push(verify.clone(), JobClass::Background, base, 2, lifetime));
+            let step = lifetime / 100;
+            // One free worker sees a fresh short foreground job on every turn.
+            for tick in 1..=26 {
+                let at = base + step * tick;
+                assert!(queue.push(client.clone(), JobClass::Foreground, at, 2, lifetime));
+                if tick <= 25 {
+                    assert_eq!(queue.pop(), Some((client.clone(), JobClass::Foreground)));
+                } else {
+                    assert_eq!(queue.pop(), Some((verify.clone(), JobClass::Background)));
+                    assert!(at.duration_since(base) < lifetime / 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_aging_handles_late_admission_and_shorter_lifetimes_within_a_class() {
+        let [long, late, client, expired] = job_ids();
+        let base = Instant::now();
+        let mut queue = JobQueueState::default();
+        assert!(queue.push(
+            long,
+            JobClass::Background,
+            base,
+            4,
+            Duration::from_secs(120)
+        ));
+        // Already spent 118 s awaiting queue capacity; only 2 s remain.
+        let at = base + Duration::from_secs(1);
+        assert!(queue.push(
+            late.clone(),
+            JobClass::Background,
+            at,
+            4,
+            Duration::from_secs(2)
+        ));
+        assert!(queue.push(
+            client,
+            JobClass::Foreground,
+            at + Duration::from_secs(1),
+            4,
+            Duration::MAX
+        ));
+        assert_eq!(queue.pop(), Some((late, JobClass::Background)));
+        assert_eq!(
+            JobClass::Maintenance.delay(Duration::from_secs(8)),
+            Duration::from_secs(2)
+        );
+        assert!(queue.push(expired.clone(), JobClass::Background, at, 4, Duration::ZERO));
+        assert_eq!(queue.pop(), Some((expired, JobClass::Background)));
+    }
+
+    #[test]
     fn job_queue_reports_queued_and_running_work() {
         let [first, second, third, absent] = job_ids();
         let queue = JobQueue::new(2);
         assert!(queue.pop(Duration::from_millis(1)).is_none());
-        assert!(queue.push(first.clone(), JobClass::Background));
-        assert!(queue.push(second.clone(), JobClass::Foreground));
-        assert!(!queue.push(third, JobClass::Foreground));
+        assert!(queue.push(first.clone(), JobClass::Background, Duration::MAX));
+        assert!(queue.push(second.clone(), JobClass::Foreground, Duration::MAX));
+        assert!(!queue.push(third, JobClass::Foreground, Duration::MAX));
         let running = queue.pop(Duration::from_millis(1)).unwrap();
         assert_eq!(running.id(), &second);
         assert!(queue.running(&second));

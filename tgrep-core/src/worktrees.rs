@@ -92,7 +92,7 @@ pub struct WorktreeOptions {
     /// Canonical coverage always includes hidden files. Query visibility is
     /// applied separately. Size is checked against bytes actually read.
     pub walk: MetaWalkOptions,
-    /// Maximum distinct queued paths; overflow forces full reconciliation.
+    /// Maximum queued paths after ancestor coarsening; overflow forces full reconciliation.
     pub hint_capacity: usize,
     /// Optional existing, dedicated private directory. The entire directory
     /// is excluded from discovery, including atomic-checkpoint staging files.
@@ -2809,7 +2809,7 @@ fn queue_hint(hints: &mut BTreeSet<String>, path: String, capacity: usize) -> bo
             .max()
             .unwrap_or(0);
         if depth <= 1 {
-            return false;
+            return hints.len() <= capacity;
         }
         let coarsened: BTreeSet<_> = hints
             .iter()

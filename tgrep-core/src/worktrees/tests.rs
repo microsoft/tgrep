@@ -3016,6 +3016,35 @@ fn overflowing_hints_coarsen_to_ancestors_without_losing_coverage() {
 }
 
 #[test]
+fn coarsened_hints_can_fit_capacity_without_reaching_the_preferred_target() {
+    for capacity in [2, 3, 16] {
+        let roots = (capacity / 2 + 1).min(capacity - 1);
+        let paths: Vec<_> = (0..roots)
+            .map(|index| format!("root-{index}.txt"))
+            .chain((0..=capacity - roots).map(|index| format!("src/file-{index}.txt")))
+            .collect();
+        let mut hints = BTreeSet::new();
+        for path in &paths {
+            assert!(queue_hint(&mut hints, path.clone(), capacity));
+        }
+        assert_eq!(hints.len(), roots + 1);
+        assert!(hints.len() > capacity / 2);
+        for path in &paths {
+            assert!(is_hinted(path, &hints, &mut 0));
+        }
+        for index in roots..capacity - 1 {
+            assert!(queue_hint(
+                &mut hints,
+                format!("root-{index}.txt"),
+                capacity
+            ));
+        }
+        assert_eq!(hints.len(), capacity);
+        assert!(!queue_hint(&mut hints, "overflow.txt".into(), capacity));
+    }
+}
+
+#[test]
 fn non_ascii_hints_cover_the_ascii_parent_and_ignore_changes_use_tree_passes() {
     let fixture = Fixture::new();
     write(&fixture.root, "src/one.txt", b"needle\n");

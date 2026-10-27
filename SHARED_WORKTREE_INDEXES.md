@@ -1534,6 +1534,10 @@ repeated just because an event arrived during it.
 Deadline exhaustion and cancellation of a serving verification leave the view
 ready but unverified; the outcome is `failed` or `cancelled`, and the next
 attempt respects interval and cost backoff. Other verification errors close readiness.
+Failed or cancelled polling passes also record their terminal attempt and cost.
+Their retained work waits for that tier's retry delay even while the view is
+not ready; a newer input invalidation bypasses this idle retry delay to request
+prompt repair. Successful-content age advances only after a successful reread.
 Watch errors/overflow, explicit full invalidation, observed Git/ignore changes
 and normal invalidating events keep their existing fail-closed semantics and
 take precedence over a pending verification. Continuous mutation can postpone

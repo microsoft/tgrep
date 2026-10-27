@@ -1040,6 +1040,162 @@ fn failed_and_cancelled_native_content_verifications_back_off_without_resetting_
 }
 
 #[test]
+fn failed_and_cancelled_polling_passes_back_off_until_retry_or_new_input() {
+    for mode in ["poll", "auto"] {
+        let fixture = Fixture::new();
+        let mut daemon = start(&fixture, &policy(), &["--watch-mode", mode]);
+        let (claim, guard) = owner(&daemon);
+        verified_attach(
+            &daemon,
+            &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
+        );
+        let view = daemon.rpc(
+            "lookup",
+            json!({"root":fs::canonicalize(&fixture.a).unwrap()}),
+        );
+        daemon.rpc(
+            "testing.suppress-watch-events",
+            json!({"view":view["view"],"suppress":true}),
+        );
+        if mode == "auto" {
+            daemon.rpc(
+                "testing.watch-event",
+                json!({"view":view["view"],"kind":"failure"}),
+            );
+        }
+        wait_for(
+            &daemon,
+            "views.status",
+            json!({"id":view["view"]}),
+            |status| {
+                status["ready"] == true
+                    && status["work"].is_null()
+                    && status["queued_work"].as_array().unwrap().is_empty()
+                    && status["watch_mode"] == "poll"
+            },
+        );
+        for (metadata_only, tier) in [(true, "metadata"), (false, "content")] {
+            for (category, outcome) in [("deadline", "failed"), ("cancelled", "cancelled")] {
+                let before = daemon.rpc("views.status", json!({"id":view["view"]}));
+                fs::write(
+                    fixture.a.join("notes.txt"),
+                    format!("shared_term polling_{mode}_{tier}_{outcome}\n"),
+                )
+                .unwrap();
+                daemon.rpc(
+                    "testing.install",
+                    json!({
+                        "point":"reconcile-batch-opened","operation":null,"skip_hits":0,
+                        "action":{"mode":"error","category":category}
+                    }),
+                );
+                let reread_elapsed = if metadata_only { 0 } else { 86_400_000 };
+                let since = Instant::now();
+                daemon.rpc(
+                    "testing.reconcile-timer",
+                    json!({
+                        "view":view["view"],"elapsed_ms":86_400_000,
+                        "reread_elapsed_ms":reread_elapsed
+                    }),
+                );
+                let after = wait_verified(&daemon, &view, outcome, tier, since);
+                assert_eq!(after["ready"], false, "{after}");
+                assert_eq!(after["serving"], true, "{after}");
+                let verification = &after["last_verification"];
+                assert!(
+                    verification["content_age_ms"].as_u64().unwrap()
+                        >= before["last_verification"]["content_age_ms"]
+                            .as_u64()
+                            .unwrap(),
+                    "{after}"
+                );
+                if metadata_only {
+                    assert!(
+                        verification["content_attempt_age_ms"].as_u64().unwrap()
+                            >= before["last_verification"]["content_attempt_age_ms"]
+                                .as_u64()
+                                .unwrap(),
+                        "{after}"
+                    );
+                } else {
+                    assert!(
+                        u128::from(verification["content_attempt_age_ms"].as_u64().unwrap())
+                            <= since.elapsed().as_millis(),
+                        "{after}"
+                    );
+                }
+                let retry_delay = verification[if metadata_only {
+                    "metadata_delay_ms"
+                } else {
+                    "content_retry_delay_ms"
+                }]
+                .as_u64()
+                .unwrap();
+                assert!(retry_delay >= 120_000, "{after}");
+                for elapsed in [0, retry_delay - 1] {
+                    daemon.rpc(
+                        "testing.reconcile-timer",
+                        json!({
+                            "view":view["view"],
+                            "elapsed_ms":if metadata_only { elapsed } else { 120_000 },
+                            "reread_elapsed_ms":reread_elapsed,
+                            "reread_attempt_elapsed_ms":elapsed
+                        }),
+                    );
+                    let idle = daemon.rpc("views.status", json!({"id":view["view"]}));
+                    assert_eq!(idle["input_epoch"], after["input_epoch"], "{idle}");
+                    assert_eq!(idle["last_reconcile"], after["last_reconcile"], "{idle}");
+                    assert_eq!(idle["last_verification"]["outcome"], outcome, "{idle}");
+                    assert!(idle["work"].is_null(), "{idle}");
+                    assert!(idle["queued_work"].as_array().unwrap().is_empty(), "{idle}");
+                }
+
+                let since = Instant::now();
+                if outcome == "cancelled" {
+                    // A newer explicit invalidation bypasses the idle retry delay.
+                    daemon.rpc(
+                        "testing.watch-event",
+                        json!({"view":view["view"],"kind":"rescan"}),
+                    );
+                } else {
+                    daemon.rpc(
+                        "testing.reconcile-timer",
+                        json!({
+                            "view":view["view"],"elapsed_ms":retry_delay,
+                            "reread_elapsed_ms":reread_elapsed,
+                            "reread_attempt_elapsed_ms":retry_delay
+                        }),
+                    );
+                }
+                let full = !metadata_only || outcome == "cancelled";
+                let repaired = wait_verified(
+                    &daemon,
+                    &view,
+                    if full { "full-pass" } else { "metadata-pass" },
+                    if full { "content" } else { "metadata" },
+                    since,
+                );
+                assert_eq!(repaired["ready"], true, "{repaired}");
+                assert_eq!(repaired["last_reconcile"]["full"], full, "{repaired}");
+                assert_eq!(
+                    repaired["last_reconcile"]["files_read"],
+                    if full { 3 } else { 1 },
+                    "{repaired}"
+                );
+                assert_scan_parity(&daemon, &fixture.a, fixture.temp.path());
+            }
+        }
+        daemon.rpc(
+            "views.detach",
+            json!({"owner":claim.owner,"lease":"managed-client"}),
+        );
+        daemon.rpc("owners.release", json!({"claim":claim}));
+        drop(guard);
+        stop(&mut daemon);
+    }
+}
+
+#[test]
 fn superseded_native_content_verification_retains_evidence_and_advances_its_timer() {
     let fixture = Fixture::new();
     let mut daemon = start(&fixture, &policy(), &["--watch-mode", "auto"]);

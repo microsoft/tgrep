@@ -336,7 +336,7 @@ struct Monitor {
     watch_counters: Arc<WatchCounters>,
     last_schedule: Instant,
     last_reconcile: Instant,
-    /// Last completed full pass or terminal serving-verification attempt.
+    /// Last completed full pass or terminal verification/polling attempt.
     last_verification: Instant,
     /// Last successful content pass, not advanced by failed or cancelled attempts.
     last_reread: Instant,
@@ -345,10 +345,16 @@ struct Monitor {
     reread_cost: Duration,
     verification: Option<&'static str>,
     verification_tier: Option<&'static str>,
+    poll_retry: Option<PollRetry>,
     pending: HashSet<Id>,
     failures: u32,
     #[cfg(feature = "managed-test-hooks")]
     suppress_events: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PollRetry {
+    epoch: u64,
+    metadata_only: bool,
 }
 
 struct WatchSettings {
@@ -2064,14 +2070,22 @@ impl State {
         let started = Instant::now();
         let _receipt = self.namespace.hold_operation(id)?;
         let operation = self.namespace.operation(id)?;
-        let result = match operation.kind.as_str() {
-            "metadata" => self.namespace.execute_metadata_mutation(id).map(|_| ()),
-            "collection" => {
-                let request: CollectionRequest = serde_json::from_value(operation.request.clone())?;
-                self.namespace.collect_pass(id, &request).map(|_| ())
+        let mut reconcile_epoch = None;
+        let result = (|| {
+            if operation.kind == "reconcile" {
+                let request: ReconcileRequest = serde_json::from_value(operation.request.clone())?;
+                reconcile_epoch = Some(self.views.slot(&request.view)?.input_epoch());
             }
-            _ => self.views.execute(id).map(|_| ()),
-        };
+            match operation.kind.as_str() {
+                "metadata" => self.namespace.execute_metadata_mutation(id).map(|_| ()),
+                "collection" => {
+                    let request: CollectionRequest =
+                        serde_json::from_value(operation.request.clone())?;
+                    self.namespace.collect_pass(id, &request).map(|_| ())
+                }
+                _ => self.views.execute(id).map(|_| ()),
+            }
+        })();
         if let Err(error) = result {
             self.namespace.fail_operation(id, error)?;
         }
@@ -2118,6 +2132,7 @@ impl State {
                     }
                     let verify =
                         operation.kind == "reconcile" && operation.request["verify"] == true;
+                    let polling = reconcile_epoch.is_some() && self.watches.polling(&state);
                     let result = final_operation.result.as_ref();
                     let outcome = match final_operation.state {
                         OperationState::Completed
@@ -2148,8 +2163,8 @@ impl State {
                         {
                             Some("metadata-pass")
                         }
-                        OperationState::Failed if verify => Some("failed"),
-                        OperationState::Cancelled if verify => Some("cancelled"),
+                        OperationState::Failed if verify || polling => Some("failed"),
+                        OperationState::Cancelled if verify || polling => Some("cancelled"),
                         _ => None,
                     };
                     if let Some(outcome) = outcome {
@@ -2158,6 +2173,18 @@ impl State {
                         state.verification = Some(outcome);
                         let metadata_only =
                             outcome != "full-pass" && operation.request["metadata_only"] == true;
+                        state.poll_retry = if polling
+                            && matches!(
+                                final_operation.state,
+                                OperationState::Failed | OperationState::Cancelled
+                            ) {
+                            reconcile_epoch.map(|epoch| PollRetry {
+                                epoch,
+                                metadata_only,
+                            })
+                        } else {
+                            None
+                        };
                         state.verification_tier =
                             Some(if metadata_only { "metadata" } else { "content" });
                         let cost = result
@@ -2275,6 +2302,18 @@ impl State {
             reread_elapsed,
             reread_attempt_elapsed,
         ) = elapsed(&monitor);
+        if let Some(pending) = &monitor.poll_retry
+            && pending.epoch == status.input_epoch
+        {
+            let (attempt_elapsed, cost) = if pending.metadata_only {
+                (verification_elapsed, monitor.stat_cost)
+            } else {
+                (reread_attempt_elapsed, monitor.reread_cost)
+            };
+            if attempt_elapsed < verification_delay(self.watches.interval, cost) {
+                return Ok(false);
+            }
+        }
         let polling = self.watches.polling(&monitor);
         let stat_due = reconcile_elapsed.min(verification_elapsed)
             >= verification_delay(self.watches.interval, monitor.stat_cost);
@@ -2352,6 +2391,10 @@ impl State {
             .cloned()
             .collect();
         for id in pending {
+            if self.jobs.running(&id) {
+                // Terminal receipts precede job()'s retry-clock accounting.
+                continue;
+            }
             match self.namespace.operation(&id) {
                 Ok(operation)
                     if matches!(
@@ -2566,6 +2609,7 @@ pub(super) fn run(root: &Path, options: Options<'_>, policy: Policy) -> Result<(
             reread_cost: Duration::ZERO,
             verification: None,
             verification_tier: None,
+            poll_retry: None,
             pending: HashSet::new(),
             failures: 0,
             #[cfg(feature = "managed-test-hooks")]

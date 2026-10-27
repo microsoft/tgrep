@@ -41,6 +41,10 @@ fn guarded_generation_open_retries_only_exact_catalog_writer_contention() {
         &daemon,
         &daemon.rpc("views.attach", attach_input(&fixture, &claim)),
     );
+    // Readiness precedes permit teardown, which must finish before we hold the writer lock.
+    live::wait_for(&daemon, "namespace.status", json!({}), |status| {
+        status["usage"]["reserved_slots"] == 0
+    });
     let storage = PathBuf::from(daemon.marker["storage"].as_str().unwrap());
     let incarnation = Id::parse(
         attached["result"]["current"]["current"]["incarnation"]

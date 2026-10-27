@@ -2294,6 +2294,7 @@ fn hint_lookup_work_depends_on_path_depth_not_queue_size() {
     let view = fixture.view(&fixture.root, &fixture.generation());
     assert_eq!(view.refresh().unwrap().hint_lookups, 0);
     let path = fixture.root.join("dir/nested/one.txt");
+    let before = file_version(&fs::metadata(&path).unwrap());
     let modified = fs::metadata(&path).unwrap().modified().unwrap();
     fs::write(&path, b"new needle").unwrap();
     File::options()
@@ -2302,6 +2303,7 @@ fn hint_lookup_work_depends_on_path_depth_not_queue_size() {
         .unwrap()
         .set_modified(modified)
         .unwrap();
+    let version_unchanged = before == file_version(&fs::metadata(&path).unwrap());
     for index in 0..2000 {
         view.invalidate_path(Path::new(&format!("unrelated-{index}/file")))
             .unwrap();
@@ -2309,9 +2311,11 @@ fn hint_lookup_work_depends_on_path_depth_not_queue_size() {
     view.invalidate_path(Path::new("DIR//.")).unwrap();
     let stats = view.refresh().unwrap();
     assert!(!stats.full);
+    // A changed file version skips the walk's hint lookup for that path.
+    let expected_lookups = if version_unchanged { 8 } else { 5 };
     assert_eq!(
-        stats.hint_lookups, 8,
-        "walk: three plus two prefixes; opened file: three, independent of 2001 hints"
+        stats.hint_lookups, expected_lookups,
+        "walk: two prefixes plus three if the version matches; opened file: three, independent of 2001 hints"
     );
     assert_eq!(stats.files_read, 1);
     assert_eq!(
@@ -2815,16 +2819,44 @@ fn metadata_verification_carries_evidence_and_content_verification_repairs_same_
     };
     assert_eq!(stats.metadata_reused, 3);
 
+    let path = fixture.root.join("one.txt");
+    let before = file_version(&fs::metadata(&path).unwrap());
     same_stat_write(&fixture.root, "one.txt", b"zzzzz needle\n");
-    let Verification::Unchanged(stats) = view.verify_metadata_controlled(&permit).unwrap() else {
-        panic!("same-stat rewrite is intentionally left to the content tier");
+    // Restoring mtime does not restore all version fields (e.g. Unix ctime).
+    let version_unchanged = before == file_version(&fs::metadata(&path).unwrap());
+    let verified = view.verify_metadata_controlled(&permit).unwrap();
+    let stats = if version_unchanged {
+        let Verification::Unchanged(stats) = verified else {
+            panic!("equal file versions should carry metadata: {verified:?}");
+        };
+        assert_eq!(stats.metadata_reused, 3);
+        assert_eq!(stats.files_read, 0);
+        assert!(candidates(&view, "zzz").is_empty());
+        stats
+    } else {
+        let Verification::Published(stats) = verified else {
+            panic!("a changed file version should repair the edit: {verified:?}");
+        };
+        assert_eq!(stats.metadata_reused, 2);
+        assert_eq!(stats.files_read, 1);
+        assert_eq!(matches(&view, "zzz"), ["one.txt"]);
+        stats
     };
-    assert_eq!(stats.files_read, 0);
-    assert!(candidates(&view, "zzz").is_empty());
-    assert!(matches!(
-        view.verify_controlled(&permit).unwrap(),
-        Verification::Published(_)
-    ));
+    assert!(!stats.full);
+    let verified = view.verify_controlled(&permit).unwrap();
+    let stats = if version_unchanged {
+        let Verification::Published(stats) = verified else {
+            panic!("the content tier must repair the missed edit: {verified:?}");
+        };
+        stats
+    } else {
+        let Verification::Unchanged(stats) = verified else {
+            panic!("the metadata tier already repaired the edit: {verified:?}");
+        };
+        stats
+    };
+    assert!(stats.full);
+    assert_eq!(stats.files_read, 3);
     assert_eq!(matches(&view, "zzz"), ["one.txt"]);
 
     write(&fixture.root, "added/three.txt", b"new needle\n");

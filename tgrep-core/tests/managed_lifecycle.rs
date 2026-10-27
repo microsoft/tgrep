@@ -45,6 +45,23 @@ fn git(root: &Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().into()
 }
 
+fn lock_after_readers_drop(file: &fs::File) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs2::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return,
+            // A concurrent subprocess can inherit the guard until exec closes it.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("guard remained locked after readers dropped: {error}"),
+        }
+    }
+}
+
 fn policy() -> Policy {
     serde_json::from_value(serde_json::json!({
         "schema":2, "storage":"managed",
@@ -1091,7 +1108,7 @@ fn deferred_adaptive_migration_retains_its_target_and_single_attempt_budget() {
                 .join(format!("{incarnation}.lock")),
         )
         .unwrap();
-    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    lock_after_readers_drop(&guard);
     let operation = manager
         .accept_adaptive(
             fixture.token("contended-adaptive"),
@@ -1461,7 +1478,7 @@ fn transient_retirement_locks_defer_attachment_without_changing_its_exact_intent
                 .join(format!("{incarnation}.lock")),
         )
         .unwrap();
-    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    lock_after_readers_drop(&guard);
     let manager = fixture.manager();
     let operation = manager
         .accept_attach(
@@ -1669,7 +1686,7 @@ fn managed_format_and_escaped_reader_cannot_bypass_ownership() {
         "escaped raw reader must protect the physical object"
     );
     drop(raw);
-    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    lock_after_readers_drop(&guard);
 }
 
 #[test]
@@ -2126,7 +2143,7 @@ fn escaped_candidate_keeps_the_base_and_root_protected() {
     #[cfg(windows)]
     assert!(fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).is_err());
     batch.finish().unwrap();
-    fs2::FileExt::try_lock_exclusive(&guard).unwrap();
+    lock_after_readers_drop(&guard);
     #[cfg(windows)]
     fs::rename(&fixture.root, fixture.temp.path().join("moved-root")).unwrap();
 }

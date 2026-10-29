@@ -880,8 +880,36 @@ fn removed(daemon: &Daemon, incarnation: &Value) -> bool {
     }
 }
 
+/// Probes until an outcome shows no other work. A probe that sees any, such
+/// as a scheduler pass or a request still finishing, refuses the stop before
+/// admission closes, so it never tests `activity.lock` for readers.
 fn idle_status(daemon: &Daemon) -> Value {
-    retry_busy(daemon, "stop-if-idle", idle_request(daemon))
+    let started = Instant::now();
+    loop {
+        let idle = retry_busy(daemon, "stop-if-idle", idle_request(daemon));
+        let other_work = [
+            "leases",
+            "owners",
+            "reservations",
+            "operations",
+            "operation_readers",
+        ]
+        .iter()
+        .any(|field| idle[*field] != 0)
+            || idle["external"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|count| *count != 0);
+        if idle["stopping"] == true || !other_work {
+            return idle;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "other work remains visible: {idle}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -930,9 +958,9 @@ fn escaped_cross_process_readers_block_collection_and_idle_stop_then_allow_exact
         daemon.rpc("owners.release", json!({"claim":claim}));
         drop(guard);
         let idle = idle_status(&daemon);
-        assert_eq!(idle["stopping"], false);
-        assert_eq!(idle["namespace_readers_or_work"], true);
-        assert_eq!(idle["leases"], 0);
+        assert_eq!(idle["stopping"], false, "{idle}");
+        assert_eq!(idle["namespace_readers_or_work"], true, "{idle}");
+        assert_eq!(idle["leases"], 0, "{idle}");
         reader.send("release");
         success(reader.finish(Duration::from_secs(30)).unwrap());
 

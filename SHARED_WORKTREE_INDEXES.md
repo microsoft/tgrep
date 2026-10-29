@@ -1317,8 +1317,9 @@ writers, as does the trusted-storage contract.
    status 2 and its unchanged `tgrep: <reason_code>: <detail>` stderr diagnostic.
    Examples are `busy`/`catalog-io` (another catalog writer outlasted the fixed
    SQLite wait), `busy`/`owner-guard-already-held`, `busy`/`namespace-admission-*`
-   and non-retryable `stale-identity` claims whose namespace, instance or
-   lifetime ended. Claim acquisition writes nothing to the catalog.
+   (admission is closed; an idle probe never closes it while an issued owner
+   remains unreleased) and non-retryable `stale-identity` claims whose namespace,
+   instance or lifetime ended. Claim acquisition writes nothing to the catalog.
    Claim-file read, size and parse errors are not classified and write no stdout
    line; neither does any failure after `holding:true`, such as a lost handshake.
    Reuse the same claim file only after a frame with `retryable:true` and
@@ -1677,7 +1678,7 @@ attempt, reapplying cooldown, or selecting a later `HEAD`.
 | `views.detach` | `{"owner":<owner-id>,"lease":<lease-token>}`; idempotent lease release and remaining reader/root drain state |
 | `metadata.start`, `collections.start` | Owner-scoped operation envelope; asynchronous live admission |
 | `metadata.run`, `collections.run`, `maintenance.recover` | Namespace-scoped envelope; authorized bounded offline work |
-| `stop-if-idle` | `{"token":<namespace-scoped-operation-token>}`; live atomic admission closure and all-category idle decision |
+| `stop-if-idle` | `{"token":<namespace-scoped-operation-token>}`; all-category idle decision. Visible work refuses before admission closes; otherwise atomic admission closure precedes the final check. `namespace_readers_or_work` is observed only after admission closes and is `false` when the probe refuses before closing |
 
 Metadata requests are tagged by `method` and `params`:
 
@@ -1956,14 +1957,25 @@ cancelled/deadline, expired receipts and recovery-required. A transport failure
 after request transmission has unknown commitment, not automatic retry-as-new
 authorization. Recover the retained token and exact current state.
 
-`stop-if-idle` first closes admission, then accounts for leases, owners,
-reservations, operations and receipt readers, independent namespace/root/object
-guards, requests, queries, queued jobs and background batches. Idle verifier
-caches are discarded only when those other shutdown blockers are clear; a busy
-probe preserves bounded member-verification progress until its normal expiry.
-Active verification remains protected by its work lifetime. A retained cache
-alone does not make a daemon permanently busy.
-A busy decision reopens admission; a committed stop leaves it closed before exit.
+`stop-if-idle` samples receipt readers, requests, queries, queued jobs and
+background batches, then counts unreleased leases and owners, reservations and
+unfinished operations, and closes admission in that same catalog transaction
+only when everything is idle. Each acceptance checks admission in its own
+catalog transaction, so every unfinished operation accepted before the closure
+is counted, and a later acceptance receives retryable
+`busy`/`namespace-admission-closed` instead. Visible work refuses the stop
+without closing admission or testing `activity.lock`, which work and independent
+readers hold shared, so operations accepted earlier and their jobs keep running.
+After a closure the probe rechecks those counts and receipt readers and tests
+independent namespace/root/object guards through `activity.lock`; it commits a
+stop only when every category is idle. `namespace_readers_or_work` is observed
+only after admission closes; it is `false` when the probe refuses before closing.
+Idle verifier caches are discarded only when those other shutdown blockers are
+clear; a busy probe preserves bounded member-verification progress until its
+normal expiry. Active verification remains protected by its work lifetime. A
+retained cache alone does not make a daemon permanently busy.
+A busy decision leaves admission open, reopening it after a closure; a committed
+stop leaves it closed before exit. Only a committed stop ends in-flight work.
 An uncommitted lock-admission Busy error leaves the accepted token pending;
 retry that same token rather than abandoning it and consuming another queue
 slot. A completed non-stopping decision is terminal and replayable, including

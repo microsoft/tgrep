@@ -84,6 +84,15 @@ pub struct ExternalWork {
     pub background_batches: u64,
 }
 
+impl ExternalWork {
+    fn is_idle(&self) -> bool {
+        self.queries == 0
+            && self.queued_jobs == 0
+            && self.requests == 0
+            && self.background_batches == 0
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IdleOutcome {
     pub stopping: bool,
@@ -94,6 +103,8 @@ pub struct IdleOutcome {
     pub reservations: u64,
     pub operations: u64,
     pub operation_readers: u64,
+    /// Whether `activity.lock` had holders. Observed only after admission
+    /// closes; `false` when the probe refuses the stop before closing it.
     pub namespace_readers_or_work: bool,
     pub verification_active: bool,
     pub external: ExternalWork,
@@ -105,6 +116,38 @@ pub struct IdleOutcome {
 struct ServiceRecord {
     instance: Id,
     stopping: bool,
+}
+
+/// Unreleased leases and owners, reservations, and unfinished operations other
+/// than the probe's own receipt.
+fn idle_counts(
+    connection: &rusqlite::Connection,
+    operation: Option<&Id>,
+) -> Result<(u64, u64, u64, u64)> {
+    Ok(connection.query_row(
+        "SELECT
+         (SELECT count(*) FROM records WHERE kind='lease' AND json_extract(record,'$.released')=0),
+         (SELECT count(*) FROM owners WHERE json_extract(record,'$.released')=0),
+         (SELECT count(*) FROM reservations),
+         (SELECT count(*) FROM operations WHERE state IN ('accepted','preparing','cancelling')
+            AND (?1 IS NULL OR id!=?1))",
+        [operation.map(Id::as_str)],
+        |row| {
+            Ok((
+                unsigned(row, 0)?,
+                unsigned(row, 1)?,
+                unsigned(row, 2)?,
+                unsigned(row, 3)?,
+            ))
+        },
+    )?)
+}
+
+fn receipt_readers(readers: &std::collections::HashMap<Id, u32>, operation: Option<&Id>) -> u64 {
+    readers
+        .iter()
+        .map(|(id, count)| u64::from(*count).saturating_sub(u64::from(operation == Some(id))))
+        .sum()
 }
 
 impl Namespace {
@@ -169,8 +212,11 @@ impl Namespace {
         })
     }
 
-    /// Close admission before looking for *any* protected category. A failed
-    /// idle check reopens service; retained cache references alone are not work.
+    /// Count catalog work and close admission in one transaction, then look
+    /// for *every* protected category before a stop commits. Work visible
+    /// before the closure refuses the stop without closing admission or testing
+    /// `activity.lock`, so a busy probe never fails admitted work. A failed idle
+    /// check reopens service; retained cache references alone are not work.
     pub fn stop_if_idle(&self, external: ExternalWork) -> Result<IdleOutcome> {
         let serial = self
             .maintenance
@@ -271,22 +317,49 @@ impl Namespace {
     ) -> Result<IdleOutcome> {
         self.expire_cursors()?;
         let result = (|| {
-            self.transaction(|transaction| {
-                transaction.execute("UPDATE state SET admission='closed' WHERE singleton=1", [])?;
-                Ok(())
+            let sampled_readers = {
+                let readers = self
+                    .operation_readers
+                    .lock()
+                    .map_err(|_| Error::corrupt("operation reader registry poisoned"))?;
+                receipt_readers(&readers, operation)
+            };
+            let visible = sampled_readers != 0 || !external.is_idle();
+            // Acceptance checks admission in its own write transaction, so this
+            // count includes every unfinished operation accepted before the closure.
+            let (counts, closed) = self.transaction(|transaction| {
+                let counts = idle_counts(transaction, operation)?;
+                let closed = !visible && counts == (0, 0, 0, 0);
+                if closed {
+                    transaction
+                        .execute("UPDATE state SET admission='closed' WHERE singleton=1", [])?;
+                }
+                Ok((counts, closed))
             })?;
+            if !closed {
+                let (leases, owners, reservations, operations) = counts;
+                // A refused stop must not restart bounded member authentication.
+                let verification_active = !self.discard_idle_verification(true)?;
+                let outcome = IdleOutcome {
+                    stopping: false,
+                    namespace: self.header().namespace.clone(),
+                    instance: self.instance().clone(),
+                    leases,
+                    owners,
+                    reservations,
+                    operations,
+                    operation_readers: sampled_readers,
+                    namespace_readers_or_work: false,
+                    verification_active,
+                    external,
+                    committed_state: CommitState::NotCommitted,
+                };
+                self.commit_idle_decision(&outcome, operation)?;
+                return Ok(outcome);
+            }
             self.fault(super::faults::Point::IdleAdmissionClosed, operation)?;
-            let (leases, owners, reservations, operations) = self.read(|connection| {
-                Ok(connection.query_row(
-                    "SELECT
-                     (SELECT count(*) FROM records WHERE kind='lease' AND json_extract(record,'$.released')=0),
-                     (SELECT count(*) FROM owners WHERE json_extract(record,'$.released')=0),
-                     (SELECT count(*) FROM reservations),
-                     (SELECT count(*) FROM operations WHERE state IN ('accepted','preparing','cancelling')
-                        AND (?1 IS NULL OR id!=?1))",
-                    [operation.map(Id::as_str)], |row| Ok((unsigned(row,0)?,unsigned(row,1)?,unsigned(row,2)?,unsigned(row,3)?)),
-                )?)
-            })?;
+            let (leases, owners, reservations, operations) =
+                self.read(|connection| idle_counts(connection, operation))?;
             let activity = self.directory.open_file("activity.lock", true)?;
             if FileIdentity::of(&activity)? != self.header().activity_identity {
                 return Err(Error::corrupt("idle activity anchor was replaced"));
@@ -305,22 +378,14 @@ impl Namespace {
                 .operation_readers
                 .lock()
                 .map_err(|_| Error::corrupt("operation reader registry poisoned"))?;
-            let operation_readers = readers
-                .iter()
-                .map(|(id, count)| {
-                    u64::from(*count).saturating_sub(u64::from(operation == Some(id)))
-                })
-                .sum::<u64>();
+            let operation_readers = receipt_readers(&readers, operation);
             let idle = leases == 0
                 && owners == 0
                 && reservations == 0
                 && operations == 0
                 && operation_readers == 0
                 && !namespace_readers_or_work
-                && external.queries == 0
-                && external.queued_jobs == 0
-                && external.requests == 0
-                && external.background_batches == 0;
+                && external.is_idle();
             // A refused stop must not restart bounded member authentication.
             let verification_active = !self.discard_idle_verification(!idle)?;
             let stopping = idle && !verification_active;
@@ -342,31 +407,7 @@ impl Namespace {
                     CommitState::NotCommitted
                 },
             };
-            self.transaction(|transaction| {
-                if stopping {
-                    transaction.execute(
-                        "INSERT INTO records VALUES('service','current',1,?1) ON CONFLICT(kind,id) DO UPDATE SET version=version+1,record=excluded.record",
-                        [text(&serde_json::json!({"instance":self.instance(),"stopping":true}))?],
-                    )?;
-                } else {
-                    transaction.execute("UPDATE state SET admission='open' WHERE singleton=1", [])?;
-                }
-                if let Some(id) = operation {
-                    let encoded: String = transaction.query_row("SELECT record FROM operations WHERE id=?1",
-                        [id.as_str()], |row| row.get(0))?;
-                    let mut operation: OperationRecord = serde_json::from_str(&encoded)?;
-                    if operation.cancelled {
-                        return Err(Error::new(ErrorCategory::Cancelled, "idle-stop-cancelled", "stop was cancelled before commitment"));
-                    }
-                    operation.state = OperationState::Completed;
-                    operation.committed_state = outcome.committed_state;
-                    operation.result = Some(serde_json::to_value(&outcome)?);
-                    Self::save_operation(transaction, &operation)?;
-                }
-                Ok(())
-            })?;
-            self.fault(super::faults::Point::IdleCommitted, operation)
-                .map_err(|error| error.committed(outcome.committed_state))?;
+            self.commit_idle_decision(&outcome, operation)?;
             Ok(outcome)
         })();
         if let Err(original) = &result {
@@ -393,6 +434,36 @@ impl Namespace {
             }
         }
         result
+    }
+
+    /// Publish an idle decision: shutdown authorization for a stop, otherwise
+    /// open admission, together with the probe's own receipt.
+    fn commit_idle_decision(&self, outcome: &IdleOutcome, operation: Option<&Id>) -> Result<()> {
+        self.transaction(|transaction| {
+            if outcome.stopping {
+                transaction.execute(
+                    "INSERT INTO records VALUES('service','current',1,?1) ON CONFLICT(kind,id) DO UPDATE SET version=version+1,record=excluded.record",
+                    [text(&serde_json::json!({"instance":self.instance(),"stopping":true}))?],
+                )?;
+            } else {
+                transaction.execute("UPDATE state SET admission='open' WHERE singleton=1", [])?;
+            }
+            if let Some(id) = operation {
+                let encoded: String = transaction.query_row("SELECT record FROM operations WHERE id=?1",
+                    [id.as_str()], |row| row.get(0))?;
+                let mut operation: OperationRecord = serde_json::from_str(&encoded)?;
+                if operation.cancelled {
+                    return Err(Error::new(ErrorCategory::Cancelled, "idle-stop-cancelled", "stop was cancelled before commitment"));
+                }
+                operation.state = OperationState::Completed;
+                operation.committed_state = outcome.committed_state;
+                operation.result = Some(serde_json::to_value(outcome)?);
+                Self::save_operation(transaction, &operation)?;
+            }
+            Ok(())
+        })?;
+        self.fault(super::faults::Point::IdleCommitted, operation)
+            .map_err(|error| error.committed(outcome.committed_state))
     }
 
     /// Storage-only, bounded recovery. It never resolves a Git revision or

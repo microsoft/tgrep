@@ -548,6 +548,57 @@ fn committed_idle_acceptance_error_does_not_stop_a_busy_daemon() {
 }
 
 #[test]
+fn busy_idle_probe_keeps_admission_open_for_an_accepted_attachment() {
+    let fixture = Fixture::new();
+    let mut daemon = start(&fixture, &policy(), &["--no-watch"]);
+    let (claim, guard) = owner(&daemon);
+    let first = verified(
+        &daemon,
+        initial_attach(
+            &daemon,
+            &claim,
+            attach_input(&fixture, &claim),
+            "busy-idle-setup",
+        ),
+    );
+    // The lease is visible work, so the probe must refuse before admission
+    // closes; a closure would fail the attachment accepted below.
+    let hook = daemon.rpc(
+        "testing.install",
+        json!({
+            "point":"idle-admission-closed","operation":null,"skip_hits":0,
+            "action":{"mode":"pause","timeout_ms":5000}
+        }),
+    );
+    let mut sibling = attach_input(&fixture, &claim);
+    sibling["token"] = token(&claim, next_sequence(&first));
+    sibling["request"]["root"] = json!(fs::canonicalize(&fixture.b).unwrap());
+    sibling["request"]["lease"] = json!("sibling-client");
+    let accepted = daemon.rpc("views.attach", sibling);
+    let response = retry_busy_response(&daemon, "stop-if-idle", idle_request(&daemon));
+    let attached = terminal(&daemon, &accepted);
+    assert_eq!(attached["state"], "completed", "{attached}");
+    assert!(response.get("error").is_none(), "{response}");
+    let busy = &response["result"]["data"];
+    assert_eq!(busy["stopping"], false, "{busy}");
+    assert_eq!(busy["owners"], 1, "{busy}");
+    assert_eq!(busy["namespace_readers_or_work"], false, "{busy}");
+    let status = daemon.rpc("testing.status", json!({}));
+    assert_eq!(status["ticket"], hook["ticket"]);
+    assert_eq!(status["stage"], "armed", "{status}");
+    assert_eq!(status["hits"], 0, "{status}");
+    daemon.rpc("testing.release", json!({"id":hook["ticket"]}));
+    verified(&daemon, attached);
+    assert_scan_parity(&daemon, &fixture.b, fixture.temp.path());
+    for lease in ["managed-client", "sibling-client"] {
+        daemon.rpc("views.detach", json!({"owner":claim.owner,"lease":lease}));
+    }
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
 fn live_post_commit_recovery_restores_attach_refresh_and_migration_without_restart() {
     use super::live::wait_for;
 

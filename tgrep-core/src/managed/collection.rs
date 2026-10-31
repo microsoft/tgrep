@@ -783,7 +783,10 @@ mod tests {
                 let busy = namespace.stop_if_idle(Default::default()).unwrap();
                 assert!(!busy.stopping, "{busy:?}");
                 assert_eq!(busy.owners, 1);
-                assert!(busy.namespace_readers_or_work);
+                assert_eq!(busy.operations, 1, "{busy:?}");
+                // The accepted attachment refuses the stop before admission
+                // closes, so the probe leaves the pinned readers' lock alone.
+                assert!(!busy.namespace_readers_or_work, "{busy:?}");
                 assert_eq!(
                     namespace.verification_diagnostics().unwrap()["verified_prefix_bytes"],
                     prefix,

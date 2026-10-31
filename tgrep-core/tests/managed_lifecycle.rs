@@ -165,24 +165,25 @@ impl Fixture {
         .unwrap()
     }
 
+    fn attach_request(&self) -> tgrep_core::managed::AttachRequest {
+        tgrep_core::managed::AttachRequest {
+            root: self.root.clone(),
+            revision: Some("HEAD".into()),
+            profile: IndexingProfile::default(),
+            lease: Token::parse("primary-lease").unwrap(),
+            owner: self.owner.registration().owner.clone(),
+            accept_current: None,
+            migratable: true,
+            allocation_version: self.namespace.allocation().unwrap().version,
+        }
+    }
+
     fn attach(
         &mut self,
         manager: &tgrep_core::managed::ViewManager,
     ) -> tgrep_core::managed::ViewRecord {
         let operation = manager
-            .accept_attach(
-                self.token("attach"),
-                tgrep_core::managed::AttachRequest {
-                    root: self.root.clone(),
-                    revision: Some("HEAD".into()),
-                    profile: IndexingProfile::default(),
-                    lease: Token::parse("primary-lease").unwrap(),
-                    owner: self.owner.registration().owner.clone(),
-                    accept_current: None,
-                    migratable: true,
-                    allocation_version: self.namespace.allocation().unwrap().version,
-                },
-            )
+            .accept_attach(self.token("attach"), self.attach_request())
             .unwrap();
         let completed = manager.execute(&operation.id).unwrap();
         assert_eq!(
@@ -2947,6 +2948,222 @@ fn atomic_idle_admission_rejects_new_owners_operations_and_independent_readers()
         );
     });
     assert!(fixture.namespace.prepare_owner().is_err());
+}
+
+/// Waits until an idle probe has either returned or parked at the installed
+/// test hook; `false` means it did neither within the bound.
+#[cfg(feature = "managed-test-hooks")]
+fn idle_probe_settled<T>(
+    namespace: &Namespace,
+    probe: &std::thread::ScopedJoinHandle<'_, T>,
+) -> bool {
+    use tgrep_core::managed::faults::Stage;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if probe.is_finished()
+            || namespace
+                .test_fault_status()
+                .unwrap()
+                .is_some_and(|status| status.stage == Stage::Waiting)
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+#[cfg(feature = "managed-test-hooks")]
+fn busy_idle_probe_keeps_admission_open_for_an_accepted_attach() {
+    use tgrep_core::managed::faults::{Action, Point, Specification};
+    use tgrep_core::managed::{ExternalWork, OperationState};
+    let mut fixture = Fixture::new();
+    fixture.namespace.activate().unwrap();
+    let manager = fixture.manager();
+    let accepted = manager
+        .accept_attach(fixture.token("attach"), fixture.attach_request())
+        .unwrap();
+    let hook = fixture
+        .namespace
+        .install_test_fault(Specification {
+            point: Point::IdleAdmissionClosed,
+            operation: None,
+            skip_hits: 0,
+            action: Action::Pause { timeout_ms: 30000 },
+        })
+        .unwrap();
+    let (settled, executed, released, probe) = std::thread::scope(|scope| {
+        let probe = scope.spawn(|| fixture.namespace.stop_if_idle(ExternalWork::default()));
+        let settled = idle_probe_settled(&fixture.namespace, &probe);
+        // The attachment was accepted before the probe, so its job must not
+        // observe a closure that the visible work already refuses.
+        let executed = manager.execute(&accepted.id);
+        let released = fixture.namespace.release_test_fault(&hook.ticket);
+        (settled, executed, released, probe.join().unwrap())
+    });
+    let executed = executed.unwrap();
+    assert_eq!(executed.state, OperationState::Completed, "{executed:?}");
+    assert!(
+        settled,
+        "idle probe neither returned nor reached its barrier"
+    );
+    let released = released.unwrap();
+    assert_eq!(
+        released.hits, 0,
+        "busy probe closed admission: {released:?}"
+    );
+    let probe = probe.unwrap();
+    assert!(!probe.stopping, "{probe:?}");
+    assert_eq!((probe.owners, probe.operations), (1, 1), "{probe:?}");
+    assert!(!probe.namespace_readers_or_work, "{probe:?}");
+    let view: tgrep_core::managed::ViewRecord =
+        serde_json::from_value(executed.result.unwrap()["current"].clone()).unwrap();
+    manager
+        .slot(&view.id)
+        .unwrap()
+        .query(view.version)
+        .unwrap()
+        .validate()
+        .unwrap();
+}
+
+#[test]
+#[cfg(feature = "managed-test-hooks")]
+fn busy_idle_decision_leaves_the_activity_lock_to_admitted_work() {
+    use tgrep_core::managed::faults::{Action, Point, Specification};
+    use tgrep_core::managed::{ExternalWork, OperationState};
+    let mut fixture = Fixture::new();
+    fixture.namespace.activate().unwrap();
+    let manager = fixture.manager();
+    let accepted = manager
+        .accept_attach(fixture.token("attach"), fixture.attach_request())
+        .unwrap();
+    let owner = fixture.owner.registration().owner.clone();
+    let allocation_version = fixture.namespace.allocation().unwrap().version;
+    let hook = fixture
+        .namespace
+        .install_test_fault(Specification {
+            point: Point::IdleCommitted,
+            operation: None,
+            skip_hits: 0,
+            action: Action::Pause { timeout_ms: 30000 },
+        })
+        .unwrap();
+    let (settled, reserved, released, probe) = std::thread::scope(|scope| {
+        let probe = scope.spawn(|| fixture.namespace.stop_if_idle(ExternalWork::default()));
+        let settled = idle_probe_settled(&fixture.namespace, &probe);
+        // Admitted work takes the shared activity lock while the busy decision
+        // commits; a refused stop must not hold it exclusively.
+        let reserved = fixture
+            .namespace
+            .reserve(
+                &accepted.id,
+                Some(&owner),
+                WorkRequest {
+                    allocation_version,
+                    staging_bytes: 16 * 1024 * 1024,
+                    private_bytes: 128 * 1024 * 1024,
+                    slots: 1,
+                },
+            )
+            .map(drop);
+        let released = fixture.namespace.release_test_fault(&hook.ticket);
+        (settled, reserved, released, probe.join().unwrap())
+    });
+    reserved.expect("work accepted before a busy idle probe must still reserve");
+    assert!(
+        settled,
+        "idle probe neither returned nor reached its barrier"
+    );
+    let released = released.unwrap();
+    assert_eq!(
+        released.hits, 1,
+        "busy decision skipped its barrier: {released:?}"
+    );
+    let probe = probe.unwrap();
+    assert!(!probe.stopping, "{probe:?}");
+    assert_eq!((probe.owners, probe.operations), (1, 1), "{probe:?}");
+    let executed = manager.execute(&accepted.id).unwrap();
+    assert_eq!(executed.state, OperationState::Completed, "{executed:?}");
+}
+
+#[test]
+#[cfg(feature = "managed-test-hooks")]
+fn operation_accepted_before_an_idle_probe_refuses_the_stop_and_completes() {
+    use tgrep_core::managed::faults::{Action, Point, Specification};
+    use tgrep_core::managed::{ExternalWork, MetadataMutation, OperationState};
+    let fixture = Fixture::new();
+    fixture.namespace.activate().unwrap();
+    fixture
+        .namespace
+        .release_owner(fixture.owner.registration())
+        .unwrap();
+    drop(fixture.owner);
+    let current = fixture.namespace.policy().unwrap();
+    let accepted = fixture
+        .namespace
+        .accept_metadata_mutation(
+            OperationToken {
+                scope: fixture.namespace.header().namespace.clone(),
+                sequence: 1,
+                token: Token::parse("accepted-before-idle").unwrap(),
+            },
+            MetadataMutation::Policy {
+                expected_version: current.version,
+                policy: current.policy,
+            },
+        )
+        .unwrap();
+    let hook = fixture
+        .namespace
+        .install_test_fault(Specification {
+            point: Point::IdleAdmissionClosed,
+            operation: None,
+            skip_hits: 0,
+            action: Action::Pause { timeout_ms: 30000 },
+        })
+        .unwrap();
+    let (settled, executed, released, probe) = std::thread::scope(|scope| {
+        let probe = scope.spawn(|| fixture.namespace.stop_if_idle(ExternalWork::default()));
+        let settled = idle_probe_settled(&fixture.namespace, &probe);
+        // The accepted operation is the only protected work: it must keep the
+        // namespace serving rather than be failed so that the stop can commit.
+        let executed = fixture.namespace.execute_metadata_mutation(&accepted.id);
+        let released = fixture.namespace.release_test_fault(&hook.ticket);
+        (settled, executed, released, probe.join().unwrap())
+    });
+    let executed = executed.unwrap();
+    assert_eq!(executed.state, OperationState::Completed, "{executed:?}");
+    assert!(
+        settled,
+        "idle probe neither returned nor reached its barrier"
+    );
+    let released = released.unwrap();
+    assert_eq!(
+        released.hits, 0,
+        "busy probe closed admission: {released:?}"
+    );
+    let probe = probe.unwrap();
+    assert!(!probe.stopping, "{probe:?}");
+    assert_eq!(
+        (
+            probe.leases,
+            probe.owners,
+            probe.reservations,
+            probe.operations
+        ),
+        (0, 0, 0, 1),
+        "{probe:?}"
+    );
+    assert!(!fixture.namespace.stop_is_committed().unwrap());
+    let stopped = fixture
+        .namespace
+        .stop_if_idle(ExternalWork::default())
+        .unwrap();
+    assert!(stopped.stopping, "{stopped:?}");
 }
 
 #[test]

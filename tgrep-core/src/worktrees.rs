@@ -1431,6 +1431,10 @@ impl WorktreeView {
     /// checkout, or no longer a directory) is skipped with all its
     /// descendants, and a candidate that is missing, not a regular file or
     /// without trusted metadata gets no record.
+    ///
+    /// Scratch buffers are charged to the permit before they are allocated,
+    /// a growing buffer together with the old storage it still holds, and
+    /// released when they are dropped. `memory` grows only by the records.
     fn excluded_records(
         &self,
         listed: &[String],
@@ -1441,56 +1445,55 @@ impl WorktreeView {
             Some(permit) => permit.check().map_err(crate::Error::from),
             None => Ok(()),
         };
-        if let Some(memory) = memory.as_deref_mut() {
-            memory
-                .grow(listed.len() as u64 * 48)
-                .map_err(crate::Error::from)?;
-        }
+        // A set of `n` string slices holds at most 16n/7 buckets of 17
+        // bytes plus one group of control bytes; small sets round up.
+        let listed_bytes = match listed.len() {
+            0 => 0,
+            len => len as u64 * 48 + 256,
+        };
+        // Declared before the buffers it covers, so it is released after
+        // them on every return path.
+        let mut scratch = permit
+            .map(|permit| permit.memory(listed_bytes))
+            .transpose()
+            .map_err(crate::Error::from)?;
         let listed: HashSet<&str> = listed.iter().map(String::as_str).collect();
-        let mut candidates = Vec::new();
-        for entry in self.generation.entries() {
-            check()?;
-            if entry.mode.is_regular()
+        let candidate = |entry: &crate::generations::TrackedEntry| {
+            entry.mode.is_regular()
                 && !is_rules_file(&entry.path)
                 && !listed.contains(entry.path.as_str())
-            {
+        };
+        let mut count = 0;
+        for entry in self.generation.entries() {
+            check()?;
+            count += usize::from(candidate(entry));
+        }
+        let candidate_bytes = (count * std::mem::size_of::<&str>()) as u64;
+        if let Some(scratch) = scratch.as_mut() {
+            scratch.grow(candidate_bytes).map_err(crate::Error::from)?;
+        }
+        let mut candidates = Vec::with_capacity(count);
+        for entry in self.generation.entries() {
+            check()?;
+            if candidate(entry) {
                 candidates.push(entry.path.as_str());
             }
         }
         drop(listed);
-        if let Some(memory) = memory.as_deref_mut() {
-            memory
-                .grow(candidates.len() as u64 * 16)
+        if let Some(scratch) = scratch.as_mut() {
+            scratch
+                .resize(candidate_bytes)
                 .map_err(crate::Error::from)?;
         }
         let mut records = BTreeMap::new();
         // (directory prefix length, candidate range); candidates are sorted,
-        // so every directory's descendants are contiguous.
-        let mut pending = vec![(0, 0, candidates.len())];
+        // so every directory's descendants are contiguous and ordered by
+        // their remainder after the prefix.
+        let mut pending = Vec::new();
+        push_charged(&mut pending, (0, 0, candidates.len()), &mut scratch)?;
         while let Some((prefix, start, end)) = pending.pop() {
             check()?;
-            let mut files = Vec::new();
-            let mut directories = Vec::new();
-            let mut index = start;
-            while index < end {
-                let rest = &candidates[index][prefix..];
-                match rest.find('/') {
-                    None => {
-                        files.push((rest, candidates[index]));
-                        index += 1;
-                    }
-                    Some(slash) => {
-                        let child = &rest[..=slash];
-                        let first = index;
-                        while index < end && candidates[index][prefix..].starts_with(child) {
-                            index += 1;
-                        }
-                        directories.push((&rest[..slash], prefix + slash + 1, first, index));
-                    }
-                }
-            }
-            files.sort_unstable_by_key(|(name, _)| *name);
-            directories.sort_unstable_by_key(|(name, ..)| *name);
+            let range = &candidates[start..end];
             let directory = match prefix {
                 0 => self.root.clone(),
                 _ => self.root.join(&candidates[start][..prefix - 1]),
@@ -1510,20 +1513,34 @@ impl WorktreeView {
                 let Ok(kind) = entry.file_type() else {
                     continue;
                 };
+                let name = name.as_bytes();
                 if kind.is_dir() {
-                    if let Ok(found) = directories.binary_search_by_key(&name, |(name, ..)| *name) {
-                        let (_, child, first, last) = directories[found];
-                        pending.push((child, first, last));
+                    let first = range.partition_point(|path| {
+                        path.as_bytes()[prefix..].iter().lt(name.iter().chain(b"/"))
+                    });
+                    let last = first
+                        + range[first..].partition_point(|path| {
+                            path.as_bytes()[prefix..]
+                                .strip_prefix(name)
+                                .is_some_and(|tail| tail.first() == Some(&b'/'))
+                        });
+                    if first < last {
+                        push_charged(
+                            &mut pending,
+                            (prefix + name.len() + 1, start + first, start + last),
+                            &mut scratch,
+                        )?;
                     }
                     continue;
                 }
                 if !kind.is_file() {
                     continue;
                 }
-                let Ok(found) = files.binary_search_by_key(&name, |(name, _)| *name) else {
+                let Ok(found) = range.binary_search_by(|path| path.as_bytes()[prefix..].cmp(name))
+                else {
                     continue;
                 };
-                let path = files[found].1;
+                let path = range[found];
                 let Ok(metadata) = entry.metadata() else {
                     continue;
                 };
@@ -2995,6 +3012,31 @@ fn is_rules_file(path: &str) -> bool {
     ]
     .iter()
     .any(|rules| name.eq_ignore_ascii_case(rules))
+}
+
+/// Pushes onto `stack`, charging replacement storage before allocating it.
+/// While growing, the old storage stays charged until the copy releases it.
+fn push_charged<T>(
+    stack: &mut Vec<T>,
+    value: T,
+    charge: &mut Option<crate::managed::work::MemoryCharge>,
+) -> Result<()> {
+    if stack.len() == stack.capacity() {
+        let size = std::mem::size_of::<T>() as u64;
+        let old = stack.capacity();
+        let new = (old * 2).max(16);
+        if let Some(charge) = charge.as_mut() {
+            charge.grow(new as u64 * size).map_err(crate::Error::from)?;
+        }
+        stack.reserve_exact(new - stack.len());
+        if let Some(charge) = charge.as_mut() {
+            charge
+                .resize(charge.bytes() - old as u64 * size)
+                .map_err(crate::Error::from)?;
+        }
+    }
+    stack.push(value);
+    Ok(())
 }
 
 fn parent_path(path: &str) -> &str {

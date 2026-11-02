@@ -125,6 +125,18 @@ impl Fixture {
         Arc<crate::managed::WorkPermit>,
         WorktreeView,
     ) {
+        let (namespace, permit) = self.permit();
+        let view =
+            WorktreeView::new_controlled(&self.root, self.generation(), options, &permit).unwrap();
+        (namespace, permit, view)
+    }
+
+    fn permit(
+        &self,
+    ) -> (
+        Arc<crate::managed::Namespace>,
+        Arc<crate::managed::WorkPermit>,
+    ) {
         let namespace = crate::managed::Namespace::initialize(
             &Repository::discover(&self.root).unwrap(),
             &self.storage,
@@ -151,9 +163,7 @@ impl Fixture {
                 },
             )
             .unwrap();
-        let view =
-            WorktreeView::new_controlled(&self.root, self.generation(), options, &permit).unwrap();
-        (namespace, permit, view)
+        (namespace, permit)
     }
 }
 
@@ -1748,6 +1758,43 @@ fn excluded_records_classify_notifications_and_skip_absent_paths() {
         set_hidden_attribute(&root.join("sub/inner.txt"));
         assert_eq!(reason("sub/inner.txt"), UnchangedFile::HiddenChanged);
     }
+}
+
+#[test]
+fn excluded_records_charge_scratch_before_allocating_and_release_it() {
+    let fixture = Fixture::new();
+    let root = &fixture.root;
+    write(root, ".gitignore", b"ign/\n");
+    write(root, "keep.txt", b"needle\n");
+    for index in 0..200 {
+        write(root, &format!("ign/d{index:03}/x.log"), b"needle\n");
+    }
+    git(root, &["add", "--force", "ign"]);
+    commit(root);
+    let view = fixture.view(root, &fixture.generation());
+    let (_namespace, permit) = fixture.permit();
+    let mut charge = permit.memory(1000).unwrap();
+    let listed = [".gitignore".to_owned(), "keep.txt".to_owned()];
+    let records = view
+        .excluded_records(&listed, Some(&permit), Some(&mut charge))
+        .unwrap();
+    assert_eq!(records.len(), 200);
+    let record_bytes: u64 = records
+        .keys()
+        .map(|path| path.len() as u64 + EXCLUDED_RECORD_BYTES)
+        .sum();
+    // The caller's charge grows only by the records.
+    assert_eq!(charge.bytes(), 1000 + record_bytes);
+    // All 200 directories wait on the stack before the first record, and
+    // the candidates stay allocated until the last one.
+    let scratch = 200 * (std::mem::size_of::<&str>() + std::mem::size_of::<[usize; 3]>());
+    assert!(permit.peak_private_bytes() >= 1000 + record_bytes + scratch as u64);
+    // The scratch is released: the rest of the budget is free again.
+    drop(
+        permit
+            .memory(permit.private_limit() - charge.bytes())
+            .unwrap(),
+    );
 }
 
 #[test]

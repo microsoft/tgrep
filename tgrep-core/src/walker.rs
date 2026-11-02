@@ -499,7 +499,7 @@ pub fn walk_dir_with_ignorecase(
 
     let gitignore_files = gitignore_files.into_inner().unwrap();
     let ignore_files = ignore_files.into_inner().unwrap();
-    let visibility = finish_visibility(
+    let (visibility, _) = finish_visibility(
         &root,
         opts.no_ignore,
         opts.no_require_git,
@@ -556,7 +556,8 @@ fn finish_visibility(
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
     read_control: Option<&std::sync::Arc<dyn ignore::gitignore::FileReadControl>>,
     permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
-) -> crate::managed::Result<crate::visibility::PathVisibility> {
+) -> crate::managed::Result<(crate::visibility::PathVisibility, Vec<String>)> {
+    let mut whitelisted = Vec::new();
     if !no_ignore && !visibility.is_empty() {
         let matcher = crate::gitignore::matcher_from_ignore_paths_controlled(
             root,
@@ -566,12 +567,9 @@ fn finish_visibility(
             ignorecase,
             read_control,
         );
-        match permit {
-            Some(permit) => visibility.apply_ignore_rules_controlled(matcher.as_ref(), permit)?,
-            None => visibility.apply_ignore_rules(matcher.as_ref()),
-        }
+        whitelisted = visibility.apply_ignore_rules_controlled(matcher.as_ref(), permit)?;
     }
-    Ok(visibility)
+    Ok((visibility, whitelisted))
 }
 
 /// Build a point-query ignore matcher from `.gitignore` and `.ignore` files
@@ -637,6 +635,9 @@ pub struct MetaWalkResult {
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
     pub visibility: crate::visibility::PathVisibility,
+    /// Walked non-directory entries that are hidden by name or attribute but
+    /// that an ignore-file whitelist admits, so `visibility` omits them.
+    pub whitelisted_hidden: Vec<String>,
     /// Entries/metadata the walk could not inspect, or relative paths that
     /// cannot be represented losslessly in the index's Unicode path format.
     pub skipped_error: usize,
@@ -994,7 +995,7 @@ fn walk_metadata_inner(
     let memory = memory.lock().expect("walk memory lock").take();
     let gitignore_files = gitignore_files.into_inner().unwrap();
     let ignore_files = ignore_files.into_inner().unwrap();
-    let visibility = finish_visibility(
+    let (visibility, whitelisted_hidden) = finish_visibility(
         &root,
         opts.no_ignore,
         opts.no_require_git,
@@ -1017,6 +1018,7 @@ fn walk_metadata_inner(
             gitignore_files,
             ignore_files,
             visibility,
+            whitelisted_hidden,
             skipped_error: skipped_error.into_inner(),
         },
         memory,

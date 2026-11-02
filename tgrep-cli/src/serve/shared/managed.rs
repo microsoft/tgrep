@@ -25,7 +25,7 @@ use tgrep_core::managed::{
     OwnerClaim, Policy, ReconcileRequest, RecoveryRequest, RefreshRequest, Token, ViewManager,
     ViewQuery, ViewSlot,
 };
-use tgrep_core::worktrees::{WorktreeOptions, WorktreeSnapshot};
+use tgrep_core::worktrees::{UnchangedFile, WorktreeOptions, WorktreeSnapshot};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -375,6 +375,13 @@ struct WatchCounters {
     other: AtomicU64,
     errors: AtomicU64,
     unchanged_paths: AtomicU64,
+    unchanged_excluded: AtomicU64,
+    unfiltered_missing: AtomicU64,
+    unfiltered_untrusted: AtomicU64,
+    unfiltered_no_evidence: AtomicU64,
+    unfiltered_version_changed: AtomicU64,
+    unfiltered_hidden_changed: AtomicU64,
+    unfiltered_unavailable: AtomicU64,
     invalidated_paths: AtomicU64,
     full_invalidations: AtomicU64,
     tree_invalidations: AtomicU64,
@@ -385,6 +392,24 @@ struct WatchCounters {
 impl WatchCounters {
     fn add(counter: &AtomicU64, value: u64) {
         counter.fetch_add(value, Ordering::Relaxed);
+    }
+
+    /// Counts a classified file notification; true when it may be dropped.
+    fn filtered(&self, reason: UnchangedFile) -> bool {
+        let counter = match reason {
+            UnchangedFile::Unchanged => &self.unchanged_paths,
+            UnchangedFile::UnchangedExcluded => {
+                Self::add(&self.unchanged_paths, 1);
+                &self.unchanged_excluded
+            }
+            UnchangedFile::Untrusted => &self.unfiltered_untrusted,
+            UnchangedFile::NoEvidence => &self.unfiltered_no_evidence,
+            UnchangedFile::VersionChanged => &self.unfiltered_version_changed,
+            UnchangedFile::HiddenChanged => &self.unfiltered_hidden_changed,
+            UnchangedFile::Unavailable => &self.unfiltered_unavailable,
+        };
+        Self::add(counter, 1);
+        reason.is_unchanged()
     }
 
     fn snapshot(&self) -> Value {
@@ -400,6 +425,15 @@ impl WatchCounters {
                 "error": load(&self.errors),
             },
             "unchanged_paths_filtered": load(&self.unchanged_paths),
+            "unchanged_excluded_filtered": load(&self.unchanged_excluded),
+            "unfiltered": {
+                "missing": load(&self.unfiltered_missing),
+                "untrusted": load(&self.unfiltered_untrusted),
+                "no_evidence": load(&self.unfiltered_no_evidence),
+                "version_changed": load(&self.unfiltered_version_changed),
+                "hidden_changed": load(&self.unfiltered_hidden_changed),
+                "unavailable": load(&self.unfiltered_unavailable),
+            },
             "invalidated_paths": load(&self.invalidated_paths),
             "full_invalidations": load(&self.full_invalidations),
             "tree_invalidations": load(&self.tree_invalidations),
@@ -1180,18 +1214,26 @@ fn watch_event(
                     Ok(relative) if relative == Path::new(".git") => tree = true,
                     Ok(relative) if !relative.as_os_str().is_empty() => {
                         // Drop notifications that left a file's trusted
-                        // metadata equal to the indexed evidence, so external
-                        // walkers and attribute churn do not trigger passes.
-                        if content_candidate && let Ok(metadata) = std::fs::metadata(&path) {
-                            if metadata.is_dir() {
-                                // A parent notification may be the only sign of
-                                // new membership. Rewalk, but do not reread its subtree.
-                                tree = true;
-                                continue;
-                            }
-                            if slot.unchanged_file(relative, &metadata) {
-                                WatchCounters::add(&counters.unchanged_paths, 1);
-                                continue;
+                        // metadata and raw hidden status equal to what the
+                        // published state recorded: the indexed evidence of a
+                        // listed file, or the metadata of a tracked file that
+                        // ignore rules exclude. External walkers and attribute
+                        // churn then do not trigger passes.
+                        if content_candidate {
+                            match std::fs::metadata(&path) {
+                                Ok(metadata) if metadata.is_dir() => {
+                                    // A parent notification may be the only sign of
+                                    // new membership. Rewalk, but do not reread its subtree.
+                                    tree = true;
+                                    continue;
+                                }
+                                Ok(metadata) => {
+                                    let reason = slot.unchanged_file_reason(relative, &metadata);
+                                    if counters.filtered(reason) {
+                                        continue;
+                                    }
+                                }
+                                Err(_) => WatchCounters::add(&counters.unfiltered_missing, 1),
                             }
                         }
                         paths.push(relative.to_path_buf())
@@ -3418,7 +3460,19 @@ mod scheduling_tests {
         };
         git(&["init", "--quiet"]);
         fs::write(root.join("source.txt"), "shared_term\n").unwrap();
+        for (path, text) in [
+            (".gitignore", "*.log\n"),
+            ("wl/.gitignore", "!.keep.txt\n"),
+            ("wl/.keep.txt", "shared_term\n"),
+            ("sub/.gitignore", "*\n!.gitignore\n"),
+            ("sub/inner.txt", "shared_term\n"),
+            ("ign/tracked.log", "shared_term\n"),
+        ] {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), text).unwrap();
+        }
         git(&["add", "."]);
+        git(&["add", "--force", "sub/inner.txt", "ign/tracked.log"]);
         git(&["commit", "--quiet", "-m", "initial"]);
         git(&[
             "worktree",
@@ -3484,14 +3538,36 @@ mod scheduling_tests {
         let failure = Mutex::new(None);
         let counters = WatchCounters::default();
         let source = slot.root().join("source.txt");
+        let modify_path = |kind, path: &str| {
+            Ok(notify::Event::new(EventKind::Modify(kind)).add_path(slot.root().join(path)))
+        };
         let modify =
             |kind| Ok(notify::Event::new(EventKind::Modify(kind)).add_path(source.clone()));
         let before = slot.input_epoch();
-        for kind in [
-            notify::event::ModifyKind::Any,
-            notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Any),
+        // Dot-files a whitelist admits, and tracked files that ignore rules
+        // exclude, are filtered like ordinary indexed files.
+        for path in [
+            "source.txt",
+            "wl/.keep.txt",
+            "sub/.gitignore",
+            "sub/inner.txt",
+            "ign/tracked.log",
         ] {
-            watch_event(&slot, &[], &storage, &failure, &counters, modify(kind)).unwrap();
+            for kind in [
+                notify::event::ModifyKind::Any,
+                notify::event::ModifyKind::Metadata(notify::event::MetadataKind::Any),
+            ] {
+                watch_event(
+                    &slot,
+                    &[],
+                    &storage,
+                    &failure,
+                    &counters,
+                    modify_path(kind, path),
+                )
+                .unwrap();
+            }
+            assert_eq!(slot.input_epoch(), before, "{path}");
         }
         assert_eq!(
             slot.input_epoch(),
@@ -3516,11 +3592,42 @@ mod scheduling_tests {
             "renames are always rechecked"
         );
         let events = counters.snapshot();
-        assert_eq!(events["events"], 3);
-        assert_eq!(events["by_kind"]["modify"], 3);
-        assert_eq!(events["unchanged_paths_filtered"], 2);
+        assert_eq!(events["events"], 11);
+        assert_eq!(events["by_kind"]["modify"], 11);
+        assert_eq!(events["unchanged_paths_filtered"], 10);
+        assert_eq!(events["unchanged_excluded_filtered"], 4);
         assert_eq!(events["invalidated_paths"], 1);
         assert_eq!(events["epoch_advances"], 1);
+
+        // Real changes are still invalidated, and status reports why.
+        fs::write(slot.root().join("ign/tracked.log"), "shared_term, edited\n").unwrap();
+        fs::write(slot.root().join("new.txt"), "shared_term\n").unwrap();
+        for path in ["ign/tracked.log", "new.txt", "missing.txt"] {
+            watch_event(
+                &slot,
+                &[],
+                &storage,
+                &failure,
+                &counters,
+                modify_path(notify::event::ModifyKind::Any, path),
+            )
+            .unwrap();
+        }
+        assert_eq!(slot.input_epoch(), before + 4);
+        let events = counters.snapshot();
+        assert_eq!(events["unchanged_paths_filtered"], 10);
+        assert_eq!(events["invalidated_paths"], 4);
+        assert_eq!(
+            events["unfiltered"],
+            json!({
+                "missing": 1,
+                "untrusted": 0,
+                "no_evidence": 1,
+                "version_changed": 1,
+                "hidden_changed": 0,
+                "unavailable": 0,
+            })
+        );
         let (private, common) =
             tgrep_core::git_index::read_repository_dirs_bounded(&linked).unwrap();
         let private = fs::canonicalize(private).unwrap();
@@ -3879,6 +3986,39 @@ mod scheduling_tests {
         assert_eq!(snapshot["by_kind"]["error"], 1);
         assert_eq!(snapshot["unchanged_paths_filtered"], 5);
         assert_eq!(snapshot["full_invalidations"], 0);
+    }
+
+    #[test]
+    fn watch_counters_classify_filtered_and_kept_paths() {
+        let counters = WatchCounters::default();
+        for (reason, filtered) in [
+            (UnchangedFile::Unchanged, true),
+            (UnchangedFile::UnchangedExcluded, true),
+            (UnchangedFile::UnchangedExcluded, true),
+            (UnchangedFile::Untrusted, false),
+            (UnchangedFile::NoEvidence, false),
+            (UnchangedFile::VersionChanged, false),
+            (UnchangedFile::VersionChanged, false),
+            (UnchangedFile::HiddenChanged, false),
+            (UnchangedFile::Unavailable, false),
+        ] {
+            assert_eq!(counters.filtered(reason), filtered, "{reason:?}");
+        }
+        WatchCounters::add(&counters.unfiltered_missing, 1);
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot["unchanged_paths_filtered"], 3);
+        assert_eq!(snapshot["unchanged_excluded_filtered"], 2);
+        assert_eq!(
+            snapshot["unfiltered"],
+            json!({
+                "missing": 1,
+                "untrusted": 1,
+                "no_evidence": 1,
+                "version_changed": 2,
+                "hidden_changed": 1,
+                "unavailable": 1,
+            })
+        );
     }
 
     fn job_ids() -> [Id; 4] {

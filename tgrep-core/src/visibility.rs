@@ -74,20 +74,27 @@ impl PathVisibility {
         }
     }
 
+    /// Like [`Self::apply_ignore_rules`], but returns the files it admitted:
+    /// they are hidden by name or attribute, yet recorded as visible.
     pub(crate) fn apply_ignore_rules_controlled(
         &mut self,
         ignore: Option<&IgnoreMatcher>,
-        permit: &std::sync::Arc<crate::managed::WorkPermit>,
-    ) -> crate::managed::Result<()> {
+        permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
+    ) -> crate::managed::Result<Vec<String>> {
+        let mut whitelisted = Vec::new();
         if let Some(ignore) = ignore {
             for (path, is_dir) in std::mem::take(&mut self.hidden) {
-                permit.check()?;
+                if let Some(permit) = permit {
+                    permit.check()?;
+                }
                 if !ignore.is_whitelisted(Path::new(&path), is_dir) {
                     self.hidden.insert(path, is_dir);
+                } else if !is_dir {
+                    whitelisted.push(path);
                 }
             }
         }
-        Ok(())
+        Ok(whitelisted)
     }
 
     /// `prefix` is the search-root-relative slice of the index root, with a

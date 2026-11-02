@@ -1587,10 +1587,23 @@ explicit refresh. Legacy v1 and ordinary-server policies are unchanged.
 `status` expose the effective `watch_mode`, `watch_fallback`,
 `reconciliation_policy`, `last_verification` and `watch_events`. Native
 `Modify` notifications other than renames are dropped when the file's current
-metadata matches the trusted read evidence of the current publication and its
-recorded hidden status (Windows `FILE_NOTIFY_CHANGE_ATTRIBUTES`, `LAST_ACCESS`
-and duplicate-write churn). Creates, removes, renames and rescans are not
-filtered as unchanged files, nor are files while a replacement is being prepared.
+trusted metadata and raw hidden status match what the current publication
+recorded (Windows `FILE_NOTIFY_CHANGE_ATTRIBUTES`, `LAST_ACCESS` and
+duplicate-write churn). For a listed file, that is its trusted read evidence and
+the hidden status the walk observed before whitelists applied: a dot-file that
+an ignore-file whitelist admits is visible to queries but still hidden by name.
+For a regular tracked file that ignore rules exclude, each pass records its
+trusted metadata. It stats only excluded tracked files that are present, listing
+each directory once; absent files and missing directories cost no failed stat.
+`last_reconcile.excluded_tracked` counts these records, which count toward
+retained view memory, and `last_reconcile.timings.excluded_records_us` reports
+their cost within discovery. Metadata verification refreshes them in place.
+Ignore and attributes files (`.gitignore`, `.ignore`, `p4ignore.ini`,
+`.gitattributes`) that the walk does not list, untracked ignored files such as
+build output, and other files without recorded metadata are never dropped:
+missing evidence cannot distinguish a no-op from a new file. Creates, removes,
+renames and rescans are not filtered as unchanged files, nor are files while a
+replacement is being prepared.
 Git metadata-root modifications, remote/prefetch refs, packed refs, lock files, objects, logs,
 FETCH_HEAD and ORIG_HEAD do not invalidate content. Index and HEAD changes still
 request a tree check: index membership can affect case-insensitive ignore
@@ -1602,7 +1615,10 @@ A same-size, same-timestamp rewrite is left to a path hint or the content tier.
 Directory-entry metadata can lag active writers on Windows; metadata reuse is
 eventually consistent, not an atomic snapshot. `watch_events` reports cumulative `events`, `by_kind`
 (`access`, `create`, `modify`, `remove`, `other`, `error`),
-`unchanged_paths_filtered`, `invalidated_paths`, `full_invalidations`,
+`unchanged_paths_filtered` (of which `unchanged_excluded_filtered` matched an
+excluded tracked file's record), `unfiltered` (file notifications kept, by
+reason: `missing`, `untrusted`, `no_evidence`, `version_changed`,
+`hidden_changed`, `unavailable`), `invalidated_paths`, `full_invalidations`,
 `tree_invalidations`, `git_metadata_ignored` and
 `epoch_advances`, so watcher input churn can be measured directly. The policy reports
 `incremental_coverage: "unavailable"`, `change_journal: "not-integrated"` and

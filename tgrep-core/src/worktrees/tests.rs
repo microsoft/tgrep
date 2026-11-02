@@ -1554,6 +1554,202 @@ fn unchanged_file_requires_equal_trusted_evidence_and_hidden_status() {
     }
 }
 
+/// Case-1 targets are dot-files that an ignore-file whitelist admits; case-2
+/// targets are tracked files that ignore rules exclude. The controls were
+/// already filtered before either case was handled.
+fn filter_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    let root = &fixture.root;
+    write(root, ".gitignore", b"*.log\n");
+    write(root, ".editorconfig", b"root = true\n");
+    write(root, "control.txt", b"needle\n");
+    write(root, "wl/.gitignore", b"!.keep.txt\n");
+    write(root, "wl/.keep.txt", b"needle\n");
+    write(root, "sub/.gitignore", b"*\n!.gitignore\n");
+    write(root, "sub/inner.txt", b"needle\n");
+    write(root, "ign/tracked.log", b"needle\n");
+    git(
+        root,
+        &["add", "--force", "sub/inner.txt", "ign/tracked.log"],
+    );
+    commit(root);
+    fixture
+}
+
+fn unchanged(view: &WorktreeView, root: &Path, path: &str) -> bool {
+    view.unchanged_file(Path::new(path), &fs::metadata(root.join(path)).unwrap())
+}
+
+#[cfg(windows)]
+fn set_hidden_attribute(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+    let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // The NUL-terminated buffer remains live for the Win32 call.
+    assert_ne!(
+        unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) },
+        0
+    );
+}
+
+#[test]
+fn unchanged_file_drops_whitelisted_hidden_files() {
+    let fixture = filter_fixture();
+    let root = &fixture.root;
+    let view = stale_view(root, &fixture.generation());
+    view.refresh().unwrap();
+    for control in [
+        "control.txt",
+        ".editorconfig",
+        ".gitignore",
+        "wl/.gitignore",
+    ] {
+        assert!(unchanged(&view, root, control), "{control}");
+    }
+    // A whitelist makes these dot-files visible, but they are still hidden by
+    // name, so a no-op notification reports the same raw hidden status.
+    for target in ["wl/.keep.txt", "sub/.gitignore"] {
+        assert!(unchanged(&view, root, target), "{target}");
+    }
+    write(root, "wl/.keep.txt", b"needle, edited\n");
+    assert!(!unchanged(&view, root, "wl/.keep.txt"));
+    view.invalidate_path(Path::new("wl/.keep.txt")).unwrap();
+    view.refresh().unwrap();
+    assert!(unchanged(&view, root, "wl/.keep.txt"));
+    assert!(matches(&view, "edited").contains(&"wl/.keep.txt".to_string()));
+
+    // Editing a whitelisted ignore file still rewalks membership.
+    write(root, "sub/.gitignore", b"*\n!.gitignore\n!inner.txt\n");
+    assert!(!unchanged(&view, root, "sub/.gitignore"));
+    view.invalidate_path(Path::new("sub/.gitignore")).unwrap();
+    assert!(view.control.lock().unwrap().tree);
+    view.refresh().unwrap();
+    assert!(matches(&view, "needle").contains(&"sub/inner.txt".to_string()));
+    assert!(unchanged(&view, root, "sub/.gitignore"));
+    assert!(unchanged(&view, root, "sub/inner.txt"));
+    #[cfg(windows)]
+    {
+        // The attribute changes neither the raw hidden status of a dot-file
+        // nor the visibility that a whitelist grants it.
+        set_hidden_attribute(&root.join("wl/.keep.txt"));
+        assert!(unchanged(&view, root, "wl/.keep.txt"));
+    }
+}
+
+#[test]
+fn unchanged_file_drops_tracked_files_that_ignore_rules_exclude() {
+    let fixture = filter_fixture();
+    let root = &fixture.root;
+    let view = stale_view(root, &fixture.generation());
+    view.refresh().unwrap();
+    let found = matches(&view, "needle");
+    for target in ["sub/inner.txt", "ign/tracked.log"] {
+        assert!(!found.contains(&target.to_string()), "{target}");
+        assert!(unchanged(&view, root, target), "{target}");
+    }
+    write(root, "ign/tracked.log", b"needle, edited\n");
+    assert!(!unchanged(&view, root, "ign/tracked.log"));
+    view.invalidate_path(Path::new("ign/tracked.log")).unwrap();
+    view.refresh().unwrap();
+    assert!(unchanged(&view, root, "ign/tracked.log"));
+
+    // Verification refreshes the records of excluded files in place without
+    // closing readiness, because excluded content never affects queries.
+    write(
+        root,
+        "sub/inner.txt",
+        b"needle, edited without a notification\n",
+    );
+    assert!(!unchanged(&view, root, "sub/inner.txt"));
+    assert!(matches!(
+        view.verify_metadata().unwrap(),
+        Verification::Unchanged(_)
+    ));
+    assert!(view.status().unwrap().ready);
+    assert!(unchanged(&view, root, "sub/inner.txt"));
+    assert!(unchanged(&view, root, "ign/tracked.log"));
+}
+
+#[test]
+fn unchanged_file_keeps_new_files_rule_edits_and_visibility_changes() {
+    let fixture = filter_fixture();
+    let root = &fixture.root;
+    write(root, "deny/.gitignore", b"*\n");
+    write(root, "deny/kept.txt", b"needle\n");
+    git(
+        root,
+        &["add", "--force", "deny/.gitignore", "deny/kept.txt"],
+    );
+    commit(root);
+    let view = stale_view(root, &fixture.generation());
+    view.refresh().unwrap();
+
+    write(root, "new.txt", b"needle\n");
+    assert!(!unchanged(&view, root, "new.txt"));
+    write(root, "ign/untracked.log", b"needle\n");
+    assert!(!unchanged(&view, root, "ign/untracked.log"));
+
+    // An ignore file that its own rules exclude has no recorded metadata, so
+    // even a no-op notification rewalks membership.
+    assert!(!unchanged(&view, root, "deny/.gitignore"));
+    write(root, "deny/.gitignore", b"# nothing ignored\n");
+    assert!(!unchanged(&view, root, "deny/.gitignore"));
+    view.invalidate_path(Path::new("deny/.gitignore")).unwrap();
+    assert!(view.control.lock().unwrap().tree);
+    view.refresh().unwrap();
+    assert!(matches(&view, "needle").contains(&"deny/kept.txt".to_string()));
+
+    #[cfg(windows)]
+    {
+        // Only an attribute changes, but it changes query visibility of a
+        // listed file that no whitelist admits.
+        set_hidden_attribute(&root.join("control.txt"));
+        assert!(!unchanged(&view, root, "control.txt"));
+    }
+}
+
+#[test]
+fn excluded_records_classify_notifications_and_skip_absent_paths() {
+    let fixture = filter_fixture();
+    let root = &fixture.root;
+    write(root, "gone/deep/a.log", b"needle\n");
+    write(root, "ign/gone.log", b"needle\n");
+    git(root, &["add", "--force", "gone/deep/a.log", "ign/gone.log"]);
+    commit(root);
+    fs::remove_dir_all(root.join("gone")).unwrap();
+    fs::remove_file(root.join("ign/gone.log")).unwrap();
+    let view = stale_view(root, &fixture.generation());
+    let reason = |path: &str| {
+        view.unchanged_file_reason(Path::new(path), &fs::metadata(root.join(path)).unwrap())
+    };
+    assert_eq!(reason("control.txt"), UnchangedFile::NoEvidence);
+    // Absent tracked paths and the listed whitelisted ignore file get no record.
+    assert_eq!(view.refresh().unwrap().excluded_tracked, 2);
+    assert_eq!(reason("control.txt"), UnchangedFile::Unchanged);
+    assert_eq!(reason("wl/.keep.txt"), UnchangedFile::Unchanged);
+    assert_eq!(reason("ign/tracked.log"), UnchangedFile::UnchangedExcluded);
+    assert!(UnchangedFile::UnchangedExcluded.is_unchanged());
+    assert_eq!(
+        view.unchanged_file_reason(
+            Path::new("ign/tracked.log"),
+            &fs::metadata(root.join("ign")).unwrap()
+        ),
+        UnchangedFile::Untrusted
+    );
+
+    write(root, "ign/gone.log", b"needle\n");
+    assert_eq!(reason("ign/gone.log"), UnchangedFile::NoEvidence);
+    write(root, "ign/tracked.log", b"needle, edited\n");
+    assert_eq!(reason("ign/tracked.log"), UnchangedFile::VersionChanged);
+    write(root, "control.txt", b"needle, edited\n");
+    assert_eq!(reason("control.txt"), UnchangedFile::VersionChanged);
+    #[cfg(windows)]
+    {
+        set_hidden_attribute(&root.join("sub/inner.txt"));
+        assert_eq!(reason("sub/inner.txt"), UnchangedFile::HiddenChanged);
+    }
+}
+
 #[test]
 fn read_and_discovery_errors_close_the_gate_and_force_full_retry() {
     let fixture = Fixture::new();

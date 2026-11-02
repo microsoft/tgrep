@@ -10,7 +10,8 @@ use crate::generations::GenerationKey;
 use crate::generations::{BuildStats, Generation, GenerationManager, IndexingProfile, Repository};
 use crate::rooted::RootedDir;
 use crate::worktrees::{
-    OverlayCost, ReconcileStats, Verification, WorktreeOptions, WorktreeSnapshot, WorktreeView,
+    OverlayCost, ReconcileStats, UnchangedFile, Verification, WorktreeOptions, WorktreeSnapshot,
+    WorktreeView,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -2150,11 +2151,27 @@ impl ViewSlot {
     /// current publication. Conservatively false while a replacement is being
     /// prepared, so its independent reads never depend on a dropped event.
     pub fn unchanged_file(&self, relative: &Path, metadata: &std::fs::Metadata) -> bool {
+        self.unchanged_file_reason(relative, metadata)
+            .is_unchanged()
+    }
+
+    /// Classifies a watched file against the current publication, as
+    /// [`WorktreeView::unchanged_file_reason`] does. Reports
+    /// [`UnchangedFile::Unavailable`] while the view is closing or a
+    /// replacement is being prepared.
+    pub fn unchanged_file_reason(
+        &self,
+        relative: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> UnchangedFile {
         let current = match self.state.lock() {
             Ok(state) if !state.closing && state.preparing.is_none() => state.current.clone(),
             _ => None,
         };
-        current.is_some_and(|current| current.view.unchanged_file(relative, metadata))
+        match current {
+            Some(current) => current.view.unchanged_file_reason(relative, metadata),
+            None => UnchangedFile::Unavailable,
+        }
     }
 
     pub fn current(&self) -> Result<Arc<PublishedView>> {

@@ -789,7 +789,7 @@ impl WorktreeView {
         }
         let mut options = self.options.walk.clone();
         options.max_file_size = None;
-        let (walk, mut memory) =
+        let (walk, mut memory, _) =
             walker::walk_file_metadata_controlled(&self.root, &options, &repository, permit)
                 .map_err(crate::Error::from)?;
         if walk.skipped_error != 0 {
@@ -1425,6 +1425,16 @@ impl WorktreeView {
     /// them unchanged can be dropped. Ignore and attributes files get no
     /// record: their notifications keep invalidating membership.
     ///
+    /// Not being listed is no proof of exclusion: a file restored after the
+    /// walk is not listed either. A candidate found on disk is recorded only
+    /// when the walk's own ignore rules ignore the file or one of its parent
+    /// directories. The point-query matcher the walk built for visibility is
+    /// reused; otherwise one is built from the walk's rule files when the
+    /// first candidate is found. Under a permit, both parse the rule-file
+    /// contents the walk read; without one, they read the rule files again.
+    /// Tracked files the walk skipped only for other reasons, such as excluded
+    /// directories, get no record.
+    ///
     /// Tracked paths are matched by exact spelling while listing only the
     /// directories that contain candidates, one listing at a time. A
     /// directory that cannot be listed (absent in a sparse or partial
@@ -1434,13 +1444,19 @@ impl WorktreeView {
     ///
     /// Scratch buffers are charged to the permit before they are allocated,
     /// a growing buffer together with the old storage it still holds, and
-    /// released when they are dropped. `memory` grows only by the records.
+    /// released when they are dropped. The walk's rules keep their own charge
+    /// until they are dropped on return. `memory` grows only by the records.
     fn excluded_records(
         &self,
-        listed: &[String],
+        walk: &walker::MetaWalkResult,
+        rules: walker::WalkRules,
         permit: Option<&Arc<crate::managed::WorkPermit>>,
         mut memory: Option<&mut crate::managed::work::MemoryCharge>,
     ) -> Result<BTreeMap<String, ExcludedFile>> {
+        if self.options.walk.no_ignore {
+            return Ok(BTreeMap::new());
+        }
+        let listed = &walk.listed_files;
         let check = || match permit {
             Some(permit) => permit.check().map_err(crate::Error::from),
             None => Ok(()),
@@ -1486,6 +1502,8 @@ impl WorktreeView {
                 .map_err(crate::Error::from)?;
         }
         let mut records = BTreeMap::new();
+        let mut rules = rules;
+        let mut proven = rules.matcher.is_some();
         // (directory prefix length, candidate range); candidates are sorted,
         // so every directory's descendants are contiguous and ordered by
         // their remainder after the prefix.
@@ -1541,6 +1559,17 @@ impl WorktreeView {
                     continue;
                 };
                 let path = range[found];
+                if !proven {
+                    rules.matcher = self.walk_matcher(walk, rules.inputs.as_ref(), permit)?;
+                    proven = true;
+                }
+                if !rules
+                    .matcher
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.is_ignored(Path::new(path), false))
+                {
+                    continue;
+                }
                 let Ok(metadata) = entry.metadata() else {
                     continue;
                 };
@@ -1563,6 +1592,38 @@ impl WorktreeView {
             }
         }
         Ok(records)
+    }
+
+    /// A point-query matcher for the rules `walk` applied, when the walk did
+    /// not build one for visibility. A controlled walk's input control serves
+    /// the snapshots of the rule files it read and charges the parse. The
+    /// walk's case-insensitive matching is left out: it only adds exclusions,
+    /// so without it a candidate can only stay unproven.
+    fn walk_matcher(
+        &self,
+        walk: &walker::MetaWalkResult,
+        inputs: Option<&Arc<crate::managed::inputs::InputControl>>,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Option<crate::gitignore::IgnoreMatcher>> {
+        let control = inputs
+            .cloned()
+            .map(|inputs| inputs as Arc<dyn ignore::gitignore::FileReadControl>);
+        let matcher = crate::gitignore::matcher_from_ignore_paths_controlled(
+            &self.root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            self.options.walk.no_require_git,
+            None,
+            control.as_ref(),
+        );
+        if let Some(inputs) = inputs {
+            let checked = match permit {
+                Some(permit) => permit.check(),
+                None => Ok(()),
+            };
+            inputs.finish(checked).map_err(crate::Error::from)?;
+        }
+        Ok(matcher)
     }
 
     fn prepare(
@@ -1602,28 +1663,29 @@ impl WorktreeView {
         // Metadata alone must not permanently exclude a file whose actual
         // bytes have become small enough. Bound actual reads instead.
         options.max_file_size = None;
-        let (walk, memory) = match permit {
+        let (walk, memory, rules) = match permit {
             Some(permit) => {
-                let (walk, memory) = walker::walk_file_metadata_controlled(
+                let (walk, memory, rules) = walker::walk_file_metadata_controlled(
                     &self.root,
                     &options,
                     &repository,
                     permit,
                 )
                 .map_err(crate::Error::from)?;
-                (walk, Some(memory))
+                (walk, Some(memory), rules)
             }
-            None => (
-                walker::walk_file_metadata_with_ignorecase(&self.root, &options, ignorecase),
-                None,
-            ),
+            None => {
+                let (walk, rules) =
+                    walker::walk_file_metadata_with_rules(&self.root, &options, ignorecase);
+                (walk, None, rules)
+            }
         };
         if walk.skipped_error != 0 {
             return Err(WorktreeError::IncompleteWalk(walk.skipped_error));
         }
         let mut memory = memory;
         let records = Instant::now();
-        let excluded = self.excluded_records(&walk.listed_files, permit, memory.as_mut())?;
+        let excluded = self.excluded_records(&walk, rules, permit, memory.as_mut())?;
         let excluded_records_us = crate::managed::work::micros(records.elapsed());
         after_discovery();
         let mut prepared = Prepared {

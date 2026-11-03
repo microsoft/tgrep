@@ -1773,10 +1773,13 @@ fn excluded_records_charge_scratch_before_allocating_and_release_it() {
     commit(root);
     let view = fixture.view(root, &fixture.generation());
     let (_namespace, permit) = fixture.permit();
+    let (walk, rules) = walker::walk_file_metadata_with_rules(&view.root, &view.options.walk, None);
+    let mut listed = walk.listed_files.clone();
+    listed.sort();
+    assert_eq!(listed, [".gitignore", "keep.txt"]);
     let mut charge = permit.memory(1000).unwrap();
-    let listed = [".gitignore".to_owned(), "keep.txt".to_owned()];
     let records = view
-        .excluded_records(&listed, Some(&permit), Some(&mut charge))
+        .excluded_records(&walk, rules, Some(&permit), Some(&mut charge))
         .unwrap();
     assert_eq!(records.len(), 200);
     let record_bytes: u64 = records
@@ -1795,6 +1798,48 @@ fn excluded_records_charge_scratch_before_allocating_and_release_it() {
             .memory(permit.private_limit() - charge.bytes())
             .unwrap(),
     );
+}
+
+#[test]
+fn excluded_records_require_the_walks_rules_to_exclude_a_file() {
+    let fixture = Fixture::new();
+    let root = &fixture.root;
+    write(root, ".gitignore", b"ign/\n");
+    write(root, "restored.txt", b"needle\n");
+    write(root, "ign/tracked.log", b"needle\n");
+    git(root, &["add", "--force", "ign"]);
+    commit(root);
+    fs::remove_file(root.join("restored.txt")).unwrap();
+    let view = fixture.view(root, &fixture.generation());
+    let (_namespace, permit) = fixture.permit();
+    let mut options = view.options.walk.clone();
+    options.max_file_size = None;
+    // With the matcher the walk built for visibility, then with one rebuilt
+    // from the snapshots its input control kept.
+    for rebuild in [false, true] {
+        let (walk, mut charge, mut rules) =
+            walker::walk_file_metadata_controlled(&view.root, &options, &view.repository, &permit)
+                .unwrap();
+        assert!(rules.matcher.is_some());
+        assert!(!walk.listed_files.iter().any(|path| path == "restored.txt"));
+        if rebuild {
+            rules.matcher = None;
+        }
+        // A tracked file restored after the walk is unlisted, but the rules
+        // the walk applied don't exclude it, so its notifications must keep
+        // invalidating. A rule added since is not one the walk applied.
+        write(root, "restored.txt", b"needle\n");
+        write(root, ".gitignore", b"ign/\nrestored.txt\n");
+        let records = view
+            .excluded_records(&walk, rules, Some(&permit), Some(&mut charge))
+            .unwrap();
+        assert_eq!(records.keys().collect::<Vec<_>>(), ["ign/tracked.log"]);
+        // The walk's rules were released on return.
+        drop(charge);
+        drop(permit.memory(permit.private_limit()).unwrap());
+        fs::remove_file(root.join("restored.txt")).unwrap();
+        write(root, ".gitignore", b"ign/\n");
+    }
 }
 
 #[test]

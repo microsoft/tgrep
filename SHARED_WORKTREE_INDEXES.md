@@ -1593,8 +1593,14 @@ duplicate-write churn). For a listed file, that is its trusted read evidence and
 the hidden status the walk observed before whitelists applied: a dot-file that
 an ignore-file whitelist admits is visible to queries but still hidden by name.
 For a regular tracked file that ignore rules exclude, each pass records its
-trusted metadata. It stats only excluded tracked files that are present, listing
-each directory once; absent files and missing directories cost no failed stat.
+trusted metadata. A tracked file the walk did not list gets a record only when
+the ignore rules the walk applied, parsed from the rule-file contents it read,
+exclude the file or a parent directory; a file restored after the walk, or one
+skipped only for another reason, gets none. It stats only excluded tracked files
+that are present, listing each directory once; absent files and missing
+directories cost no failed stat. The charges for the rule-file snapshots and
+parsed patterns the walk read are held until the records are built, then
+released.
 `last_reconcile.excluded_tracked` counts these records, which count toward
 retained view memory, and `last_reconcile.timings.excluded_records_us` reports
 their cost within discovery. Metadata verification refreshes them in place.

@@ -1597,6 +1597,31 @@ trusted metadata. A tracked file the walk did not list gets a record only when
 the ignore rules the walk applied, parsed from the rule-file contents it read,
 exclude the file or a parent directory; a tracked file that no rule excludes,
 whether restored after the walk or skipped only for another reason, gets none.
+Neither the global excludes file nor the repository's `info/exclude` counts as
+that proof, because the walk can list a file that one of them excludes from the
+root. The walk matches global patterns relative to the daemon's working
+directory rather than the view root, so an anchored global pattern can match a
+file from the root that the walk lists. Behind a `.git` file, the walk applies
+`info/exclude` only when Git is required and the pointer, resolved against the
+daemon's working directory, leads to a Git directory with a `commondir` file. An
+absolute linked-worktree pointer does; a submodule's or a `--separate-git-dir`
+checkout's Git directory has no `commondir`, and a relative pointer resolves
+from the wrong directory. These two files have the lowest precedence of the
+standard rules, so leaving them out only removes exclusions: a tracked file that
+only they exclude gets no record, and its no-op notifications keep invalidating,
+as before 1.2.7. When Git ignores case, the case filter still matches
+`info/exclude`'s rules, but it never hides a tracked file, and the walk applies
+the same filter. Nor does a file below a nested repository get a record,
+because the walk stops applying the outer repository's `.gitignore` and
+`info/exclude` rules there, while the matcher still applies them. Any
+directory entry below the root named `.git` or `.jj` in any ASCII case and of
+any type marks such a repository, as does a listing error, whether or not Git
+rules require a repository. The walk treats a directory as another repository
+only when a lookup of `.git` or `.jj` in it finds an entry, and never with
+`--no-require-git`. Unless the file system equates another name with those
+beyond ASCII case, this skips at least every subtree the walk treats as one. A
+listing can return the marker after other entries, so the records and
+subdirectories already taken from that directory are then released.
 It stats only excluded tracked files that are present, listing each directory
 once; absent files and missing directories cost no failed stat. The charges for
 the rule-file snapshots and parsed patterns the walk read are held until the

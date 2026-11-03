@@ -1442,7 +1442,19 @@ impl WorktreeView {
     /// first candidate is found. Under a permit, both parse the rule-file
     /// contents the walk read; without one, they read the rule files again.
     /// Tracked files the walk skipped only for other reasons, such as excluded
-    /// directories, get no record.
+    /// directories, get no record. Nor does anything below a possible nested
+    /// repository: a directory other than the root with an entry named `.git`
+    /// or `.jj`, in any ASCII case and of any type, or whose listing fails
+    /// partway. Below a nested repository, the walk stops applying the outer
+    /// repository's `.gitignore` and `info/exclude` rules, while the matcher
+    /// still applies them. Neither exclude file proves exclusion either, as
+    /// the walk can list a file that one excludes from the root: it matches
+    /// global excludes' anchored patterns relative to the process's working
+    /// directory, and it skips the repository's `info/exclude` behind a `.git`
+    /// file whose Git directory, resolved against that working directory, has
+    /// no `commondir` file, and behind any `.git` file when Git is not
+    /// required. A tracked file that only an exclude file excludes therefore
+    /// gets no record, and its notifications keep invalidating.
     ///
     /// Tracked paths are matched by exact spelling while listing only the
     /// directories that contain candidates, one listing at a time. A
@@ -1454,7 +1466,8 @@ impl WorktreeView {
     /// Scratch buffers are charged to the permit before they are allocated,
     /// a growing buffer together with the old storage it still holds, and
     /// released when they are dropped. The walk's rules keep their own charge
-    /// until they are dropped on return. `memory` grows only by the records.
+    /// until they are dropped on return. `memory` grows only by the records,
+    /// and shrinks again for those removed below a nested repository.
     fn excluded_records(
         &self,
         walk: &walker::MetaWalkResult,
@@ -1528,19 +1541,33 @@ impl WorktreeView {
             let Ok(entries) = fs::read_dir(&directory) else {
                 continue;
             };
+            let subdirectories = pending.len();
+            let mut nested = false;
             for entry in entries {
                 check()?;
                 let Ok(entry) = entry else {
-                    continue;
+                    if prefix == 0 {
+                        continue;
+                    }
+                    // It could be the entry that marks a nested repository.
+                    nested = true;
+                    break;
                 };
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else {
                     continue;
                 };
+                let name = name.as_bytes();
+                // Any type, in any ASCII case.
+                if prefix != 0
+                    && (name.eq_ignore_ascii_case(b".git") || name.eq_ignore_ascii_case(b".jj"))
+                {
+                    nested = true;
+                    break;
+                }
                 let Ok(kind) = entry.file_type() else {
                     continue;
                 };
-                let name = name.as_bytes();
                 if kind.is_dir() {
                     let first = range.partition_point(|path| {
                         path.as_bytes()[prefix..].iter().lt(name.iter().chain(b"/"))
@@ -1572,11 +1599,9 @@ impl WorktreeView {
                     rules.matcher = self.walk_matcher(walk, rules.inputs.as_ref(), permit)?;
                     proven = true;
                 }
-                if !rules
-                    .matcher
-                    .as_ref()
-                    .is_some_and(|matcher| matcher.is_ignored(Path::new(path), false))
-                {
+                if !rules.matcher.as_ref().is_some_and(|matcher| {
+                    matcher.is_ignored_without_exclude_files(Path::new(path), false)
+                }) {
                     continue;
                 }
                 let Ok(metadata) = entry.metadata() else {
@@ -1598,6 +1623,21 @@ impl WorktreeView {
                         hidden: crate::visibility::is_hidden(Path::new(path), Some(&metadata)),
                     },
                 );
+            }
+            if nested {
+                pending.truncate(subdirectories);
+                let mut released = 0;
+                for path in range {
+                    if !path.as_bytes()[prefix..].contains(&b'/') && records.remove(*path).is_some()
+                    {
+                        released += path.len() as u64 + EXCLUDED_RECORD_BYTES;
+                    }
+                }
+                if let Some(memory) = memory.as_deref_mut().filter(|_| released > 0) {
+                    memory
+                        .resize(memory.bytes() - released)
+                        .map_err(crate::Error::from)?;
+                }
             }
         }
         Ok(records)

@@ -1910,6 +1910,150 @@ fn excluded_records_require_the_walks_rules_to_exclude_a_file() {
 }
 
 #[test]
+fn excluded_records_skip_nested_repositories() {
+    let fixture = Fixture::new();
+    let root = &fixture.root;
+    write(root, ".gitignore", b"*.log\n");
+    let directories = ["gitdir", "gitfile", "jj", "plain"];
+    // `-a.log` and `-d` list before `.git` and `.jj` on NTFS and ReFS, so a
+    // record and a subdirectory are queued before the boundary is found.
+    let paths: Vec<String> = directories
+        .iter()
+        .flat_map(|directory| {
+            ["-a.log", "-d/x.log", "x.log"].map(|name| format!("{directory}/{name}"))
+        })
+        .collect();
+    for path in &paths {
+        write(root, path, b"needle\n");
+    }
+    for directory in directories {
+        write(root, &format!("{directory}/kept.log"), b"needle\n");
+    }
+    git(
+        root,
+        &["add", "--force", "gitdir", "gitfile", "jj", "plain"],
+    );
+    commit(root);
+    let view = fixture.view(root, &fixture.generation());
+    let (_namespace, permit) = fixture.permit();
+    fs::create_dir(root.join("gitdir/.git")).unwrap();
+    write(root, "gitfile/.git", b"gitdir: missing\n");
+    fs::create_dir(root.join("jj/.jj")).unwrap();
+    let mut options = view.options.walk.clone();
+    options.max_file_size = None;
+    let expected = [
+        "plain/-a.log",
+        "plain/-d/x.log",
+        "plain/kept.log",
+        "plain/x.log",
+    ];
+    for rebuild in [false, true] {
+        for path in &paths {
+            fs::remove_file(root.join(path)).unwrap();
+        }
+        let (walk, mut charge, mut rules) =
+            walker::walk_file_metadata_controlled(&view.root, &options, &view.repository, &permit)
+                .unwrap();
+        assert!(rules.matcher.is_some());
+        // Below a nested repository, the walk stops applying the outer
+        // repository's `.gitignore` and `info/exclude` rules to tracked files,
+        // while the matcher still applies them.
+        let mut kept: Vec<_> = walk
+            .listed_files
+            .iter()
+            .filter(|path| path.ends_with("kept.log"))
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["gitdir/kept.log", "gitfile/kept.log", "jj/kept.log"]);
+        if rebuild {
+            rules.matcher = None;
+        }
+        // Restored after the walk, so the walk listed none of them.
+        for path in &paths {
+            write(root, path, b"needle\n");
+        }
+        let entry = charge.bytes();
+        let records = view
+            .excluded_records(&walk, rules, Some(&permit), Some(&mut charge))
+            .unwrap();
+        assert_eq!(records.keys().collect::<Vec<_>>(), expected);
+        let record_bytes: u64 = records
+            .keys()
+            .map(|path| path.len() as u64 + EXCLUDED_RECORD_BYTES)
+            .sum();
+        // Records rolled back below a boundary released their charges.
+        assert_eq!(charge.bytes(), entry + record_bytes);
+        drop(charge);
+        drop(permit.memory(permit.private_limit()).unwrap());
+    }
+    // `.ignore` applies below nested repositories too, so their tracked files
+    // are candidates of a full pass; only the records outside them remain.
+    write(root, ".ignore", b"*.log\n");
+    assert_eq!(
+        view.refresh().unwrap().excluded_tracked,
+        expected.len() as u64
+    );
+}
+
+#[test]
+fn excluded_records_never_take_global_excludes_as_proof() {
+    let fixture = Fixture::new();
+    let root = &fixture.root;
+    write(root, ".gitignore", b"*.ctl\n");
+    let paths = [
+        "anchored.glob",
+        "control.ctl",
+        "sub/any.globany",
+        "sub/interior.glob",
+    ];
+    for path in paths {
+        write(root, path, b"needle\n");
+    }
+    git(root, &["add", "--force", ".gitignore", "anchored.glob"]);
+    git(root, &["add", "--force", "control.ctl", "sub"]);
+    commit(root);
+    let view = fixture.view(root, &fixture.generation());
+    let (_namespace, permit) = fixture.permit();
+    let mut options = view.options.walk.clone();
+    options.max_file_size = None;
+    for path in paths {
+        fs::remove_file(root.join(path)).unwrap();
+    }
+    let (walk, mut charge, mut rules) =
+        walker::walk_file_metadata_controlled(&view.root, &options, &view.repository, &permit)
+            .unwrap();
+    // Restored after the walk, so the walk listed none of them.
+    for path in paths {
+        write(root, path, b"needle\n");
+    }
+    // A pass's matcher roots global excludes at the view root, so these
+    // anchored patterns match there even when the walk, which matches them
+    // from the process's working directory, lists the files.
+    let mut local = ignore::gitignore::GitignoreBuilder::new(root);
+    local.add_line(None, "*.ctl").unwrap();
+    let mut global = ignore::gitignore::GitignoreBuilder::new(root);
+    for line in ["/anchored.glob", "sub/interior.glob", "*.globany"] {
+        global.add_line(None, line).unwrap();
+    }
+    let matcher =
+        crate::gitignore::IgnoreMatcher::new(local.build().unwrap(), global.build().unwrap())
+            .unwrap();
+    for path in paths {
+        assert!(matcher.is_ignored(Path::new(path), false), "{path}");
+    }
+    rules.matcher = Some(matcher);
+    let entry = charge.bytes();
+    let records = view
+        .excluded_records(&walk, rules, Some(&permit), Some(&mut charge))
+        .unwrap();
+    assert_eq!(records.keys().collect::<Vec<_>>(), ["control.ctl"]);
+    assert_eq!(
+        charge.bytes(),
+        entry + "control.ctl".len() as u64 + EXCLUDED_RECORD_BYTES
+    );
+}
+
+#[test]
 fn read_and_discovery_errors_close_the_gate_and_force_full_retry() {
     let fixture = Fixture::new();
     write(&fixture.root, "file.txt", b"old needle");
@@ -3774,4 +3918,94 @@ fn content_only_profile_admits_extension_named_text_through_base_overlay_and_hin
     let restored = WorktreeView::restore(&fixture.root, content_pin, options).unwrap();
     restored.refresh().unwrap();
     assert_eq!(matches(&restored, "revised marker"), ["docs/report.doc"]);
+}
+
+#[test]
+fn excluded_records_never_take_the_repository_exclude_file_as_proof() {
+    for layout in ["directory", "separate", "relative"] {
+        let fixture = Fixture::new();
+        let repo = &fixture.root;
+        write(repo, ".gitignore", b"ign/\n");
+        write(repo, "x.secret", b"needle\n");
+        write(repo, "ign/tracked.log", b"needle\n");
+        git(repo, &["add", "--force", "x.secret", "ign"]);
+        commit(repo);
+        let parent = repo.parent().unwrap();
+        let (root, common) = match layout {
+            "directory" => (repo.clone(), repo.join(".git")),
+            // As `git init --separate-git-dir` writes it: an absolute
+            // `gitdir` without `commondir`.
+            "separate" => {
+                let git_dir = parent.join("separate.git");
+                fs::rename(repo.join(".git"), &git_dir).unwrap();
+                let target = git_dir.display().to_string().replace('\\', "/");
+                write(repo, ".git", format!("gitdir: {target}\n").as_bytes());
+                (repo.clone(), git_dir)
+            }
+            // A linked worktree with a relative `gitdir`, as
+            // `git worktree add --relative-paths` writes it.
+            _ => {
+                let linked = parent.join("linked");
+                git(
+                    repo,
+                    &["worktree", "add", "--quiet", &linked.display().to_string()],
+                );
+                let gitfile = fs::read_to_string(linked.join(".git")).unwrap();
+                let admin = Path::new(gitfile.trim().trim_start_matches("gitdir: "));
+                let admin = admin.file_name().unwrap().to_str().unwrap().to_owned();
+                let gitfile = format!("gitdir: ../repo/.git/worktrees/{admin}\n");
+                write(&linked, ".git", gitfile.as_bytes());
+                (linked, repo.join(".git"))
+            }
+        };
+        write(&common, "info/exclude", b"*.secret\n");
+        assert!(
+            crate::gitignore::repo_exclude_path(&root).is_some(),
+            "{layout}"
+        );
+        let view = fixture.view(&root, &fixture.generation());
+        let (_namespace, permit) = fixture.permit();
+        let mut options = view.options.walk.clone();
+        options.max_file_size = None;
+        // Only a walk below a `.git` directory applies the file.
+        let (listing, _, _) =
+            walker::walk_file_metadata_controlled(&view.root, &options, &view.repository, &permit)
+                .unwrap();
+        assert_eq!(
+            listing.listed_files.iter().any(|path| path == "x.secret"),
+            layout != "directory",
+            "{layout}"
+        );
+        drop(listing);
+        fs::remove_file(root.join("x.secret")).unwrap();
+        for rebuild in [false, true] {
+            let (walk, mut charge, mut rules) = walker::walk_file_metadata_controlled(
+                &view.root,
+                &options,
+                &view.repository,
+                &permit,
+            )
+            .unwrap();
+            if rebuild {
+                rules.matcher = None;
+            }
+            // Restored after the walk, so no walk listed it.
+            write(&root, "x.secret", b"needle\n");
+            let entry = charge.bytes();
+            let records = view
+                .excluded_records(&walk, rules, Some(&permit), Some(&mut charge))
+                .unwrap();
+            assert_eq!(
+                records.keys().collect::<Vec<_>>(),
+                ["ign/tracked.log"],
+                "{layout} rebuild={rebuild}"
+            );
+            assert_eq!(
+                charge.bytes(),
+                entry + "ign/tracked.log".len() as u64 + EXCLUDED_RECORD_BYTES,
+                "{layout} rebuild={rebuild}"
+            );
+            fs::remove_file(root.join("x.secret")).unwrap();
+        }
+    }
 }

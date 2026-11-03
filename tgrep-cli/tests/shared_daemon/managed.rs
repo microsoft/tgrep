@@ -1161,6 +1161,79 @@ fn assert_scan_parity(daemon: &Daemon, root: &Path, home: &Path) {
 }
 
 #[test]
+fn global_excludes_never_prove_excluded_file_records() {
+    let fixture = Fixture::new();
+    let home = fixture.temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        "[core]\nexcludesFile = ~/global-ignore\n",
+    )
+    .unwrap();
+    fs::write(
+        home.join("global-ignore"),
+        "/anchored.glob\nsub/interior.glob\n*.globany\n",
+    )
+    .unwrap();
+    fs::write(fixture.a.join(".gitignore"), "*.ctl\n").unwrap();
+    fs::create_dir(fixture.a.join("sub")).unwrap();
+    for path in [
+        "anchored.glob",
+        "control.ctl",
+        "sub/any.globany",
+        "sub/interior.glob",
+    ] {
+        fs::write(fixture.a.join(path), "shared_term excluded\n").unwrap();
+    }
+    git(&fixture.a, &["add", "--force", "."]);
+    git(&fixture.a, &["commit", "-qm", "excluded tracked files"]);
+    let revision = git(&fixture.a, &["rev-parse", "HEAD"]);
+    // The walk matches global patterns from the daemon's working directory,
+    // which it inherits from this process, so it lists the anchored files.
+    assert!(!std::env::current_dir().unwrap().starts_with(&fixture.a));
+    let policy_path = fixture.storage.join("policy.json");
+    fs::write(&policy_path, serde_json::to_vec(&policy()).unwrap()).unwrap();
+    let mut daemon = Daemon::start_with_home(
+        &fixture.a,
+        &fixture.storage,
+        &[
+            "--shared-policy",
+            policy_path.to_str().unwrap(),
+            "--no-watch",
+        ],
+        Some(&home),
+    );
+    let (claim, guard) = owner(&daemon);
+    let mut input = attach_input(&fixture, &claim);
+    input["request"]["revision"] = json!(revision);
+    let operation = daemon.rpc("views.attach", input);
+    let view = completed(&daemon, &operation)["result"]["current"].clone();
+    verified_attach(&daemon, &operation);
+    let result = search(&daemon, &fixture.a).to_string();
+    for (name, listed) in [
+        ("anchored.glob", true),
+        ("interior.glob", true),
+        ("any.globany", false),
+        ("control.ctl", false),
+    ] {
+        assert_eq!(result.contains(name), listed, "{name}: {result}");
+    }
+    let status = daemon.rpc("views.status", json!({"id":view["id"]}));
+    assert_eq!(status["ready"], true);
+    // Only `.gitignore` proves an unlisted file excluded: the walk excludes
+    // `sub/any.globany` too, but by a global pattern.
+    assert_eq!(status["last_reconcile"]["excluded_tracked"], 1, "{status}");
+    let detached = daemon.rpc(
+        "views.detach",
+        json!({"owner":claim.owner,"lease":"managed-client"}),
+    );
+    assert_eq!(detached["lease_released"], true);
+    daemon.rpc("owners.release", json!({"claim":claim}));
+    drop(guard);
+    stop(&mut daemon);
+}
+
+#[test]
 fn bounded_ignore_inputs_preserve_scan_parity_and_leave_sibling_views_serviceable() {
     let fixture = Fixture::new();
     let home = fixture.temp.path().join("home");

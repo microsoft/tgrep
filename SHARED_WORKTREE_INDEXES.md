@@ -1595,15 +1595,24 @@ an ignore-file whitelist admits is visible to queries but still hidden by name.
 For a regular tracked file that ignore rules exclude, each pass records its
 trusted metadata. A tracked file the walk did not list gets a record only when
 the ignore rules the walk applied, parsed from the rule-file contents it read,
-exclude the file or a parent directory; a file restored after the walk, or one
-skipped only for another reason, gets none. It stats only excluded tracked files
-that are present, listing each directory once; absent files and missing
-directories cost no failed stat. The charges for the rule-file snapshots and
-parsed patterns the walk read are held until the records are built, then
-released.
+exclude the file or a parent directory; a tracked file that no rule excludes,
+whether restored after the walk or skipped only for another reason, gets none.
+It stats only excluded tracked files that are present, listing each directory
+once; absent files and missing directories cost no failed stat. The charges for
+the rule-file snapshots and parsed patterns the walk read are held until the
+records are built, then released.
 `last_reconcile.excluded_tracked` counts these records, which count toward
 retained view memory, and `last_reconcile.timings.excluded_records_us` reports
-their cost within discovery. Metadata verification refreshes them in place.
+their cost within discovery. When verification finds the publication current,
+it refreshes these records in place, drops those for files that are gone, and
+forgets the raw hidden status of whitelisted files that its walk no longer
+reports as hidden and whitelisted. On Windows, a file can lose both its hidden
+attribute and the whitelist that admitted it without changing its visibility or
+its file version. If neither change was notified, verification finds the
+publication current; without that pruning, the notification for setting the
+attribute again would be dropped as unchanged. Verification adds neither,
+so a tracked file excluded, or a whitelisted file hidden, since the last
+publication keeps invalidating until a pass publishes.
 Ignore and attributes files (`.gitignore`, `.ignore`, `p4ignore.ini`,
 `.gitattributes`) that the walk does not list, untracked ignored files such as
 build output, and other files without recorded metadata are never dropped:

@@ -1592,14 +1592,19 @@ fn unchanged(view: &WorktreeView, root: &Path, path: &str) -> bool {
 
 #[cfg(windows)]
 fn set_hidden_attribute(path: &Path) {
+    set_file_attributes(
+        path,
+        windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN,
+    );
+}
+
+#[cfg(windows)]
+fn set_file_attributes(path: &Path, attributes: u32) {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+    use windows_sys::Win32::Storage::FileSystem::SetFileAttributesW;
     let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     // The NUL-terminated buffer remains live for the Win32 call.
-    assert_ne!(
-        unsafe { SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN) },
-        0
-    );
+    assert_ne!(unsafe { SetFileAttributesW(wide.as_ptr(), attributes) }, 0);
 }
 
 #[test]
@@ -1618,6 +1623,14 @@ fn unchanged_file_drops_whitelisted_hidden_files() {
     }
     // A whitelist makes these dot-files visible, but they are still hidden by
     // name, so a no-op notification reports the same raw hidden status.
+    for target in ["wl/.keep.txt", "sub/.gitignore"] {
+        assert!(unchanged(&view, root, target), "{target}");
+    }
+    // Verification keeps the whitelisted entries its walk still reports.
+    assert!(matches!(
+        view.verify_metadata().unwrap(),
+        Verification::Unchanged(_)
+    ));
     for target in ["wl/.keep.txt", "sub/.gitignore"] {
         assert!(unchanged(&view, root, target), "{target}");
     }
@@ -1644,6 +1657,60 @@ fn unchanged_file_drops_whitelisted_hidden_files() {
         set_hidden_attribute(&root.join("wl/.keep.txt"));
         assert!(unchanged(&view, root, "wl/.keep.txt"));
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn unchanged_verification_prunes_whitelisted_entries_its_walk_no_longer_reports() {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    let fixture = Fixture::new();
+    let root = &fixture.root;
+    write(root, "plain.txt", b"needle\n");
+    write(root, "kept.txt", b"needle\n");
+    git(root, &["add", "plain.txt", "kept.txt"]);
+    commit(root);
+    // The walk doesn't list the repository's exclude file, so verification
+    // sees an edit to it only through the visibility the edit changes.
+    let exclude = root.join(".git").join("info").join("exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, "!plain.txt\n!kept.txt\n").unwrap();
+    set_hidden_attribute(&root.join("plain.txt"));
+    set_hidden_attribute(&root.join("kept.txt"));
+    let view = stale_view(root, &fixture.generation());
+    view.refresh().unwrap();
+    for path in ["plain.txt", "kept.txt"] {
+        assert!(!view.state.read().unwrap().visibility.records_hidden(path));
+        assert!(unchanged(&view, root, path), "{path}");
+    }
+
+    // Without a notification, plain.txt loses both its attribute and its
+    // whitelist. Its visibility and its Windows file version are unchanged,
+    // so verification publishes nothing.
+    set_file_attributes(&root.join("plain.txt"), FILE_ATTRIBUTE_NORMAL);
+    fs::write(&exclude, "!kept.txt\n").unwrap();
+    assert!(matches!(
+        view.verify_metadata().unwrap(),
+        Verification::Unchanged(_)
+    ));
+    assert!(unchanged(&view, root, "kept.txt"));
+
+    // With no whitelist left, setting the attribute again hides the file.
+    set_hidden_attribute(&root.join("plain.txt"));
+    let metadata = fs::metadata(root.join("plain.txt")).unwrap();
+    assert_eq!(
+        view.unchanged_file_reason(Path::new("plain.txt"), &metadata),
+        UnchangedFile::HiddenChanged
+    );
+    view.invalidate_path(Path::new("plain.txt")).unwrap();
+    view.refresh().unwrap();
+    assert!(
+        view.state
+            .read()
+            .unwrap()
+            .visibility
+            .records_hidden("plain.txt")
+    );
+    assert!(unchanged(&view, root, "plain.txt"));
 }
 
 #[test]

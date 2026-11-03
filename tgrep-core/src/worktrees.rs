@@ -1193,11 +1193,20 @@ impl WorktreeView {
                 .write()
                 .map_err(|_| WorktreeError::Synchronization)?;
             state.evidence = prepared.evidence;
-            // Retained memory accounts for the published records only, so only
-            // those are refreshed. A file excluded since then stays without a
-            // record and keeps invalidating until a pass publishes. Whitelisted
-            // hidden paths are kept: with the published visibility unchanged,
-            // a stale entry can only make the raw comparison report a change.
+            // Retained memory accounts for the published records and
+            // whitelisted hidden paths, so both are pruned rather than
+            // replaced: a tracked file excluded, or a whitelisted file
+            // hidden, since then has no entry and keeps invalidating until a
+            // pass publishes. A whitelisted hidden path the walk no longer
+            // reports must go. A file can lose both its whitelist and its
+            // hidden attribute without changing its published visibility or,
+            // on Windows, its file version. If neither change was notified,
+            // the stale entry would drop the notification for setting the
+            // attribute again.
+            let whitelisted_hidden = prepared.whitelisted_hidden;
+            state
+                .whitelisted_hidden
+                .retain(|path| whitelisted_hidden.contains(path));
             let mut excluded = prepared.excluded;
             state
                 .excluded

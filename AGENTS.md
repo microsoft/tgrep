@@ -120,7 +120,8 @@ when current disk bytes are required.
 `--watch-mode poll` and actual native-watcher failure/budget fallback instead
 close `ready` for their passes, using the same metadata/content tiers and delays.
 `watch_events` in status counts watcher input by kind, metadata-only
-notifications filtered as unchanged, invalidated paths and epoch advances.
+notifications filtered as unchanged, file notifications kept and why,
+invalidated paths and epoch advances.
 `reconciliation_policy` distinguishes configured mode from each view's effective
 polling and reports namespace monitor counts. `last_verification` reports the
 tier and effective delays; `last_reconcile.metadata_reused` counts files not

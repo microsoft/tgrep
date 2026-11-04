@@ -499,7 +499,7 @@ pub fn walk_dir_with_ignorecase(
 
     let gitignore_files = gitignore_files.into_inner().unwrap();
     let ignore_files = ignore_files.into_inner().unwrap();
-    let visibility = finish_visibility(
+    let (visibility, _, _) = finish_visibility(
         &root,
         opts.no_ignore,
         opts.no_require_git,
@@ -556,7 +556,13 @@ fn finish_visibility(
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
     read_control: Option<&std::sync::Arc<dyn ignore::gitignore::FileReadControl>>,
     permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
-) -> crate::managed::Result<crate::visibility::PathVisibility> {
+) -> crate::managed::Result<(
+    crate::visibility::PathVisibility,
+    Vec<String>,
+    Option<crate::gitignore::IgnoreMatcher>,
+)> {
+    let mut whitelisted = Vec::new();
+    let mut rules = None;
     if !no_ignore && !visibility.is_empty() {
         let matcher = crate::gitignore::matcher_from_ignore_paths_controlled(
             root,
@@ -566,12 +572,22 @@ fn finish_visibility(
             ignorecase,
             read_control,
         );
-        match permit {
-            Some(permit) => visibility.apply_ignore_rules_controlled(matcher.as_ref(), permit)?,
-            None => visibility.apply_ignore_rules(matcher.as_ref()),
-        }
+        whitelisted = visibility.apply_ignore_rules_controlled(matcher.as_ref(), permit)?;
+        rules = matcher;
     }
-    Ok(visibility)
+    Ok((visibility, whitelisted, rules))
+}
+
+/// Ignore rules a metadata walk applied, kept for point queries after it.
+///
+/// A controlled walk's input control holds the charge for the rules it read
+/// and serves the walk's snapshots of them, so building a matcher from it
+/// reads nothing from disk. Dropping this releases that charge.
+pub(crate) struct WalkRules {
+    /// The point-query matcher the walk built for visibility, if it needed
+    /// one. Declared first so it drops before the charge.
+    pub(crate) matcher: Option<crate::gitignore::IgnoreMatcher>,
+    pub(crate) inputs: Option<std::sync::Arc<crate::managed::inputs::InputControl>>,
 }
 
 /// Build a point-query ignore matcher from `.gitignore` and `.ignore` files
@@ -637,6 +653,9 @@ pub struct MetaWalkResult {
     pub gitignore_files: Vec<PathBuf>,
     pub ignore_files: Vec<PathBuf>,
     pub visibility: crate::visibility::PathVisibility,
+    /// Walked non-directory entries that are hidden by name or attribute but
+    /// that an ignore-file whitelist admits, so `visibility` omits them.
+    pub whitelisted_hidden: Vec<String>,
     /// Entries/metadata the walk could not inspect, or relative paths that
     /// cannot be represented losslessly in the index's Unicode path format.
     pub skipped_error: usize,
@@ -705,9 +724,24 @@ pub fn walk_file_metadata_with_ignorecase(
     opts: &MetaWalkOptions,
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
 ) -> MetaWalkResult {
-    walk_metadata_inner(root, opts, ignorecase, None, None)
-        .expect("an uncontrolled metadata walk has no work-budget failure")
-        .0
+    walk_file_metadata_with_rules(root, opts, ignorecase).0
+}
+
+/// [`walk_file_metadata_with_ignorecase`], also returning the rules it applied.
+pub(crate) fn walk_file_metadata_with_rules(
+    root: &Path,
+    opts: &MetaWalkOptions,
+    ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
+) -> (MetaWalkResult, WalkRules) {
+    let (walk, _, matcher) = walk_metadata_inner(root, opts, ignorecase, None, None)
+        .expect("an uncontrolled metadata walk has no work-budget failure");
+    (
+        walk,
+        WalkRules {
+            matcher,
+            inputs: None,
+        },
+    )
 }
 
 pub(crate) fn walk_file_metadata_controlled(
@@ -715,7 +749,11 @@ pub(crate) fn walk_file_metadata_controlled(
     opts: &MetaWalkOptions,
     repository: &crate::generations::Repository,
     permit: &std::sync::Arc<crate::managed::WorkPermit>,
-) -> crate::managed::Result<(MetaWalkResult, crate::managed::work::MemoryCharge)> {
+) -> crate::managed::Result<(
+    MetaWalkResult,
+    crate::managed::work::MemoryCharge,
+    WalkRules,
+)> {
     let inputs = crate::managed::inputs::InputControl::new(permit)?;
     let control: std::sync::Arc<dyn ignore::gitignore::FileReadControl> = inputs.clone();
     let result = (|| {
@@ -727,23 +765,37 @@ pub(crate) fn walk_file_metadata_controlled(
             )?
             .map(std::sync::Arc::new)
         };
-        let (walk, charge) =
+        let (walk, charge, matcher) =
             walk_metadata_inner(root, opts, ignorecase, Some(permit), Some(control))?;
         Ok((
             walk,
             charge.expect("controlled walk owns its memory charge"),
+            matcher,
         ))
     })();
-    inputs.finish(result)
+    let (walk, charge, matcher) = inputs.finish(result)?;
+    Ok((
+        walk,
+        charge,
+        WalkRules {
+            matcher,
+            inputs: Some(inputs),
+        },
+    ))
 }
 
+#[allow(clippy::type_complexity)]
 fn walk_metadata_inner(
     root: &Path,
     opts: &MetaWalkOptions,
     ignorecase: Option<std::sync::Arc<crate::gitignore::CaseInsensitiveIgnore>>,
     permit: Option<&std::sync::Arc<crate::managed::WorkPermit>>,
     read_control: Option<std::sync::Arc<dyn ignore::gitignore::FileReadControl>>,
-) -> crate::managed::Result<(MetaWalkResult, Option<crate::managed::work::MemoryCharge>)> {
+) -> crate::managed::Result<(
+    MetaWalkResult,
+    Option<crate::managed::work::MemoryCharge>,
+    Option<crate::gitignore::IgnoreMatcher>,
+)> {
     let memory = std::sync::Arc::new(std::sync::Mutex::new(
         permit.map(|permit| permit.memory(0)).transpose()?,
     ));
@@ -994,7 +1046,7 @@ fn walk_metadata_inner(
     let memory = memory.lock().expect("walk memory lock").take();
     let gitignore_files = gitignore_files.into_inner().unwrap();
     let ignore_files = ignore_files.into_inner().unwrap();
-    let visibility = finish_visibility(
+    let (visibility, whitelisted_hidden, matcher) = finish_visibility(
         &root,
         opts.no_ignore,
         opts.no_require_git,
@@ -1017,9 +1069,11 @@ fn walk_metadata_inner(
             gitignore_files,
             ignore_files,
             visibility,
+            whitelisted_hidden,
             skipped_error: skipped_error.into_inner(),
         },
         memory,
+        matcher,
     ))
 }
 

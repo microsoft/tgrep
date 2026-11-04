@@ -8,7 +8,7 @@
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
@@ -141,6 +141,9 @@ pub struct ReconcileStats {
     pub epoch: u64,
     pub full: bool,
     pub files_discovered: usize,
+    /// Regular tracked files the walk did not list (ignore rules exclude them)
+    /// whose metadata was recorded so unchanged notifications can be filtered.
+    pub excluded_tracked: u64,
     /// Searchable files provisionally served from the pinned generation before
     /// checkout content has been verified.
     pub provisional_files: u64,
@@ -182,6 +185,8 @@ pub struct ReconcileStats {
 pub struct ReconcileTimings {
     pub queue_us: u64,
     pub discovery_us: u64,
+    /// Recording metadata for tracked files the walk excluded; part of discovery.
+    pub excluded_records_us: u64,
     pub planning_us: u64,
     pub content_verification_us: u64,
     pub worker_content_us: u64,
@@ -266,11 +271,52 @@ struct Evidence {
     content: Option<ContentId>,
 }
 
+/// Metadata of a regular tracked file that the walk did not list because
+/// ignore rules exclude it. Its content never reaches the view, so only its
+/// metadata is kept to recognize notifications that changed nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExcludedFile {
+    /// Always trusted ([`FileVersion::is_trusted`]).
+    version: FileVersion,
+    /// Raw hidden status ([`crate::visibility::is_hidden`]).
+    hidden: bool,
+}
+
+/// Why [`WorktreeView::unchanged_file_reason`] kept or dropped a notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnchangedFile {
+    /// Listed with equal trusted version and raw hidden status: drop.
+    Unchanged,
+    /// Excluded by ignore rules with an equal recorded version and raw hidden
+    /// status: drop.
+    UnchangedExcluded,
+    /// The current metadata is not a regular file or has no trusted version.
+    Untrusted,
+    /// The published state has no evidence or record for the path.
+    NoEvidence,
+    /// The recorded version is missing (not validated by a read) or differs.
+    VersionChanged,
+    /// The raw hidden status differs from what the published state recorded.
+    HiddenChanged,
+    /// The view is closing or a verification pass is preparing.
+    Unavailable,
+}
+
+impl UnchangedFile {
+    /// Whether the notification changed nothing the view depends on.
+    pub fn is_unchanged(self) -> bool {
+        matches!(self, Self::Unchanged | Self::UnchangedExcluded)
+    }
+}
+
 struct State {
     index: HybridIndex,
     evidence: BTreeMap<String, Evidence>,
     listed: BTreeSet<String>,
     visibility: PathVisibility,
+    /// Listed files hidden by name or attribute that a whitelist admits.
+    whitelisted_hidden: BTreeSet<String>,
+    excluded: BTreeMap<String, ExcludedFile>,
     restored_content: BTreeMap<String, ContentId>,
     memory: Option<crate::managed::memory::RetainedMemory>,
     cost: OverlayCost,
@@ -480,6 +526,8 @@ impl WorktreeView {
                 evidence: BTreeMap::new(),
                 listed: BTreeSet::new(),
                 visibility: PathVisibility::default(),
+                whitelisted_hidden: BTreeSet::new(),
+                excluded: BTreeMap::new(),
                 restored_content: BTreeMap::new(),
                 memory: None,
                 cost: OverlayCost::default(),
@@ -547,27 +595,64 @@ impl WorktreeView {
         self.options.stale_reads
     }
 
-    /// Whether the regular file at `relative`, described by `metadata`, has
-    /// trusted indexed evidence and recorded hidden status equal to its
-    /// current state. Watchers may drop metadata-only notifications for such
-    /// files; a content change that preserves size and timestamps is left to
-    /// full verification.
+    /// Whether a notification for the regular file at `relative`, described
+    /// by `metadata`, left everything the published state depends on
+    /// unchanged, so a watcher may drop it. See
+    /// [`Self::unchanged_file_reason`].
     pub fn unchanged_file(&self, relative: &Path, metadata: &std::fs::Metadata) -> bool {
+        self.unchanged_file_reason(relative, metadata)
+            .is_unchanged()
+    }
+
+    /// Classifies a notification for the regular file at `relative`,
+    /// described by `metadata`, against the published state.
+    ///
+    /// A listed file is unchanged when its evidence holds a trusted version,
+    /// validated around the read that produced its content, equal to the
+    /// current one, and its raw hidden status (by name or attribute, before
+    /// any ignore-file whitelist applies) equals the raw status the walk saw.
+    /// A regular tracked file that ignore rules excluded from the walk is
+    /// unchanged when the metadata recorded for it (trusted version and raw
+    /// hidden status) equals the current metadata. Anything else, including
+    /// a path the published state has no evidence or record for (as for a
+    /// new file), is a change. A content change that preserves size and
+    /// timestamps is left to full verification.
+    pub fn unchanged_file_reason(
+        &self,
+        relative: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> UnchangedFile {
         let version = crate::meta::file_version(metadata);
         if !metadata.is_file() || !version.is_trusted() {
-            return false;
+            return UnchangedFile::Untrusted;
         }
         let Ok(relative) = relative_path(relative) else {
-            return false;
+            return UnchangedFile::NoEvidence;
         };
         let hidden = crate::visibility::is_hidden(Path::new(&relative), Some(metadata));
-        self.state.read().is_ok_and(|state| {
-            state.visibility.records_hidden(&relative) == hidden
-                && state
-                    .evidence
-                    .get(&relative)
-                    .is_some_and(|evidence| evidence.version.as_ref() == Some(&version))
-        })
+        let Ok(state) = self.state.read() else {
+            return UnchangedFile::Unavailable;
+        };
+        if let Some(evidence) = state.evidence.get(&relative) {
+            if evidence.version.as_ref() != Some(&version) {
+                return UnchangedFile::VersionChanged;
+            }
+            // The recorded visibility drops whitelisted entries, so restore
+            // them to compare the raw status the walk saw with the current one.
+            let recorded = state.visibility.records_hidden(&relative)
+                || state.whitelisted_hidden.contains(&relative);
+            return if recorded == hidden {
+                UnchangedFile::Unchanged
+            } else {
+                UnchangedFile::HiddenChanged
+            };
+        }
+        match state.excluded.get(&relative) {
+            None => UnchangedFile::NoEvidence,
+            Some(excluded) if excluded.version != version => UnchangedFile::VersionChanged,
+            Some(excluded) if excluded.hidden != hidden => UnchangedFile::HiddenChanged,
+            Some(_) => UnchangedFile::UnchangedExcluded,
+        }
     }
 
     /// Caught up: the published state reflects every observed invalidation.
@@ -704,7 +789,7 @@ impl WorktreeView {
         }
         let mut options = self.options.walk.clone();
         options.max_file_size = None;
-        let (walk, mut memory) =
+        let (walk, mut memory, _) =
             walker::walk_file_metadata_controlled(&self.root, &options, &repository, permit)
                 .map_err(crate::Error::from)?;
         if walk.skipped_error != 0 {
@@ -804,14 +889,26 @@ impl WorktreeView {
                     .map_err(crate::Error::from)?;
             }
         }
-        let bytes =
-            retained_view_bytes(&state.index.live, evidence.keys(), &walk.visibility, permit)
-                .map_err(crate::Error::from)?;
+        let whitelisted_hidden: BTreeSet<String> = walk.whitelisted_hidden.into_iter().collect();
+        // Provisional evidence has no versions, so no notification is dropped
+        // until the first pass publishes verified evidence and records.
+        let excluded = BTreeMap::new();
+        let bytes = retained_view_bytes(
+            &state.index.live,
+            evidence.keys(),
+            &walk.visibility,
+            &whitelisted_hidden,
+            &excluded,
+            permit,
+        )
+        .map_err(crate::Error::from)?;
         memory.resize(bytes).map_err(crate::Error::from)?;
         state.memory = Some(memory.retain(0).map_err(crate::Error::from)?);
         state.listed = listed;
         state.evidence = evidence;
         state.visibility = walk.visibility;
+        state.whitelisted_hidden = whitelisted_hidden;
+        state.excluded = excluded;
         state.restored_content.clear();
         state.cost = measure_overlay_cost(&state, Some(permit)).map_err(crate::Error::from)?;
         stats.epoch = epoch;
@@ -1091,10 +1188,36 @@ impl WorktreeView {
             .lock()
             .map_err(|_| WorktreeError::Synchronization)?;
         if !self.stale.load(Ordering::Acquire) {
-            self.state
+            let mut state = self
+                .state
                 .write()
-                .map_err(|_| WorktreeError::Synchronization)?
-                .evidence = prepared.evidence;
+                .map_err(|_| WorktreeError::Synchronization)?;
+            state.evidence = prepared.evidence;
+            // Retained memory accounts for the published records and
+            // whitelisted hidden paths, so both are pruned rather than
+            // replaced: a tracked file excluded, or a whitelisted file
+            // hidden, since then has no entry and keeps invalidating until a
+            // pass publishes. A whitelisted hidden path the walk no longer
+            // reports must go. A file can lose both its whitelist and its
+            // hidden attribute without changing its published visibility or,
+            // on Windows, its file version. If neither change was notified,
+            // the stale entry would drop the notification for setting the
+            // attribute again.
+            let whitelisted_hidden = prepared.whitelisted_hidden;
+            state
+                .whitelisted_hidden
+                .retain(|path| whitelisted_hidden.contains(path));
+            let mut excluded = prepared.excluded;
+            state
+                .excluded
+                .retain(|path, record| match excluded.remove(path) {
+                    Some(current) => {
+                        *record = current;
+                        true
+                    }
+                    None => false,
+                });
+            drop(state);
             let mut stats = prepared.stats;
             if let Some(permit) = permit {
                 permit.observe_reconciliation(&mut stats);
@@ -1195,6 +1318,8 @@ impl WorktreeView {
         let Prepared {
             evidence,
             visibility,
+            whitelisted_hidden,
+            excluded,
             upserts,
             mut stats,
             mut memory,
@@ -1256,8 +1381,15 @@ impl WorktreeView {
             .collect();
         let retained = match (permit, memory) {
             (Some(permit), Some(mut memory)) => {
-                let bytes = retained_view_bytes(live, evidence.keys(), &visibility, permit)
-                    .map_err(crate::Error::from)?;
+                let bytes = retained_view_bytes(
+                    live,
+                    evidence.keys(),
+                    &visibility,
+                    &whitelisted_hidden,
+                    &excluded,
+                    permit,
+                )
+                .map_err(crate::Error::from)?;
                 memory.resize(bytes).map_err(crate::Error::from)?;
                 Some(memory.retain(0).map_err(crate::Error::from)?)
             }
@@ -1269,6 +1401,8 @@ impl WorktreeView {
         state.listed = listed;
         state.evidence = evidence;
         state.visibility = visibility;
+        state.whitelisted_hidden = whitelisted_hidden;
+        state.excluded = excluded;
         state.restored_content.clear();
         state.memory = retained;
         state.cost = measure_overlay_cost(&state, permit).map_err(crate::Error::from)?;
@@ -1293,6 +1427,252 @@ impl WorktreeView {
         self.generation
             .entry(path)
             .and_then(|entry| entry.content_id())
+    }
+
+    /// Records the metadata of regular tracked files that the walk did not
+    /// list because ignore rules exclude them, so notifications that leave
+    /// them unchanged can be dropped. Ignore and attributes files get no
+    /// record: their notifications keep invalidating membership.
+    ///
+    /// Not being listed is no proof of exclusion: a file restored after the
+    /// walk is not listed either. A candidate found on disk is recorded only
+    /// when the walk's own ignore rules ignore the file or one of its parent
+    /// directories. The point-query matcher the walk built for visibility is
+    /// reused; otherwise one is built from the walk's rule files when the
+    /// first candidate is found. Under a permit, both parse the rule-file
+    /// contents the walk read; without one, they read the rule files again.
+    /// Tracked files the walk skipped only for other reasons, such as excluded
+    /// directories, get no record. Nor does anything below a possible nested
+    /// repository: a directory other than the root with an entry named `.git`
+    /// or `.jj`, in any ASCII case and of any type, or whose listing fails
+    /// partway. Below a nested repository, the walk stops applying the outer
+    /// repository's `.gitignore` and `info/exclude` rules, while the matcher
+    /// still applies them. Neither exclude file proves exclusion either, as
+    /// the walk can list a file that one excludes from the root: it matches
+    /// global excludes' anchored patterns relative to the process's working
+    /// directory, and it skips the repository's `info/exclude` behind a `.git`
+    /// file whose Git directory, resolved against that working directory, has
+    /// no `commondir` file, and behind any `.git` file when Git is not
+    /// required. A tracked file that only an exclude file excludes therefore
+    /// gets no record, and its notifications keep invalidating.
+    ///
+    /// Tracked paths are matched by exact spelling while listing only the
+    /// directories that contain candidates, one listing at a time. A
+    /// directory that cannot be listed (absent in a sparse or partial
+    /// checkout, or no longer a directory) is skipped with all its
+    /// descendants, and a candidate that is missing, not a regular file or
+    /// without trusted metadata gets no record.
+    ///
+    /// Scratch buffers are charged to the permit before they are allocated,
+    /// a growing buffer together with the old storage it still holds, and
+    /// released when they are dropped. The walk's rules keep their own charge
+    /// until they are dropped on return. `memory` grows only by the records,
+    /// and shrinks again for those removed below a nested repository.
+    fn excluded_records(
+        &self,
+        walk: &walker::MetaWalkResult,
+        rules: walker::WalkRules,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+        mut memory: Option<&mut crate::managed::work::MemoryCharge>,
+    ) -> Result<BTreeMap<String, ExcludedFile>> {
+        if self.options.walk.no_ignore {
+            return Ok(BTreeMap::new());
+        }
+        let listed = &walk.listed_files;
+        let check = || match permit {
+            Some(permit) => permit.check().map_err(crate::Error::from),
+            None => Ok(()),
+        };
+        // A set of `n` string slices holds at most 16n/7 buckets of 17
+        // bytes plus one group of control bytes; small sets round up.
+        let listed_bytes = match listed.len() {
+            0 => 0,
+            len => len as u64 * 48 + 256,
+        };
+        // Declared before the buffers it covers, so it is released after
+        // them on every return path.
+        let mut scratch = permit
+            .map(|permit| permit.memory(listed_bytes))
+            .transpose()
+            .map_err(crate::Error::from)?;
+        let listed: HashSet<&str> = listed.iter().map(String::as_str).collect();
+        let candidate = |entry: &crate::generations::TrackedEntry| {
+            entry.mode.is_regular()
+                && !is_rules_file(&entry.path)
+                && !listed.contains(entry.path.as_str())
+        };
+        let mut count = 0;
+        for entry in self.generation.entries() {
+            check()?;
+            count += usize::from(candidate(entry));
+        }
+        let candidate_bytes = (count * std::mem::size_of::<&str>()) as u64;
+        if let Some(scratch) = scratch.as_mut() {
+            scratch.grow(candidate_bytes).map_err(crate::Error::from)?;
+        }
+        let mut candidates = Vec::with_capacity(count);
+        for entry in self.generation.entries() {
+            check()?;
+            if candidate(entry) {
+                candidates.push(entry.path.as_str());
+            }
+        }
+        drop(listed);
+        if let Some(scratch) = scratch.as_mut() {
+            scratch
+                .resize(candidate_bytes)
+                .map_err(crate::Error::from)?;
+        }
+        let mut records = BTreeMap::new();
+        let mut rules = rules;
+        let mut proven = rules.matcher.is_some();
+        // (directory prefix length, candidate range); candidates are sorted,
+        // so every directory's descendants are contiguous and ordered by
+        // their remainder after the prefix.
+        let mut pending = Vec::new();
+        push_charged(&mut pending, (0, 0, candidates.len()), &mut scratch)?;
+        while let Some((prefix, start, end)) = pending.pop() {
+            check()?;
+            let range = &candidates[start..end];
+            let directory = match prefix {
+                0 => self.root.clone(),
+                _ => self.root.join(&candidates[start][..prefix - 1]),
+            };
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            let subdirectories = pending.len();
+            let mut nested = false;
+            for entry in entries {
+                check()?;
+                let Ok(entry) = entry else {
+                    if prefix == 0 {
+                        continue;
+                    }
+                    // It could be the entry that marks a nested repository.
+                    nested = true;
+                    break;
+                };
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let name = name.as_bytes();
+                // Any type, in any ASCII case.
+                if prefix != 0
+                    && (name.eq_ignore_ascii_case(b".git") || name.eq_ignore_ascii_case(b".jj"))
+                {
+                    nested = true;
+                    break;
+                }
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    let first = range.partition_point(|path| {
+                        path.as_bytes()[prefix..].iter().lt(name.iter().chain(b"/"))
+                    });
+                    let last = first
+                        + range[first..].partition_point(|path| {
+                            path.as_bytes()[prefix..]
+                                .strip_prefix(name)
+                                .is_some_and(|tail| tail.first() == Some(&b'/'))
+                        });
+                    if first < last {
+                        push_charged(
+                            &mut pending,
+                            (prefix + name.len() + 1, start + first, start + last),
+                            &mut scratch,
+                        )?;
+                    }
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                let Ok(found) = range.binary_search_by(|path| path.as_bytes()[prefix..].cmp(name))
+                else {
+                    continue;
+                };
+                let path = range[found];
+                if !proven {
+                    rules.matcher = self.walk_matcher(walk, rules.inputs.as_ref(), permit)?;
+                    proven = true;
+                }
+                if !rules.matcher.as_ref().is_some_and(|matcher| {
+                    matcher.is_ignored_without_exclude_files(Path::new(path), false)
+                }) {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                let version = crate::meta::file_version(&metadata);
+                if !metadata.is_file() || !version.is_trusted() {
+                    continue;
+                }
+                if let Some(memory) = memory.as_deref_mut() {
+                    memory
+                        .grow(path.len() as u64 + EXCLUDED_RECORD_BYTES)
+                        .map_err(crate::Error::from)?;
+                }
+                records.insert(
+                    path.to_owned(),
+                    ExcludedFile {
+                        version,
+                        hidden: crate::visibility::is_hidden(Path::new(path), Some(&metadata)),
+                    },
+                );
+            }
+            if nested {
+                pending.truncate(subdirectories);
+                let mut released = 0;
+                for path in range {
+                    if !path.as_bytes()[prefix..].contains(&b'/') && records.remove(*path).is_some()
+                    {
+                        released += path.len() as u64 + EXCLUDED_RECORD_BYTES;
+                    }
+                }
+                if let Some(memory) = memory.as_deref_mut().filter(|_| released > 0) {
+                    memory
+                        .resize(memory.bytes() - released)
+                        .map_err(crate::Error::from)?;
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    /// A point-query matcher for the rules `walk` applied, when the walk did
+    /// not build one for visibility. A controlled walk's input control serves
+    /// the snapshots of the rule files it read and charges the parse. The
+    /// walk's case-insensitive matching is left out: it only adds exclusions,
+    /// so without it a candidate can only stay unproven.
+    fn walk_matcher(
+        &self,
+        walk: &walker::MetaWalkResult,
+        inputs: Option<&Arc<crate::managed::inputs::InputControl>>,
+        permit: Option<&Arc<crate::managed::WorkPermit>>,
+    ) -> Result<Option<crate::gitignore::IgnoreMatcher>> {
+        let control = inputs
+            .cloned()
+            .map(|inputs| inputs as Arc<dyn ignore::gitignore::FileReadControl>);
+        let matcher = crate::gitignore::matcher_from_ignore_paths_controlled(
+            &self.root,
+            &walk.gitignore_files,
+            &walk.ignore_files,
+            self.options.walk.no_require_git,
+            None,
+            control.as_ref(),
+        );
+        if let Some(inputs) = inputs {
+            let checked = match permit {
+                Some(permit) => permit.check(),
+                None => Ok(()),
+            };
+            inputs.finish(checked).map_err(crate::Error::from)?;
+        }
+        Ok(matcher)
     }
 
     fn prepare(
@@ -1332,41 +1712,50 @@ impl WorktreeView {
         // Metadata alone must not permanently exclude a file whose actual
         // bytes have become small enough. Bound actual reads instead.
         options.max_file_size = None;
-        let (walk, memory) = match permit {
+        let (walk, memory, rules) = match permit {
             Some(permit) => {
-                let (walk, memory) = walker::walk_file_metadata_controlled(
+                let (walk, memory, rules) = walker::walk_file_metadata_controlled(
                     &self.root,
                     &options,
                     &repository,
                     permit,
                 )
                 .map_err(crate::Error::from)?;
-                (walk, Some(memory))
+                (walk, Some(memory), rules)
             }
-            None => (
-                walker::walk_file_metadata_with_ignorecase(&self.root, &options, ignorecase),
-                None,
-            ),
+            None => {
+                let (walk, rules) =
+                    walker::walk_file_metadata_with_rules(&self.root, &options, ignorecase);
+                (walk, None, rules)
+            }
         };
         if walk.skipped_error != 0 {
             return Err(WorktreeError::IncompleteWalk(walk.skipped_error));
         }
+        let mut memory = memory;
+        let records = Instant::now();
+        let excluded = self.excluded_records(&walk, rules, permit, memory.as_mut())?;
+        let excluded_records_us = crate::managed::work::micros(records.elapsed());
         after_discovery();
         let mut prepared = Prepared {
             memory,
             parents: Vec::new(),
             evidence: BTreeMap::new(),
             visibility: walk.visibility,
-            upserts: BTreeMap::new(),
+            whitelisted_hidden: walk.whitelisted_hidden.into_iter().collect(),
             stats: ReconcileStats {
                 full,
                 files_discovered: walk.listed_files.len(),
+                excluded_tracked: excluded.len() as u64,
                 timings: ReconcileTimings {
                     discovery_us: crate::managed::work::micros(discovery.elapsed()),
+                    excluded_records_us,
                     ..ReconcileTimings::default()
                 },
                 ..ReconcileStats::default()
             },
+            excluded,
+            upserts: BTreeMap::new(),
         };
         let planning = Instant::now();
         let state = self
@@ -2047,6 +2436,8 @@ impl WorktreeView {
             &index.live,
             restored_content.keys(),
             &PathVisibility::default(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
             permit,
         )
         .map_err(crate::Error::from)?;
@@ -2058,6 +2449,8 @@ impl WorktreeView {
             .map_err(|_| WorktreeError::Synchronization)?;
         state.index = index;
         state.restored_content = restored_content;
+        state.whitelisted_hidden.clear();
+        state.excluded.clear();
         state.memory = Some(retained);
         state.cost = measure_overlay_cost(&state, Some(permit)).map_err(crate::Error::from)?;
         Ok(())
@@ -2197,6 +2590,8 @@ fn retained_view_bytes<'a>(
     live: &LiveIndex,
     paths: impl Iterator<Item = &'a String>,
     visibility: &PathVisibility,
+    whitelisted_hidden: &BTreeSet<String>,
+    excluded: &BTreeMap<String, ExcludedFile>,
     permit: &Arc<crate::managed::WorkPermit>,
 ) -> crate::managed::Result<u64> {
     let mut bytes = live
@@ -2204,16 +2599,38 @@ fn retained_view_bytes<'a>(
         .checked_add(visibility.private_memory_estimate(permit)?)
         .and_then(|bytes| bytes.checked_add(64 * 1024))
         .ok_or_else(|| crate::managed::Error::pressure("view-memory-account-overflow"))?;
+    let overflow = || crate::managed::Error::pressure("view-memory-account-overflow");
     for path in paths {
         permit.check()?;
         bytes = (path.capacity() as u64)
             .checked_mul(2)
             .and_then(|path| path.checked_add(512))
             .and_then(|path| bytes.checked_add(path))
-            .ok_or_else(|| crate::managed::Error::pressure("view-memory-account-overflow"))?;
+            .ok_or_else(overflow)?;
+    }
+    for path in whitelisted_hidden {
+        permit.check()?;
+        bytes = (path.capacity() as u64)
+            .checked_add(WHITELISTED_HIDDEN_RECORD_BYTES)
+            .and_then(|path| bytes.checked_add(path))
+            .ok_or_else(overflow)?;
+    }
+    for path in excluded.keys() {
+        permit.check()?;
+        bytes = (path.capacity() as u64)
+            .checked_add(EXCLUDED_RECORD_BYTES)
+            .and_then(|path| bytes.checked_add(path))
+            .ok_or_else(overflow)?;
     }
     Ok(bytes)
 }
+
+/// Estimated bytes per retained whitelisted-hidden path, beyond its string
+/// capacity: tree node share and the string header.
+const WHITELISTED_HIDDEN_RECORD_BYTES: u64 = 192;
+/// Estimated bytes per retained excluded-file record, beyond its path
+/// capacity: tree node share, string header and [`ExcludedFile`].
+const EXCLUDED_RECORD_BYTES: u64 = 256;
 
 /// An escaped managed candidate retains both the base and the physical root.
 /// There is deliberately no conversion or Deref to an unguarded File.
@@ -2460,6 +2877,8 @@ struct Prepared {
     parents: Vec<ParentObservation>,
     evidence: BTreeMap<String, Evidence>,
     visibility: PathVisibility,
+    whitelisted_hidden: BTreeSet<String>,
+    excluded: BTreeMap<String, ExcludedFile>,
     upserts: BTreeMap<String, PreparedUpsert>,
     stats: ReconcileStats,
 }
@@ -2690,6 +3109,45 @@ impl BaseContents {
             .get(&id)
             .copied())
     }
+}
+
+/// Whether the file name of a tracked `path` is one the walk may read ignore
+/// or attributes rules from, in any letter case.
+fn is_rules_file(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    [
+        crate::gitignore::GITIGNORE_FILENAME,
+        crate::gitignore::DOT_IGNORE_FILENAME,
+        crate::gitignore::P4IGNORE_FILENAME,
+        ".gitattributes",
+    ]
+    .iter()
+    .any(|rules| name.eq_ignore_ascii_case(rules))
+}
+
+/// Pushes onto `stack`, charging replacement storage before allocating it.
+/// While growing, the old storage stays charged until the copy releases it.
+fn push_charged<T>(
+    stack: &mut Vec<T>,
+    value: T,
+    charge: &mut Option<crate::managed::work::MemoryCharge>,
+) -> Result<()> {
+    if stack.len() == stack.capacity() {
+        let size = std::mem::size_of::<T>() as u64;
+        let old = stack.capacity();
+        let new = (old * 2).max(16);
+        if let Some(charge) = charge.as_mut() {
+            charge.grow(new as u64 * size).map_err(crate::Error::from)?;
+        }
+        stack.reserve_exact(new - stack.len());
+        if let Some(charge) = charge.as_mut() {
+            charge
+                .resize(charge.bytes() - old as u64 * size)
+                .map_err(crate::Error::from)?;
+        }
+    }
+    stack.push(value);
+    Ok(())
 }
 
 fn parent_path(path: &str) -> &str {

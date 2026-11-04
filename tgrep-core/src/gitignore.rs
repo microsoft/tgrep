@@ -221,7 +221,21 @@ impl IgnoreMatcher {
     }
 
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
-        if self.standard_decision(path, is_dir, true) == Some(true) {
+        self.ignored(path, is_dir, true)
+    }
+
+    /// Like [`is_ignored`](Self::is_ignored), but the standard rules leave out
+    /// the repository's `info/exclude` file and the global excludes file. They
+    /// have the lowest precedence there, and the p4ignore and case filters
+    /// don't read the standard decision, so leaving them out can only turn an
+    /// ignored path into one that isn't. When Git ignores case, the case filter
+    /// still matches `info/exclude`'s rules, but it never hides a tracked file.
+    pub fn is_ignored_without_exclude_files(&self, path: &Path, is_dir: bool) -> bool {
+        self.ignored(path, is_dir, false)
+    }
+
+    fn ignored(&self, path: &Path, is_dir: bool, excludes: bool) -> bool {
+        if self.standard_decision(path, is_dir, true, excludes) == Some(true) {
             return true;
         }
         if self.local_is_filter
@@ -244,10 +258,16 @@ impl IgnoreMatcher {
     /// through the walker's hidden filter. Parent-directory matches are not
     /// inherited here: the walker makes the hidden decision for each entry.
     pub fn is_whitelisted(&self, path: &Path, is_dir: bool) -> bool {
-        self.standard_decision(path, is_dir, false) == Some(false)
+        self.standard_decision(path, is_dir, false, true) == Some(false)
     }
 
-    fn standard_decision(&self, path: &Path, is_dir: bool, parents: bool) -> Option<bool> {
+    fn standard_decision(
+        &self,
+        path: &Path,
+        is_dir: bool,
+        parents: bool,
+        excludes: bool,
+    ) -> Option<bool> {
         let matched = |matcher: &Gitignore, path: &Path| {
             let result = if parents {
                 matcher.matched_path_or_any_parents(path, is_dir)
@@ -306,6 +326,7 @@ impl IgnoreMatcher {
         }
 
         if standard_decision.is_none()
+            && excludes
             && let Some((prefix, matcher)) = &self.repo_exclude
         {
             let path = if prefix.is_empty() {
@@ -316,7 +337,7 @@ impl IgnoreMatcher {
             standard_decision = matched(matcher, Path::new(&path));
         }
 
-        if standard_decision.is_none() {
+        if excludes && standard_decision.is_none() {
             standard_decision = matched(&self.global, path);
         }
         standard_decision
@@ -861,13 +882,21 @@ fn git_repo_root(root: &Path) -> Option<&Path> {
 
 /// The `info/exclude` file whose rules apply to `root`, if there is one.
 ///
-/// Not `.git/info/exclude`. In a linked worktree or a submodule `.git` is a
-/// file holding a `gitdir:` pointer, and that directory in turn holds a
-/// `commondir` naming the repository every worktree shares — which is where the
-/// one `info/exclude` lives. `WalkBuilder` resolves that chain, so a matcher
-/// that stopped at the literal path enforced different rules than the walk in
-/// exactly the layouts where the two differ, and the watcher would index a file
-/// the next stale check evicts.
+/// Not `.git/info/exclude`. In a linked worktree `.git` is a file holding a
+/// `gitdir:` pointer, and that directory in turn holds a `commondir` naming the
+/// repository every worktree shares — which is where the one `info/exclude`
+/// lives. When Git is required, `WalkBuilder` follows that chain through an
+/// absolute pointer, so a matcher that stopped at the literal path enforced
+/// different rules than the walk in exactly the layouts where the two differ,
+/// and the watcher would index a file the next stale check evicts.
+///
+/// This function follows Git further than the walk does. It resolves a
+/// relative pointer against the directory holding `.git` (`read_git_dir_using`)
+/// where the walk resolves it against the process's working directory, and it
+/// takes a Git directory without `commondir`, such as a submodule's or a
+/// `--separate-git-dir` checkout's, as its own common directory
+/// (`common_git_dir`) where the walk applies no `info/exclude`. Excluded-file
+/// records therefore never take this file as proof.
 pub fn repo_exclude_path(root: &Path) -> Option<PathBuf> {
     let path = repo_exclude_candidate(root)?;
     path.is_file().then_some(path)

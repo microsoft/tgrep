@@ -1069,8 +1069,8 @@ the follow-up rewalks the tree and reads the queued hints instead of reopening
 every unchanged file. Timestamps, clean Git status and an
 unavailable journal never prove that nothing changed. Status reports
 `last_verification` with its outcome, tier, ages and effective delays, and `watch_events` counts
-watcher input by kind, metadata-only notifications filtered as unchanged,
-invalidated paths and epoch advances. `queued_work` shows whether the view's
+watcher input by kind, metadata-only notifications filtered as unchanged, file
+notifications kept and why, invalidated paths and epoch advances. `queued_work` shows whether the view's
 accepted work is running or queued, and in which scheduling class; work for a
 view that is not ready runs ahead of other views' background verification.
 Searches are not queued work: they run on their own threads and thread pool,

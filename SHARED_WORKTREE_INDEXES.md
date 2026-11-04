@@ -1587,10 +1587,63 @@ explicit refresh. Legacy v1 and ordinary-server policies are unchanged.
 `status` expose the effective `watch_mode`, `watch_fallback`,
 `reconciliation_policy`, `last_verification` and `watch_events`. Native
 `Modify` notifications other than renames are dropped when the file's current
-metadata matches the trusted read evidence of the current publication and its
-recorded hidden status (Windows `FILE_NOTIFY_CHANGE_ATTRIBUTES`, `LAST_ACCESS`
-and duplicate-write churn). Creates, removes, renames and rescans are not
-filtered as unchanged files, nor are files while a replacement is being prepared.
+trusted metadata and raw hidden status match what the current publication
+recorded (Windows `FILE_NOTIFY_CHANGE_ATTRIBUTES`, `LAST_ACCESS` and
+duplicate-write churn). For a listed file, that is its trusted read evidence and
+the hidden status the walk observed before whitelists applied: a dot-file that
+an ignore-file whitelist admits is visible to queries but still hidden by name.
+For a regular tracked file that ignore rules exclude, each pass records its
+trusted metadata. A tracked file the walk did not list gets a record only when
+the ignore rules the walk applied, parsed from the rule-file contents it read,
+exclude the file or a parent directory; a tracked file that no rule excludes,
+whether restored after the walk or skipped only for another reason, gets none.
+Neither the global excludes file nor the repository's `info/exclude` counts as
+that proof, because the walk can list a file that one of them excludes from the
+root. The walk matches global patterns relative to the daemon's working
+directory rather than the view root, so an anchored global pattern can match a
+file from the root that the walk lists. Behind a `.git` file, the walk applies
+`info/exclude` only when Git is required and the pointer, resolved against the
+daemon's working directory, leads to a Git directory with a `commondir` file. An
+absolute linked-worktree pointer does; a submodule's or a `--separate-git-dir`
+checkout's Git directory has no `commondir`, and a relative pointer resolves
+from the wrong directory. These two files have the lowest precedence of the
+standard rules, so leaving them out only removes exclusions: a tracked file that
+only they exclude gets no record, and its no-op notifications keep invalidating,
+as before 1.2.7. When Git ignores case, the case filter still matches
+`info/exclude`'s rules, but it never hides a tracked file, and the walk applies
+the same filter. Nor does a file below a nested repository get a record,
+because the walk stops applying the outer repository's `.gitignore` and
+`info/exclude` rules there, while the matcher still applies them. Any
+directory entry below the root named `.git` or `.jj` in any ASCII case and of
+any type marks such a repository, as does a listing error, whether or not Git
+rules require a repository. The walk treats a directory as another repository
+only when a lookup of `.git` or `.jj` in it finds an entry, and never with
+`--no-require-git`. Unless the file system equates another name with those
+beyond ASCII case, this skips at least every subtree the walk treats as one. A
+listing can return the marker after other entries, so the records and
+subdirectories already taken from that directory are then released.
+It stats only excluded tracked files that are present, listing each directory
+once; absent files and missing directories cost no failed stat. The charges for
+the rule-file snapshots and parsed patterns the walk read are held until the
+records are built, then released.
+`last_reconcile.excluded_tracked` counts these records, which count toward
+retained view memory, and `last_reconcile.timings.excluded_records_us` reports
+their cost within discovery. When verification finds the publication current,
+it refreshes these records in place, drops those for files that are gone, and
+forgets the raw hidden status of whitelisted files that its walk no longer
+reports as hidden and whitelisted. On Windows, a file can lose both its hidden
+attribute and the whitelist that admitted it without changing its visibility or
+its file version. If neither change was notified, verification finds the
+publication current; without that pruning, the notification for setting the
+attribute again would be dropped as unchanged. Verification adds neither,
+so a tracked file excluded, or a whitelisted file hidden, since the last
+publication keeps invalidating until a pass publishes.
+Ignore and attributes files (`.gitignore`, `.ignore`, `p4ignore.ini`,
+`.gitattributes`) that the walk does not list, untracked ignored files such as
+build output, and other files without recorded metadata are never dropped:
+missing evidence cannot distinguish a no-op from a new file. Creates, removes,
+renames and rescans are not filtered as unchanged files, nor are files while a
+replacement is being prepared.
 Git metadata-root modifications, remote/prefetch refs, packed refs, lock files, objects, logs,
 FETCH_HEAD and ORIG_HEAD do not invalidate content. Index and HEAD changes still
 request a tree check: index membership can affect case-insensitive ignore
@@ -1602,7 +1655,10 @@ A same-size, same-timestamp rewrite is left to a path hint or the content tier.
 Directory-entry metadata can lag active writers on Windows; metadata reuse is
 eventually consistent, not an atomic snapshot. `watch_events` reports cumulative `events`, `by_kind`
 (`access`, `create`, `modify`, `remove`, `other`, `error`),
-`unchanged_paths_filtered`, `invalidated_paths`, `full_invalidations`,
+`unchanged_paths_filtered` (of which `unchanged_excluded_filtered` matched an
+excluded tracked file's record), `unfiltered` (file notifications kept, by
+reason: `missing`, `untrusted`, `no_evidence`, `version_changed`,
+`hidden_changed`, `unavailable`), `invalidated_paths`, `full_invalidations`,
 `tree_invalidations`, `git_metadata_ignored` and
 `epoch_advances`, so watcher input churn can be measured directly. The policy reports
 `incremental_coverage: "unavailable"`, `change_journal: "not-integrated"` and

@@ -41,6 +41,9 @@ pub struct SearchOptions {
     pub count: bool,
     pub word_boundary: bool,
     pub max_count: Option<usize>,
+    /// `--max-results`: stop after the file in which this many matching lines
+    /// have been written.
+    pub max_results: Option<u64>,
     pub json: bool,
     pub vimgrep: bool,
     pub stats: bool,
@@ -245,6 +248,12 @@ impl SearchOptions {
             || self.sort.is_some()
             || self.replace.is_some()
             || self.effective_passthru())
+    }
+
+    /// Whether `--max-results` has been reached, so no further file is searched.
+    pub fn max_results_reached(&self, writer: &OutputWriter) -> bool {
+        self.max_results
+            .is_some_and(|limit| writer.written_lines() >= limit)
     }
 
     /// Resolve smart-case from literals in every supplied pattern.
@@ -1135,12 +1144,21 @@ fn search_via_server(
 ) -> Result<bool> {
     let mut stream = info.connect(SERVER_READ_TIMEOUT)?;
     let mut request = server_search_request(scope, opts, ci)?;
+    if let Some(limit) = opts.max_results
+        && opts.sort.is_none()
+    {
+        // Lets the server stop reading candidate files at the limit. One that
+        // predates the option ignores it and replies in full, and rendering
+        // applies the limit either way. A shared daemon is not sent it: that
+        // one rejects options it does not know and pages its replies. Nor is
+        // a sorted search: its limit counts files in sorted order, which the
+        // server does not search in.
+        request["params"]["max_results"] = serde_json::json!(limit);
+    }
     if opts.streams_from_server() {
         // The server then sends each chunk of files as soon as it is searched,
         // as `partial` replies ahead of the final one, and the rows are
         // printed as they arrive. One that predates the option replies once.
-        // A shared daemon is not asked: that one rejects options it does not
-        // know and pages its replies.
         request["params"]["stream"] = serde_json::json!(true);
     }
     writeln!(stream, "{request}")?;
@@ -1783,8 +1801,15 @@ fn render_server_result(
             writer.write_count(file, n)?;
         }
     } else {
+        let mut current_file = None;
         for m in matches {
             let file = m.get("file").and_then(|f| f.as_str()).unwrap_or("");
+            if current_file != Some(file) {
+                if opts.max_results_reached(writer) {
+                    break;
+                }
+                current_file = Some(file);
+            }
             if let Some(stats) = &search_stats {
                 writer.set_file_bytes_searched(stats[file]);
             }
@@ -2051,7 +2076,7 @@ fn search_local_index(
 
         if search_file(&read, &matcher, rel_path, opts, writer, explicit)? {
             had_matches = true;
-            if opts.quiet {
+            if opts.quiet || opts.max_results_reached(writer) {
                 break;
             }
         }
@@ -2265,7 +2290,7 @@ fn brute_force_search(
 
         if search_file(&read, &matcher, &rel_path, opts, writer, false)? {
             had_matches = true;
-            if opts.quiet {
+            if opts.quiet || opts.max_results_reached(writer) {
                 break;
             }
         }

@@ -1883,6 +1883,8 @@ struct SearchRequest {
     encoding: tgrep_core::encoding::EncodingMode,
     opts: SearchOpts,
     scope: SearchScope,
+    /// Stop after the file in which this many matching lines have been found.
+    max_results: Option<u64>,
     /// Send the rows of each chunk of candidates as soon as it is searched,
     /// as `partial` replies ahead of the final one.
     stream: bool,
@@ -2121,6 +2123,14 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         query::build_relaxed_multi_pattern_plan(&all_patterns, case_insensitive)
     };
 
+    let max_results = match params.get("max_results") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| "max_results must be a non-negative integer".to_string())?,
+        ),
+    };
     let stream = match params.get("stream") {
         None | Some(serde_json::Value::Null) => false,
         Some(value) => value
@@ -2138,6 +2148,7 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         ordered_filters,
         encoding,
         scope: SearchScope::parse(params)?,
+        max_results,
         stream,
         opts: SearchOpts {
             files_only,
@@ -2248,6 +2259,7 @@ fn search_with_budget(
     let pattern = req.pattern;
     let case_insensitive = req.case_insensitive;
     let scope = req.scope;
+    let max_results = req.max_results;
     let stream = req.stream;
 
     // Skip redundant prefilter stats when the index used an equally strict cap.
@@ -2511,6 +2523,8 @@ fn search_with_budget(
     let mut matches = Vec::new();
     let mut file_stats = Vec::new();
     let mut search_stats = Vec::new();
+    let mut matched_lines = 0u64;
+    let mut truncated = false;
     let mut sent_rows = 0usize;
     let mut searched = 0usize;
     // Whether a chunk has been searched whose rows are not yet with the client.
@@ -2522,6 +2536,10 @@ fn search_with_budget(
     };
     let mut unsearched = candidate_info.as_slice();
     while !unsearched.is_empty() {
+        if max_results.is_some_and(|limit| matched_lines >= limit) {
+            truncated = true;
+            break;
+        }
         if stream && part_ready {
             part_ready = false;
             let mut part = serde_json::json!({
@@ -2609,6 +2627,16 @@ fn search_with_budget(
             Err(e) => return json_rpc_error(id, -32603, &format!("{e}")),
         };
         for file in per_file {
+            if let Some(limit) = max_results {
+                // Whole files in candidate order, ending with the one that
+                // reaches the limit, so the result does not depend on how the
+                // candidates fall into chunks.
+                if matched_lines >= limit {
+                    truncated = true;
+                    break;
+                }
+                matched_lines += matched_line_count(&file.rows);
+            }
             matches.extend(file.rows);
             file_stats.extend(file.stats);
             search_stats.extend(file.search_stats);
@@ -2652,6 +2680,10 @@ fn search_with_budget(
         "multiline_replace": true,
         "report_replacements": true,
     });
+    if truncated {
+        // `max_results` ended the search before every candidate was searched.
+        result["truncated"] = serde_json::json!(true);
+    }
     if opts.stats || opts.count_matches {
         result["file_stats"] = serde_json::json!(file_stats);
     }
@@ -2668,6 +2700,48 @@ fn search_with_budget(
     }
 
     json_rpc_result(id, result)
+}
+
+/// The matching lines among one file's rows: a line with several rows counts
+/// once, and context and binary rows do not count.
+fn matched_line_count(rows: &[serde_json::Value]) -> u64 {
+    let mut count = 0;
+    let mut last_line = None;
+    for row in rows {
+        if row
+            .get("type")
+            .and_then(|kind| kind.as_str())
+            .unwrap_or("match")
+            != "match"
+        {
+            continue;
+        }
+        let line = row.get("line").and_then(|line| line.as_u64());
+        if line != last_line {
+            last_line = line;
+            count += 1;
+        }
+    }
+    count
+}
+
+#[cfg(test)]
+mod matched_line_count_tests {
+    use super::*;
+
+    #[test]
+    fn counts_lines_once() {
+        let rows = serde_json::json!([
+            {"file": "a", "line": 3, "type": "context"},
+            {"file": "a", "line": 4},
+            {"file": "a", "line": 4, "type": "match"},
+            {"file": "a", "line": 5, "type": "context"},
+            {"file": "a", "line": 9, "type": "match"},
+            {"file": "a", "type": "binary", "lines": 7},
+        ]);
+        assert_eq!(matched_line_count(rows.as_array().unwrap()), 2);
+        assert_eq!(matched_line_count(&[]), 0);
+    }
 }
 
 fn update_content_cache(

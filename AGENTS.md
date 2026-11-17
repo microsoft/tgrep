@@ -315,6 +315,11 @@ legacy-format support for migration.
 
 ## Keep `index`, `serve` and search flags aligned
 
+`--max-results <N>` ends a search after the file in which the N-th matching
+line is found, and a server stops reading files there. Prefer it to piping
+into `head` when a pattern may be broad: the output is whole files, and the
+search itself is cut short.
+
 Some flags describe the index, so `index`, `serve` and search have to agree on
 them. If they differ, the client either cannot find the server or silently
 searches a different set of files.

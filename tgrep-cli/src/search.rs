@@ -1271,6 +1271,7 @@ fn render_server_reply(
     writer: &mut OutputWriter,
 ) -> Result<bool> {
     let mut had_matches = false;
+    let counted = writer.work_counted();
     loop {
         let part = (|| -> Result<(bool, bool)> {
             let line = pending
@@ -1301,8 +1302,12 @@ fn render_server_reply(
                 }
             }
             // Nothing has been reported yet, so the search can still be done
-            // another way.
-            Err(error) if !had_matches => return Err(error),
+            // another way. Parts without matches have counted the files they
+            // searched, which that search will count again.
+            Err(error) if !had_matches => {
+                writer.restore_work(counted);
+                return Err(error);
+            }
             Err(error) => {
                 // Searching again another way would print the files already
                 // reported a second time.
@@ -3055,7 +3060,7 @@ mod pending_reply_tests {
     use super::*;
 
     #[test]
-    fn lines_come_out_in_order_until_the_reply_ends() {
+    fn in_order() {
         let pending = PendingReply::default();
         assert!(pending.push(Ok("one\n".into())));
         assert!(pending.push(Ok("two\n".into())));
@@ -3067,7 +3072,7 @@ mod pending_reply_tests {
     }
 
     #[test]
-    fn a_full_queue_holds_the_reader_until_a_line_is_taken() {
+    fn full_queue_blocks() {
         let pending = std::sync::Arc::new(PendingReply::default());
         let big = "x".repeat(MAX_PENDING_REPLY_BYTES);
         assert!(pending.push(Ok(big)));
@@ -3091,7 +3096,7 @@ mod pending_reply_tests {
     }
 
     #[test]
-    fn stopping_releases_a_waiting_reader() {
+    fn stop_releases_reader() {
         let pending = std::sync::Arc::new(PendingReply::default());
         assert!(pending.push(Ok("x".repeat(MAX_PENDING_REPLY_BYTES))));
         let reader = {

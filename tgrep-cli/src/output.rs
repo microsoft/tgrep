@@ -378,6 +378,18 @@ impl OutputWriter {
         self.all_searches += 1;
     }
 
+    /// The files and bytes counted as searched so far, for [`Self::restore_work`].
+    pub fn work_counted(&self) -> (u64, u64) {
+        (self.all_bytes_searched, self.all_searches)
+    }
+
+    /// Forget work counted since `counted` was taken. A search that is given
+    /// up before it reported anything is done again another way, which counts
+    /// the same files itself.
+    pub fn restore_work(&mut self, counted: (u64, u64)) {
+        (self.all_bytes_searched, self.all_searches) = counted;
+    }
+
     /// Remote work is counted before rendering, including files without rows.
     pub fn set_file_bytes_searched(&mut self, bytes: u64) {
         self.pending_bytes_searched = bytes;

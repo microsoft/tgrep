@@ -6,9 +6,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -134,7 +135,7 @@ fn cli_lines(args: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn a_streamed_search_arrives_in_parts_that_add_up_to_the_whole() {
+fn parts_add_up() {
     let fixture = setup_fixture();
     let root = fixture.path().to_str().unwrap();
     let index = TempDir::new().unwrap();
@@ -195,4 +196,250 @@ fn a_streamed_search_arrives_in_parts_that_add_up_to_the_whole() {
         streamed.iter().collect::<BTreeSet<_>>(),
         sorted.iter().collect::<BTreeSet<_>>()
     );
+}
+
+/// Index a fresh fixture and return it with its index directory.
+fn indexed_fixture() -> (TempDir, TempDir, std::path::PathBuf) {
+    let fixture = setup_fixture();
+    let index = TempDir::new().unwrap();
+    let index_dir = index.path().join("index");
+    let output = Command::new(tgrep_bin())
+        .args(["index", fixture.path().to_str().unwrap(), "--index-path"])
+        .arg(&index_dir)
+        .output()
+        .expect("failed to run tgrep index");
+    assert!(
+        output.status.success(),
+        "index build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (fixture, index, index_dir)
+}
+
+/// The first `partial` reply a real server sends for the fixture, for a stub
+/// to replay. The server is stopped again before this returns.
+fn first_part_from_a_server(root: &Path, index_dir: &Path) -> serde_json::Value {
+    let child = Command::new(tgrep_bin())
+        .arg("serve")
+        .arg(root)
+        .arg("--index-path")
+        .arg(index_dir)
+        .arg("--no-watch")
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn tgrep serve");
+    let _guard = ServerGuard { child };
+    let port = wait_for_port(index_dir);
+    let mut parts = search_replies(port, serde_json::json!({"pattern": MARKER, "stream": true}));
+    assert!(parts.len() >= 2, "{} replies", parts.len());
+    let first = parts.swap_remove(0);
+    assert_eq!(first["partial"], true);
+    assert!(!first["matches"].as_array().unwrap().is_empty());
+    first
+}
+
+const STUB_INSTANCE: &str = "stub-server";
+
+/// Run `client` against a stand-in for a server: a listener recorded in
+/// `serve.json` that reads one search request and leaves `serve` to answer it.
+fn with_stub_server<T>(
+    index_dir: &Path,
+    serve: impl FnOnce(serde_json::Value, TcpStream) + Send,
+    client: impl FnOnce() -> T,
+) -> T {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    fs::write(
+        index_dir.join("serve.json"),
+        serde_json::json!({
+            "pid": std::process::id(),
+            "port": listener.local_addr().unwrap().port(),
+            "instance": STUB_INSTANCE,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    thread::scope(|scope| {
+        let stub = scope.spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "the client did not connect");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let mut request = String::new();
+            BufReader::new(&stream).read_line(&mut request).unwrap();
+            serve(serde_json::from_str(&request).unwrap(), stream);
+        });
+        let result = client();
+        stub.join().unwrap();
+        result
+    })
+}
+
+fn stub_reply(result: &serde_json::Value) -> String {
+    serde_json::json!({"jsonrpc": "2.0", "id": 1, "instance": STUB_INSTANCE, "result": result})
+        .to_string()
+}
+
+#[test]
+fn cli_prints_parts_as_they_arrive() {
+    let (fixture, _index, index_dir) = indexed_fixture();
+    let first = first_part_from_a_server(fixture.path(), &index_dir);
+    let rows = first["matches"].as_array().unwrap().len();
+
+    let (shown, part_shown) = mpsc::channel::<()>();
+    let (status, printed) = with_stub_server(
+        &index_dir,
+        move |request, stream| {
+            assert_eq!(request["params"]["stream"], true, "{request}");
+            writeln!(&stream, "{}", stub_reply(&first)).unwrap();
+            // The rest is held back until the first part is on the CLI's
+            // stdout, which a client that waited for the whole reply would
+            // never reach.
+            part_shown
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the first part was not printed before the final reply");
+            let mut last = first.clone();
+            last.as_object_mut().unwrap().remove("partial");
+            last["matches"] = serde_json::json!([]);
+            writeln!(&stream, "{}", stub_reply(&last)).unwrap();
+        },
+        || {
+            let child = Command::new(tgrep_bin())
+                .args(["--color", "never", "--no-heading", "-n", "--index-path"])
+                .arg(&index_dir)
+                .arg(MARKER)
+                .arg(fixture.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("failed to run tgrep");
+            let mut search = ServerGuard { child };
+            let stdout = search.child.stdout.take().unwrap();
+            let (line_out, lines) = mpsc::channel();
+            let reader = thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    if line_out.send(line.unwrap()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut printed = Vec::new();
+            while printed.len() < rows {
+                let line = lines
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("the first part was not printed while the reply was still open");
+                printed.push(line);
+            }
+            shown.send(()).unwrap();
+            let status = search.child.wait().unwrap();
+            reader.join().unwrap();
+            printed.extend(lines.try_iter());
+            (status, printed)
+        },
+    );
+    assert!(status.success(), "{status}");
+    assert_eq!(printed.len(), rows, "only the first part had rows");
+}
+
+#[test]
+fn truncated_reply_is_not_retried() {
+    let (fixture, _index, index_dir) = indexed_fixture();
+    let first = first_part_from_a_server(fixture.path(), &index_dir);
+    let rows = first["matches"].as_array().unwrap().len();
+    assert!(rows < FILES);
+
+    // The server sends one part with matches and then closes the connection.
+    let output = with_stub_server(
+        &index_dir,
+        move |_request, stream| writeln!(&stream, "{}", stub_reply(&first)).unwrap(),
+        || {
+            Command::new(tgrep_bin())
+                .args(["--color", "never", "--no-heading", "-n", "--index-path"])
+                .arg(&index_dir)
+                .arg(MARKER)
+                .arg(fixture.path())
+                .output()
+                .expect("failed to run tgrep")
+        },
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("results are incomplete"), "{stderr}");
+    assert!(!stderr.contains("falling back"), "{stderr}");
+    let printed: Vec<&str> = stdout.lines().collect();
+    assert_eq!(printed.len(), rows, "the part's rows and nothing else");
+    assert_eq!(
+        printed.iter().collect::<BTreeSet<_>>().len(),
+        rows,
+        "every row once"
+    );
+}
+
+/// The `stats` of the `summary` line of a `--json` search.
+fn json_summary_stats(index_dir: &Path, root: &Path) -> (serde_json::Value, String) {
+    let output = Command::new(tgrep_bin())
+        .args(["--json", "--index-path"])
+        .arg(index_dir)
+        .arg(MARKER)
+        .arg(root)
+        .output()
+        .expect("failed to run tgrep");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    let summary = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["type"] == "summary")
+        .expect("a summary line");
+    (summary["data"]["stats"].clone(), stderr)
+}
+
+#[test]
+fn fallback_does_not_double_count() {
+    let (fixture, _index, index_dir) = indexed_fixture();
+    let (alone, _) = json_summary_stats(&index_dir, fixture.path());
+    assert_eq!(alone["searches"], FILES);
+
+    // A part that searched three files without a match, then the connection
+    // closes: nothing was reported, so the client searches the index itself.
+    let part = serde_json::json!({
+        "partial": true,
+        "matches": [],
+        "candidates": FILES,
+        "searched": 3,
+        "hidden_complete": true,
+        "ordered_filters": true,
+        "multiline_replace": true,
+        "report_replacements": true,
+        "search_stats": [
+            {"file": "dir00/file000.txt", "bytes_searched": 30, "binary_offset": null},
+            {"file": "dir01/file001.txt", "bytes_searched": 30, "binary_offset": null},
+            {"file": "dir02/file002.txt", "bytes_searched": 30, "binary_offset": null},
+        ],
+    });
+    let (after_fallback, stderr) = with_stub_server(
+        &index_dir,
+        move |_request, stream| writeln!(&stream, "{}", stub_reply(&part)).unwrap(),
+        || json_summary_stats(&index_dir, fixture.path()),
+    );
+    // The part was accepted and the reply then ended, which is what makes the
+    // client fall back.
+    assert!(stderr.contains("server closed the connection"), "{stderr}");
+    assert!(stderr.contains("falling back"), "{stderr}");
+    for counter in ["searches", "bytes_searched", "matches", "matched_lines"] {
+        assert_eq!(after_fallback[counter], alone[counter], "{counter}");
+    }
 }

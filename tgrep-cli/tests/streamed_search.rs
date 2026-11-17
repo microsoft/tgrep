@@ -359,32 +359,49 @@ fn truncated_reply_is_not_retried() {
     let rows = first["matches"].as_array().unwrap().len();
     assert!(rows < FILES);
 
-    // The server sends one part with matches and then closes the connection.
-    let output = with_stub_server(
-        &index_dir,
-        move |_request, stream| writeln!(&stream, "{}", stub_reply(&first)).unwrap(),
-        || {
-            Command::new(tgrep_bin())
-                .args(["--color", "never", "--no-heading", "-n", "--index-path"])
-                .arg(&index_dir)
-                .arg(MARKER)
-                .arg(fixture.path())
-                .output()
-                .expect("failed to run tgrep")
-        },
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(output.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("results are incomplete"), "{stderr}");
-    assert!(!stderr.contains("falling back"), "{stderr}");
-    let printed: Vec<&str> = stdout.lines().collect();
-    assert_eq!(printed.len(), rows, "the part's rows and nothing else");
-    assert_eq!(
-        printed.iter().collect::<BTreeSet<_>>().len(),
-        rows,
-        "every row once"
-    );
+    // The server sends one part with matches. Then it either closes the
+    // connection or reports an error.
+    let failure = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "instance": STUB_INSTANCE,
+        "error": {"code": -32603, "message": "response exceeds 64 MiB; narrow the query or scan"},
+    })
+    .to_string();
+    for ending in [None, Some(failure)] {
+        let part = first.clone();
+        let sent = ending.clone();
+        let output = with_stub_server(
+            &index_dir,
+            move |_request, stream| {
+                writeln!(&stream, "{}", stub_reply(&part)).unwrap();
+                if let Some(error) = sent {
+                    writeln!(&stream, "{error}").unwrap();
+                }
+            },
+            || {
+                Command::new(tgrep_bin())
+                    .args(["--color", "never", "--no-heading", "-n", "--index-path"])
+                    .arg(&index_dir)
+                    .arg(MARKER)
+                    .arg(fixture.path())
+                    .output()
+                    .expect("failed to run tgrep")
+            },
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(2), "{ending:?}: {stderr}");
+        assert!(stderr.contains("results are incomplete"), "{stderr}");
+        assert!(!stderr.contains("falling back"), "{stderr}");
+        let printed: Vec<&str> = stdout.lines().collect();
+        assert_eq!(printed.len(), rows, "the part's rows and nothing else");
+        assert_eq!(
+            printed.iter().collect::<BTreeSet<_>>().len(),
+            rows,
+            "every row once"
+        );
+    }
 }
 
 /// The `stats` of the `summary` line of a `--json` search.

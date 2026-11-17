@@ -2210,6 +2210,24 @@ fn handle_search_streaming(
     state: &ServerState,
     send_part: &dyn Fn(&str) -> bool,
 ) -> String {
+    search_with_budget(
+        id,
+        params,
+        state,
+        send_part,
+        tgrep_core::managed::MAX_RESPONSE_BYTES,
+    )
+}
+
+/// [`handle_search_streaming`] with the size one reply may have as a
+/// parameter, so that tests can reach it with a few files.
+fn search_with_budget(
+    id: Option<serde_json::Value>,
+    params: &serde_json::Value,
+    state: &ServerState,
+    send_part: &dyn Fn(&str) -> bool,
+    reply_budget: usize,
+) -> String {
     let start = Instant::now();
     // Marks the server as in use, so the periodic reconcile waits for a gap
     // rather than walking the tree underneath a client that is mid-session.
@@ -2448,7 +2466,7 @@ fn handle_search_streaming(
     // falls back to its local index rather than the server buffering an
     // unbounded response. A streamed search sends each chunk's rows as a
     // reply of their own, and the budget starts afresh for the next.
-    let remaining = std::sync::atomic::AtomicUsize::new(tgrep_core::managed::MAX_RESPONSE_BYTES);
+    let remaining = std::sync::atomic::AtomicUsize::new(reply_budget);
     let mut resolve_time = Duration::ZERO;
     let mut search_time = Duration::ZERO;
     let mut matches = Vec::new();
@@ -2492,7 +2510,7 @@ fn handle_search_streaming(
                 );
                 return json_rpc_error(id, -32000, "search abandoned: the client stopped reading");
             }
-            remaining.store(tgrep_core::managed::MAX_RESPONSE_BYTES, Ordering::Release);
+            remaining.store(reply_budget, Ordering::Release);
         }
         let (chunk, later) = unsearched.split_at(chunk_files.min(unsearched.len()));
         unsearched = later;
@@ -2546,7 +2564,7 @@ fn handle_search_streaming(
                 searched -= chunk.len();
                 unsearched = &candidate_info[searched..];
                 chunk_files = chunk.len() / 2;
-                remaining.store(tgrep_core::managed::MAX_RESPONSE_BYTES, Ordering::Release);
+                remaining.store(reply_budget, Ordering::Release);
                 continue;
             }
             Err(e) => return json_rpc_error(id, -32603, &format!("{e}")),
@@ -10120,6 +10138,124 @@ mod tests {
             last_search_ms: std::sync::atomic::AtomicU64::new(0),
             stale_refresh_hook: Mutex::new(None),
         })
+    }
+
+    /// `files` indexed files with one matching line each: their directory,
+    /// their index and a server state for them.
+    fn needle_files(files: usize) -> (TempDir, PathBuf, PathBuf, Arc<ServerState>) {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        for at in 0..files {
+            let dir = root.join(format!("dir{:02}", at % 8));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("file{at:03}.txt")),
+                format!("needle {at}\n"),
+            )
+            .unwrap();
+        }
+        let index_dir = temp.path().join("index");
+        builder::build_index(&root, Some(&index_dir), true, false, &[]).unwrap();
+        let state = test_server_state_from_index(&root, &index_dir);
+        (temp, root, index_dir, state)
+    }
+
+    /// The files of an unstreamed search for `needle`, in candidate order.
+    fn needle_order(state: &ServerState) -> Vec<String> {
+        let whole: serde_json::Value = serde_json::from_str(&handle_search(
+            None,
+            &serde_json::json!({"pattern": "needle"}),
+            state,
+        ))
+        .unwrap();
+        row_files(std::slice::from_ref(&whole))
+    }
+
+    /// The replies to a streamed search for `needle` when one reply may hold
+    /// `budget` bytes: the parts sent, then the final reply.
+    fn streamed_needles(state: &ServerState, budget: usize) -> Vec<serde_json::Value> {
+        let parts = std::cell::RefCell::new(Vec::new());
+        let last = search_with_budget(
+            None,
+            &serde_json::json!({"pattern": "needle", "stream": true}),
+            state,
+            &|part| {
+                parts.borrow_mut().push(serde_json::from_str(part).unwrap());
+                true
+            },
+            budget,
+        );
+        let mut replies: Vec<serde_json::Value> = parts.into_inner();
+        replies.push(serde_json::from_str(&last).unwrap());
+        replies
+    }
+
+    fn row_files(replies: &[serde_json::Value]) -> Vec<String> {
+        replies
+            .iter()
+            .filter_map(|reply| reply["result"]["matches"].as_array())
+            .flatten()
+            .map(|row| row["file"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// A chunk whose rows overflow one reply is searched again as smaller
+    /// ones, after earlier parts have gone out. Every row still arrives once
+    /// and in order.
+    #[test]
+    fn oversized_chunk_is_split() {
+        const FILES: usize = 300;
+        let (_temp, _root, _index_dir, state) = needle_files(FILES);
+        let expected = needle_order(&state);
+        assert_eq!(expected.len(), FILES);
+
+        let roomy = streamed_needles(&state, tgrep_core::managed::MAX_RESPONSE_BYTES);
+        assert_eq!(roomy.len(), 2, "chunks of 64 and 236 files");
+
+        // Too small for the rows of 64 files.
+        let tight = streamed_needles(&state, 2048);
+        let (last, parts) = tight.split_last().unwrap();
+        assert!(parts.len() > 8, "{} parts", parts.len());
+        let mut sizes = Vec::new();
+        for part in parts {
+            assert_eq!(part["result"]["partial"], true, "{part}");
+            sizes.push(part["result"]["matches"].as_array().unwrap().len());
+        }
+        // No part is a whole first chunk, and none is empty.
+        assert!(
+            sizes
+                .iter()
+                .all(|size| (1..STREAM_FIRST_CHUNK_FILES).contains(size)),
+            "{sizes:?}"
+        );
+        // Chunks grow again after a part that fit. A part smaller than the
+        // one before it is such a chunk, split after that part was sent.
+        assert!(sizes.windows(2).any(|pair| pair[1] < pair[0]), "{sizes:?}");
+        assert!(last.get("error").is_none(), "{last}");
+        assert_eq!(last["result"]["num_matches"], FILES);
+        assert_eq!(row_files(&tight), expected);
+    }
+
+    /// A file whose own rows overflow one reply cannot be sent, so the search
+    /// ends with an error, after parts with every file ahead of it.
+    #[test]
+    fn oversized_file_fails() {
+        const FILES: usize = 300;
+        let (_temp, root, index_dir, state) = needle_files(FILES);
+        let order = needle_order(&state);
+        // Candidate order differs from one index build to the next, so the
+        // large file is made out of the one in the middle of this build's.
+        let big_at = FILES / 2;
+        std::fs::write(root.join(&order[big_at]), "needle again\n".repeat(400)).unwrap();
+        // A fresh state, which has not cached that file's one line.
+        let state = test_server_state_from_index(&root, &index_dir);
+
+        let replies = streamed_needles(&state, 2048);
+        let (last, parts) = replies.split_last().unwrap();
+        let message = last["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("response exceeds"), "{last}");
+        assert!(!parts.is_empty());
+        assert_eq!(row_files(parts), order[..big_at]);
     }
 
     fn install_reader_file(

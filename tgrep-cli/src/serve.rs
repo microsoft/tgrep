@@ -2284,9 +2284,9 @@ fn handle_search(
     // Resolve file contents from cache (LRU) or disk.
     // Two-phase approach: read-lock for cache hits, then disk I/O outside the
     // lock, then a single write-lock to promote hits and insert misses.
-    let read_candidate = |path: &Path| {
+    let read_candidate = |rel_path: &str, opened: std::io::Result<std::fs::File>| {
         let read = (|| -> std::io::Result<Option<Vec<u8>>> {
-            let mut file = open_within_root(state, path)?;
+            let mut file = opened?;
             let length = file.metadata()?.len();
             if opts.max_filesize.is_some_and(|limit| length > limit) {
                 return Ok(None);
@@ -2306,13 +2306,70 @@ fn handle_search(
         match read {
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!(
-                    "warning: cannot read indexed file {}: {error}",
-                    path.display()
-                );
+                eprintln!("warning: cannot read indexed file {rel_path:?}: {error}");
                 None
             }
         }
+    };
+    // Read and decode files from disk, returned in the order given. A lone
+    // open walks and verifies every ancestor directory, which costs far more
+    // than reading a source file. So the files are grouped by directory:
+    // each group pins its ancestors once, and the groups run in parallel.
+    let read_from_disk = |paths: Vec<String>,
+                          encoding: tgrep_core::encoding::EncodingMode|
+     -> Vec<(String, Arc<DecodedFile>)> {
+        let mut order: Vec<usize> = (0..paths.len()).collect();
+        order.sort_by(|&left, &right| paths[left].cmp(&paths[right]));
+        let sorted: Vec<String> = order.iter().map(|&at| paths[at].clone()).collect();
+        let groups: Vec<&[String]> = tgrep_core::rooted::sibling_batches(&sorted).collect();
+        let read: Vec<Vec<Option<Arc<DecodedFile>>>> = groups
+            .par_iter()
+            .map(|siblings| {
+                let parent = Path::new(&siblings[0]).parent().unwrap_or(Path::new(""));
+                // A directory that is missing or that changes while it is read
+                // fails its whole group. Its files are then opened one at a
+                // time, so that each is read or reported on its own.
+                let one_at_a_time = || -> Vec<Option<Arc<DecodedFile>>> {
+                    siblings
+                        .iter()
+                        .map(|rel_path| {
+                            let opened = state.rooted.open_file(Path::new(rel_path));
+                            let bytes = read_candidate(rel_path, opened)?;
+                            Some(Arc::new(DecodedFile::new(bytes, encoding)))
+                        })
+                        .collect()
+                };
+                let Ok(batch) = state.rooted.read_batch(parent) else {
+                    return one_at_a_time();
+                };
+                let files: Vec<Option<Arc<DecodedFile>>> = siblings
+                    .iter()
+                    .map(|rel_path| {
+                        // Lossy, like the local path: refusing invalid UTF-8
+                        // would make UTF-16 and Latin-1 sources silently
+                        // invisible over the server while the same query
+                        // works with --no-index.
+                        let bytes = read_candidate(rel_path, batch.open_file(Path::new(rel_path)))?;
+                        Some(Arc::new(DecodedFile::new(bytes, encoding)))
+                    })
+                    .collect();
+                // The files were only read through the directories this
+                // group pinned if those are still the indexed ones.
+                if batch.finish().is_err() {
+                    return one_at_a_time();
+                }
+                files
+            })
+            .collect();
+        let mut by_position: Vec<Option<Arc<DecodedFile>>> = vec![None; paths.len()];
+        for (&at, file) in order.iter().zip(read.into_iter().flatten()) {
+            by_position[at] = file;
+        }
+        paths
+            .into_iter()
+            .zip(by_position)
+            .filter_map(|(rel_path, file)| Some((rel_path, file?)))
+            .collect()
     };
     let resolve_chunk = |chunk: &[(String, PathBuf)]| -> Vec<(String, Arc<DecodedFile>)> {
         if encoding.may_differ_from_index() {
@@ -2321,25 +2378,17 @@ fn handle_search(
             // different `--encoding` must neither read those entries nor write
             // its own, or one client's `-E sjis` would silently change what
             // the next client sees.
-            return chunk
-                .iter()
-                .filter_map(|(rel_path, full_path)| {
-                    let bytes = read_candidate(full_path)?;
-                    Some((
-                        rel_path.clone(),
-                        Arc::new(DecodedFile::new(bytes, encoding)),
-                    ))
-                })
-                .collect();
+            let paths = chunk.iter().map(|(rel_path, _)| rel_path.clone()).collect();
+            return read_from_disk(paths, encoding);
         }
         let cache_generation = state.cache_generation.load(Ordering::SeqCst);
         // Phase 1: read-lock to find cache hits (peek avoids write-lock need)
         let mut hit_keys: Vec<String> = Vec::new();
         let mut hits: Vec<(String, Arc<DecodedFile>)> = Vec::with_capacity(chunk.len());
-        let mut misses: Vec<(String, PathBuf)> = Vec::new();
+        let mut misses: Vec<String> = Vec::new();
         {
             let cache = state.cache.read().unwrap();
-            for (rel_path, full_path) in chunk {
+            for (rel_path, _) in chunk {
                 if let Some(cached) = cache.peek(rel_path).filter(|cached| {
                     opts.max_filesize
                         .is_none_or(|limit| cached.source_bytes <= limit)
@@ -2347,23 +2396,13 @@ fn handle_search(
                     hit_keys.push(rel_path.clone());
                     hits.push((rel_path.clone(), Arc::clone(cached)));
                 } else {
-                    misses.push((rel_path.clone(), full_path.clone()));
+                    misses.push(rel_path.clone());
                 }
             }
         } // read lock released
 
         // Phase 2: read cache misses from disk (no lock held)
-        let disk_results: Vec<(String, Arc<DecodedFile>)> = misses
-            .into_iter()
-            .filter_map(|(rel_path, full_path)| {
-                // Lossy, like the local path: refusing invalid UTF-8 would make
-                // UTF-16 and Latin-1 sources silently invisible over the server
-                // while the same query works with --no-index.
-                let bytes = read_candidate(&full_path)?;
-                let decoded = DecodedFile::new(bytes, tgrep_core::encoding::EncodingMode::Auto);
-                Some((rel_path, Arc::new(decoded)))
-            })
-            .collect();
+        let disk_results = read_from_disk(misses, tgrep_core::encoding::EncodingMode::Auto);
 
         // Phase 3: single write-lock to promote hits and insert misses
         if !hit_keys.is_empty() || !disk_results.is_empty() {

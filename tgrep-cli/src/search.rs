@@ -232,6 +232,21 @@ fn metadata_time_key(md: &std::fs::Metadata, key: SortKey) -> Option<std::time::
 }
 
 impl SearchOptions {
+    /// Whether a server may send this search's rows in parts, to be printed
+    /// as they arrive. That suits output made of one file's rows after
+    /// another; anything computed over the whole result needs it in one piece.
+    fn streams_from_server(&self) -> bool {
+        !(self.stats
+            || self.count
+            || self.count_matches
+            || self.files_only
+            || self.files_without_match
+            || self.quiet
+            || self.sort.is_some()
+            || self.replace.is_some()
+            || self.effective_passthru())
+    }
+
     /// Resolve smart-case from literals in every supplied pattern.
     pub fn effective_case_insensitive(&self) -> Result<bool> {
         // `-s` wins over `-S`, matching ripgrep, but `-i` still wins over `-s`.
@@ -1119,25 +1134,193 @@ fn search_via_server(
     writer: &mut OutputWriter,
 ) -> Result<bool> {
     let mut stream = info.connect(SERVER_READ_TIMEOUT)?;
-    let request = server_search_request(scope, opts, ci)?;
+    let mut request = server_search_request(scope, opts, ci)?;
+    if opts.streams_from_server() {
+        // The server then sends each chunk of files as soon as it is searched,
+        // as `partial` replies ahead of the final one, and the rows are
+        // printed as they arrive. One that predates the option replies once.
+        // A shared daemon is not asked: that one rejects options it does not
+        // know and pages its replies.
+        request["params"]["stream"] = serde_json::json!(true);
+    }
     writeln!(stream, "{request}")?;
     stream.flush()?;
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let response: serde_json::Value = serde_json::from_str(&line)?;
-    info.verify_response(&response)?;
-    if let Some(error) = response.get("error") {
-        let msg = error
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error");
-        anyhow::bail!("server error: {msg}");
+    // The reply is read on a thread of its own, so the server does not wait
+    // for this process's output: whoever reads that output may pause (a
+    // pager, a slow pipe), and the server would take a reply it cannot send
+    // for a client that has gone. An empty line stands for the end of the
+    // reply.
+    //
+    // The thread is left to end by itself rather than joined: it may be
+    // waiting for more from a peer that keeps the connection open, and
+    // shutting the socket down does not wake a blocked read on every
+    // platform. It holds nothing but its own handle to the socket.
+    let reader_stream = stream.try_clone()?;
+    let pending = std::sync::Arc::new(PendingReply::default());
+    let reader_pending = std::sync::Arc::clone(&pending);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader_stream);
+        loop {
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).map(|_| line);
+            let ended = !matches!(&read, Ok(line) if !line.is_empty());
+            if !reader_pending.push(read) || ended {
+                break;
+            }
+        }
+    });
+    let outcome = render_server_reply(
+        &pending, info, &request, root, index_root, scope, opts, writer,
+    );
+    pending.stop_reading();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    outcome
+}
+
+/// How much of a reply may wait to be rendered: four replies of the largest
+/// size a server sends. Tests fill it with far less.
+const MAX_PENDING_REPLY_BYTES: usize = if cfg!(test) {
+    1024
+} else {
+    4 * tgrep_core::managed::MAX_RESPONSE_BYTES
+};
+
+/// The lines of a server's reply that have been read but not yet rendered.
+///
+/// Reading ahead keeps a reader of this process's output that pauses from
+/// holding up the server, but only up to [`MAX_PENDING_REPLY_BYTES`]: beyond
+/// that the lines stay with the server, so a huge result behind a stalled
+/// reader costs a bounded amount of memory. The bound on the process is
+/// about twice the queue: one more line is admitted while the queue is still
+/// under its limit, the reader holds the line it is waiting to add, and the
+/// line being rendered has left the queue. A server that then waits longer
+/// than its write timeout gives up, and the reply ends early.
+#[derive(Default)]
+struct PendingReply {
+    state: std::sync::Mutex<PendingLines>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PendingLines {
+    lines: std::collections::VecDeque<std::io::Result<String>>,
+    bytes: usize,
+    /// No more lines will be pushed.
+    ended: bool,
+    /// No more lines will be taken.
+    stopped: bool,
+}
+
+impl PendingReply {
+    /// Add a line, or the error or empty line that ends the reply, waiting
+    /// while too much is pending. Returns whether more lines are wanted.
+    fn push(&self, line: std::io::Result<String>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while state.bytes >= MAX_PENDING_REPLY_BYTES && !state.stopped {
+            state = self.changed.wait(state).unwrap();
+        }
+        if state.stopped {
+            return false;
+        }
+        match &line {
+            Ok(line) if !line.is_empty() => state.bytes += line.len(),
+            _ => state.ended = true,
+        }
+        state.lines.push_back(line);
+        self.changed.notify_all();
+        true
     }
-    let result = response
-        .get("result")
-        .ok_or_else(|| anyhow::anyhow!("no result in response"))?;
-    render_server_result(result, &request, root, index_root, scope, opts, writer)
+
+    /// The next line, waiting for one to arrive; `None` once the reply has
+    /// ended and every line has been taken.
+    fn next(&self) -> Option<std::io::Result<String>> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(line) = state.lines.pop_front() {
+                if let Ok(line) = &line {
+                    state.bytes -= line.len();
+                }
+                self.changed.notify_all();
+                return Some(line);
+            }
+            if state.ended {
+                return None;
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    /// Let go of a reader that is waiting to push.
+    fn stop_reading(&self) {
+        self.state.lock().unwrap().stopped = true;
+        self.changed.notify_all();
+    }
+}
+
+/// Render the reply to a search request as its lines arrive: any `partial`
+/// results, then the final one.
+#[allow(clippy::too_many_arguments)]
+fn render_server_reply(
+    pending: &PendingReply,
+    info: &ServerInfo,
+    request: &serde_json::Value,
+    root: &Path,
+    index_root: &Path,
+    scope: &IndexScope,
+    opts: &SearchOptions,
+    writer: &mut OutputWriter,
+) -> Result<bool> {
+    let mut had_matches = false;
+    let counted = writer.work_counted();
+    loop {
+        let part = (|| -> Result<(bool, bool)> {
+            let line = pending
+                .next()
+                .context("the server reply ended without a final result")??;
+            anyhow::ensure!(!line.is_empty(), "server closed the connection");
+            let response: serde_json::Value = serde_json::from_str(&line)?;
+            info.verify_response(&response)?;
+            if let Some(error) = response.get("error") {
+                let msg = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                anyhow::bail!("server error: {msg}");
+            }
+            let result = response
+                .get("result")
+                .ok_or_else(|| anyhow::anyhow!("no result in response"))?;
+            let matched =
+                render_server_result(result, request, root, index_root, scope, opts, writer)?;
+            Ok((matched, !flag_set(result, "partial")))
+        })();
+        match part {
+            Ok((matched, last)) => {
+                had_matches |= matched;
+                if last {
+                    return Ok(had_matches);
+                }
+            }
+            // Nothing has been reported yet, so the search can still be done
+            // another way. Parts without matches have counted the files they
+            // searched, which that search will count again.
+            Err(error) if !had_matches => {
+                writer.restore_work(counted);
+                return Err(error);
+            }
+            Err(error) => {
+                // Searching again another way would print the files already
+                // reported a second time.
+                crate::ERRORED.store(true, std::sync::atomic::Ordering::SeqCst);
+                if !opts.no_messages {
+                    eprintln!(
+                        "tgrep: the server's reply ended early ({error}); results are incomplete"
+                    );
+                }
+                return Ok(had_matches);
+            }
+        }
+    }
 }
 
 fn server_search_request(
@@ -2869,6 +3052,60 @@ pub(crate) fn plan_summary(plan: &QueryPlan) -> String {
             format!("OR({})", subs.join(", "))
         }
         QueryPlan::MatchAll => "MatchAll (full scan)".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod pending_reply_tests {
+    use super::*;
+
+    #[test]
+    fn in_order() {
+        let pending = PendingReply::default();
+        assert!(pending.push(Ok("one\n".into())));
+        assert!(pending.push(Ok("two\n".into())));
+        assert!(pending.push(Ok(String::new())));
+        assert_eq!(pending.next().unwrap().unwrap(), "one\n");
+        assert_eq!(pending.next().unwrap().unwrap(), "two\n");
+        assert_eq!(pending.next().unwrap().unwrap(), "");
+        assert!(pending.next().is_none());
+    }
+
+    #[test]
+    fn full_queue_blocks() {
+        let pending = std::sync::Arc::new(PendingReply::default());
+        let big = "x".repeat(MAX_PENDING_REPLY_BYTES);
+        assert!(pending.push(Ok(big)));
+        let pushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (pending, pushed) = (pending.clone(), pushed.clone());
+            std::thread::spawn(move || {
+                let wanted = pending.push(Ok("next\n".into()));
+                pushed.store(true, std::sync::atomic::Ordering::SeqCst);
+                wanted
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!pushed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            pending.next().unwrap().unwrap().len(),
+            MAX_PENDING_REPLY_BYTES
+        );
+        assert!(reader.join().unwrap());
+        assert_eq!(pending.next().unwrap().unwrap(), "next\n");
+    }
+
+    #[test]
+    fn stop_releases_reader() {
+        let pending = std::sync::Arc::new(PendingReply::default());
+        assert!(pending.push(Ok("x".repeat(MAX_PENDING_REPLY_BYTES))));
+        let reader = {
+            let pending = pending.clone();
+            std::thread::spawn(move || pending.push(Ok("unwanted\n".into())))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        pending.stop_reading();
+        assert!(!reader.join().unwrap());
     }
 }
 

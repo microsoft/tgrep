@@ -825,7 +825,12 @@ exit code determined by the search alone. Suppress the message with
    overlay in `HybridIndex`. Updates take precedence over disk entries.
    Clients use JSON-RPC 2.0 over newline-delimited TCP on loopback, with one
    thread per connection. Shared read locks allow concurrent queries but can
-   contend with writers.
+   contend with writers. A `search` request with `"stream": true` is answered
+   in several lines with the same `id`: results marked `"partial": true`, each
+   with the rows of the candidates searched since the last one and the
+   `candidates` and `searched` counts so far, then the final result with the
+   remaining rows. The CLI asks for this when it prints one file's rows after
+   another, and prints each part as it arrives.
 
 The server's content cache is limited to 50,000 entries and 1 GiB of decoded
 content, with a 64 MiB per-entry limit. `--files` combines content-index paths

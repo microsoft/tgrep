@@ -345,6 +345,44 @@ fn multiline_counts_source_lines() {
     assert_eq!(limited["truncated"], true, "{limited}");
 }
 
+/// A binary file that a directory search does not report does not use up the
+/// limit either, whichever backend finds it.
+#[test]
+fn hidden_binary_not_counted() {
+    const TEXT_FILES: usize = 4;
+    let dir = TempDir::new().unwrap();
+    // Binary only past the part of a file that indexing inspects, so these
+    // are candidates of an indexed search too.
+    let mut late_binary = format!("{MARKER}\n{}\n", "x".repeat(16 * 1024)).into_bytes();
+    late_binary.push(0);
+    for file in 0..64 {
+        fs::write(dir.path().join(format!("binary{file}.txt")), &late_binary).unwrap();
+    }
+    for file in 0..TEXT_FILES {
+        fs::write(
+            dir.path().join(format!("text{file}.txt")),
+            format!("{MARKER}\n"),
+        )
+        .unwrap();
+    }
+    let root = dir.path().to_str().unwrap();
+    let (_index, index_dir) = build_index(root);
+    let index_arg = index_dir.to_str().unwrap();
+
+    // A limit of every text line is only reached by the last text file, in
+    // whatever order the files are searched.
+    let limit = TEXT_FILES.to_string();
+    let limited = ["--max-results", &limit, MARKER, root];
+    let all_text = |lines: Vec<(String, String)>, backend: &str| {
+        assert_eq!(lines.len(), TEXT_FILES, "{backend}: {lines:?}");
+    };
+    all_text(search(&[&["--no-index"], &limited[..]].concat()), "scan");
+    let indexed = [&["--index-path", index_arg], &limited[..]].concat();
+    all_text(search(&indexed), "on-disk index");
+    let (_guard, _port) = start_server(root, &index_dir);
+    all_text(search(&indexed), "server");
+}
+
 #[test]
 fn conflicting_modes_rejected() {
     let fixture = setup_fixture();

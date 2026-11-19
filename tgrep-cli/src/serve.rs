@@ -2748,7 +2748,9 @@ fn invalidate_cached_paths_locked<'a>(
 #[derive(Default)]
 struct FileSearchResult {
     rows: Vec<serde_json::Value>,
-    /// The file's matching lines in the source, however its rows render them.
+    /// The file's matching lines in the source, however its rows render them,
+    /// for `max_results`. Zero for a binary file: the client decides whether
+    /// that one is reported, and counts it then.
     matched_lines: u64,
     stats: Option<crate::search::FileMatchStats>,
     search_stats: Option<crate::search::FileSearchStats>,
@@ -2878,7 +2880,11 @@ fn search_file_matches_bounded(
     }
     let mut result = FileSearchResult {
         rows: Vec::new(),
-        matched_lines: found.match_totals().1,
+        matched_lines: if binary_offset.is_some() {
+            0
+        } else {
+            found.match_totals().1
+        },
         search_stats,
         stats: (opts.stats || opts.count_matches).then(|| {
             let (matches, matched_lines) = found.match_totals();
@@ -10330,6 +10336,31 @@ mod tests {
         assert!(message.contains("response exceeds"), "{last}");
         assert!(!parts.is_empty());
         assert_eq!(row_files(parts), order[..big_at]);
+    }
+
+    /// A binary file does not use up `max_results`, since the client may not
+    /// report it. The search goes on to the next file.
+    #[test]
+    fn binary_not_counted() {
+        let (_temp, root, index_dir, state) = needle_files(8);
+        let order = needle_order(&state);
+        // Binary only past the part of a file that indexing inspects.
+        let mut late_binary = format!("needle\n{}\n", "x".repeat(16 * 1024)).into_bytes();
+        late_binary.push(0);
+        std::fs::write(root.join(&order[0]), late_binary).unwrap();
+        // A fresh state, which has not cached that file as text.
+        let state = test_server_state_from_index(&root, &index_dir);
+
+        let reply: serde_json::Value = serde_json::from_str(&handle_search(
+            None,
+            &serde_json::json!({"pattern": "needle", "max_results": 1}),
+            &state,
+        ))
+        .unwrap();
+        let rows = reply["result"]["matches"].as_array().unwrap();
+        assert_eq!(rows[0]["type"], "binary", "{reply}");
+        assert_eq!(row_files(std::slice::from_ref(&reply)), order[..2]);
+        assert_eq!(reply["result"]["truncated"], true, "{reply}");
     }
 
     fn install_reader_file(

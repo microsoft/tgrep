@@ -383,6 +383,32 @@ fn hidden_binary_not_counted() {
     all_text(search(&indexed), "server");
 }
 
+/// `--stats` totals cover the files printed, not those the limit left out.
+#[test]
+fn stats_cover_reported_files() {
+    let fixture = setup_fixture();
+    let root = fixture.path().to_str().unwrap();
+    let (_index, index_dir) = build_index(root);
+    let (_guard, _port) = start_server(root, &index_dir);
+
+    for order in [&[][..], &["--sort", "path"]] {
+        let output = Command::new(tgrep_bin())
+            .args(["--stats", "--max-results", "3", "--index-path"])
+            .arg(&index_dir)
+            .args(order)
+            .args([MARKER, root])
+            .output()
+            .expect("failed to run tgrep");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("via server"), "{order:?}: {stderr}");
+        // Two files of two lines each reach a limit of three.
+        assert!(
+            stderr.contains("4 matches (4 matched lines)"),
+            "{order:?}: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn conflicting_modes_rejected() {
     let fixture = setup_fixture();

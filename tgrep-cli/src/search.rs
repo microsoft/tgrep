@@ -250,6 +250,16 @@ impl SearchOptions {
             || self.effective_passthru())
     }
 
+    /// The `max_results` to send a plain server when `reported` lines are
+    /// already counted: what is left of the limit, so that a later search
+    /// path ends as early as the first. None for a sorted search: its limit
+    /// counts files in sorted order, which the server does not search in.
+    fn server_max_results(&self, reported: u64) -> Option<u64> {
+        self.max_results
+            .filter(|_| self.sort.is_none())
+            .map(|limit| limit.saturating_sub(reported))
+    }
+
     /// Whether `--max-results` has been reached, so no further file is searched.
     pub fn max_results_reached(&self, writer: &OutputWriter) -> bool {
         self.max_results
@@ -1144,15 +1154,11 @@ fn search_via_server(
 ) -> Result<bool> {
     let mut stream = info.connect(SERVER_READ_TIMEOUT)?;
     let mut request = server_search_request(scope, opts, ci)?;
-    if let Some(limit) = opts.max_results
-        && opts.sort.is_none()
-    {
+    if let Some(limit) = opts.server_max_results(writer.reported_lines()) {
         // Lets the server stop reading candidate files at the limit. One that
         // predates the option ignores it and replies in full, and rendering
         // applies the limit either way. A shared daemon is not sent it: that
-        // one rejects options it does not know and pages its replies. Nor is
-        // a sorted search: its limit counts files in sorted order, which the
-        // server does not search in.
+        // one rejects options it does not know and pages its replies.
         request["params"]["max_results"] = serde_json::json!(limit);
     }
     if opts.streams_from_server() {
@@ -1740,6 +1746,8 @@ fn render_server_result(
         }
     }
 
+    // The rows ahead of the file at which `--max-results` ended the output.
+    let mut reported_rows = matches.len();
     if opts.quiet {
         // No output, but still report stats for the first matching file.
     } else if opts.files_only {
@@ -1820,6 +1828,7 @@ fn render_server_result(
             let file = m.get("file").and_then(|f| f.as_str()).unwrap_or("");
             if current_file != Some(file) {
                 if opts.max_results_reached(writer) {
+                    reported_rows = at;
                     break;
                 }
                 current_file = Some(file);
@@ -1913,18 +1922,32 @@ fn render_server_result(
         // Apply the same scope to per-file totals as to output rows. The
         // server's `num_matches` includes context rows, and
         // rendered spans can split or merge the original matches.
+        // Nor do the totals cover files that `--max-results` left out.
+        let reported = &matches[..reported_rows];
         let (num, lines) = if let Some(stats) = &file_stats {
             let first_file = matches
                 .first()
                 .and_then(|m| m.get("file"))
                 .and_then(|f| f.as_str());
+            let reported_files: Option<std::collections::HashSet<&str>> =
+                (reported_rows < matches.len()).then(|| {
+                    reported
+                        .iter()
+                        .filter_map(|m| m.get("file").and_then(|f| f.as_str()))
+                        .collect()
+                });
             stats
                 .iter()
                 .filter(|s| !opts.quiet || first_file == Some(s.file.as_str()))
+                .filter(|s| {
+                    reported_files
+                        .as_ref()
+                        .is_none_or(|files| files.contains(s.file.as_str()))
+                })
                 .fold((0, 0), |(m, l), s| (m + s.matches, l + s.matched_lines))
         } else {
             // Older servers only provide rendered rows.
-            count_reported_matches(matches)
+            count_reported_matches(reported)
         };
         let mut narrowing_note = "";
         if let Some(stats) = result.get("index_stats")
@@ -1979,7 +2002,7 @@ fn row_source_lines(rows: &[serde_json::Value]) -> u64 {
 }
 
 #[cfg(test)]
-mod row_source_lines_tests {
+mod max_results_tests {
     use super::*;
 
     #[test]
@@ -1997,6 +2020,25 @@ mod row_source_lines_tests {
         assert_eq!(row_source_lines(rows), 5);
         assert_eq!(row_source_lines(&rows[6..]), 1);
         assert_eq!(row_source_lines(&[]), 0);
+    }
+
+    #[test]
+    fn limited_request() {
+        let mut opts = SearchOptions {
+            pattern: "needle".into(),
+            ..Default::default()
+        };
+        let stats = |opts: &SearchOptions| {
+            server_search_request(&IndexScope::Whole, opts, false).unwrap()["params"]["stats"]
+                .clone()
+        };
+        assert_eq!(stats(&opts), false);
+        assert_eq!(opts.server_max_results(0), None);
+
+        opts.max_results = Some(10);
+        assert_eq!(stats(&opts), true, "the limit counts per-file totals");
+        assert_eq!(opts.server_max_results(0), Some(10));
+        assert_eq!(opts.server_max_results(9), Some(1), "a later search path");
     }
 }
 

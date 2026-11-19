@@ -302,11 +302,8 @@ pub struct OutputWriter {
     all_searches: u64,
     total_matches: u64,
     total_matched_lines: u64,
-    /// Matching lines written so far, for `--max-results`.
-    written_lines: u64,
-    /// File and line of the last match written. A line with several match
-    /// rows (`-o`, `--vimgrep`) is one matching line.
-    last_written_line: Option<(String, usize)>,
+    /// Matching lines of the files reported so far, for `--max-results`.
+    reported_lines: u64,
 }
 
 impl OutputWriter {
@@ -345,14 +342,19 @@ impl OutputWriter {
             all_searches: 0,
             total_matches: 0,
             total_matched_lines: 0,
-            written_lines: 0,
-            last_written_line: None,
+            reported_lines: 0,
         }
     }
 
-    /// How many matching lines have been written across the invocation.
-    pub fn written_lines(&self) -> u64 {
-        self.written_lines
+    /// The matching lines of the files reported across the invocation.
+    pub fn reported_lines(&self) -> u64 {
+        self.reported_lines
+    }
+
+    /// Count a reported file's matching lines towards `--max-results`. These
+    /// are lines of the source, however its matches are printed.
+    pub fn note_reported_lines(&mut self, lines: u64) {
+        self.reported_lines += lines;
     }
 
     pub fn match_totals(&self) -> (u64, u64) {
@@ -666,18 +668,6 @@ impl OutputWriter {
     }
 
     pub fn write_match(&mut self, m: &Match) -> io::Result<()> {
-        match &mut self.last_written_line {
-            Some((file, line)) if *file == m.file => {
-                if *line != m.line_number {
-                    *line = m.line_number;
-                    self.written_lines += 1;
-                }
-            }
-            last => {
-                *last = Some((m.file.clone(), m.line_number));
-                self.written_lines += 1;
-            }
-        }
         // The context position moves past the whole source block, however
         // many lines its rewrite printed.
         let last_line = m.block.map_or(m.line_number, |(_, last)| last);

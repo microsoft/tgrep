@@ -2635,7 +2635,7 @@ fn search_with_budget(
                     truncated = true;
                     break;
                 }
-                matched_lines += matched_line_count(&file.rows);
+                matched_lines += file.matched_lines;
             }
             matches.extend(file.rows);
             file_stats.extend(file.stats);
@@ -2702,48 +2702,6 @@ fn search_with_budget(
     json_rpc_result(id, result)
 }
 
-/// The matching lines among one file's rows: a line with several rows counts
-/// once, and context and binary rows do not count.
-fn matched_line_count(rows: &[serde_json::Value]) -> u64 {
-    let mut count = 0;
-    let mut last_line = None;
-    for row in rows {
-        if row
-            .get("type")
-            .and_then(|kind| kind.as_str())
-            .unwrap_or("match")
-            != "match"
-        {
-            continue;
-        }
-        let line = row.get("line").and_then(|line| line.as_u64());
-        if line != last_line {
-            last_line = line;
-            count += 1;
-        }
-    }
-    count
-}
-
-#[cfg(test)]
-mod matched_line_count_tests {
-    use super::*;
-
-    #[test]
-    fn counts_lines_once() {
-        let rows = serde_json::json!([
-            {"file": "a", "line": 3, "type": "context"},
-            {"file": "a", "line": 4},
-            {"file": "a", "line": 4, "type": "match"},
-            {"file": "a", "line": 5, "type": "context"},
-            {"file": "a", "line": 9, "type": "match"},
-            {"file": "a", "type": "binary", "lines": 7},
-        ]);
-        assert_eq!(matched_line_count(rows.as_array().unwrap()), 2);
-        assert_eq!(matched_line_count(&[]), 0);
-    }
-}
-
 fn update_content_cache(
     state: &ServerState,
     expected_generation: u64,
@@ -2790,6 +2748,8 @@ fn invalidate_cached_paths_locked<'a>(
 #[derive(Default)]
 struct FileSearchResult {
     rows: Vec<serde_json::Value>,
+    /// The file's matching lines in the source, however its rows render them.
+    matched_lines: u64,
     stats: Option<crate::search::FileMatchStats>,
     search_stats: Option<crate::search::FileSearchStats>,
 }
@@ -2918,6 +2878,7 @@ fn search_file_matches_bounded(
     }
     let mut result = FileSearchResult {
         rows: Vec::new(),
+        matched_lines: found.match_totals().1,
         search_stats,
         stats: (opts.stats || opts.count_matches).then(|| {
             let (matches, matched_lines) = found.match_totals();

@@ -6,7 +6,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -79,9 +79,44 @@ fn assert_limited(lines: &[(String, String)], limit: usize, backend: &str) {
         expected_files * LINES_PER_FILE,
         "{backend}: {lines:?}"
     );
+    assert_eq!(file_count(lines), expected_files, "{backend}: {lines:?}");
+}
+
+/// How many files `lines` are from.
+fn file_count(lines: &[(String, String)]) -> usize {
     let mut files: Vec<&str> = lines.iter().map(|(file, _)| file.as_str()).collect();
     files.dedup();
-    assert_eq!(files.len(), expected_files, "{backend}: {lines:?}");
+    files.len()
+}
+
+/// An index of `root` in a directory of its own.
+fn build_index(root: &str) -> (TempDir, PathBuf) {
+    let index = TempDir::new().unwrap();
+    let index_dir = index.path().join("index");
+    let output = Command::new(tgrep_bin())
+        .args(["index", root, "--index-path"])
+        .arg(&index_dir)
+        .output()
+        .expect("failed to run tgrep index");
+    assert!(
+        output.status.success(),
+        "index build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (index, index_dir)
+}
+
+/// A server for `root` and the port it listens on.
+fn start_server(root: &str, index_dir: &Path) -> (ServerGuard, u16) {
+    let child = Command::new(tgrep_bin())
+        .args(["serve", root, "--no-watch", "--index-path"])
+        .arg(index_dir)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn tgrep serve");
+    let guard = ServerGuard { child };
+    let port = wait_for_port(index_dir);
+    (guard, port)
 }
 
 fn wait_for_port(index_dir: &Path) -> u16 {
@@ -161,19 +196,8 @@ fn limit_spans_paths() {
 fn index_and_server_stop_at_limit() {
     let fixture = setup_fixture();
     let root = fixture.path().to_str().unwrap();
-    let index = TempDir::new().unwrap();
-    let index_dir = index.path().join("index");
+    let (_index, index_dir) = build_index(root);
     let index_arg = index_dir.to_str().unwrap();
-
-    let output = Command::new(tgrep_bin())
-        .args(["index", root, "--index-path", index_arg])
-        .output()
-        .expect("failed to run tgrep index");
-    assert!(
-        output.status.success(),
-        "index build failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 
     let indexed = search(&[
         "--index-path",
@@ -201,13 +225,7 @@ fn index_and_server_stop_at_limit() {
         "a sorted search starts with the first path: {sorted_indexed:?}"
     );
 
-    let child = Command::new(tgrep_bin())
-        .args(["serve", root, "--index-path", index_arg, "--no-watch"])
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn tgrep serve");
-    let _guard = ServerGuard { child };
-    let port = wait_for_port(&index_dir);
+    let (_guard, port) = start_server(root, &index_dir);
 
     let served = search(&[
         "--index-path",
@@ -258,6 +276,73 @@ fn index_and_server_stop_at_limit() {
         "{unlimited}"
     );
     assert!(unlimited.get("truncated").is_none(), "{unlimited}");
+}
+
+/// Files of one name under separate search paths are separate files.
+#[test]
+fn same_name_across_paths() {
+    let dir = TempDir::new().unwrap();
+    let mut paths = Vec::new();
+    for name in ["a", "b", "c"] {
+        let path = dir.path().join(name);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("file.txt"), format!("{MARKER}\n")).unwrap();
+        paths.push(path.to_str().unwrap().to_string());
+    }
+    let mut args = vec!["--no-index", "--max-results", "2", MARKER];
+    args.extend(paths.iter().map(String::as_str));
+    assert_eq!(search(&args).len(), 2);
+}
+
+/// The limit counts lines of the source. A match of two lines counts as two,
+/// also where it is printed as one row.
+#[test]
+fn multiline_counts_source_lines() {
+    let fixture = setup_fixture();
+    let root = fixture.path().to_str().unwrap();
+    let (_index, index_dir) = build_index(root);
+    let index_arg = index_dir.to_str().unwrap();
+    let pattern = format!("{MARKER} one\\nnothing");
+
+    let check = |backend: &str, backend_args: &[&str]| {
+        for rendering in [&["--vimgrep"][..], &["--replace", "X"]] {
+            for order in [&[][..], &["--sort", "path"]] {
+                for (limit, files) in [("2", 1), ("3", 2), ("4", 2)] {
+                    let mut args = vec!["-U", "--max-results", limit];
+                    args.extend(backend_args);
+                    args.extend(rendering);
+                    args.extend(order);
+                    args.extend([pattern.as_str(), root]);
+                    let lines = search(&args);
+                    assert_eq!(lines.len(), files, "{backend} {args:?}: one row a file");
+                    assert_eq!(file_count(&lines), files, "{backend} {args:?}");
+                }
+            }
+        }
+    };
+    check("scan", &["--no-index"]);
+    check("on-disk index", &["--index-path", index_arg]);
+
+    let (_guard, port) = start_server(root, &index_dir);
+    check("server", &["--index-path", index_arg]);
+
+    // The count carries from one search path to the next.
+    let paths: Vec<PathBuf> = (0..3)
+        .map(|at| fixture.path().join(format!("dir{at}")))
+        .collect();
+    let mut args = vec!["-U", "--vimgrep", "--max-results", "3"];
+    args.extend(["--index-path", index_arg, pattern.as_str()]);
+    args.extend(paths.iter().map(|path| path.to_str().unwrap()));
+    assert_eq!(search(&args).len(), 2, "server, three paths");
+
+    let limited = search_rpc(
+        port,
+        serde_json::json!({
+            "pattern": pattern, "multiline": true, "vimgrep": true, "max_results": 3,
+        }),
+    );
+    assert_eq!(limited["matches"].as_array().unwrap().len(), 2, "{limited}");
+    assert_eq!(limited["truncated"], true, "{limited}");
 }
 
 #[test]

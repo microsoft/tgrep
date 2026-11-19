@@ -623,7 +623,10 @@ can therefore exceed ripgrep's.
 `--max-results` limits matching lines across the whole invocation, which
 ripgrep has no flag for. Files are reported whole: the search ends after the
 file that brings the total to the limit, so a few more lines than the limit
-can be printed. A server stops reading candidate files at that point too,
+can be printed. The lines counted are those of the source: a multiline match
+counts every line it covers, however it is printed, and so do the matching
+lines of a binary file that is reported with a note. A server stops reading
+candidate files at that point too,
 which keeps a broad query on a large tree fast; a shared daemon and a search
 with `--sort` search every candidate and apply the limit to the result. It
 cannot be combined with `-l`, `--files-without-match`, `-c`,

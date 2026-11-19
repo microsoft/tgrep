@@ -41,6 +41,9 @@ pub struct SearchOptions {
     pub count: bool,
     pub word_boundary: bool,
     pub max_count: Option<usize>,
+    /// `--max-results`: stop after the file that brings the matching lines
+    /// of the files reported to this many.
+    pub max_results: Option<u64>,
     pub json: bool,
     pub vimgrep: bool,
     pub stats: bool,
@@ -245,6 +248,22 @@ impl SearchOptions {
             || self.sort.is_some()
             || self.replace.is_some()
             || self.effective_passthru())
+    }
+
+    /// The `max_results` to send a plain server when `reported` lines are
+    /// already counted: what is left of the limit, so that a later search
+    /// path ends as early as the first. None for a sorted search: its limit
+    /// counts files in sorted order, which the server does not search in.
+    fn server_max_results(&self, reported: u64) -> Option<u64> {
+        self.max_results
+            .filter(|_| self.sort.is_none())
+            .map(|limit| limit.saturating_sub(reported))
+    }
+
+    /// Whether `--max-results` has been reached, so no further file is searched.
+    pub fn max_results_reached(&self, writer: &OutputWriter) -> bool {
+        self.max_results
+            .is_some_and(|limit| writer.reported_lines() >= limit)
     }
 
     /// Resolve smart-case from literals in every supplied pattern.
@@ -1135,12 +1154,17 @@ fn search_via_server(
 ) -> Result<bool> {
     let mut stream = info.connect(SERVER_READ_TIMEOUT)?;
     let mut request = server_search_request(scope, opts, ci)?;
+    if let Some(limit) = opts.server_max_results(writer.reported_lines()) {
+        // Lets the server stop reading candidate files at the limit. One that
+        // predates the option ignores it and replies in full, and rendering
+        // applies the limit either way. A shared daemon is not sent it: that
+        // one rejects options it does not know and pages its replies.
+        request["params"]["max_results"] = serde_json::json!(limit);
+    }
     if opts.streams_from_server() {
         // The server then sends each chunk of files as soon as it is searched,
         // as `partial` replies ahead of the final one, and the rows are
         // printed as they arrive. One that predates the option replies once.
-        // A shared daemon is not asked: that one rejects options it does not
-        // know and pages its replies.
         request["params"]["stream"] = serde_json::json!(true);
     }
     writeln!(stream, "{request}")?;
@@ -1408,7 +1432,10 @@ fn server_search_request(
             "vimgrep": opts.vimgrep,
             "detail": detail,
             "positions": positions,
-            "stats": opts.stats,
+            // The per-file totals are also what `--max-results` counts: the
+            // limit runs across every search path, and rows do not show how
+            // many lines of the source a match covers.
+            "stats": opts.stats || opts.max_results.is_some(),
         },
         "id": 1,
     });
@@ -1617,7 +1644,7 @@ fn render_server_result(
     } else {
         None
     };
-    let file_stats = if opts.stats || opts.count_matches {
+    let file_stats = if opts.stats || opts.count_matches || opts.max_results.is_some() {
         result
             .get("file_stats")
             .map(|stats| -> Result<Vec<FileMatchStats>> {
@@ -1719,6 +1746,8 @@ fn render_server_result(
         }
     }
 
+    // The rows ahead of the file at which `--max-results` ended the output.
+    let mut reported_rows = matches.len();
     if opts.quiet {
         // No output, but still report stats for the first matching file.
     } else if opts.files_only {
@@ -1783,8 +1812,34 @@ fn render_server_result(
             writer.write_count(file, n)?;
         }
     } else {
-        for m in matches {
+        // Each file's matching lines, for `--max-results`, when the reply
+        // has them.
+        let source_lines: Option<std::collections::HashMap<&str, u64>> = file_stats
+            .as_ref()
+            .filter(|_| opts.max_results.is_some())
+            .map(|stats| {
+                stats
+                    .iter()
+                    .map(|stats| (stats.file.as_str(), stats.matched_lines))
+                    .collect()
+            });
+        let mut current_file = None;
+        for (at, m) in matches.iter().enumerate() {
             let file = m.get("file").and_then(|f| f.as_str()).unwrap_or("");
+            if current_file != Some(file) {
+                if opts.max_results_reached(writer) {
+                    reported_rows = at;
+                    break;
+                }
+                current_file = Some(file);
+                if opts.max_results.is_some() {
+                    let lines = source_lines
+                        .as_ref()
+                        .and_then(|lines| lines.get(file).copied())
+                        .unwrap_or_else(|| row_source_lines(&matches[at..]));
+                    writer.note_reported_lines(lines);
+                }
+            }
             if let Some(stats) = &search_stats {
                 writer.set_file_bytes_searched(stats[file]);
             }
@@ -1867,18 +1922,32 @@ fn render_server_result(
         // Apply the same scope to per-file totals as to output rows. The
         // server's `num_matches` includes context rows, and
         // rendered spans can split or merge the original matches.
+        // Nor do the totals cover files that `--max-results` left out.
+        let reported = &matches[..reported_rows];
         let (num, lines) = if let Some(stats) = &file_stats {
             let first_file = matches
                 .first()
                 .and_then(|m| m.get("file"))
                 .and_then(|f| f.as_str());
+            let reported_files: Option<std::collections::HashSet<&str>> =
+                (reported_rows < matches.len()).then(|| {
+                    reported
+                        .iter()
+                        .filter_map(|m| m.get("file").and_then(|f| f.as_str()))
+                        .collect()
+                });
             stats
                 .iter()
                 .filter(|s| !opts.quiet || first_file == Some(s.file.as_str()))
+                .filter(|s| {
+                    reported_files
+                        .as_ref()
+                        .is_none_or(|files| files.contains(s.file.as_str()))
+                })
                 .fold((0, 0), |(m, l), s| (m + s.matches, l + s.matched_lines))
         } else {
             // Older servers only provide rendered rows.
-            count_reported_matches(matches)
+            count_reported_matches(reported)
         };
         let mut narrowing_note = "";
         if let Some(stats) = result.get("index_stats")
@@ -1900,6 +1969,77 @@ fn render_server_result(
 
     writer.flush()?;
     Ok(had_matches)
+}
+
+/// The matching source lines among the rows of the file that `rows` starts
+/// with, for a server that predates per-file totals. A row of a rewritten
+/// block counts the source lines of the block, and any other row its own
+/// line, which is all that such a reply tells.
+fn row_source_lines(rows: &[serde_json::Value]) -> u64 {
+    let file = rows.first().and_then(|row| row.get("file"));
+    let mut count = 0;
+    let mut counted_to = 0;
+    for row in rows.iter().take_while(|row| row.get("file") == file) {
+        if row
+            .get("type")
+            .and_then(|kind| kind.as_str())
+            .unwrap_or("match")
+            != "match"
+        {
+            continue;
+        }
+        let line = row.get("line").and_then(|line| line.as_u64()).unwrap_or(0);
+        let block = row.get("block").and_then(|block| block.as_array());
+        let bound = |at: usize| block.and_then(|block| block.get(at)?.as_u64());
+        let first = bound(0).unwrap_or(line).max(counted_to + 1);
+        let last = bound(1).unwrap_or(line);
+        if last >= first {
+            count += last - first + 1;
+            counted_to = last;
+        }
+    }
+    count
+}
+
+#[cfg(test)]
+mod max_results_tests {
+    use super::*;
+
+    #[test]
+    fn rows_count_source_lines() {
+        let rows = serde_json::json!([
+            {"file": "a", "line": 3, "type": "context"},
+            {"file": "a", "line": 4},
+            {"file": "a", "line": 4, "type": "match"},
+            {"file": "a", "line": 6, "type": "match", "block": [6, 8]},
+            {"file": "a", "line": 8, "type": "match", "block": [8, 9]},
+            {"file": "a", "type": "binary", "lines": 7},
+            {"file": "b", "line": 1},
+        ]);
+        let rows = rows.as_array().unwrap();
+        assert_eq!(row_source_lines(rows), 5);
+        assert_eq!(row_source_lines(&rows[6..]), 1);
+        assert_eq!(row_source_lines(&[]), 0);
+    }
+
+    #[test]
+    fn limited_request() {
+        let mut opts = SearchOptions {
+            pattern: "needle".into(),
+            ..Default::default()
+        };
+        let stats = |opts: &SearchOptions| {
+            server_search_request(&IndexScope::Whole, opts, false).unwrap()["params"]["stats"]
+                .clone()
+        };
+        assert_eq!(stats(&opts), false);
+        assert_eq!(opts.server_max_results(0), None);
+
+        opts.max_results = Some(10);
+        assert_eq!(stats(&opts), true, "the limit counts per-file totals");
+        assert_eq!(opts.server_max_results(0), Some(10));
+        assert_eq!(opts.server_max_results(9), Some(1), "a later search path");
+    }
 }
 
 fn search_local_index(
@@ -2051,7 +2191,7 @@ fn search_local_index(
 
         if search_file(&read, &matcher, rel_path, opts, writer, explicit)? {
             had_matches = true;
-            if opts.quiet {
+            if opts.quiet || opts.max_results_reached(writer) {
                 break;
             }
         }
@@ -2265,7 +2405,7 @@ fn brute_force_search(
 
         if search_file(&read, &matcher, &rel_path, opts, writer, false)? {
             had_matches = true;
-            if opts.quiet {
+            if opts.quiet || opts.max_results_reached(writer) {
                 break;
             }
         }
@@ -2682,6 +2822,7 @@ fn search_decoded_file(
         let (matches, matched_lines) = found.match_totals();
         writer.note_matches(matches, matched_lines);
     }
+    writer.note_reported_lines(found.match_totals().1);
 
     let has_matches = !found.is_empty();
     if !has_matches {

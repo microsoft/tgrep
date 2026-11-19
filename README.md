@@ -401,6 +401,7 @@ These tables describe search flags. Use `tgrep index --help` and
 | `-w, --word-regexp` | Require non-word characters or text boundaries on both sides of the match; overrides earlier `-x` |
 | `-v, --invert-match` | Show lines that do NOT match |
 | `-o, --only-matching` | Print only the matched parts |
+| `--match-context <N>` | Like `-o`, with up to N Unicode characters on each side of each match on its line. Nearby excerpts may overlap. Columns and byte offsets still identify the match. JSON keeps its full-line events. |
 | `-e, --regexp <PAT>` | Additional pattern (repeatable for OR) |
 | `-f, --file <FILE>` | Read patterns verbatim, one per line; blank lines are empty patterns (repeatable) |
 | `-U, --multiline` | Enable multiline matching (`.` still excludes `\n`) |

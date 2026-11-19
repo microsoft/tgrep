@@ -837,6 +837,7 @@ struct SearchOpts {
     files_only: bool,
     invert_match: bool,
     only_matching: bool,
+    match_context: usize,
     max_count: Option<usize>,
     before_context: usize,
     after_context: usize,
@@ -889,6 +890,7 @@ impl SearchOpts {
             invert_match: self.invert_match,
             multiline: self.multiline,
             only_matching: self.only_matching,
+            match_context: self.match_context,
             before_context: self.before_context,
             after_context: self.after_context,
             max_count: if self.files_only && !self.stats {
@@ -902,7 +904,8 @@ impl SearchOpts {
             vimgrep: self.vimgrep,
             // Counts and `-l` need only whether a line matched, not every
             // span on it.
-            all_spans: self.stats
+            all_spans: self.match_context > 0
+                || self.stats
                 || self.count_matches
                 || (self.detail && !self.count && !self.files_only),
             replace_blocks: self.multiline_replace,
@@ -1974,10 +1977,21 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .get("invert_match")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let only_matching = params
-        .get("only_matching")
-        .and_then(|o| o.as_bool())
-        .unwrap_or(false);
+    let match_context = params
+        .get("match_context")
+        .map(|n| {
+            n.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| {
+                    "match_context must be a nonnegative integer that fits usize".to_string()
+                })
+        })
+        .transpose()?;
+    let only_matching = match_context.is_some()
+        || params
+            .get("only_matching")
+            .and_then(|o| o.as_bool())
+            .unwrap_or(false);
     let after_context = params
         .get("after_context")
         .and_then(|a| a.as_u64())
@@ -2143,6 +2157,7 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
             files_only,
             invert_match,
             only_matching,
+            match_context: match_context.unwrap_or(0),
             max_count,
             before_context,
             after_context,
@@ -2533,6 +2548,7 @@ fn search_with_budget(
                 "hidden_complete": true,
                 "ordered_filters": true,
                 "multiline_replace": true,
+                "match_context": true,
                 "report_replacements": true,
             });
             sent_rows += part["matches"].as_array().map_or(0, Vec::len);
@@ -2650,7 +2666,8 @@ fn search_with_budget(
         "ordered_filters": true,
         // `multiline_replace` and `report_replacements` requests are honoured.
         "multiline_replace": true,
-        "report_replacements": true,
+        "match_context": true,
+                "report_replacements": true,
     });
     if opts.stats || opts.count_matches {
         result["file_stats"] = serde_json::json!(file_stats);

@@ -904,7 +904,7 @@ impl SearchOpts {
             vimgrep: self.vimgrep,
             // Counts and `-l` need only whether a line matched, not every
             // span on it.
-            all_spans: self.match_context > 0
+            all_spans: self.only_matching
                 || self.stats
                 || self.count_matches
                 || (self.detail && !self.count && !self.files_only),

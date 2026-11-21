@@ -3545,16 +3545,17 @@ fn native_capacity_error(error: &notify::Error) -> bool {
         notify::ErrorKind::MaxFilesWatch => true,
         notify::ErrorKind::Io(error) => {
             #[cfg(unix)]
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::ENOSPC | libc::EMFILE | libc::ENFILE | libc::ENOMEM)
-            ) {
-                return true;
+            {
+                matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOSPC | libc::EMFILE | libc::ENFILE | libc::ENOMEM)
+                )
             }
             #[cfg(windows)]
-            if matches!(error.raw_os_error(), Some(4 | 8 | 14 | 1450 | 1816)) {
-                return true;
+            {
+                matches!(error.raw_os_error(), Some(4 | 8 | 14 | 1450 | 1816))
             }
+            #[cfg(not(any(unix, windows)))]
             false
         }
         _ => false,
@@ -7642,7 +7643,7 @@ fn refresh_stale_locked(
         );
     }
 
-    if !stream_merge_stale_changes(
+    stream_merge_stale_changes(
         state,
         &changed,
         &added,
@@ -7656,11 +7657,7 @@ fn refresh_stale_locked(
             visibility: Some(&walk.visibility),
             scanned_files: current_meta,
         },
-    ) {
-        return false;
-    }
-
-    true
+    )
 }
 
 /// Restore a known-empty on-disk index after a failed bootstrap.

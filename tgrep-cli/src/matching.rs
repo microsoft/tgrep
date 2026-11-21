@@ -965,6 +965,7 @@ pub struct MatchOptions {
     pub invert_match: bool,
     pub multiline: bool,
     pub only_matching: bool,
+    pub match_context: usize,
     pub before_context: usize,
     pub after_context: usize,
     pub max_count: Option<usize>,
@@ -995,6 +996,26 @@ pub struct MatchOptions {
     /// match's expanded replacement alongside them instead of rewriting the
     /// line.
     pub report_replacements: bool,
+}
+
+/// Return a same-line excerpt and the byte range to highlight inside it.
+fn match_excerpt(line: &str, start: usize, end: usize, radius: usize) -> (&str, (usize, usize)) {
+    let mut left = start;
+    let mut right = end;
+    // A replacement can introduce a line break into an otherwise single-line buffer.
+    for ch in line[..start].chars().rev().take(radius) {
+        if ch == '\n' {
+            break;
+        }
+        left -= ch.len_utf8();
+    }
+    for ch in line[end..].chars().take(radius) {
+        if ch == '\n' {
+            break;
+        }
+        right += ch.len_utf8();
+    }
+    (&line[left..right], (start - left, end - left))
 }
 
 /// One unit of output produced by searching a single file.
@@ -1202,51 +1223,52 @@ impl<'a> FileMatches<'a> {
             }
 
             if opts.only_matching && !hit.spans.is_empty() {
-                // With `-r`, `-o` prints the replacement of each match rather
-                // than the matched text itself.
-                if let Some(rep) = &opts.replace {
-                    // ripgrep rewrites the line and reports offsets into the
-                    // result, so each match moves by the length delta of the
-                    // ones before it. Columns stay in source terms here and are
-                    // corrected by `column_shifts` after the caller has mapped
-                    // them back through any lossy-decoding repairs.
-                    let mut shift: isize = 0;
-                    for (start, end, text) in matcher.expansions(line, rep).map_err(E::from)? {
-                        let len = text.len();
-                        on_emit(Emit::Match {
-                            line_number: hit.idx + 1,
-                            content: Cow::Owned(text),
-                            columns: vec![start + 1],
-                            spans: vec![(0, len)],
-                            absolute_offset: offset + start,
-                            line_offset: offset,
-                            column_shifts: vec![shift],
-                            offset_shift: shift,
-                            terminator_len: 0,
-                            block: None,
-                            hidden: false,
-                            replacements: None,
-                        })?;
-                        shift += len as isize - (end - start) as isize;
-                    }
-                    return Ok(());
-                }
-                for &(s, e) in &hit.spans {
-                    let text = &line[s..e];
+                let mut emit = |content, span, start, shift| {
                     on_emit(Emit::Match {
                         line_number: hit.idx + 1,
-                        content: Cow::Borrowed(text),
-                        columns: vec![s + 1],
-                        spans: vec![(0, text.len())],
-                        absolute_offset: offset + s,
+                        content,
+                        columns: vec![start + 1],
+                        spans: vec![span],
+                        absolute_offset: offset + start,
                         line_offset: offset,
-                        column_shifts: Vec::new(),
-                        offset_shift: 0,
+                        column_shifts: if shift == 0 { Vec::new() } else { vec![shift] },
+                        offset_shift: shift,
                         terminator_len: 0,
                         block: None,
                         hidden: false,
                         replacements: None,
-                    })?;
+                    })
+                };
+                match &opts.replace {
+                    None => {
+                        for &(start, end) in &hit.spans {
+                            let (text, span) = match_excerpt(line, start, end, opts.match_context);
+                            emit(Cow::Borrowed(text), span, start, 0)?;
+                        }
+                    }
+                    Some(rep) if opts.match_context == 0 => {
+                        // Plain -o only needs the expansions, even on very long lines.
+                        let mut shift = 0;
+                        for (start, end, text) in matcher.expansions(line, rep)? {
+                            let len = text.len();
+                            emit(Cow::Owned(text), (0, len), start, shift)?;
+                            shift += len as isize - (end - start) as isize;
+                        }
+                    }
+                    Some(rep) => {
+                        // Nearby replacements can also fall inside the excerpt.
+                        let (rewritten, spans) = matcher.replace_all(line, rep)?;
+                        for (&(source, _), (start, end)) in hit.spans.iter().zip(spans) {
+                            let (text, span) =
+                                match_excerpt(&rewritten, start, end, opts.match_context);
+                            emit(
+                                Cow::Owned(text.to_owned()),
+                                span,
+                                source,
+                                start as isize - source as isize,
+                            )?;
+                        }
+                    }
                 }
                 return Ok(());
             }
@@ -1444,11 +1466,13 @@ fn emit_block<'a, E>(
                 let Some((a, b)) = piece(rep, ls, te) else {
                     continue;
                 };
+                let (text, span) =
+                    match_excerpt(&block.text[ls..te], a - ls, b - ls, opts.match_context);
                 on_emit(Emit::Match {
                     line_number: block.first + 1 + k,
-                    content: Cow::Owned(block.text[a..b].to_owned()),
+                    content: Cow::Owned(text.to_owned()),
                     columns: vec![rep.src.0 - block.start + 1],
-                    spans: vec![(0, b - a)],
+                    spans: vec![span],
                     absolute_offset: rep.src.0,
                     line_offset: block.start,
                     column_shifts: vec![shift],

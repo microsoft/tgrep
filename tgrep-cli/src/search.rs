@@ -53,6 +53,7 @@ pub struct SearchOptions {
     pub type_ops: Vec<filetypes::TypeOp>,
     pub invert_match: bool,
     pub only_matching: bool,
+    pub match_context: usize,
     pub after_context: Option<usize>,
     pub before_context: Option<usize>,
     pub context: Option<usize>,
@@ -427,6 +428,7 @@ impl SearchOptions {
             invert_match: self.invert_match,
             multiline: self.multiline,
             only_matching: self.effective_only_matching(),
+            match_context: self.match_context,
             before_context: self.before_ctx(),
             after_context: self.after_ctx(),
             // `-q` and `--files-without-match` only need to know whether the
@@ -994,7 +996,7 @@ pub fn run(
                     })?;
                 require_server_coverage(&result)?;
                 require_ordered_filters(&result, &request)?;
-                require_replace_support(&result, &request)?;
+                require_render_support(&result, &request)?;
                 Ok((view.root, scope, request, result))
             })();
             match response {
@@ -1436,8 +1438,10 @@ fn server_search_request(
     if opts.needs_ordered_filters()? {
         request["params"]["ordered_filters"] = serde_json::json!(true);
     }
-    // A server that predates a `--replace` rendering cannot honour it, and
-    // its reply is then refused. Ask only when the output depends on it.
+    // Ask for rendering extensions only when the output depends on them.
+    if opts.match_context > 0 && opts.prints_text_lines() {
+        request["params"]["match_context"] = serde_json::json!(opts.match_context);
+    }
     if opts.needs_replace_blocks(ci) {
         request["params"]["multiline_replace"] = serde_json::json!(true);
     }
@@ -1452,13 +1456,12 @@ fn server_search_request(
     Ok(request)
 }
 
-/// Fail when the result comes from a server that predates the `--replace`
-/// rendering `request` asked for. Such a server ignores the request and
-/// rewrites `-U` matches line by line, or leaves `--json` submatches without
-/// their `replacement`. Reading the request rather than the options keeps
-/// this check in step with what `server_search_request` decided to ask for.
-fn require_replace_support(result: &serde_json::Value, request: &serde_json::Value) -> Result<()> {
+/// Older servers ignore unknown rendering options. Check the reply before printing any rows.
+fn require_render_support(result: &serde_json::Value, request: &serde_json::Value) -> Result<()> {
     let params = &request["params"];
+    if params.get("match_context").is_some() && !flag_set(result, "match_context") {
+        anyhow::bail!("server does not support character context");
+    }
     if flag_set(params, "multiline_replace") && !flag_set(result, "multiline_replace") {
         anyhow::bail!("server does not support multiline replacement blocks");
     }
@@ -1552,7 +1555,7 @@ fn render_server_result(
     // rows, so an old/partial server can never silently answer --hidden.
     require_server_coverage(result)?;
     require_ordered_filters(result, request)?;
-    require_replace_support(result, request)?;
+    require_render_support(result, request)?;
 
     let empty_vec = Vec::new();
     let matches = result
@@ -3866,7 +3869,7 @@ mod tests {
             let params = &request["params"];
             assert!(params.get("multiline_replace").is_none(), "{params}");
             assert!(params.get("report_replacements").is_none(), "{params}");
-            assert!(require_replace_support(&serde_json::json!({}), &request).is_ok());
+            assert!(require_render_support(&serde_json::json!({}), &request).is_ok());
         }
 
         for opts in [
@@ -3958,20 +3961,19 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({"multiline_replace": false, "report_replacements": false}),
         ] {
-            assert!(require_replace_support(&result, &blocks).is_err());
-            assert!(require_replace_support(&result, &json).is_err());
+            assert!(require_render_support(&result, &blocks).is_err());
+            assert!(require_render_support(&result, &json).is_err());
         }
         assert!(
-            require_replace_support(&serde_json::json!({"multiline_replace": true}), &json)
-                .is_err()
+            require_render_support(&serde_json::json!({"multiline_replace": true}), &json).is_err()
         );
         assert!(
-            require_replace_support(&serde_json::json!({"report_replacements": true}), &blocks)
+            require_render_support(&serde_json::json!({"report_replacements": true}), &blocks)
                 .is_err()
         );
         let acked = serde_json::json!({"multiline_replace": true, "report_replacements": true});
-        assert!(require_replace_support(&acked, &blocks).is_ok());
-        assert!(require_replace_support(&acked, &json).is_ok());
+        assert!(require_render_support(&acked, &blocks).is_ok());
+        assert!(require_render_support(&acked, &json).is_ok());
     }
 
     #[test]

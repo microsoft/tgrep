@@ -401,6 +401,7 @@ These tables describe search flags. Use `tgrep index --help` and
 | `-w, --word-regexp` | Require non-word characters or text boundaries on both sides of the match; overrides earlier `-x` |
 | `-v, --invert-match` | Show lines that do NOT match |
 | `-o, --only-matching` | Print only the matched parts |
+| `--match-context <N>` | Like `-o`, with up to N Unicode characters on each side of each match on its line. Nearby excerpts may overlap. Columns and byte offsets still identify the match. JSON keeps its full-line events. |
 | `-e, --regexp <PAT>` | Additional pattern (repeatable for OR) |
 | `-f, --file <FILE>` | Read patterns verbatim, one per line; blank lines are empty patterns (repeatable) |
 | `-U, --multiline` | Enable multiline matching (`.` still excludes `\n`) |
@@ -412,6 +413,7 @@ These tables describe search flags. Use `tgrep index --help` and
 | `--files-without-match` | Print files that do NOT match |
 | `-q, --quiet` | Suppress output; exit code only |
 | `-m, --max-count <N>` | Limit matching lines per file (see [Match limits](#match-limits)) |
+| `--max-results <N>` | Stop after the file in which the N-th matching line is found (see [Match limits](#match-limits)) |
 | `-g, --glob <GLOB>` | Filter files by glob pattern, case-sensitive (repeatable); overrides `-t`/`-T` |
 | `--iglob <GLOB>` | Case-insensitive glob filter (repeatable) |
 | `--glob-case-insensitive` | Treat all `-g` globs as case-insensitive |
@@ -618,6 +620,18 @@ of lines covered by matches, so a multiline match is not cut short.
 
 tgrep reads a whole-file buffer even with `-m`; its `bytes_searched` statistic
 can therefore exceed ripgrep's.
+
+`--max-results` limits matching lines across the whole invocation, which
+ripgrep has no flag for. Files are reported whole: the search ends after the
+file that brings the total to the limit, so a few more lines than the limit
+can be printed. The lines counted are those of the source: a multiline match
+counts every line it covers, however it is printed, and so do the matching
+lines of a binary file that is reported with a note. A server stops reading
+candidate files at that point too,
+which keeps a broad query on a large tree fast; a shared daemon and a search
+with `--sort` search every candidate and apply the limit to the result. It
+cannot be combined with `-l`, `--files-without-match`, `-c`,
+`--count-matches`, `-q` or `--files`.
 
 ### JSON statistics
 
@@ -833,7 +847,9 @@ exit code determined by the search alone. Suppress the message with
    with the rows of the candidates searched since the last one and the
    `candidates` and `searched` counts so far, then the final result with the
    remaining rows. The CLI asks for this when it prints one file's rows after
-   another, and prints each part as it arrives.
+   another, and prints each part as it arrives. `"max_results": N` ends the
+   search after the file in which the N-th matching line is found, and the
+   final result then carries `"truncated": true`.
 
 The server's content cache is limited to 50,000 entries and 1 GiB of decoded
 content, with a 64 MiB per-entry limit. `--files` combines content-index paths

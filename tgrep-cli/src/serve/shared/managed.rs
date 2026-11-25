@@ -2089,7 +2089,7 @@ impl State {
         let metadata = json!({"root":slot.root(),"view":slot.id(),"generation":pin.key,"version":published.version,
             "incarnation":pin.incarnation,"commit":pin.commit,"ready":true,"lagging":query.lagging(),
             "hidden_complete":true,"ordered_filters":true,
-            "multiline_replace":true,"report_replacements":true,"backend":"shared-v2"});
+            "multiline_replace":true,"report_replacements":true,"match_context":true,"backend":"shared-v2"});
         let source = ManagedQuery { query, slot };
         // Pages end well before the operation deadline so long scans resume
         // instead of failing.

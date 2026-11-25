@@ -1140,6 +1140,7 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             "extra_patterns" => value
                 .as_array()
                 .is_some_and(|array| array.iter().all(Value::is_string)),
+            "match_context" => value.is_u64(),
             "max_count" | "after_context" | "before_context" | "max_filesize"
             | "regex_size_limit" | "dfa_size_limit" => value.is_null() || value.is_u64(),
             "case_insensitive"
@@ -1243,7 +1244,7 @@ impl State {
         let metadata = json!({
             "root":entry.view.root(), "view":entry.id, "generation":entry.view.generation().key(),
             "ready":true, "hidden_complete":true, "ordered_filters":true,
-            "multiline_replace":true, "report_replacements":true, "backend":"shared-v1",
+            "multiline_replace":true, "report_replacements":true, "match_context":true, "backend":"shared-v1",
             "protocol":PROTOCOL, "instance":self.registration.instance,
             "repository":self.registration.repository
         });

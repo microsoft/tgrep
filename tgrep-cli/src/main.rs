@@ -135,9 +135,23 @@ struct Cli {
     #[arg(short = 'o', long = "only-matching", global = true)]
     only_matching: bool,
 
+    /// Print each match with up to N characters on either side on the same line. Implies -o.
+    #[arg(long, value_name = "N", global = true)]
+    match_context: Option<usize>,
+
     /// Limit matches per file.
     #[arg(short = 'm', long = "max-count", global = true)]
     max_count: Option<usize>,
+
+    /// Stop after the file in which the NUM-th matching line is found.
+    #[arg(
+        long = "max-results",
+        global = true,
+        value_name = "NUM",
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with_all = ["files_only", "files_without_match", "count", "count_matches", "quiet", "list_files"]
+    )]
+    max_results: Option<u64>,
 
     /// List files that would be searched (no search performed).
     #[arg(long = "files", global = true)]
@@ -1142,6 +1156,7 @@ impl Cli {
             count: self.count,
             word_boundary: self.word_regexp,
             max_count: self.max_count,
+            max_results: self.max_results,
             json,
             vimgrep: self.vimgrep,
             stats: self.stats || self.debug || self.trace,
@@ -1152,7 +1167,8 @@ impl Cli {
             glob_case_insensitive: self.glob_case_insensitive,
             type_ops: self.type_ops.clone(),
             invert_match: self.invert_match,
-            only_matching: self.only_matching,
+            only_matching: self.only_matching || self.match_context.is_some(),
+            match_context: self.match_context.unwrap_or(0),
             after_context: self.after_context,
             before_context: self.before_context,
             context: self.context,
@@ -1686,6 +1702,9 @@ fn run_search(
                 let _ = writer.finish();
                 process::exit(2);
             }
+        }
+        if opts.max_results_reached(&writer) {
+            break;
         }
     }
 

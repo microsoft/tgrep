@@ -837,6 +837,7 @@ struct SearchOpts {
     files_only: bool,
     invert_match: bool,
     only_matching: bool,
+    match_context: usize,
     max_count: Option<usize>,
     before_context: usize,
     after_context: usize,
@@ -889,6 +890,7 @@ impl SearchOpts {
             invert_match: self.invert_match,
             multiline: self.multiline,
             only_matching: self.only_matching,
+            match_context: self.match_context,
             before_context: self.before_context,
             after_context: self.after_context,
             max_count: if self.files_only && !self.stats {
@@ -902,7 +904,8 @@ impl SearchOpts {
             vimgrep: self.vimgrep,
             // Counts and `-l` need only whether a line matched, not every
             // span on it.
-            all_spans: self.stats
+            all_spans: self.only_matching
+                || self.stats
                 || self.count_matches
                 || (self.detail && !self.count && !self.files_only),
             replace_blocks: self.multiline_replace,
@@ -1883,6 +1886,8 @@ struct SearchRequest {
     encoding: tgrep_core::encoding::EncodingMode,
     opts: SearchOpts,
     scope: SearchScope,
+    /// Stop after the file in which this many matching lines have been found.
+    max_results: Option<u64>,
     /// Send the rows of each chunk of candidates as soon as it is searched,
     /// as `partial` replies ahead of the final one.
     stream: bool,
@@ -1974,10 +1979,21 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         .get("invert_match")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let only_matching = params
-        .get("only_matching")
-        .and_then(|o| o.as_bool())
-        .unwrap_or(false);
+    let match_context = params
+        .get("match_context")
+        .map(|n| {
+            n.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| {
+                    "match_context must be a nonnegative integer that fits usize".to_string()
+                })
+        })
+        .transpose()?;
+    let only_matching = match_context.is_some()
+        || params
+            .get("only_matching")
+            .and_then(|o| o.as_bool())
+            .unwrap_or(false);
     let after_context = params
         .get("after_context")
         .and_then(|a| a.as_u64())
@@ -2121,6 +2137,14 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         query::build_relaxed_multi_pattern_plan(&all_patterns, case_insensitive)
     };
 
+    let max_results = match params.get("max_results") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or_else(|| "max_results must be a non-negative integer".to_string())?,
+        ),
+    };
     let stream = match params.get("stream") {
         None | Some(serde_json::Value::Null) => false,
         Some(value) => value
@@ -2138,11 +2162,13 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         ordered_filters,
         encoding,
         scope: SearchScope::parse(params)?,
+        max_results,
         stream,
         opts: SearchOpts {
             files_only,
             invert_match,
             only_matching,
+            match_context: match_context.unwrap_or(0),
             max_count,
             before_context,
             after_context,
@@ -2248,6 +2274,7 @@ fn search_with_budget(
     let pattern = req.pattern;
     let case_insensitive = req.case_insensitive;
     let scope = req.scope;
+    let max_results = req.max_results;
     let stream = req.stream;
 
     // Skip redundant prefilter stats when the index used an equally strict cap.
@@ -2511,6 +2538,8 @@ fn search_with_budget(
     let mut matches = Vec::new();
     let mut file_stats = Vec::new();
     let mut search_stats = Vec::new();
+    let mut matched_lines = 0u64;
+    let mut truncated = false;
     let mut sent_rows = 0usize;
     let mut searched = 0usize;
     // Whether a chunk has been searched whose rows are not yet with the client.
@@ -2522,6 +2551,10 @@ fn search_with_budget(
     };
     let mut unsearched = candidate_info.as_slice();
     while !unsearched.is_empty() {
+        if max_results.is_some_and(|limit| matched_lines >= limit) {
+            truncated = true;
+            break;
+        }
         if stream && part_ready {
             part_ready = false;
             let mut part = serde_json::json!({
@@ -2533,6 +2566,7 @@ fn search_with_budget(
                 "hidden_complete": true,
                 "ordered_filters": true,
                 "multiline_replace": true,
+                "match_context": true,
                 "report_replacements": true,
             });
             sent_rows += part["matches"].as_array().map_or(0, Vec::len);
@@ -2609,6 +2643,16 @@ fn search_with_budget(
             Err(e) => return json_rpc_error(id, -32603, &format!("{e}")),
         };
         for file in per_file {
+            if let Some(limit) = max_results {
+                // Whole files in candidate order, ending with the one that
+                // reaches the limit, so the result does not depend on how the
+                // candidates fall into chunks.
+                if matched_lines >= limit {
+                    truncated = true;
+                    break;
+                }
+                matched_lines += file.matched_lines;
+            }
             matches.extend(file.rows);
             file_stats.extend(file.stats);
             search_stats.extend(file.search_stats);
@@ -2650,8 +2694,13 @@ fn search_with_budget(
         "ordered_filters": true,
         // `multiline_replace` and `report_replacements` requests are honoured.
         "multiline_replace": true,
+        "match_context": true,
         "report_replacements": true,
     });
+    if truncated {
+        // `max_results` ended the search before every candidate was searched.
+        result["truncated"] = serde_json::json!(true);
+    }
     if opts.stats || opts.count_matches {
         result["file_stats"] = serde_json::json!(file_stats);
     }
@@ -2716,6 +2765,10 @@ fn invalidate_cached_paths_locked<'a>(
 #[derive(Default)]
 struct FileSearchResult {
     rows: Vec<serde_json::Value>,
+    /// The file's matching lines in the source, however its rows render them,
+    /// for `max_results`. Zero for a binary file: the client decides whether
+    /// that one is reported, and counts it then.
+    matched_lines: u64,
     stats: Option<crate::search::FileMatchStats>,
     search_stats: Option<crate::search::FileSearchStats>,
 }
@@ -2844,6 +2897,11 @@ fn search_file_matches_bounded(
     }
     let mut result = FileSearchResult {
         rows: Vec::new(),
+        matched_lines: if binary_offset.is_some() {
+            0
+        } else {
+            found.match_totals().1
+        },
         search_stats,
         stats: (opts.stats || opts.count_matches).then(|| {
             let (matches, matched_lines) = found.match_totals();
@@ -3526,22 +3584,27 @@ fn stop_native_watcher(state: &ServerState) {
 fn native_capacity_error(error: &notify::Error) -> bool {
     match &error.kind {
         notify::ErrorKind::MaxFilesWatch => true,
-        notify::ErrorKind::Io(error) => {
-            #[cfg(unix)]
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::ENOSPC | libc::EMFILE | libc::ENFILE | libc::ENOMEM)
-            ) {
-                return true;
-            }
-            #[cfg(windows)]
-            if matches!(error.raw_os_error(), Some(4 | 8 | 14 | 1450 | 1816)) {
-                return true;
-            }
-            false
-        }
+        notify::ErrorKind::Io(error) => error.raw_os_error().is_some_and(native_capacity_os_error),
         _ => false,
     }
+}
+
+#[cfg(unix)]
+fn native_capacity_os_error(code: i32) -> bool {
+    matches!(
+        code,
+        libc::ENOSPC | libc::EMFILE | libc::ENFILE | libc::ENOMEM
+    )
+}
+
+#[cfg(windows)]
+fn native_capacity_os_error(code: i32) -> bool {
+    matches!(code, 4 | 8 | 14 | 1450 | 1816)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn native_capacity_os_error(_code: i32) -> bool {
+    false
 }
 
 fn watch_failure_reason(error: &notify::Error) -> String {
@@ -7625,7 +7688,7 @@ fn refresh_stale_locked(
         );
     }
 
-    if !stream_merge_stale_changes(
+    stream_merge_stale_changes(
         state,
         &changed,
         &added,
@@ -7639,11 +7702,7 @@ fn refresh_stale_locked(
             visibility: Some(&walk.visibility),
             scanned_files: current_meta,
         },
-    ) {
-        return false;
-    }
-
-    true
+    )
 }
 
 /// Restore a known-empty on-disk index after a failed bootstrap.
@@ -10295,6 +10354,31 @@ mod tests {
         assert!(message.contains("response exceeds"), "{last}");
         assert!(!parts.is_empty());
         assert_eq!(row_files(parts), order[..big_at]);
+    }
+
+    /// A binary file does not use up `max_results`, since the client may not
+    /// report it. The search goes on to the next file.
+    #[test]
+    fn binary_not_counted() {
+        let (_temp, root, index_dir, state) = needle_files(8);
+        let order = needle_order(&state);
+        // Binary only past the part of a file that indexing inspects.
+        let mut late_binary = format!("needle\n{}\n", "x".repeat(16 * 1024)).into_bytes();
+        late_binary.push(0);
+        std::fs::write(root.join(&order[0]), late_binary).unwrap();
+        // A fresh state, which has not cached that file as text.
+        let state = test_server_state_from_index(&root, &index_dir);
+
+        let reply: serde_json::Value = serde_json::from_str(&handle_search(
+            None,
+            &serde_json::json!({"pattern": "needle", "max_results": 1}),
+            &state,
+        ))
+        .unwrap();
+        let rows = reply["result"]["matches"].as_array().unwrap();
+        assert_eq!(rows[0]["type"], "binary", "{reply}");
+        assert_eq!(row_files(std::slice::from_ref(&reply)), order[..2]);
+        assert_eq!(reply["result"]["truncated"], true, "{reply}");
     }
 
     fn install_reader_file(

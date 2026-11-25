@@ -590,6 +590,47 @@ fn multiline_count_matches_uses_shared_per_file_totals() {
     );
 }
 
+/// `--max-results` counts the lines of the source when a shared daemon
+/// answers: a match of two lines counts as two, though it is one row.
+#[test]
+fn shared_limit_counts_source_lines() {
+    let mut f = Fixture::new();
+    let root = f.a.join("limit");
+    fs::create_dir(&root).unwrap();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(root.join(name), "hello\nworld\n").unwrap();
+    }
+    git(&f.a, &["add", "limit"]);
+    git(&f.a, &["commit", "-qm", "limit"]);
+    f.revision = git(&f.a, &["rev-parse", "HEAD"]);
+    let d = f.start(&["--no-watch"]);
+    let lease = d.attach(&f.a, &f.revision);
+    let before = d.lookup(&f.a)["queries"].as_u64().unwrap();
+    let mut queries = 0;
+    for order in [&[][..], &["--sort", "path"]] {
+        for (limit, files) in [("2", 1), ("3", 2), ("4", 2)] {
+            let mut args = vec![
+                "-U",
+                "--vimgrep",
+                "--color",
+                "never",
+                "--max-results",
+                limit,
+            ];
+            args.extend(order);
+            args.extend(["--", r"hello\nworld", root.to_str().unwrap()]);
+            let rows = success(cli(&root, &args));
+            queries += 1;
+            assert_eq!(rows.lines().count(), files, "{args:?}: {rows}");
+        }
+    }
+    assert_eq!(d.lookup(&f.a)["queries"], before + queries);
+    d.rpc(
+        "detach",
+        json!({"root":f.a,"view":lease["view"],"lease":lease["lease"]}),
+    );
+}
+
 fn prepare_multiline_counts(f: &mut Fixture) {
     fs::write(
         f.a.join("count-heavy.txt"),
@@ -873,6 +914,11 @@ fn assert_compat_queries(root: &Path, marker: &str) -> u64 {
     let prefix = root.to_string_lossy().replace('\\', "/");
     let mut queries = 0;
     for (flags, pattern, expected) in [
+        (
+            vec!["--no-filename", "--match-context=1"],
+            "ell",
+            Some("hello\n".to_string()),
+        ),
         (
             vec!["-l", "-T", "rust", "-t", "rust"],
             "needle",

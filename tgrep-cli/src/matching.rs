@@ -1009,8 +1009,9 @@ fn match_excerpt(line: &str, start: usize, end: usize, radius: usize) -> (&str, 
         }
         left -= ch.len_utf8();
     }
-    for ch in line[end..].chars().take(radius) {
-        if ch == '\n' {
+    let right_context = &line[end..];
+    for (i, ch) in right_context.char_indices().take(radius) {
+        if ch == '\n' || (ch == '\r' && right_context[i + 1..].starts_with('\n')) {
             break;
         }
         right += ch.len_utf8();

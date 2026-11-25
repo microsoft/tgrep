@@ -4767,6 +4767,22 @@ fn match_context_highlights_and_replacements() {
 }
 
 #[test]
+fn match_context_does_not_include_cr_from_replacement_crlf() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("lines");
+    fs::write(&path, "hit-hit\n").unwrap();
+
+    tgrep()
+        .args(["--no-index", "--match-context=3", "-r"])
+        .arg("X\r\nY")
+        .arg("hit")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout("X\r\nY-X\nY-X\r\nY\n");
+}
+
+#[test]
 fn only_matching_short_flag() {
     let dir = setup_fixture();
     let sub = dir.path().join("testdata");

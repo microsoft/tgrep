@@ -560,6 +560,9 @@ fn simplify(plan: QueryPlan) -> QueryPlan {
                     plan => simplified.push(plan),
                 }
             }
+            // Nested captures can introduce a mandatory literal after an
+            // alternation; keep selective posting intersections first.
+            simplified.sort_by_key(|plan| !matches!(plan, QueryPlan::And(_)));
             match simplified.len() {
                 0 => QueryPlan::MatchAll,
                 1 => simplified.pop().unwrap(),
@@ -1150,34 +1153,36 @@ mod tests {
 
     #[test]
     fn concatenated_alternation_skips_branch_lookups_after_literal_miss() {
-        let plan = build_query_plan("QZX(the|and)", false).unwrap();
-        let QueryPlan::All(plans) = &plan else {
-            panic!("expected conjunction plan: {plan:?}");
-        };
-        let QueryPlan::And(literals) = &plans[0] else {
-            panic!("expected literal constraints first: {plan:?}");
-        };
-        let literal_hashes: Vec<_> = literals.iter().map(|query| query.hash).collect();
+        for pattern in ["QZX(the|and)", "(the|and)(QZX(foo|bar))"] {
+            let plan = build_query_plan(pattern, false).unwrap();
+            let QueryPlan::All(plans) = &plan else {
+                panic!("expected conjunction plan for {pattern}: {plan:?}");
+            };
+            let QueryPlan::And(literals) = &plans[0] else {
+                panic!("expected literal constraints first for {pattern}: {plan:?}");
+            };
+            let literal_hashes: Vec<_> = literals.iter().map(|query| query.hash).collect();
 
-        let calls = std::cell::RefCell::new(Vec::new());
-        assert!(
-            execute_plan(&plan, &|tri| {
-                calls.borrow_mut().push(tri);
-                Vec::new()
-            })
-            .is_empty()
-        );
-        assert_eq!(*calls.borrow(), literal_hashes);
+            let calls = std::cell::RefCell::new(Vec::new());
+            assert!(
+                execute_plan(&plan, &|tri| {
+                    calls.borrow_mut().push(tri);
+                    Vec::new()
+                })
+                .is_empty()
+            );
+            assert_eq!(*calls.borrow(), literal_hashes, "{pattern}: {plan:?}");
 
-        calls.borrow_mut().clear();
-        assert!(
-            execute_plan_with_masks(&plan, &|tri| {
-                calls.borrow_mut().push(tri);
-                Vec::new()
-            })
-            .is_empty()
-        );
-        assert_eq!(*calls.borrow(), literal_hashes);
+            calls.borrow_mut().clear();
+            assert!(
+                execute_plan_with_masks(&plan, &|tri| {
+                    calls.borrow_mut().push(tri);
+                    Vec::new()
+                })
+                .is_empty()
+            );
+            assert_eq!(*calls.borrow(), literal_hashes, "{pattern}: {plan:?}");
+        }
     }
 
     #[test]

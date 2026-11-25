@@ -4752,6 +4752,9 @@ fn match_context_highlights_and_replacements() {
             vec!["--match-context=1", "-U", "-r", "R", r"ab\ncd"],
             "xRz\n",
         ),
+        // An empty replacement still has context; plain -o keeps printing nothing.
+        (vec!["--match-context=1", "-U", "-r", "", r"ab\ncd"], "xz\n"),
+        (vec!["-o", "-U", "-r", "", r"ab\ncd"], ""),
     ] {
         tgrep()
             .args(["--no-index", "-I"])

@@ -1448,6 +1448,12 @@ fn emit_block<'a, E>(
         let (a, b) = (rep.dst.0.max(ls), rep.dst.1.min(te));
         (a < b).then_some((a, b))
     };
+    // With match context, an empty replacement still anchors an excerpt on the
+    // one rewritten line that contains its position.
+    let anchor = |rep: &Placed, ls: usize, te: usize| {
+        let at = rep.dst.0;
+        (opts.match_context > 0 && rep.dst.1 == at && (ls..=te).contains(&at)).then_some((at, at))
+    };
     let mut rows = 0usize;
 
     if opts.only_matching {
@@ -1463,7 +1469,7 @@ fn emit_block<'a, E>(
             .collect();
         for (k, &(ls, te, _)) in lines.iter().enumerate() {
             for (rep, &shift) in block.reps.iter().zip(&shifts) {
-                let Some((a, b)) = piece(rep, ls, te) else {
+                let Some((a, b)) = piece(rep, ls, te).or_else(|| anchor(rep, ls, te)) else {
                     continue;
                 };
                 let (text, span) =

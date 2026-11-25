@@ -491,7 +491,9 @@ fn decompose_hir(hir: &Hir) -> QueryPlan {
             flush(&mut current_literal, &mut fold_run, &mut all_queries);
 
             if !all_queries.is_empty() {
-                plans.push(QueryPlan::And(all_queries));
+                // Check literal constraints first so an empty posting set can
+                // skip materializing potentially common alternation branches.
+                plans.insert(0, QueryPlan::And(all_queries));
             }
             match plans.len() {
                 0 => QueryPlan::MatchAll,
@@ -1144,6 +1146,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn concatenated_alternation_skips_branch_lookups_after_literal_miss() {
+        let plan = build_query_plan("QZX(the|and)", false).unwrap();
+        let QueryPlan::All(plans) = &plan else {
+            panic!("expected conjunction plan: {plan:?}");
+        };
+        let QueryPlan::And(literals) = &plans[0] else {
+            panic!("expected literal constraints first: {plan:?}");
+        };
+        let literal_hashes: Vec<_> = literals.iter().map(|query| query.hash).collect();
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        assert!(
+            execute_plan(&plan, &|tri| {
+                calls.borrow_mut().push(tri);
+                Vec::new()
+            })
+            .is_empty()
+        );
+        assert_eq!(*calls.borrow(), literal_hashes);
+
+        calls.borrow_mut().clear();
+        assert!(
+            execute_plan_with_masks(&plan, &|tri| {
+                calls.borrow_mut().push(tri);
+                Vec::new()
+            })
+            .is_empty()
+        );
+        assert_eq!(*calls.borrow(), literal_hashes);
     }
 
     #[test]

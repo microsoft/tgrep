@@ -3567,22 +3567,27 @@ fn stop_native_watcher(state: &ServerState) {
 fn native_capacity_error(error: &notify::Error) -> bool {
     match &error.kind {
         notify::ErrorKind::MaxFilesWatch => true,
-        notify::ErrorKind::Io(error) => {
-            #[cfg(unix)]
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::ENOSPC | libc::EMFILE | libc::ENFILE | libc::ENOMEM)
-            ) {
-                return true;
-            }
-            #[cfg(windows)]
-            if matches!(error.raw_os_error(), Some(4 | 8 | 14 | 1450 | 1816)) {
-                return true;
-            }
-            false
-        }
+        notify::ErrorKind::Io(error) => error.raw_os_error().is_some_and(native_capacity_os_error),
         _ => false,
     }
+}
+
+#[cfg(unix)]
+fn native_capacity_os_error(code: i32) -> bool {
+    matches!(
+        code,
+        libc::ENOSPC | libc::EMFILE | libc::ENFILE | libc::ENOMEM
+    )
+}
+
+#[cfg(windows)]
+fn native_capacity_os_error(code: i32) -> bool {
+    matches!(code, 4 | 8 | 14 | 1450 | 1816)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn native_capacity_os_error(_code: i32) -> bool {
+    false
 }
 
 fn watch_failure_reason(error: &notify::Error) -> String {
@@ -7666,7 +7671,7 @@ fn refresh_stale_locked(
         );
     }
 
-    if !stream_merge_stale_changes(
+    stream_merge_stale_changes(
         state,
         &changed,
         &added,
@@ -7680,11 +7685,7 @@ fn refresh_stale_locked(
             visibility: Some(&walk.visibility),
             scanned_files: current_meta,
         },
-    ) {
-        return false;
-    }
-
-    true
+    )
 }
 
 /// Restore a known-empty on-disk index after a failed bootstrap.

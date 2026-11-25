@@ -915,6 +915,11 @@ fn assert_compat_queries(root: &Path, marker: &str) -> u64 {
     let mut queries = 0;
     for (flags, pattern, expected) in [
         (
+            vec!["--no-filename", "--match-context=1"],
+            "ell",
+            Some("hello\n".to_string()),
+        ),
+        (
             vec!["-l", "-T", "rust", "-t", "rust"],
             "needle",
             Some(format!("{prefix}/a.rs\n")),

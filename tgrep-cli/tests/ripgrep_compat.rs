@@ -3027,6 +3027,13 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
     // older server's reply is just as good), and the output (`None` for JSON).
     for (flags, pattern, fields, reason, expected) in [
         (
+            vec!["--no-filename", "--match-context=1"],
+            "ell",
+            &["match_context"][..],
+            Some("character context"),
+            Some("hello\n"),
+        ),
+        (
             vec!["-l", "-T", "rust", "-t", "rust"],
             "needle",
             &["type_ops", "ordered_filters"][..],
@@ -3133,6 +3140,7 @@ fn ordered_filters_and_replacements_reject_servers_without_support() {
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
                 // New fields are sent only when the result depends on them.
                 for name in [
+                    "match_context",
                     "type_ops",
                     "ordered_filters",
                     "multiline_replace",
@@ -4673,6 +4681,106 @@ fn invert_match_long_flag() {
 }
 
 // ─── Only matching (-o / --only-matching) ───────────────────────────
+
+#[test]
+fn match_context_keeps_match_positions_across_backends() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("hits"), "ä🌲hit-hit猫z\r\nhit\n").unwrap();
+    fs::write(root.join("unrelated"), "nothing here\n").unwrap();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        let run = |flags: &[&str]| {
+            let output = tgrep()
+                .args(backend)
+                .args(["--stats", "--color", "never", "-I"])
+                .args(flags)
+                .args(["--", "hit|needle"])
+                .arg(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains(marker), "{stderr}");
+            (String::from_utf8(output.stdout).unwrap(), stderr)
+        };
+        let (plain, base_stats) = run(&["-o", "--column", "-b"]);
+        let (zero, _) = run(&["--match-context=0", "--column", "-b"]);
+        assert_eq!(zero, plain);
+        let (excerpt, stats) = run(&["--match-context=1", "--column", "-b"]);
+        assert_eq!(excerpt, "1:7:6:🌲hit-\n1:11:10:-hit猫\n2:1:19:hit\n");
+        // Each excerpt contains the other hit. Both positions must still be reported.
+        let (overlap, _) = run(&["--match-context=4", "--column"]);
+        assert_eq!(overlap, "1:7:ä🌲hit-hit\n1:11:hit-hit猫z\n2:1:hit\n");
+        if backend[0] != "--no-index" {
+            let plan = |s: &str| {
+                s.lines()
+                    .find(|l| l.starts_with("Query plan:"))
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_eq!(plan(&base_stats), plan(&stats));
+            assert!(plan(&stats).contains("candidates: 1/2"), "{stats}");
+        }
+        let (json, _) = run(&["--match-context=1", "--json"]);
+        let hit = json
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|v| v["type"] == "match")
+            .unwrap();
+        assert_eq!(hit["data"]["lines"]["text"], "ä🌲hit-hit猫z\r\n");
+        assert_eq!(hit["data"]["submatches"].as_array().unwrap().len(), 2);
+    });
+}
+
+#[test]
+fn match_context_highlights_and_replacements() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("lines");
+    fs::write(&path, "αhit-hitβ\nxab\ncdz\n").unwrap();
+    for (flags, expected) in [
+        (
+            vec!["--color=always", "--match-context=1", "hit"],
+            "α\x1b[1;31mhit\x1b[0m-\n-\x1b[1;31mhit\x1b[0mβ\n",
+        ),
+        (
+            vec!["--match-context=3", "--column", "-b", "-r", "X", "hit"],
+            "1:3:2:αX-Xβ\n1:5:4:αX-Xβ\n",
+        ),
+        (vec!["--match-context=1", "-U", r"ab\ncd"], "xab\ncdz\n"),
+        (
+            vec!["--match-context=1", "-U", "-r", "R", r"ab\ncd"],
+            "xRz\n",
+        ),
+        // An empty replacement still has context; plain -o keeps printing nothing.
+        (vec!["--match-context=1", "-U", "-r", "", r"ab\ncd"], "xz\n"),
+        (vec!["-o", "-U", "-r", "", r"ab\ncd"], ""),
+    ] {
+        tgrep()
+            .args(["--no-index", "-I"])
+            .args(flags)
+            .arg(&path)
+            .assert()
+            .success()
+            .stdout(expected);
+    }
+}
+
+#[test]
+fn match_context_does_not_include_cr_from_replacement_crlf() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("lines");
+    fs::write(&path, "hit-hit\n").unwrap();
+
+    tgrep()
+        .args(["--no-index", "--match-context=3", "-r"])
+        .arg("X\r\nY")
+        .arg("hit")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout("X\r\nY-X\nY-X\r\nY\n");
+}
 
 #[test]
 fn only_matching_short_flag() {

@@ -26,6 +26,8 @@ pub struct TrigramQuery {
 pub enum QueryPlan {
     /// All trigrams must match (intersection of posting lists).
     And(Vec<TrigramQuery>),
+    /// Every child plan must match (intersection of candidate sets).
+    All(Vec<Self>),
     /// Any branch can match (union of results).
     Or(Vec<Self>),
     /// No trigrams could be extracted — must scan all files.
@@ -451,6 +453,7 @@ fn decompose_hir(hir: &Hir) -> QueryPlan {
         HirKind::Literal(Literal(bytes)) => literals_to_query_plan(bytes),
         HirKind::Concat(subs) => {
             let mut all_queries = Vec::new();
+            let mut plans = Vec::new();
             let mut current_literal = Vec::new();
             let mut fold_run = false;
             let flush =
@@ -477,21 +480,25 @@ fn decompose_hir(hir: &Hir) -> QueryPlan {
                     fold_run = true;
                 } else {
                     flush(&mut current_literal, &mut fold_run, &mut all_queries);
-                    // Recurse into the non-literal child
-                    let sub_plan = decompose_hir(sub);
-                    if let QueryPlan::And(queries) = sub_plan {
-                        all_queries.extend(queries);
+                    match decompose_hir(sub) {
+                        QueryPlan::And(queries) => all_queries.extend(queries),
+                        QueryPlan::MatchAll => {}
+                        plan => plans.push(plan),
                     }
-                    // MatchAll or Or children don't contribute AND trigrams
                 }
             }
 
             flush(&mut current_literal, &mut fold_run, &mut all_queries);
 
-            if all_queries.is_empty() {
-                QueryPlan::MatchAll
-            } else {
-                QueryPlan::And(all_queries)
+            if !all_queries.is_empty() {
+                // Check literal constraints first so an empty posting set can
+                // skip materializing potentially common alternation branches.
+                plans.insert(0, QueryPlan::And(all_queries));
+            }
+            match plans.len() {
+                0 => QueryPlan::MatchAll,
+                1 => plans.pop().unwrap(),
+                _ => QueryPlan::All(plans),
             }
         }
         HirKind::Alternation(alts) => {
@@ -544,6 +551,24 @@ fn simplify(plan: QueryPlan) -> QueryPlan {
                 QueryPlan::And(queries)
             }
         }
+        QueryPlan::All(plans) => {
+            let mut simplified = Vec::new();
+            for plan in plans.into_iter().map(simplify) {
+                match plan {
+                    QueryPlan::MatchAll => {}
+                    QueryPlan::All(children) => simplified.extend(children),
+                    plan => simplified.push(plan),
+                }
+            }
+            // Nested captures can introduce a mandatory literal after an
+            // alternation; keep selective posting intersections first.
+            simplified.sort_by_key(|plan| !matches!(plan, QueryPlan::And(_)));
+            match simplified.len() {
+                0 => QueryPlan::MatchAll,
+                1 => simplified.pop().unwrap(),
+                _ => QueryPlan::All(simplified),
+            }
+        }
         QueryPlan::Or(plans) => {
             let simplified: Vec<QueryPlan> = plans.into_iter().map(simplify).collect();
             if simplified.len() == 1 {
@@ -582,6 +607,9 @@ where
                 }
             }
             result
+        }
+        QueryPlan::All(plans) => {
+            intersect_many_sorted(plans.iter().map(|sub| execute_plan(sub, lookup)))
         }
         QueryPlan::Or(plans) => {
             let lists = plans.iter().map(|sub| execute_plan(sub, lookup)).collect();
@@ -662,6 +690,9 @@ where
 
             candidates.into_iter().map(|(fid, _, _)| fid).collect()
         }
+        QueryPlan::All(plans) => {
+            intersect_many_sorted(plans.iter().map(|sub| execute_plan_with_masks(sub, lookup)))
+        }
         QueryPlan::Or(plans) => {
             let lists = plans
                 .iter()
@@ -671,6 +702,21 @@ where
         }
         QueryPlan::MatchAll => Vec::new(),
     }
+}
+
+fn intersect_many_sorted(lists: impl IntoIterator<Item = Vec<u32>>) -> Vec<u32> {
+    let mut lists = lists.into_iter();
+    let Some(mut result) = lists.next() else {
+        return Vec::new();
+    };
+    // Stop before evaluating another child if the conjunction is already empty.
+    while !result.is_empty() {
+        let Some(list) = lists.next() else {
+            break;
+        };
+        result = intersect_sorted(&result, &list);
+    }
+    result
 }
 
 fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -1029,6 +1075,138 @@ mod tests {
             }
             _ => panic!("expected Or plan for alternation"),
         }
+    }
+
+    #[test]
+    fn concatenated_alternations_narrow_candidates() {
+        let contents = [
+            "React.useImperativeHandle",
+            "React.useReducer",
+            "React.useState",
+            "Other.useReducer",
+            "React.useReducer.tail",
+            "React.useImperativeHandle.end",
+            "React.useState.tail",
+            "React.x",
+            "React.",
+            "React.\u{212a}elvin",
+            "React.KELVIN",
+        ];
+        let mut inverted = std::collections::HashMap::<u32, Vec<PostingEntry>>::new();
+        for (file_id, content) in contents.iter().enumerate() {
+            for (tri, masks) in trigram::extract_merged_masks(content.as_bytes()) {
+                inverted.entry(tri).or_default().push(PostingEntry {
+                    file_id: file_id as u32,
+                    loc_mask: masks.loc_mask,
+                    next_mask: masks.next_mask,
+                });
+            }
+        }
+        let lookup = |tri| inverted.get(&tri).cloned().unwrap_or_default();
+        let cases: &[(&str, &[u32])] = &[
+            (r"React\.(useImperativeHandle|useReducer)", &[0, 1, 4, 5]),
+            (r"React.(useImperativeHandle|useReducer)", &[0, 1, 4, 5]),
+            (r"(useImperativeHandle|useReducer).*React\.", &[0, 1, 4, 5]),
+            (r"(useImperativeHandle|useReducer).*(tail|end)", &[4, 5]),
+            (r"(React\.useImperativeHandle|Other\.useReducer).*tail", &[]),
+            (
+                r"(React\.(useImperativeHandle|useReducer)|Other).*tail",
+                &[4],
+            ),
+            (
+                r"React\.(useImperativeHandle|useReducer)\.(tail|end)",
+                &[4, 5],
+            ),
+            (r"React\.(useImperativeHandle|useReducer)+", &[0, 1, 4, 5]),
+            (
+                r"React\.(useImperativeHandle|useReducer)?",
+                &[0, 1, 2, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (
+                r"React\.(useImperativeHandle|x)",
+                &[0, 1, 2, 4, 5, 6, 7, 8, 9, 10],
+            ),
+            (r"React\.(useImperativeHandle|(?i:kelvin))", &[0, 5, 9, 10]),
+        ];
+        for &(pattern, expected) in cases {
+            let plan = build_query_plan(pattern, false).unwrap();
+            assert!(!plan.is_match_all(), "{pattern}: {plan:?}");
+            for candidates in [
+                execute_plan(&plan, &|tri| {
+                    lookup(tri).iter().map(|entry| entry.file_id).collect()
+                }),
+                execute_plan_with_masks(&plan, &lookup),
+            ] {
+                assert_eq!(candidates, expected, "{pattern}: {plan:?}");
+                let matcher = regex::Regex::new(pattern).unwrap();
+                for (id, content) in contents.iter().enumerate() {
+                    if matcher.is_match(content) {
+                        assert!(
+                            candidates.contains(&(id as u32)),
+                            "{pattern} lost {content:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concatenated_alternation_skips_branch_lookups_after_literal_miss() {
+        for pattern in ["QZX(the|and)", "(the|and)(QZX(foo|bar))"] {
+            let plan = build_query_plan(pattern, false).unwrap();
+            let QueryPlan::All(plans) = &plan else {
+                panic!("expected conjunction plan for {pattern}: {plan:?}");
+            };
+            let QueryPlan::And(literals) = &plans[0] else {
+                panic!("expected literal constraints first for {pattern}: {plan:?}");
+            };
+            let literal_hashes: Vec<_> = literals.iter().map(|query| query.hash).collect();
+
+            let calls = std::cell::RefCell::new(Vec::new());
+            assert!(
+                execute_plan(&plan, &|tri| {
+                    calls.borrow_mut().push(tri);
+                    Vec::new()
+                })
+                .is_empty()
+            );
+            assert_eq!(*calls.borrow(), literal_hashes, "{pattern}: {plan:?}");
+
+            calls.borrow_mut().clear();
+            assert!(
+                execute_plan_with_masks(&plan, &|tri| {
+                    calls.borrow_mut().push(tri);
+                    Vec::new()
+                })
+                .is_empty()
+            );
+            assert_eq!(*calls.borrow(), literal_hashes, "{pattern}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn many_concatenated_alternations_keep_planning_and_lookup_linear() {
+        let plan = build_query_plan(&"(alpha|omega)".repeat(32), false).unwrap();
+        assert!(!plan.is_match_all());
+        let lookups = std::cell::Cell::new(0);
+        let lookup = |_| {
+            lookups.set(lookups.get() + 1);
+            assert!(lookups.get() <= 256, "alternations must not be distributed");
+            vec![PostingEntry {
+                file_id: 7,
+                loc_mask: u8::MAX,
+                next_mask: u8::MAX,
+            }]
+        };
+        assert_eq!(
+            execute_plan(&plan, &|tri| {
+                lookup(tri).iter().map(|entry| entry.file_id).collect()
+            }),
+            vec![7]
+        );
+        lookups.set(0);
+        assert_eq!(execute_plan_with_masks(&plan, &lookup), vec![7]);
     }
 
     #[test]

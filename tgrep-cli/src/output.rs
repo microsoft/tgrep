@@ -302,6 +302,8 @@ pub struct OutputWriter {
     all_searches: u64,
     total_matches: u64,
     total_matched_lines: u64,
+    /// Matching lines of the files reported so far, for `--max-results`.
+    reported_lines: u64,
 }
 
 impl OutputWriter {
@@ -340,7 +342,19 @@ impl OutputWriter {
             all_searches: 0,
             total_matches: 0,
             total_matched_lines: 0,
+            reported_lines: 0,
         }
+    }
+
+    /// The matching lines of the files reported across the invocation.
+    pub fn reported_lines(&self) -> u64 {
+        self.reported_lines
+    }
+
+    /// Count a reported file's matching lines towards `--max-results`. These
+    /// are lines of the source, however its matches are printed.
+    pub fn note_reported_lines(&mut self, lines: u64) {
+        self.reported_lines += lines;
     }
 
     pub fn match_totals(&self) -> (u64, u64) {

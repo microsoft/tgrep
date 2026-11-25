@@ -3047,6 +3047,10 @@ fn index_narrowing_note(raw: u64, total: u64) -> &'static str {
 pub(crate) fn plan_summary(plan: &QueryPlan) -> String {
     match plan {
         QueryPlan::And(queries) => format!("AND({} trigrams)", queries.len()),
+        QueryPlan::All(plans) => {
+            let subs: Vec<String> = plans.iter().map(plan_summary).collect();
+            format!("ALL({})", subs.join(", "))
+        }
         QueryPlan::Or(plans) => {
             let subs: Vec<String> = plans.iter().map(plan_summary).collect();
             format!("OR({})", subs.join(", "))

@@ -816,6 +816,9 @@ exit code determined by the search alone. Suppress the message with
    trigrams in parallel. Sorted postings map trigrams to candidate files.
 2. **Querying** decomposes regex literals into trigram lookups, intersects or
    unions posting lists, and verifies candidates with the full regex engine.
+   Concatenations retain alternation constraints: `React\.(useImperativeHandle|useReducer)`
+   intersects the prefix's candidates with the union of the branches' candidates,
+   without expanding combinations of multiple alternations.
    Inline case flags participate in planning; unsupported constructs use
    conservative plans rather than excluding possible matches. Case-insensitive
    fixed strings use the same Unicode-aware planning after escaping regex

@@ -1779,6 +1779,56 @@ fn indexed_json_keeps_line_terminators_and_raw_invalid_utf8() {
 }
 
 #[test]
+fn indexed_concatenated_alternations_keep_candidates_selective() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("testdata");
+    fs::create_dir_all(&root).unwrap();
+    for (name, content) in [
+        ("imperative.txt", "React.useImperativeHandle\n"),
+        ("reducer.txt", "React.useReducer\n"),
+        ("other.txt", "Other.useReducer\n"),
+    ] {
+        fs::write(root.join(name), content).unwrap();
+    }
+    for i in 0..256 {
+        fs::write(root.join(format!("decoy-{i}.txt")), "React.useState\n").unwrap();
+    }
+    let cases: &[(&[&str], &str)] = &[
+        (&[], r"React\.(useImperativeHandle|useReducer)"),
+        (&[], r"React.(useImperativeHandle|useReducer)"),
+        (&[], r"React\.useImperativeHandle|React\.useReducer"),
+        (&["-i"], r"react\.(useimperativehandle|usereducer)"),
+        (&["-P"], r"React\.(useImperativeHandle|useReducer)"),
+        (&["-P"], r"(?<!//)React\.(useImperativeHandle|useReducer)"),
+    ];
+    let mut direct = Vec::new();
+    with_stats_backends(&root, &dir.path().join("idx"), |backend, marker| {
+        for (i, &(flags, pattern)) in cases.iter().enumerate() {
+            let output = tgrep()
+                .args(backend)
+                .args(flags)
+                .args(["--stats", "--sort", "path", "--color", "never", "-c"])
+                .args(["--", pattern, root.to_str().unwrap()])
+                .assert()
+                .success()
+                .get_output()
+                .clone();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains(marker), "{flags:?} {pattern}: {stderr}");
+            if backend == ["--no-index"] {
+                direct.push(output.stdout);
+            } else {
+                assert_eq!(output.stdout, direct[i], "{flags:?} {pattern}");
+                assert!(
+                    stderr.contains("raw candidates: 2/259"),
+                    "{flags:?} {pattern}: {stderr}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
 fn indexed_inline_case_flags_keep_candidates_selective() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("testdata");

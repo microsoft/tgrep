@@ -139,6 +139,16 @@ struct Cli {
     #[arg(short = 'm', long = "max-count", global = true)]
     max_count: Option<usize>,
 
+    /// Stop after the file in which the NUM-th matching line is found.
+    #[arg(
+        long = "max-results",
+        global = true,
+        value_name = "NUM",
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with_all = ["files_only", "files_without_match", "count", "count_matches", "quiet", "list_files"]
+    )]
+    max_results: Option<u64>,
+
     /// List files that would be searched (no search performed).
     #[arg(long = "files", global = true)]
     list_files: bool,
@@ -1142,6 +1152,7 @@ impl Cli {
             count: self.count,
             word_boundary: self.word_regexp,
             max_count: self.max_count,
+            max_results: self.max_results,
             json,
             vimgrep: self.vimgrep,
             stats: self.stats || self.debug || self.trace,
@@ -1686,6 +1697,9 @@ fn run_search(
                 let _ = writer.finish();
                 process::exit(2);
             }
+        }
+        if opts.max_results_reached(&writer) {
+            break;
         }
     }
 

@@ -187,6 +187,15 @@ fn parts_add_up() {
     let streamed_files: Vec<String> = parts.iter().flat_map(files_of).collect();
     assert_eq!(streamed_files, whole_files, "same rows in the same order");
 
+    // With a limit, the parts end at the file that reaches it.
+    let limited = search_replies(
+        port,
+        serde_json::json!({"pattern": MARKER, "stream": true, "max_results": 100}),
+    );
+    let limited_files: Vec<String> = limited.iter().flat_map(files_of).collect();
+    assert_eq!(limited_files, whole_files[..100]);
+    assert_eq!(limited.last().unwrap()["truncated"], true);
+
     // The CLI prints the same lines whether the server streamed them (plain
     // output) or replied once (`--sort` needs the whole result).
     let streamed = cli_lines(&["--index-path", index_arg, MARKER, root]);
